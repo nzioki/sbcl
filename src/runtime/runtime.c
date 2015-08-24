@@ -176,6 +176,7 @@ Common runtime options:\n\
   --core <filename>          Use the specified core file instead of the default.\n\
   --dynamic-space-size <MiB> Size of reserved dynamic space in megabytes.\n\
   --control-stack-size <MiB> Size of reserved control stack in megabytes.\n\
+  --noinform                 Do not print banner on start-up.\n\
 \n\
 Common toplevel options:\n\
   --sysinit <filename>       System-wide init-file to use instead of default.\n\
