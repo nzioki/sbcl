@@ -268,7 +268,7 @@
     (once-only ((n-object object))
       (ecase (numeric-type-complexp type)
         (:real
-         (if (and #!-(or x86 x86-64 arm) ;; Not implemented elsewhere yet
+         (if (and #!-(or x86 x86-64 arm arm64) ;; Not implemented elsewhere yet
                   nil
                   (eql (numeric-type-class type) 'integer)
                   (eql (numeric-type-low type) 0)
@@ -297,6 +297,10 @@
   (declare (type hairy-type type))
   (let ((spec (hairy-type-specifier type)))
     (cond ((unknown-type-p type)
+           #+sb-xc-host
+           (warn "can't open-code test of unknown type ~S"
+                 (type-specifier type))
+           #-sb-xc-host
            (when (policy *lexenv* (> speed inhibit-warnings))
              (compiler-notify "can't open-code test of unknown type ~S"
                               (type-specifier type)))
@@ -304,7 +308,17 @@
           (t
            (ecase (first spec)
              (satisfies
-              `(if (funcall (global-function ,(second spec)) ,object) t nil))
+              (let* ((name (second spec))
+                     (expansion (fun-name-inline-expansion name)))
+                ;; Lambda without lexenv can easily be handled here.
+                ;; This fixes the issue that LEGAL-FUN-NAME-P which is
+                ;; just a renaming of VALID-FUNCTION-NAME-P would not
+                ;; be inlined when testing the FUNCTION-NAME type.
+                `(if ,(if (and (typep expansion '(cons (eql lambda)))
+                               (not (fun-lexically-notinline-p name)))
+                          `(,expansion ,object)
+                          `(funcall (global-function ,name) ,object))
+                     t nil)))
              ((not and)
               (once-only ((n-obj object))
                 `(,(first spec) ,@(mapcar (lambda (x)
@@ -639,12 +653,8 @@
                    ;; There is no loss in the case where both fail, and there
                    ;; is a benefit in a passing case. Always try both though,
                    ;; because (MAKE-INSTANCE 'x) works on any structure class.
-                   (abstract-base-p
-                    (let ((dd (layout-info layout)))
-                      (and dd
-                           (not (dd-default-constructor dd))
-                           (let ((ctors (dd-constructors dd)))
-                             (or (not ctors) (equal ctors '((nil))))))))
+                   (abstract-base-p (awhen (layout-info layout)
+                                      (not (dd-constructors it))))
                    (get-ancestor
                     ;; Use DATA-VECTOR-REF directly, since that's what SVREF in
                     ;; a SAFETY 0 lexenv will eventually be transformed to.

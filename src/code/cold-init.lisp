@@ -21,10 +21,14 @@
 ;;; which might be tedious to maintain, instead we use a hack:
 ;;; anything whose name matches a magic character pattern is
 ;;; uninterned.
-;;;
-;;; FIXME: Are there other tables that need to have entries removed?
-;;; What about symbols of the form DEF!FOO?
+;;; Additionally, you can specify an arbitrary way to destroy
+;;; random bootstrap stuff on per-package basis.
 (defun !unintern-init-only-stuff ()
+  (dolist (package (list-all-packages))
+    (awhen (find-symbol "UNINTERN-INIT-ONLY-STUFF" package)
+      (format t "~&Calling ~/sb-impl::print-symbol-with-prefix/~%" it)
+      (funcall it)
+      (unintern it package)))
   (flet ((uninternable-p (symbol)
            (let ((name (symbol-name symbol)))
              (or (and (>= (length name) 1) (char= (char name 0) #\!))
@@ -152,7 +156,7 @@
   (progn (prin1 `(package = ,(package-name *package*)))
          (terpri))
 
-  ;; *RAW-SLOT-DATA-LIST* is essentially a compile-time constant
+  ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
   (show-and-call sb!kernel::!raw-slot-data-init)
 
@@ -192,6 +196,7 @@
   (/show0 "back from !POLICY-COLD-INIT-OR-RESANIFY")
 
   (show-and-call !constantp-cold-init)
+  (show-and-call !constantp2-cold-init)
   ;; Must be done before toplevel forms are invoked
   ;; because a toplevel defstruct will need to add itself
   ;; to the subclasses of STRUCTURE-OBJECT.
@@ -222,6 +227,24 @@
                         (/primitive-print hexstr))))
   (let (#!+sb-show (index-in-cold-toplevels 0))
     #!+sb-show (declare (type fixnum index-in-cold-toplevels))
+
+    (encapsulate
+     'find-package '!bootstrap
+     (lambda (f designator)
+       (cond ((packagep designator) designator)
+             (t (funcall f (let ((s (string designator)))
+                             (if (eql (mismatch s "SB!") 3)
+                                 (concatenate 'string "SB-" (subseq s 3))
+                                 s)))))))
+    (encapsulate '%failed-aver '!bootstrap
+                 (lambda (f expr)
+                   ;; output the message before signaling error,
+                   ;; as it may be this is too early in the cold init.
+                   (fresh-line)
+                   (write-line "failed AVER:")
+                   (write expr)
+                   (terpri)
+                   (funcall f expr)))
 
     (dolist (toplevel-thing (prog1
                                 (nreverse *!reversed-cold-toplevels*)
@@ -255,6 +278,10 @@
             (!cold-lose "bogus fixup code in *!REVERSED-COLD-TOPLEVELS*"))))
         (t (!cold-lose "bogus operation in *!REVERSED-COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
+  (unencapsulate '%failed-aver '!bootstrap)
+  (unencapsulate 'find-package '!bootstrap)
+
+  (show-and-call time-reinit)
 
   ;; Set sane values again, so that the user sees sane values instead
   ;; of whatever is left over from the last DECLAIM/PROCLAIM.
@@ -279,8 +306,6 @@
   (show-and-call !foreign-cold-init)
   #!-(and win32 (not sb-thread))
   (show-and-call signal-cold-init-or-reinit)
-  (/show0 "enabling internal errors")
-  (setf (extern-alien "internal_errors_enabled" int) 1)
 
   (show-and-call float-cold-init-or-reinit)
 
@@ -305,7 +330,11 @@
   ;; the ANSI-specified initial value of *PACKAGE*
   (setf *package* (find-package "COMMON-LISP-USER"))
 
-  (!enable-infinite-error-protector)
+  ;; Enable normal (post-cold-init) behavior of INFINITE-ERROR-PROTECT.
+  (setf sb!kernel::*maximum-error-depth* 10)
+  (/show0 "enabling internal errors")
+  (setf (extern-alien "internal_errors_enabled" int) 1)
+
 
   ; hppa heap is segmented, lisp and c uses a stub to call eachother
   #!+hpux (%primitive sb!vm::setup-return-from-lisp-stub)
@@ -459,3 +488,18 @@ process to continue normally."
                     (%primitive print (hexstr obj)))))))
     (%cold-print x 0))
   (values))
+
+(in-package "SB!INT")
+(defun unintern-init-only-stuff ()
+  (let ((this-package (find-package "SB-INT")))
+    ;; For some reason uninterning these:
+    ;;    DEF!TYPE DEF!CONSTANT DEF!MACRO DEF!STRUCT
+    ;; does not work, they stick around as uninterned symbols.
+    ;; Some other macros must expand into them. Ugh.
+    (dolist (s '(defenum defmacro-mundanely defun-cached
+                 with-globaldb-name
+                 .
+                 #!+sb-show ()
+                 #!-sb-show (/hexstr /nohexstr /noshow /noshow0 /noxhow
+                             /primitive-print /show /show0 /xhow)))
+      (unintern s this-package))))

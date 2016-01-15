@@ -374,25 +374,37 @@
   #-sb-xc-host (lambda (name) (if (fboundp name) :function nil)))
 
 ;;; Indicates whether the function is deprecated.
-(define-info-type (:function :deprecated) :type-spec deprecation-info)
+(define-info-type (:function :deprecated)
+  :type-spec (or null deprecation-info))
 
 (declaim (ftype (sfunction (t) ctype)
                 specifier-type ctype-of sb!kernel::ctype-of-array))
 
-;;; The type specifier for this function.
-(define-info-type (:function :type)
-  :type-spec ctype
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+(defun ftype-from-fdefn (name)
+  (declare (ignorable name))
   ;; Again [as in (DEFINE-INFO-TYPE (:FUNCTION :TYPE) ...)] it's
   ;; not clear how to generalize the FBOUNDP expression to the
   ;; cross-compiler. -- WHN 19990330
-  :default
-  ;; Delay evaluation of (SPECIFIER-TYPE) since it can't work yet
-  #+sb-xc-host (lambda (x) (declare (ignore x)) (specifier-type 'function))
-  #-sb-xc-host (lambda (name)
-                 (if (fboundp name)
-                     (handler-bind ((style-warning #'muffle-warning))
-                       (specifier-type (sb!impl::%fun-type (fdefinition name))))
-                     (specifier-type 'function))))
+  #+sb-xc-host
+  (specifier-type 'function)
+  #-sb-xc-host
+  (let* ((fdefn (sb!kernel::find-fdefn name))
+         (fun (and fdefn (fdefn-fun fdefn))))
+    (if fun
+        (handler-bind ((style-warning #'muffle-warning))
+          (specifier-type (sb!impl::%fun-type fun)))
+        (specifier-type 'function)))))
+
+;;; The type specifier for this function, or a DEFSTRUCT-DESCRIPTION
+;;; or the symbol :GENERIC-FUNTION.
+;;; If a DD, it must contain a constructor whose name is
+;;; the one being sought in globaldb, which is used to derive the type.
+;;; If :GENERIC-FUNCTION, the info is recomputed from existing methods
+;;; and stored back into globaldb.
+(define-info-type (:function :type)
+  :type-spec (or ctype defstruct-description (member :generic-function))
+  :default #'ftype-from-fdefn)
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -446,6 +458,13 @@
 ;;; expansion is inhibited.
 ;;; As an exception, a cons of two atoms represents structure metadata
 ;;; which is recognized and transformed in a stylized way.
+;;;
+;;; This item is almost mutually exclusive with an inline expansion,
+;;; but both are possible in the rare case of a system-defined transform
+;;; that may decline to expand. If it does, an inline expansion could win.
+;;; We don't actually have anything like that any more though.
+;;; For user-defined functions, the invariant is maintained that at most
+;;; one of :source-transform and an inline-expansion exist.
 (define-info-type (:function :source-transform)
   :type-spec (or function null (cons atom atom)))
 
@@ -485,7 +504,8 @@
 (define-info-type (:variable :always-bound)
   :type-spec (member nil :eventually :always-bound))
 
-(define-info-type (:variable :deprecated) :type-spec deprecation-info)
+(define-info-type (:variable :deprecated)
+  :type-spec (or null deprecation-info))
 
 ;;; the declared type for this variable
 (define-info-type (:variable :type)
@@ -566,47 +586,16 @@
 
 (define-info-type (:type :documentation) :type-spec (or string null))
 
-;;; Either a CTYPE which is the translation of this type name,
-;;; or a function that parses type specifiers into CTYPE structures.
-;;; The :BUILTIN property is mutually exclusive with a CTYPE stored here.
-;;; :BUILTIN could probably be eliminated, as it is redundant since we
-;;; can discern a :BUILTIN by its :KIND being :PRIMITIVE.
-(define-info-type (:type :translator)
-  :type-spec (or function ctype null)
-  ;; This error is never seen by a user. After meta-compile there is no
-  ;; means to define additional types with custom translators.
-  :validate-function (lambda (name new-value)
-                       ;; The compiler-macro signals an error
-                       ;; on forward-referenced info-types.
-                       #+sb-xc-host (declare (notinline info))
-                       (when (and new-value (info :type :expander name))
-                         (bug "Type has an expander"))
-                       (when (and (not (functionp new-value))
-                                  new-value
-                                  (info :type :builtin name))
-                         (bug ":BUILTIN and :TRANSLATOR are incompatible"))))
+;;; The expander function for a defined type,
+;;; or a cons whose CAR is a function which is a builtin type translator.
+(define-info-type (:type :expander) :type-spec (or function list))
 
-;;; The expander function for a defined type.
-;;; It returns a type expression, not a CTYPE.
-(define-info-type (:type :expander)
-  :type-spec (or function null)
-  ;; This error is never seen by a user.
-  ;; The user sees "illegal to redefine standard type".
-  :validate-function (lambda (name new-value)
-                       (when (and new-value (info :type :translator name))
-                         (bug "Type has a translator"))))
-
-;;; If true, then the type coresponding to this name. Note that if
+;;; If non-nil, then the type coresponding to this name. Note that if
 ;;; this is a built-in class with a translation, then this is the
 ;;; translation, not the class object. This info type keeps track of
 ;;; various atomic types (NIL etc.) and also serves as a means to
 ;;; ensure that common standard types are only consed once.
-(define-info-type (:type :builtin)
-  :type-spec (or ctype null)
-  :validate-function (lambda (name new-value)
-                       (when (and (ctype-p new-value)
-                                  (ctype-p (info :type :translator name)))
-                         (bug ":BUILTIN and :TRANSLATOR are incompatible"))))
+(define-info-type (:type :builtin) :type-spec (or ctype null))
 
 ;;; The classoid-cell for this type
 (define-info-type (:type :classoid-cell) :type-spec t)
@@ -645,8 +634,9 @@
 
 (define-info-type (:type :source-location) :type-spec t)
 
-;;; Indicates whether the function is deprecated.
-(define-info-type (:type :deprecated) :type-spec deprecation-info)
+;;; Indicates whether the type is deprecated.
+(define-info-type (:type :deprecated)
+  :type-spec (or null deprecation-info))
 
 ;;;; ":TYPED-STRUCTURE" subsection.
 ;;;; Data pertaining to structures that used DEFSTRUCT's :TYPE option.

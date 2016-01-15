@@ -297,6 +297,8 @@
       ;; Before the actual FASL header, write a shebang line using the current
       ;; runtime path, so our fasls can be executed directly from the shell.
       (when *runtime-pathname*
+        #+sb-xc-host (bug "Can't write shebang line") ; no #'NATIVE-PATHNAME
+        #-sb-xc-host
         (fasl-write-string
          (format nil "#!~A --script~%"
                  (native-namestring *runtime-pathname* :as-file t))
@@ -761,7 +763,8 @@
 (defun dump-array (x file)
   (if (vectorp x)
       (dump-vector x file)
-      (dump-multi-dim-array x file)))
+      #-sb-xc-host (dump-multi-dim-array x file)
+      #+sb-xc-host (bug "Can't dump multi-dim array")))
 
 ;;; Dump the vector object. If it's not simple, then actually dump a
 ;;; simple version of it. But we enter the original in the EQ or EQUAL
@@ -1144,6 +1147,8 @@
                          (fasl-output-patch-table fasl-output))))
         handle))))
 
+;;; This is only called from assemfile, which doesn't exist in the target.
+#+sb-xc-host
 (defun dump-assembler-routines (code-segment length fixups routines file)
   (dump-fop 'fop-assembler-code file)
   (dump-word length file)
@@ -1151,7 +1156,9 @@
   (dolist (routine routines)
     (dump-object (car routine) file)
     (dump-fop 'fop-assembler-routine file)
-    (dump-word (label-position (cdr routine)) file))
+    (dump-word (+ (label-position (cadr routine))
+                  (caddr routine))
+               file))
   (dump-fixups fixups file)
   #!-(or x86 x86-64)
   (dump-fop 'fop-sanctify-for-execution file)
@@ -1246,6 +1253,7 @@
   (declare (type sb!c::source-info info))
   (let ((res (sb!c::debug-source-for-info info))
         (*dump-only-valid-structures* nil))
+    ;; Zero out the timestamps to get reproducible fasls.
     #+sb-xc-host (setf (sb!c::debug-source-created res) 0
                        (sb!c::debug-source-compiled res) 0)
     (dump-object res fasl-output)
@@ -1254,7 +1262,11 @@
         (dump-push res-handle fasl-output)
         (dump-fop 'fop-structset fasl-output)
         (dump-word info-handle fasl-output)
-        (dump-word sb!c::+debug-info-source-index+ fasl-output))
+        (macrolet ((debug-info-source-index ()
+                     (let ((dd (find-defstruct-description 'sb!c::debug-info)))
+                       (dsd-index (find 'source (dd-slots dd)
+                                        :key #'dsd-name :test 'string=)))))
+          (dump-word (debug-info-source-index) fasl-output)))
       #+sb-xc-host
       (progn
         (dump-push res-handle fasl-output)

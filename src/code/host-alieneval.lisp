@@ -206,13 +206,7 @@
                (find-if #'aux-defn-matches (auxiliary-type-definitions env)))))
       (if in-auxiliaries
           (values (third in-auxiliaries) t)
-          (ecase kind
-            (:struct
-             (info :alien-type :struct name))
-            (:union
-             (info :alien-type :union name))
-            (:enum
-             (info :alien-type :enum name)))))))
+          (info :alien-type kind name)))))
 
 (defun (setf auxiliary-alien-type) (new-value kind name env)
   (declare (type sb!kernel:lexenv-designator env))
@@ -229,24 +223,8 @@
   (dolist (info *new-auxiliary-types*)
     (destructuring-bind (kind name defn) info
       (declare (ignore defn))
-      (when (ecase kind
-              (:struct
-               (info :alien-type :struct name))
-              (:union
-               (info :alien-type :union name))
-              (:enum
-               (info :alien-type :enum name)))
+      (when (info :alien-type kind name)
         (error "attempt to shadow definition of ~A ~S" kind name)))))
-
-(def!struct (alien-type
-             (:make-load-form-fun sb!kernel:just-dump-it-normally)
-             (:constructor make-alien-type
-                           (&key class bits alignment
-                            &aux (alignment
-                                  (or alignment (guess-alignment bits))))))
-  (class 'root :type symbol)
-  (bits nil :type (or null unsigned-byte))
-  (alignment nil :type (or null unsigned-byte)))
 
 (defun unparse-alien-type (type)
   #!+sb-doc
@@ -308,19 +286,12 @@
                             (and (eq (first a) (first b))
                                  (eq (second a) (second b))))))
       (destructuring-bind (kind name defn) info
-        (macrolet ((frob (kind)
-                         `(let ((old (info :alien-type ,kind name)))
-                            (unless (or (null old) (alien-type-= old defn))
-                              (warn
-                               "redefining ~A ~S to be:~%  ~S,~%was:~%  ~S"
-                               kind name defn old))
-                            (setf (info :alien-type ,kind name) defn
-                                  (info :source-location :alien-type name)
-                                  source-location))))
-          (ecase kind
-            (:struct (frob :struct))
-            (:union (frob :union))
-            (:enum (frob :enum)))))))
+        (let ((old (info :alien-type kind name)))
+          (unless (or (null old) (alien-type-= old defn))
+            (warn "redefining ~A ~S to be:~%  ~S,~%was:~%  ~S"
+                  kind name defn old)))
+        (setf (info :alien-type kind name) defn
+              (info :source-location :alien-type name) source-location))))
 
   (defun %define-alien-type (name new)
     (ecase (info :alien-type :kind name)
@@ -359,7 +330,7 @@
 
 (define-alien-type-translator system-area-pointer ()
   (make-alien-system-area-pointer-type
-   :bits #!-alpha sb!vm:n-word-bits #!+alpha 64))
+   :bits sb!vm:n-machine-word-bits))
 
 (define-alien-type-method (system-area-pointer :unparse) (type)
   (declare (ignore type))
@@ -427,6 +398,7 @@
   `(foreign-symbol-sap ,(heap-alien-info-alien-name info)
                        ,(heap-alien-info-datap info)))
 
+#-sb-xc-host ; No FOREIGN-SYMBOL-SAP
 (defun heap-alien-info-sap (info)
   (foreign-symbol-sap (heap-alien-info-alien-name info)
                       (heap-alien-info-datap info)))
@@ -616,18 +588,18 @@
   ;; of return values and override the naturalize method to perform
   ;; the sign extension (in compiler/target/c-call.lisp).
   (ecase context
-    ((:normal #!-(or x86 x86-64) :result)
+    ((:normal #!-(or alpha x86 x86-64) :result)
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (alien-integer-type-bits type)))
-    #!+(or x86 x86-64)
+    #!+(or alpha x86 x86-64)
     (:result
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (max (alien-integer-type-bits type)
-                sb!vm:n-word-bits)))))
+                sb!vm:n-machine-word-bits)))))
 
 ;;; As per the comment in the :ALIEN-REP method above, this is defined
-;;; elsewhere for x86oids.
-#!-(or x86 x86-64)
+;;; elsewhere for alpha and x86oids.
+#!-(or alpha x86 x86-64)
 (define-alien-type-method (integer :naturalize-gen) (type alien)
   (declare (ignore type))
   alien)
@@ -704,11 +676,11 @@
                  (unless (alien-type-= result old)
                    (cerror "Continue, clobbering the old definition"
                            "Incompatible alien enum type definition: ~S" name)
-                   (setf (alien-type-from old) (alien-type-from result)
-                         (alien-type-to old) (alien-type-to result)
-                         (alien-type-kind old) (alien-type-kind result)
-                         (alien-type-offset old) (alien-type-offset result)
-                         (alien-type-signed old) (alien-type-signed result)))
+                   (setf (alien-enum-type-from old) (alien-enum-type-from result)
+                         (alien-enum-type-to old) (alien-enum-type-to result)
+                         (alien-enum-type-kind old) (alien-enum-type-kind result)
+                         (alien-enum-type-offset old) (alien-enum-type-offset result)
+                         (alien-enum-type-signed old) (alien-enum-type-signed result)))
                  (setf result old))
                (unless old-p
                  (setf (auxiliary-alien-type :enum name env) result))))
@@ -861,9 +833,7 @@
 ;;;; the POINTER type
 
 (define-alien-type-class (pointer :include (alien-value (bits
-                                                         #!-alpha
-                                                         sb!vm:n-word-bits
-                                                         #!+alpha 64)))
+                                                         sb!vm:n-machine-word-bits)))
   (to nil :type (or alien-type null)))
 
 (define-alien-type-translator * (to &environment env)

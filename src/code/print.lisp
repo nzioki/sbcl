@@ -161,6 +161,7 @@ variable: an unreadable object representing the error is printed instead.")
                      ((:suppress-errors *suppress-print-errors*)
                       *suppress-print-errors*))
                #!+sb-doc ,doc
+               (declare (explicit-check))
                ,@forms)))
   (def write
        "Output OBJECT to the specified stream, defaulting to *STANDARD-OUTPUT*."
@@ -172,6 +173,7 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;; Same as a call to (WRITE OBJECT :STREAM STREAM), but returning OBJECT.
 (defun %write (object stream)
+  (declare (explicit-check))
   (output-object object (out-synonym-of stream))
   object)
 
@@ -179,6 +181,7 @@ variable: an unreadable object representing the error is printed instead.")
   #!+sb-doc
   "Output a mostly READable printed representation of OBJECT on the specified
   STREAM."
+  (declare (explicit-check))
   (let ((*print-escape* t))
     (output-object object (out-synonym-of stream)))
   object)
@@ -187,6 +190,7 @@ variable: an unreadable object representing the error is printed instead.")
   #!+sb-doc
   "Output an aesthetic but not necessarily READable printed representation
   of OBJECT on the specified STREAM."
+  (declare (explicit-check))
   (let ((*print-escape* nil)
         (*print-readably* nil))
     (output-object object (out-synonym-of stream)))
@@ -196,6 +200,7 @@ variable: an unreadable object representing the error is printed instead.")
   #!+sb-doc
   "Output a newline, the mostly READable printed representation of OBJECT, and
   space to the specified STREAM."
+  (declare (explicit-check))
   (let ((stream (out-synonym-of stream)))
     (terpri stream)
     (prin1 object stream)
@@ -205,6 +210,7 @@ variable: an unreadable object representing the error is printed instead.")
 (defun pprint (object &optional stream)
   #!+sb-doc
   "Prettily output OBJECT preceded by a newline."
+  (declare (explicit-check))
   (let ((*print-pretty* t)
         (*print-escape* t)
         (stream (out-synonym-of stream)))
@@ -305,6 +311,7 @@ variable: an unreadable object representing the error is printed instead.")
   ;; to be T or NIL (a stream-designator), which is not really right
   ;; if eventually the call will be to a PRINT-OBJECT method,
   ;; since the generic function should always receive a stream.
+  (declare (explicit-check))
   (labels ((print-it (stream)
              (if *print-pretty*
                  (sb!pretty:output-pretty-object object stream)
@@ -403,18 +410,22 @@ variable: an unreadable object representing the error is printed instead.")
     (instance
      ;; The first case takes the above idea one step further: If an instance
      ;; isn't a citizen yet, it has no right to a print-object method.
-     (cond ((sb!kernel::undefined-classoid-p (layout-classoid (layout-of object)))
-            ;; not only is this unreadable, it's unprintable too.
-            (print-unreadable-object (object stream :identity t)
-              (format stream "UNPRINTABLE instance of ~W"
-                      (layout-classoid (layout-of object)))))
-           ((not (and (boundp '*print-object-is-disabled-p*)
-                      *print-object-is-disabled-p*))
-            (print-object object stream))
-           ((typep object 'structure-object)
-            (default-structure-print object stream *current-level-in-print*))
-           (t
-            (write-string "#<INSTANCE but not STRUCTURE-OBJECT>" stream))))
+     ;; Additionally, if the object is an obsolete CONDITION, don't crash.
+     ;; (There is no update-instance protocol for conditions)
+     (let* ((layout (layout-of object))
+            (classoid (layout-classoid layout)))
+       (cond ((or (sb!kernel::undefined-classoid-p classoid)
+                  (and (layout-invalid layout) (condition-classoid-p classoid)))
+              ;; not only is this unreadable, it's unprintable too.
+              (print-unreadable-object (object stream :identity t)
+                (format stream "UNPRINTABLE instance of ~W" classoid)))
+             ((not (and (boundp '*print-object-is-disabled-p*)
+                        *print-object-is-disabled-p*))
+              (print-object object stream))
+             ((typep object 'structure-object)
+              (default-structure-print object stream *current-level-in-print*))
+             (t
+              (write-string "#<INSTANCE but not STRUCTURE-OBJECT>" stream)))))
     (funcallable-instance
      (cond
        ((not (and (boundp '*print-object-is-disabled-p*)
@@ -453,7 +464,7 @@ variable: an unreadable object representing the error is printed instead.")
      (output-fdefn object stream))
     #!+sb-simd-pack
     (simd-pack
-     (output-simd-pack object stream))
+     (print-object object stream))
     (t
      (output-random object stream))))
 
@@ -1722,31 +1733,29 @@ variable: an unreadable object representing the error is printed instead.")
           ;; (You'd get crashes in INTERNAL-NAME-P and other places)
           (format stream "(~{~S~^ ~})" name)))))
 
+;;; Making this a DEFMETHOD defers its compilation until after the inline
+;;; functions %SIMD-PACK-{SINGLES,DOUBLES,UB64S} get defined.
 #!+sb-simd-pack
-(defun output-simd-pack (pack stream)
-  (declare (type simd-pack pack))
+(defmethod print-object ((pack simd-pack) stream)
   (cond ((and *print-readably* *read-eval*)
-         (etypecase pack
-           ((simd-pack double-float)
-            (multiple-value-call #'format stream
-              "#.(~S ~S ~S)"
-              '%make-simd-pack-double
-              (%simd-pack-doubles pack)))
-           ((simd-pack single-float)
-            (multiple-value-call #'format stream
-              "#.(~S ~S ~S ~S ~S)"
-              '%make-simd-pack-single
-              (%simd-pack-singles pack)))
-           (t
-            (multiple-value-call #'format stream
-              "#.(~S #X~16,'0X #X~16,'0X)"
-              '%make-simd-pack-ub64
-              (%simd-pack-ub64s pack)))))
+         (multiple-value-bind (format maker extractor)
+             (etypecase pack
+               ((simd-pack double-float)
+                (values "#.(~S ~S ~S)"
+                        '%make-simd-pack-double #'%simd-pack-doubles))
+               ((simd-pack single-float)
+                (values "#.(~S ~S ~S ~S ~S)"
+                        '%make-simd-pack-single #'%simd-pack-singles))
+               (t
+                (values "#.(~S #X~16,'0X #X~16,'0X)"
+                        '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
+           (multiple-value-call
+            #'format stream format maker (funcall extractor pack))))
         (t
          (print-unreadable-object (pack stream)
            (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
                       (= (logand value mask) mask))
-                    (split-num (value start)
+                  (split-num (value start)
                       (loop
                          for i from 0 to 3
                          and v = (ash value (- start)) then (ash v -8)

@@ -14,7 +14,6 @@
 ;;; a value for an optimization declaration
 (def!type policy-quality () '(integer 0 3))
 
-(defvar *policy*)
 (defvar *macro-policy* nil)
 ;;; global policy restrictions as a POLICY object or nil
 (!defvar *policy-restrictions* nil)
@@ -68,57 +67,8 @@ EXPERIMENTAL INTERFACE: Subject to change."
   (values-documentation nil :read-only t))
 
 ;;; names of recognized optimization policy qualities
-(declaim (simple-vector **policy-primary-qualities**
-                        **policy-dependent-qualities**))
-(!defglobal **policy-primary-qualities**
-        #(;; ANSI standard qualities
-          compilation-speed
-          debug
-          safety
-          space
-          speed
-          ;; SBCL extensions
-          ;;
-          ;; FIXME: INHIBIT-WARNINGS is a misleading name for this.
-          ;; Perhaps BREVITY would be better. But the ideal name would
-          ;; have connotations of suppressing not warnings but only
-          ;; optimization-related notes, which is already mostly the
-          ;; behavior, and should probably become the exact behavior.
-          ;; Perhaps INHIBIT-NOTES?
-          inhibit-warnings))
+(declaim (simple-vector **policy-dependent-qualities**))
 (defglobal **policy-dependent-qualities** #())
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant n-policy-primary-qualities (length **policy-primary-qualities**))
-  ;; 1 bit per quality is stored to indicate whether it was explicitly given
-  ;; a value in a lexical policy. In addition to the 5 ANSI-standard qualities,
-  ;; SBCL defines one more "primary" quality and 16 dependent qualities.
-  ;; Both kinds take up 1 bit in the mask of specified qualities.
-  (defconstant max-policy-qualities 32))
-
-;; Each primary and dependent quality policy is assigned a small integer index.
-;; The POLICY struct represents a set of policies in an order-insensitive way
-;; that facilitates quicker lookup than scanning an alist.
-(defstruct (policy (:constructor make-policy
-                                 (primary-qualities &optional presence-bits)))
-  ;; Mask with a 1 for each quality that has an explicit value in this policy.
-  ;; Primary qualities fill the mask from left-to-right and dependent qualities
-  ;; from right-to-left.
-  ;; xc has trouble folding this MASK-FIELD, but it works when host-evaluated.
-  (presence-bits #.(mask-field
-                    (byte n-policy-primary-qualities
-                          (- max-policy-qualities n-policy-primary-qualities))
-                    -1)
-                 :type (unsigned-byte #.max-policy-qualities))
-  ;; For efficiency, primary qualities are segregated because there are few
-  ;; enough of them to fit in a fixnum.
-  (primary-qualities 0 :type (unsigned-byte #.(* 2 n-policy-primary-qualities)))
-  ;; 2 bits per dependent quality is a fixnum on 64-bit build, not on 32-bit.
-  ;; It would certainly be possible to constrain this to storing exactly
-  ;; the 16 currently defined dependent qualities,
-  ;; but that would be overly limiting.
-  (dependent-qualities 0
-   :type (unsigned-byte #.(* (- max-policy-qualities n-policy-primary-qualities)
-                             2))))
 
 ;; Return POLICY as a list suitable to the OPTIMIZE declaration.
 ;; If FORCE-ALL then include qualities without an explicit value too.
@@ -292,8 +242,8 @@ EXPERIMENTAL INTERFACE: Subject to change."
 ;;; Evaluate EXPR in terms of the optimization policy associated with
 ;;; THING. EXPR is a form which accesses optimization qualities by
 ;;; referring to them by name, e.g. (> SPEED SPACE).
-(defmacro policy (thing expr)
-  (let* ((n-policy (gensym "N-POLICY-"))
+(defmacro policy (thing expr &optional (coercion-fn '%coerce-to-policy))
+  (let* ((n-policy (make-symbol "P"))
          (binds (loop for name across **policy-primary-qualities**
                       for index downfrom -1
                       collect `(,name (%policy-quality ,n-policy ,index))))
@@ -304,10 +254,11 @@ EXPERIMENTAL INTERFACE: Subject to change."
                                  (if (= ,name 1)
                                      ,(policy-dependent-quality-expression info)
                                      ,name))))))
-    `(let* ((,n-policy (%coerce-to-policy ,thing)))
+    `(let ((,n-policy (,coercion-fn ,thing)))
+       ;; FIXME: automatically inserted IGNORABLE decls are
+       ;; often suggestive of poor style, as is this one.
        (declare (ignorable ,n-policy))
-       (symbol-macrolet (,@binds
-                         ,@dependent-binds)
+       (symbol-macrolet (,@binds ,@dependent-binds)
          ,expr))))
 
 ;;; Dependent qualities

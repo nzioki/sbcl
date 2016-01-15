@@ -104,6 +104,14 @@
 
 ;;;; the FD-STREAM structure
 
+;;; Coarsely characterizes the element type of an FD-STREAM w.r.t.
+;;; its SUBTYPEP relations to the relevant CHARACTER and
+;;; ([UN]SIGNED-BYTE 8) types. This coarse characterization enables
+;;; dispatching on the element type as needed by {READ,WRITE}-SEQUENCE
+;;; without calling SUBTYPEP.
+(deftype stream-element-mode ()
+  '(member character unsigned-byte signed-byte :bivalent))
+
 (defstruct (fd-stream
             (:constructor %make-fd-stream)
             (:conc-name fd-stream-)
@@ -124,6 +132,9 @@
   (element-size 1 :type index)
   ;; the type of element being transfered
   (element-type 'base-char)
+  ;; coarse characterization of the element type. see description of
+  ;; STREAM-ELEMENT-MODE type.
+  (element-mode :bivalent :type stream-element-mode)
   ;; the Unix file descriptor
   (fd -1 :type #!-win32 fixnum #!+win32 sb!vm:signed-word)
   ;; What do we know about the FD?
@@ -162,10 +173,11 @@
   (external-format :latin-1)
   ;; fixed width, or function to call with a character
   (char-size 1 :type (or fixnum function))
-  (output-bytes #'ill-out :type function)
-  ;; a boolean indicating whether the stream is bivalent.  For
-  ;; internal use only.
-  (bivalent-p nil :type boolean))
+  (output-bytes #'ill-out :type function))
+
+(defun fd-stream-bivalent-p (stream)
+  (eq (fd-stream-element-mode stream) :bivalent))
+
 (def!method print-object ((fd-stream fd-stream) stream)
   (declare (type stream stream))
   (print-unreadable-object (fd-stream stream :type t :identity t)
@@ -730,7 +742,7 @@
   (setf (signed-sap-ref-32 (buffer-sap obuf) tail)
         byte))
 
-#+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+#!+64-bit
 (progn
   (def-output-routines ("OUTPUT-UNSIGNED-LONG-LONG-~A-BUFFERED"
                         8
@@ -820,6 +832,20 @@
       (bytes-for-char-fun ef-entry)
       (funcall (bytes-for-char-fun ef-entry) #\x)))
 
+(defun sb!alien::string-to-c-string (string external-format)
+  (declare (type simple-string string))
+  (locally
+      (declare (optimize (speed 3) (safety 0)))
+    (let ((external-format (get-external-format-or-lose external-format)))
+      (funcall (ef-write-c-string-fun external-format) string))))
+
+(defun sb!alien::c-string-to-string (sap external-format element-type)
+  (declare (type system-area-pointer sap))
+  (locally
+      (declare (optimize (speed 3) (safety 0)))
+    (let ((external-format (get-external-format-or-lose external-format)))
+      (funcall (ef-read-c-string-fun external-format) sap element-type))))
+
 (defun wrap-external-format-functions (external-format fun)
   (let ((result (%copy-external-format external-format)))
     (macrolet ((frob (accessor)
@@ -842,41 +868,6 @@
   #!+sb-doc
   "Hashtable of all available external formats. The table maps from
   external-format names to EXTERNAL-FORMAT structures.")
-
-(defun get-external-format (external-format)
-  (flet ((keyword-external-format (keyword)
-           (declare (type keyword keyword))
-           (gethash keyword *external-formats*))
-         (replacement-handlerify (entry replacement)
-           (when entry
-             (wrap-external-format-functions
-              entry
-              (lambda (fun)
-                (and fun
-                     (lambda (&rest rest)
-                       (declare (dynamic-extent rest))
-                       (handler-bind
-                           ((stream-decoding-error
-                             (lambda (c)
-                               (declare (ignore c))
-                               (invoke-restart 'input-replacement replacement)))
-                            (stream-encoding-error
-                             (lambda (c)
-                               (declare (ignore c))
-                               (invoke-restart 'output-replacement replacement)))
-                            (octets-encoding-error
-                             (lambda (c) (use-value replacement c)))
-                            (octet-decoding-error
-                             (lambda (c) (use-value replacement c))))
-                         (apply fun rest)))))))))
-    (typecase external-format
-      (keyword (keyword-external-format external-format))
-      ((cons keyword)
-       (let ((entry (keyword-external-format (car external-format)))
-             (replacement (getf (cdr external-format) :replacement)))
-         (if replacement
-             (replacement-handlerify entry replacement)
-             entry))))))
 
 (defun get-external-format-or-lose (external-format)
   (or (get-external-format external-format)
@@ -1238,7 +1229,7 @@
                    ((signed-byte 32) 4 sap head)
   (signed-sap-ref-32 sap head))
 
-#+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+#!+64-bit
 (progn
   (def-input-routine input-unsigned-64bit-byte
       ((unsigned-byte 64) 8 sap head)
@@ -2266,29 +2257,31 @@
          (setf input t))
         ((not (or input output))
          (error "File descriptor must be opened either for input or output.")))
-  (let ((stream (funcall (ecase class
-                           (fd-stream '%make-fd-stream)
-                           (form-tracking-stream '%make-form-tracking-stream))
-                                 :fd fd
-                                 :fd-type
-                                 #!-win32 (sb!unix:fd-type fd)
-                                 ;; KLUDGE.
-                                 #!+win32 (if serve-events
-                                              :unknown
-                                              :regular)
-                                 :name name
-                                 :file file
-                                 :original original
-                                 :delete-original delete-original
-                                 :pathname pathname
-                                 :buffering buffering
-                                 :dual-channel-p dual-channel-p
-                                 :bivalent-p (eq element-type :default)
-                                 :serve-events serve-events
-                                 :timeout
-                                 (if timeout
-                                     (coerce timeout 'single-float)
-                                     nil))))
+  (let* ((constructor (ecase class
+                        (fd-stream '%make-fd-stream)
+                        (form-tracking-stream '%make-form-tracking-stream)))
+         (element-mode (stream-element-type-stream-element-mode element-type))
+         (stream (funcall constructor
+                          :fd fd
+                          :fd-type
+                          #!-win32 (sb!unix:fd-type fd)
+                          ;; KLUDGE.
+                          #!+win32 (if serve-events
+                                       :unknown
+                                       :regular)
+                          :name name
+                          :file file
+                          :original original
+                          :delete-original delete-original
+                          :pathname pathname
+                          :buffering buffering
+                          :dual-channel-p dual-channel-p
+                          :element-mode element-mode
+                          :serve-events serve-events
+                          :timeout
+                          (if timeout
+                              (coerce timeout 'single-float)
+                              nil))))
     (set-fd-stream-routines stream element-type external-format
                             input output input-buffer-p)
     (when auto-close
@@ -2665,21 +2658,6 @@
              t)
             (t
              (fd-stream-pathname stream)))))
-
-;; Placing this definition (formerly in "toplevel") after the important
-;; stream types are known produces smaller+faster code than it did before.
-(defun stream-output-stream (stream)
-  (typecase stream
-    (fd-stream
-     stream)
-    (synonym-stream
-     (stream-output-stream
-      (symbol-value (synonym-stream-symbol stream))))
-    (two-way-stream
-     (stream-output-stream
-      (two-way-stream-output-stream stream)))
-    (t
-     stream)))
 
 ;; Fix the INPUT-CHAR-POS slot of STREAM after having consumed characters
 ;; from the CIN-BUFFER. This operation is done upon exit from a FAST-READ-CHAR

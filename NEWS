@@ -1,5 +1,85 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
-changes relative to sbcl-1.2.14:
+
+changes relative to sbcl-1.3.1
+  * enhancement: {READ,WRITE}-SEQUENCE are much faster for some combinations
+    of short sequences and stream types
+  * enhancement: MAKE-LIST's result can be stack-allocated on x86-64
+  * bug fix: WRITE-SEQUENCE no longer fails to write lists containing integers
+    to bivalent streams
+  * bug fix: LOGTEST (and hence ODDP) no longer conses when given fixnum
+    arguments and small bit positions.  (lp#1277690)
+  * bug fix: READ-FROM-STRING compiler-macro does not permute its arguments
+  * bug fix: DEFUN of a function name that collides with a system-generated
+    structure accessor does not confuse the runtime. (lp#540063)
+  * bug fix: heap corruption from miscompiled RESTART-BIND. (lp#1530390)
+
+changes in sbcl-1.3.1 relative to sbcl-1.3.0:
+  * enhancement: SB-THREAD support for ARM64.
+  * enhancement: compiling an out-of-line DEFSTRUCT constructor call
+    will warn if a defaulted value is incompatible with its slot type.
+  * enhancement: a local INLINE declaration on a structure constructor
+    will work as intended, subject to any other factors that inhibit
+    inlining, even if the DEFSTRUCT was not itself within a global
+    INLINE proclamation for the named constructor
+  * enhancement: SB-EXT:DYNAMIC-SPACE-SIZE is now defined for cheneygc.
+  * enhancement: x86[-64] platforms support SB-EXT:CAS on structure slots
+    of type SB-EXT:WORD
+  * enhancement: the interleaved structure slot optimization from
+    release 1.2.6 has been ported to 32-bit x86, Sparc, PowerPC, ARM64.
+  * enhancement: SB-THREAD:JOIN-THREAD signals a proper error when an attempt
+    is made to join the current thread
+  * bug fix: NTH-VALUE does not cause stack overflow. (lp#1511419)
+  * bug fix: structure constructor type checking is better. (lp#1508735)
+  * bug fix: supplied-p variables for unused optional or keyword variables no
+    longer confuse SB-DI:PARSE-COMPILED-DEBUG-FUN-LAMBDA-LIST (and thus the
+    backtrace machinery) (lp#1498644)
+  * bug fix: Backtrace correctly handles undefined-function frames on MIPS.
+  * bug fix: WITH-FLOAT-TRAPS-MASKED correctly clears accrued traps on MIPS
+    (fixes issues with floating-point type derivation in the compiler).
+  * bug fix: FLOAT-NAN-P and FLOAT-TRAPPING-NAN-P now work correctly on MIPS
+    and HPPA.
+  * bug fix: MIPS context register access now masks to 32 bits (fixing issues
+    parsing negative-fixnum values for internal-error arguments and escaped
+    debug variables on 64-bit CPUs).
+  * bug fix: (SETF SAP-REF-DOUBLE) with constant offset on big-endian MIPS
+    now works correctly.
+  * bug fix: Callback parameter (argument) handling on MIPS is now vastly
+    more correct.
+  * bug fix: %DECREMENT-SEMAPHORE adjusts the remaining timeout after a
+    spurious wakeup
+
+changes in sbcl-1.3.0 relative to sbcl-1.2.16:
+  * minor incompatible change: the environment passed to a macro/setf/deftype
+    expander is not always an object of type SB-KERNEL:LEXENV.
+    It can be nil, as is permissible by the standard.
+  * enhancement: ported to ARM64 Linux.
+  * enhancement: a new interpreter is included which has many benefits
+    over sb-eval. It is disabled by default. See src/interpreter/README
+    for instructions to enable it, and further details.
+  * bug fix: calling COMPILE when SB-EXT:*EVALUATOR-MODE* was :INTERPRET
+    would fail to perform "normal semantic processing such as macro expansion"
+    as stipulated by X3J13 issue LOAD-TIME-EVAL.
+  * bug fix: SB-UNICODE:CONFUSABLE-P no longer treats "<" and the empty
+    string as confusable.  (lp#1504739)
+  * bug fix: (ASSERT (COMPUTE-IT ...)) would expand incorrectly
+    if COMPUTE-IT was a local macro that shadowed a global function.
+  * bug fix: SB-POSIX:CFSETISPEED and SB-POSIX:CFSETOSPEED now work properly
+    on platforms that use only the minimum specified set of fields in struct
+    termios (verified on Linux, still known not to work on FreeBSD and NetBSD,
+    very probably others).  (partial fix for lp#1500951)
+
+changes in sbcl-1.2.16 relative to sbcl-1.2.15:
+  * enhancement: by default, timers with a repeat interval do not "catch up"
+    by repeatedly calling their function after a clock discontinuity such as a
+    suspend and resume cycle
+  * bug fix: correctly restore multiple values on the stack in the presence of
+    alien calls. (lp#1489590)
+  * bug fix: MAKE-STRING-OUTPUT-STREAM enforces that :ELEMENT-TYPE
+    is a subtype of CHARACTER.
+  * bug fix: an EQL method specializer no longer causes garbage retention
+    if there are no extant methods using the specializer. (lp#492851)
+
+changes in sbcl-1.2.15 relative to sbcl-1.2.14:
   * new feature: DEPRECATION declaration for functions, variables and types
     causes {EARLY,LATE,FINAL}-DEPRECATION-WARNING to be signaled when subject
     of the declaration is used. Integrated with DESCRIBE, DOCUMENTATION and

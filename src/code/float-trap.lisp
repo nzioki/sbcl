@@ -197,7 +197,7 @@ sets the floating point modes to their current values (and thus is a no-op)."
     (with-interrupts
       ;; Reset the accumulated exceptions, may be needed on other
       ;; platforms too, at least Linux doesn't seem to require it.
-      #!+sunos
+      #!+(or sunos (and hppa linux))
       (setf (ldb sb!vm::float-sticky-bits (floating-point-modes)) 0)
       (error (or (cdr (assoc code *sigfpe-code-error-alist*))
                  'floating-point-exception)))))
@@ -215,6 +215,12 @@ sets the floating point modes to their current values (and thus is a no-op)."
                         float-traps-byte #xffffffff))
         (exception-mask (dpb (lognot (float-trap-mask traps))
                              float-sticky-bits #xffffffff))
+        ;; MIPS has a second set of "accumulated exceptions" which are
+        ;; actually used to cause the exception to be delivered, and
+        ;; which can be set from user code.  Compute the mask here,
+        ;; and clear them below.
+        #!+mips (cause-mask (dpb (lognot (float-trap-mask traps))
+                                 float-exceptions-byte #xffffffff))
         (orig-modes (gensym)))
     `(let ((,orig-modes (floating-point-modes)))
       (unwind-protect
@@ -226,4 +232,5 @@ sets the floating point modes to their current values (and thus is a no-op)."
         (setf (floating-point-modes)
               (logior (logand ,orig-modes ,(logior traps exceptions))
                       (logand (floating-point-modes)
-                              ,(logand trap-mask exception-mask))))))))
+                              ,(logand trap-mask exception-mask
+                                       #!+mips cause-mask))))))))

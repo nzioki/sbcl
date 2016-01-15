@@ -13,9 +13,18 @@
 
 (let ((*features* (cons :sb-xc *features*)))
   (load "src/cold/muffler.lisp"))
+
+;; Avoid forward-reference to an as-yet unknown type.
+;; NB: This is not how you would write this function, if you required
+;; such a thing. It should be (TYPEP X 'CODE-DELETION-NOTE).
+;; Do as I say, not as I do.
+(defun code-deletion-note-p (x)
+  (eq (type-of x) 'sb!ext:code-deletion-note))
 (setq sb!c::*handled-conditions*
-      '(((or (satisfies unable-to-optimize-note-p)
-             sb!ext:code-deletion-note) . muffle-warning)))
+      `((,(sb!kernel:specifier-type
+           '(or (satisfies unable-to-optimize-note-p)
+                (satisfies code-deletion-note-p)))
+         . muffle-warning)))
 
 (defun proclaim-target-optimization ()
   (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
@@ -83,9 +92,7 @@
       (sb!int:info :function :macro-function 'sb!int:quasiquote)
       (cl:macro-function 'sb!int:quasiquote))
 (setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
-(progn ; Should be: sb-xc:with-compilation-unit () ... but
-  ;; leaving aside the question of building in any host - which shouldn't
-  ;; matter - building SBCL in SBCL can hang in a way I haven't tracked down.
+(sb-xc:with-compilation-unit ()
   (load "src/cold/compile-cold-sbcl.lisp"))
 
 (when sb!c::*track-full-called-fnames*
@@ -107,8 +114,10 @@
                  (push (cons name cell) likely-suspicious)
                  (push (cons name cell) possibly-suspicious))))))
     (flet ((show (label list)
-             (format t "~%~A suspicious calls:~:{~%~*~4d ~0@*~S~*~@{~%     ~S~}~}~%"
-                     label (sort list #'> :key #'cadr))))
+             (format t "~%~A suspicious calls:~:{~%~4d ~S~@{~%     ~S~}~}~%"
+                     label
+                     (mapcar (lambda (x) (list* (ash (cadr x) -2) (car x) (cddr x)))
+                             (sort list #'> :key #'cadr)))))
       ;; Called inlines not in the presence of a declaration to the contrary
       ;; indicate that perhaps the function definition appeared too late.
       (show "Likely" likely-suspicious)

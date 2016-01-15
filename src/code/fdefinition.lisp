@@ -45,22 +45,20 @@
 ;; have been verified to be a symbol by the caller.
 (defun symbol-fdefn (symbol)
   (declare (optimize (safety 0)))
-  (info-vector-fdefn (symbol-info-vector (uncross symbol))))
+  (info-vector-fdefn (symbol-info-vector symbol)))
 
 ;; Return the fdefn object for NAME, or NIL if there is no fdefn.
 ;; Signal an error if name isn't valid.
 ;; Assume that exists-p implies LEGAL-FUN-NAME-P.
 ;;
 (declaim (ftype (sfunction ((or symbol list)) (or fdefn null)) find-fdefn))
-(defun find-fdefn (name0)
-  ;; Since this emulates GET-INFO-VALUE, we have to uncross the name.
-  (let ((name (uncross name0)))
-    (declare (optimize (safety 0)))
-    (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
-      (return-from find-fdefn (symbol-fdefn name)))
-    ;; Technically the ALLOW-ATOM argument of NIL isn't needed, but
-    ;; the compiler isn't figuring out not to test SYMBOLP twice in a row.
-    (with-globaldb-name (key1 key2 nil) name
+(defun find-fdefn (name)
+  (declare (explicit-check))
+  (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
+    (return-from find-fdefn (symbol-fdefn name)))
+  ;; Technically the ALLOW-ATOM argument of NIL isn't needed, but
+  ;; the compiler isn't figuring out not to test SYMBOLP twice in a row.
+  (with-globaldb-name (key1 key2 nil) name
       :hairy
       ;; INFO-GETHASH returns NIL or a vector. INFO-VECTOR-FDEFN accepts
       ;; either. If fdefn isn't found, fall through to the legality test.
@@ -84,17 +82,21 @@
                   (aref it (1- (the index data-idx))))))))
         (when (eq key1 'setf) ; bypass the legality test
           (return-from find-fdefn nil))))
-    (legal-fun-name-or-type-error name)))
+  (legal-fun-name-or-type-error name))
 
 (declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
 (defun find-or-create-fdefn (name)
   (or (find-fdefn name)
       ;; We won't reach here if the name was not legal
-      (let ((name (uncross name)))
-        (get-info-value-initializing :function :definition name
-                                     (make-fdefn name)))))
+      (get-info-value-initializing :function :definition name
+                                   (make-fdefn name))))
 
-(defun maybe-clobber-ftype (name)
+;;; Remove NAME's FTYPE information unless it was explicitly PROCLAIMED.
+;;; The NEW-FUNCTION argument is presently unused, but could be used
+;;; for checking compatibility of the NEW-FUNCTION against a proclamation.
+;;; (We could issue a warning and/or remove the type if incompatible.)
+(defun maybe-clobber-ftype (name new-function)
+  (declare (ignore new-function))
   (unless (eq :declared (info :function :where-from name))
     (clear-info :function :type name)))
 
@@ -112,9 +114,15 @@
 ;; Coerce CALLABLE (a function-designator) to a FUNCTION.
 ;; The compiler emits this when someone tries to FUNCALL something.
 ;; Extended-function-designators are not accepted,
-;; This function is defknowned with 'explicit-check', and we avoid calling
+;; This function declares EXPLICIT-CHECK, and we avoid calling
 ;; SYMBOL-FUNCTION because that would do another check.
+;; It would be great if this could change its error message
+;; depending on the input to either:
+;;   "foo is not a function designator" if not a CALLABLE
+;;   "foo does not designate a currently defined function"
+;;    if a symbol does not satisfy FBOUNDP.
 (defun %coerce-callable-to-fun (callable)
+  (declare (explicit-check))
   (etypecase callable
     (function callable)
     (symbol (%coerce-name-to-fun callable symbol-fdefn))))
@@ -140,12 +148,11 @@
 ;;; encapsulation for identification in case you need multiple
 ;;; encapsulations of the same name.
 (defun encapsulate (name type function)
-  (let ((fdefn (find-fdefn name)))
-    (unless (and fdefn (fdefn-fun fdefn))
-      (error 'undefined-function :name name))
-    (when (typep (fdefn-fun fdefn) 'generic-function)
+  (let* ((fdefn (find-fdefn name))
+         (underlying-fun (sb!c:safe-fdefn-fun fdefn)))
+    (when (typep underlying-fun 'generic-function)
       (return-from encapsulate
-        (encapsulate-generic-function (fdefn-fun fdefn) type function)))
+        (encapsulate-generic-function underlying-fun type function)))
     ;; We must bind and close over INFO. Consider the case where we
     ;; encapsulate (the second) an encapsulated (the first)
     ;; definition, and later someone unencapsulates the encapsulated
@@ -155,7 +162,7 @@
     ;; clobber the appropriate INFO structure to allow
     ;; basic-definition to be bound to the next definition instead of
     ;; an encapsulation that no longer exists.
-    (let ((info (make-encapsulation-info type (fdefn-fun fdefn))))
+    (let ((info (make-encapsulation-info type underlying-fun)))
       (setf (fdefn-fun fdefn)
             (named-lambda encapsulation (&rest args)
               (apply function (encapsulation-info-definition info)
@@ -265,6 +272,7 @@
   "Return name's global function definition taking care to respect any
    encapsulations and to return the innermost encapsulated definition.
    This is SETF'able."
+  (declare (explicit-check))
   (let ((fun (%coerce-name-to-fun name)))
     (loop
      (let ((encap-info (encapsulation-info fun)))
@@ -277,8 +285,8 @@
   "A list of functions that (SETF FDEFINITION) invokes before storing the
    new value. The functions take the function name and the new value.")
 
-;; Return :MACRO or :SPECIAL if FUNCTION is the error-signaling trampoline
-;; for a macro or a special operator respectively. Test for this by seeing
+;; Return T if FUNCTION is the error-signaling trampoline
+;; for a macro or a special operator. Test for this by seeing
 ;; whether FUNCTION is the same closure as for a known macro.
 ;; For cold-init to work, this must pick any macro defined before
 ;; this function is. A safe choice is a macro from this same file.
@@ -288,10 +296,7 @@
        ;; %closure-fun to 0, which is ok - it returns NIL.
        (eq (load-time-value
             (%closure-fun (symbol-function '%coerce-name-to-fun)) t)
-           (%closure-fun function))
-       ;; This is not super-efficient, but every code path that gets
-       ;; here does so with the intent of signaling an error.
-       (car (%fun-name function))))
+           (%closure-fun function))))
 
 ;; Reject any "object of implementation-dependent nature" that
 ;; so happens to be a function in SBCL, but which must not be
@@ -307,9 +312,10 @@
   #!+sb-doc
   "Set NAME's global function definition."
   (declare (type function new-value) (optimize (safety 1)))
+  (declare (explicit-check))
   (err-if-unacceptable-function new-value '(setf fdefinition))
   (with-single-package-locked-error (:symbol name "setting fdefinition of ~A")
-    (maybe-clobber-ftype name)
+    (maybe-clobber-ftype name new-value)
 
     ;; Check for hash-table stuff. Woe onto him that mixes encapsulation
     ;; with this.
@@ -354,12 +360,14 @@
 (defun fboundp (name)
   #!+sb-doc
   "Return true if name has a global function definition."
+  (declare (explicit-check))
   (let ((fdefn (find-fdefn name)))
     (and fdefn (fdefn-fun fdefn) t)))
 
 (defun fmakunbound (name)
   #!+sb-doc
   "Make NAME have no global function definition."
+  (declare (explicit-check))
   (with-single-package-locked-error
       (:symbol name "removing the function or macro definition of ~A")
     (let ((fdefn (find-fdefn name)))

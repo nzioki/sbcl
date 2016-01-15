@@ -15,21 +15,20 @@
 ;;; If non-NIL, emit assembly code. If NIL, emit VOP templates.
 (defvar *emit-assembly-code-not-vops-p* nil)
 
-;;; a list of (NAME . LABEL) for every entry point
+;;; a list of (NAME LABEL OFFSET) for every entry point
 (defvar *entry-points* nil)
-
-;;; Set this to NIL to inhibit assembly-level optimization. (For
-;;; compiler debugging, rather than policy control.)
-(defvar *assembly-optimize* t)
 
 ;;; Note: You might think from the name that this would act like
 ;;; COMPILE-FILE, but in fact it's arguably more like LOAD, even down
 ;;; to the return convention. It LOADs a file, then writes out any
 ;;; assembly code created by the process.
+#+sb-xc-host
 (defun assemble-file (name
                       &key
                       (output-file (make-pathname :defaults name
                                                   :type "assem")))
+  (when sb-cold::*compile-for-effect-only*
+    (return-from assemble-file t))
   ;; FIXME: Consider nuking the filename defaulting logic here.
   (let* ((*emit-assembly-code-not-vops-p* t)
          (name (pathname name))
@@ -40,13 +39,21 @@
          (*code-segment* nil)
          (*elsewhere* nil)
          (*assembly-optimize* nil)
-         (*fixup-notes* nil))
+         (*fixup-notes* nil)
+         #!+inline-constants
+         *constant-segment*
+         #!+inline-constants
+         *constant-table*
+         #!+inline-constants
+         *constant-vector*)
     (unwind-protect
         (let ((*features* (cons :sb-assembling *features*)))
           (init-assembler)
           (load (merge-pathnames name (make-pathname :type "lisp")))
           (sb!assem:append-segment *code-segment* *elsewhere*)
           (setf *elsewhere* nil)
+          #!+inline-constants
+          (emit-inline-constants)
           (let ((length (sb!assem:finalize-segment *code-segment*)))
             (dump-assembler-routines *code-segment*
                                      length
@@ -85,6 +92,28 @@
        (setf (reg-spec-temp reg) (make-symbol (symbol-name name)))))
     reg))
 
+(defun expand-one-export-spec (export)
+  (if (symbolp export)
+      `(list ',export ,export 0)
+      (destructuring-bind
+          (name (operator base-label offset))
+          export
+        ;; KLUDGE: Presume that all compound export specs are of the
+        ;; form (NAME (OPERATOR BASE-LABEL OFFSET)), where OPERATOR is
+        ;; + or -, BASE-LABEL is a LABEL in the present scope, and
+        ;; OFFSET evaluates to an integer.  Ideally, we should be
+        ;; smarter about this.
+        `(list ',name ,base-label (,operator ,offset)))))
+
+(defun expand-export-option (exports)
+  (loop
+    for export in exports
+    collect `(push ,(expand-one-export-spec export) *entry-points*)))
+
+(defun expand-align-option (align)
+  (when align
+    `((emit-alignment ,align))))
+
 (defun emit-assemble (name options regs code)
   (collect ((decls))
     (loop
@@ -100,8 +129,10 @@
                    regs)
        ,@(decls)
        (sb!assem:assemble (*code-segment* ',name)
+         ,@(expand-align-option (cadr (assoc :align options)))
          ,name
-         (push (cons ',name ,name) *entry-points*)
+         (push (list ',name ,name 0) *entry-points*)
+         ,@(expand-export-option (cdr (assoc :export options)))
          ,@code
          ,@(generate-return-sequence
             (or (cadr (assoc :return-style options)) :raw))

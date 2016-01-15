@@ -14,22 +14,10 @@
 
 ;;; Forward declarations
 
-(declaim (ftype (function (t &rest t) nil) sb!c::compiler-error)
-         (ftype (function (t &rest t) (values &optional))
-                sb!c::compiler-warn sb!c::compiler-style-warn)
-         (ftype function
-                bad-type
-                parse-body
-                sane-package
-                style-warn)
-         (ftype function
-                sb!fasl::allocate-struct
-                sb!fasl::target-push
-                sb!fasl::cold-cons
-                sb!fasl::cold-intern
-                sb!fasl::cold-svset
-                sb!fasl::cold-symbol-value
-                sb!fasl::write-slots))
+#!+sb-fasteval
+(declaim (ftype function
+                sb!interpreter::interpreted-function-proto-fn
+                sb!interpreter::interpreted-function-env))
 
 ;;; In correct code, TRULY-THE has only a performance impact and can
 ;;; be safely degraded to ordinary THE.
@@ -76,6 +64,13 @@
   '(or condition structure-object standard-object))
 (deftype funcallable-instance ()
   (error "not clear how to represent FUNCALLABLE-INSTANCE type"))
+
+;; The definition of TYPE-SPECIFIER for the target appears in the file
+;; 'deftypes-for-target' - it allows CLASSes and CLASOIDs as specifiers.
+;; Instances are never used as specifiers when building SBCL,
+;; handily avoiding a problem in figuring out an order in which to
+;; define the types CLASS, CLASSOID, and TYPE-SPECIFIER.
+(deftype type-specifier () '(or list symbol))
 
 ;;; In the target SBCL, the INSTANCE type refers to a base
 ;;; implementation for compound types with lowtag
@@ -147,6 +142,17 @@
 (defun signed-byte-32-p (number)
   (typep number '(signed-byte 32)))
 
+;; This has an obvious portable implementation
+;; as (typep number 'ratio), but apparently we
+;; expect never to need it.
+(defun ratiop (number)
+  (declare (ignore number))
+  (error "Should not call RATIOP"))
+
+(defun make-value-cell (value)
+  (declare (ignore value))
+  (error "cross-compiler can not make value cells"))
+
 ;;; package locking nops for the cross-compiler
 
 (defmacro without-package-locks (&body body)
@@ -174,8 +180,23 @@
 
 (declaim (declaration enable-package-locks disable-package-locks))
 
+;; Nonstandard accessor for when you know you have a valid package in hand.
+;; This avoids double lookup in *PACKAGE-NAMES* in a few places.
+;; But portably we have to just fallback to PACKAGE-NAME.
+(defun package-%name (x) (package-name x))
+
 ;;; printing structures
 
 (defun default-structure-print (structure stream depth)
   (declare (ignore depth))
   (write structure :stream stream :circle t))
+
+(in-package "SB!KERNEL")
+(defun %find-position (item seq from-end start end key test)
+  (let ((position (position item seq :from-end from-end
+                            :start start :end end :key key :test test)))
+    (values (if position (elt seq position) nil) position)))
+
+(defun sb!impl::split-seconds-for-sleep (&rest args)
+  (declare (ignore args))
+  (error "Can't call SPLIT-SECONDS-FOR-SLEEP"))

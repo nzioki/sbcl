@@ -56,8 +56,17 @@
 (sb!xc:deftype pathname-version ()
   '(or integer (member nil :newest :wild :unspecific)))
 
-;;; internal time format. (Note: not a FIXNUM, ouch..)
-(sb!xc:deftype internal-time () 'unsigned-byte)
+;;; Internal time format.
+;;; 62 bits should give
+;;; one hundred forty-six million one hundred thirty-five thousand five hundred twenty years of runtime
+;;; It's dangerous to run SBCL for that long without updating.
+;;; And it'll be a fixnum on 64-bit targets.
+;;; The result from querying get-internal-run-time with multiple cores
+;;; running full tilt will exhaust this faster, but it's still plenty enough.
+(sb!xc:deftype internal-time () '(unsigned-byte 62))
+(sb!xc:deftype internal-seconds ()
+  '(unsigned-byte
+    #.(- 62 (floor (log sb!xc:internal-time-units-per-second 2)))))
 
 (sb!xc:deftype bignum-element-type () `(unsigned-byte ,sb!vm:n-word-bits))
 (sb!xc:deftype bignum-type () 'bignum)
@@ -126,7 +135,8 @@
   #!+sb-doc
   "Return the element type that will actually be used to implement an array
    with the specifier :ELEMENT-TYPE Spec."
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
+  (declare (explicit-check))
   (handler-case
       ;; Can't rely on SPECIFIER-TYPE to signal PARSE-UNKNOWN-TYPE in
       ;; the case of (AND KNOWN UNKNOWN), since the result of the
@@ -143,7 +153,8 @@
   #!+sb-doc
   "Return the element type of the most specialized COMPLEX number type that
    can hold parts of type SPEC."
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
+  (declare (explicit-check))
   (let ((type (specifier-type spec)))
     (cond
       ((eq type *empty-type*) nil)
@@ -173,40 +184,6 @@
                 (error "~S isn't an integer type?" subtype))
     (when (csubtypep subtype (specifier-type type))
       (return type))))
-
-;;; If TYPE has a CHECK-xxx template, but doesn't have a corresponding
-;;; PRIMITIVE-TYPE, then return the template's name. Otherwise, return NIL.
-(defun hairy-type-check-template-name (type)
-  (declare (type ctype type))
-  (typecase type
-    (cons-type
-     (if (type= type (specifier-type 'cons))
-         'sb!c:check-cons
-         nil))
-    (built-in-classoid
-     (if (type= type (specifier-type 'symbol))
-         'sb!c:check-symbol
-         nil))
-    (numeric-type
-     (cond ((type= type (specifier-type 'fixnum))
-            'sb!c:check-fixnum)
-           #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-           ((type= type (specifier-type '(signed-byte 32)))
-            'sb!c:check-signed-byte-32)
-           #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-           ((type= type (specifier-type '(unsigned-byte 32)))
-            'sb!c:check-unsigned-byte-32)
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-           ((type= type (specifier-type '(signed-byte 64)))
-            'sb!c:check-signed-byte-64)
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-           ((type= type (specifier-type '(unsigned-byte 64)))
-            'sb!c:check-unsigned-byte-64)
-           (t nil)))
-    (fun-type
-     'sb!c:check-fun)
-    (t
-     nil)))
 
 ;; Given a union type INPUT, see if it fully covers an ARRAY-* type,
 ;; and unite into that when possible, taking care to handle more

@@ -24,14 +24,24 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB-PCL")
+(in-package "SB!PCL")
 
-(/show "starting early-low.lisp")
+(declaim (type (member nil early braid complete) **boot-state**))
+(defglobal **boot-state** nil)
+
+(/show0 "starting early-low.lisp")
 
 ;;; The PCL package is internal and is used by code in potential
 ;;; bottlenecks. And since it's internal, no one should be
 ;;; doing things like deleting and recreating it in a running target Lisp.
+;;; By the time we get to compiling the rest of PCL,
+;;; the package will have been renamed,
+;;; so subsequently compiled code should refer to "SB-PCL", not "SB!PCL".
 (define-symbol-macro *pcl-package* (load-time-value (find-package "SB-PCL") t))
+
+(declaim (inline class-classoid))
+(defun class-classoid (class)
+  (layout-classoid (class-wrapper class)))
 
 (declaim (inline defstruct-classoid-p))
 (defun defstruct-classoid-p (classoid)
@@ -59,10 +69,14 @@
    (intern (apply #'format nil format-string format-arguments) package)))
 
 (defun make-class-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-CLASS-~A*" (symbol-name class-name)))
+  ;; Reference a package that is now SB!PCL but later SB-PCL
+  (format-symbol (load-time-value (find-package "SB!PCL") t)
+                 "*THE-CLASS-~A*" (symbol-name class-name)))
 
 (defun make-wrapper-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-WRAPPER-~A*" (symbol-name class-name)))
+  ;; Reference a package that is now SB!PCL but later SB-PCL
+  (format-symbol (load-time-value (find-package "SB!PCL") t)
+                 "*THE-WRAPPER-~A*" (symbol-name class-name)))
 
 (defun condition-type-p (type)
   (and (symbolp type)
@@ -119,5 +133,38 @@
                   *the-wrapper-of-float* *the-wrapper-of-cons*
                   *the-wrapper-of-complex* *the-wrapper-of-character*
                   *the-wrapper-of-bit-vector* *the-wrapper-of-array*))
+
+;;;; PCL instances
+
+(sb!kernel::!defstruct-with-alternate-metaclass standard-instance
+  :slot-names (slots hash-code)
+  :boa-constructor %make-standard-instance
+  :superclass-name t
+  :metaclass-name standard-classoid
+  :metaclass-constructor make-standard-classoid
+  :dd-type structure
+  :runtime-type-checks-p nil)
+
+(sb!kernel::!defstruct-with-alternate-metaclass standard-funcallable-instance
+  ;; KLUDGE: Note that neither of these slots is ever accessed by its
+  ;; accessor name as of sbcl-0.pre7.63. Presumably everything works
+  ;; by puns based on absolute locations. Fun fun fun.. -- WHN 2001-10-30
+  :slot-names (clos-slots hash-code)
+  :boa-constructor %make-standard-funcallable-instance
+  :superclass-name function
+  :metaclass-name standard-classoid
+  :metaclass-constructor make-standard-classoid
+  :dd-type funcallable-structure
+  ;; Only internal implementation code will access these, and these
+  ;; accesses (slot readers in particular) could easily be a
+  ;; bottleneck, so it seems reasonable to suppress runtime type
+  ;; checks.
+  ;;
+  ;; (Except note KLUDGE above that these accessors aren't used at all
+  ;; (!) as of sbcl-0.pre7.63, so for now it's academic.)
+  :runtime-type-checks-p nil)
+
+(defconstant std-instance-hash-slot-index 2)
+(defconstant fsc-instance-hash-slot-index 2)
 
-(/show "finished with early-low.lisp")
+(/show0 "finished with early-low.lisp")

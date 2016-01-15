@@ -58,12 +58,20 @@
                 ;; attempt this if TEST-FORM is the application of a
                 ;; special operator because of argument evaluation
                 ;; order issues.
-                ((when (typep test-form '(cons symbol list))
-                   (let ((name (first test-form)))
-                     (when (or (eq (info :function :kind name) :function)
-                               (and (typep env 'sb!kernel:lexenv)
-                                    (sb!c::functional-p
-                                     (cdr (assoc name (sb!c::lexenv-funs env))))))
+               ((when (typep test-form '(cons symbol list))
+                   (let* ((name (first test-form))
+                          (global-fun-p
+                           (eq (info :function :kind name) :function)))
+                     (when (typecase env
+                             (sb!kernel:lexenv
+                              (let ((f (cdr (assoc name (sb!c::lexenv-funs env)))))
+                                (if (not f) global-fun-p (sb!c::functional-p f))))
+                             #!+(and sb-fasteval (host-feature sb-xc))
+                             (sb!interpreter:basic-env
+                              (let ((kind
+                                     (sb!interpreter::find-lexical-fun env name)))
+                                (if (null kind) global-fun-p (eq kind :function))))
+                             (null global-fun-p))
                        `(,name ,@(mapcar #'process-place (rest test-form)))))))
                 ;; For all other cases, just evaluate TEST-FORM and do
                 ;; not report any details if the assertion fails.
@@ -150,7 +158,7 @@ invoked. In that case it will store into PLACE and start over."
   (let ((kind (info :variable :kind name)))
     (case kind
      ((:macro :unknown)
-      (sb!c:with-source-location (source-location)
+      (when source-location
         (setf (info :source-location :symbol-macro name) source-location))
       (setf (info :variable :kind name) :macro)
       (setf (info :variable :macro-expansion name) expansion))
@@ -179,7 +187,8 @@ invoked. In that case it will store into PLACE and start over."
   ;; DEBUG-NAME is called primarily for its side-effect of asserting
   ;; that (COMPILER-MACRO-FUNCTION x) is not a legal function name.
   (let ((def (make-macro-lambda (sb!c::debug-name 'compiler-macro name)
-                                lambda-list body 'define-compiler-macro name)))
+                                lambda-list body 'define-compiler-macro name
+                                :accessor 'sb!c::compiler-macro-args)))
     `(progn
           (eval-when (:compile-toplevel)
            (sb!c::%compiler-defmacro :compiler-macro-function ',name t))
@@ -244,9 +253,10 @@ invoked. In that case it will store into PLACE and start over."
                      for existing = (gethash k keys-seen)
                      do (when existing
                           (let ((sb!c::*current-path*
-                                 (when (boundp 'sb!c::*source-paths*)
-                                   (or (sb!c::get-source-path case)
-                                       sb!c::*current-path*))))
+                                  (when (boundp 'sb!c::*source-paths*)
+                                    (or (sb!c::get-source-path case)
+                                        (and (boundp 'sb!c::*current-path*)
+                                             sb!c::*current-path*)))))
                             (warn 'duplicate-case-key-warning
                                   :key k
                                   :case-kind name
@@ -402,8 +412,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; WITH-FOO i/o-related macros
 
 (defmacro-mundanely with-open-stream ((var stream) &body forms-decls)
-  (multiple-value-bind (forms decls)
-      (parse-body forms-decls :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body forms-decls nil)
     (let ((abortp (gensym)))
       `(let ((,var ,stream)
              (,abortp t))
@@ -422,8 +431,7 @@ invoked. In that case it will store into PLACE and start over."
 
 (defmacro-mundanely with-input-from-string ((var string &key index start end)
                                             &body forms-decls)
-  (multiple-value-bind (forms decls)
-      (parse-body forms-decls :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body forms-decls nil)
     `(let ((,var
             ;; Should (WITH-INPUT-FROM-STRING (stream str :start nil :end 5))
             ;; pass the explicit NIL, and thus get an error? It's logical
@@ -443,8 +451,7 @@ invoked. In that case it will store into PLACE and start over."
 (defmacro-mundanely with-output-to-string
     ((var &optional string &key (element-type ''character))
      &body forms-decls)
-  (multiple-value-bind (forms decls)
-      (parse-body forms-decls :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body forms-decls nil)
     (if string
         (let ((element-type-var (gensym)))
           `(let ((,var (make-fill-pointer-output-stream ,string))
@@ -470,7 +477,7 @@ invoked. In that case it will store into PLACE and start over."
 
 ;;;; miscellaneous macros
 
-(defmacro-mundanely nth-value (n form)
+(defmacro-mundanely nth-value (n form &environment env)
   #!+sb-doc
   "Evaluate FORM and return the Nth value (zero based)
  without consing a temporary list of values."
@@ -481,18 +488,20 @@ invoked. In that case it will store into PLACE and start over."
   ;; form will take longer than can be described as adequate, as the
   ;; optional dispatch mechanism for the M-V-B gets increasingly
   ;; hairy.
-  (if (integerp n)
-      (let ((dummy-list (make-gensym-list n))
-            (keeper (sb!xc:gensym "KEEPER")))
-        `(multiple-value-bind (,@dummy-list ,keeper) ,form
-           (declare (ignore ,@dummy-list))
-           ,keeper))
+  (let ((val (and (sb!xc:constantp n env) (constant-form-value n env))))
+    (if (and (integerp val) (<= 0 val 10)) ; Arbitrary limit.
+        (let ((dummy-list (make-gensym-list val))
+              (keeper (sb!xc:gensym "KEEPER")))
+          `(multiple-value-bind (,@dummy-list ,keeper) ,form
+             (declare (ignore ,@dummy-list))
+             ,keeper))
       ;; &MORE conversion handily deals with non-constant N,
       ;; avoiding the unstylish practice of inserting FORM into the
       ;; expansion more than once to pick off a few small values.
-      `(multiple-value-call
-           (lambda (n &rest list) (nth (truly-the index n) list))
-         (the index ,n) ,form)))
+      ;; This is not as good as above, because it uses TAIL-CALL-VARIABLE.
+        `(multiple-value-call
+             (lambda (n &rest list) (nth (truly-the index n) list))
+           (the index ,n) ,form))))
 
 (defmacro-mundanely declaim (&rest specs)
   #!+sb-doc
@@ -513,11 +522,11 @@ invoked. In that case it will store into PLACE and start over."
   with object-type prefix and object-identity suffix, and executing the
   code in BODY to provide possible further output."
   ;; Note: possibly out-of-order keyword argument evaluation.
-  (if body
-      (let ((fun (make-symbol "THUNK")))
-        `(dx-flet ((,fun () ,@body))
-           (%print-unreadable-object ,object ,stream ,type ,identity #',fun)))
-      `(%print-unreadable-object ,object ,stream ,type ,identity)))
+  (let ((call `(%print-unreadable-object ,object ,stream ,type ,identity)))
+    (if body
+        (let ((fun (make-symbol "THUNK")))
+          `(dx-flet ((,fun () ,@body)) (,@call #',fun)))
+        call)))
 
 (defmacro-mundanely ignore-errors (&rest forms)
   #!+sb-doc

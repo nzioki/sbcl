@@ -357,23 +357,32 @@ Examples:
       (terpri *error-output*)
       (force-output *error-output*))))
 
+;; Bidrectional map between IR1/IR2/assembler abstractions
+;; and a corresponding small integer identifier. One direction could be done
+;; by adding the integer ID as an object slot, but we want both directions.
+(defstruct (compiler-ir-obj-map (:conc-name objmap-)
+                                (:constructor make-compiler-ir-obj-map ())
+                                (:copier nil)
+                                (:predicate nil))
+  (obj-to-id   (make-hash-table :test 'eq) :read-only t)
+  (id-to-cont  (make-array 10) :type simple-vector) ; number -> CTRAN or LVAR
+  (id-to-tn    (make-array 10) :type simple-vector) ; number -> TN
+  (id-to-label (make-array 10) :type simple-vector) ; number -> LABEL
+  (cont-num    0 :type fixnum)
+  (tn-id       0 :type fixnum)
+  (label-id    0 :type fixnum))
+
+(declaim (type compiler-ir-obj-map *compiler-ir-obj-map*))
+(defvar *compiler-ir-obj-map*)
+
 ;;; Evaluate BODY, then return (VALUES BODY-VALUE WARNINGS-P
 ;;; FAILURE-P), where BODY-VALUE is the first value of the body, and
 ;;; WARNINGS-P and FAILURE-P are as in CL:COMPILE or CL:COMPILE-FILE.
-;;; This also wraps up WITH-IR1-NAMESPACE functionality.
 (defmacro with-compilation-values (&body body)
-  ;; These bindings could just as well be in WITH-IR1-NAMESPACE, but
-  ;; since they're primarily debugging tools, it's nicer to have
+  ;; This binding could just as well be in WITH-IR1-NAMESPACE, but
+  ;; since it's primarily a debugging tool, it's nicer to have
   ;; a wider unique scope by ID.
-  `(let ((*continuation-number* 0)
-         (*continuation-numbers* (make-hash-table :test 'eq))
-         (*number-continuations* (make-hash-table :test 'eql))
-         (*tn-id* 0)
-         (*tn-ids* (make-hash-table :test 'eq))
-         (*id-tns* (make-hash-table :test 'eql))
-         (*label-id* 0)
-         (*label-ids* (make-hash-table :test 'eq))
-         (*id-labels* (make-hash-table :test 'eql)))
+  `(let ((*compiler-ir-obj-map* (make-compiler-ir-obj-map)))
        (unwind-protect
             (let ((*warnings-p* nil)
                   (*failure-p* nil))
@@ -383,12 +392,46 @@ Examples:
                   (values (progn ,@body)
                        *warnings-p*
                        *failure-p*)))
-         (clrhash *tn-ids*)
-         (clrhash *id-tns*)
-         (clrhash *continuation-numbers*)
-         (clrhash *number-continuations*)
-         (clrhash *label-ids*)
-         (clrhash *id-labels*))))
+         (let ((map *compiler-ir-obj-map*))
+           (clrhash (objmap-obj-to-id map))
+           (fill (objmap-id-to-cont map) nil)
+           (fill (objmap-id-to-tn map) nil)
+           (fill (objmap-id-to-label map) nil)))))
+
+;;; THING is a kind of thing about which we'd like to issue a warning,
+;;; but showing at most one warning for a given set of <THING,FMT,ARGS>.
+;;; The compiler does a good job of making sure not to print repetitive
+;;; warnings for code that it compiles, but this solves a different problem.
+;;; Specifically, for a warning from PARSE-LAMBDA-LIST, there are three calls:
+;;; - once in the expander for defmacro itself, as it calls MAKE-MACRO-LAMBDA
+;;;   which calls PARSE-LAMBDA-LIST. This is the toplevel form processing.
+;;; - again for :compile-toplevel, where the DS-BIND calls PARSE-LAMBDA-LIST.
+;;;   If compiling in compile-toplevel, then *COMPILE-OBJECT* is a core object,
+;;;   but if interpreting, then it is still a fasl.
+;;; - once for compiling to fasl. *COMPILE-OBJECT* is a fasl.
+;;; I'd have liked the data to be associated with the fasl, except that
+;;; as indicated above, the second line hides some information.
+(defun style-warn-once (thing fmt &rest args)
+  (declare (special *compile-object*))
+  (let* ((source-info *source-info*)
+         (file-info (and (source-info-p source-info)
+                         (source-info-file-info source-info)))
+         (file-compiling-p (file-info-p file-info)))
+    (flet ((match-p (entry &aux (rest (cdr entry)))
+             ;; THING is compared by EQ, FMT by STRING=.
+             (and (eq (car entry) thing)
+                  (string= (car rest) fmt)
+                  ;; We don't want to walk into default values,
+                  ;; e.g. (&optional (b #<insane-struct))
+                  ;; because #<insane-struct> might be circular.
+                  (equal-but-no-car-recursion (cdr rest) args))))
+      (unless (and file-compiling-p
+                   (find-if #'match-p
+                            (file-info-style-warning-tracker file-info)))
+        (when file-compiling-p
+          (push (list* thing fmt args)
+                (file-info-style-warning-tracker file-info)))
+        (apply 'style-warn fmt args)))))
 
 ;;;; component compilation
 
@@ -616,6 +659,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                                     code-length
                                     fixup-notes
                                     *compile-object*))
+              #-sb-xc-host ; no compiling to core
               (core-object
                (maybe-mumble "core")
                (make-core-component component
@@ -782,74 +826,6 @@ necessary, since type inference may take arbitrarily long to converge.")
   (terpri)
   (values))
 
-;;;; file reading
-;;;;
-;;;; When reading from a file, we have to keep track of some source
-;;;; information. We also exploit our ability to back up for printing
-;;;; the error context and for recovering from errors.
-;;;;
-;;;; The interface we provide to this stuff is the stream-oid
-;;;; SOURCE-INFO structure. The bookkeeping is done as a side effect
-;;;; of getting the next source form.
-
-;;; A FILE-INFO structure holds all the source information for a
-;;; given file.
-(def!struct (file-info
-             (:copier nil)
-             #-no-ansi-print-object
-             (:print-object (lambda (s stream)
-                              (print-unreadable-object (s stream :type t)
-                                (princ (file-info-name s) stream)))))
-  ;; If a file, the truename of the corresponding source file. If from
-  ;; a Lisp form, :LISP. If from a stream, :STREAM.
-  (name (missing-arg) :type (or pathname (eql :lisp)))
-  ;; the external format that we'll call OPEN with, if NAME is a file.
-  (external-format nil)
-  ;; the defaulted, but not necessarily absolute file name (i.e. prior
-  ;; to TRUENAME call.) Null if not a file. This is used to set
-  ;; *COMPILE-FILE-PATHNAME*, and if absolute, is dumped in the
-  ;; debug-info.
-  (untruename nil :type (or pathname null))
-  ;; the file's write date (if relevant)
-  (write-date nil :type (or unsigned-byte null))
-  ;; the source path root number of the first form in this file (i.e.
-  ;; the total number of forms converted previously in this
-  ;; compilation)
-  (source-root 0 :type unsigned-byte)
-  ;; parallel vectors containing the forms read out of the file and
-  ;; the file positions that reading of each form started at (i.e. the
-  ;; end of the previous form)
-  (forms (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
-  (positions (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
-  ;; A vector of character ranges than span each subform in the TLF,
-  ;; reset to empty for each one, updated by form-tracking-stream-observer.
-  (subforms nil :type (or null (vector t)) :read-only t))
-
-;;; The SOURCE-INFO structure provides a handle on all the source
-;;; information for an entire compilation.
-(def!struct (source-info
-             #-no-ansi-print-object
-             (:print-object (lambda (s stream)
-                              (print-unreadable-object
-                                  (s stream :type t :identity t))))
-             (:copier nil))
-  ;; the UT that compilation started at
-  (start-time (get-universal-time) :type unsigned-byte)
-  ;; the IRT that compilation started at
-  (start-real-time (get-internal-real-time) :type unsigned-byte)
-  ;; the FILE-INFO structure for this compilation
-  (file-info nil :type (or file-info null))
-  ;; the stream that we are using to read the FILE-INFO, or NIL if
-  ;; no stream has been opened yet
-  (stream nil :type (or stream null))
-  ;; for coalescing DEFINITION-SOURCE-LOCATION of effectively toplevel forms
-  ;; inside one truly toplevel form.
-  (last-defn-source-loc)
-  ;; if the current compilation is recursive (e.g., due to EVAL-WHEN
-  ;; processing at compile-time), the invoking compilation's
-  ;; source-info.
-  (parent nil :type (or source-info null)))
-
 ;;; Given a pathname, return a SOURCE-INFO structure.
 (defun make-file-source-info (file external-format &optional form-tracking-p)
   (make-source-info
@@ -1037,6 +1013,9 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; *TOPLEVEL-LAMBDAS* instead.
 (defun convert-and-maybe-compile (form path &optional (expand t))
   (declare (list path))
+  #+sb-xc-host
+  (when sb-cold::*compile-for-effect-only*
+    (return-from convert-and-maybe-compile))
   (let ((*top-level-form-noted* (note-top-level-form form t)))
     ;; Don't bother to compile simple objects that just sit there.
     (when (and form (or (symbolp form) (consp form)))
@@ -1087,8 +1066,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; We parse declarations and then recursively process the body.
 (defun process-toplevel-locally (body path compile-time-too &key vars funs)
   (declare (list path))
-  (multiple-value-bind (forms decls)
-      (parse-body body :doc-string-allowed nil :toplevel t)
+  (multiple-value-bind (forms decls) (parse-body body nil t)
     (with-ir1-namespace
       (let* ((*lexenv* (process-decls decls vars funs))
              ;; FIXME: VALUES declaration
@@ -1103,6 +1081,17 @@ necessary, since type inference may take arbitrarily long to converge.")
              ;; FIXME: Ideally, something should be done so that DECLAIM
              ;; inside LOCALLY works OK. Failing that, at least we could
              ;; issue a warning instead of silently screwing up.
+             ;; Here's how to fix this: a POLICY object can in fact represent
+             ;; absence of qualitities. Whenever we rebind *POLICY* (here and
+             ;; elsewhere), it should be bound to a policy that expresses no
+             ;; qualities. Proclamations should update SYMBOL-GLOBAL-VALUE of
+             ;; *POLICY*, which can be seen irrespective of dynamic bindings,
+             ;; and declarations should update the lexical policy.
+             ;; The POLICY macro can be amended to merge the dynamic *POLICY*
+             ;; (or whatever it came from, like a LEXENV) with the global
+             ;; *POLICY*. COERCE-TO-POLICY can do the merge, employing a 1-line
+             ;; cache so that repeated calls for any two fixed policy objects
+             ;; return the identical value (since policies are immutable).
              (*policy* (lexenv-policy *lexenv*))
              ;; This is probably also a hack
              (*handled-conditions* (lexenv-handled-conditions *lexenv*))
@@ -1658,44 +1647,51 @@ necessary, since type inference may take arbitrarily long to converge.")
     (setq *block-compile* nil)
     (setq *entry-points* nil)))
 
-(defun handle-condition-p (condition)
-  (let ((lexenv
-         (etypecase *compiler-error-context*
-           (node
-            (node-lexenv *compiler-error-context*))
-           (compiler-error-context
-            (let ((lexenv (compiler-error-context-lexenv
-                           *compiler-error-context*)))
-              (aver lexenv)
-              lexenv))
-           (null *lexenv*))))
-    (let ((muffles (lexenv-handled-conditions lexenv)))
-      (if (null muffles) ; common case
-          nil
-          (dolist (muffle muffles nil)
-            (destructuring-bind (typespec . restart-name) muffle
-              (when (and (typep condition typespec)
-                         (find-restart restart-name condition))
-                (return t))))))))
+(flet ((get-handled-conditions ()
+         (let ((ctxt *compiler-error-context*))
+           (lexenv-handled-conditions
+            (etypecase ctxt
+             (node (node-lexenv ctxt))
+             (compiler-error-context
+              (let ((lexenv (compiler-error-context-lexenv ctxt)))
+                (aver lexenv)
+                lexenv))
+             ;; Is this right? I would think that if lexenv is null
+             ;; we should look at *HANDLED-CONDITIONS*.
+             (null *lexenv*)))))
+       (handle-p (condition ctype)
+         #+sb-xc-host (typep condition (type-specifier ctype))
+         #-sb-xc-host (%%typep condition ctype)))
+  (declare (inline handle-p))
 
-(defun handle-condition-handler (condition)
-  (let ((lexenv
-         (etypecase *compiler-error-context*
-           (node
-            (node-lexenv *compiler-error-context*))
-           (compiler-error-context
-            (let ((lexenv (compiler-error-context-lexenv
-                           *compiler-error-context*)))
-              (aver lexenv)
-              lexenv))
-           (null *lexenv*))))
-    (let ((muffles (lexenv-handled-conditions lexenv)))
-      (aver muffles)
+  (defun handle-condition-p (condition)
+    (dolist (muffle (get-handled-conditions) nil)
+      (destructuring-bind (ctype . restart-name) muffle
+        (when (and (handle-p condition ctype)
+                   (find-restart restart-name condition))
+          (return t)))))
+
+  (defun handle-condition-handler (condition)
+    (let ((muffles (get-handled-conditions)))
+      (aver muffles) ; FIXME: looks redundant with "fell through"
       (dolist (muffle muffles (bug "fell through"))
-        (destructuring-bind (typespec . restart-name) muffle
-          (when (typep condition typespec)
+        (destructuring-bind (ctype . restart-name) muffle
+          (when (handle-p condition ctype)
             (awhen (find-restart restart-name condition)
-              (invoke-restart it))))))))
+              (invoke-restart it)))))))
+
+  ;; WOULD-MUFFLE-P is called (incorrectly) only by NOTE-UNDEFINED-REFERENCE.
+  ;; It is not wrong per se, but as used, it is wrong, making it nearly
+  ;; impossible to muffle a subset of undefind warnings whose NAME and KIND
+  ;; slots match specific things tested by a user-defined predicate.
+  ;; Attempting to do that might muffle everything, depending on how your
+  ;; predicate responds to a vanilla WARNING. Consider e.g.
+  ;;   (AND WARNING (NOT (SATISFIES HAIRYFN)))
+  ;; where HAIRYFN depends on the :FORMAT-CONTROL and :FORMAT-ARGUMENTS.
+  (defun would-muffle-p (condition)
+    (let ((ctype (rassoc 'muffle-warning
+                         (lexenv-handled-conditions *lexenv*))))
+      (and ctype (handle-p condition (car ctype))))))
 
 ;;; Read all forms from INFO and compile them, with output to OBJECT.
 ;;; Return (VALUES ABORT-P WARNINGS-P FAILURE-P).
@@ -1797,7 +1793,11 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defun print-compile-start-note (source-info)
   (declare (type source-info source-info))
   (let ((file-info (source-info-file-info source-info)))
-    (compiler-mumble "~&; compiling file ~S (written ~A):~%"
+    (compiler-mumble #+sb-xc-host "~&; ~A file ~S (written ~A):~%"
+                     #+sb-xc-host (if sb-cold::*compile-for-effect-only*
+                                      "preloading"
+                                      "cross-compiling")
+                     #-sb-xc-host "~&; compiling file ~S (written ~A):~%"
                      (namestring (file-info-name file-info))
                      (sb!int:format-universal-time nil
                                                    (file-info-write-date
@@ -2046,9 +2046,10 @@ SPEED and COMPILATION-SPEED optimization values, and the
 (defvar *constants-being-created* nil)
 (defvar *constants-created-since-last-init* nil)
 ;;; FIXME: Shouldn't these^ variables be unbound outside LET forms?
-(defun emit-make-load-form (constant &optional (name nil namep))
+(defun emit-make-load-form (constant &optional (name nil namep)
+                                     &aux (fasl *compile-object*))
   (aver (fasl-output-p *compile-object*))
-  (unless (or (fasl-constant-already-dumped-p constant *compile-object*)
+  (unless (or (fasl-constant-already-dumped-p constant fasl)
               ;; KLUDGE: This special hack is because I was too lazy
               ;; to rework DEF!STRUCT so that the MAKE-LOAD-FORM
               ;; function of LAYOUT returns nontrivial forms when
@@ -2079,7 +2080,7 @@ SPEED and COMPILATION-SPEED optimization values, and the
         (setq creation-form :sb-just-dump-it-normally))
       (case creation-form
         (:sb-just-dump-it-normally
-         (fasl-validate-structure constant *compile-object*)
+         (fasl-validate-structure constant fasl)
          t)
         (:ignore-it
          nil)
@@ -2096,9 +2097,9 @@ SPEED and COMPILATION-SPEED optimization values, and the
                  (catch constant
                    (fasl-note-handle-for-constant
                     constant
-                    (or (fopcompile-allocate-instance creation-form)
+                    (or (fopcompile-allocate-instance fasl creation-form)
                         (compile-load-time-value creation-form))
-                    *compile-object*)
+                    fasl)
                    nil)
                (compiler-error "circular references in creation form for ~S"
                                constant)))
@@ -2109,7 +2110,7 @@ SPEED and COMPILATION-SPEED optimization values, and the
                        (loop for (name form) on (cdr info) by #'cddr
                          collect name into names
                          collect form into forms
-                         finally (or (fopcompile-constant-init-forms forms)
+                         finally (or (fopcompile-constant-init-forms fasl forms)
                                      (compile-make-load-form-init-forms forms)))
                        nil)))
                (when circular-ref

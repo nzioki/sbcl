@@ -123,26 +123,32 @@
 
 (defun compile-in-lexenv (name definition lexenv
                           &optional source-info tlf errorp)
-  (multiple-value-bind (compiled-definition warnings-p failure-p)
-      (cond
-        #!+sb-eval
-        ((sb!eval:interpreted-function-p definition)
-         (multiple-value-bind (definition lexenv)
-             (sb!eval:prepare-for-compile definition)
-           (actually-compile name definition lexenv source-info tlf errorp)))
-        ((compiled-function-p definition)
-         (values definition nil nil))
-        (t
-         (actually-compile name definition lexenv source-info tlf errorp)))
-    (check-type compiled-definition compiled-function)
-    (cond (name
-           (if (and (symbolp name)
-                    (macro-function name))
-               (setf (macro-function name) compiled-definition)
-               (setf (fdefinition name) compiled-definition))
-           (values name warnings-p failure-p))
+  (dx-flet ((really-compile (definition lexenv)
+              (actually-compile
+               name definition lexenv source-info tlf errorp)))
+    (multiple-value-bind (compiled-definition warnings-p failure-p)
+        (typecase definition
+          #!+sb-fasteval
+          (sb!interpreter:interpreted-function
+           (multiple-value-call #'really-compile
+             (sb!interpreter:prepare-for-compile definition)))
+          #!+sb-eval
+          (sb!eval:interpreted-function
+           (multiple-value-call #'really-compile
+             (sb!eval:prepare-for-compile definition)))
+          (function
+           (values definition nil nil))
           (t
-           (values compiled-definition warnings-p failure-p)))))
+           (really-compile definition lexenv)))
+      (aver (typep compiled-definition 'compiled-function))
+      (let ((result (if (not name)
+                        compiled-definition
+                        (progn
+                          (if (and (symbolp name) (macro-function name))
+                              (setf (macro-function name) compiled-definition)
+                              (setf (fdefinition name) compiled-definition))
+                          name))))
+        (values result warnings-p failure-p)))))
 
 (defun compile (name &optional (definition (or (and (symbolp name)
                                                     (macro-function name))

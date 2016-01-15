@@ -83,16 +83,6 @@ enum {
  * that don't have pointers to younger generations? */
 boolean enable_page_protection = 1;
 
-/* the minimum size (in bytes) for a large object*/
-/* NB this logic is unfortunately copied in 'compiler/x86-64/macros.lisp' */
-#if (GENCGC_ALLOC_GRANULARITY >= PAGE_BYTES) && (GENCGC_ALLOC_GRANULARITY >= GENCGC_CARD_BYTES)
-os_vm_size_t large_object_size = 4 * GENCGC_ALLOC_GRANULARITY;
-#elif (GENCGC_CARD_BYTES >= PAGE_BYTES) && (GENCGC_CARD_BYTES >= GENCGC_ALLOC_GRANULARITY)
-os_vm_size_t large_object_size = 4 * GENCGC_CARD_BYTES;
-#else
-os_vm_size_t large_object_size = 4 * PAGE_BYTES;
-#endif
-
 /* Largest allocation seen since last GC. */
 os_vm_size_t large_allocation = 0;
 
@@ -507,6 +497,9 @@ write_generation_stats(FILE *file)
 #elif defined(LISP_FEATURE_ARM)
     #define FPU_STATE_SIZE 8
     long long fpu_state[FPU_STATE_SIZE];
+#elif defined(LISP_FEATURE_ARM64)
+    #define FPU_STATE_SIZE 64
+    long fpu_state[FPU_STATE_SIZE];
 #endif
 
     /* This code uses the FP instructions which may be set up for Lisp
@@ -1437,7 +1430,7 @@ gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_
 {
     void *new_free_pointer;
 
-    if ((size_t)nbytes>=large_object_size)
+    if (nbytes>=LARGE_OBJECT_SIZE)
         return gc_alloc_large(nbytes, page_type_flag, my_region);
 
     /* Check whether there is room in the current alloc region. */
@@ -4488,7 +4481,7 @@ general_alloc_internal(sword_t nbytes, int page_type_flag, struct alloc_region *
 #else
                 set_pseudo_atomic_interrupted(thread);
 #ifdef GENCGC_IS_PRECISE
-                /* PPC calls alloc() from a trap or from pa_alloc(),
+                /* PPC calls alloc() from a trap
                  * look up the most context if it's from a trap. */
                 {
                     os_context_t *context =
@@ -4549,7 +4542,7 @@ general_alloc(sword_t nbytes, int page_type_flag)
 }
 
 lispobj AMD64_SYSV_ABI *
-alloc(long nbytes)
+alloc(sword_t nbytes)
 {
 #ifdef LISP_FEATURE_SB_SAFEPOINT_STRICTLY
     struct thread *self = arch_os_get_current_thread();

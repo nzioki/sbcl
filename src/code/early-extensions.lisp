@@ -126,14 +126,6 @@
                       (t `(values ,@(cdr result) &optional)))))
     `(function ,args ,result)))
 
-;;; a type specifier
-;;;
-;;; FIXME: The SB!KERNEL:INSTANCE here really means CL:CLASS.
-;;; However, the CL:CLASS type is only defined once PCL is loaded,
-;;; which is before this is evaluated.  Once PCL is moved into cold
-;;; init, this might be fixable.
-(def!type type-specifier () '(or list symbol instance))
-
 ;;; the default value used for initializing character data. The ANSI
 ;;; spec says this is arbitrary, so we use the value that falls
 ;;; through when we just let the low-level consing code initialize
@@ -401,15 +393,6 @@
 (defun neq (x y)
   (not (eq x y)))
 
-;;; not really an old-fashioned function, but what the calling
-;;; convention should've been: like NTH, but with the same argument
-;;; order as in all the other indexed dereferencing functions, with
-;;; the collection first and the index second
-(declaim (inline nth-but-with-sane-arg-order))
-(declaim (ftype (function (list index) t) nth-but-with-sane-arg-order))
-(defun nth-but-with-sane-arg-order (list index)
-  (nth index list))
-
 (defun adjust-list (list length initial-element)
   (let ((old-length (length list)))
     (cond ((< old-length length)
@@ -444,7 +427,7 @@
           decls))
 ;;; just like DOLIST, but with one-dimensional arrays
 (defmacro dovector ((elt vector &optional result) &body body)
-  (multiple-value-bind (forms decls) (parse-body body :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body body nil)
     (with-unique-names (index length vec)
       `(let ((,vec ,vector))
         (declare (type vector ,vec))
@@ -461,20 +444,16 @@
 
 ;;; Iterate over the entries in a HASH-TABLE, first obtaining the lock
 ;;; if the table is a synchronized table.
+;;; An implicit block named NIL exists around the iteration, as is the custom.
 (defmacro dohash (((key-var value-var) table &key result locked) &body body)
-  (multiple-value-bind (forms decls) (parse-body body :doc-string-allowed nil)
-    (with-unique-names (gen n-more n-table)
-      (let ((iter-form `(with-hash-table-iterator (,gen ,n-table)
-                         (loop
-                           (multiple-value-bind (,n-more ,key-var ,value-var) (,gen)
-                             ,@decls
-                             (unless ,n-more (return ,result))
-                             ,@forms)))))
-        `(let ((,n-table ,table))
-           ,(if locked
-                `(with-locked-system-table (,n-table)
-                   ,iter-form)
-                iter-form))))))
+  (let* ((n-table (make-symbol "HT"))
+         (iter-form `(block nil
+                       (maphash (lambda (,key-var ,value-var) ,@body) ,n-table)
+                       ,result)))
+    `(let ((,n-table ,table))
+       ,(if locked
+            `(with-locked-system-table (,n-table) ,iter-form)
+            iter-form))))
 
 ;;; Executes BODY for all entries of PLIST with KEY and VALUE bound to
 ;;; the respective keys and values.
@@ -506,7 +485,7 @@
 (def!macro binding* ((&rest clauses) &body body)
   (unless clauses ; wrap in LET to preserve non-toplevelness
     (return-from binding* `(let () ,@body)))
-  (multiple-value-bind (body decls) (parse-body body :doc-string-allowed nil)
+  (multiple-value-bind (body decls) (parse-body body nil)
     ;; Generate an abstract representation that combines LET* clauses.
     (let (repr)
       (dolist (clause clauses)
@@ -679,7 +658,7 @@
     (unless (<= 2 (length arg) 3)
       (error "bad argument spec: ~S" arg)))
   (assert (typep hash-bits '(integer 5 14))) ; reasonable bounds
-  (let* ((fun-name (symbolicate name "-MEMO-WRAPPER"))
+  (let* ((fun-name (symbolicate "!" name "-MEMO-WRAPPER"))
          (var-name (symbolicate "**" name "-CACHE-VECTOR**"))
          (statistics-name
           (when *profile-hash-cache*
@@ -829,7 +808,7 @@
                                         memoizer-supplied-p)
                               &allow-other-keys)
                         args &body body-decls-doc)
-  (binding* (((forms decls doc) (parse-body body-decls-doc))
+  (binding* (((forms decls doc) (parse-body body-decls-doc t))
              ((inputs aux-vars)
               (let ((aux (member '&aux args)))
                 (if aux
@@ -845,7 +824,7 @@
                        ;; We don't need (DX-FLET ((,thunk () ,@body)) ...)
                        ;; This lambda is a single-use local call within
                        ;; the inline memoizing wrapper.
-                       `(,',(symbolicate name "-MEMO-WRAPPER")
+                       `(,',(symbolicate "!" name "-MEMO-WRAPPER")
                          (lambda () ,@body) ,@',arg-names)))
              ,@(if memoizer-supplied-p
                    forms
@@ -891,7 +870,7 @@
 ;;; unspecified. We try to signal errors in such cases.
 (defun find-undeleted-package-or-lose (package-designator)
   (let ((maybe-result (%find-package-or-lose package-designator)))
-    (if (package-name maybe-result)     ; if not deleted
+    (if (package-%name maybe-result)    ; if not deleted
         maybe-result
         (error 'simple-package-error
                :package maybe-result
@@ -1002,15 +981,7 @@
      (%failed-aver ',expr)))
 
 (defun %failed-aver (expr)
-  ;; hackish way to tell we're in a cold sbcl and output the
-  ;; message before signalling error, as it may be this is too
-  ;; early in the cold init.
-  (when (find-package "SB!C")
-    (fresh-line)
-    (write-line "failed AVER:")
-    (write expr)
-    (terpri))
-  (bug "~@<failed AVER: ~2I~_~A~:>" expr))
+  (bug "~@<failed AVER: ~2I~_~S~:>" expr))
 
 (defun bug (format-control &rest format-arguments)
   (error 'bug
@@ -1038,10 +1009,12 @@
       (destructuring-bind (result) x result)
       x))
 
-;;; some commonly-occuring CONSTANTLY forms
+;;; some commonly-occurring CONSTANTLY forms
 (macrolet ((def-constantly-fun (name constant-expr)
-             `(setf (symbol-function ',name)
-                    (constantly ,constant-expr))))
+             `(progn
+                (declaim (ftype (sfunction * (eql ,constant-expr)) ,name))
+                (setf (symbol-function ',name)
+                      (constantly ,constant-expr)))))
   (def-constantly-fun constantly-t t)
   (def-constantly-fun constantly-nil nil)
   (def-constantly-fun constantly-0 0))
@@ -1341,9 +1314,14 @@
 
 (defun check-deprecated-type (type-specifier)
   (typecase type-specifier
-    ((and type-specifier (not instance))
+    ((or symbol cons)
      (%check-deprecated-type type-specifier))
     (class
+     ;; FIXME: this case does not acknowledge that improperly named classes
+     ;; can exist. Suppose a few classes each have CLASS-NAME = FRED
+     ;; but (FIND-CLASS 'FRED) does not return any of them; and simultaneously
+     ;; FRED is a completely unrelated type specifier defined via DEFTYPE.
+     ;; This should see that class-name does not properly name the class.
      (let ((name (class-name type-specifier)))
        (when (and name (symbolp name))
          (%check-deprecated-type name))))))
@@ -1449,7 +1427,7 @@
 (defun setup-type-in-final-deprecation
     (software version name replacement-spec)
   (declare (ignore software version replacement-spec))
-  (%compiler-deftype name (constant-type-expander t) nil))
+  (%compiler-deftype name (constant-type-expander name t) nil))
 
 (defmacro define-deprecated-function (state version name replacements lambda-list
                                       &body body)
@@ -1613,7 +1591,8 @@
 
 ;;; Default evaluator mode (interpeter / compiler)
 
-(declaim (type (member :compile #!+sb-eval :interpret) *evaluator-mode*))
+(declaim (type (member :compile #!+(or sb-eval sb-fasteval) :interpret)
+               *evaluator-mode*))
 (!defparameter *evaluator-mode* :compile
   #!+sb-doc
   "Toggle between different evaluator implementations. If set to :COMPILE,
@@ -1719,8 +1698,7 @@ to :INTERPRET, an interpreter will be used.")
 (defmacro with-simple-output-to-string
     ((var &optional string)
      &body body)
-  (multiple-value-bind (forms decls)
-      (parse-body body :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body body nil)
     (if string
         `(let ((,var (sb!impl::make-fill-pointer-output-stream ,string)))
            ,@decls
@@ -1730,3 +1708,10 @@ to :INTERPRET, an interpreter will be used.")
            ,@forms
            (truly-the (simple-array character (*))
                       (get-output-stream-string ,var))))))
+
+(defun self-evaluating-p (x)
+  (typecase x
+    (null t)
+    (symbol (or (eq x t) (eq (symbol-package x) *keyword-package*)))
+    (cons nil)
+    (t t)))

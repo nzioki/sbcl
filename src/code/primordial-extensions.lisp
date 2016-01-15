@@ -98,8 +98,7 @@
                          (t (illegal-varlist)))))
                 (t (illegal-varlist)))))
       ;; Construct the new form.
-      (multiple-value-bind (code decls)
-          (parse-body decls-and-code :doc-string-allowed nil)
+      (multiple-value-bind (code decls) (parse-body decls-and-code nil)
         `(block ,block
            (,bind ,(nreverse r-inits)
                   ,@decls
@@ -131,6 +130,7 @@
 ;;; Incidentally, this is essentially the same operator which
 ;;; _On Lisp_ calls WITH-GENSYMS.
 (defmacro with-unique-names (symbols &body body)
+  (declare (notinline every)) ; because we can't inline ALPHA-CHAR-P
   `(let ,(mapcar (lambda (symbol)
                    (let* ((symbol-name (symbol-name symbol))
                           (stem (if (every #'alpha-char-p symbol-name)
@@ -219,10 +219,7 @@
                 ;; but it will immediately lead to undefined to behavior,
                 ;; since almost any operation on a deleted package is
                 ;; undefined.
-                ;; The "%" accessor avoids calling %FIND-PACKAGE-OR-LOSE,
-                ;; though it probably does not make much difference, if any.
-                (#+sb-xc-host package-name #-sb-xc-host package-%name
-                 maybe-package))
+                (package-%name maybe-package))
            maybe-package)
           (t
            ;; We're in the undefined behavior zone. First, munge the
@@ -308,22 +305,6 @@
   `(def!constant ,symbol
      (%defconstant-eqx-value ',symbol ,expr ,eqx)
      ,@(when doc (list doc))))
-(defun %defconstant-eqx-value (symbol expr eqx)
-  (declare (type function eqx))
-  (flet ((bummer (explanation)
-           (error "~@<bad DEFCONSTANT-EQX ~S ~2I~_~S: ~2I~_~A ~S~:>"
-                  symbol
-                  expr
-                  explanation
-                  (symbol-value symbol))))
-    (cond ((not (boundp symbol))
-           expr)
-          ((not (constantp symbol))
-           (bummer "already bound as a non-constant"))
-          ((not (funcall eqx (symbol-value symbol) expr))
-           (bummer "already bound as a different constant value"))
-          (t
-           (symbol-value symbol)))))
 
 ;;; a helper function for various macros which expect clauses of a
 ;;; given length, etc.
@@ -395,5 +376,8 @@
         (let ((it (copy-symbol 'it)))
           `(let ((,it ,test))
              (if ,it
-                 (let ((it ,it)) (declare (ignorable it)) ,@body)
+                 ;; Just like COND - no body means return the tested value.
+                 ,(if body
+                      `(let ((it ,it)) (declare (ignorable it)) ,@body)
+                      it)
                  (acond ,@rest)))))))

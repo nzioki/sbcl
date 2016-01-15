@@ -229,6 +229,13 @@
       '(%scalbn f ex)
       '(scale-double-float f ex)))
 
+;;; Given a number X, create a form suitable as a bound for an
+;;; interval. Make the bound open if OPEN-P is T. NIL remains NIL.
+;;; FIXME: as this is a constructor, shouldn't it be named MAKE-BOUND?
+#!-sb-fluid (declaim (inline set-bound))
+(defun set-bound (x open-p)
+  (if (and x open-p) (list x) x))
+
 ;;; What is the CROSS-FLOAT-INFINITY-KLUDGE?
 ;;;
 ;;; SBCL's own implementation of floating point supports floating
@@ -752,6 +759,13 @@
                               (fp-pos-zero-p arg-hi)))))))))
 (eval-when (:compile-toplevel :execute)
   (setf *read-default-float-format* 'single-float))
+
+;;; The basic interval type. It can handle open and closed intervals.
+;;; A bound is open if it is a list containing a number, just like
+;;; Lisp says. NIL means unbounded.
+(defstruct (interval (:constructor %make-interval (low high))
+                     (:copier nil))
+  low high)
 
 #-sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
@@ -1610,6 +1624,7 @@
 (defknown %unary-ftruncate/double (double-float) double-float
   (movable foldable flushable))
 
+#-sb-xc-host
 (defun %unary-ftruncate/single (x)
   (declare (type single-float x))
   (declare (optimize speed (safety 0)))
@@ -1627,6 +1642,7 @@
          (setf bits (logandc2 bits (- (ash 1 frac-bits) 1)))
          (make-single-float bits))))))
 
+#-sb-xc-host
 (defun %unary-ftruncate/double (x)
   (declare (type double-float x))
   (declare (optimize speed (safety 0)))

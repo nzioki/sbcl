@@ -12,12 +12,6 @@
 
 (in-package "SB!VM")
 
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
-
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
 (defun make-nlx-entry-arg-start-location ()
@@ -274,10 +268,7 @@
         (inst word (make-fixup 'unwind :assembly-routine)))
       (inst load-from-label pc-tn lr-tn uwp-label)
 
-      (emit-label ENTRY-LABEL)
-      ;; KLUDGE: either COMPUTE-LRA computes or UNWIND jumps one
-      ;; instruction further.
-      (inst mov nargs 0)
+      (emit-return-pc ENTRY-LABEL)
       (inst mov nargs 0)
 
       (move lexenv saved-function)

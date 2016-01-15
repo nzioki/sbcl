@@ -177,19 +177,19 @@
 
 ;; lispobj-sized word, whatever that may be
 ;; hopefully nobody ever wants a 128-bit SBCL...
-#!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+#!+64-bit
 (progn
-(defun bvref-word (bytes index)
-  (bvref-64 bytes index))
-(defun (setf bvref-word) (new-val bytes index)
-  (setf (bvref-64 bytes index) new-val)))
+  (defun bvref-word (bytes index)
+    (bvref-64 bytes index))
+  (defun (setf bvref-word) (new-val bytes index)
+    (setf (bvref-64 bytes index) new-val)))
 
-#!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+#!-64-bit
 (progn
-(defun bvref-word (bytes index)
-  (bvref-32 bytes index))
-(defun (setf bvref-word) (new-val bytes index)
-  (setf (bvref-32 bytes index) new-val)))
+  (defun bvref-word (bytes index)
+    (bvref-32 bytes index))
+  (defun (setf bvref-word) (new-val bytes index)
+    (setf (bvref-32 bytes index) new-val)))
 
 
 ;;;; representation of spaces in the core
@@ -285,7 +285,9 @@
 (def!method print-object ((des descriptor) stream)
   (let ((lowtag (descriptor-lowtag des)))
     (print-unreadable-object (des stream :type t)
-      (cond ((is-fixnum-lowtag lowtag)
+      (cond ((eq (descriptor-gspace des) :load-time-value)
+             (format stream "for LTV ~D" (descriptor-word-offset des)))
+            ((is-fixnum-lowtag lowtag)
              (format stream "for fixnum: ~W" (descriptor-fixnum des)))
             ((is-other-immediate-lowtag lowtag)
              (format stream
@@ -479,7 +481,11 @@
 
 ;;; (Note: In CMU CL, this function expected a SAP-typed ADDRESS
 ;;; value, instead of the object-and-offset we use here.)
-(declaim (ftype (function (descriptor sb!vm:word descriptor) (values))
+(declaim (ftype (function (descriptor
+                           (integer #.(- sb!vm:list-pointer-lowtag)
+                                    #.sb!ext:most-positive-word)
+                           descriptor)
+                          (values))
                 note-load-time-value-reference))
 (defun note-load-time-value-reference (address offset marker)
   (cold-push (cold-list (cold-intern :load-time-value-fixup)
@@ -682,10 +688,10 @@ core and return a descriptor to it."
   (etypecase x
     (single-float
      ;; 64-bit platforms have immediate single-floats.
-     #!+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+     #!+64-bit
      (make-random-descriptor (logior (ash (single-float-bits x) 32)
                                      sb!vm::single-float-widetag))
-     #!-#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+     #!-64-bit
      (let ((des (allocate-header+object *dynamic*
                                          (1- sb!vm:single-float-size)
                                          sb!vm:single-float-widetag)))
@@ -704,13 +710,13 @@ core and return a descriptor to it."
   (let ((des (allocate-header+object *dynamic*
                                       (1- sb!vm:complex-single-float-size)
                                       sb!vm:complex-single-float-widetag)))
-    #!-x86-64
+    #!-64-bit
     (progn
       (write-wordindexed des sb!vm:complex-single-float-real-slot
                          (make-random-descriptor (single-float-bits (realpart num))))
       (write-wordindexed des sb!vm:complex-single-float-imag-slot
                          (make-random-descriptor (single-float-bits (imagpart num)))))
-    #!+x86-64
+    #!+64-bit
     (write-wordindexed des sb!vm:complex-single-float-data-slot
                        (make-random-descriptor
                         (logior (ldb (byte 32 0) (single-float-bits (realpart num)))
@@ -762,9 +768,15 @@ core and return a descriptor to it."
     (write-wordindexed dest sb!vm:cons-cdr-slot cdr)
     dest))
 (defun cold-list (&rest args)
-  (if args
-      (cold-cons (car args) (apply 'cold-list (cdr args)))
-      *nil-descriptor*))
+  (let ((head *nil-descriptor*)
+        (tail nil))
+    ;; A recursive algorithm would have the first cons at the highest
+    ;; address. This way looks nicer when viewed in ldb.
+    (loop
+     (unless args (return head))
+     (let ((cons (cold-cons (pop args) *nil-descriptor*)))
+       (if tail (cold-rplacd tail cons) (setq head cons))
+       (setq tail cons)))))
 (defun cold-list-length (list) ; but no circularity detection
   ;; a recursive implementation uses too much stack for some Lisps
   (let ((n 0))
@@ -826,12 +838,12 @@ core and return a descriptor to it."
   ;; This is a backend support routine, but the style within this file
   ;; is to conditionalize by the target features.
   (defun cold-assign-tls-index (symbol index)
-    #!+x86-64
+    #!+64-bit
     (let ((header-word
            (logior (ash index 32)
                    (descriptor-bits (read-memory symbol)))))
       (write-wordindexed symbol 0 (make-random-descriptor header-word)))
-    #!-x86-64
+    #!-64-bit
     (write-wordindexed symbol sb!vm:symbol-tls-index-slot
                        (make-random-descriptor index)))
 
@@ -840,9 +852,9 @@ core and return a descriptor to it."
   (defun ensure-symbol-tls-index (symbol)
     (let* ((cold-sym (cold-intern symbol))
            (tls-index
-            #!+x86-64
+            #!+64-bit
             (ldb (byte 32 32) (descriptor-bits (read-memory cold-sym)))
-            #!-x86-64
+            #!-64-bit
             (descriptor-bits
              (read-wordindexed cold-sym sb!vm:symbol-tls-index-slot))))
       (unless (plusp tls-index)
@@ -982,9 +994,9 @@ core and return a descriptor to it."
                   (let* ((dsd (cold-car slots))
                          (slot-name (read-slot dsd dsd-layout :name)))
                     (when (eq (keywordicate (warm-symbol slot-name)) initarg)
-                      (let ((raw-type (read-slot dsd dsd-layout :raw-type)))
-                        ;; Untagged slots are not accessible during cold-load.
-                        (aver (eq (warm-symbol raw-type) t)))
+                      ;; Untagged slots are not accessible during cold-load
+                      (aver (eql (descriptor-fixnum
+                                  (read-slot dsd dsd-layout :%raw-type)) -1))
                       (return (descriptor-fixnum
                                (read-slot dsd dsd-layout :index))))))
                 (let ((dsd (find initarg slots
@@ -1145,7 +1157,8 @@ core and return a descriptor to it."
                  (patch-instance-layout cold-package *package-layout*)
                  ;; Initialize string slots
                  (write-slots cold-package package-layout
-                              :%name (base-string-to-core name)
+                              :%name (base-string-to-core
+                                      (target-package-name name))
                               :%nicknames (chill-nicknames name)
                               :doc-string (if docstring
                                               (base-string-to-core docstring)
@@ -1153,6 +1166,10 @@ core and return a descriptor to it."
                               :%use-list *nil-descriptor*)
                  ;; the cddr of this will accumulate the 'used-by' package list
                  (push (list name cold-package) target-pkg-list)))
+             (target-package-name (string)
+               (if (eql (mismatch string "SB!") 3)
+                   (concatenate 'string "SB-" (subseq string 3))
+                   string))
              (chill-nicknames (pkg-name)
                (let ((result *nil-descriptor*))
                  ;; Make the package nickname lists for the standard packages
@@ -1166,7 +1183,12 @@ core and return a descriptor to it."
                                 ((string= pkg-name "COMMON-LISP-USER")
                                  '("CL-USER"))
                                 ((string= pkg-name "KEYWORD") '())
-                                (t (package-nicknames (find-package pkg-name))))
+                                (t
+                                 ;; 'package-data-list' contains no nicknames.
+                                 ;; (See comment in 'set-up-cold-packages')
+                                 (aver (null (package-nicknames
+                                              (find-package pkg-name))))
+                                 nil))
                           result)
                    (cold-push (base-string-to-core nickname) result))))
              (find-cold-package (name)
@@ -1174,10 +1196,7 @@ core and return a descriptor to it."
              (find-package-cell (name)
                (or (assoc (if (string= name "CL") "COMMON-LISP" name)
                           target-pkg-list :test #'string=)
-                   (error "No cold package named ~S" name)))
-             (list-to-core (list)
-               (let ((res *nil-descriptor*))
-                 (dolist (x list res) (cold-push x res)))))
+                   (error "No cold package named ~S" name))))
       ;; pass 1: make all proto-packages
       (dolist (pd package-data-list)
         (init-cold-package (sb-cold:package-data-name pd)
@@ -1191,11 +1210,11 @@ core and return a descriptor to it."
               (push (cadr cell) use)
               (push this (cddr cell))))
           (write-slots this package-layout
-                       :%use-list (list-to-core (nreverse use)))))
+                       :%use-list (apply 'cold-list (nreverse use)))))
       ;; pass 3: set the 'used-by' lists
       (dolist (cell target-pkg-list)
         (write-slots (cadr cell) package-layout
-                     :%used-by-list (list-to-core (cddr cell)))))))
+                     :%used-by-list (apply 'cold-list (cddr cell)))))))
 
 ;;; sanity check for a symbol we're about to create on the target
 ;;;
@@ -1375,10 +1394,6 @@ core and return a descriptor to it."
   (when set-home-p
     (write-wordindexed symbol-descriptor sb!vm:symbol-package-slot
                        (car target-pkg-info)))
-  (when (member host-symbol (package-shadowing-symbols host-package))
-    ;; Fail in an obvious way if target shadowing symbols exist.
-    ;; (This is simply not an important use-case during system bootstrap.)
-    (error "Genesis doesn't like shadowing symbol ~S, sorry." host-symbol))
   (let ((access-lists (cdr target-pkg-info)))
     (case accessibility
       (:external (push symbol-descriptor (car access-lists)))
@@ -1538,18 +1553,31 @@ core and return a descriptor to it."
           (sort cold-package-symbols-list #'string< :key #'car))
     (dolist (pkgcons cold-package-symbols-list)
       (destructuring-bind (pkg-name . pkg-info) pkgcons
+        (let ((shadow
+               ;; Record shadowing symbols (except from SB-XC) in SB! packages.
+               (when (eql (mismatch pkg-name "SB!") 3)
+                 ;; Be insensitive to the host's ordering.
+                 (sort (remove (find-package "SB-XC")
+                               (package-shadowing-symbols (find-package pkg-name))
+                               :key #'symbol-package) #'string<))))
+          (write-slots (car (gethash pkg-name *cold-package-symbols*)) ; package
+                       (find-layout 'package)
+                       :%shadowing-symbols
+                       (apply 'cold-list (mapcar 'cold-intern shadow))))
         (unless (member pkg-name '("COMMON-LISP" "KEYWORD") :test 'string=)
           (let ((host-pkg (find-package pkg-name))
                 (sb-xc-pkg (find-package "SB-XC"))
                 syms)
+            ;; Now for each symbol directly present in this host-pkg,
+            ;; i.e. accessible but not :INHERITED, figure out if the symbol
+            ;; came from a different package, and if so, make a note of it.
             (with-package-iterator (iter host-pkg :internal :external)
               (loop (multiple-value-bind (foundp sym accessibility) (iter)
                       (unless foundp (return))
                       (unless (or (eq (symbol-package sym) host-pkg)
                                   (eq (symbol-package sym) sb-xc-pkg))
                         (push (cons sym accessibility) syms)))))
-            (setq syms (sort syms #'string< :key #'car))
-            (dolist (symcons syms)
+            (dolist (symcons (sort syms #'string< :key #'car))
               (destructuring-bind (sym . accessibility) symcons
                 (record-accessibility accessibility (cold-intern sym)
                                       pkg-info sym host-pkg)))))
@@ -1607,6 +1635,10 @@ core and return a descriptor to it."
 (defun cold-cdr (des)
   (aver (= (descriptor-lowtag des) sb!vm:list-pointer-lowtag))
   (read-wordindexed des sb!vm:cons-cdr-slot))
+(defun cold-rplacd (des newval)
+  (aver (= (descriptor-lowtag des) sb!vm:list-pointer-lowtag))
+  (write-wordindexed des sb!vm:cons-cdr-slot newval)
+  des)
 (defun cold-null (des)
   (= (descriptor-bits des)
      (descriptor-bits *nil-descriptor*)))
@@ -2003,8 +2035,24 @@ core and return a descriptor to it."
        (ecase kind
          (:absolute
           (setf (bvref-32 gspace-bytes gspace-byte-offset) value))))
+      (:arm64
+       (ecase kind
+         (:absolute
+          (setf (bvref-64 gspace-bytes gspace-byte-offset) value))
+         (:cond-branch
+          (setf (ldb (byte 19 5)
+                     (bvref-32 gspace-bytes gspace-byte-offset))
+                (ash (- value (+ gspace-byte-address gspace-byte-offset))
+                     -2)))
+         (:uncond-branch
+          (setf (ldb (byte 26 0)
+                     (bvref-32 gspace-bytes gspace-byte-offset))
+                (ash (- value (+ gspace-byte-address gspace-byte-offset))
+                     -2)))))
       (:hppa
        (ecase kind
+         (:absolute
+          (setf (bvref-32 gspace-bytes gspace-byte-offset) value))
          (:load
           (setf (bvref-32 gspace-bytes gspace-byte-offset)
                 (logior (mask-field (byte 18 14)
@@ -2728,7 +2776,7 @@ core and return a descriptor to it."
             (cond ((cold-null x) (return-from recurse nil))
                   ((is-fixnum-lowtag (descriptor-lowtag x))
                    (return-from recurse (descriptor-fixnum x)))
-                  #!+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+                  #!+64-bit
                   ((is-other-immediate-lowtag (descriptor-lowtag x))
                    (let ((bits (descriptor-bits x)))
                      (when (= (logand bits sb!vm:widetag-mask)
@@ -2745,14 +2793,14 @@ core and return a descriptor to it."
                          (base-string-from-core
                           (read-wordindexed x sb!vm:symbol-name-slot)))
                         (warm-symbol x)))
-                   #!+#.(cl:if (cl:= sb!vm:n-word-bits 32) '(and) '(or))
+                   #!-64-bit
                    (#.sb!vm:single-float-widetag
                     `(:ffloat-bits
                       ,(read-bits-wordindexed x sb!vm:single-float-value-slot)))
                    (#.sb!vm:double-float-widetag
                     `(:dfloat-bits
                       ,(read-bits-wordindexed x sb!vm:double-float-value-slot)
-                      #!+#.(cl:if (cl:= sb!vm:n-word-bits 32) '(and) '(or))
+                      #!-64-bit
                       ,(read-bits-wordindexed
                         x (1+ sb!vm:double-float-value-slot))))
                    (#.sb!vm:bignum-widetag
@@ -3224,7 +3272,7 @@ core and return a descriptor to it."
           (toggle (sb!vm:saetp-typecode saetp))
           (awhen (sb!vm:saetp-complex-typecode saetp) (toggle it)))))
     (format out
-            "~%static unsigned char unprintable_array_types[32] = ~% {~{~d~^,~}};~%"
+            "~%static unsigned char unprintable_array_types[32] =~% {~{~d~^,~}};~%"
             (coerce array-type-bits 'list)))
   (values))
 
@@ -3601,7 +3649,7 @@ initially undefined function references:~2%")
            (*cold-fdefn-objects* (make-hash-table :test 'equal))
            (*cold-symbols* (make-hash-table :test 'eql)) ; integer keys
            (*cold-package-symbols* (make-hash-table :test 'equal)) ; string keys
-           (pkg-metadata (sb-cold:read-from-file "package-data-list.lisp-expr"))
+           (pkg-metadata (sb-cold::package-list-for-genesis))
            (*read-only* (make-gspace :read-only
                                      read-only-core-space-id
                                      sb!vm:read-only-space-start))

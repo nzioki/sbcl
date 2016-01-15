@@ -363,6 +363,7 @@
 ;;; BAR in (INTEGER FOO BAR) are INTEGERs.
 (defun sb!xc:typep (host-object target-type-spec &optional (env nil env-p))
   (declare (ignore env))
+  (declare (optimize (debug 0))) ; workaround for lp# 1498644
   (aver (null env-p)) ; 'cause we're too lazy to think about it
   (multiple-value-bind (opinion certain-p)
       (cross-typep host-object target-type-spec)
@@ -454,7 +455,7 @@
             ;; Beyond this, there seems to be no portable correspondence.
             (error "can't map host Lisp CHARACTER ~S to target Lisp" x))))
     (structure!object
-     (find-classoid (uncross (class-name (class-of x)))))
+     (find-classoid (uncross (class-name (class-of x))))) ; FIXME: TYPE-OF?
     (t
      ;; There might be more cases which we could handle with
      ;; sufficient effort; since all we *need* to handle are enough
@@ -462,3 +463,6 @@
      ;; future maintainers make the bootstrap code more complicated,
      ;; they can also add new cases here to handle it. -- WHN 2000-11-11
      (error "can't handle ~S in cross CTYPE-OF" x))))
+
+(defun sb!pcl::class-has-a-forward-referenced-superclass-p (x)
+  (bug "CLASS-HAS-A-FORWARD-REFERENCED-SUPERCLASS-P reached: ~S" x))

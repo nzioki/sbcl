@@ -945,8 +945,9 @@
     (setf debug-name (name-lambdalike form)))
   (multiple-value-bind (vars keyp allow-other-keys aux-vars aux-vals)
       (make-lambda-vars (cadr form))
-    (multiple-value-bind (forms decls doc) (parse-body (cddr form))
-      (binding* (((*lexenv* result-type post-binding-lexenv lambda-list)
+    (multiple-value-bind (forms decls doc) (parse-body (cddr form) t)
+      (binding* (((*lexenv* result-type post-binding-lexenv
+                   lambda-list explicit-check)
                   (process-decls decls (append aux-vars vars) nil
                                  :binding-form-p t :allow-lambda-list t))
                  (debug-catch-p (and maybe-add-debug-catch
@@ -976,6 +977,8 @@
                                                       :source-name source-name
                                                       :debug-name debug-name
                                                       :system-lambda system-lambda)))))
+        (when explicit-check
+          (setf (getf (functional-plist res) 'explicit-check) explicit-check))
         (setf (functional-inline-expansion res) form)
         (setf (functional-arg-documentation res)
               (if (eq lambda-list :unspecified)
@@ -1085,9 +1088,16 @@
                         (recurse body
                                  (process-decls `((declare ,@bindings)) nil nil)))
                        (:macro
-                        (let ((macros (loop for (name . function) in bindings
-                                            collect (list* name 'macro
-                                                           (eval-in-lexenv function lexenv)))))
+                        (let ((macros
+                               (mapcar (lambda (binding)
+                                         (list* (car binding) 'macro
+                                                #-sb-xc-host
+                                                (eval-in-lexenv (cdr binding) lexenv)
+                                                #+sb-xc-host ; no EVAL-IN-LEXENV
+                                                (if (null-lexenv-p lexenv)
+                                                    (eval (cdr binding))
+                                                    (bug "inline-lexenv?"))))
+                                       bindings)))
                           (recurse body
                                    (make-lexenv :default lexenv
                                                 :funs macros))))
@@ -1133,9 +1143,11 @@
 ;;; Given a lambda-list, return a FUN-TYPE object representing the signature:
 ;;; return type is *, and each individual arguments type is T -- but we get
 ;;; the argument counts and keywords.
+;;; TODO: enhance this to optionally accept an alist of (var . type)
+;;; and use that lieu of SB-INTERPRETER:APPROXIMATE-PROTO-FN-TYPE.
 (defun ftype-from-lambda-list (lambda-list)
   (multiple-value-bind (llks req opt rest key-list)
-      (parse-lambda-list lambda-list)
+      (parse-lambda-list lambda-list :silent t)
     (flet ((list-of-t (list) (mapcar (constantly t) list)))
       (let ((reqs (list-of-t req))
             (opts (when opt (cons '&optional (list-of-t opt))))
@@ -1185,10 +1197,14 @@
 ;;; EXPLICIT-CHECK attribute, which is specified on functions that
 ;;; check their argument types as a consequence of type dispatching.
 ;;; This avoids redundant checks such as NUMBERP on the args to +, etc.
+;;; FIXME: this seems to have nothing at all to do with adding "new"
+;;; definitions, as it is only called from IR1-CONVERT-INLINE-EXPANSION.
 (defun assert-new-definition (var fun)
-  (let ((type (leaf-type var))
-        (for-real (eq (leaf-where-from var) :declared))
-        (info (info :function :info (leaf-source-name var))))
+  (let* ((type (leaf-type var))
+         (for-real (eq (leaf-where-from var) :declared))
+         (name (leaf-source-name var))
+         (info (info :function :info name))
+         (explicit-check (getf (functional-plist fun) 'explicit-check)))
     (assert-definition-type
      fun type
      ;; KLUDGE: Common Lisp is such a dynamic language that in general
@@ -1202,11 +1218,7 @@
      :unwinnage-fun (cond (info #'compiler-style-warn)
                           (for-real #'compiler-notify)
                           (t nil))
-     :really-assert
-     (and for-real
-          (not (and info
-                    (ir1-attributep (fun-info-attributes info)
-                                    explicit-check))))
+     :really-assert (and for-real (not explicit-check))
      :where (if for-real
                 "previous declaration"
                 "previous definition"))))
@@ -1258,7 +1270,26 @@
       (substitute-leaf fun var))
     fun))
 
+;;; Store INLINE-LAMBDA as the inline expansion of NAME.
 (defun %set-inline-expansion (name defined-fun inline-lambda)
+  (cond ((member inline-lambda '(:accessor :predicate))
+         ;; Special-case that implies a structure-related source-transform.
+         (when (info :function :inline-expansion-designator name)
+           ;; Any inline expansion that existed can't be useful.
+           (warn "structure ~(~A~) ~S clobbers inline function"
+                 inline-lambda name))
+         (setq inline-lambda nil)) ; will be cleared below
+        (t
+         ;; Warn if stomping on a structure predicate or accessor
+         ;; whether or not we are about to install an inline-lambda.
+         (let ((info (info :function :source-transform name)))
+           (when (consp info)
+             (clear-info :function :source-transform name)
+             ;; This is serious enough that you can get two warnings:
+             ;; - one because you redefined a function at all,
+             ;; - and one because the source-transform is erased.
+             (warn "redefinition of ~S clobbers structure ~:[accessor~;predicate~]"
+                   name (eq (cdr info) :predicate))))))
   (cond (inline-lambda
          (setf (info :function :inline-expansion-designator name)
                inline-lambda)
@@ -1270,15 +1301,18 @@
 
 ;;; the even-at-compile-time part of DEFUN
 ;;;
-;;; The INLINE-LAMBDA is a LAMBDA-WITH-LEXENV, or NIL if there is no
-;;; inline expansion.
+;;; The INLINE-LAMBDA is either the symbol :ACCESSOR, meaning that
+;;; the function is a structure accessor, or a LAMBDA-WITH-LEXENV,
+;;; or NIL if there is no inline expansion.
 (defun %compiler-defun (name inline-lambda compile-toplevel)
   (let ((defined-fun nil)) ; will be set below if we're in the compiler
     (when compile-toplevel
       (with-single-package-locked-error
           (:symbol name "defining ~S as a function")
         (setf defined-fun
-              (if inline-lambda
+              (if (consp inline-lambda)
+                  ;; FIFTH as an accessor - how informative!
+                  ;; Obfuscation aside, I doubt this is even right.
                   (get-defined-fun name (fifth inline-lambda))
                   (get-defined-fun name))))
       (when (boundp '*lexenv*)

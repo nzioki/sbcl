@@ -75,12 +75,6 @@
               (t
                (,accessor uses))))))
 
-#!-sb-fluid (declaim (inline lvar-derived-type))
-(defun lvar-derived-type (lvar)
-  (declare (type lvar lvar))
-  (or (lvar-%derived-type lvar)
-      (setf (lvar-%derived-type lvar)
-            (%lvar-derived-type lvar))))
 (defun %lvar-derived-type (lvar)
   (lvar-type-using lvar node-derived-type))
 
@@ -235,20 +229,8 @@
                               (t (coerce-to-values type)))))
                dest)))))
   (or (lvar-%externally-checkable-type lvar) *wild-type*))
-#!-sb-fluid(declaim (inline flush-lvar-externally-checkable-type))
-(defun flush-lvar-externally-checkable-type (lvar)
-  (declare (type lvar lvar))
-  (setf (lvar-%externally-checkable-type lvar) nil))
 
 ;;;; interface routines used by optimizers
-
-(declaim (inline reoptimize-component))
-(defun reoptimize-component (component kind)
-  (declare (type component component)
-           (type (member nil :maybe t) kind))
-  (aver kind)
-  (unless (eq (component-reoptimize component) t)
-    (setf (component-reoptimize component) kind)))
 
 ;;; This function is called by optimizers to indicate that something
 ;;; interesting has happened to the value of LVAR. Optimizers must
@@ -2210,7 +2192,11 @@
 (defun delete-cast (cast)
   (declare (type cast cast))
   (let ((value (cast-value cast))
-        (lvar (node-lvar cast)))
+        (lvar (cast-lvar cast)))
+    (when (and (bound-cast-p cast)
+               (bound-cast-check cast))
+      (flush-combination (bound-cast-check cast))
+      (setf (bound-cast-check cast) nil))
     (delete-filter cast lvar value)
     (when lvar
       (reoptimize-lvar lvar)
@@ -2252,9 +2238,18 @@
         (atype (cast-asserted-type cast)))
     (unless (or do-not-optimize
                 (not (may-delete-vestigial-exit cast)))
+      (when (and (bound-cast-p cast)
+                 (bound-cast-check cast)
+                 (constant-lvar-p (bound-cast-bound cast)))
+        (setf atype
+              (specifier-type `(integer 0 (,(lvar-value (bound-cast-bound cast)))))
+              (cast-asserted-type cast) atype
+              (bound-cast-derived cast) t))
       (let ((lvar (node-lvar cast)))
-        (when (values-subtypep (lvar-derived-type value)
-                               (cast-asserted-type cast))
+        (when (and (or (not (bound-cast-p cast))
+                       (bound-cast-derived cast))
+                   (values-subtypep (lvar-derived-type value)
+                                    (cast-asserted-type cast)))
           (delete-cast cast)
           (return-from ir1-optimize-cast t))
 
@@ -2283,41 +2278,54 @@
                              (eq (basic-combination-kind use) :local))
                     (merges use))))
               (dolist (use (merges))
-                (merge-tail-sets use)))))))
+                (merge-tail-sets use))))))
+
+      (when (and (bound-cast-p cast)
+                 (bound-cast-check cast)
+                 (policy cast (= insert-array-bounds-checks 0)))
+        (flush-combination (bound-cast-check cast))
+        (setf (bound-cast-check cast) nil)))
 
     (let* ((value-type (lvar-derived-type value))
            (int (values-type-intersection value-type atype)))
       (derive-node-type cast int)
-      (when (eq int *empty-type*)
-        (unless (eq value-type *empty-type*)
-
-          ;; FIXME: Do it in one step.
-          (let ((context (node-source-form cast))
-                (detail (lvar-all-sources (cast-value cast))))
-            (filter-lvar
-             value
-             (if (cast-single-value-p cast)
-                 `(list 'dummy)
-                 `(multiple-value-call #'list 'dummy)))
-            (filter-lvar
-             (cast-value cast)
-             ;; FIXME: Derived type.
-             `(%compile-time-type-error 'dummy
-                                        ',(type-specifier atype)
-                                        ',(type-specifier value-type)
-                                        ',detail
-                                        ',(compile-time-type-error-context context))))
-          ;; KLUDGE: FILTER-LVAR does not work for non-returning
-          ;; functions, so we declare the return type of
-          ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
-          ;; here.
-          (setq value (cast-value cast))
-          (derive-node-type (lvar-uses value) *empty-type*)
-          (maybe-terminate-block (lvar-uses value) nil)
-          ;; FIXME: Is it necessary?
-          (aver (null (block-pred (node-block cast))))
-          (delete-block-lazily (node-block cast))
-          (return-from ir1-optimize-cast)))
+      (cond ((or
+              (neq int *empty-type*)
+              (eq value-type *empty-type*)))
+            ;; No need to transform into an analog of
+            ;; %COMPILE-TIME-TYPE-ERROR, %CHECK-BOUND will signal at
+            ;; run-time and %CHECK-BOUND ir2-converter will signal at
+            ;; compile-time if it survives further stages of ir1
+            ;; optimization.
+            ((bound-cast-p cast))
+            (t
+             ;; FIXME: Do it in one step.
+             (let ((context (node-source-form cast))
+                   (detail (lvar-all-sources (cast-value cast))))
+               (filter-lvar
+                value
+                (if (cast-single-value-p cast)
+                    `(list 'dummy)
+                    `(multiple-value-call #'list 'dummy)))
+               (filter-lvar
+                (cast-value cast)
+                ;; FIXME: Derived type.
+                `(%compile-time-type-error 'dummy
+                                           ',(type-specifier atype)
+                                           ',(type-specifier value-type)
+                                           ',detail
+                                           ',(compile-time-type-error-context context))))
+             ;; KLUDGE: FILTER-LVAR does not work for non-returning
+             ;; functions, so we declare the return type of
+             ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
+             ;; here.
+             (setq value (cast-value cast))
+             (derive-node-type (lvar-uses value) *empty-type*)
+             (maybe-terminate-block (lvar-uses value) nil)
+             ;; FIXME: Is it necessary?
+             (aver (null (block-pred (node-block cast))))
+             (delete-block-lazily (node-block cast))
+             (return-from ir1-optimize-cast)))
       (when (eq (node-derived-type cast) *empty-type*)
         (maybe-terminate-block cast nil))
 

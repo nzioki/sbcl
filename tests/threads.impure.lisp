@@ -190,6 +190,10 @@
                  (multiple-value-list
                   (join-thread (make-thread (lambda () (values 1 2 3))))))))
 
+;; Used to signal a SIMPLE-ERROR about a recursive lock attempt.
+(with-test (:name (join-thread :self-join))
+  (assert-error (join-thread *current-thread*) join-thread-error))
+
 ;;; We had appalling scaling properties for a while.  Make sure they
 ;;; don't reappear.
 (defun scaling-test (function &optional (nthreads 5))
@@ -544,6 +548,22 @@
       (assert (zerop (count-live-threads waiters)))
       (assert (zerop (count-live-threads more-waiters))))))
 
+;; At some point %DECREMENT-SEMAPHORE did not adjust the remaining
+;; timeout after spurious wakeups, potentially leading to
+;; longer/infinite waiting despite the specified timeout.
+(with-test (:name (:semaphore :timeout :spurious-wakeup))
+  (let* ((semaphore (make-semaphore))
+         (done nil)
+         (thread (make-thread (lambda ()
+                                (let ((mutex (semaphore-mutex semaphore))
+                                      (queue (semaphore-queue semaphore)))
+                                  (loop :until done :do
+                                     (with-mutex (mutex)
+                                       (condition-notify queue))))))))
+    (assert (eq nil (wait-on-semaphore semaphore :timeout .5)))
+    (setf done t)
+    (join-thread thread)))
+
 (format t "~&semaphore tests done~%")
 
 (defun test-interrupt (function-to-interrupt &optional quit-p)
@@ -648,8 +668,8 @@
             (lambda ()
               (handler-bind ((error #'(lambda (cond)
                                         (princ cond)
-                                        (sb-debug:backtrace
-                                         most-positive-fixnum))))
+                                        (sb-debug:print-backtrace
+                                         :count most-positive-fixnum))))
                 (loop (check-interrupt-count
                        (counter-n *interrupt-counter*))))))))
     (let ((func (lambda ()
@@ -911,7 +931,7 @@
         (fool1 (cons 1 2))
         (fool2 (cons 2 3)))
     (progv (list mysym) '(nil)
-      (let* ((i (get-lisp-obj-address (sb-vm:symbol-tls-index mysym)))
+      (let* ((i (get-lisp-obj-address (sb-kernel:symbol-tls-index mysym)))
              (j (+ i sb-vm:n-word-bytes)))
         (assert (eql (sap-ref-word (current-thread-sap) j)
                      sb-vm:no-tls-value-marker-widetag))
@@ -936,7 +956,7 @@
 (defun oops (e)
   (setf *errors* e)
   (format t "~&oops: ~A in ~S~%" e *current-thread*)
-  (sb-debug:backtrace)
+  (sb-debug:print-backtrace)
   (catch 'done))
 
 (with-test (:name (:unsynchronized-hash-table)
@@ -1252,7 +1272,7 @@
                                  (lambda ()
                                    (dotimes (i 1000)
                                      (with-output-to-string (*debug-io*)
-                                       (sb-debug::backtrace 10))))))))
+                                       (sb-debug:print-backtrace :count 10))))))))
     (wait-for-threads threads)))
 
 (format t "backtrace test done~%")

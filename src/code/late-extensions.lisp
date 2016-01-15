@@ -57,7 +57,7 @@
          (slotd (or (and dd (find slot (dd-slots dd) :key #'dsd-name))
                     (error "Slot ~S not found in ~S." slot structure)))
          (index (dsd-index slotd))
-         #!-interleaved-raw-slots (raw-type (dsd-raw-type slotd)))
+         #!-interleaved-raw-slots (rsd (sb!kernel::dsd-raw-slot-data slotd)))
     `(progn
        (declaim (inline ,name))
        (defun ,name (instance)
@@ -69,11 +69,11 @@
                  #!+interleaved-raw-slots
                  (* (+ sb!vm:instance-slots-offset index) sb!vm:n-word-bytes)
                  #!-interleaved-raw-slots
-                 (* (if (eq t raw-type)
+                 (* (if (not rsd)
                         (+ sb!vm:instance-slots-offset index)
                         (- (1+ (sb!kernel::dd-instance-length dd))
                            sb!vm:instance-slots-offset index
-                           (1- (sb!kernel::raw-slot-words raw-type))))
+                           (1- (sb!kernel::raw-slot-data-n-words rsd))))
                     sb!vm:n-word-bytes))))))))
 
 ;;;; ATOMIC-INCF and ATOMIC-DECF
@@ -113,12 +113,12 @@
            (invalid-place))
          (with-unique-names (array)
            `(let ((,array (the (simple-array word (*)) ,(car args))))
-              #!+(or x86 x86-64 ppc)
+              #!+compare-and-swap-vops
               (%array-atomic-incf/word
                ,array
-               (%check-bound ,array (array-dimension ,array 0) ,(cadr args))
+               (check-bound ,array (array-dimension ,array 0) ,(cadr args))
                ,(compute-delta))
-              #!-(or x86 x86-64 ppc)
+              #!-compare-and-swap-vops
               ,(with-unique-names (index old-value)
                 `(without-interrupts
                   (let* ((,index ,(cadr args))
@@ -156,14 +156,13 @@
            (when (dsd-read-only slotd)
              (error "Cannot use ~S with structure accessor for a read-only slot: ~S"
                     name place))
-           #!+(or x86 x86-64 ppc)
+           #!+compare-and-swap-vops
            `(truly-the sb!vm:word
              (%raw-instance-atomic-incf/word
               (the ,(dd-name (car accessor-info)) ,@args)
               ,(dsd-index slotd)
               ,(compute-delta)))
-                 ;; No threads outside x86 and x86-64 for now, so this is easy...
-           #!-(or x86 x86-64 ppc)
+           #!-compare-and-swap-vops
            (with-unique-names (structure old-value)
              `(without-interrupts
                (let* ((,structure ,@args)
@@ -232,7 +231,7 @@ EXPERIMENTAL: Interface subject to change."
   (expand-atomic-frob 'atomic-decf place diff env))
 
 ;; Interpreter stubs for ATOMIC-INCF.
-#!+(or x86 x86-64 ppc)
+#!+compare-and-swap-vops
 (progn
   ;; argument types are declared in vm-fndb
   (defun %array-atomic-incf/word (array index diff)
@@ -313,12 +312,13 @@ See also DEFGLOBAL which assigns the VALUE at compile-time too."
   (%compiler-defglobal name :always-bound value (not boundp))
   (when docp
     (setf (fdocumentation name 'variable) doc))
-  (sb!c:with-source-location (source-location)
+  (when source-location
     (setf (info :source-location :variable name) source-location))
   name)
 
 ;;;; WAIT-FOR -- waiting on arbitrary conditions
 
+#-sb-xc-host
 (defun %%wait-for (test stop-sec stop-usec)
   (declare (function test))
   (labels ((try ()
@@ -376,6 +376,7 @@ See also DEFGLOBAL which assigns the VALUE at compile-time too."
                        (t
                         (return-from %%wait-for nil))))))))
 
+#-sb-xc-host
 (defun %wait-for (test timeout)
   (declare (function test))
   (tagbody
@@ -431,8 +432,8 @@ returns NIL each time."
 designated by UPDATE-FN with ARGUMENTS and the previous value of PLACE.
 
 PLACE may be read and UPDATE-FN evaluated and called multiple times before the
-update succeeds: atomicity in this context means that value of place did not
-change between the time it was read, and the time it was replaced with the
+update succeeds: atomicity in this context means that the value of PLACE did
+not change between the time it was read, and the time it was replaced with the
 computed value.
 
 PLACE can be any place supported by SB-EXT:COMPARE-AND-SWAP.
@@ -536,3 +537,71 @@ version 1[.0.0...] or greater."
                or later is required)."
               (lisp-implementation-version)
               subversions))))
+
+;;; Signalling an error when trying to print an error condition is
+;;; generally a PITA, so whatever the failure encountered when
+;;; wondering about FILE-POSITION within a condition printer, 'tis
+;;; better silently to give up than to try to complain.
+(defun file-position-or-nil-for-error (stream &optional (pos nil posp))
+  ;; Arguably FILE-POSITION shouldn't be signalling errors at all; but
+  ;; "NIL if this cannot be determined" in the ANSI spec doesn't seem
+  ;; absolutely unambiguously to prohibit errors when, e.g., STREAM
+  ;; has been closed so that FILE-POSITION is a nonsense question. So
+  ;; my (WHN) impression is that the conservative approach is to
+  ;; IGNORE-ERRORS. (I encountered this failure from within a homebrew
+  ;; defsystemish operation where the ERROR-STREAM had been CL:CLOSEd,
+  ;; I think by nonlocally exiting through a WITH-OPEN-FILE, by the
+  ;; time an error was reported.)
+  (ignore-errors
+   (if posp
+       (file-position stream pos)
+       (file-position stream))))
+
+(defun stream-error-position-info (stream &optional position)
+  (when (and (not position) (form-tracking-stream-p stream))
+    (let ((line/col (line/col-from-charpos stream)))
+      (return-from stream-error-position-info
+        `((:line ,(car line/col))
+          (:column ,(cdr line/col))
+          ,@(let ((position (file-position-or-nil-for-error stream)))
+              ;; FIXME: 1- is technically broken for multi-byte external
+              ;; encodings, albeit bug-compatible with the broken code in
+              ;; the general case (below) for non-form-tracking-streams.
+              ;; i.e. If you position to this byte, it might not be the
+              ;; first byte of any character.
+              (when position `((:file-position ,(1- position)))))))))
+
+  ;; Give up early for interactive streams and non-character stream.
+  (when (or (ignore-errors (interactive-stream-p stream))
+            (not (subtypep (ignore-errors (stream-element-type stream))
+                           'character)))
+    (return-from stream-error-position-info))
+
+  (flet ((read-content (old-position position)
+           "Read the content of STREAM into a buffer in order to count
+lines and columns."
+           (unless (and old-position position
+                        (< position sb!xc:array-dimension-limit))
+             (return-from read-content))
+           (let ((content
+                   (make-string position :element-type (stream-element-type stream))))
+             (when (and (file-position-or-nil-for-error stream :start)
+                        (eql position (ignore-errors (read-sequence content stream))))
+               (file-position-or-nil-for-error stream old-position)
+               content)))
+         ;; Lines count from 1, columns from 0. It's stupid and
+         ;; traditional.
+         (line (string)
+           (1+ (count #\Newline string)))
+         (column (string position)
+           (- position (or (position #\Newline string :from-end t) 0))))
+   (let* ((stream-position (file-position-or-nil-for-error stream))
+          (position (or position
+                        ;; FILE-POSITION is the next character --
+                        ;; error is at the previous one.
+                        (and stream-position (plusp stream-position)
+                             (1- stream-position))))
+          (content (read-content stream-position position)))
+     `(,@(when content `((:line ,(line content))
+                         (:column ,(column content position))))
+       ,@(when position `((:file-position ,position)))))))

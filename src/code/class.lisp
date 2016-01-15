@@ -170,11 +170,11 @@
   (declare (type layout layout))
   (declare (ignore env))
   (when (layout-invalid layout)
-    (compiler-error "can't dump reference to obsolete class: ~S"
-                    (layout-classoid layout)))
+    (sb!c::compiler-error "can't dump reference to obsolete class: ~S"
+                          (layout-classoid layout)))
   (let ((name (classoid-name (layout-classoid layout))))
     (unless name
-      (compiler-error "can't dump anonymous LAYOUT: ~S" layout))
+      (sb!c::compiler-error "can't dump anonymous LAYOUT: ~S" layout))
     ;; Since LAYOUT refers to a class which refers back to the LAYOUT,
     ;; we have to do this in two stages, like the TREE-WITH-PARENT
     ;; example in the MAKE-LOAD-FORM entry in the ANSI spec.
@@ -295,7 +295,9 @@ between the ~A definition and the ~A definition"
                           layout)
                 find-and-init-or-check-layout))
 (defun find-and-init-or-check-layout (name length inherits depthoid metadata)
-  (with-world-lock ()
+  (truly-the ; avoid an "assertion too complex to check" optimizer note
+   (values layout &optional)
+   (with-world-lock ()
     (let ((layout (find-layout name)))
       (%init-or-check-layout layout
                              (or (find-classoid name nil)
@@ -303,7 +305,7 @@ between the ~A definition and the ~A definition"
                              length
                              inherits
                              depthoid
-                             metadata))))
+                             metadata)))))
 
 ;;; Record LAYOUT as the layout for its class, adding it as a subtype
 ;;; of all superclasses. This is the operation that "installs" a
@@ -569,16 +571,22 @@ between the ~A definition and the ~A definition"
 
           (remhash name table)
           (%note-type-defined name)
+          ;; FIXME: I'm unconvinced of the need to handle either of these.
+          ;; Package locks preclude the latter, and in the former case,
+          ;; once you've made some random thing into a :PRIMITIVE kind of type,
+          ;; you've painted yourself into a corner - those types
+          ;; elicit vociferous complaints if you try to redefine them.
+          ;;
           ;; we need to handle things like
           ;;   (setf (find-class 'foo) (find-class 'integer))
           ;; and
           ;;   (setf (find-class 'integer) (find-class 'integer))
           (cond ((built-in-classoid-p new-value)
+                 ;; But I can't figure out how to get assertions to pass
+                 ;; without violation what would otherwise be invariants
+                 ;; of the internal representation of types. This sucks.
                  (setf (info :type :kind name)
-                       (or (info :type :kind name) :defined))
-                 (let ((translation (built-in-classoid-translation new-value)))
-                   (when translation
-                     (setf (info :type :translator name) translation))))
+                       (or (info :type :kind name) :defined)))
                 (t
                  (setf (info :type :kind name) :instance)))
           (setf (classoid-cell-classoid cell) new-value)
@@ -646,8 +654,10 @@ between the ~A definition and the ~A definition"
 
 ;;;; CLASS type operations
 
-;; referenced right away by !DEFINE-TYPE-CLASS.
-(eval-when (:compile-toplevel :load-toplevel :execute)
+;; CLASSOID-ENUMERABLE-P is referenced during compile by !DEFINE-TYPE-CLASS.
+;; But don't redefine it when building the target since we've already
+;; got a perfectly good definition loaded for the host.
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   ;; Actually this definition makes very little sense because
   ;;     (TYPE-ENUMERABLE (FIND-CLASSOID 'CHARACTER)) => T
   ;; but (TYPE-ENUMERABLE (SPECIFIER-TYPE 'CHARACTER)) => NIL.
@@ -665,8 +675,12 @@ between the ~A definition and the ~A definition"
 ;;; class comparison, we must ensure that both are valid before
 ;;; proceeding.
 (defun %ensure-classoid-valid (classoid layout error-context)
+  (declare (ignorable error-context)) ; not used on host
   (aver (eq classoid (layout-classoid layout)))
   (or (not (layout-invalid layout))
+      ;; Avoid accidentally reaching code that can't work.
+      #+sb-xc-host (bug "(TYPEP x 'STANDARD-CLASSOID) can't be tested")
+      #-sb-xc-host
       (if (typep classoid 'standard-classoid)
           (let ((class (classoid-pcl-class classoid)))
             (cond
@@ -699,6 +713,7 @@ between the ~A definition and the ~A definition"
                  (%ensure-classoid-valid class2 layout2 errorp))
       (return-from %ensure-both-classoids-valid nil))))
 
+#-sb-xc-host ; No such thing as LAYOUT-OF, never mind the rest
 (defun update-object-layout-or-invalid (object layout)
   ;; FIXME: explain why this isn't (LAYOUT-FOR-STD-CLASS-P LAYOUT).
   (if (layout-for-std-class-p (layout-of object))
@@ -802,24 +817,10 @@ between the ~A definition and the ~A definition"
       (values nil nil)
       (invoke-complex-subtypep-arg1-method type1 class2 nil t)))
 
-(!define-type-method (classoid :negate) (type)
-  (make-negation-type :type type))
+(!define-type-method (classoid :negate) (type) (make-negation-type type))
 
 (!define-type-method (classoid :unparse) (type)
   (classoid-proper-name type))
-
-;;;; PCL stuff
-
-;;; the CLASSOID that we use to represent type information for
-;;; STANDARD-CLASS and FUNCALLABLE-STANDARD-CLASS.  The type system
-;;; side does not need to distinguish between STANDARD-CLASS and
-;;; FUNCALLABLE-STANDARD-CLASS.
-(def!struct (standard-classoid (:include classoid)
-                               (:constructor make-standard-classoid)))
-;;; a metaclass for classes which aren't standardlike but will never
-;;; change either.
-(def!struct (static-classoid (:include classoid)
-                             (:constructor make-static-classoid)))
 
 ;;;; built-in classes
 
@@ -1038,14 +1039,14 @@ between the ~A definition and the ~A definition"
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(unsigned-byte 32)))
-     #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+     #!+64-bit
      (simple-array-unsigned-byte-63
       :translation (simple-array (unsigned-byte 63) (*))
       :codes (#.sb!vm:simple-array-unsigned-byte-63-widetag)
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(unsigned-byte 63)))
-     #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+     #!+64-bit
      (simple-array-unsigned-byte-64
       :translation (simple-array (unsigned-byte 64) (*))
       :codes (#.sb!vm:simple-array-unsigned-byte-64-widetag)
@@ -1081,7 +1082,7 @@ between the ~A definition and the ~A definition"
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(signed-byte 32)))
-     #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+     #!+64-bit
      (simple-array-signed-byte-64
       :translation (simple-array (signed-byte 64) (*))
       :codes (#.sb!vm:simple-array-signed-byte-64-widetag)
@@ -1218,7 +1219,8 @@ between the ~A definition and the ~A definition"
                                      (list (car inherits))
                                      '(t))))
         x
-      (declare (ignore codes state translation prototype-form))
+      (declare (ignore codes state translation prototype-form)
+               (notinline info (setf info)))
       (let ((inherits-list (if (eq name t)
                                ()
                                (cons t (reverse inherits))))
@@ -1311,6 +1313,9 @@ between the ~A definition and the ~A definition"
 ;;;; class definition/redefinition
 
 ;;; This is to be called whenever we are altering a class.
+#+sb-xc-host
+(defun %modify-classoid (classoid) (bug "MODIFY-CLASSOID ~S" classoid))
+#-sb-xc-host
 (defun %modify-classoid (classoid)
   (clear-type-caches)
   (when (member (classoid-state classoid) '(:read-only :frozen))

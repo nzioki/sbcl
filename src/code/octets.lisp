@@ -446,3 +446,56 @@ one-past-the-end"
         ((octet-decoding-error (lambda (c)
                                  (use-value ,cname c))))
       ,@body))))
+
+;;; This function was moved from 'fd-stream' because it depends on
+;;; the various error classes, two of which are defined just above.
+(defun get-external-format (external-format)
+  (flet ((keyword-external-format (keyword)
+           (declare (type keyword keyword))
+           (gethash keyword *external-formats*))
+         (replacement-handlerify (entry replacement)
+           (when entry
+             (wrap-external-format-functions
+              entry
+              (lambda (fun)
+                (and fun
+                     (lambda (&rest rest)
+                       (declare (dynamic-extent rest))
+                       (handler-bind
+                           ((stream-decoding-error
+                             (lambda (c)
+                               (declare (ignore c))
+                               (invoke-restart 'input-replacement replacement)))
+                            (stream-encoding-error
+                             (lambda (c)
+                               (declare (ignore c))
+                               (invoke-restart 'output-replacement replacement)))
+                            (octets-encoding-error
+                             (lambda (c) (use-value replacement c)))
+                            (octet-decoding-error
+                             (lambda (c) (use-value replacement c))))
+                         (apply fun rest)))))))))
+    (typecase external-format
+      (keyword (keyword-external-format external-format))
+      ((cons keyword)
+       (let ((entry (keyword-external-format (car external-format)))
+             (replacement (getf (cdr external-format) :replacement)))
+         (if replacement
+             (replacement-handlerify entry replacement)
+             entry))))))
+
+(defun unintern-init-only-stuff ()
+  (let ((this-package (find-package "SB-IMPL")))
+    (dolist (s '(char-class char-class2 char-class3
+                 steve-splice))
+      (unintern s this-package))
+    (flet ((ends-with-p (s1 s2)
+             (let ((diff (- (length s1) (length s2))))
+               (and (>= diff 0) (string= s1 s2 :start1 diff)))))
+      (do-symbols (s this-package)
+        (let ((name (symbol-name s)))
+          (if (and (macro-function s)
+                   (eql (mismatch name "DEFINE-") 7)
+                   (or (ends-with-p name "->STRING")
+                       (ends-with-p name "->STRING*")))
+              (unintern s this-package)))))))

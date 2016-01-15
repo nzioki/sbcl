@@ -74,8 +74,7 @@
         (return (simple-eval-in-lexenv (first i) lexenv)))))
 
 (defun simple-eval-locally (exp lexenv &key vars)
-  (multiple-value-bind (body decls)
-      (parse-body (rest exp) :doc-string-allowed nil)
+  (multiple-value-bind (body decls) (parse-body (rest exp) nil)
     (let ((lexenv
            ;; KLUDGE: Uh, yeah.  I'm not anticipating
            ;; winning any prizes for this code, which was
@@ -261,11 +260,16 @@
 
 (defun eval-in-lexenv (exp lexenv)
   #!+sb-eval
+  (let ((lexenv (or lexenv (make-null-lexenv))))
+    (if (eq *evaluator-mode* :compile)
+        (simple-eval-in-lexenv exp lexenv)
+        (sb!eval:eval-in-native-environment exp lexenv)))
+  #!+sb-fasteval
   (if (eq *evaluator-mode* :compile)
-      (simple-eval-in-lexenv exp lexenv)
-      (sb!eval:eval-in-native-environment exp lexenv))
-  #!-sb-eval
-  (simple-eval-in-lexenv exp lexenv))
+      (simple-eval-in-lexenv exp (or lexenv (make-null-lexenv)))
+      (sb!interpreter:eval-in-environment exp lexenv))
+  #!-(or sb-eval sb-fasteval)
+  (simple-eval-in-lexenv exp (or lexenv (make-null-lexenv))))
 
 (defun eval (original-exp)
   #!+sb-doc
@@ -274,9 +278,9 @@
   (let ((*eval-source-context* original-exp)
         (*eval-tlf-index* nil)
         (*eval-source-info* nil))
-    (eval-in-lexenv original-exp (make-null-lexenv))))
+    (eval-in-lexenv original-exp nil)))
 
-(defun eval-tlf (original-exp tlf-index &optional (lexenv (make-null-lexenv)))
+(defun eval-tlf (original-exp tlf-index &optional lexenv)
   (let ((*eval-source-context* original-exp)
         (*eval-tlf-index* tlf-index)
         (*eval-source-info* sb!c::*source-info*))

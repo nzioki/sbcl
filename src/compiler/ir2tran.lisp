@@ -29,29 +29,6 @@
       (combination-step-info node)
       nil))
 
-;;; If there is any CHECK-xxx template for TYPE, then return it,
-;;; otherwise return NIL.
-(defun type-check-template (type)
-  (declare (type ctype type))
-  (multiple-value-bind (check-ptype exact) (primitive-type type)
-    (if exact
-        (primitive-type-check check-ptype)
-        (let ((name (hairy-type-check-template-name type)))
-          (if name
-              (template-or-lose name)
-              nil)))))
-
-;;; Emit code in BLOCK to check that VALUE is of the specified TYPE,
-;;; yielding the checked result in RESULT. VALUE and result may be of
-;;; any primitive type. There must be CHECK-xxx VOP for TYPE. Any
-;;; other type checks should have been converted to an explicit type
-;;; test.
-(defun emit-type-check (node block value result type)
-  (declare (type tn value result) (type node node) (type ir2-block block)
-           (type ctype type))
-  (emit-move-template node block (type-check-template type) value result)
-  (values))
-
 ;;; Allocate an indirect value cell.
 (defevent make-value-cell-event "Allocate heap value cell for lexical var.")
 (defun emit-make-value-cell (node block value res)
@@ -562,27 +539,6 @@
           dest))
   (values))
 
-;;; Move each SRC TN into the corresponding DEST TN, checking types
-;;; and defaulting any unsupplied source values to NIL
-(defun move-results-checked (node block src dest types)
-  (declare (type node node) (type ir2-block block) (list src dest types))
-  (let ((nsrc (length src))
-        (ndest (length dest))
-        (ntypes (length types)))
-    (mapc (lambda (from to type)
-            (if type
-                (emit-type-check node block from to type)
-                (emit-move node block from to)))
-          (if (> ndest nsrc)
-              (append src (make-list (- ndest nsrc)
-                                     :initial-element (emit-constant nil)))
-              src)
-          dest
-          (if (> ndest ntypes)
-              (append types (make-list (- ndest ntypes)))
-              types)))
-  (values))
-
 ;;; If necessary, emit coercion code needed to deliver the RESULTS to
 ;;; the specified lvar. NODE and BLOCK provide context for emitting
 ;;; code. Although usually obtained from STANDARD-RESULT-TNs or
@@ -621,27 +577,26 @@
              (2lvar (lvar-info lvar))
              (value (cast-value node))
              (2value (lvar-info value)))
-    (cond ((eq (ir2-lvar-kind 2lvar) :unused))
-          ((eq (ir2-lvar-kind 2lvar) :unknown)
-           (aver (eq (ir2-lvar-kind 2value) :unknown))
-           (aver (not (cast-type-check node)))
-           (move-results-coerced node block
-                                 (ir2-lvar-locs 2value)
-                                 (ir2-lvar-locs 2lvar)))
-          ((eq (ir2-lvar-kind 2lvar) :fixed)
-           (aver (eq (ir2-lvar-kind 2value) :fixed))
-           (if (cast-type-check node)
-               (move-results-checked node block
-                                     (ir2-lvar-locs 2value)
-                                     (ir2-lvar-locs 2lvar)
-                                     (multiple-value-bind (check types)
-                                         (cast-check-types node nil)
-                                       (aver (eq check :simple))
-                                       types))
-               (move-results-coerced node block
-                                     (ir2-lvar-locs 2value)
-                                     (ir2-lvar-locs 2lvar))))
-          (t (bug "CAST cannot be :DELAYED.")))))
+    (ecase (ir2-lvar-kind 2lvar)
+      (:unused)
+      ((:unknown :fixed)
+       (aver (not (cast-type-check node)))
+       (move-results-coerced node block
+                             (ir2-lvar-locs 2value)
+                             (ir2-lvar-locs 2lvar))))))
+
+(defoptimizer (%check-bound ir2-convert)
+    ((array bound index) node block)
+  (when (constant-lvar-p bound)
+    (let* ((bound-type (specifier-type `(integer 0 (,(lvar-value bound)))))
+           (index-type (lvar-type index)))
+      (when (eq (type-intersection bound-type index-type)
+                *empty-type*)
+        (let ((*compiler-error-context* node))
+          (compiler-warn "Derived type ~s is not a suitable index for ~s."
+                         (type-specifier index-type)
+                         (type-specifier (lvar-type array)))))))
+  (ir2-convert-template node block))
 
 ;;;; template conversion
 
@@ -1182,6 +1137,19 @@
          (fname (lvar-fun-name lvar t)))
     (declare (type (or symbol cons) fname))
 
+    ;; Warn about cross-compiling certain full-calls,
+    ;; as it is indicative of dependency order problems.
+    #+sb-xc-host
+    (let ((compname (component-name (node-component node))))
+      ;; Don't care too much about macro performance.
+      (unless (and (stringp compname) (string/= compname "DEF!MACRO"))
+        ;; Catch FOO and (SETF FOO) both.
+        (let ((stem (if (atom fname) fname (second fname))))
+          (when (member stem
+                        sb-cold::*full-calls-to-warn-about*
+                        :test #'string=)
+            (warn "Full call to ~S" fname)))))
+
     (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
                                 (fun-lexically-notinline-p fname))))
            (inlineable-bit (if inlineable-p 1 0))
@@ -1270,10 +1238,11 @@
                       ((and optional
                             (not (optional-dispatch-more-entry ef)))
                        (optional-dispatch-max-args ef)))))
-      (vop verify-arg-count node block
-           arg-count-location
-           min
-           max))))
+      (unless (and (eql min 0) (not max))
+        (vop verify-arg-count node block
+             arg-count-location
+             min
+             max)))))
 
 ;;; Do all the stuff that needs to be done on XEP entry:
 ;;; -- Create frame.
@@ -1908,23 +1877,32 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 (macrolet ((def (name)
              `(defoptimizer (,name ir2-convert) ((&rest args) node block)
-                (let* ((refs (reference-tn-list
-                              (loop for arg in args
-                                    for tn = (make-normal-tn *backend-t-primitive-type*)
-                                    do
-                                    (emit-move node block (lvar-tn node block arg) tn)
-                                    collect tn)
-                              nil))
-                       (lvar (node-lvar node))
-                       (res (lvar-result-tns
-                             lvar
-                             (list (primitive-type (specifier-type 'list))))))
-                  (when (and lvar (lvar-dynamic-extent lvar))
-                    (vop current-stack-pointer node block
-                         (ir2-lvar-stack-pointer (lvar-info lvar))))
-                  (vop* ,name node block (refs) ((first res) nil)
-                        (length args))
-                  (move-lvar-result node block res lvar)))))
+                (cond #!+gencgc
+                      ((>= (length args)
+                           (/ sb!vm:large-object-size
+                              (* sb!vm:n-word-bytes 2)))
+                       ;; The VOPs will try to allocate all space at once
+                       ;; And it'll end up in large objects, and no conses
+                       ;; are welcome there.
+                       (ir2-convert-full-call node block))
+                      (t
+                       (let* ((refs (reference-tn-list
+                                     (loop for arg in args
+                                           for tn = (make-normal-tn *backend-t-primitive-type*)
+                                           do
+                                           (emit-move node block (lvar-tn node block arg) tn)
+                                           collect tn)
+                                     nil))
+                              (lvar (node-lvar node))
+                              (res (lvar-result-tns
+                                    lvar
+                                    (list (primitive-type (specifier-type 'list))))))
+                         (when (and lvar (lvar-dynamic-extent lvar))
+                           (vop current-stack-pointer node block
+                                (ir2-lvar-stack-pointer (lvar-info lvar))))
+                         (vop* ,name node block (refs) ((first res) nil)
+                               (length args))
+                         (move-lvar-result node block res lvar)))))))
   (def list)
   (def list*))
 
@@ -2069,7 +2047,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                                    (leaf-has-source-name-p (ref-leaf use))
                                    (leaf-source-name (ref-leaf use))))
                         (ftype (and (info :function :info name) ; only use the FTYPE if
-                                    (info :function :type name)))) ; NAME was DEFKNOWN
+                                    (proclaimed-ftype name)))) ; NAME was DEFKNOWN
                    (unless (or (node-tail-p last)
                                (policy last (zerop safety))
                                (and (fun-type-p ftype)

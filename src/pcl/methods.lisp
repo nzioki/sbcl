@@ -174,8 +174,7 @@
 (defmethod shared-initialize :before
            ((generic-function standard-generic-function)
             slot-names
-            &key (name nil namep)
-                 (lambda-list () lambda-list-p)
+            &key (lambda-list () lambda-list-p)
                  argument-precedence-order
                  declarations
                  documentation
@@ -184,9 +183,6 @@
   (declare (ignore slot-names
                    declarations argument-precedence-order documentation
                    lambda-list lambda-list-p))
-
-  (when namep
-    (set-fun-name generic-function name))
 
   (flet ((initarg-error (initarg value string)
            (error "when initializing the generic function ~S:~%~
@@ -302,6 +298,11 @@
    ;; at this point.  Since there's no ANSI-blessed way of getting an
    ;; EQL specializer, that seems unnecessarily painful, so we are
    ;; nice to our users.  -- CSR, 2007-06-01
+   ;; Note that INTERN-EQL-SPECIALIZER is exported from SB-MOP, but MOP isn't
+   ;; part of the ANSI standard. Parsing introduces a tiny semantic problem in
+   ;; the edge case of an EQL specializer whose object is literally (EQL :X).
+   ;; That one must be supplied as a pre-parsed #<EQL-SPECIALIZER> because if
+   ;; not, we'd parse it into a specializer whose object is :X.
    (parse-specializers generic-function specializers) errorp t))
 
 ;;; Compute various information about a generic-function's arglist by looking
@@ -473,6 +474,41 @@
                     situations.~@:>"
    :format-arguments (list 'print-object)))
 
+(defun defer-ftype-computation (gf)
+  ;; Is there any reason not to do this as soon as possible?
+  ;; While doing it with every ADD/REMOVE-METHOD call could result in
+  ;; wasted work, it seems like unnecessary complexity.
+  ;; I think it's just to get through bootstrap, probably,
+  ;; but if it's a semantics thing, it deserves some explanation.
+  (let ((name (generic-function-name gf)))
+    (when (legal-fun-name-p name) ; tautological ?
+      (unless (eq (info :function :where-from name) :declared)
+        (when (and (fboundp name) (eq (fdefinition name) gf))
+          (setf (info :function :type name) :generic-function))))))
+
+(defun compute-gf-ftype (name)
+  (let ((gf (and (fboundp name) (fdefinition name))))
+    (if (generic-function-p gf)
+        (let* ((ll (generic-function-lambda-list gf))
+               ;; If the GF has &REST without &KEY then we don't augment
+               ;; the FTYPE with keywords, so as not to complain about keywords
+               ;; which seem not to be accepted.
+               (type (sb-c::ftype-from-lambda-list
+                      (if (and (member '&rest ll) (not (member '&key ll)))
+                          ll
+                          (generic-function-pretty-arglist gf)))))
+          ;; It would be nice if globaldb were transactional,
+          ;; so that either both updates or neither occur.
+          (setf (info :function :type name) type
+                (info :function :where-from name) :defined-method)
+          type)
+        ;; The defaulting expression for (:FUNCTION :TYPE) does not store
+        ;; the default. For :GENERIC-FUNCTION that is not FBOUNDP we also
+        ;; don't, however this branch should never be reached because the
+        ;; info only stores :GENERIC-FUNCTION when methods are loaded.
+        ;; Maybe AVER that it does not happen?
+        (sb-c::ftype-from-fdefn name))))
+
 (defun real-add-method (generic-function method &optional skip-dfun-update-p)
   (flet ((similar-lambda-lists-p (old-method new-lambda-list)
            (binding* (((a-llks a-nreq a-nopt)
@@ -569,7 +605,7 @@
                               :generic-function generic-function
                               :method method)
                 (update-dfun generic-function))
-              (setf (gf-info-needs-update generic-function) t)
+              (defer-ftype-computation generic-function)
               (map-dependents generic-function
                               (lambda (dep)
                                 (update-dependent generic-function
@@ -580,85 +616,30 @@
 
 (defun real-remove-method (generic-function method)
   (when (eq generic-function (method-generic-function method))
+    (flush-effective-method-cache generic-function)
     (let ((lock (gf-lock generic-function)))
       ;; System lock because interrupts need to be disabled as well:
       ;; it would be bad to unwind and leave the gf in an inconsistent
       ;; state.
       (sb-thread::with-recursive-system-lock (lock)
-        (let* ((specializers (method-specializers method)) ; flushable?
+        (let* ((specializers (method-specializers method))
                (methods (generic-function-methods generic-function))
                (new-methods (remove method methods)))
-          (declare (ignore specializers))
           (setf (method-generic-function method) nil
                 (generic-function-methods generic-function) new-methods)
-          (dolist (specializer (method-specializers method))
+          (dolist (specializer specializers)
             (remove-direct-method specializer method))
           (set-arg-info generic-function)
           (update-ctors 'remove-method
                         :generic-function generic-function
                         :method method)
           (update-dfun generic-function)
-          (setf (gf-info-needs-update generic-function) t)
+          (defer-ftype-computation generic-function)
           (map-dependents generic-function
                           (lambda (dep)
                             (update-dependent generic-function
                                               dep 'remove-method method)))))))
   generic-function)
-
-
-;; Tell INFO about the generic function's methods' keys so that the
-;; compiler doesn't complain that the keys defined for some method are
-;; unrecognized.
-(sb-ext:without-package-locks
-  (defun sb-c::maybe-update-info-for-gf (name)
-    (let ((gf (if (fboundp name) (fdefinition name))))
-      (when (and gf (generic-function-p gf) (not (early-gf-p gf))
-                 (not (eq :declared (info :function :where-from name)))
-                 (gf-info-needs-update gf))
-        (let* ((methods (generic-function-methods gf))
-               (gf-lambda-list (generic-function-lambda-list gf))
-               (tfun (constantly t))
-               keysp)
-          (multiple-value-bind (llks gf.required gf.optional gf.rest gf.keys)
-              (parse-lambda-list gf-lambda-list)
-            ;; 7.6.4 point 5 probably entails that if any method says
-            ;; &allow-other-keys then the gf should be construed to
-            ;; accept any key.
-            (let* ((allowp (or (ll-kwds-allowp llks)
-                               (find '&allow-other-keys methods
-                                     :test #'find
-                                     :key #'method-lambda-list)))
-                   (ftype
-                    (specifier-type
-                     ;; SERIOUSLY? Do we not already have like at least
-                     ;; two other variations on this code?
-                     `(function
-                       (,@(mapcar tfun gf.required)
-                          ,@(if gf.optional
-                                `(&optional ,@(mapcar tfun gf.optional)))
-                          ,@(if gf.rest
-                                `(&rest t))
-                          ,@(when (ll-kwds-keyp llks)
-                              (let ((all-keys
-                                     (mapcar
-                                      (lambda (x)
-                                        (list x t))
-                                      (remove-duplicates
-                                       (nconc
-                                        (mapcan #'function-keywords methods)
-                                        (mapcar #'parse-key-arg-spec gf.keys))))))
-                                (when all-keys
-                                  (setq keysp t)
-                                  `(&key ,@all-keys))))
-                          ,@(when (and (not keysp) allowp)
-                              `(&key))
-                          ,@(when allowp
-                              `(&allow-other-keys)))
-                       *))))
-              (setf (info :function :type name) ftype
-                    (info :function :where-from name) :defined-method
-                    (gf-info-needs-update gf) nil)
-              ftype)))))))
 
 (defun compute-applicable-methods-function (generic-function arguments)
   (values (compute-applicable-methods-using-types
@@ -729,8 +710,15 @@
                                (specl2 class-eq-specializer))
   (eq (specializer-class specl1) (specializer-class specl2)))
 
+;; FIXME: This method is wacky, and indicative of a coding style in which
+;; metaphorically the left hand does not know what the right is doing.
+;; If you want this to be the abstract comparator, and you "don't know"
+;; that EQL-specializers are interned, then the comparator should be EQL.
+;; But if you *do* know that they're interned, then why does this method
+;; exist at all? The method on SPECIALIZER works fine.
 (defmethod same-specializer-p ((specl1 eql-specializer)
                                (specl2 eql-specializer))
+  ;; A bit of deception to confuse the enemy?
   (eq (specializer-object specl1) (specializer-object specl2)))
 
 (defmethod specializer-class ((specializer eql-specializer))
@@ -1688,67 +1676,37 @@
                                (method-lambda-list method)))
     (declare (ignore nreq nopt))
     (values keywords (ll-kwds-allowp llks))))
-
-(defmethod function-keyword-parameters ((method standard-method))
-  (multiple-value-bind (llks nreq nopt keywords keyword-parameters)
-      (analyze-lambda-list (if (consp method)
-                               (early-method-lambda-list method)
-                               (method-lambda-list method)))
-    (declare (ignore nreq nopt keywords))
-    (values keyword-parameters (ll-kwds-allowp llks))))
-
-;; FIXME: this is just: "parse, set keys to nil, unparse" (I think).
-(defun method-ll->generic-function-ll (ll)
-  (multiple-value-bind (llks nreq nopt keywords keyword-parameters)
-      (analyze-lambda-list ll)
-    (declare (ignore llks nreq nopt keywords))
-    (remove-if (lambda (s)
-                 (or (memq s keyword-parameters)
-                     (eq s '&allow-other-keys)))
-               ll)))
 
 ;;; This is based on the rules of method lambda list congruency
 ;;; defined in the spec. The lambda list it constructs is the pretty
 ;;; union of the lambda lists of the generic function and of all its
-;;; methods.  It doesn't take method applicability into account at all
-;;; yet.
-
-;;; (Notice that we ignore &AUX variables as they're not part of the
-;;; "public interface" of a function.)
-
-(defmethod generic-function-pretty-arglist
-           ((generic-function standard-generic-function))
-  (let ((gf-lambda-list (generic-function-lambda-list generic-function))
-        (methods (generic-function-methods generic-function)))
-    (if (null methods)
-        gf-lambda-list
-        (multiple-value-bind (gf.llks gf.required gf.optional gf.rest gf.keys)
-            (parse-lambda-list gf-lambda-list :silent t)
-          ;; Possibly extend the keyword parameters of the gf by
-          ;; additional key parameters of its methods:
-          (let ((methods.keys nil) (methods.allowp nil))
-            (dolist (m methods)
-              (multiple-value-bind (m.keyparams m.allow-other-keys)
-                  (function-keyword-parameters m)
-                (setq methods.keys (union methods.keys m.keyparams :key #'maybe-car))
-                (setq methods.allowp (or methods.allowp m.allow-other-keys))))
-            (let ((arglist '()))
-              (when (or (ll-kwds-allowp gf.llks) methods.allowp)
-                (push '&allow-other-keys arglist))
-              (when (or gf.keys methods.keys)
-                ;; We make sure that the keys of the gf appear before
-                ;; those of its methods, since they're probably more
-                ;; generally appliable.
-                (setq arglist (nconc (list '&key) gf.keys
-                                     (nset-difference methods.keys gf.keys)
-                                     arglist)))
-              (when gf.rest
-                (setq arglist (nconc (cons '&rest gf.rest) arglist)))
-              (when gf.optional
-                (setq arglist (nconc (list '&optional) gf.optional arglist)))
-              (nconc gf.required arglist)))))))
-
-(defun maybe-car (thing)
-  (if (listp thing)
-      (car thing)
-      thing))
+;;; methods.  It doesn't take method applicability into account; we
+;;; also ignore non-public parts of the interface (e.g. &AUX, default
+;;; and supplied-p parameters)
+;;; The compiler uses this for type-checking that callers pass acceptable
+;;; keywords, so don't make this do anything fancy like looking at effective
+;;; methods without also fixing the compiler.
+(defmethod generic-function-pretty-arglist ((gf standard-generic-function))
+  (let ((gf-lambda-list (generic-function-lambda-list gf))
+        (methods (generic-function-methods gf)))
+    (flet ((canonize (k)
+             (multiple-value-bind (kw var)
+                 (parse-key-arg-spec k)
+               (if (and (eql (symbol-package kw) *keyword-package*)
+                        (string= kw var))
+                   var
+                   (list (list kw var))))))
+      (multiple-value-bind (llks required optional rest keys)
+          (parse-lambda-list gf-lambda-list :silent t)
+        (collect ((keys (mapcar #'canonize keys)))
+        ;; Possibly extend the keyword parameters of the gf by
+        ;; additional key parameters of its methods:
+          (dolist (m methods
+                     (make-lambda-list llks nil required optional rest (keys)))
+            (binding* (((m.llks nil nil nil m.keys)
+                        (parse-lambda-list (method-lambda-list m) :silent t)))
+              (setq llks (logior llks m.llks))
+              (dolist (k m.keys)
+                (unless (member (parse-key-arg-spec k) (keys)
+                                :key #'parse-key-arg-spec :test #'eq)
+                  (keys (canonize k)))))))))))

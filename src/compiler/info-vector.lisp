@@ -515,7 +515,7 @@
 
 ;; Compute the number of elements needed to hold unpacked VECTOR after packing.
 ;; This is not "compute-packed-info-size" since that could be misconstrued
-;; and wanting the vector to be already packed.
+;; as expecting the vector to be already packed.
 ;;
 (defun compute-packified-info-size (vector &optional (end (length vector)))
   (declare (simple-vector vector)) ; unpacked format
@@ -1175,6 +1175,30 @@ This is interpreted as
 (defun set-info-value (name info-number new-value)
   (when (typep name 'fixnum)
     (error "~D is not a legal INFO name." name))
+
+  ;; Storage of FAST-METHOD and SLOW-METHOD compiler info is largely pointless.
+  ;; Why? Because the compiler can't even resolve the "name" of the function in
+  ;; many cases. If there are EQL specializers involved, it's clearly impossible
+  ;; because the form X in (EQL x) needs to be evaluated. So most of the data
+  ;; can't be computed until the file defining the method is loaded. At that
+  ;; point, you know that the :KIND is :FUNCTION, and :WHERE-FROM is :DEFINED
+  ;; - they can't be anything else. And you also pretty much know the signature,
+  ;; since it is based on the specializers, so storing again is a total waste.
+  ;;
+  ;; FIXME: figure out a way not to store these, or else have globaldb ignore
+  ;; the calls to set-info-value, and mock any calls to get-info-value
+  ;; so that it looks like the data were stored, if someone tries to read it.
+  ;: Or store the data in the method object somehow so that at least dropping
+  ;; a method can drop the data. This would work because as mentioned above,
+  ;; there is mostly no such thing as purely compile-time info for methods.
+  #+nil ; So I can easily re-enable this to figure out what's going on.
+  (when (and (consp name)
+             (memq (car name) '(sb!pcl::slow-method sb!pcl::fast-method))
+             (some #'consp (car (last name))))
+    (let ((i (aref sb!c::*info-types* info-number)))
+      (warn "Globaldb storing info for ~S~% ~S ~S~% -> ~S"
+            name (meta-info-category i) (meta-info-kind i) new-value)))
+
   (let ((name (uncross name)))
     ;; If the INFO-NUMBER already exists in VECT, then copy it and
     ;; alter one cell; otherwise unpack it, grow the vector, and repack.
@@ -1247,7 +1271,7 @@ This is interpreted as
 ;; Note also that we do not do an initial attempt to read once with INFO,
 ;; followed up by a double-checking get-or-set operation. It is assumed that
 ;; the user of this already did an initial check, if such is warranted.
-(defun %get-info-value-initializing (name info-number creation-thunk)
+(defun %get-info-value-initializing (info-number name creation-thunk)
   (when (typep name 'fixnum)
     (error "~D is not a legal INFO name." name))
   (let ((name (uncross name))

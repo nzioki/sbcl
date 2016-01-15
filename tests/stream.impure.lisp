@@ -302,7 +302,7 @@
                       (read-sequence sequence stream)
                       (error "READ-SEQUENCE didn't signal an error"))
         (type-error (condition)
-          (assert (eql (type-error-datum condition) (code-char 255)))
+          (assert (eql (type-error-datum condition) 255))
           (assert (subtypep (type-error-expected-type condition)
                             '(signed-byte 8)))))))
   (delete-file pathname))
@@ -422,7 +422,7 @@
 
 ;;; writing looong lines. takes way too long and way too much space
 ;;; to test on 64 bit platforms
-#-#.(cl:if (cl:= sb-vm:n-word-bits 64) '(and) '(or))
+#-64-bit
 (let ((test "long-lines-write-test.tmp"))
     (unwind-protect
          (with-open-file (f test

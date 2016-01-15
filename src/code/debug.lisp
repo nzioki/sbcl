@@ -65,7 +65,10 @@ provide bindings for printer control variables.")
 ;;; If this is bound before the debugger is invoked, it is used as the stack
 ;;; top by the debugger. It can either be the first interesting frame, or the
 ;;; name of the last uninteresting frame.
-(defvar *stack-top-hint* nil)
+;;; This is a !DEFVAR so that cold-init can use SIGNAL.
+;;; It actually works as long as the condition is not a subtype of WARNING
+;;; or ERROR. (Any other direct descendant of CONDITION should be fine)
+(!defvar *stack-top-hint* nil)
 
 (defvar *real-stack-top* nil)
 (defvar *stack-top* nil)
@@ -233,7 +236,7 @@ backtraces. Possible values are :MINIMAL, :NORMAL, and :FULL.
                        do (setf frame (or (sb!di:frame-down frame) frame)))
                  frame))
              (interrupted-frame ()
-               (or (nth-value 1 (find-interrupted-name-and-frame))
+               (or (find-interrupted-frame)
                    (current-frame))))
      (cond ((eq :current-frame frame-designator)
             (current-frame))
@@ -297,7 +300,8 @@ is :DEBUGGER-FRAME.
                         (count *backtrace-frame-count*)
                         (print-thread t)
                         (print-frame-source nil)
-                        (method-frame-style *method-frame-style*))
+                        (method-frame-style *method-frame-style*)
+                        (emergency-best-effort (> *debug-command-level* 1)))
   #!+sb-doc
   "Print a listing of the call stack to STREAM, defaulting to *DEBUG-IO*.
 
@@ -335,26 +339,54 @@ source available\" for frames for which were compiled at lower debug settings.
 METHOD-FRAME-STYLE (defaulting to *METHOD-FRAME-STYLE*), determines how frames
 corresponding to method functions are printed. Possible values
 are :MINIMAL, :NORMAL, and :FULL. See *METHOD-FRAME-STYLE* for more
-information."
+information.
+
+If EMERGENCY-BEST-EFFORT is true then try to print as much information as
+possible while navigating and ignoring possible errors."
   (with-debug-io-syntax ()
-    (fresh-line stream)
-    (when print-thread
-      (format stream "Backtrace for: ~S~%" sb!thread:*current-thread*))
-    (let ((*suppress-print-errors* (if (subtypep 'serious-condition *suppress-print-errors*)
-                                       *suppress-print-errors*
-                                       'serious-condition))
-          (*print-circle* t)
-          (n start))
-      (handler-bind ((print-not-readable #'print-unreadably))
-        (map-backtrace (lambda (frame)
-                         (print-frame-call frame stream
-                                           :number n
-                                           :method-frame-style method-frame-style
-                                           :print-frame-source print-frame-source)
-                         (incf n))
-                       :from (backtrace-start-frame from)
-                       :start start
-                       :count count)))
+    (let ((*suppress-print-errors* (if (and emergency-best-effort
+                                            (not (subtypep 'serious-condition *suppress-print-errors*)))
+                                       'serious-condition
+                                       *suppress-print-errors*))
+          (frame-index start))
+      (labels
+          ((print-frame (frame stream)
+             (print-frame-call frame stream
+                               :number frame-index
+                               :method-frame-style method-frame-style
+                               :print-frame-source print-frame-source
+                               :emergency-best-effort emergency-best-effort))
+           (print-frame/normal (frame)
+             (print-frame frame stream))
+           (print-frame/emergency-best-effort (frame)
+             (with-open-stream (buffer (make-string-output-stream))
+               (handler-case
+                   (progn
+                     (fresh-line stream)
+                     (print-frame frame buffer)
+                     (write-string (get-output-stream-string buffer) stream))
+                 (serious-condition (error)
+                   (print-unreadable-object (error stream :type t)
+                     (format stream "while printing frame ~S. The partial output is: ~S"
+                             frame-index (get-output-stream-string buffer))))))))
+        (handler-bind
+            ((print-not-readable #'print-unreadably))
+          (fresh-line stream)
+          (when print-thread
+            (format stream "Backtrace for: ~S~%" sb!thread:*current-thread*))
+          (map-backtrace (lambda (frame)
+                           (restart-case
+                               (if emergency-best-effort
+                                   (print-frame/emergency-best-effort frame)
+                                   (print-frame/normal frame))
+                             (skip-printing-frame ()
+                               :report (lambda (stream)
+                                         (format stream "Skip printing frame ~S" frame-index))
+                               (print-unreadable-object (frame stream :type t :identity t))))
+                           (incf frame-index))
+                         :from (backtrace-start-frame from)
+                         :start start
+                         :count count))))
     (fresh-line stream)
     (values)))
 
@@ -520,36 +552,36 @@ thread, NIL otherwise."
           (map-frame-args
            (lambda (element)
              (lambda-list-element-dispatch element
-                                           :required ((push (frame-call-arg element location frame) reversed-result))
-                                           :optional ((push (frame-call-arg (second element) location frame)
-                                                            reversed-result))
-                                           :keyword ((push (second element) reversed-result)
-                                                     (push (frame-call-arg (third element) location frame)
-                                                           reversed-result))
-                                           :deleted ((push (frame-call-arg element location frame) reversed-result))
-                                           :rest ((lambda-var-dispatch (second element) location
-                                                                       nil
-                                                                       (let ((rest (sb!di:debug-var-value (second element) frame)))
-                                                                         (if (listp rest)
-                                                                             (setf reversed-result (append (reverse rest) reversed-result))
-                                                                             (push (make-unprintable-object "unavailable &REST argument")
-                                                                                   reversed-result))
-                                                                         (return-from enumerating))
-                                                                       (push (make-unprintable-object
-                                                                              "unavailable &REST argument")
-                                                                             reversed-result)))
-                                           :more ((lambda-var-dispatch (second element) location
-                                                                       nil
-                                                                       (let ((context (sb!di:debug-var-value (second element) frame))
-                                                                             (count (sb!di:debug-var-value (third element) frame)))
-                                                                         (setf reversed-result
-                                                                               (append (reverse
-                                                                                        (multiple-value-list
-                                                                                         (sb!c::%more-arg-values context 0 count)))
-                                                                                       reversed-result))
-                                                                         (return-from enumerating))
-                                                                       (push (make-unprintable-object "unavailable &MORE argument")
-                                                                             reversed-result)))))
+              :required ((push (frame-call-arg element location frame) reversed-result))
+              :optional ((push (frame-call-arg (second element) location frame)
+                               reversed-result))
+              :keyword ((push (second element) reversed-result)
+                        (push (frame-call-arg (third element) location frame)
+                              reversed-result))
+              :deleted ((push (frame-call-arg element location frame) reversed-result))
+              :rest ((lambda-var-dispatch (second element) location
+                      nil
+                      (let ((rest (sb!di:debug-var-value (second element) frame)))
+                        (if (listp rest)
+                            (setf reversed-result (append (reverse rest) reversed-result))
+                            (push (make-unprintable-object "unavailable &REST argument")
+                                  reversed-result))
+                        (return-from enumerating))
+                      (push (make-unprintable-object
+                             "unavailable &REST argument")
+                            reversed-result)))
+              :more ((lambda-var-dispatch (second element) location
+                      nil
+                      (let ((context (sb!di:debug-var-value (second element) frame))
+                            (count (sb!di:debug-var-value (third element) frame)))
+                        (setf reversed-result
+                              (append (reverse
+                                       (multiple-value-list
+                                        (sb!c::%more-arg-values context 0 count)))
+                                      reversed-result))
+                        (return-from enumerating))
+                      (push (make-unprintable-object "unavailable &MORE argument")
+                            reversed-result)))))
            frame))
         (nreverse reversed-result))
     (sb!di:lambda-list-unavailable ()
@@ -688,7 +720,8 @@ the current thread are replaced with dummy objects which can safely escape."
 (defun print-frame-call (frame stream
                          &key print-frame-source
                               number
-                              (method-frame-style *method-frame-style*))
+                              (method-frame-style *method-frame-style*)
+                              (emergency-best-effort (> *debug-command-level* 1)))
   (when number
     (format stream "~&~S: " (if (integerp number)
                                 number
@@ -704,7 +737,9 @@ the current thread are replaced with dummy objects which can safely escape."
         ;; *PRINT-LEVEL*.
         (let ((*print-length* nil)
               (*print-level* nil)
-              (name (ensure-printable-object name)))
+              (name (if emergency-best-effort
+                        (ensure-printable-object name)
+                        name)))
           (write name :stream stream :escape t :pretty (equal '(lambda ()) name)))
 
         ;; For the function arguments, we can just print normally.  If
@@ -712,7 +747,9 @@ the current thread are replaced with dummy objects which can safely escape."
         ;; possible, punting the loop over lambda-list variables since
         ;; any other arguments will be in the &REST arg's list of
         ;; values.
-        (let ((args (ensure-printable-object args)))
+        (let ((args (if emergency-best-effort
+                        (ensure-printable-object args)
+                        args)))
           (if (listp args)
               (format stream "~{ ~_~S~}" args)
               (format stream " ~S" args)))))
@@ -842,11 +879,11 @@ the current thread are replaced with dummy objects which can safely escape."
     (cond
       ;; No hint, just keep the debugger guts out.
       ((not hint)
-       (find-caller-name-and-frame))
+       (find-caller-frame))
       ;; Interrupted. Look for the interrupted frame -- if we don't find one
       ;; this falls back to the next case.
       ((and (eq hint 'invoke-interruption)
-            (nth-value 1 (find-interrupted-name-and-frame))))
+            (find-interrupted-frame)))
       ;; Name of the first uninteresting frame.
       ((symbolp hint)
        (find-caller-of-named-frame hint))
@@ -857,14 +894,11 @@ the current thread are replaced with dummy objects which can safely escape."
 (defun invoke-debugger (condition)
   #!+sb-doc
   "Enter the debugger."
-
   (let ((*stack-top-hint* (resolve-stack-top-hint)))
-
     ;; call *INVOKE-DEBUGGER-HOOK* first, so that *DEBUGGER-HOOK* is not
     ;; called when the debugger is disabled
     (run-hook '*invoke-debugger-hook* condition)
     (run-hook '*debugger-hook* condition)
-
     ;; We definitely want *PACKAGE* to be of valid type.
     ;;
     ;; Elsewhere in the system, we use the SANE-PACKAGE function for
@@ -876,13 +910,11 @@ the current thread are replaced with dummy objects which can safely escape."
               "The value of ~S was not an undeleted PACKAGE. It has been ~
                reset to ~S."
               '*package* *package*))
-
     ;; Before we start our own output, finish any pending output.
     ;; Otherwise, if the user tried to track the progress of his program
     ;; using PRINT statements, he'd tend to lose the last line of output
     ;; or so, which'd be confusing.
     (flush-standard-output-streams)
-
     (funcall-with-debug-io-syntax #'%invoke-debugger condition)))
 
 (defun %print-debugger-invocation-reason (condition stream)
@@ -1014,7 +1046,8 @@ the current thread are replaced with dummy objects which can safely escape."
            (handler-case
                (print-backtrace :stream *error-output*
                                 :from :interrupted-frame
-                                :print-thread t)
+                                :print-thread t
+                                :emergency-best-effort t)
              (condition ()
                (values)))
            (finish-output *error-output*)))
@@ -1619,6 +1652,13 @@ forms that explicitly control this kind of evaluation.")
 
 (!def-debug-command "LIST-LOCALS" ()
   (let ((d-fun (sb!di:frame-debug-fun *current-frame*)))
+    #!+sb-fasteval
+    (when (typep (sb!di:debug-fun-name d-fun nil)
+                 '(cons (eql sb!interpreter::.eval.)))
+      (let ((env (arg 1)))
+        (when (typep env 'sb!interpreter:basic-env)
+          (return-from list-locals-debug-command
+            (sb!interpreter:list-locals env)))))
     (if (sb!di:debug-var-info-available d-fun)
         (let ((*standard-output* *debug-io*)
               (location (sb!di:frame-code-location *current-frame*))

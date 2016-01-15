@@ -55,6 +55,13 @@
 os_vm_size_t dynamic_space_size = DEFAULT_DYNAMIC_SPACE_SIZE;
 os_vm_size_t thread_control_stack_size = DEFAULT_CONTROL_STACK_SIZE;
 
+#ifndef LISP_FEATURE_GENCGC
+inline static boolean
+in_gc_p(void) {
+    return current_dynamic_space == from_space;
+}
+#endif
+
 inline static boolean
 forwarding_pointer_p(lispobj *pointer) {
     lispobj first_word=*pointer;
@@ -62,6 +69,7 @@ forwarding_pointer_p(lispobj *pointer) {
     return (first_word == 0x01);
 #else
     return (is_lisp_pointer(first_word)
+            && in_gc_p() /* cheneygc new_space_p() is broken when not in gc */
             && new_space_p(first_word));
 #endif
 }
@@ -823,7 +831,7 @@ size_tiny_boxed(lispobj *where)
 
 /* Note: on the sparc we don't have to do anything special for fdefns, */
 /* 'cause the raw-addr has a function lowtag. */
-#if (!defined(LISP_FEATURE_SPARC)) && (!defined(LISP_FEATURE_ARM))
+#if !defined(LISP_FEATURE_SPARC) && !defined(LISP_FEATURE_ARM)
 static sword_t
 scav_fdefn(lispobj *where, lispobj object)
 {
@@ -1803,7 +1811,11 @@ scav_hash_table_entries (struct hash_table *hash_table)
              * rehashing. */
             if (!hash_vector || hash_vector[i] == MAGIC_HASH_VECTOR_VALUE) {
                 lispobj new_key = kv_vector[2*i];
-
+                // FIXME: many EQ-based sxhash values are insensitive
+                // to object movement. The most important one is SYMBOL,
+                // but others also carry around a hash value: LAYOUT, CLASSOID,
+                // and STANDARD-[FUNCALLABLE-]INSTANCE.
+                // If old_key is any of those, don't set needs_rehash_p.
                 if (old_key != new_key && new_key != empty_symbol) {
                     hash_table->needs_rehash_p = T;
                 }
@@ -2493,13 +2505,19 @@ gc_search_space(lispobj *start, size_t words, lispobj *pointer)
 {
     while (words > 0) {
         size_t count = 1;
-        lispobj thing = *start;
+        lispobj *forwarded_start;
 
+        if (forwarding_pointer_p(start))
+            forwarded_start =
+                native_pointer((lispobj)forwarding_pointer_value(start));
+        else
+            forwarded_start = start;
+        lispobj thing = *forwarded_start;
         /* If thing is an immediate then this is a cons. */
         if (is_lisp_pointer(thing) || is_lisp_immediate(thing))
             count = 2;
         else
-            count = (sizetab[widetag_of(thing)])(start);
+            count = (sizetab[widetag_of(thing)])(forwarded_start);
 
         /* Check whether the pointer is within this object. */
         if ((pointer >= start) && (pointer < (start+count))) {

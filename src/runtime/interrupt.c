@@ -641,12 +641,12 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
 
     /* Build a fake stack frame or frames */
 
-#if !defined(LISP_FEATURE_ARM)
+#if !defined(LISP_FEATURE_ARM) && !defined(LISP_FEATURE_ARM64)
     access_control_frame_pointer(th) =
         (lispobj *)(uword_t)
-            (*os_context_register_addr(context, reg_CSP));
+        (*os_context_register_addr(context, reg_CSP));
     if ((lispobj *)(uword_t)
-            (*os_context_register_addr(context, reg_CFP))
+        (*os_context_register_addr(context, reg_CFP))
         == access_control_frame_pointer(th)) {
         /* There is a small window during call where the callee's
          * frame isn't built yet. */
@@ -658,7 +658,7 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
                 *os_context_register_addr(context, reg_OCFP);
             access_control_frame_pointer(th)[1] =
                 *os_context_register_addr(context, reg_LRA);
-            access_control_frame_pointer(th) += 8;
+            access_control_frame_pointer(th) += 2;
             /* Build our frame on top of it. */
             oldcont = (lispobj)(*os_context_register_addr(context, reg_CFP));
         }
@@ -668,9 +668,12 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
             oldcont = (lispobj)(*os_context_register_addr(context, reg_OCFP));
         }
     } else
-#else /* LISP_FEATURE_ARM */
+#elif defined (LISP_FEATURE_ARM)
+        access_control_frame_pointer(th) =
+            SymbolValue(CONTROL_STACK_POINTER, th);
+#elif defined (LISP_FEATURE_ARM64)
     access_control_frame_pointer(th) =
-        SymbolValue(CONTROL_STACK_POINTER, th);
+        (lispobj *)(uword_t) (*os_context_register_addr(context, reg_CSP));
 #endif
     /* We can't tell whether we are still in the caller if it had to
      * allocate a stack frame due to stack arguments. */
@@ -681,7 +684,7 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
         oldcont = (lispobj)(*os_context_register_addr(context, reg_CFP));
     }
 
-    access_control_stack_pointer(th) = access_control_frame_pointer(th) + 8;
+    access_control_stack_pointer(th) = access_control_frame_pointer(th) + 3;
 
     access_control_frame_pointer(th)[0] = oldcont;
     access_control_frame_pointer(th)[1] = NIL;
@@ -732,7 +735,7 @@ fake_foreign_function_call(os_context_t *context)
         *os_context_register_addr(context, reg_BSP));
 #endif
 
-#ifdef LISP_FEATURE_ARM
+#if defined(LISP_FEATURE_ARM)
     /* Stash our control stack pointer */
     bind_variable(INTERRUPTED_CONTROL_STACK_POINTER,
                   SymbolValue(CONTROL_STACK_POINTER, thread),
@@ -778,7 +781,7 @@ undo_fake_foreign_function_call(os_context_t *context)
     /* Undo dynamic binding of FREE_INTERRUPT_CONTEXT_INDEX */
     unbind(thread);
 
-#ifdef LISP_FEATURE_ARM
+#if defined(LISP_FEATURE_ARM)
     /* Restore our saved control stack pointer */
     SetSymbolValue(CONTROL_STACK_POINTER,
                    SymbolValue(INTERRUPTED_CONTROL_STACK_POINTER,
@@ -1382,7 +1385,8 @@ interrupt_handle_now_handler(int signal, siginfo_t *info, void *void_context)
         || (signal == SIGEMT)
 #endif
         )
-        corruption_warning_and_maybe_lose("Signal %d received", signal);
+        corruption_warning_and_maybe_lose("Signal %d received (PC: %p)", signal,
+                                          *os_context_pc_addr(context));
 #endif
     interrupt_handle_now(signal, info, context);
     RESTORE_ERRNO;
@@ -1581,7 +1585,7 @@ arrange_return_to_c_function(os_context_t *context,
     *os_context_npc_addr(context) =
         4 + *os_context_pc_addr(context);
 #endif
-#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM)
+#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_ARM64)
     *os_context_register_addr(context,reg_CODE) =
         (os_context_register_t)(fun + FUN_POINTER_LOWTAG);
 #endif
@@ -1600,7 +1604,7 @@ arrange_return_to_lisp_function(os_context_t *context, lispobj function)
 }
 
 // These have undefined_alien_function tramp in x-assem.S
-#if !(defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM))
+#if !(defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_ARM64))
 /* KLUDGE: Theoretically the approach we use for undefined alien
  * variables should work for functions as well, but on PPC/Darwin
  * we get bus error at bogus addresses instead, hence this workaround,
@@ -1652,7 +1656,8 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
 
     if(addr >= CONTROL_STACK_HARD_GUARD_PAGE(th) &&
        addr < CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size) {
-        lose("Control stack exhausted");
+        lose("Control stack exhausted, fault: %p, PC: %p",
+             addr, *os_context_pc_addr(context));
     }
     else if(addr >= CONTROL_STACK_GUARD_PAGE(th) &&
             addr < CONTROL_STACK_GUARD_PAGE(th) + os_vm_page_size) {
@@ -2086,6 +2091,10 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
     * now -- some address is better then no address in this case.
     */
     current_memory_fault_address = addr;
+
+    /* If we lose on corruption, provide LDB with debugging information. */
+    fake_foreign_function_call(context);
+
     /* To allow debugging memory faults in signal handlers and such. */
     corruption_warning_and_maybe_lose("Memory fault at %p (pc=%p, sp=%p)",
                                       addr,
@@ -2096,12 +2105,15 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
                                       0
 #endif
                                       );
-    unblock_signals_in_context_and_maybe_warn(context);
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+    undo_fake_foreign_function_call(context);
+    unblock_signals_in_context_and_maybe_warn(context);
     arrange_return_to_lisp_function(context,
                                     StaticSymbolFunction(MEMORY_FAULT_ERROR));
 #else
+    unblock_gc_signals(0, 0);
     funcall0(StaticSymbolFunction(MEMORY_FAULT_ERROR));
+    undo_fake_foreign_function_call(context);
 #endif
 }
 #endif
@@ -2138,7 +2150,7 @@ handle_trap(os_context_t *context, int trap)
 #endif
     case trap_Error:
     case trap_Cerror:
-#ifdef LISP_FEATURE_X86_64
+#ifdef trap_InvalidArgCount
     case trap_InvalidArgCount:
 #endif
         FSHOW((stderr, "/<trap error/cerror %d>\n", trap));

@@ -184,7 +184,7 @@
 
 
 (with-test (:name :nan-comparisons
-            :fails-on '(or :sparc :mips))
+            :fails-on '(or :sparc))
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -287,6 +287,7 @@
 ;; in mind at all times when working with SSE or similar instruction sets.
 ;;
 ;; Run only on x86/x86-64m as no other platforms have SB-VM::TOUCH-OBJECT.
+#-interpreter
 (macrolet ((with-pinned-floats ((count type &rest names) &body body)
              "Force COUNT float values to be kept live (and hopefully in registers),
               fill a temporary register with noise, and execute BODY."

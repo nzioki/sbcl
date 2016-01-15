@@ -204,6 +204,7 @@
   ;; Note: While ANSI specifies no exceptional situations in this function,
   ;; ALLOCATE-CONDITION will signal a type error if TYPE does not designate
   ;; a condition class. This seems fair enough.
+  (declare (explicit-check))
   (multiple-value-bind (condition classoid)
       (apply #'allocate-condition type initargs)
 
@@ -292,9 +293,8 @@
   (with-single-package-locked-error
       (:symbol name "defining ~A as a condition")
     (%compiler-define-condition name parent-types layout all-readers all-writers)
-    (sb!c:with-source-location (source-location)
-      (setf (layout-source-location layout)
-            source-location))
+    (when source-location
+      (setf (layout-source-location layout) source-location))
     (let ((class (find-classoid name))) ; FIXME: rename to 'classoid'
       (setf (condition-classoid-slots class) slots
             (condition-classoid-direct-default-initargs class) direct-default-initargs
@@ -529,15 +529,6 @@
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
 (define-condition simple-type-error (simple-condition type-error) ())
-
-;; Can't have a function called SIMPLE-TYPE-ERROR or TYPE-ERROR...
-(declaim (ftype (sfunction (t t t &rest t) nil) bad-type))
-(defun bad-type (datum type control &rest arguments)
-  (error 'simple-type-error
-         :datum datum
-         :expected-type type
-         :format-control control
-         :format-arguments arguments))
 
 (define-condition program-error (error) ())
 (define-condition parse-error   (error) ())
@@ -1008,8 +999,8 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
   (:report
    (lambda (condition stream)
      (let ((array (invalid-array-index-error-array condition)))
-       (format stream "Index ~W out of bounds for ~@[axis ~W of ~]~S, ~
-                       should be nonnegative and <~W."
+       (format stream "Invalid index ~W for ~@[axis ~W of ~]~S, ~
+                       should be a non-negative integer below ~W."
                (type-error-datum condition)
                (when (> (array-rank array) 1)
                  (invalid-array-index-error-axis condition))
@@ -1111,7 +1102,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((error-stream (stream-error-stream condition)))
        (format stream
                "READER-ERROR ~@[at ~W ~]on ~S:~%~?~%Original error: ~A"
-               (file-position-or-nil-for-error error-stream) error-stream
+               (sb!impl::file-position-or-nil-for-error error-stream) error-stream
                (simple-condition-format-control condition)
                (simple-condition-format-arguments condition)
                (reader-impossible-number-error-error condition))))))
@@ -1292,6 +1283,11 @@ handled by any other handler, it will be muffled.")
     (return-from function-file-namestring
       (sb!c:definition-source-location-namestring
           (sb!eval:interpreted-function-source-location function))))
+  #!+sb-fasteval
+  (when (typep function 'sb!interpreter:interpreted-function)
+    (return-from function-file-namestring
+      (awhen (sb!interpreter:fun-source-location function)
+        (sb!c:definition-source-location-namestring it))))
   (let* ((fun (%fun-fun function))
          (code (fun-code-header fun))
          (debug-info (%code-debug-info code))
@@ -1309,9 +1305,10 @@ handled by any other handler, it will be muffled.")
      (and (typep old 'compiled-function)
           (typep new '(not compiled-function)))
      ;; fin->regular is interesting except for interpreted->compiled.
-     (and (typep old '(and funcallable-instance
-                           #!+sb-eval (not sb!eval:interpreted-function)))
-          (typep new '(not funcallable-instance)))
+     (and (typep new '(not funcallable-instance))
+          (typep old '(and funcallable-instance
+                           #!+sb-fasteval (not sb!interpreter:interpreted-function)
+                           #!+sb-eval (not sb!eval:interpreted-function))))
      ;; different file or unknown location is interesting.
      (let* ((old-namestring (function-file-namestring old))
             (new-namestring
@@ -1419,7 +1416,7 @@ the usual naming convention (names like *FOO*) for special variables"
              (format stream "Undefined alien: ~S"
                      (undefined-alien-symbol warning)))))
 
-#!+sb-eval
+#!+(or sb-eval sb-fasteval)
 (define-condition lexical-environment-too-complex (style-warning)
   ((form :initarg :form :reader lexical-environment-too-complex-form)
    (lexenv :initarg :lexenv :reader lexical-environment-too-complex-lexenv))
@@ -1430,6 +1427,16 @@ the usual naming convention (names like *FOO*) for special variables"
                          SIMPLE-EVAL-IN-LEXENV.  Lexenv: ~S~:@>"
                      (lexical-environment-too-complex-form warning)
                      (lexical-environment-too-complex-lexenv warning)))))
+
+;; If the interpreter is in use (and the REPL is interpreted),
+;; it's easy to accidentally make the macroexpand-hook an interpreted
+;; function. So MACROEXPAND-1 is a little more careful,
+;; and might signal this, instead of only EVAL being able to signal it.
+(define-condition macroexpand-hook-type-error (type-error)
+  ()
+  (:report (lambda (condition stream)
+             (format stream "The value of *MACROEXPAND-HOOK* is not a designator for a compiled function: ~S"
+                     (type-error-datum condition)))))
 
 ;; Although this has -ERROR- in the name, it's just a STYLE-WARNING.
 (define-condition character-decoding-error-in-comment (style-warning)
@@ -1506,10 +1513,6 @@ the usual naming convention (names like *FOO*) for special variables"
                                                       type-proclamation-mismatch)
   ())
 
-(defun type-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'type-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
-
 (define-condition ftype-proclamation-mismatch (proclamation-mismatch)
   ()
   (:default-initargs :kind 'ftype))
@@ -1517,10 +1520,6 @@ the usual naming convention (names like *FOO*) for special variables"
 (define-condition ftype-proclamation-mismatch-warning (style-warning
                                                        ftype-proclamation-mismatch)
   ())
-
-(defun ftype-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'ftype-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
 
 (define-condition ftype-proclamation-mismatch-error (error
                                                      ftype-proclamation-mismatch)

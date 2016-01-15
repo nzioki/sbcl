@@ -27,8 +27,10 @@
 #include "lispregs.h"
 #include "genesis/static-symbols.h"
 #include "genesis/vector.h"
+#include "genesis/code.h"
 #include "thread.h"
 #include "monitor.h"
+#include "breakpoint.h"
 
 /* the way that we shut down the system on a fatal error */
 
@@ -152,6 +154,22 @@ corruption_warning_and_maybe_lose(char *fmt, ...)
 #endif
 }
 
+void print_constant(os_context_t *context, int offset) {
+    lispobj code = find_code(context);
+    if (code != NIL) {
+        struct code *codeptr = (struct code *)native_pointer(code);
+        int length = HeaderValue(codeptr->header);
+        putchar('\t');
+        if (offset >= length) {
+            printf("Constant offset %d out of bounds for the code object of length %d.\n",
+                   offset, length);
+        } else {
+            brief_print(codeptr->constants[offset -
+                                           (offsetof(struct code, constants) >> WORD_SHIFT)]);
+        }
+    }
+}
+
 char *internal_error_descriptions[] = {INTERNAL_ERROR_NAMES};
 /* internal error handler for when the Lisp error system doesn't exist
  *
@@ -164,12 +182,23 @@ describe_internal_error(os_context_t *context)
     unsigned char *ptr = arch_internal_error_arguments(context);
     int len, scoffset, sc, offset, ch;
 
+#ifdef LISP_FEATURE_ARM64
+    u32 trap_instruction = *(u32 *)ptr;
+    unsigned code = trap_instruction >> 13 & 0xFF;
+    printf("Internal error #%d \"%s\" at %p\n", code,
+           internal_error_descriptions[code],
+           (void*)*os_context_pc_addr(context));
+    ptr += 4;
+    len = *ptr++;
+#else
     len = *ptr++;
     printf("Internal error #%d \"%s\" at %p\n", *ptr,
            internal_error_descriptions[*ptr],
            (void*)*os_context_pc_addr(context));
     ptr++;
     len--;
+#endif
+
     while (len > 0) {
         scoffset = *ptr++;
         len--;
@@ -187,8 +216,8 @@ describe_internal_error(os_context_t *context)
             ptr += 4;
             len -= 4;
         }
-        sc = scoffset & 0x1f;
-        offset = scoffset >> 5;
+        sc = scoffset & 0x3F;
+        offset = scoffset >> 6;
 
         printf("    SC: %d, Offset: %d", sc, offset);
         switch (sc) {
@@ -240,6 +269,9 @@ describe_internal_error(os_context_t *context)
             printf("\t%g\n", *(double *)&context->sc_fpregs[offset]);
             break;
 #endif
+        case sc_Constant:
+            print_constant(context, offset);
+            break;
         default:
             printf("\t???\n");
             break;

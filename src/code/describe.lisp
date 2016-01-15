@@ -52,6 +52,9 @@
                   ,@(when declarations `((declare ,@declarations)))
                   ,@body)
                t name)))
+    #+sb-fasteval
+    (sb-interpreter:interpreted-function
+     (sb-interpreter:fun-lambda-expression fun))
     (function
      (let* ((name (fun-name fun))
             (fun (%simple-fun-self (%fun-fun fun)))
@@ -176,13 +179,10 @@
   (typecase x
     (simple-fun "compiled function")
     (closure "compiled closure")
-    #+sb-eval
-    (sb-eval:interpreted-function
-     "interpreted function")
-    (generic-function
-     "generic-function")
-    (t
-     "funcallable-instance")))
+    ((or #+sb-fasteval sb-interpreter:interpreted-function
+         #+sb-eval sb-eval:interpreted-function) "interpreted function")
+    (generic-function "generic-function")
+    (t "funcallable-instance")))
 
 (defmethod object-type-string ((x stream))
   "stream")
@@ -537,7 +537,7 @@
     (format stream "~@:_Lambda-list: ~:A" lambda-list)))
 
 (defun describe-function-source (function stream)
-  (if (compiled-function-p function)
+  (if (compiled-function-p (the function function))
       (let* ((code (fun-code-header (%fun-fun function)))
              (info (sb-kernel:%code-debug-info code)))
         (when info
@@ -553,8 +553,14 @@
                       ((sb-di:debug-source-form source)
                        (format stream "~@:_Source form:~@:_  ~S"
                                (sb-di:debug-source-form source)))))))))
-      #+sb-eval
-      (let ((source (sb-eval:interpreted-function-source-location function)))
+      (let ((source
+             (typecase function
+               #+sb-eval
+               (sb-eval:interpreted-function
+                (sb-eval:interpreted-function-source-location function))
+               #+sb-fasteval
+               (sb-interpreter:interpreted-function
+                (sb-interpreter:fun-source-location function)))))
         (when source
           (let ((namestring (sb-c:definition-source-location-namestring source)))
             (when namestring
@@ -573,7 +579,7 @@
                 (pprint-indent :block 2 stream)
                 (format stream "~@:_~:(~A~) type: ~S"
                         from
-                        (type-specifier (info :function :type name)))))))
+                        (type-specifier (proclaimed-ftype name)))))))
         ;; Defined.
         (multiple-value-bind (fun what lambda-list derived-type declared-type
                               inline methods)
@@ -591,15 +597,11 @@
                                              (%fun-type function)))
                           (legal-name-p (legal-fun-name-p name))
                           (ctype (and legal-name-p
-                                      (info :function :type name)))
+                                      (proclaimed-ftype name)))
                           (type (and ctype (type-specifier ctype)))
                           (from (and legal-name-p
                                      (info :function :where-from name)))
                           declared-type)
-                     ;; Ensure lazy pickup of information
-                     ;; from methods.
-                     (when legal-name-p
-                       (sb-c::maybe-update-info-for-gf name))
                      (cond ((not type))
                            ((eq from :declared)
                             (setf declared-type type))
@@ -704,11 +706,8 @@
 
 (defun describe-type (name stream)
   (let* ((kind (info :type :kind name))
-         (fun (case kind
-                (:defined
-                 (or (info :type :expander name) t))
-                (:primitive
-                 (or (info :type :translator name) t)))))
+         (fun (and kind (info :type :expander name)))
+         (fun (if (listp fun) (car fun) fun)))
     (when fun
       (pprint-newline :mandatory stream)
       (pprint-logical-block (stream nil)
@@ -717,9 +716,7 @@
         (pprint-indent :block 2 stream)
         (describe-deprecation 'type name stream)
         (describe-documentation name 'type stream (eq t fun))
-        (unless (eq t fun)
-          ;; even though :translator can store a CTYPE, this is safe
-          ;; because a symbol can't have a non-FUNCTIONP translator.
+        (when (functionp fun)
           (describe-lambda-list (%fun-lambda-list fun) stream)
           (multiple-value-bind (expansion ok)
               (handler-case (typexpand-1 name)

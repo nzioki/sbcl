@@ -35,54 +35,43 @@
                 process-handle-conditions-decl))
 (defun process-handle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
-    (dolist (clause (cdr spec))
+    (dolist (clause (cdr spec) new)
       (destructuring-bind (typespec restart-name) clause
-        (let ((ospec (rassoc restart-name new :test #'eq)))
+        (let ((type (compiler-specifier-type typespec))
+              (ospec (rassoc restart-name new :test #'eq)))
           (if ospec
-              (setf (car ospec)
-                    (type-specifier
-                     (type-union (compiler-specifier-type (car ospec))
-                                 (compiler-specifier-type typespec))))
-              (push (cons (type-specifier (compiler-specifier-type typespec))
-                          restart-name)
-                    new)))))
-    new))
+              (setf (car ospec) (type-union (car ospec) type))
+              (push (cons type restart-name) new)))))))
 
 (declaim (ftype (function (list list) list)
                 process-muffle-conditions-decl))
 (defun process-muffle-conditions-decl (spec list)
   (process-handle-conditions-decl
-   (cons 'handle-conditions
-         (mapcar (lambda (x) (list x 'muffle-warning)) (cdr spec)))
+   `(handle-conditions ((or ,@(cdr spec)) muffle-warning))
    list))
 
 (declaim (ftype (function (list list) list)
                 process-unhandle-conditions-decl))
 (defun process-unhandle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
-    (dolist (clause (cdr spec))
+    (dolist (clause (cdr spec) new)
       (destructuring-bind (typespec restart-name) clause
         (let ((ospec (rassoc restart-name new :test #'eq)))
           (if ospec
-              (let ((type-specifier
-                     (type-specifier
-                      (type-intersection
-                       (compiler-specifier-type (car ospec))
-                       (compiler-specifier-type `(not ,typespec))))))
-                (if type-specifier
-                    (setf (car ospec) type-specifier)
-                    (setq new
-                          (delete restart-name new :test #'eq :key #'cdr))))
+              (let ((type (type-intersection
+                           (car ospec)
+                           (compiler-specifier-type `(not ,typespec)))))
+                (if (type= type *empty-type*)
+                    (setq new (delete restart-name new :test #'eq :key #'cdr))
+                    (setf (car ospec) type)))
               ;; do nothing?
-              nil))))
-    new))
+              nil))))))
 
 (declaim (ftype (function (list list) list)
                 process-unmuffle-conditions-decl))
 (defun process-unmuffle-conditions-decl (spec list)
   (process-unhandle-conditions-decl
-   (cons 'unhandle-conditions
-         (mapcar (lambda (x) (list x 'muffle-warning)) (cdr spec)))
+   `(unhandle-conditions ((or ,@(cdr spec)) muffle-warning))
    list))
 
 (declaim (ftype (function (list list) list)
@@ -120,6 +109,10 @@
         (setf (info :variable :always-bound name) info-value)
         (setf (info :variable :kind name) info-value))))
 
+(defun type-proclamation-mismatch-warn (name old new &optional description)
+  (warn 'type-proclamation-mismatch-warning
+        :name name :old old :new new :description description))
+
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
     (error "Cannot proclaim TYPE of a non-symbol: ~S" name))
@@ -134,16 +127,24 @@
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
 
-(defun proclaim-ftype (name type type-specifier where-from)
+(defun ftype-proclamation-mismatch-warn (name old new &optional description)
+  (warn 'ftype-proclamation-mismatch-warning
+        :name name :old old :new new :description description))
+
+(defun proclaim-ftype (name type-oid type-specifier where-from)
+  (declare (type (or ctype defstruct-description) type-oid))
   (unless (legal-fun-name-p name)
     (error "Cannot declare FTYPE of illegal function name ~S" name))
-  (unless (csubtypep type (specifier-type 'function))
-    (error "Not a function type: ~S" (type-specifier type)))
-
+  (when (and (ctype-p type-oid)
+             (not (csubtypep type-oid (specifier-type 'function))))
+    (error "Not a function type: ~S" (type-specifier type-oid)))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
     (when (eq (info :function :where-from name) :declared)
-      (let ((old-type (info :function :type name)))
+      (let ((old-type (proclaimed-ftype name))
+            (type (if (ctype-p type-oid)
+                      type-oid
+                      (specifier-type type-specifier))))
         (cond
           ((not (type/= type old-type))) ; not changed
           ((not (info :function :info name)) ; not a known function
@@ -166,7 +167,7 @@
     (note-name-defined name :function)
 
     ;; The actual type declaration.
-    (setf (info :function :type name) type
+    (setf (info :function :type name) type-oid
           (info :function :where-from name) where-from)))
 
 (defun seal-class (class)
@@ -201,9 +202,9 @@
     (error 'simple-type-error
            :datum            state
            :expected-type    'deprecation-state
-           :format-control   "~<In declaration ~S, ~S state is not a ~
+           :format-control   "~@<In declaration ~S, ~S state is not a ~
                               valid deprecation state. Expected one ~
-                              of ~{~A~^, ~}.~@:>"
+                              of ~{~S~^, ~}.~@:>"
            :format-arguments (list form state
                                    (rest (typexpand 'deprecation-state)))))
   (multiple-value-call #'values
@@ -243,26 +244,20 @@
 ;;; (TYPE FOO X Y) when FOO is a type specifier. This function
 ;;; implements that by converting (FOO X Y) to (TYPE FOO X Y).
 (defun canonized-decl-spec (decl-spec)
-  (let* ((id (first decl-spec))
-         (id-is-type (if (symbolp id)
-                         (info :type :kind id)
-                         ;; A cons might not be a valid type specifier,
-                         ;; but it can't be a declaration either.
-                         (or (consp id)
-                             (typep id 'class))))
-         (id-is-declared-decl (info :declaration :recognized id)))
-    ;; FIXME: Checking ID-IS-DECLARED is probably useless these days,
-    ;; since we refuse to use the same symbol as both a type name and
-    ;; recognized declaration name.
-    (cond ((and id-is-type id-is-declared-decl)
-           (compiler-error
-            "ambiguous declaration ~S:~%  ~
-             ~S was declared as a DECLARATION, but is also a type name."
-            decl-spec id))
-          (id-is-type
-           (list* 'type decl-spec))
-          (t
-           decl-spec))))
+  (let ((id (first decl-spec)))
+    (if (cond  ((symbolp id) (info :type :kind id))
+               ((listp id)
+                (let ((id (car id)))
+                  (and (symbolp id)
+                       (or (info :type :expander id)
+                           (info :type :kind id)))))
+               (t
+                ;; FIXME: should be (TYPEP id '(OR CLASS CLASSOID))
+                ;; but that references CLASS too soon.
+                ;; See related hack in DEF!TYPE TYPE-SPECIFIER.
+                (typep id 'instance)))
+        (cons 'type decl-spec)
+        decl-spec)))
 
 ;; These return values are intended for EQ-comparison in
 ;; STORE-LOCATION in %PROCLAIM.

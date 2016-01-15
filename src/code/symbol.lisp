@@ -15,7 +15,7 @@
 
 (in-package "SB!IMPL")
 
-(declaim (maybe-inline get get3 %put getf remprop %putf get-properties keywordp))
+(declaim (maybe-inline get3 %put getf remprop %putf get-properties keywordp))
 
 ;;; Used by [GLOBAL-]SYMBOL-VALUE compiler-macros:
 ;;;
@@ -166,7 +166,7 @@ distinct from the global value. Can also be SETF."
     ;; I really think the code paths should be reconciled.
     ;; e.g. what's up with *USER-HASH-TABLE-TESTS* being checked
     ;; in %SET-FDEFINITION but not here?
-    (maybe-clobber-ftype symbol)
+    (maybe-clobber-ftype symbol new-value)
     (let ((fdefn (find-or-create-fdefn symbol)))
       (setf (fdefn-fun fdefn) new-value))))
 
@@ -538,6 +538,7 @@ distinct from the global value. Can also be SETF."
 ;;; ...in which case you frankly deserve to lose.
 (defun about-to-modify-symbol-value (symbol action &optional (new-value nil valuep) bind)
   (declare (symbol symbol))
+  (declare (explicit-check))
   (flet ((describe-action ()
            (ecase action
              (set "set SYMBOL-VALUE of ~S")
@@ -566,7 +567,7 @@ distinct from the global value. Can also be SETF."
           ;; :VARIABLE :TYPE is in the db only if it is declared, so no need to
           ;; check.
           (let ((type (info :variable :type symbol)))
-            (unless (sb!kernel::%%typep new-value type nil)
+            (unless (%%typep new-value type nil)
               (let ((spec (type-specifier type)))
                 (error 'simple-type-error
                        :format-control "~@<Cannot ~@? to ~S, not of type ~S.~:@>"

@@ -917,11 +917,37 @@
 
 (defun eval-the (body env)
   (program-destructuring-bind (value-type form) body
-    (declare (ignore value-type))
-    ;; FIXME: We should probably check the types here, even though
-    ;; the consequences of the values not being of the asserted types
-    ;; are formally undefined.
-    (%eval form env)))
+    (let ((values (multiple-value-list (%eval form env)))
+          (vtype (if (ctype-p value-type) value-type (values-specifier-type value-type))))
+      ;; FIXME: we should probably do this only if SAFETY>SPEED
+      (cond
+        ((eq vtype *wild-type*) (values-list values))
+        ((values-type-p vtype)
+         (do ((vs values (cdr vs))
+              (ts (values-type-required vtype) (cdr ts)))
+             ((null ts)
+              (do ((vs vs (cdr vs))
+                   (ts (values-type-optional vtype) (cdr ts)))
+                  ((null ts)
+                   (do ((vs vs (cdr vs))
+                        (rest (values-type-rest vtype)))
+                       ((null vs) (values-list values))
+                     (if rest
+                         (unless (ctypep (car vs) rest)
+                           (error 'type-error :datum (car vs) :expected-type (type-specifier rest)))
+                         (error 'type-error :datum vs :expected-type nil))))
+                (let ((v (car vs))
+                      (type (car ts)))
+                  (when vs
+                    (unless (ctypep v type)
+                      (error 'type-error :datum v :expected-type (type-specifier type)))))))
+           (let ((v (car vs))
+                 (type (car ts)))
+             (unless (ctypep v type)
+               (error 'type-error :datum v :expected-type (type-specifier type))))))
+
+        ((ctypep (car values) vtype) (values-list values))
+        (t (error 'type-error :datum (car values) :expected-type (type-specifier vtype)))))))
 
 (defun eval-unwind-protect (body env)
   (program-destructuring-bind (protected-form &body cleanup-forms) body
@@ -962,12 +988,6 @@
         (eval-progn body env)
         (sb!sys:with-pinned-objects ((car values))
           (eval-with-pinned-objects (cons (cdr values) body) env)))))
-
-(define-condition macroexpand-hook-type-error (type-error)
-  ()
-  (:report (lambda (condition stream)
-             (format stream "The value of *MACROEXPAND-HOOK* is not a designator for a compiled function: ~A"
-                     (type-error-datum condition)))))
 
 (defvar *eval-dispatch-functions* nil)
 
@@ -1033,18 +1053,8 @@
                  (:function (%apply function (eval-args (cdr exp) env)))
                  ;; CLHS 3.1.2.1.2.2 Macro Forms
                  (:macro
-                  (let ((hook *macroexpand-hook*))
-                    ;; Having an interpreted function as the
-                    ;; macroexpander hook could cause an infinite
-                    ;; loop.
-                    (unless (compiled-function-p
-                             (etypecase hook
-                               (function hook)
-                               (symbol (symbol-function hook))))
-                      (error 'macroexpand-hook-type-error
-                             :datum hook
-                             :expected-type 'compiled-function))
-                    (%eval (funcall hook
+                  (let ((hook (valid-macroexpand-hook)))
+                    (%eval (funcall (truly-the function hook)
                                     function
                                     exp
                                     (env-native-lexenv env))

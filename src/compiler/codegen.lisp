@@ -70,7 +70,8 @@
 (defvar *prev-segment*)
 (defvar *prev-vop*)
 
-(defun trace-instruction (segment vop inst args)
+(defun trace-instruction (segment vop inst &rest args)
+  (declare (dynamic-extent args))
   (let ((*standard-output* *compiler-trace-output*))
     (unless (eq *prev-segment* segment)
       (format t "in the ~A segment:~%" (sb!assem:segment-type segment))
@@ -85,9 +86,9 @@
       (setf *prev-vop* vop))
     (case inst
       (:label
-       (format t "~A:~%" args))
+       (format t "~A:~%" (car args)))
       (:align
-       (format t "~0,8T.align~0,8T~A~%" args))
+       (format t "~0,8T.align~0,8T~A~%" (car args)))
       (t
        (format t "~0,8T~A~@[~0,8T~{~A~^, ~}~]~%" inst args))))
   (values))
@@ -127,6 +128,20 @@
         *constant-table*  (make-hash-table :test #'equal)
         *constant-vector* (make-array 16 :adjustable t :fill-pointer 0))
   (values))
+
+#!+inline-constants
+(defun emit-inline-constants ()
+  (unless (zerop (length *constant-vector*))
+    (let ((constants (sb!vm:sort-inline-constants *constant-vector*)))
+      (assemble (*constant-segment*)
+        (map nil (lambda (constant)
+                   (sb!vm:emit-inline-constant (car constant) (cdr constant)))
+             constants)))
+    (sb!assem:append-segment *constant-segment* *code-segment*)
+    (setf *code-segment* *constant-segment*))
+  (setf *constant-segment* nil
+        *constant-vector*  nil
+        *constant-table*   nil))
 
 (defun generate-code (component)
   (when *compiler-trace-output*
@@ -180,26 +195,7 @@
     (sb!assem:append-segment *code-segment* *elsewhere*)
     (setf *elsewhere* nil)
     #!+inline-constants
-    (progn
-      (unless (zerop (length *constant-vector*))
-        (let ((constants (sb!vm:sort-inline-constants *constant-vector*)))
-          (assemble (*constant-segment*)
-            #+nil
-            (sb!vm:emit-constant-segment-header
-             *constant-segment*
-             constants
-             (do-ir2-blocks (2block component nil)
-               (when (policy (block-last (ir2-block-block 2block))
-                             (> speed space))
-                 (return t))))
-            (map nil (lambda (constant)
-                       (sb!vm:emit-inline-constant (car constant) (cdr constant)))
-                 constants)))
-        (sb!assem:append-segment *constant-segment* *code-segment*)
-        (setq *code-segment* *constant-segment*))
-      (setf *constant-segment* nil
-            *constant-vector*  nil
-            *constant-table*   nil))
+    (emit-inline-constants)
     (values (sb!assem:finalize-segment *code-segment*)
             *fixup-notes*)))
 

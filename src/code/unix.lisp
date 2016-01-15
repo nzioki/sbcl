@@ -608,7 +608,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
        (format *debug-io*
                "~&=== Starting a ~A without a timeout while interrupts are disabled. ===~%"
                type)
-       (sb!debug:backtrace)))
+       (sb!debug:print-backtrace)))
     nil))
 
 ;;;; poll.h
@@ -1142,9 +1142,9 @@ the UNIX epoch (January 1st 1970.)"
         (c-sec 0)
         (c-msec 0)
         (now 0))
-    (declare (type unsigned-byte e-sec c-sec)
-             (type fixnum e-msec c-msec)
-             (type unsigned-byte now))
+    (declare (type sb!kernel:internal-seconds e-sec c-sec)
+             (type sb!kernel:internal-seconds e-msec c-msec)
+             (type sb!kernel:internal-time now))
     (defun reinit-internal-real-time ()
       (setf (values e-sec e-msec) (system-real-time-values)
             c-sec 0
@@ -1222,11 +1222,15 @@ the UNIX epoch (January 1st 1970.)"
   (let ((ent (alien-funcall
               (extern-alien "sb_readdir"
                             (function system-area-pointer system-area-pointer))
-                            dir)))
+              dir))
+        errno)
     (if (zerop (sap-int ent))
-        (when errorp (simple-perror
-                      (format nil "Error reading directory entry~@[ from ~S~]"
-                              namestring)))
+        (when (and errorp
+                   (not (zerop (setf errno (get-errno)))))
+          (simple-perror
+           (format nil "Error reading directory entry~@[ from ~S~]"
+                   namestring)
+           :errno errno))
         ent)))
 
 (declaim (inline unix-closedir))

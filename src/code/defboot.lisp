@@ -85,29 +85,30 @@
                        (if ,n-result
                            ,n-result
                            (cond ,@more))))
-                  (if (eq t test)
+                  (if (and (eq test t)
+                           (not more))
                       ;; THE to preserve non-toplevelness for FOO in
                       ;;   (COND (T (FOO)))
-                      ;; FIXME: this hides all other possible stylistic issues,
-                      ;; not the least of which is a code deletion note,
-                      ;; if there are forms following the one whose head is T.
-                      ;; This is not usually the SBCL preferred way.
                       `(the t (progn ,@forms))
                       `(if ,test
                            (progn ,@forms)
                            ,(when more `(cond ,@more))))))))))
 
-(defmacro-mundanely when (test &body forms)
+(flet ((prognify (forms)
+         (cond ((singleton-p forms) (car forms))
+               ((not forms) nil)
+               (t `(progn ,@forms)))))
+  (defmacro-mundanely when (test &body forms)
   #!+sb-doc
   "If the first argument is true, the rest of the forms are
 evaluated as a PROGN."
-  `(if ,test (progn ,@forms) nil))
+  `(if ,test ,(prognify forms)))
 
-(defmacro-mundanely unless (test &body forms)
+  (defmacro-mundanely unless (test &body forms)
   #!+sb-doc
   "If the first argument is not true, the rest of the forms are
 evaluated as a PROGN."
-  `(if ,test nil (progn ,@forms)))
+  `(if ,test nil ,(prognify forms))))
 
 (defmacro-mundanely and (&rest forms)
   (cond ((endp forms) t)
@@ -134,8 +135,7 @@ evaluated as a PROGN."
 ;;;; various sequencing constructs
 
 (flet ((prog-expansion-from-let (varlist body-decls let)
-         (multiple-value-bind (body decls)
-             (parse-body body-decls :doc-string-allowed nil)
+         (multiple-value-bind (body decls) (parse-body body-decls nil)
            `(block nil
               (,let ,varlist
                 ,@decls
@@ -176,64 +176,71 @@ evaluated as a PROGN."
    ;; the only unsurprising choice.
    (info :function :inline-expansion-designator name)))
 
-(defmacro-mundanely defun (&environment env name args &body body)
+(defmacro-mundanely defun (&environment env name lambda-list &body body)
   #!+sb-doc
   "Define a function at top level."
   #+sb-xc-host
   (unless (symbol-package (fun-name-block-name name))
     (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
-  (multiple-value-bind (forms decls doc) (parse-body body)
+  (multiple-value-bind (forms decls doc) (parse-body body t)
     (let* (;; stuff shared between LAMBDA and INLINE-LAMBDA and NAMED-LAMBDA
-           (lambda-guts `(,args
+           (lambda-guts `(,lambda-list
                           ,@(when doc (list doc))
                           ,@decls
                           (block ,(fun-name-block-name name)
                             ,@forms)))
            (lambda `(lambda ,@lambda-guts))
            (named-lambda `(named-lambda ,name ,@lambda-guts))
-           (inline-lambda
-            (when (inline-fun-name-p name)
-              ;; we want to attempt to inline, so complain if we can't
-              (or (sb!c:maybe-inline-syntactic-closure lambda env)
-                  (progn
-                    (#+sb-xc-host warn
-                     #-sb-xc-host sb!c:maybe-compiler-notify
-                     "lexical environment too hairy, can't inline DEFUN ~S"
-                     name)
-                    nil)))))
+           (inline-thing
+            (or (sb!kernel::defstruct-generated-defn-p name lambda-list body)
+                (when (inline-fun-name-p name)
+                  ;; we want to attempt to inline, so complain if we can't
+                  (acond ((sb!c:maybe-inline-syntactic-closure lambda env)
+                          (list 'quote it))
+                         (t
+                          (#+sb-xc-host warn
+                           #-sb-xc-host sb!c:maybe-compiler-notify
+                           "lexical environment too hairy, can't inline DEFUN ~S"
+                           name)
+                          nil))))))
       `(progn
          (eval-when (:compile-toplevel)
-           (sb!c:%compiler-defun ',name ',inline-lambda t))
+           (sb!c:%compiler-defun ',name ,inline-thing t))
+         (%defun ',name ,named-lambda (sb!c:source-location)
+                 ,@(and inline-thing (list inline-thing)))
+         ;; This warning, if produced, comes after the DEFUN happens.
+         ;; When compiling, there's no real difference, but when interpreting,
+         ;; if there is a handler for style-warning that nonlocally exits,
+         ;; it's wrong to have skipped the DEFUN itself, since if there is no
+         ;; function, then the warning ought not to have been issued at all.
          ,@(when (typep name '(cons (eql setf)))
              `((eval-when (:compile-toplevel :execute)
-                 (sb!c::warn-if-setf-macro ',name))))
-         (%defun ',name ,named-lambda (sb!c:source-location)
-                 ,@(and inline-lambda
-                        `(',inline-lambda)))))))
+                 (sb!c::warn-if-setf-macro ',name))))))))
 
 #-sb-xc-host
-(progn (defun %defun (name def source-location &optional inline-lambda)
-          (declare (type function def))
-          ;; should've been checked by DEFMACRO DEFUN
-          (aver (legal-fun-name-p name))
-          (sb!c:%compiler-defun name inline-lambda nil)
-          (when (fboundp name)
-            (warn 'redefinition-with-defun
-                  :name name :new-function def :new-location source-location))
-          (setf (sb!xc:fdefinition name) def)
+(progn
+  (defun %defun (name def source-location &optional inline-lambda)
+    (declare (type function def))
+    ;; should've been checked by DEFMACRO DEFUN
+    (aver (legal-fun-name-p name))
+    (sb!c:%compiler-defun name inline-lambda nil)
+    (when (fboundp name)
+      (warn 'redefinition-with-defun
+            :name name :new-function def :new-location source-location))
+    (setf (sb!xc:fdefinition name) def)
   ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
   ;; also checks package locks. By doing this here we let (SETF
   ;; FDEFINITION) do the load-time package lock checking before
   ;; we frob any existing inline expansions.
-          (sb!c::%set-inline-expansion name nil inline-lambda)
-          (sb!c::note-name-defined name :function)
-          name)
-       ;; During cold-init we don't touch the fdefinition.
-       (defun !%quietly-defun (name inline-lambda)
-         (sb!c:%compiler-defun name nil nil) ; makes :WHERE-FROM = :DEFINED
-         (sb!c::%set-inline-expansion name nil inline-lambda)
-         ;; and no need to call NOTE-NAME-DEFINED. It would do nothing.
-         ))
+    (sb!c::%set-inline-expansion name nil inline-lambda)
+    (sb!c::note-name-defined name :function)
+    name)
+  ;; During cold-init we don't touch the fdefinition.
+  (defun !%quietly-defun (name inline-lambda)
+    (sb!c:%compiler-defun name nil nil) ; makes :WHERE-FROM = :DEFINED
+    (sb!c::%set-inline-expansion name nil inline-lambda)
+    ;; and no need to call NOTE-NAME-DEFINED. It would do nothing.
+    ))
 
 ;;;; DEFVAR and DEFPARAMETER
 
@@ -278,7 +285,7 @@ evaluated as a PROGN."
     (set var val))
   (when docp
     (setf (fdocumentation var 'variable) doc))
-  (sb!c:with-source-location (source-location)
+  (when source-location
     (setf (info :source-location :variable var) source-location))
   var)
 
@@ -288,7 +295,7 @@ evaluated as a PROGN."
   (set var val)
   (when docp
     (setf (fdocumentation var 'variable) doc))
-  (sb!c:with-source-location (source-location)
+  (when source-location
     (setf (info :source-location :variable var) source-location))
   var)
 
@@ -353,7 +360,7 @@ evaluated as a PROGN."
   ;; environment. We spuriously reference the gratuitous variable,
   ;; since we don't want to use IGNORABLE on what might be a special
   ;; var.
-  (multiple-value-bind (forms decls) (parse-body body :doc-string-allowed nil)
+  (multiple-value-bind (forms decls) (parse-body body nil)
     (let* ((n-list (gensym "N-LIST"))
            (start (gensym "START")))
       (multiple-value-bind (clist members clist-ok)
@@ -424,7 +431,8 @@ evaluated as a PROGN."
    RESTARTS-FORM are associated with the condition returned by CONDITION-FORM.
    This allows FIND-RESTART, etc., to recognize restarts that are not related
    to the error currently being debugged. See also RESTART-CASE."
-  (once-only ((restarts restarts-form))
+  (once-only ((condition-form condition-form)
+              (restarts restarts-form))
     (with-unique-names (restart)
       ;; FIXME: check the need for interrupt-safety.
       `(unwind-protect
@@ -695,8 +703,15 @@ evaluated as a PROGN."
                    ;; The predicate is used only if needed - it's not an error
                    ;; if not fboundp (though dangerously stupid) - so just
                    ;; reference #'F for the compiler to see the use of the name.
+                   ;; But (KLUDGE): since the ref is to force a compile-time
+                   ;; effect, the interpreter should not see that form,
+                   ;; because there is no way for it to perform an unsafe ref,
+                   ;; (and it wouldn't signal a style-warning anyway),
+                   ;; and so it would actually fail immediately if predicate
+                   ;; were not defined.
                    (let ((name (second type)))
-                     (dummy-forms `#',name)
+                     (when (typep env 'lexenv)
+                       (dummy-forms `#',name))
                      `(find-or-create-fdefn ',name)))
                   ((and (symbolp type)
                         (condition-classoid-p (find-classoid type nil)))

@@ -11,9 +11,6 @@
 
 (in-package "SB!VM")
 
-(defun lowest-set-bit-index (integer-value)
-  (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
-
 (defun repeating-pattern-p (val)
   (declare (type (unsigned-byte 32) val))
   (and (= (ldb (byte 16 0) val)
@@ -128,11 +125,6 @@
 (define-move-vop move :move
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into another
 ;;; frame for argument or known value passing.

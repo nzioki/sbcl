@@ -19,11 +19,11 @@
                                             (throw 'd-b-error c)))))
                     (funcall fun form env))))))
   (macrolet ((maybe-funcall (&rest args)
-               ;; The evaluator will delay lambda-list checks until
+               ;; The interpreters will delay lambda-list checks until
                ;; the lambda is actually called.
-               (if (eq sb-ext:*evaluator-mode* :interpret)
-                   `(funcall ,@args)
-                   `(progn ,@args)))
+               (if (eq sb-ext:*evaluator-mode* :compile)
+                   `(progn ,@args)
+                   `(funcall ,@args)))
              (error-p (ll)
                `(progn
                   (multiple-value-bind (result error)
@@ -449,3 +449,9 @@
       (macroexpand-1
        '(defmacro defx (name ll &optional (types '*) &key node) 1)))
     (assert (= count 1))))
+
+(with-test (:name :silent-pcl-internals)
+  (assert-no-signal
+   (sb-int:parse-lambda-list
+    '(sb-pcl::.pv. sb-pcl::.next-method-call. self &optional o &key k
+       &allow-other-keys))))

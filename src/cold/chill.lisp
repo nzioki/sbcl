@@ -60,13 +60,19 @@
     (def 'defparameter)
     (def 'defvar)))
 
-(export '(sb-int::def!method
+(export '(sb-disassem::!begin-instruction-definitions)
+        'sb-disassem)
+
+(export '(sb-int::def!method sb-int::defmacro-mundanely
           sb-int::!cold-init-forms
           sb-int::!coerce-to-specialized
+          sb-int::/show sb-int::/noshow sb-int::/show0 sb-int::/noshow0
           sb-int::!uncross-format-control)
         'sb-int)
 
 (setf (macro-function 'sb-int:def!method) (macro-function 'defmethod))
+(defmacro sb-int:defmacro-mundanely (name lambda-list &body body)
+  `(let () (defmacro ,name ,lambda-list ,@body)))
 
 (defmacro sb-int:!cold-init-forms (&rest forms) `(progn ,@forms))
 
@@ -77,3 +83,11 @@
   (declare (ignore type))
   a)
 (defmacro sb-int:!uncross-format-control (s) s)
+
+;; If :sb-show is present, then these symbols are fboundp.
+;; Otherwise define them as no-ops.
+(unless (fboundp 'sb-int:/show)
+  (defmacro sb-int:/show (&rest junk) (declare (ignore junk)))
+  (setf (macro-function 'sb-int:/noshow) (macro-function 'sb-int:/show)
+        (macro-function 'sb-int:/show0) (macro-function 'sb-int:/show)
+        (macro-function 'sb-int:/noshow0) (macro-function 'sb-int:/show)))

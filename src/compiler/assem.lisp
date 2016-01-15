@@ -278,6 +278,7 @@
                   `(note-write-dependency ,',segment ,',inst ,loc ,@keys)))
        ,@body)))
 
+#!+(or hppa sparc ppc mips) ; only for platforms with scheduling assembler.
 (defun note-read-dependency (segment inst read)
   (multiple-value-bind (loc-num size)
       (sb!c:location-number read)
@@ -315,6 +316,7 @@
         (push inst (svref (segment-readers segment) index)))))
   (values))
 
+#!+(or hppa sparc ppc mips) ; only for platforms with scheduling assembler.
 (defun note-write-dependency (segment inst write &key partially)
   (multiple-value-bind (loc-num size)
       (sb!c:location-number write)
@@ -381,6 +383,9 @@
       (when (zerop countdown)
         (schedule-pending-instructions segment))))
   (values))
+
+#!-(or mips ppc sparc) ; not defined for platforms other than these
+(defun sb!c:emit-nop (seg) seg (bug "EMIT-NOP"))
 
 ;;; Emit all the pending instructions, and reset any state. This is
 ;;; called whenever we hit a label (i.e. an entry point of some kind)
@@ -757,6 +762,9 @@
     (integer
      (dotimes (i amount)
        (emit-byte segment pattern)))
+    ;; EMIT-LONG-NOP does not exist for most backends.
+    ;; Better to get an ECASE error than undefined-function.
+    #!+x86-64
     ((eql :long-nop)
      (sb!vm:emit-long-nop segment amount)))
   (values))
@@ -1240,16 +1248,19 @@
   #+sb-xc-host
   (def sb!xc:defmacro %macroexpand))
 
+(defun inst-emitter-symbol (symbol &optional create)
+  (values (funcall (if create 'intern 'find-symbol)
+                   (string-downcase symbol)
+                   *backend-instruction-set-package*)))
+
 (defmacro inst (&whole whole instruction &rest args &environment env)
   #!+sb-doc
   "Emit the specified instruction to the current segment."
-  (let ((inst (gethash (symbol-name instruction) *assem-instructions*)))
-    (cond ((null inst)
-           (error "unknown instruction: ~S" instruction))
-          ((functionp inst)
-           (funcall inst (cdr whole) env))
-          (t
-           `(,inst (%%current-segment%%) (%%current-vop%%) ,@args)))))
+  (let ((sym (inst-emitter-symbol instruction)))
+    ;; An ordinary style-warning will suffice to indicate a missing emitter.
+    ;; There's no need for an extra check.
+    (cond ((get sym :macro) (funcall sym (cdr whole) env))
+          (t `(,sym (%%current-segment%%) (%%current-vop%%) ,@args)))))
 
 ;;; Note: The need to capture MACROLET bindings of %%CURRENT-SEGMENT%%
 ;;; and %%CURRENT-VOP%% prevents this from being an ordinary function.
@@ -1444,63 +1455,41 @@
                (:big-endian forms))
            ',name)))))
 
-(defun grovel-lambda-list (lambda-list vop-var)
-  (let ((segment-name (car lambda-list))
-        (vop-var (or vop-var (make-symbol "VOP"))))
-    (sb!int:collect ((new-lambda-list))
-      (new-lambda-list segment-name)
-      (new-lambda-list vop-var)
-      (labels
-          ((grovel (state lambda-list)
-             (when lambda-list
-               (let ((param (car lambda-list)))
-                 (cond
-                  ((member param sb!xc:lambda-list-keywords)
-                   (new-lambda-list param)
-                   (grovel param (cdr lambda-list)))
-                  (t
-                   (ecase state
-                     ((nil)
-                      (new-lambda-list param)
-                      `(cons ,param ,(grovel state (cdr lambda-list))))
-                     (&optional
-                      (multiple-value-bind (name default supplied-p)
-                          (if (consp param)
-                              (values (first param)
-                                      (second param)
-                                      (or (third param)
-                                          (sb!xc:gensym "SUPPLIED-P-")))
-                              (values param nil (sb!xc:gensym "SUPPLIED-P-")))
-                        (new-lambda-list (list name default supplied-p))
-                        `(and ,supplied-p
-                              (cons ,(if (consp name)
-                                         (second name)
-                                         name)
-                                    ,(grovel state (cdr lambda-list))))))
-                     (&key
-                      (multiple-value-bind (name default supplied-p)
-                          (if (consp param)
-                              (values (first param)
-                                      (second param)
-                                      (or (third param)
-                                          (sb!xc:gensym "SUPPLIED-P-")))
-                              (values param nil (sb!xc:gensym "SUPPLIED-P-")))
-                        (new-lambda-list (list name default supplied-p))
-                        (multiple-value-bind (key var)
-                            (if (consp name)
-                                (values (first name) (second name))
-                                (values (keywordicate name) name))
-                          `(append (and ,supplied-p (list ',key ,var))
-                                   ,(grovel state (cdr lambda-list))))))
-                     (&rest
-                      (new-lambda-list param)
-                      (grovel state (cdr lambda-list))
-                      param))))))))
-        (let ((reconstructor (grovel nil (cdr lambda-list))))
-          (values (new-lambda-list)
-                  segment-name
-                  vop-var
-                  reconstructor))))))
+;;; Return a list of forms involving VALUES that will pass the arguments from
+;;; LAMBA-LIST by way of MULTIPLE-VALUE-CALL. Secondary value is the augmented
+;;; lambda-list which has a supplied-p var for every &OPTIONAL and &KEY arg.
+(defun make-arglist-forwarder (lambda-list)
+  (multiple-value-bind (llks required optional rest keys aux)
+      (parse-lambda-list lambda-list)
+    (collect ((reconstruction))
+      (flet ((augment (spec var def sup-p var-maker arg-passing-form)
+               (multiple-value-bind (sup-p new-spec)
+                   (if sup-p
+                       (values (car sup-p) spec)
+                       (let ((sup-p (copy-symbol var)))
+                         (values sup-p `(,(funcall var-maker) ,def ,sup-p))))
+                 (reconstruction `(if ,sup-p ,arg-passing-form (values)))
+                 new-spec)))
+        (setq optional ; Ensure that each &OPTIONAL arg has a supplied-p var.
+              (mapcar (lambda (spec)
+                        (multiple-value-bind (var def sup)
+                            (parse-optional-arg-spec spec)
+                          (augment spec var def sup (lambda () var) var)))
+                      optional))
+        (unless (ll-kwds-restp llks)
+          (setq keys ; Do the same for &KEY, unless &REST is present.
+                (mapcar (lambda (spec)
+                          (multiple-value-bind (key var def sup)
+                              (parse-key-arg-spec spec)
+                            (augment spec var def sup
+                                     (lambda ()
+                                       (if (eq (keywordicate var) key)
+                                           var
+                                           `(,key ,var)))
+                                     `(values ',key ,var))))
+                        keys))))
+      (values `(,@required ,@(reconstruction) ,@(if rest `((values-list ,@rest))))
+              (make-lambda-list llks nil required optional rest keys aux)))))
 
 (defun extract-nths (index glue list-of-lists-of-lists)
   (mapcar (lambda (list-of-lists)
@@ -1511,26 +1500,26 @@
           list-of-lists-of-lists))
 
 (defmacro define-instruction (name lambda-list &rest options)
-  (let* ((sym-name (symbol-name name))
-         (defun-name (sb!int:symbolicate sym-name "-INST-EMITTER"))
-         (vop-var nil)
-         (postits (gensym "POSTITS-"))
-         (emitter nil)
-         (decls nil)
-         (attributes nil)
-         (cost nil)
-         (dependencies nil)
-         (delay nil)
-         (pinned nil)
-         (pdefs nil))
-    (sb!int:/noshow "entering DEFINE-INSTRUCTION" name lambda-list options)
+  (binding* ((sym-name (symbol-name name))
+             (defun-name (inst-emitter-symbol sym-name t))
+             (segment-name (car lambda-list))
+             (vop-name nil)
+             (postits (gensym "POSTITS-"))
+             (emitter nil)
+             (decls nil)
+             (attributes nil)
+             (cost nil)
+             (dependencies nil)
+             (delay nil)
+             (pinned nil)
+             (pdefs nil)
+             ((arg-reconstructor new-lambda-list)
+              (make-arglist-forwarder (cdr lambda-list))))
     (dolist (option-spec options)
-      (sb!int:/noshow option-spec)
       (multiple-value-bind (option args)
           (if (consp option-spec)
               (values (car option-spec) (cdr option-spec))
               (values option-spec nil))
-        (sb!int:/noshow option args)
         (case option
           (:emitter
            (when emitter
@@ -1551,42 +1540,27 @@
           (:pinned
            (setf pinned t))
           (:vop-var
-           (if vop-var
+           (if vop-name
                (error "You can only specify :VOP-VAR once per instruction.")
-               (setf vop-var (car args))))
+               (setf vop-name (car args))))
           (:printer
-           (sb!int:/noshow "uniquifying :PRINTER with" args)
-           #-sb-xc-host
-           (push (eval `(list (multiple-value-list
-                               ,(sb!disassem:gen-printer-def-forms-def-form
-                                 name
-                                 (cdr option-spec)))))
-                 pdefs))
-          (:printer-list
-           ;; same as :PRINTER, but is EVALed first, and is a list of
-           ;; printers
-           #-sb-xc-host
-           (push
-            (eval
-             `(eval
-               `(list ,@(mapcar (lambda (printer)
-                                  `(multiple-value-list
-                                    ,(sb!disassem:gen-printer-def-forms-def-form
-                                      ',name printer nil)))
-                                ,(cadr option-spec)))))
-            pdefs))
+           (let* ((inst-args (second args))
+                  (names (mapcar #'car inst-args)))
+             (when (> (length names) (length (remove-duplicates names)))
+               (error "Duplicate operand names in ~S~%" args)))
+           (destructuring-bind (name operands . options) args
+             (push ``(,',name (,,@(mapcar (lambda (x) ``(,',(car x) ,,@(cdr x)))
+                                          operands))
+                              ,,@options) pdefs)))
           (t
            (error "unknown option: ~S" option)))))
-    (sb!int:/noshow "done processing options")
-    (setf pdefs (nreverse pdefs))
-    (multiple-value-bind
-        (new-lambda-list segment-name vop-name arg-reconstructor)
-        (grovel-lambda-list lambda-list vop-var)
-      (sb!int:/noshow new-lambda-list segment-name vop-name arg-reconstructor)
+    (unless vop-name
+      (setq vop-name (make-symbol "VOP")))
+    (when emitter
       (push `(let ((hook (segment-inst-hook ,segment-name)))
                (when hook
-                 (funcall hook ,segment-name ,vop-name ,sym-name
-                          ,arg-reconstructor)))
+                 (multiple-value-call hook ,segment-name ,vop-name ,sym-name
+                                      ,@arg-reconstructor)))
             emitter)
       (push `(dolist (postit ,postits)
                (emit-back-patch ,segment-name 0 postit))
@@ -1628,9 +1602,13 @@
                                                 (,segment-name ,inst-name)
                                               ,@dependencies)))
                                       (queue-inst ,segment-name ,inst-name))
-                                    (,flet-name ,segment-name))))))))
-      `(progn
-         (defun ,defun-name ,new-lambda-list
+                                    (,flet-name ,segment-name)))))))))
+    `(progn
+       #-sb-xc-host ; The disassembler is not used on the host.
+       (setf (get ',defun-name 'sb!disassem::instruction-flavors)
+             (list ,@pdefs))
+       ,(when emitter
+         `(defun ,defun-name (,segment-name ,vop-name ,@new-lambda-list)
            ,@(when decls
                `((declare ,@decls)))
            (let ((,postits (segment-postits ,segment-name)))
@@ -1648,22 +1626,12 @@
                #-sb-xc-host
                (declare (enable-package-locks %%current-segment%%))
                ,@emitter))
-           (values))
-         (eval-when (:compile-toplevel :load-toplevel :execute)
-           (%define-instruction ,sym-name ',defun-name))
-         ,@(extract-nths 1 'progn pdefs)
-         ,@(when pdefs
-             `((sb!disassem:install-inst-flavors
-                ',name
-                (append ,@(extract-nths 0 'list pdefs)))))))))
+           (values))))))
 
 (defmacro define-instruction-macro (name lambda-list &body body)
-  (let ((namestring (symbol-name name)))
+  (let* ((namestring (symbol-name name))
+         (defun-name (inst-emitter-symbol namestring t)))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (%define-instruction ,namestring
-                            ,(make-macro-lambda
-                              namestring lambda-list body 'inst name)))))
-
-(defun %define-instruction (name defun)
-  (setf (gethash name *assem-instructions*) defun)
-  name)
+       (setf (get ',defun-name :macro) t
+             (symbol-function ',defun-name)
+             ,(make-macro-lambda namestring lambda-list body 'inst name)))))

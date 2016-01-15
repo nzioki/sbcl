@@ -221,7 +221,7 @@ initial_thread_trampoline(struct thread *th)
 #ifdef LISP_FEATURE_SB_THREAD
     pthread_setspecific(lisp_thread, (void *)1);
 #endif
-#if defined(THREADS_USING_GCSIGNAL) && defined(LISP_FEATURE_PPC)
+#if defined(THREADS_USING_GCSIGNAL) && (defined(LISP_FEATURE_PPC) || defined(LISP_FEATURE_ARM64))
     /* SIG_STOP_FOR_GC defaults to blocked on PPC? */
     unblock_gc_signals(0,0);
 #endif
@@ -305,9 +305,16 @@ perform_thread_post_mortem(struct thread_post_mortem *post_mortem)
 #ifdef CREATE_POST_MORTEM_THREAD
     pthread_detach(pthread_self());
 #endif
+    int result;
     if (post_mortem) {
-        gc_assert(!pthread_join(post_mortem->os_thread, NULL));
-        gc_assert(!pthread_attr_destroy(post_mortem->os_attr));
+        if ((result = pthread_join(post_mortem->os_thread, NULL))) {
+            lose("Error calling pthread_join in perform_thread_post_mortem:\n%s",
+                 strerror(result));
+        }
+        if ((result = pthread_attr_destroy(post_mortem->os_attr))) {
+            lose("Error calling pthread_attr_destroy in perform_thread_post_mortem:\n%s",
+                 strerror(result));
+        }
         free(post_mortem->os_attr);
         os_invalidate(post_mortem->os_address, THREAD_STRUCT_SIZE);
         free(post_mortem);
@@ -439,7 +446,8 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
     gc_assert(lock_ret == 0);
 #endif
 
-    if(th->tls_cookie>=0) arch_os_thread_cleanup(th);
+    arch_os_thread_cleanup(th);
+
 #ifndef LISP_FEATURE_SB_SAFEPOINT
     os_sem_destroy(th->state_sem);
     os_sem_destroy(th->state_not_running_sem);
@@ -475,8 +483,6 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
 #else
     pthread_setspecific(specials, NULL);
 #endif
-
-    schedule_thread_post_mortem(th);
 }
 
 /* this is the first thing that runs in the child (which is why the
@@ -501,6 +507,8 @@ new_thread_trampoline(struct thread *th)
     init_new_thread(th, &scribble, 1);
     result = funcall0(function);
     undo_init_new_thread(th, &scribble);
+
+    schedule_thread_post_mortem(th);
 
     FSHOW((stderr,"/exiting thread %lu\n", thread_self()));
     return result;
@@ -745,9 +753,14 @@ create_thread_struct(lispobj initial_function) {
 #else
     th->alien_stack_pointer=((void *)th->alien_stack_start);
 #endif
-#if defined(LISP_FEATURE_X86) || defined (LISP_FEATURE_X86_64) || defined(LISP_FEATURE_SB_THREAD)
+
+#ifdef LISP_FEATURE_SB_THREAD
     th->pseudo_atomic_bits=0;
+#elif defined LISP_FEATURE_GENCGC
+    clear_pseudo_atomic_atomic(th);
+    clear_pseudo_atomic_interrupted(th);
 #endif
+
 #ifdef LISP_FEATURE_GENCGC
     gc_set_region_empty(&th->alloc_region);
 # if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
@@ -777,11 +790,6 @@ create_thread_struct(lispobj initial_function) {
     SetSymbolValue(CONTROL_STACK_END,(lispobj)th->control_stack_end,th);
 #if defined(LISP_FEATURE_X86) || defined (LISP_FEATURE_X86_64)
     SetSymbolValue(ALIEN_STACK_POINTER,(lispobj)th->alien_stack_pointer,th);
-    SetSymbolValue(PSEUDO_ATOMIC_BITS,(lispobj)th->pseudo_atomic_bits,th);
-#endif
-#ifdef PSEUDO_ATOMIC_INTERRUPTED
-    clear_pseudo_atomic_atomic(th);
-    clear_pseudo_atomic_interrupted(th);
 #endif
 #endif
     bind_variable(CURRENT_CATCH_BLOCK,make_fixnum(0),th);

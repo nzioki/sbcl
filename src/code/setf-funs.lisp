@@ -43,12 +43,13 @@
                    (eq (info :function :kind sym) :function)
                    (or (info :setf :inverse sym)
                        (info :setf :expander sym))
-                   (not (member sym ignore)))
+                   ;; Use STRING= because (NEQ 'LDB 'SB!XC:LDB) etc.
+                   (not (member sym ignore :test #'string=)))
           (res sym))))
     `(progn
       ,@(mapcan
          (lambda (sym)
-           (let ((type (type-specifier (info :function :type sym))))
+           (let ((type (type-specifier (proclaimed-ftype sym))))
              (aver (consp type))
              (list
               #!-sb-fluid `(declaim (inline (setf ,sym)))

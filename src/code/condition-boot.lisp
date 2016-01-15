@@ -25,10 +25,9 @@
                 ;; excluding T which is assumed.
                 (%compiler-define-condition
                  ',name ',direct-supers
-                 ,(sb!kernel:make-layout
+                 ,(make-layout
                    :classoid (make-undefined-classoid name)
-                   :inherits (map 'vector #'sb!kernel:find-layout
-                                  (cons t inherits))
+                   :inherits (map 'vector #'find-layout (cons t inherits))
                    :depthoid -1
                    :length 3)
                  nil nil))))
@@ -42,10 +41,10 @@
   (def style-warning (warning) condition warning)
   (def compiler-note (condition) condition)
   (def parse-unknown-type (condition) condition)
+  (def parse-deprecated-type (condition) condition)
   (def serious-condition (condition) condition)
   (def error (serious-condition) condition serious-condition)
   (def sb!di:debug-condition (serious-condition) condition serious-condition)
   (def stream-error (error) condition serious-condition error)
   (def reference-condition (condition) condition)
-  (def sb!format:format-error (error reference-condition)
-       condition reference-condition serious-condition error))
+  )

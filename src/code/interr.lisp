@@ -32,8 +32,8 @@
       (unless (<= max 3)
         (error "Update (DEFUN INTERNAL-ERROR) for ~D error arguments" max))))
   `(setf (svref **internal-error-handlers** ,(error-number-or-lose name))
-         (named-lambda ,(string name) (name ,@args)
-           (declare (optimize (sb!c::verify-arg-count 0)) (ignorable name))
+         (named-lambda ,(string name) (,@args)
+           (declare (optimize (sb!c::verify-arg-count 0)))
            ,@body)))) ; EVAL-WHEN
 
 (deferr undefined-fun-error (fdefn-or-symbol)
@@ -42,14 +42,14 @@
                  (symbol fdefn-or-symbol)
                  (fdefn (fdefn-name fdefn-or-symbol)))))
 
-#!+(or arm x86-64)
+#!+(or arm arm64 x86-64)
 (deferr undefined-alien-fun-error (address)
   (error 'undefined-alien-function-error
          :name
          (and (integerp address)
               (sap-foreign-symbol (int-sap address)))))
 
-#!-(or arm x86-64)
+#!-(or arm arm64 x86-64)
 (defun undefined-alien-fun-error ()
   (error 'undefined-alien-function-error))
 
@@ -79,9 +79,30 @@
          "attempt to RETURN-FROM a block or GO to a tag that no longer exists"))
 
 (deferr unseen-throw-tag-error (tag)
-  (error 'simple-control-error
-         :format-control "attempt to THROW to a tag that does not exist: ~S"
-         :format-arguments (list tag)))
+  (let ((text "attempt to THROW to a tag that does not exist: ~S"))
+    #!+sb-fasteval
+    (when (listp tag)
+      (multiple-value-bind (name frame)
+          (sb!debug::find-interrupted-name-and-frame)
+        (let ((down (and (eq name 'sb!c::unwind) ; is this tautological ?
+                         (sb!di:frame-down frame))))
+          (when frame
+            ;; Is this really the canonical way to get a frame name?
+            (let ((prev-frame-name
+                   (sb!di:debug-fun-name (sb!di:frame-debug-fun down))))
+              (when (and (listp prev-frame-name)
+                         (eq (car prev-frame-name) 'sb!c::xep))
+                (setq prev-frame-name (second prev-frame-name)))
+              (cond ((equal prev-frame-name '(eval return-from))
+                     (setq text "attempt to RETURN-FROM an exited block: ~S"
+                           ;; block name was wrapped in a cons
+                           tag (car tag)))
+                    ((equal prev-frame-name '(eval go))
+                     ;; FIXME: can we reverse-engineer the tag name from
+                     ;; the object that was thrown, for a better diagnostic?
+                     (setq text "attempt to GO into an exited tagbody"))))))))
+    (error 'simple-control-error
+           :format-control text :format-arguments (list tag))))
 
 (deferr nil-fun-returned-error (function)
   (error 'simple-control-error
@@ -144,55 +165,29 @@
 
 ;;; This flag is used to prevent infinite recursive lossage when
 ;;; we can't find the caller for some reason.
-(defvar *finding-name* nil)
+(defvar *finding-frame* nil)
 
-(defun find-caller-name-and-frame ()
-  (if *finding-name*
-      (values "<error finding caller name -- already finding name>" nil)
-      (handler-case
-          (let* ((*finding-name* t)
-                 (frame (sb!di:frame-down (sb!di:frame-down (sb!di:top-frame))))
-                 (name (sb!di:debug-fun-name
-                        (sb!di:frame-debug-fun frame))))
-            (sb!di:flush-frames-above frame)
-            (values name frame))
-        (error ()
-          (values "<error finding caller name -- trapped error>" nil))
-        (sb!di:debug-condition ()
-          (values "<error finding caller name -- trapped debug-condition>"
-                  nil)))))
+(defun find-caller-frame ()
+  (unless *finding-frame*
+    (handler-case
+        (let* ((*finding-frame* t)
+               (frame (sb!di:frame-down (sb!di:frame-down (sb!di:top-frame)))))
+          (sb!di:flush-frames-above frame)
+          frame)
+      ((or error sb!di:debug-condition) ()))))
 
-(defun find-interrupted-name-and-frame ()
-  (/show0 "entering FIND-INTERRUPTED-NAME-AND-FRAME")
-  (if *finding-name*
-      (values "<error finding interrupted name -- already finding name>" nil)
-      (handler-case
-          (let ((*finding-name* t))
-            (/show0 "in ordinary case")
-            (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
-                ((null frame)
-                 (/show0 "null frame")
-                 (values "<error finding interrupted name -- null frame>" nil))
-              (/noshow0 "at head of DO loop")
-              (when (and (sb!di::compiled-frame-p frame)
-                         (sb!di::compiled-frame-escaped frame))
-                (sb!di:flush-frames-above frame)
-                (/show0 "returning from within DO loop")
-                (return (values (sb!di:debug-fun-name
-                                 (sb!di:frame-debug-fun frame))
-                                frame)))))
-        (error ()
-          (/show0 "trapped ERROR")
-          (values "<error finding interrupted name -- trapped error>" nil))
-        (sb!di:debug-condition ()
-          (/show0 "trapped DEBUG-CONDITION")
-          (values "<error finding interrupted name -- trapped debug-condition>"
-                  nil)))))
+(defun find-interrupted-frame ()
+  (when (plusp *free-interrupt-context-index*)
+    (handler-case
+        (sb!di::signal-context-frame (sb!alien::alien-sap
+                                      (sb!di::nth-interrupt-context
+                                       (1- *free-interrupt-context-index*))))
+      ((or error sb!di:debug-condition) ()))))
 
 (defun find-caller-of-named-frame (name)
-  (unless *finding-name*
+  (unless *finding-frame*
     (handler-case
-        (let ((*finding-name* t))
+        (let ((*finding-frame* t))
           (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
               ((null frame))
             (when (and (sb!di::compiled-frame-p frame)
@@ -213,8 +208,7 @@
   (multiple-value-bind (llks req opt)
       (parse-lambda-list (%simple-fun-arglist handler) :silent t)
     (declare (ignore llks))
-    ;; The handler always gets name as the first (extra) argument.
-    (let ((n (1+ (length arguments)))
+    (let ((n (length arguments))
           (n-req (length req))
           (n-opt (length opt)))
       (and (>= n n-req) (<= n (+ n-req n-opt))))))
@@ -260,35 +254,33 @@
       (multiple-value-bind (error-number arguments)
           (sb!vm:internal-error-args alien-context)
         (with-interrupt-bindings
-          (multiple-value-bind (name sb!debug:*stack-top-hint*)
-              (find-interrupted-name-and-frame)
-            (/show0 "back from FIND-INTERRUPTED-NAME")
-            (let ((*current-internal-error* error-number)
-                  (fp (int-sap (sb!vm:context-register alien-context
-                                                       sb!vm::cfp-offset))))
-              (if (and (>= error-number (length **internal-error-handlers**))
-                       (< error-number (length sb!c:+backend-internal-errors+)))
-                  (error 'type-error
-                         :datum (sb!di::sub-access-debug-var-slot
-                                 fp (first arguments) alien-context)
-                         :expected-type
-                         (car (svref sb!c:+backend-internal-errors+
-                                     error-number)))
-                  (let ((handler
-                         (and (typep error-number
-                                     '#.`(mod ,(length **internal-error-handlers**)))
-                              (svref **internal-error-handlers** error-number))))
-                   (cond
+          (let ((sb!debug:*stack-top-hint* (find-interrupted-frame))
+                (*current-internal-error* error-number)
+                (fp (int-sap (sb!vm:context-register alien-context
+                                                     sb!vm::cfp-offset))))
+            (if (and (>= error-number (length **internal-error-handlers**))
+                     (< error-number (length sb!c:+backend-internal-errors+)))
+                (error 'type-error
+                       :datum (sb!di::sub-access-debug-var-slot
+                               fp (first arguments) alien-context)
+                       :expected-type
+                       (car (svref sb!c:+backend-internal-errors+
+                                   error-number)))
+                (let ((handler
+                        (and (typep error-number
+                                    '#.`(mod ,(length **internal-error-handlers**)))
+                             (svref **internal-error-handlers** error-number))))
+                  (cond
                     ((and (functionp handler)
                           (internal-error-args-ok arguments handler))
                      (macrolet ((arg (n)
                                   `(sb!di::sub-access-debug-var-slot
                                     fp (nth ,n arguments) alien-context)))
                        (ecase (length arguments)
-                         (0 (funcall handler name))
-                         (1 (funcall handler name (arg 0)))
-                         (2 (funcall handler name (arg 0) (arg 1)))
-                         (3 (funcall handler name (arg 0) (arg 1) (arg 2))))))
+                         (0 (funcall handler))
+                         (1 (funcall handler (arg 0)))
+                         (2 (funcall handler (arg 0) (arg 1)))
+                         (3 (funcall handler (arg 0) (arg 1) (arg 2))))))
                     ((eql handler 0) ; if (DEFERR x) was inadvertently omitted
                      (error 'simple-error
                             :format-control
@@ -308,7 +300,7 @@
                                   (mapcar (lambda (sc-offset)
                                             (sb!di::sub-access-debug-var-slot
                                              fp sc-offset alien-context))
-                                          arguments)))))))))))))))
+                                          arguments))))))))))))))
 
 (defun control-stack-exhausted-error ()
   (let ((sb!debug:*stack-top-hint* nil))
@@ -359,8 +351,9 @@
 
 #!-win32
 (defun memory-fault-error ()
-  (error 'memory-fault-error
-         :address current-memory-fault-address))
+  (let ((sb!debug:*stack-top-hint* (find-interrupted-frame)))
+    (error 'memory-fault-error
+           :address current-memory-fault-address)))
 
 ;;; This is SIGTRAP / EXCEPTION_BREAKPOINT that runtime could not deal
 ;;; with. Prior to Windows we just had a Lisp side handler for

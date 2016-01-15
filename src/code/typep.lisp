@@ -16,21 +16,23 @@
 (defun typep (object type &optional environment)
   #!+sb-doc
   "Is OBJECT of type TYPE?"
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
+  (declare (explicit-check))
   ;; Actually interpreting types at runtime is done by %TYPEP. The
   ;; cost of the extra function call here should be negligible
   ;; compared to the cost of interpreting types. (And the compiler
   ;; tries hard to optimize away the interpretation of types at
   ;; runtime, and when it succeeds, we never get here anyway.)
-  (%typep object type))
+  (%%typep object (specifier-type type)))
 
 ;;; the actual TYPEP engine. The compiler only generates calls to this
 ;;; function when it can't figure out anything more intelligent to do.
 (defun %typep (object specifier)
-  (%%typep object
-           (if (ctype-p specifier)
-               specifier
-               (specifier-type specifier))))
+  ;; Checking CTYPE-P on the specifier, as used to be done, is not right.
+  ;; If the specifier were a CTYPE we shouldn't have gotten here.
+  (declare (explicit-check))
+  (%%typep object (specifier-type specifier)))
+
 (defun %%typep (object type &optional (strict t))
   (declare (type ctype type))
   (etypecase type

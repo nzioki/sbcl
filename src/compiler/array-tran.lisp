@@ -574,7 +574,9 @@
           ;; default
           (t
            #-sb-xc-host
-           (unless (ctypep default-initial-element elt-ctype)
+           (and (and (testable-type-p elt-ctype)
+                     (neq elt-ctype *empty-type*)
+                     (not (ctypep default-initial-element elt-ctype)))
              ;; This situation arises e.g. in (MAKE-ARRAY 4 :ELEMENT-TYPE
              ;; '(INTEGER 1 5)) ANSI's definition of MAKE-ARRAY says "If
              ;; INITIAL-ELEMENT is not supplied, the consequences of later
@@ -759,6 +761,36 @@
                                initial-contents
                                call))
 
+;;;; ADJUST-ARRAY
+(deftransform adjust-array ((array dims &key displaced-to displaced-index-offset)
+                            (array integer &key
+                                   (:displaced-to array)
+                                   (:displaced-index-offset *)))
+  (unless displaced-to
+    (give-up-ir1-transform))
+  `(progn
+     (when (invalid-array-p array)
+       (invalid-array-error array))
+     (unless (= 1 (array-rank array))
+       (error "The number of dimensions is not equal to the rank of the array"))
+     (unless (eql (array-element-type array) (array-element-type displaced-to))
+       (error "Can't displace an array of type ~S to another of type ~S"
+              (array-element-type array) (array-element-type displaced-to)))
+     (let ((displacement (or displaced-index-offset 0))
+           (array-size dims))
+       (when (< (array-total-size displaced-to) (+ displacement array-size))
+         (error "The :DISPLACED-TO array is too small"))
+       (if (adjustable-array-p array)
+           (let ((nfp (when (array-has-fill-pointer-p array)
+                        (when (> (%array-fill-pointer array) array-size)
+                          (error "Cannot ADJUST-ARRAY an array to a size smaller than its fill pointer"))
+                        (%array-fill-pointer array))))
+             (set-array-header array displaced-to array-size nfp
+                               displacement dims t nil))
+           (make-array dims :element-type (array-element-type array)
+                       :displaced-to displaced-to
+                       :displaced-index-offset displaced-index-offset)))))
+
 ;;;; miscellaneous properties of arrays
 
 ;;; Transforms for various array properties. If the property is know
@@ -774,14 +806,26 @@
                (array-type
                 (array-type-dimensions type))
                (union-type
-                (let* ((types (remove nil (mapcar #'maybe-array-type-dimensions
-                                                  (union-type-types type))))
-                       (result (car types)))
-                  (dolist (other (cdr types) result)
-                    (unless (equal result other)
+                (let* ((types (loop for type in (union-type-types type)
+                                    for dimensions = (maybe-array-type-dimensions type)
+                                    when (eq dimensions '*)
+                                    do
+                                    (return-from maybe-array-type-dimensions '*)
+                                    when dimensions
+                                    collect it))
+                       (result (car types))
+                       (length (length result))
+                       (complete-match t))
+                  (dolist (other (cdr types))
+                    (when (/= length (length other))
                       (give-up-ir1-transform
                        "~@<dimensions of arrays in union type ~S do not match~:@>"
-                       (type-specifier type))))))
+                       (type-specifier type)))
+                    (unless (equal result other)
+                      (setf complete-match nil)))
+                  (if complete-match
+                      result
+                      (make-list length :initial-element '*))))
                (intersection-type
                 (let* ((types (remove nil (mapcar #'maybe-array-type-dimensions
                                                   (intersection-type-types type))))
@@ -962,18 +1006,13 @@
               "The array type is ambiguous; must call ~
                ARRAY-HAS-FILL-POINTER-P at runtime.")))))))
 
-;;; Primitive used to verify indices into arrays. If we can tell at
-;;; compile-time or we are generating unsafe code, don't bother with
-;;; the VOP.
-(deftransform %check-bound ((array dimension index) * * :node node)
-  (cond ((policy node (= insert-array-bounds-checks 0))
-         'index)
-        ((not (constant-lvar-p dimension))
-         (give-up-ir1-transform))
-        (t
-         (let ((dim (lvar-value dimension)))
-           ;; FIXME: Can SPEED > SAFETY weaken this check to INTEGER?
-           `(the (integer 0 (,dim)) index)))))
+(deftransform check-bound ((array dimension index) * * :node node)
+  ;; This is simply to avoid multiple evaluation of INDEX by the
+  ;; translator, it's easier to wrap it in a lambda from DEFTRANSFORM
+  `(bound-cast array ,(if (constant-lvar-p dimension)
+                          (lvar-value dimension)
+                          'dimension)
+               index))
 
 ;;;; WITH-ARRAY-DATA
 
@@ -1163,7 +1202,7 @@
       `(let ((,n-vector ,vector))
          (the ,elt-type (data-vector-ref
                          (the simple-vector ,n-vector)
-                         (%check-bound ,n-vector (length ,n-vector) ,index)))))))
+                         (check-bound ,n-vector (length ,n-vector) ,index)))))))
 
 (define-source-transform %svset (vector index value)
   (let ((elt-type (or (when (symbolp vector)
@@ -1176,12 +1215,12 @@
       `(let ((,n-vector ,vector))
          (truly-the ,elt-type (data-vector-set
                                (the simple-vector ,n-vector)
-                               (%check-bound ,n-vector (length ,n-vector) ,index)
+                               (check-bound ,n-vector (length ,n-vector) ,index)
                                (the ,elt-type ,value)))))))
 
 (macrolet (;; This is a handy macro for computing the row-major index
            ;; given a set of indices. We wrap each index with a call
-           ;; to %CHECK-BOUND to ensure that everything works out
+           ;; to CHECK-BOUND to ensure that everything works out
            ;; correctly. We can wrap all the interior arithmetic with
            ;; TRULY-THE INDEX because we know the resultant
            ;; row-major index must be an index.
@@ -1208,15 +1247,15 @@
                                 (do* ((dims dims (cdr dims))
                                       (indices n-indices (cdr indices))
                                       (last-dim nil (car dims))
-                                      (form `(%check-bound ,',array
-                                                           ,(car dims)
-                                                           ,(car indices))
+                                      (form `(check-bound ,',array
+                                                          ,(car dims)
+                                                          ,(car indices))
                                             `(truly-the
                                               index
                                               (+ (truly-the index
                                                             (* ,form
                                                                ,last-dim))
-                                                 (%check-bound
+                                                 (check-bound
                                                   ,',array
                                                   ,(car dims)
                                                   ,(car indices))))))
@@ -1256,7 +1295,7 @@
        (let* ((declared-element-ctype (array-type-declared-element-type type))
               (bare-form
                 `(data-vector-ref array
-                                  (%check-bound array (array-dimension array 0) index))))
+                                  (check-bound array (array-dimension array 0) index))))
          (if (type= declared-element-ctype element-ctype)
              bare-form
              `(the ,(type-specifier declared-element-ctype) ,bare-form))))
@@ -1297,15 +1336,15 @@
                   ,(if extra
                        ``(truly-the ,declared-type
                                     (,',transform-to array
-                                                     (%check-bound array
-                                                                   (array-dimension array 0)
-                                                                   index)
+                                                     (check-bound array
+                                                                  (array-dimension array 0)
+                                                                  index)
                                                      (the ,declared-type ,@',extra)))
                        ``(the ,declared-type
                            (,',transform-to array
-                                            (%check-bound array
-                                                          (array-dimension array 0)
-                                                          index))))))))
+                                            (check-bound array
+                                                         (array-dimension array 0)
+                                                         index))))))))
   (define hairy-data-vector-ref/check-bounds
       hairy-data-vector-ref nil nil)
   (define hairy-data-vector-set/check-bounds
@@ -1316,10 +1355,10 @@
 ;;; array total size.
 (deftransform row-major-aref ((array index))
   `(hairy-data-vector-ref array
-                          (%check-bound array (array-total-size array) index)))
+                          (check-bound array (array-total-size array) index)))
 (deftransform %set-row-major-aref ((array index new-value))
   `(hairy-data-vector-set array
-                          (%check-bound array (array-total-size array) index)
+                          (check-bound array (array-total-size array) index)
                           new-value))
 
 ;;;; bit-vector array operation canonicalization

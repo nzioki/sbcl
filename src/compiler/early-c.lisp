@@ -190,11 +190,12 @@ the stack without triggering overflow protection.")
   ;; We do this BOUNDP check because this function can be called when
   ;; not in a compilation unit (as when loading top level forms).
   (when (boundp '*undefined-warnings*)
-    (setq *undefined-warnings*
-          (delete-if (lambda (x)
-                       (and (equal (undefined-warning-name x) name)
-                            (eq (undefined-warning-kind x) kind)))
-                     *undefined-warnings*)))
+    (let ((name (uncross name)))
+      (setq *undefined-warnings*
+            (delete-if (lambda (x)
+                         (and (equal (undefined-warning-name x) name)
+                              (eq (undefined-warning-kind x) kind)))
+                       *undefined-warnings*))))
   (values))
 
 ;;; to be called when a variable is lexically bound
@@ -289,3 +290,7 @@ the stack without triggering overflow protection.")
           (bug "~S is a legal function name, and cannot be used as a ~
                 debug name." name))
         name))))
+
+;;; Set this to NIL to inhibit assembly-level optimization. (For
+;;; compiler debugging, rather than policy control.)
+(defvar *assembly-optimize* t)

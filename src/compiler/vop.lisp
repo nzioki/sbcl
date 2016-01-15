@@ -41,18 +41,14 @@
 ;;; representations of that value.
 (defstruct (primitive-type (:copier nil))
   ;; the name of this PRIMITIVE-TYPE
-  (name nil :type symbol)
+  (name nil :type symbol :read-only t)
   ;; a list of the SC numbers for all the SCs that a TN of this type
   ;; can be allocated in
-  (scs nil :type list)
+  (scs nil :type list :read-only t)
   ;; the Lisp type equivalent to this type. If this type could never be
-  ;; returned by PRIMITIVE-TYPE, then this is the NIL (or empty) type
-  (specifier (missing-arg) :type type-specifier)
-  ;; the template used to check that an object is of this type. This is a
-  ;; template of one argument and one result, both of primitive-type T. If
-  ;; the argument is of the correct type, then it is delivered into the
-  ;; result. If the type is incorrect, then an error is signalled.
-  (check nil :type (or template null)))
+  ;; returned by PRIMITIVE-TYPE, then this is the NIL (or empty) type.
+  ;; TYPE-SPECIFIER is too general - this doesn't allow CLASS/CLASSOID.
+  (specifier (missing-arg) :type (or symbol list) :read-only t))
 
 (defprinter (primitive-type)
   name)
@@ -229,7 +225,7 @@
 
 ;;; An IR2-COMPONENT serves mostly to accumulate non-code information
 ;;; about the component being compiled.
-(defstruct (ir2-component (:copier nil))
+(def!struct (ir2-component (:copier nil))
   ;; the counter used to allocate global TN numbers
   (global-tn-counter 0 :type index)
   ;; NORMAL-TNS is the head of the list of all the normal TNs that
@@ -460,11 +456,6 @@
   ;; are read and before results are written. This is only filled in
   ;; when VOP-INFO-SAVE-P is non-null.
   (save-set nil :type (or local-tn-bit-vector null)))
-(defprinter (vop)
-  (info :prin1 (vop-info-name info))
-  args
-  results
-  (codegen-info :test codegen-info))
 
 ;;; A TN-REF object contains information about a particular reference
 ;;; to a TN. The information in TN-REFs largely determines how TNs are
@@ -493,10 +484,6 @@
   (target nil :type (or null tn-ref))
   ;; the load TN allocated for this operand, if any
   (load-tn nil :type (or tn null)))
-(defprinter (tn-ref)
-  tn
-  write-p
-  (vop :test vop :prin1 (vop-info-name (vop-info vop))))
 
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
@@ -653,6 +640,20 @@
   ;; encodes the source ref (shifted 8, it is also encoded in
   ;; MAX-VOP-TN-REFS) and the dest ref index.
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1))))
+
+;; These printers follow the definition of VOP-INFO because they
+;; want to inline VOP-INFO-NAME, and it's less code to move them here
+;; than to move the defstructs of VOP-INFO and TEMPLATE.
+(defprinter (vop)
+  (info :prin1 (vop-info-name info))
+  args
+  results
+  (codegen-info :test codegen-info))
+(defprinter (tn-ref)
+  tn
+  write-p
+  (vop :test vop :prin1 (vop-info-name (vop-info vop))))
+
 
 ;;;; SBs and SCs
 
@@ -941,6 +942,7 @@
   (physenv nil :type (or physenv null))
   ;; The depth of the deepest loop that this TN is used in.
   (loop-depth 0 :type fixnum))
+(declaim (freeze-type tn))
 (def!method print-object ((tn tn) stream)
   (print-unreadable-object (tn stream :type t)
     ;; KLUDGE: The distinction between PRINT-TN and PRINT-OBJECT on TN is
@@ -953,7 +955,7 @@
 ;;; lifetime analysis, the global conflicts structure is used during
 ;;; lifetime analysis to represent the set of TNs live at the start of
 ;;; the IR2 block.
-(defstruct (global-conflicts
+(def!struct (global-conflicts
             (:constructor make-global-conflicts (kind tn block number))
             (:copier nil))
   ;; the IR2-BLOCK that this structure represents the conflicts for

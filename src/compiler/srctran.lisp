@@ -151,7 +151,19 @@
       (specifier-type 'cons)
       (lvar-type arg)))
 
-;;;
+(define-source-transform make-list (length &rest rest)
+  (if (or (null rest)
+          ;; Use of &KEY in source xforms doesn't have all the usual semantics.
+          ;; It's better to hand-roll it - cf. transforms for WRITE[-TO-STRING].
+          (typep rest '(cons (eql :initial-element) (cons t null))))
+      ;; Something fishy here- If THE is removed, OPERAND-RESTRICTION-OK
+      ;; returns NIL because type inference on MAKE-LIST never happens.
+      ;; But the fndb entry for %MAKE-LIST is right, so I'm slightly bewildered.
+      `(%make-list (the (integer 0 (,(1- sb!xc:array-dimension-limit))) ,length)
+                   ,(second rest))
+      (values nil t))) ; give up
+
+(deftransform %make-list ((length item) ((constant-arg (eql 0)) t)) nil)
 
 (define-source-transform nconc (&rest args)
   (case (length args)
@@ -385,13 +397,6 @@
   (def signed-zero-< <)
   (def signed-zero-<= <=))
 
-;;; The basic interval type. It can handle open and closed intervals.
-;;; A bound is open if it is a list containing a number, just like
-;;; Lisp says. NIL means unbounded.
-(defstruct (interval (:constructor %make-interval)
-                     (:copier nil))
-  low high)
-
 (defun make-interval (&key low high)
   (labels ((normalize-bound (val)
              (cond #-sb-xc-host
@@ -414,14 +419,8 @@
                         (list new-val))))
                    (t
                     (error "unknown bound type in MAKE-INTERVAL")))))
-    (%make-interval :low (normalize-bound low)
-                    :high (normalize-bound high))))
-
-;;; Given a number X, create a form suitable as a bound for an
-;;; interval. Make the bound open if OPEN-P is T. NIL remains NIL.
-#!-sb-fluid (declaim (inline set-bound))
-(defun set-bound (x open-p)
-  (if (and x open-p) (list x) x))
+    (%make-interval (normalize-bound low)
+                    (normalize-bound high))))
 
 ;;; Apply the function F to a bound X. If X is an open bound and the
 ;;; function is declared strictly monotonic, then the result will be
@@ -2890,7 +2889,8 @@
 (declaim (type (sfunction (integer) rational) reciprocate))
 (defun reciprocate (x)
   (declare (optimize (safety 0)))
-  (%make-ratio 1 x))
+  #+sb-xc-host (error "Can't call reciprocate ~D" x)
+  #-sb-xc-host (%make-ratio 1 x))
 
 (deftransform expt ((base power) ((constant-arg unsigned-byte) integer))
   (let ((base (lvar-value base)))
@@ -2972,7 +2972,7 @@
     (labels ((reoptimize-node (node name)
                (setf (node-derived-type node)
                      (fun-type-returns
-                      (info :function :type name)))
+                      (proclaimed-ftype name)))
                (setf (lvar-%derived-type (node-lvar node)) nil)
                (setf (node-reoptimize node) t)
                (setf (block-reoptimize (node-block node)) t)
@@ -3533,6 +3533,7 @@
 (deftransform mask-signed-field ((size x) ((constant-arg t) *) *)
   "fold identity operation"
   (let ((size (lvar-value size)))
+    (when (= size 0) (give-up-ir1-transform))
     (unless (csubtypep (lvar-type x) (specifier-type `(signed-byte ,size)))
       (give-up-ir1-transform))
     'x))
@@ -3858,8 +3859,13 @@
 (macrolet ((def (x)
              `(%deftransform ',x '(function * *) #'simple-equality-transform)))
   (def eq)
-  (def char=)
-  (def two-arg-char-equal))
+  (def char=))
+
+;;; Can't use the above thing, since TYPES-EQUAL-OR-INTERSECT is case sensitive.
+(deftransform two-arg-char-equal ((x y) * *)
+  (cond
+    ((same-leaf-ref-p x y) t)
+    (t (give-up-ir1-transform))))
 
 ;;; This is similar to SIMPLE-EQUALITY-TRANSFORM, except that we also
 ;;; try to convert to a type-specific predicate or EQ:
@@ -4981,7 +4987,7 @@
     (give-up-ir1-transform "not a real transform"))
   (defun /report-lvar (x message)
     (declare (ignore x message))))
-
+
 (deftransform encode-universal-time
     ((second minute hour date month year &optional time-zone)
      ((constant-arg (mod 60)) (constant-arg (mod 60))
@@ -5013,3 +5019,18 @@
       (if (> seconds (expt 10 8))
           (give-up-ir1-transform)
           `(sb!unix:nanosleep ,seconds ,nano)))))
+
+;; On 64-bit architectures the TLS index is in the symbol header,
+;; !DEFINE-PRIMITIVE-OBJECT doesn't define an accessor for it.
+;; In the architectures where tls-index is an ordinary slot holding a tagged
+;; object, it represents the byte offset to an aligned object and looks
+;; in Lisp like a fixnum that is off by a factor of (EXPT 2 N-FIXNUM-TAG-BITS).
+;; We're reading with a raw SAP accessor, so must make it look equally "off".
+;; Also we don't get the defknown automatically.
+#!+(and 64-bit sb-thread)
+(defknown symbol-tls-index (t) fixnum (flushable))
+#!+(and 64-bit sb-thread)
+(define-source-transform symbol-tls-index (sym)
+  `(ash (sap-ref-32 (int-sap (get-lisp-obj-address (the symbol ,sym)))
+                    (- 4 sb!vm:other-pointer-lowtag))
+        (- sb!vm:n-fixnum-tag-bits)))

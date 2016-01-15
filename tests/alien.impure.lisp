@@ -36,14 +36,17 @@
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness)))
+  (declare (ignore function failurep))
   (assert warningsp))
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness "FOO")))
+  (declare (ignore function failurep))
   (assert (not warningsp)))
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness "FOO" "BAR")))
+  (declare (ignore function failurep))
   (assert warningsp))
 
 ;;; This used to break due to too eager auxiliary type twiddling in
@@ -221,13 +224,15 @@
     (when x
       (return-from try-to-leak-alien-stack 'going))
     (never)))
-(with-test (:name :nlx-causes-alien-stack-leak)
+(with-test (:name :nlx-causes-alien-stack-leak
+                  :fails-on :interpreter) ; should it work?
   (let ((*sap-int* nil))
     (loop repeat 1024
           do (try-to-leak-alien-stack t))))
 
 ;;; bug 431
-(with-test (:name :alien-struct-redefinition)
+(with-test (:name :alien-struct-redefinition
+                  :fails-on :interpreter)
   (eval '(progn
           (define-alien-type nil (struct mystruct (myshort short) (mychar char)))
           (with-alien ((myst (struct mystruct)))
@@ -247,12 +252,23 @@
 
 ;;; void conflicted with derived type
 (declaim (inline bug-316075))
-#-win32 ;kludge: This reader conditional masks a bug, but allows the test
-        ;to fail cleanly.
+;; KLUDGE: This win32 reader conditional masks a bug, but allows the
+;; test to fail cleanly.  The linkage-table reader conditional
+;; accomodates the little fact that the function doesn't exist, and
+;; non-linkage-table systems resolve such things immediately and
+;; signal errors.
+#-(or win32 (not linkage-table))
 (sb-alien:define-alien-routine bug-316075 void (result char :out))
-(with-test (:name :bug-316075 :fails-on :win32)
+(with-test (:name :bug-316075 :fails-on :win32
+                  :broken-on '(not :linkage-table))
   #+win32 (error "fail")
-  (handler-bind ((warning #'error))
+  #-linkage-table (error "unable to set up test precondition")
+  ;; The interpreter gives you a style-warning because the "undefined alien"
+  ;; first occurs here during compilation of the test case. But if compiling
+  ;; by default, then the warning already happened above at DEFINE-ALIEN-ROUTINE
+  ;; because when that got compiled, it warned, which inhibited further
+  ;; warnings for the same foreign symbol.
+  (handler-bind (((and warning (not style-warning)) #'error))
     (compile nil '(lambda () (multiple-value-list (bug-316075))))))
 
 
@@ -267,7 +283,8 @@
     ((foo (unsigned 32)))
   foo)
 
-(with-test (:name :bug-316325 :skipped-on '(not (or :x86-64 :x86)))
+(with-test (:name :bug-316325 :skipped-on '(not (or :x86-64 :x86))
+                  :fails-on :interpreter)
   ;; This test works by defining a callback function that provides an
   ;; identity transform over a full-width machine word, then calling
   ;; it as if it returned a narrower type and checking to see if any
@@ -327,7 +344,8 @@
     (assert (equal "This comes from lisp!" (cast alien c-string)))
     (free-alien alien)))
 
-(with-test (:name :malloc-failure)
+(with-test (:name :malloc-failure
+                  :fails-on :alpha) ;; Alpha has address space to burn
   (assert (eq :enomem
               (handler-case
                   (loop repeat 128
@@ -385,6 +403,7 @@
               (catch 'out
                 (handler-bind ((sb-int:character-decoding-error
                                  (lambda (stream-condition)
+                                   (declare (ignore stream-condition))
                                    (handler-bind ((sb-int:character-decoding-error
                                                     (lambda (c-string-condition)
                                                       (throw 'out
@@ -437,4 +456,20 @@
     (file-position stream 4294967310)
     (assert (= 4294967310 (file-position stream)))))
 
-;;; success
+(with-test (:name :stack-misalignment)
+  (locally (declare (optimize (debug 2)))
+    (labels ((foo ()
+               (declare (optimize speed))
+               (sb-ext:get-time-of-day)))
+      (assert (equal (multiple-value-list
+                      (multiple-value-prog1
+                          (apply #'values (list 1))
+                        (foo)))
+                     '(1))))))
+
+;; Parse (ENUM COLOR)
+(sb-alien-internals:parse-alien-type '(enum color red blue black green) nil)
+;; Now reparse it as a different type
+(with-test (:name :change-enum-type)
+  (handler-bind ((error #'continue))
+    (sb-alien-internals:parse-alien-type '(enum color yellow ochre) nil)))

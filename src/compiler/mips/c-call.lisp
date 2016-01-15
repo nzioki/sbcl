@@ -299,18 +299,39 @@
 
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type))
-    (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb!alien::alien-integer-type-bits parsed-type)))
-               (let ((byte-offset
-                      (cond ((< bits n-word-bits)
-                             (- n-word-bytes
-                                (ceiling bits n-byte-bits)))
-                            (t 0))))
-                 `(deref (sap-alien (sap+ ,sap
-                                          ,(+ byte-offset offset))
-                                    (* ,type)))))
-        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+  ;; KLUDGE: OFFSET is given to be word-aligned (32-bit aligned), but
+  ;; double-float and long-long (both 64-bit wide) arguments need to
+  ;; be 64-bit aligned.  And then there's the bit where sub-word-wide
+  ;; values are aligned towards the END of the word on big-endian
+  ;; systems.  For both cases, we need to parse the alien type, but we
+  ;; aren't given the environment that our caller has access to, so we
+  ;; substitute a null lexenv (KLUDGE number one), then we do some bit
+  ;; twiddling to determine how much alignment we need.  Why, oh why
+  ;; can't we have something like the :ARG-TN methods for all of this
+  ;; mess?  -- AB, 2015-Nov-02
+  (let* ((parsed-type (sb!alien::parse-alien-type type (make-null-lexenv)))
+         (alignment-bits (sb!alien::alien-type-alignment parsed-type))
+         (alignment-bytes (truncate alignment-bits n-byte-bits))
+         ;; OFFSET is at least 32-bit aligned, we're trying to pick
+         ;; out the cases where we need 64-bit alignment.
+         (delta (logand offset (1- alignment-bytes))))
+    (values
+     (ecase *backend-byte-order*
+       (:big-endian
+        (if (alien-integer-type-p parsed-type)
+            (let ((bits (sb!alien::alien-integer-type-bits parsed-type)))
+              (let ((byte-offset
+                     (cond ((< bits n-word-bits)
+                            (- n-word-bytes
+                               (ceiling bits n-byte-bits)))
+                           (t 0))))
+                `(deref (sap-alien (sap+ ,sap
+                                         ,(+ byte-offset offset delta))
+                                   (* ,type)))))
+          `(deref (sap-alien (sap+ ,sap ,(+ offset delta)) (* ,type)))))
+       (:little-endian
+        `(deref (sap-alien (sap+ ,sap ,(+ offset delta)) (* ,type)))))
+     delta)))
 
 ;;; Returns a vector in static space containing machine code for the
 ;;; callback wrapper
@@ -364,9 +385,11 @@ and a pointer to the arguments."
                       (when gprs
                         (let ((gpr (pop gprs))
                               (fpr (pop fprs)))
-                          (if int-seen
-                              (when gpr (inst sw gpr nsp-tn offset))
-                              (when fpr (inst swc1 fpr nsp-tn offset))))
+                          (cond
+                           ((and (not int-seen) fpr)
+                            (inst swc1 fpr nsp-tn offset))
+                           (gpr
+                            (inst sw gpr nsp-tn offset))))
                         (incf words-processed)))
                      ((alien-double-float-type-p type)
                       (when (oddp words-processed)
@@ -377,23 +400,23 @@ and a pointer to the arguments."
                         (let* ((gpr1 (pop gprs))
                                (gpr2 (pop gprs))
                                (fpr (pop fprs)))
-                          (if int-seen
-                            (when gpr1
-                              (ecase *backend-byte-order*
-                                (:big-endian
-                                 (inst sw gpr1 nsp-tn offset)
-                                 (inst sw gpr2 nsp-tn (+ offset n-word-bytes)))
-                                (:little-endian
-                                 (inst sw gpr2 nsp-tn offset)
-                                 (inst sw gpr1 nsp-tn (+ offset n-word-bytes)))))
-                            (when fpr
-                              (ecase *backend-byte-order*
-                                (:big-endian
-                                 (inst swc1 fpr nsp-tn offset)
-                                 (inst swc1-odd fpr nsp-tn (+ offset n-word-bytes)))
-                                (:little-endian
-                                 (inst swc1-odd fpr nsp-tn offset)
-                                 (inst swc1 fpr nsp-tn (+ offset n-word-bytes)))))))
+                          (cond
+                           ((and (not int-seen) fpr)
+                            (ecase *backend-byte-order*
+                              (:big-endian
+                               (inst swc1 fpr nsp-tn (+ offset n-word-bytes))
+                               (inst swc1-odd fpr nsp-tn offset))
+                              (:little-endian
+                               (inst swc1 fpr nsp-tn offset)
+                               (inst swc1-odd fpr nsp-tn (+ offset n-word-bytes)))))
+                           (gpr1
+                            (ecase *backend-byte-order*
+                              (:big-endian
+                               (inst sw gpr1 nsp-tn offset)
+                               (inst sw gpr2 nsp-tn (+ offset n-word-bytes)))
+                              (:little-endian
+                               (inst sw gpr2 nsp-tn offset)
+                               (inst sw gpr1 nsp-tn (+ offset n-word-bytes)))))))
                         (incf words-processed 2)))
                      (t
                       (bug "Unknown alien floating point type: ~S" type))))))
@@ -428,9 +451,15 @@ and a pointer to the arguments."
               ((alien-single-float-type-p result-type)
                (inst lwc1 (make-fpr 0) sp n-callee-register-args-bytes))
               ((alien-double-float-type-p result-type)
-               (inst lwc1 (make-fpr 0) sp n-callee-register-args-bytes)
-               (inst lwc1 (make-fpr 1) sp (+ n-callee-register-args-bytes
-                                             n-word-bytes)))
+               (ecase *backend-byte-order*
+                 (:big-endian
+                  (inst lwc1 (make-fpr 0) sp (+ n-callee-register-args-bytes
+                                                n-word-bytes))
+                  (inst lwc1 (make-fpr 1) sp n-callee-register-args-bytes))
+                 (:little-endian
+                  (inst lwc1 (make-fpr 0) sp n-callee-register-args-bytes)
+                  (inst lwc1 (make-fpr 1) sp (+ n-callee-register-args-bytes
+                                                n-word-bytes)))))
               ((and (alien-integer-type-p result-type)
                     (> (sb!alien::alien-integer-type-bits result-type)
                        n-word-bits))

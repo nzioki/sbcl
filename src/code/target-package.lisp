@@ -832,9 +832,9 @@ implementation it is ~S." *default-package-use-list*)
          (unless (and (string= name (package-name package))
                       (null (set-difference nicks (package-nicknames package)
                                             :test #'string=)))
-           (assert-package-unlocked package "rename as ~A~@[ with nickname~P ~
-                                             ~{~A~^, ~}~]"
-                                    name (length nicks) nicks))
+           (assert-package-unlocked
+            package "renaming as ~A~@[ with nickname~*~P ~1@*~{~A~^, ~}~]"
+            name nicks (length nicks)))
          (with-package-names (names)
            ;; Check for race conditions now that we have the lock.
            (unless (eq package (find-package package-designator))
@@ -1603,8 +1603,7 @@ PACKAGE."
                      (add-symbol table symbol)))))
           (setf (package-external-symbols pkg) (!make-table (car symbols))
                 (package-internal-symbols pkg) (!make-table (cdr symbols))))
-        (setf (package-%shadowing-symbols pkg) nil
-              (package-%local-nicknames pkg) nil
+        (setf (package-%local-nicknames pkg) nil
               (package-%locally-nicknamed-by pkg) nil
               (package-source-location pkg) nil
               (gethash (package-%name pkg) names) pkg)
@@ -1714,3 +1713,18 @@ PACKAGE."
               (let ((shadows (package-%shadowing-symbols (this-package))))
                 (scan (not (member sym shadows :test #'string=))))
               (scan))))))
+
+(defun program-assert-symbol-home-package-unlocked (context symbol control)
+  #!-sb-package-locks
+  (declare (ignore context symbol control))
+  #!+sb-package-locks
+  (handler-bind ((package-lock-violation
+                  (lambda (condition)
+                    (ecase context
+                      (:compile
+                       (warn "Compile-time package lock violation:~%  ~A"
+                             condition)
+                       (sb!c:compiler-error condition))
+                      (:eval
+                       (eval-error condition))))))
+    (with-single-package-locked-error (:symbol symbol control))))

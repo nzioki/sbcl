@@ -10,24 +10,6 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; interfaces to IR2 conversion
-
-;;; Return a wired TN describing the N'th full call argument passing
-;;; location.
-(defun standard-arg-location (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
-                     (nth n *register-arg-offsets*))
-      (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
-
-(defun standard-arg-location-sc (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-sc-offset descriptor-reg-sc-number
-                      (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-sc-number n)))
 
 (defconstant arg-count-sc (make-sc-offset any-reg-sc-number rcx-offset))
 (defconstant closure-sc (make-sc-offset any-reg-sc-number rax-offset))
@@ -81,34 +63,6 @@
 ;;; are using non-standard conventions.
 (defun make-arg-count-location ()
   (make-wired-tn *fixnum-primitive-type* any-reg-sc-number rcx-offset))
-
-;;; Make a TN to hold the number-stack frame pointer. This is allocated
-;;; once per component, and is component-live.
-(defun make-nfp-tn ()
-  (make-restricted-tn *fixnum-primitive-type* ignore-me-sc-number))
-
-(defun make-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-(defun make-number-stack-pointer-tn ()
-  (make-restricted-tn *fixnum-primitive-type* ignore-me-sc-number))
-
-;;; Return a list of TNs that can be used to represent an unknown-values
-;;; continuation within a function.
-(defun make-unknown-values-locations ()
-  (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure. We
-;;; push placeholder entries in the CONSTANTS to leave room for
-;;; additional noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (dotimes (i code-constants-offset)
-    (vector-push-extend nil
-                        (ir2-component-constants (component-info component))))
-  (values))
 
 ;;;; frame hackery
 
@@ -1372,32 +1326,6 @@
             ((plusp min)
              (inst cmp nargs (fixnumize min))
              (inst jmp :b err-lab))))))
-
-;;; Various other error signallers.
-(macrolet ((def (name error translate &rest args)
-             `(define-vop (,name)
-                ,@(when translate
-                    `((:policy :fast-safe)
-                      (:translate ,translate)))
-                (:args ,@(mapcar (lambda (arg)
-                                   `(,arg :scs (any-reg descriptor-reg
-                                                control-stack constant)))
-                                 args))
-                (:vop-var vop)
-                (:save-p :compute-only)
-                (:generator 1000
-                  (error-call vop ',error ,@args)))))
-  (def arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs fname)
-  (def type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (def layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
-    object layout)
-  (def odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error)
-  (def unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error key)
-  (def nil-fun-returned-error nil-fun-returned-error nil fun))
 
 ;; Signal an error about an untagged number.
 ;; These are pretty much boilerplate and could be generic except:

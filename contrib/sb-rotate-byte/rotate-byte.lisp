@@ -24,6 +24,6 @@ contains the bits of INTEGER."
   (declare (notinline %rotate-byte))
   (%rotate-byte count 32 0 integer))
 
-#+x86-64
+#+64-bit
 (defun %unsigned-64-rotate-byte (count integer)
   (%unsigned-64-rotate-byte count integer))

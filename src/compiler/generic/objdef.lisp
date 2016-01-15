@@ -66,15 +66,15 @@
                :ref-trans %denominator
                :init :arg))
 
-#!+#.(cl:if (cl:= sb!vm:n-word-bits 32) '(and) '(or))
+#!-64-bit
 (!define-primitive-object (single-float :lowtag other-pointer-lowtag
                                        :widetag single-float-widetag)
   (value :c-type "float"))
 
 (!define-primitive-object (double-float :lowtag other-pointer-lowtag
                                        :widetag double-float-widetag)
-  #!-x86-64 (filler)
-  (value :c-type "double" :length #!-x86-64 2 #!+x86-64 1))
+  #!-64-bit (filler)
+  (value :c-type "double" :length #.(/ 64 n-word-bits)))
 
 #!+long-float
 (!define-primitive-object (long-float :lowtag other-pointer-lowtag
@@ -173,7 +173,8 @@
 (!define-primitive-object (fdefn :type fdefn
                                 :lowtag other-pointer-lowtag
                                 :widetag fdefn-widetag)
-  (name :ref-trans fdefn-name)
+  (name :ref-trans fdefn-name
+        :set-trans %set-fdefn-name :set-known ())
   (fun :type (or function null) :ref-trans fdefn-fun)
   (raw-addr :c-type #!-alpha "char *" #!+alpha "u32"))
 
@@ -269,16 +270,9 @@
          :ref-known (flushable)
          :init :arg))
 
-#!+alpha
 (!define-primitive-object (sap :lowtag other-pointer-lowtag
                               :widetag sap-widetag)
-  (padding)
-  (pointer :c-type "char *" :length 2))
-
-#!-alpha
-(!define-primitive-object (sap :lowtag other-pointer-lowtag
-                              :widetag sap-widetag)
-  (pointer :c-type "char *"))
+  (pointer :c-type "char *" :pointer t))
 
 
 (!define-primitive-object (weak-pointer :type weak-pointer
@@ -352,26 +346,26 @@
            :set-trans %set-symbol-package
            :init :null)
   ;; 0 tls-index means no tls-index is allocated
-  ;; x86-64 puts the tls-index in the header word.
-  #!+(and sb-thread (not x86-64))
+  ;; 64-bit put the tls-index in the header word.
+  #!+(and sb-thread (not 64-bit))
   (tls-index :ref-known (flushable) :ref-trans symbol-tls-index))
 
 (!define-primitive-object (complex-single-float
                           :lowtag other-pointer-lowtag
                           :widetag complex-single-float-widetag)
-  #!+x86-64
+  #!+64-bit
   (data :c-type "struct { float data[2]; } ")
-  #!-x86-64
+  #!-64-bit
   (real :c-type "float")
-  #!-x86-64
+  #!-64-bit
   (imag :c-type "float"))
 
 (!define-primitive-object (complex-double-float
                           :lowtag other-pointer-lowtag
                           :widetag complex-double-float-widetag)
   (filler)
-  (real :c-type "double" :length #!-x86-64 2 #!+x86-64 1)
-  (imag :c-type "double" :length #!-x86-64 2 #!+x86-64 1))
+  (real :c-type "double" :length #.(/ 64 n-word-bits))
+  (imag :c-type "double" :length #.(/ 64 n-word-bits)))
 
 #!+sb-simd-pack
 (!define-primitive-object (simd-pack
@@ -398,7 +392,7 @@
   ;; which may have different alignment then what we prefer to use.
   ;; Kept here so that when the thread dies we can release the whole
   ;; memory we reserved.
-  (os-address :c-type "void *" :length #!+alpha 2 #!-alpha 1)
+  (os-address :c-type "void *" :pointer t)
 
   ;; Keep these next six slots (alloc-region being figured in as 1 slot)
   ;; near the beginning of the structure so that x86[-64] assembly code
@@ -407,51 +401,52 @@
   ;; manipulations by fixing their TLS offsets to be < 2^7, the largest
   ;; aligned displacement fitting in a signed byte.
   #!+gencgc (alloc-region :c-type "struct alloc_region" :length 5)
-  #!+(or x86 x86-64 sb-thread) (pseudo-atomic-bits :special *pseudo-atomic-bits*)
+  #!+sb-thread (pseudo-atomic-bits #!+(or x86 x86-64) :special #!+(or x86 x86-64) *pseudo-atomic-bits*)
   ;; next two not used in C, but this wires the TLS offsets to small values
   #!+(and x86-64 sb-thread)
   (current-catch-block :special *current-catch-block*)
   #!+(and x86-64 sb-thread)
   (current-unwind-protect-block :special *current-unwind-protect-block*)
-  (alien-stack-pointer :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1
+  (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
-  (binding-stack-pointer :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1
+  (binding-stack-pointer :c-type "lispobj *" :pointer t
                          :special *binding-stack-pointer*)
   (stepping)
   ;; END of slots to keep near the beginning.
 
   ;; These aren't accessed (much) from Lisp, so don't really care
   ;; if it takes a 4-byte displacement.
-  (alien-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
-  (binding-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1
+  (alien-stack-start :c-type "lispobj *" :pointer t)
+  (binding-stack-start :c-type "lispobj *" :pointer t
                        :special *binding-stack-start*)
 
   #!+sb-thread
-  (os-attr :c-type "pthread_attr_t *" :length #!+alpha 2 #!-alpha 1)
+  (os-attr :c-type "pthread_attr_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
-  (state-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
+  (state-sem :c-type "os_sem_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
-  (state-not-running-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
+  (state-not-running-sem :c-type "os_sem_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
   (state-not-running-waitcount :c-type "int" :length 1)
   #!+(and sb-thread (not sb-safepoint))
-  (state-not-stopped-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
+  (state-not-stopped-sem :c-type "os_sem_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
   (state-not-stopped-waitcount :c-type "int" :length 1)
-  (control-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1
+  (control-stack-start :c-type "lispobj *" :pointer t
                        :special *control-stack-start*)
-  (control-stack-end :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1
+  (control-stack-end :c-type "lispobj *" :pointer t
                      :special *control-stack-end*)
   (control-stack-guard-page-protected)
   #!+win32 (private-events :c-type "struct private_events" :length 2)
-  (this :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
-  (prev :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
-  (next :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
+  (this :c-type "struct thread *" :pointer t)
+  (prev :c-type "struct thread *" :pointer t)
+  (next :c-type "struct thread *" :pointer t)
   ;; starting, running, suspended, dead
   (state :c-type "lispobj")
-  (tls-cookie)                          ;  on x86, the LDT index
+
+  #!+x86 (tls-cookie)                          ;  LDT index
   (interrupt-data :c-type "struct interrupt_data *"
-                  :length #!+alpha 2 #!-alpha 1)
+                  :pointer t)
   ;; For various reasons related to pseudo-atomic and interrupt
   ;; handling, we need to know if the machine context is in Lisp code
   ;; or not.  On non-threaded targets, this is a global variable in
@@ -478,10 +473,4 @@
   #!+win32 (synchronous-io-handle-and-flag :c-type "HANDLE" :length 1)
   #!+(and sb-safepoint-strictly (not win32))
   (sprof-alloc-region :c-type "struct alloc_region" :length 5)
-  ;; KLUDGE: On alpha, until STEPPING we have been lucky and the 32
-  ;; bit slots came in pairs. However the C compiler will align
-  ;; interrupt_contexts on a double word boundary. This logic should
-  ;; be handled by !DEFINE-PRIMITIVE-OBJECT.
-  #!+alpha
-  (padding)
-  (interrupt-contexts :c-type "os_context_t *" :rest-p t))
+  (interrupt-contexts :c-type "os_context_t *" :rest-p t :pointer t))

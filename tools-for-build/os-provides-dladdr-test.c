@@ -7,11 +7,14 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 
+#ifdef __NetBSD__
+#include <sys/param.h>
+#endif
+
 int main ()
 {
-#ifdef __NetBSD__
-  /* dladdr(3) is broken on NetBSD currently, don't forget to replace
-     with a version check when they fix it */
+#if defined(__NetBSD_Version__) && __NetBSD_Version__ < 700000001
+  /* dladdr(3) is broken on some NetBSD versions before 7.0 */
   return 1;
 #else
    void * handle = dlopen((void*)0, RTLD_GLOBAL | RTLD_NOW);

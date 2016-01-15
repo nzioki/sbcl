@@ -482,8 +482,9 @@
                    (write-to-string *random-state*)))))
 
 (with-test (:name :write-return-value)
-  (assert (= 123 (funcall (compile nil (lambda ()
-                                         (write 123)))))))
+  ;; COMPILE is called explicitly because there was a bug in the
+  ;; compiler-macro for WRITE, which isn't expanded by the evaluator.
+  (assert (= 123 (funcall (compile nil '(lambda () (write 123)))))))
 
 (with-test (:name :write/write-to-string-compiler-macro-lp/598374+581564)
   (let ((test (compile nil
@@ -706,4 +707,16 @@
            (funcall (compile nil `(lambda (x) (format nil "~s" (the string x))))
                     "\\")
            (prin1-to-string "\\"))))
-;;; success
+
+(with-test (:name :write-stream-nil)
+  (assert
+   (equal
+    (with-output-to-string (*standard-output*)
+      (funcall (compile nil `(lambda () (write "xx" :stream nil)))))
+    "\"xx\"")))
+
+(define-condition foo () (a))
+(defvar *ccc* (make-condition 'foo))
+(define-condition foo (warning) (a))
+(with-test (:name :write-obsolete-condition)
+  (assert (search "UNPRINTABLE" (write-to-string *ccc*))))

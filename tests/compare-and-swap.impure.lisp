@@ -10,7 +10,7 @@
                   (assert (eql nil (compare-and-swap (,op x) nil y)))
                   (assert (eql y (compare-and-swap (,op x) nil z)))
                   (assert (eql y (,op x)))
-                  (let ((x "foo"))
+                  (let ((x (eval "foo"))) ; hide the compile-time type error
                     (multiple-value-bind (res err)
                         (ignore-errors (compare-and-swap (,op x) nil nil))
                       (unless (not res)
@@ -80,7 +80,7 @@
 ;; type of the first argument
 (with-test (:name (:cas :svref :type))
   (multiple-value-bind (res err)
-      (ignore-errors (compare-and-swap (svref "foo" 1) 1 2))
+      (ignore-errors (compare-and-swap (svref (eval "foo") 1) 1 2))
     (assert (not res))
     (assert (typep err 'type-error))))
 
@@ -106,13 +106,13 @@
   (assert
    (eq :error
        (handler-case
-           (sb-ext:compare-and-swap (symbol-value '*a-boolean*) t 42)
+           (sb-ext:compare-and-swap (symbol-value '*a-boolean*) t (eval 42))
          (error () :error))))
   (let ((name '*a-boolean*))
     (assert
      (eq :error
          (handler-case
-             (sb-ext:compare-and-swap (symbol-value name) t 42)
+             (sb-ext:compare-and-swap (symbol-value name) t (eval 42))
            (error () :error))))))
 
 ;;;; ATOMIC-INCF and ATOMIC-DECF (we should probably rename this file atomic-ops...)
@@ -150,6 +150,13 @@
   (let ((box (make-box :word 0)))
     (sb-ext:atomic-decf (box-word box) 2)
     (assert (= (- (ash 1 sb-vm:n-word-bits) 2) (box-word box)))))
+
+(with-test (:name :cas-raw-instance-ref-word
+            :skipped-on '(not (or :x86 :x86-64)))
+  (let ((foo (make-box :word 42)))
+    ;; basic smoke test - not checking for atomicity or anything
+    (assert (eql (cas (box-word foo) 42 43) 42))
+    (assert (eql (cas (box-word foo) 43 44) 43))))
 
 (with-test (:name :atomic-incf-full-call-lp1381867
             :skipped-on '(not (or :x86 :x86-64 :ppc)))

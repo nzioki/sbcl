@@ -254,21 +254,6 @@
   (fun (missing-arg) :type function)
   (before-address nil :type (member t nil)))
 
-(defstruct (segment (:conc-name seg-)
-                    (:constructor %make-segment)
-                    (:copier nil))
-  (sap-maker (missing-arg)
-             :type (function () sb!sys:system-area-pointer))
-  ;; Length in bytes of the range of memory covered by this segment.
-  (length 0 :type disassem-length)
-  ;; Length of the memory range excluding any trailing untagged data.
-  ;; Defaults to 'length' but could be shorter.
-  (opcodes-length 0 :type disassem-length)
-  (virtual-location 0 :type address)
-  (storage-info nil :type (or null storage-info))
-  (code nil :type (or null sb!kernel:code-component))
-  (unboxed-data-range nil :type (or null (cons fixnum fixnum)))
-  (hooks nil :type list))
 (def!method print-object ((seg segment) stream)
   (print-unreadable-object (seg stream :type t)
     (let ((addr (sb!sys:sap-int (funcall (seg-sap-maker seg)))))
@@ -668,16 +653,79 @@
                   (format nil "L~W" max)))))
       (setf (dstate-labels dstate) labels))))
 
+(defun collect-inst-variants (base-name package variants cache)
+  (mapcar
+   (lambda (printer)
+     (destructuring-bind (format-name
+                          (&rest arg-constraints)
+                          &optional (printer :default)
+                          &key (print-name
+                                (without-package-locks (intern base-name package)))
+                               control)
+         printer
+       (declare (type (or symbol string) print-name))
+       (let* ((flavor (cons base-name format-name))
+              (format (format-or-lose format-name))
+              (args (copy-list (format-args format)))
+              (format-length (bytes-to-bits (format-length format))))
+         (dolist (constraint arg-constraints)
+           (destructuring-bind (name . props) constraint
+             (let ((cell (member name args :key #'arg-name))
+                   (arg))
+               (if cell
+                   (setf (car cell) (setf arg (copy-structure (car cell))))
+                   (setf args (nconc args (list (setf arg (%make-arg name))))))
+               (apply #'modify-arg
+                      arg format-length (and props (cons :value props))))))
+         (let ((inst
+                (multiple-value-bind (mask id) (compute-mask-id args)
+                  (make-instruction
+                   base-name format-name print-name
+                   (format-length format) mask id
+                   (let ((printer (if (eq printer :default)
+                                      (format-default-printer format)
+                                      printer)))
+                     (when printer
+                       (lambda (chunk inst stream dstate)
+                         (funcall (setf (inst-printer inst)
+                                        (let ((*current-instruction-flavor* flavor))
+                                          (find-printer-fun printer args cache)))
+                                  chunk inst stream dstate))))
+                   nil ; labeller needs to close over INST
+                   nil ; prefilter needs to close over INST
+                   control))))
+           (when (some #'arg-use-label args)
+             (setf (inst-labeller inst)
+                   (lambda (chunk labels dstate)
+                     (funcall (setf (inst-labeller inst)
+                                    (let ((*current-instruction-flavor* flavor))
+                                      (find-labeller-fun args cache)))
+                              chunk labels dstate))))
+           (when (some #'arg-prefilter args)
+             (setf (inst-prefilter inst)
+                   (lambda (chunk dstate)
+                     (funcall (setf (inst-prefilter inst)
+                                    (let ((*current-instruction-flavor* flavor))
+                                      (find-prefilter-fun args cache)))
+                              chunk dstate))))
+           inst))))
+   variants))
+
 ;;; Get the instruction-space, creating it if necessary.
-(defun get-inst-space (&key force)
+(defun get-inst-space (&key (package sb!assem::*backend-instruction-set-package*)
+                            force)
   (let ((ispace *disassem-inst-space*))
     (when (or force (null ispace))
-      (let ((insts nil))
-        (maphash (lambda (name inst-flavs)
-                   (declare (ignore name))
-                   (dolist (flav inst-flavs)
-                     (push flav insts)))
-                 *disassem-insts*)
+      (let ((insts nil)
+            (cache (list (list :printer) (list :prefilter) (list :labeller))))
+        (do-symbols (symbol package)
+          (setq insts (nconc (collect-inst-variants
+                              (string-upcase symbol) package
+                              (get symbol 'instruction-flavors) cache)
+                             insts)))
+        (when force
+          (format t "~&~:{~@(~A~)s: ~D~:^, ~}~%"
+                  (mapcar (lambda (x) (list (car x) (length (cdr x)))) cache)))
         (setf ispace (build-inst-space insts)))
       (setf *disassem-inst-space* ispace))
     ispace))
@@ -918,6 +966,7 @@
 #!-sb-fluid (declaim (inline sap-maker))
 (defun sap-maker (function input offset)
   (declare (optimize (speed 3))
+           (muffle-conditions compiler-note)
            (type (function (t) sb!sys:system-area-pointer) function)
            (type offset offset))
   (let ((old-sap (sb!sys:sap+ (funcall function input) offset)))
@@ -945,10 +994,18 @@
 
 (defun memory-sap-maker (address)
   (declare (optimize (speed 3))
+           (muffle-conditions compiler-note)
            (type address address))
   (let ((sap (sb!sys:int-sap address)))
     (lambda () sap)))
 
+(defstruct (source-form-cache (:conc-name sfcache-)
+                              (:copier nil))
+  (debug-source nil :type (or null sb!di:debug-source))
+  (toplevel-form-index -1 :type fixnum)
+  (last-location-retrieved nil :type (or null sb!di:code-location))
+  (last-form-retrieved -1 :type fixnum))
+
 ;;; Return a memory segment located at the system-area-pointer returned by
 ;;; SAP-MAKER and LENGTH bytes long in the disassem-state object DSTATE.
 ;;;
@@ -1029,13 +1086,6 @@
 
 ;;; getting at the source code...
 
-(defstruct (source-form-cache (:conc-name sfcache-)
-                              (:copier nil))
-  (debug-source nil :type (or null sb!di:debug-source))
-  (toplevel-form-index -1 :type fixnum)
-  (last-location-retrieved nil :type (or null sb!di:code-location))
-  (last-form-retrieved -1 :type fixnum))
-
 (defun get-different-source-form (loc context &optional cache)
   (if (and cache
            (eq (sb!di:code-location-debug-source loc)
@@ -1064,12 +1114,11 @@
   (declare (type sb!kernel:code-component code))
   (sb!c::compiled-debug-info-fun-map (sb!kernel:%code-debug-info code)))
 
-(defstruct (location-group (:copier nil))
-  (locations #() :type (vector (or list fixnum))))
-
-(defstruct (storage-info (:copier nil))
-  (groups nil :type list)               ; alist of (name . location-group)
-  (debug-vars #() :type vector))
+(defstruct (location-group (:copier nil) (:predicate nil))
+  ;; This was (VECTOR (OR LIST FIXNUM)) but that doesn't have any
+  ;; specialization other than T, and the cross-compiler has trouble
+  ;; with (SB!XC:TYPEP #() '(VECTOR (OR LIST FIXNUM)))
+  (locations #() :type simple-vector))
 
 ;;; Return the vector of DEBUG-VARs currently associated with DSTATE.
 (defun dstate-debug-vars (dstate)
@@ -1501,22 +1550,20 @@
     (disassemble-segments segments stream dstate)))
 
 (defun valid-extended-function-designators-for-disassemble-p (thing)
-  (cond ((legal-fun-name-p thing)
-         (compiled-funs-or-lose (fdefinition thing) thing))
-        #!+sb-eval
-        ((sb!eval:interpreted-function-p thing)
-         (compile nil thing))
-        ((typep thing 'sb!pcl::%method-function)
+  (typecase thing
+    ((satisfies legal-fun-name-p)
+     (compiled-funs-or-lose (fdefinition thing) thing))
+    (sb!pcl::%method-function
          ;; in a %METHOD-FUNCTION, the user code is in the fast function, so
          ;; we to disassemble both.
          ;; FIXME: interpreted methods need to be compiled as above.
          (list thing (sb!pcl::%method-function-fast-function thing)))
-        ((functionp thing)
-         thing)
-        ((and (listp thing)
-              (eq (car thing) 'lambda))
-         (compile nil thing))
-        (t nil)))
+    ((or (cons (eql lambda))
+         #!+sb-fasteval sb!interpreter:interpreted-function
+         #!+sb-eval sb!eval:interpreted-function)
+     (compile nil thing))
+    (function thing)
+    (t nil)))
 
 (defun compiled-funs-or-lose (thing &optional (name thing))
   (let ((funs (valid-extended-function-designators-for-disassemble-p thing)))
@@ -1748,6 +1795,7 @@
            (type (unsigned-byte 16) offset)
            (type (member 1 2 4 8) length)
            (type (member :little-endian :big-endian) byte-order)
+           (muffle-conditions compiler-note) ; integer coercion, oh well
            (optimize (speed 3) (safety 0)))
   (ecase length
     (1 (sb!sys:sap-ref-8 sap offset))
@@ -1997,6 +2045,8 @@
                (when note
                  (note note dstate))))
         (emit-err-arg)
+        ;; ARM64 encodes the error number in BRK instruction itself
+        #!-arm64
         (emit-err-arg)
         (emit-note (symbol-name (get-internal-error-name errnum)))
         (dolist (sc-offs sc-offsets)

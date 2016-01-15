@@ -19,12 +19,10 @@
 (define-source-transform long-float-p (x) `(double-float-p ,x))
 
 (define-source-transform compiled-function-p (x)
-  #!-sb-eval
-  `(functionp ,x)
-  #!+sb-eval
   (once-only ((x x))
     `(and (functionp ,x)
-          (not (sb!eval:interpreted-function-p ,x)))))
+          #!+sb-fasteval (not (sb!interpreter:interpreted-function-p ,x))
+          #!+sb-eval (not (sb!eval:interpreted-function-p ,x)))))
 
 (define-source-transform char-int (x)
   `(char-code ,x))
@@ -641,7 +639,7 @@
   ;; don't have a true Alpha64 port yet, we'll have to stick to
   ;; SB!VM:N-MACHINE-WORD-BITS for the time being.  --njf, 2004-08-14
   #.`(progn
-       #!+(or x86 x86-64 arm)
+       #!+(or x86 x86-64 arm arm64)
        (def sb!vm::ash-left-modfx
            :tagged ,(- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits) t)
        (def ,(intern (format nil "ASH-LEFT-MOD~D" sb!vm:n-machine-word-bits)

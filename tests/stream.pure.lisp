@@ -274,6 +274,9 @@
   (frob 'base-char)
   (frob 'nil))
 
+(with-test (:name :make-string-output-stream-et-bogosity)
+  (assert-error (make-string-output-stream :element-type 'real)))
+
 (with-open-file (s #-win32 "/dev/null" #+win32 "nul" :element-type '(signed-byte 48))
   (assert (eq :eof (read-byte s nil :eof))))
 
@@ -381,3 +384,11 @@
                   (with-input-from-string (stream s :end ptr)
                     (read stream))))
               'abc)))
+
+(with-test (:name (read-sequence sequence type-error))
+  (assert-error (read-sequence 1 (make-string-input-stream "foo"))
+                type-error))
+
+(with-test (:name (write-sequence sequence type-error))
+  (assert-error (write-sequence 1 (make-string-output-stream))
+                type-error))

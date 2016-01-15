@@ -114,7 +114,7 @@
   (setf (svref *meta-room-info* unbound-marker-widetag) cons-info)
 
   ;; Single-floats are immediate data on 64-bit systems.
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  #!+64-bit
   (setf (svref *meta-room-info* single-float-widetag) cons-info))
 
 ) ; EVAL-WHEN
@@ -142,6 +142,14 @@
 (declaim (type fixnum
                *static-space-free-pointer*
                *read-only-space-free-pointer*))
+
+#!-sb-fluid
+(declaim (inline current-dynamic-space-start))
+#!+gencgc
+(defun current-dynamic-space-start () sb!vm:dynamic-space-start)
+#!-gencgc
+(defun current-dynamic-space-start ()
+  (extern-alien "current_dynamic_space" unsigned-long))
 
 (defun space-bounds (space)
   (declare (type spaces space))
@@ -708,6 +716,15 @@
              (return-from list-allocated-objects res))))
        space)
       res)))
+
+;;; Convert the descriptor into a SAP. The bits all stay the same, we just
+;;; change our notion of what we think they are.
+;;;
+;;; Defining this here (as opposed to in 'debug-int' where it belongs)
+;;; is the path of least resistance to avoiding an inlining failure warning.
+#!-sb-fluid (declaim (inline sb!di::descriptor-sap))
+(defun sb!di::descriptor-sap (x)
+  (int-sap (get-lisp-obj-address x)))
 
 ;;; Calls FUNCTION with all object that have (possibly conservative)
 ;;; references to them on current stack.

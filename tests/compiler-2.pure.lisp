@@ -62,3 +62,61 @@
                     (byte (truly-the sb-kernel:byte-specifier bspec)))
                (sb-kernel:%dpb new (byte-size byte) (byte-position byte)
                                (old)))))))
+
+(with-test (:name :inline-satisfies-predicate)
+  ;; If we remove the indirections in these functions,
+  ;; this test should visibly break so that we can write a new test
+  ;; that asserts that inlining F works in (THE (SATISFIES F) obj).
+  (assert (equal (sb-ext:typexpand 'sb-impl::function-name)
+                 '(satisfies sb-int:legal-fun-name-p)))
+  (let ((f (compile nil '(lambda (x) (the sb-impl::function-name x)))))
+    (assert (equal (list (symbol-function 'sb-int:valid-function-name-p))
+                   (ctu:find-named-callees f))))
+  (let ((f (compile nil '(lambda (x)
+                           (declare (notinline sb-int:legal-fun-name-p))
+                           (the sb-impl::function-name x)))))
+    (assert (equal (list (symbol-function 'sb-int:legal-fun-name-p))
+                   (ctu:find-named-callees f)))))
+
+(with-test (:name :make-array-untestable-type-no-warning)
+  (assert-no-signal
+   (compile nil `(lambda () (make-array '(2 2)
+                                        :element-type `(satisfies foofa))))))
+
+(with-test (:name :make-array-nil-no-warning)
+  (assert-no-signal
+   (compile nil '(lambda () (make-array '(2 2) :element-type nil)))))
+
+(with-test (:name :nth-value-huge-n-works)
+  (flet ((return-a-ton-of-values ()
+           (values-list (loop for i below 5000 collect i))))
+    (assert (= (nth-value 1 (return-a-ton-of-values)) 1))
+    (assert (= (nth-value 4000 (return-a-ton-of-values)) 4000))))
+
+(defstruct (a-test-structure-foo
+            (:constructor make-a-foo-1)
+            (:constructor make-a-foo-2 (b &optional a)))
+  (a 0 :type symbol)
+  (b nil :type integer))
+
+(with-test (:name :improperly-initialized-slot-warns)
+  (with-open-stream (*error-output* (make-broadcast-stream))
+    (multiple-value-bind (f warn err)
+        (compile nil '(lambda () (make-a-foo-1 :a 'what)))
+      ;; should warn because B's default is NIL, not an integer.
+      (assert (and f warn err)))
+    (multiple-value-bind (f warn err)
+        (compile nil '(lambda () (make-a-foo-2 3)))
+      ;; should warn because A's default is 0
+      (assert (and f warn err)))))
+
+(with-test (:name :inline-structure-ctor-no-declaim)
+  (let ((f (compile nil
+                    '(lambda ()
+                       (make-a-foo-1 :a 'wat :b 3)))))
+    (assert (ctu:find-named-callees f)))
+  (let ((f (compile nil
+                    '(lambda ()
+                       (declare (inline make-a-foo-1))
+                       (make-a-foo-1 :a 'wat :b 3)))))
+    (assert (not (ctu:find-named-callees f)))))

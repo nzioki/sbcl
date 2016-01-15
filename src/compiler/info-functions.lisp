@@ -108,8 +108,8 @@
       ;; symbol and its #<fdefn> object, it could lead to creation of
       ;; a non-unique #<fdefn> for a name.
       (frob :info
-            :type
-            :where-from
+            :type ; Hmm. What if it was proclaimed- shouldn't it stay?
+            :where-from ; Ditto.
             :inlinep
             :kind
             :macro-function
@@ -130,7 +130,17 @@
 ;;; Trivially wrap (INFO :FUNCTION :INLINE-EXPANSION-DESIGNATOR FUN-NAME)
 (declaim (ftype (function ((or symbol cons)) list) fun-name-inline-expansion))
 (defun fun-name-inline-expansion (fun-name)
-  (info :function :inline-expansion-designator fun-name))
+  (multiple-value-bind (answer winp)
+      (info :function :inline-expansion-designator fun-name)
+    (when (and (not winp) (symbolp fun-name))
+      (let ((info (info :function :type fun-name)))
+        (when (typep info 'defstruct-description)
+          (let ((spec (assq fun-name (dd-constructors info))))
+            (aver spec)
+            (setq answer `(lambda ,@(structure-ctor-lambda-parts
+                                     info (cdr spec)))
+                  winp t)))))
+    (values answer winp)))
 
 ;;;; ANSI Common Lisp functions which are defined in terms of the info
 ;;;; database
@@ -140,14 +150,20 @@
   "If SYMBOL names a macro in ENV, returns the expansion function,
 else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
-  (declare (symbol symbol))
-  (let* ((fenv (when env (lexenv-funs env)))
-         (local-def (cdr (assoc symbol fenv))))
-    (if local-def
-        (if (and (consp local-def) (eq (car local-def) 'macro))
-            (cdr local-def)
-            nil)
-        (values (info :function :macro-function symbol)))))
+  ;; local function definitions (ordinary) can shadow a global macro
+  (typecase env
+    #!+(and sb-fasteval (host-feature sb-xc))
+    (sb!interpreter:basic-env
+     (multiple-value-bind (kind def)
+         (sb!interpreter:find-lexical-fun env symbol)
+       (when def
+         (return-from sb!xc:macro-function (when (eq kind :macro) def)))))
+    (lexenv
+     (let ((def (cdr (assoc symbol (lexenv-funs env)))))
+       (when def
+         (return-from sb!xc:macro-function
+           (when (typep def '(cons (eql macro))) (cdr def)))))))
+  (values (info :function :macro-function symbol)))
 
 (defun (setf sb!xc:macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
@@ -165,16 +181,15 @@ only."
     (clear-info :function :type symbol)
     (setf (info :function :kind symbol) :macro)
     (setf (info :function :macro-function symbol) function)
-    (install-guard-function symbol `(:macro ,symbol) nil))
+    #-sb-xc-host (install-guard-function symbol `(:macro ,symbol) nil))
   function)
 
 ;; Set (SYMBOL-FUNCTION SYMBOL) to a closure that signals an error,
 ;; preventing funcall/apply of macros and special operators.
+#-sb-xc-host
 (defun install-guard-function (symbol fun-name docstring)
-  #+sb-xc-host (declare (ignore fun-name))
   (when docstring
     (setf (random-documentation symbol 'function) docstring))
-  #-sb-xc-host
   ;; (SETF SYMBOL-FUNCTION) goes out of its way to disallow this closure,
   ;; but we can trivially replicate its low-level effect.
   (setf (fdefn-fun (find-or-create-fdefn symbol))
@@ -190,7 +205,6 @@ only."
                   :name symbol))
          fun-name)))
 
-(declaim (ftype (sfunction (t t) boolean) fun-locally-defined-p))
 (defun sb!xc:compiler-macro-function (name &optional env)
   #!+sb-doc
   "If NAME names a compiler-macro in ENV, return the expansion function, else
@@ -241,45 +255,6 @@ return NIL. Can be set with SETF when ENV is NIL."
 ;;; DEF!STRUCT and DEF!MACRO and so forth. And consider simply saving
 ;;; all the BDOCUMENTATION entries in a *BDOCUMENTATION* hash table
 ;;; and slamming them into PCL once PCL gets going.
-(defun fdocumentation (x doc-type)
-  ;; In the cross-compiler, %FUN-DOC is just plain wrong, and while it
-  ;; might "work" to fetch strings using INFO, it really doesn't make sense.
-  #+sb-xc-host (declare (ignore x doc-type))
-  #-sb-xc-host
-  (case doc-type
-    (variable
-     (typecase x
-       (symbol (values (info :variable :documentation x)))))
-    ;; FUNCTION is not used at the momemnt, just here for symmetry.
-    (function
-     (cond ((functionp x)
-            (%fun-doc x))
-           ((and (legal-fun-name-p x) (fboundp x))
-            (%fun-doc (or (and (symbolp x) (macro-function x))
-                          (fdefinition x))))))
-    (structure
-     (typecase x
-       (symbol (cond
-                 ((eq (info :type :kind x) :instance)
-                  (values (info :type :documentation x)))
-                 ((info :typed-structure :info x)
-                  (values (info :typed-structure :documentation x)))))))
-    (type
-     (typecase x
-       (structure-class (values (info :type :documentation (class-name x))))
-       (t (and (typep x 'symbol) (values (info :type :documentation x))))))
-    (setf (values (info :setf :documentation x)))
-    ((t)
-     (typecase x
-       (function (%fun-doc x))
-       (package (package-doc-string x))
-       (structure-class (values (info :type :documentation (class-name x))))
-       ((or symbol cons)
-        (random-documentation x doc-type))))
-    (t
-     (when (typep x '(or symbol cons))
-       (random-documentation x doc-type)))))
-
 (defun (setf fdocumentation) (string name doc-type)
   (declare (type (or null string) string))
   #+sb-xc-host (declare (ignore name doc-type))
@@ -322,9 +297,11 @@ return NIL. Can be set with SETF when ENV is NIL."
            (setf (random-documentation name doc-type) string))))
   string)
 
+#-sb-xc-host
 (defun random-documentation (name type)
   (cdr (assoc type (info :random-documentation :stuff name))))
 
+#-sb-xc-host
 (defun (setf random-documentation) (new-value name type)
   (let ((pair (assoc type (info :random-documentation :stuff name))))
     (if pair

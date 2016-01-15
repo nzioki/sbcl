@@ -158,7 +158,7 @@
                                       result-type)))
                    (if (array-type-p result-ctype)
                        (let ((dims (array-type-dimensions result-ctype)))
-                         (unless (and (listp dims) (= (length dims) 1))
+                         (unless (singleton-p dims)
                            (give-up-ir1-transform "invalid sequence type"))
                          (let ((dim (first dims)))
                            (if (eq dim '*)
@@ -412,7 +412,7 @@
                      (when variant
                        (write-char #\- s)
                        (write-string (symbol-name variant) s)))
-                   (load-time-value (find-package "SB!KERNEL")))
+                   (load-time-value (find-package "SB!KERNEL") t))
       (bug "Unknown list item seek transform: name=~S, key-functions=~S variant=~S"
            function-name key-functions variant)))
 
@@ -624,16 +624,17 @@
            (let* ((n-bits (sb!vm:saetp-n-bits saetp))
                   (basher-name (format nil "UB~D-BASH-FILL" n-bits))
                   (basher (or (find-symbol basher-name
-                                           (load-time-value (find-package "SB!KERNEL")))
+                                           (load-time-value
+                                            (find-package "SB!KERNEL") t))
                               (abort-ir1-transform
                                "Unknown fill basher, please report to sbcl-devel: ~A"
                                basher-name)))
                   (kind (cond ((sb!vm:saetp-fixnum-p saetp) :tagged)
                               ((member element-type '(character base-char)) :char)
                               ((eq element-type 'single-float) :single-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                              #!+64-bit
                               ((eq element-type 'double-float) :double-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                              #!+64-bit
                               ((equal element-type '(complex single-float))
                                :complex-single-float)
                               (t
@@ -658,11 +659,11 @@
                                          tmp)
                                         (:single-float
                                          (single-float-bits tmp))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                        #!+64-bit
                                         (:double-float
                                          (logior (ash (double-float-high-bits tmp) 32)
                                                  (double-float-low-bits tmp)))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                        #!+64-bit
                                         (:complex-single-float
                                          (logior (ash (single-float-bits (imagpart tmp)) 32)
                                                  (ldb (byte 32 0)
@@ -685,11 +686,11 @@
                                                     `item)
                                                    (:single-float
                                                     `(single-float-bits item))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                                   #!+64-bit
                                                    (:double-float
                                                     `(logior (ash (double-float-high-bits item) 32)
                                                              (double-float-low-bits item)))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                                   #!+64-bit
                                                    (:complex-single-float
                                                     `(logior (ash (single-float-bits (imagpart item)) 32)
                                                              (ldb (byte 32 0)
@@ -710,12 +711,12 @@
                   `(let* ((len (length seq))
                           (end (or end len))
                           (bound (1+ end)))
-                     ;; Minor abuse %CHECK-BOUND for bounds checking.
+                     ;; Minor abuse CHECK-BOUND for bounds checking.
                      ;; (- END START) may still end up negative, but
                      ;; the basher handle that.
                      (,basher ,bash-value seq
-                              (%check-bound seq bound start)
-                              (- (if end (%check-bound seq bound end) len)
+                              (check-bound seq bound start)
+                              (- (if end (check-bound seq bound end) len)
                                  start)))
                `(with-array-data ((data seq)
                                   (start start)
@@ -915,7 +916,7 @@
 ;;; performance of, the functions implementing string streams
 ;;; (e.g. SB!IMPL::STRING-OUCH).
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun make-replace-transform (saetp sequence-type1 sequence-type2)
+  (defun !make-replace-transform (saetp sequence-type1 sequence-type2)
     `(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
                             (,sequence-type1 ,sequence-type2 &rest t)
                             ,sequence-type1
@@ -965,11 +966,11 @@
        (loop for saetp across sb!vm:*specialized-array-element-type-properties*
              for sequence-type = `(simple-array ,(sb!vm:saetp-specifier saetp) (*))
              unless (= (sb!vm:saetp-typecode saetp) sb!vm::simple-array-nil-widetag)
-             collect (make-replace-transform saetp sequence-type sequence-type)
+             collect (!make-replace-transform saetp sequence-type sequence-type)
              into forms
              finally (return `(progn ,@forms))))
      (define-one-transform (sequence-type1 sequence-type2)
-       (make-replace-transform nil sequence-type1 sequence-type2)))
+       (!make-replace-transform nil sequence-type1 sequence-type2)))
   (define-replace-transforms)
   #!+sb-unicode
   (progn
@@ -1042,23 +1043,20 @@
                    (%vector-raw-bits src (1- i))))
            (values))))))
 
-#.(loop for i = 1 then (* i 2)
-        collect `(deftransform ,(intern (format nil "UB~D-BASH-COPY" i)
-                                        "SB!KERNEL")
-                                                        ((src src-offset
-                                                          dst dst-offset
-                                                          length)
-                                                        ((simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         (simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         index)
-                                                        *)
-                  (frob-bash-transform src src-offset
-                                       dst dst-offset length
-                                       ,(truncate sb!vm:n-word-bits i))) into forms
-        until (= i sb!vm:n-word-bits)
-        finally (return `(progn ,@forms)))
+#.
+(let ((arglist '((src src-offset dst dst-offset length)
+                 ((simple-unboxed-array (*)) (constant-arg index)
+                  (simple-unboxed-array (*)) (constant-arg index)
+                  index)
+                 *)))
+  (loop for i = 1 then (* i 2)
+     for name = (intern (format nil "UB~D-BASH-COPY" i) "SB!KERNEL")
+     collect `(deftransform ,name ,arglist
+                (frob-bash-transform src src-offset
+                                     dst dst-offset length
+                                     ,(truncate sb!vm:n-word-bits i))) into forms
+     until (= i sb!vm:n-word-bits)
+     finally (return `(progn ,@forms))))
 
 ;;; We expand copy loops inline in SUBSEQ and COPY-SEQ if we're copying
 ;;; arrays with elements of size >= the word size.  We do this because
@@ -1125,75 +1123,79 @@
              (values spec (ir1-transform-specifier-type spec))))
     (unless type
       (give-up-ir1-transform))
-    (multiple-value-bind (elt-type dim complexp)
-        (cond ((and (union-type-p type)
-                    (csubtypep type (specifier-type 'string)))
-               (let* ((types (union-type-types type))
-                      (first (first types)))
-                 (when (array-type-p first)
-                   (let ((dim (first (array-type-dimensions first)))
-                         (complexp (array-type-complexp first)))
-                     ;; Require sameness of dim and complexp. Give up on
-                     ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
-                     ;; which eventually fails in the call to the function.
-                     (when (every (lambda (x)
-                                    (and (array-type-p x)
-                                         (eql (first (array-type-dimensions x))
-                                              dim)
-                                         (eq (array-type-complexp x) complexp)))
-                                  (rest types))
-                       (values
-                        `(or ,@(mapcar
-                                (lambda (x)
-                                  (type-specifier (array-type-element-type x)))
-                                types))
-                        dim complexp))))))
-              ((and (array-type-p type)
-                    (csubtypep type (specifier-type 'vector)))
-               (when (contains-unknown-type-p (array-type-element-type type))
-                 (give-up-ir1-transform "~S is an unknown vector type" spec))
-               (values (let ((et (array-type-element-type type)))
-                         ;; VECTOR means (VECTOR T)
-                         (if (type= et *wild-type*) 't (type-specifier et)))
-                       (first (array-type-dimensions type))
-                       (array-type-complexp type))))
-      ;; Don't transform if size is present in the specifier
-      ;; and the SIZE argument is not known to be equal.
-      (if (and (or (eq '* dim)
-                   (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
-               ;; not sure what it would mean to make it non-simple
-               (neq complexp t))
-          `(make-array size :element-type ',elt-type
-                       ,@(when initial-element
-                           `(:initial-element initial-element)))
-          ;; no transform, but we can detect some style issues
-          (progn
-            (when dim ; was a recognizable vector subtype
-              (let* ((elt-ctype (specifier-type elt-type))
-                     (saetp (find-saetp-by-ctype elt-ctype)))
-                (cond ((not initial-element)
-                       (let ((default-initial-element
-                               (sb!vm:saetp-initial-element-default saetp)))
-                         (unless (ctypep default-initial-element elt-ctype)
-                           ;; As with MAKE-ARRAY, this is merely undefined
-                           ;; behavior, not an error.
-                           (compiler-style-warn
-                            "The default initial element ~S is not a ~S."
-                            default-initial-element elt-type))))
-                      ;; In would be possible in some cases,
-                      ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
-                      ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
-                      ;; to detect erroneous non-constants initializers,
-                      ;; but it is not important enough to bother with.
-                      ((and (constant-lvar-p initial-element)
-                            (not (ctypep (lvar-value initial-element)
-                                         elt-ctype)))
-                       ;; MAKE-ARRAY considers this a warning, not an error.
-                       (compiler-warn "~S ~S is not a ~S"
-                                      :initial-element
-                                      (lvar-value initial-element)
-                                      elt-type)))))
-            (give-up-ir1-transform))))))
+    (if (type= type (specifier-type 'list))
+        `(%make-list size initial-element)
+        (multiple-value-bind (elt-type dim complexp)
+            (cond ((and (union-type-p type)
+                        (csubtypep type (specifier-type 'string)))
+                   (let* ((types (union-type-types type))
+                          (first (first types)))
+                     (when (array-type-p first)
+                       (let ((dim (first (array-type-dimensions first)))
+                             (complexp (array-type-complexp first)))
+                         ;; Require sameness of dim and complexp. Give up on
+                         ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
+                         ;; which eventually fails in the call to the function.
+                         (when (every (lambda (x)
+                                        (and (array-type-p x)
+                                             (eql (first (array-type-dimensions x))
+                                                  dim)
+                                             (eq (array-type-complexp x) complexp)))
+                                      (rest types))
+                           (values
+                            `(or ,@(mapcar
+                                    (lambda (x)
+                                      (type-specifier (array-type-element-type x)))
+                                    types))
+                            dim complexp))))))
+                  ((and (array-type-p type)
+                        (csubtypep type (specifier-type 'vector)))
+                   (when (contains-unknown-type-p (array-type-element-type type))
+                     (give-up-ir1-transform "~S is an unknown vector type" spec))
+                   (values (let ((et (array-type-element-type type)))
+                             ;; VECTOR means (VECTOR T)
+                             (if (type= et *wild-type*)
+                                 t
+                                 (type-specifier et)))
+                           (first (array-type-dimensions type))
+                           (array-type-complexp type))))
+          ;; Don't transform if size is present in the specifier
+          ;; and the SIZE argument is not known to be equal.
+          (cond ((and (or (eq '* dim)
+                          (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
+                      ;; not sure what it would mean to make it non-simple
+                      (neq complexp t))
+                 `(make-array size :element-type ',elt-type
+                              ,@(when initial-element
+                                  `(:initial-element initial-element))))
+                ;; no transform, but we can detect some style issues
+                (t
+                 (when dim         ; was a recognizable vector subtype
+                   (let* ((elt-ctype (specifier-type elt-type))
+                          (saetp (find-saetp-by-ctype elt-ctype)))
+                     (cond ((not initial-element)
+                            (let ((default-initial-element
+                                    (sb!vm:saetp-initial-element-default saetp)))
+                              (unless (ctypep default-initial-element elt-ctype)
+                                ;; As with MAKE-ARRAY, this is merely undefined
+                                ;; behavior, not an error.
+                                (compiler-style-warn
+                                 "The default initial element ~S is not a ~S."
+                                 default-initial-element elt-type))))
+                           ;; In would be possible in some cases,
+                           ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
+                           ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
+                           ;; to detect erroneous non-constants initializers,
+                           ;; but it is not important enough to bother with.
+                           ((and (constant-lvar-p initial-element)
+                                 (not (ctypep (lvar-value initial-element)
+                                              elt-ctype)))
+                            ;; MAKE-ARRAY considers this a warning, not an error.
+                            (compiler-warn "~S ~S is not a ~S"
+                                           :initial-element
+                                           (lvar-value initial-element)
+                                           elt-type)))))
+                 (give-up-ir1-transform)))))))
 
 (deftransform subseq ((seq start &optional end)
                       (vector t &optional t)

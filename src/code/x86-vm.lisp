@@ -70,7 +70,7 @@
            (let ((fixups (code-header-ref code code-constants-offset)))
              (cond ((typep fixups '(simple-array (unsigned-byte 32) (*)))
                     (let ((new-fixups
-                           (adjust-fixup-array fixups (1+ (length fixups)))))
+                            (adjust-fixup-array fixups (1+ (length fixups)))))
                       (setf (aref new-fixups (length fixups)) offset)
                       (setf (code-header-ref code code-constants-offset)
                             new-fixups)))
@@ -85,38 +85,41 @@
                            :element-type '(unsigned-byte 32)
                            :initial-element offset)))))))
     (without-gcing
-     (let* ((sap (truly-the system-area-pointer
-                            (code-instructions code)))
-            (obj-start-addr (logand (get-lisp-obj-address code)
-                                    #xfffffff8))
-            ;; FIXME: what is this 5?
-            #+nil (const-start-addr (+ obj-start-addr (* 5 n-word-bytes)))
-            (code-start-addr (sap-int (code-instructions code)))
-            (ncode-words (code-header-ref code 1))
-            (code-end-addr (+ code-start-addr (* ncode-words n-word-bytes))))
-       (unless (member kind '(:absolute :relative))
-         (error "Unknown code-object-fixup kind ~S." kind))
-       (ecase kind
-         (:absolute
-          ;; Word at sap + offset contains a value to be replaced by
-          ;; adding that value to fixup.
-          (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset)))
-          ;; Record absolute fixups that point within the code object.
-          (when (> code-end-addr (sap-ref-32 sap offset) obj-start-addr)
-            (add-fixup code offset)))
-         (:relative
-          ;; Fixup is the actual address wanted.
-          ;;
-          ;; Record relative fixups that point outside the code
-          ;; object.
-          (when (or (< fixup obj-start-addr) (> fixup code-end-addr))
-            (add-fixup code offset))
-          ;; Replace word with value to add to that loc to get there.
-          (let* ((loc-sap (+ (sap-int sap) offset))
-                 (rel-val (- fixup loc-sap n-word-bytes)))
-            (declare (type (unsigned-byte 32) loc-sap)
-                     (type (signed-byte 32) rel-val))
-            (setf (signed-sap-ref-32 sap offset) rel-val))))))
+      (let* ((sap (truly-the system-area-pointer
+                             (code-instructions code)))
+             (obj-start-addr (logand (get-lisp-obj-address code)
+                                     #xfffffff8))
+             ;; FIXME: what is this 5?
+             #+nil (const-start-addr (+ obj-start-addr (* 5 n-word-bytes)))
+             (code-start-addr (sap-int (code-instructions code)))
+             (ncode-words (code-header-ref code 1))
+             (code-end-addr (+ code-start-addr (* ncode-words n-word-bytes))))
+        (unless (member kind '(:absolute :relative))
+          (error "Unknown code-object-fixup kind ~S." kind))
+        (ecase kind
+          (:absolute
+           ;; Word at sap + offset contains a value to be replaced by
+           ;; adding that value to fixup.
+           (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset)))
+           ;; Record absolute fixups that point within the code object.
+           (when (> code-end-addr (sap-ref-32 sap offset) obj-start-addr)
+             (add-fixup code offset)))
+          (:relative
+           ;; Fixup is the actual address wanted.
+           ;;
+           ;; Record relative fixups that point outside the code
+           ;; object.
+           (when (or (< fixup obj-start-addr) (> fixup code-end-addr))
+             (add-fixup code offset))
+           ;; Replace word with value to add to that loc to get there.
+           (let* ((loc-sap (+ (sap-int sap) offset))
+                  ;; Use modular arithmetic so that if the offset
+                  ;; doesn't fit into signed-byte-32 it'll wrap around
+                  ;; when added to EIP
+                  (rel-val (ldb (byte 32 0)
+                                (- fixup loc-sap n-word-bytes))))
+             (declare (type (unsigned-byte 32) loc-sap rel-val))
+             (setf (sap-ref-32 sap offset) rel-val))))))
     nil))
 
 ;;;; low-level signal context access functions
@@ -162,6 +165,10 @@
   (context (* os-context-t))
   (index int))
 
+#!+(or linux win32)
+(define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
+  (* unsigned) (context (* os-context-t)) (index int))
+
 (declaim (inline context-register))
 (defun context-register (context index)
   (declare (type (alien (* os-context-t)) context))
@@ -175,16 +182,26 @@
     (declare (type (alien (* unsigned-int)) addr))
     (setf (deref addr) new)))
 
-;;; This is like CONTEXT-REGISTER, but returns the value of a float
-;;; register. FORMAT is the type of float to return.
-;;;
-;;; As of sbcl-0.6.7, there is no working code which calls this code,
-;;; so it's stubbed out. Someday, in order to make the debugger work
-;;; better, it may be necessary to unstubify it.
 (defun context-float-register (context index format)
-  (declare (ignore context index))
-  (warn "stub CONTEXT-FLOAT-REGISTER")
-  (coerce 0.0 format))
+  (declare (ignorable context index))
+  #!-(or linux win32)
+  (progn
+    (warn "stub CONTEXT-FLOAT-REGISTER")
+    (coerce 0 format))
+  #!+(or linux win32)
+  (let ((sap (alien-sap (context-float-register-addr context index))))
+    (ecase format
+      (single-float
+       (coerce (sap-ref-long sap 0) 'single-float))
+      (double-float
+       (sap-ref-long sap 0))
+      (complex-single-float
+       (complex (coerce (sap-ref-long sap 0) 'single-float)
+                (coerce (sap-ref-long sap 10) 'single-float)))
+      (complex-double-float
+       (complex (sap-ref-long sap 0)
+                (sap-ref-long sap 10))))))
+
 (defun %set-context-float-register (context index format new-value)
   (declare (ignore context index))
   (warn "stub %SET-CONTEXT-FLOAT-REGISTER")

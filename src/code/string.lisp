@@ -18,6 +18,7 @@
    symbol, its name is returned. If X is a character then a one element
    string containing that character is returned. If X cannot be coerced
    into a string, an error occurs."
+  (declare (explicit-check))
   (cond ((stringp x) x)
         ((symbolp x) (symbol-name x))
         ((characterp x)
@@ -416,9 +417,18 @@
   #!+sb-doc
   "Given a character count and an optional fill character, makes and returns a
 new string COUNT long filled with the fill character."
-  (declare (fixnum count))
+  (declare (index count))
+  (declare (explicit-check))
+  ;; FIXME: while this is a correct implementation relying on an IR1 transform,
+  ;; it would be better if in the following example (assuming NOTINLINE):
+  ;;  (MAKE-STRING 1000 :ELEMENT-TYPE 'BIT :INITIAL-element #\a)
+  ;; we could report that "BIT is not a subtype of CHARACTER"
+  ;; instead of "#\a is not of type BIT". Additionally, in this case:
+  ;;  (MAKE-STRING 200000000 :ELEMENT-TYPE 'WORD :INITIAL-ELEMENT #\a)
+  ;; the error reported is heap exhaustion rather than type mismatch.
   (if fill-char
-      (make-string count :element-type element-type :initial-element fill-char)
+      (make-string count :element-type element-type
+                         :initial-element (the character fill-char))
       (make-string count :element-type element-type)))
 
 (flet ((%upcase (string start end)
@@ -450,32 +460,6 @@ new string COUNT long filled with the fill character."
   (%downcase (copy-seq (string string)) start end))
 (defun nstring-downcase (string &key (start 0) end)
   (%downcase string start end))
-) ; FLET
-
-(flet ((%capitalize (string start end)
-         (declare (string string) (index start) (type sequence-end end))
-         (let ((saved-header string))
-           (with-one-string (string start end)
-             (do ((index start (1+ index))
-                  (new-word? t)
-                  (char nil))
-                 ((= index (the fixnum end)))
-               (declare (fixnum index))
-               (setq char (schar string index))
-               (cond ((not (alphanumericp char))
-                      (setq new-word? t))
-                     (new-word?
-                      ;; CHAR is the first case-modifiable character after
-                      ;; a sequence of non-case-modifiable characters.
-                      (setf (schar string index) (char-upcase char))
-                      (setq new-word? nil))
-                     (t
-                      (setf (schar string index) (char-downcase char))))))
-           saved-header)))
-(defun string-capitalize (string &key (start 0) end)
-  (%capitalize (copy-seq (string string)) start end))
-(defun nstring-capitalize (string &key (start 0) end)
-  (%capitalize string start end))
 ) ; FLET
 
 (defun generic-string-trim (char-bag string left-p right-p)

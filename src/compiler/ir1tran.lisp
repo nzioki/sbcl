@@ -98,18 +98,25 @@
 
 ;;;; namespace management utilities
 
-(defun fun-lexically-notinline-p (name)
-  (let ((fun (lexenv-find name funs :test #'equal)))
-    ;; a declaration will trump a proclamation
-    (if (and fun (defined-fun-p fun))
-        (eq (defined-fun-inlinep fun) :notinline)
-        (eq (info :function :inlinep name) :notinline))))
-
-;; This will get redefined in PCL boot.
-(declaim (notinline maybe-update-info-for-gf))
-(defun maybe-update-info-for-gf (name)
-  (declare (ignore name))
-  nil)
+;; As with LEXENV-FIND, we assume use of *LEXENV*, but macroexpanders
+;; receive an explicit environment and should pass it.
+;; A declaration will trump a proclamation.
+(defun fun-lexically-notinline-p (name &optional (env *lexenv*))
+  (let ((answer
+         (typecase env
+           (null nil)
+           #!+(and sb-fasteval (host-feature sb-xc))
+           (sb!interpreter:basic-env
+            (sb!interpreter::fun-lexically-notinline-p name env))
+           (t
+            (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
+              ;; FIXME: this seems to omit FUNCTIONAL
+              (when (defined-fun-p fun)
+                (return-from fun-lexically-notinline-p
+                  (eq (defined-fun-inlinep fun) :notinline))))))))
+    ;; If ANSWER is NIL, go for the global value
+    (eq (or answer (info :function :inlinep name))
+        :notinline)))
 
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
@@ -137,7 +144,7 @@
                ;; complain about undefined functions.
                (not latep))
       (note-undefined-reference name :function))
-    (let ((ftype (info :function :type name))
+    (let ((ftype (proclaimed-ftype name))
           (notinline (fun-lexically-notinline-p name)))
       (make-global-var
        :kind :global-function
@@ -149,7 +156,7 @@
                  ftype
                  (specifier-type 'function))
        :defined-type (if (and (not latep) (not notinline))
-                         (or (maybe-update-info-for-gf name) ftype)
+                         ftype
                          (specifier-type 'function))
        :where-from (if notinline
                        where
@@ -238,7 +245,7 @@
                         :type (if (and (eq inlinep :notinline)
                                        (neq where :declared))
                                   (specifier-type 'function)
-                                  (info :function :type name))))
+                                  (proclaimed-ftype name))))
                      (find-global-fun name nil))))))))
 
 ;;; Return the LEAF structure for the lexically apparent function
@@ -853,10 +860,6 @@
                           (find-free-fun fun "shouldn't happen! (no-cmacro)")
                           form))))
 
-(defun muffle-warning-or-die ()
-  (muffle-warning)
-  (bug "no MUFFLE-WARNING restart"))
-
 ;;; Expand FORM using the macro whose MACRO-FUNCTION is FUN, trapping
 ;;; errors which occur during the macroexpansion.
 (defun careful-expand-macro (fun form &optional cmacro)
@@ -905,7 +908,8 @@
                                    ignoring anything  horrible here..)~:@>~:>"
                                (wherestring)
                                c)
-                              (muffle-warning-or-die)))
+                              (muffle-warning)
+                              (bug "no MUFFLE-WARNING restart")))
                    (error
                      (lambda (c)
                        (cond
@@ -918,7 +922,7 @@
                          (t
                           (compiler-error "~@<~A~@:_ ~A~:>"
                                           (wherestring) c))))))
-      (funcall sb!xc:*macroexpand-hook* fun form *lexenv*))))
+      (funcall (valid-macroexpand-hook) fun form *lexenv*))))
 
 ;;;; conversion utilities
 
@@ -1037,7 +1041,7 @@
                               ;; KLUDGE: packages we're not interested in
                               ;; stepping.
                               (mapcar #'find-package '(sb!c sb!int sb!impl
-                                                       sb!kernel sb!pcl)))))
+                                                       sb!kernel sb!pcl)) t)))
                 ;; Consistent treatment of *FOO* vs (SYMBOL-VALUE '*FOO*):
                 ;; we insert calls to SYMBOL-VALUE for most non-lexical
                 ;; variable references in order to avoid them being elided
@@ -1557,6 +1561,9 @@
 
 ;;; FIXME: This is non-ANSI, so the default should be T, or it should
 ;;; go away, I think.
+;;; Or just rename the declaration to SB-C:RESULT-TYPE so that it's not
+;;; a symbol in the CL package, and then eliminate this switch.
+;;; It's permissible to have implementation-specific declarations.
 (defvar *suppress-values-declaration* nil
   #!+sb-doc
   "If true, processing of the VALUES declaration is inhibited.")
@@ -1568,10 +1575,19 @@
   (declare (type list raw-spec vars fvars))
   (declare (type lexenv res))
   (let ((spec (canonized-decl-spec raw-spec))
-        (optimize-qualities)
-        (result-type *wild-type*))
+        (optimize-qualities))
+    ;; FIXME: we can end up with a chain of spurious parent lexenvs,
+    ;; when logically the processing of decls should yield at most
+    ;; two new lexenvs: one for the bindings and one for post-binding.
+    ;; It's possible that there's a simple fix of re-linking the resulting
+    ;; lexenv directly to *lexenv* as its parent.
     (values
      (case (first spec)
+       (type
+        (process-type-decl (cdr spec) res vars context))
+       ((ignore ignorable)
+        (process-ignore-decl spec vars fvars res)
+        res)
        (special (process-special-decl spec res vars binding-form-p context))
        (ftype
         (unless (cdr spec)
@@ -1579,9 +1595,6 @@
         (process-ftype-decl (second spec) res (cddr spec) fvars context))
        ((inline notinline maybe-inline)
         (process-inline-decl spec res fvars))
-       ((ignore ignorable)
-        (process-ignore-decl spec vars fvars res)
-        res)
        (optimize
         (multiple-value-bind (new-policy specified-qualities)
             (process-optimize-decl spec (lexenv-policy res))
@@ -1597,17 +1610,6 @@
          :default res
          :handled-conditions (process-unmuffle-conditions-decl
                               spec (lexenv-handled-conditions res))))
-       (type
-        (process-type-decl (cdr spec) res vars context))
-       (values
-        (unless *suppress-values-declaration*
-          (let ((types (cdr spec)))
-            (setq result-type
-                  (compiler-values-specifier-type
-                   (if (singleton-p types)
-                       (car types)
-                       `(values ,@types)))))
-          res))
        ((dynamic-extent truly-dynamic-extent indefinite-extent)
         (process-extent-decl (cdr spec) vars fvars (first spec))
         res)
@@ -1616,6 +1618,8 @@
          :default res
          :disabled-package-locks (process-package-lock-decl
                                   spec (lexenv-disabled-package-locks res))))
+       ;; We may want to detect LAMBDA-LIST and VALUES decls here,
+       ;; and report them as "Misplaced" rather than "Unrecognized".
        (t
         (unless (info :declaration :recognized (first spec))
           (compiler-warn "unrecognized declaration ~S" raw-spec))
@@ -1623,7 +1627,6 @@
           (if fn
               (funcall fn res spec vars fvars)
               res))))
-     result-type
      optimize-qualities)))
 
 ;;; Use a list of DECLARE forms to annotate the lists of LAMBDA-VAR
@@ -1642,38 +1645,62 @@
                       (allow-lambda-list nil))
   (declare (list decls vars fvars))
   (let ((result-type *wild-type*)
+        (allow-values-decl allow-lambda-list)
+        (explicit-check)
+        (allow-explicit-check allow-lambda-list)
         (lambda-list (if allow-lambda-list :unspecified nil))
         (optimize-qualities)
         (*post-binding-variable-lexenv* nil))
-    (dolist (decl decls)
-      (dolist (spec (rest decl))
-        (flet
-            ((process-it ()
-               (unless (consp spec)
-                 (compiler-error "malformed declaration specifier ~S in ~S"
-                                 spec decl))
-               (if (and (typep spec '(cons (eql lambda-list) (cons t null)))
-                        (eq allow-lambda-list t))
-                   (setq lambda-list (cadr spec) allow-lambda-list nil)
-                   (multiple-value-bind (new-env new-result-type new-qualities)
-                       (process-1-decl spec lexenv vars fvars
-                                       binding-form-p context)
-                     (setq lexenv new-env
-                           optimize-qualities
-                           (nconc new-qualities optimize-qualities))
-                     (unless (eq new-result-type *wild-type*)
-                       (setq result-type
-                             (values-type-intersection result-type
-                                                       new-result-type)))))))
+    (flet ((process-it (spec decl)
+             (cond ((atom spec)
+                    (compiler-error "malformed declaration specifier ~S in ~S"
+                                    spec decl))
+                   ((and (eq allow-lambda-list t)
+                         (typep spec '(cons (eql lambda-list) (cons t null))))
+                    (setq lambda-list (cadr spec) allow-lambda-list nil))
+                   ((and allow-values-decl
+                         (typep spec '(cons (eql values)))
+                         (not *suppress-values-declaration*))
+                    ;; Why do we allow more than one VALUES decl? I don't know.
+                    (setq result-type
+                          (values-type-intersection
+                           result-type
+                           (compiler-values-specifier-type
+                            (let ((types (cdr spec)))
+                              (if (singleton-p types)
+                                  (car types)
+                                  `(values ,@types)))))))
+                   ((and allow-explicit-check
+                         (typep spec '(cons (eql explicit-check))))
+                    ;; EXPLICIT-CHECK can specify that all arguments will be
+                    ;; checked by the function body, and/or all results.
+                    ;; Alternatively, a subset of arguments can be listed,
+                    ;; so that sequence operations can dispatch on the sequence
+                    ;; arguments, but benefit from automatic checks of others.
+                    ;; You can't actually specify anything yet, as the goal
+                    ;; is to be 100% compatible with the globaldb attribute.
+                    (aver (not (cdr spec)))
+                    (setq explicit-check t
+                          allow-explicit-check nil)) ; at most one of this decl
+                   (t
+                    (multiple-value-bind (new-env new-qualities)
+                        (process-1-decl spec lexenv vars fvars
+                                        binding-form-p context)
+                      (setq lexenv new-env
+                            optimize-qualities
+                            (nconc new-qualities optimize-qualities)))))))
+      (dolist (decl decls)
+        (dolist (spec (rest decl))
           (if (eq context :compile)
               (let ((*current-path* (or (get-source-path spec)
                                         (get-source-path decl)
                                         *current-path*)))
-                (process-it))
+                (process-it spec decl))
             ;; Kludge: EVAL calls this function to deal with LOCALLY.
-              (process-it)))))
+              (process-it spec decl)))))
     (warn-repeated-optimize-qualities (lexenv-policy lexenv) optimize-qualities)
-    (values lexenv result-type *post-binding-variable-lexenv* lambda-list)))
+    (values lexenv result-type *post-binding-variable-lexenv*
+            lambda-list explicit-check)))
 
 (defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
   (multiple-value-bind (*lexenv* result-type post-binding-lexenv)

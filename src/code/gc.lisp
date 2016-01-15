@@ -14,14 +14,6 @@
 ;;;; DYNAMIC-USAGE and friends
 
 #!-sb-fluid
-(declaim (inline current-dynamic-space-start))
-#!+gencgc
-(defun current-dynamic-space-start () sb!vm:dynamic-space-start)
-#!-gencgc
-(defun current-dynamic-space-start ()
-  (extern-alien "current_dynamic_space" unsigned-long))
-
-#!-sb-fluid
 (declaim (inline dynamic-usage))
 #!+gencgc
 (defun dynamic-usage ()
@@ -175,12 +167,13 @@ designated file is opened before and after each collection, and generation
 statistics are appended to it."
     (let ((val (cast %gc-logfile c-string)))
       (when val
-        (native-pathname val))))
-  (declaim (inline dynamic-space-size))
-  (defun dynamic-space-size ()
-    #!+sb-doc
-    "Size of the dynamic space in bytes."
-    (extern-alien "dynamic_space_size" os-vm-size-t)))
+        (native-pathname val)))))
+
+(declaim (inline dynamic-space-size))
+(defun dynamic-space-size ()
+  #!+sb-doc
+  "Size of the dynamic space in bytes."
+  (extern-alien "dynamic_space_size" os-vm-size-t))
 
 ;;;; SUB-GC
 

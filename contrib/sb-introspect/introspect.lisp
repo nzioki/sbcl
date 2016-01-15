@@ -92,9 +92,18 @@ include the pathname of the file and the position of the definition."
 (defun debug-info-source (debug-info)
   (sb-c::debug-info-source debug-info))
 
-(declaim (ftype (function (debug-info) debug-function) debug-info-debug-function))
-(defun debug-info-debug-function (debug-info)
-  (elt (sb-c::compiled-debug-info-fun-map debug-info) 0))
+(declaim (ftype (function (t debug-info) debug-function) debug-info-debug-function))
+(defun debug-info-debug-function (function debug-info)
+  (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
+        (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
+    (or
+     (find-if
+      (lambda (x)
+        (and
+         (sb-c::compiled-debug-fun-p x)
+         (eq (sb-c::compiled-debug-fun-name x) name)))
+      map)
+     (elt map 0))))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
@@ -284,7 +293,7 @@ If an unsupported TYPE is requested, the function will return NIL.
           (if loc
               (translate-source-location loc)
               (let ((expander-fun (sb-int:info :type :expander name)))
-                (when expander-fun
+                (when (functionp expander-fun)
                   (find-definition-source expander-fun))))))
        ((:method)
         (when (fboundp name)
@@ -450,6 +459,9 @@ If an unsupported TYPE is requested, the function will return NIL.
      (let ((source (translate-source-location
                     (sb-eval:interpreted-function-source-location object))))
        source))
+    #+sb-fasteval
+    (sb-interpreter:interpreted-function
+     (translate-source-location (sb-interpreter:fun-source-location object)))
     (function
      (find-function-definition-source object))
     ((or condition standard-object structure-object)
@@ -461,7 +473,7 @@ If an unsupported TYPE is requested, the function will return NIL.
 (defun find-function-definition-source (function)
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
-         (debug-fun (debug-info-debug-function debug-info))
+         (debug-fun (debug-info-debug-function function debug-info))
          (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
     (make-definition-source
      :pathname
@@ -508,11 +520,8 @@ function designator."
                                    (fdefinition function))))
         ((typep function 'generic-function)
          (sb-pcl::generic-function-pretty-arglist function))
-        #+sb-eval
-        ((typep function 'sb-eval:interpreted-function)
-         (sb-eval:interpreted-function-debug-lambda-list function))
         (t
-         (sb-kernel:%simple-fun-arglist (sb-kernel:%fun-fun function)))))
+         (sb-kernel:%fun-lambda-list function))))
 
 (defun deftype-lambda-list (typespec-operator)
   "Returns the lambda list of TYPESPEC-OPERATOR as first return
@@ -520,10 +529,9 @@ value, and a flag whether the arglist could be found as second
 value."
   (check-type typespec-operator symbol)
   ;; Don't return a lambda-list for combinators AND,OR,NOT.
-  (let ((f (and (sb-int:info :type :kind typespec-operator)
-                ;; globaldb prevents storing both of these
-                (or (sb-int:info :type :expander typespec-operator)
-                    (sb-int:info :type :translator typespec-operator)))))
+  (let* ((f (and (sb-int:info :type :kind typespec-operator)
+                 (sb-int:info :type :expander typespec-operator)))
+         (f (if (listp f) (car f) f)))
     (if (functionp f)
         (values (sb-kernel:%fun-lambda-list f) t)
         (values nil nil))))
@@ -532,7 +540,7 @@ value."
   "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."
   (flet ((ftype-of (function-designator)
            (sb-kernel:type-specifier
-            (sb-int:info :function :type function-designator))))
+            (sb-int:proclaimed-ftype function-designator))))
     (etypecase function-designator
       (symbol
        (when (and (fboundp function-designator)
@@ -607,11 +615,14 @@ value."
     ((or null sb-kernel:funcallable-instance)
      nil)
     (sb-kernel:closure
+     ;; FIXME: should use ENCAPSULATION-INFO instead of hardwiring an index.
      (let ((fun (sb-kernel:%closure-fun functoid)))
        (if (and (eq (sb-kernel:%fun-name fun) 'sb-impl::encapsulation)
                 (plusp (sb-kernel:get-closure-length functoid))
                 (typep (sb-kernel:%closure-index-ref functoid 0) 'sb-impl::encapsulation-info))
-           (sb-impl::encapsulation-info-definition (sb-kernel:%closure-index-ref functoid 0))
+           (get-simple-fun
+            (sb-impl::encapsulation-info-definition
+             (sb-kernel:%closure-index-ref functoid 0)))
            fun)))
     (function
      (sb-kernel:%fun-fun functoid))))
@@ -632,28 +643,45 @@ value."
 
 (defun collect-xref (kind-index wanted-name)
   (let ((ret nil))
-    (call-with-each-global-functoid
-     (lambda (info-name value)
-          ;; Get a simple-fun for the definition, and an xref array
-          ;; from the table if available.
-          (let* ((simple-fun (get-simple-fun value))
-                 (xrefs (when simple-fun
-                          (sb-kernel:%simple-fun-xrefs simple-fun)))
-                 (array (when xrefs
-                          (aref xrefs kind-index))))
-            ;; Loop through the name/path xref entries in the table
-            (loop for i from 0 below (length array) by 2
-                  for xref-name = (aref array i)
-                  for xref-path = (aref array (1+ i))
-                  do (when (equal xref-name wanted-name)
-                       (let ((source-location
-                              (find-function-definition-source simple-fun)))
-                         ;; Use the more accurate source path from
-                         ;; the xref entry.
-                         (setf (definition-source-form-path source-location)
-                               xref-path)
-                         (push (cons info-name source-location)
-                               ret)))))))
+    (flet ((process (info-name value)
+             ;; Get a simple-fun for the definition, and an xref array
+             ;; from the table if available.
+             (let* ((simple-fun (get-simple-fun value))
+                    (xrefs (when simple-fun
+                             (sb-kernel:%simple-fun-xrefs simple-fun)))
+                    (array (when xrefs
+                             (aref xrefs kind-index))))
+               ;; Loop through the name/path xref entries in the table
+               (loop for i from 0 below (length array) by 2
+                     for xref-name = (aref array i)
+                     for xref-path = (aref array (1+ i))
+                     do (when (equal xref-name wanted-name)
+                          (let ((source-location
+                                  (find-function-definition-source simple-fun)))
+                            ;; Use the more accurate source path from
+                            ;; the xref entry.
+                            (setf (definition-source-form-path source-location)
+                                  xref-path)
+                            (push (cons info-name source-location)
+                                  ret)))))))
+      (call-with-each-global-functoid
+       (lambda (info-name value)
+         ;; Functions with EQL specializers no longer get a fdefinition,
+         ;; process all the methods from a generic function
+         (cond ((and (sb-kernel:fdefn-p value)
+                     (typep (sb-kernel:fdefn-fun value) 'generic-function))
+                (loop for method in (sb-mop:generic-function-methods (sb-kernel:fdefn-fun value))
+                      for fun = (sb-pcl::safe-method-fast-function method)
+                      when fun
+                      do
+                      (process (sb-kernel:%fun-name fun) fun)))
+               ;; Methods are alredy processed above
+               ((and (sb-kernel:fdefn-p value)
+                     (consp (sb-kernel:fdefn-name value))
+                     (member (car (sb-kernel:fdefn-name value))
+                             '(sb-pcl::slow-method sb-pcl::fast-method))))
+               (t
+                (process info-name value))))))
     ret))
 
 (defun who-calls (function-name)

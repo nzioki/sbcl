@@ -216,7 +216,7 @@
 ;; Each CTYPE instance (incl. subtypes thereof) has a random opaque hash value.
 ;; Hashes are mixed together to form a lookup key in the memoization wrappers
 ;; for most operations in CTYPES. This works because CTYPEs are immutable.
-;; But 2 bits are "stolen" from the hash to use as flag bits.
+;; But some bits are "stolen" from the hash as flag bits.
 ;; The sign bit indicates that the object is the *only* object representing
 ;; its type-specifier - it is an "interned" object.
 ;; The next highest bit indicates that the object, if compared for TYPE=
@@ -225,6 +225,17 @@
 ;; At any rate, the totally opaque pseudo-random bits are under this mask.
 (defconstant +ctype-hash-mask+
   (ldb (byte (1- sb!vm:n-positive-fixnum-bits) 0) -1))
+
+;;; When comparing two ctypes, if this bit is 1 in each and they are not EQ,
+;;; and at least one is interned, then they are not TYPE=.
+(defconstant +type-admits-type=-optimization+
+  (ash 1 (- sb!vm:n-positive-fixnum-bits 1)))
+
+;;; Represent an index into *SPECIALIZED-ARRAY-ELEMENT-TYPE-PROPERTIES*
+;;; if applicable. For types which are not array specializations,
+;;; the bits are arbitrary.
+(defmacro !ctype-saetp-index (x)
+  `(ldb (byte 5 ,(- sb!vm:n-positive-fixnum-bits 6)) (type-hash-value ,x)))
 
 (def!struct (ctype (:conc-name type-)
                    (:constructor nil)
@@ -258,16 +269,12 @@
               ;; be a read/write slot?
               :read-only nil))
 
-;; Set the sign bit (the "interned" bit) of the hash-value of OBJ to 1.
-;; This is an indicator that the object is the unique internal representation
-;; of any ctype that is TYPE= to this object.
-;; Everything starts out assumed non-unique.
-;; The hash-cache logic (a/k/a memoization) tends to ignore high bits when
-;; creating cache keys because the mixing function is XOR and the caches
-;; are power-of-2 sizes. Lkewise making the low bits non-random is bad
-;; for cache distribution.
-(defconstant +type-admits-type=-optimization+
-  (ash 1 (- sb!vm:n-positive-fixnum-bits 1))) ; highest bit in fixnum
+;;; The "interned" bit indicates uniqueness of the internal representation of
+;;; any specifier that parses to this object.
+;;; Not all interned types admit TYPE= optimization. As one example:
+;;; (type= (specifier-type '(array (unsigned-byte 6) (*)))
+;;;        (specifier-type '(array (unsigned-byte 7) (*)))) => T and T
+;;; because we preserve the difference in spelling of the two types.
 (defun mark-ctype-interned (obj)
   (setf (type-hash-value obj)
         (logior sb!xc:most-negative-fixnum
@@ -370,12 +377,31 @@
 ;;; Semantics are slightly different though: DEFTYPE causes the default
 ;;; for missing &OPTIONAL arguments to be '* but a translator requires
 ;;; an explicit default of '*, or else it assumes a default of NIL.
-(defmacro !def-type-translator (name arglist &body body)
+(defmacro !def-type-translator (name &rest stuff)
   (declare (type symbol name))
-  `(!cold-init-forms
-    (setf (info :type :translator ',name)
-          ,(make-macro-lambda (format nil "~A-TYPE-PARSE" name)
-                              arglist body nil nil :environment nil))))
+  (let* ((allow-atom (if (eq (car stuff) :list) (progn (pop stuff) nil) t))
+         (lambda-list (pop stuff))
+         (context-var-p (typep (car lambda-list) '(cons (eql :context))))
+         (context
+          (if context-var-p (cadr (pop lambda-list)) (make-symbol "CONTEXT")))
+         ;; If atoms are allowed, then the internal destructuring-bind receives
+         ;; NIL when the spec is an atom; it should not take CDR of its input.
+         ;; (Note that a &WHOLE argument gets NIL, not the atom in that case)
+         ;; If atoms are disallowed, it's basically like a regular macro.
+         (lexpr (make-macro-lambda nil lambda-list stuff nil nil
+                                   :accessor (if allow-atom 'identity 'cdr)
+                                   :environment nil))
+         (ll-decl (third lexpr)))
+    (aver (and (eq (car ll-decl) 'declare) (caadr ll-decl) 'sb!c::lambda-list))
+    `(!cold-init-forms
+      (setf (info :type :expander ',name)
+            (list
+             (named-lambda ,(format nil "~A-TYPE-PARSE" name) (,context spec)
+              ,ll-decl
+              ,@(unless context-var-p `((declare (ignore ,context))))
+              ,(if allow-atom
+                   `(,lexpr (and (listp spec) (cdr spec)))
+                   `(if (listp spec) (,lexpr spec)))))))))
 
 ;;; Invoke a type method on TYPE1 and TYPE2. If the two types have the
 ;;; same class, invoke the simple method. Otherwise, invoke any
@@ -474,3 +500,161 @@
         finally (return res)))
 
 (!defun-from-collected-cold-init-forms !type-class-cold-init)
+
+;;; A few type representations need to be defined slightly earlier than
+;;; 'early-type' is compiled, so they're defined here.
+
+;;; An ARRAY-TYPE is used to represent any array type, including
+;;; things such as SIMPLE-BASE-STRING.
+(defstruct (array-type (:include ctype
+                                 (class-info (type-class-or-lose 'array)))
+                       (:constructor %make-array-type
+                        (dimensions complexp element-type
+                                    specialized-element-type))
+                       (:copier nil))
+  ;; the dimensions of the array, or * if unspecified. If a dimension
+  ;; is unspecified, it is *.
+  (dimensions '* :type (or list (member *)) :read-only t)
+  ;; Is this not a simple array type? (:MAYBE means that we don't know.)
+  (complexp :maybe :type (member t nil :maybe) :read-only t)
+  ;; the element type as originally specified
+  (element-type (missing-arg) :type ctype :read-only t)
+  ;; the element type as it is specialized in this implementation
+  (specialized-element-type *wild-type* :type ctype :read-only t))
+
+(defstruct (character-set-type
+            (:include ctype
+                      (class-info (type-class-or-lose 'character-set)))
+            (:constructor %make-character-set-type (pairs))
+            (:copier nil))
+  (pairs (missing-arg) :type list :read-only t))
+
+;;; A COMPOUND-TYPE is a type defined out of a set of types, the
+;;; common parent of UNION-TYPE and INTERSECTION-TYPE.
+(defstruct (compound-type (:include ctype)
+                          (:constructor nil)
+                          (:copier nil))
+  ;; Formerly defined in every CTYPE, but now just in the ones
+  ;; for which enumerability is variable.
+  (enumerable nil :read-only t)
+  (types nil :type list :read-only t))
+
+;;; A UNION-TYPE represents a use of the OR type specifier which we
+;;; couldn't canonicalize to something simpler. Canonical form:
+;;;   1. All possible pairwise simplifications (using the UNION2 type
+;;;      methods) have been performed. Thus e.g. there is never more
+;;;      than one MEMBER-TYPE component. FIXME: As of sbcl-0.6.11.13,
+;;;      this hadn't been fully implemented yet.
+;;;   2. There are never any UNION-TYPE components.
+;;;
+;;; TODO: As STRING is an especially important union type,
+;;; it could be interned by canonicalizing its subparts into
+;;; ARRAY of {CHARACTER,BASE-CHAR,NIL} in that exact order always.
+;;; It will therefore admit quick TYPE=, but not quick failure, since
+;;;   (type= (specifier-type '(or (simple-array (member #\a) (*))
+;;;                               (simple-array character (*))
+;;;                               (simple-array nil (*))))
+;;;          (specifier-type 'simple-string)) => T and T
+;;; even though (MEMBER #\A) is not TYPE= to BASE-CHAR.
+;;;
+(defstruct (union-type (:include compound-type
+                                 (class-info (type-class-or-lose 'union)))
+                       (:constructor make-union-type (enumerable types))
+                       (:copier nil)))
+
+;;; An INTERSECTION-TYPE represents a use of the AND type specifier
+;;; which we couldn't canonicalize to something simpler. Canonical form:
+;;;   1. All possible pairwise simplifications (using the INTERSECTION2
+;;;      type methods) have been performed. Thus e.g. there is never more
+;;;      than one MEMBER-TYPE component.
+;;;   2. There are never any INTERSECTION-TYPE components: we've
+;;;      flattened everything into a single INTERSECTION-TYPE object.
+;;;   3. There are never any UNION-TYPE components. Either we should
+;;;      use the distributive rule to rearrange things so that
+;;;      unions contain intersections and not vice versa, or we
+;;;      should just punt to using a HAIRY-TYPE.
+(defstruct (intersection-type (:include compound-type
+                                        (class-info (type-class-or-lose
+                                                     'intersection)))
+                              (:constructor %make-intersection-type
+                                            (enumerable types))
+                              (:copier nil)))
+
+;;; a list of all the float "formats" (i.e. internal representations;
+;;; nothing to do with #'FORMAT), in order of decreasing precision
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter *float-formats*
+    '(long-float double-float single-float short-float)))
+
+;;; The type of a float format.
+(deftype float-format () `(member ,@*float-formats*))
+
+;;; A NUMERIC-TYPE represents any numeric type, including things
+;;; such as FIXNUM.
+(defstruct (numeric-type (:include ctype
+                                   (class-info (type-class-or-lose 'number)))
+                         (:constructor %make-numeric-type)
+                         (:copier nil))
+  ;; Formerly defined in every CTYPE, but now just in the ones
+  ;; for which enumerability is variable.
+  (enumerable nil :read-only t)
+  ;; the kind of numeric type we have, or NIL if not specified (just
+  ;; NUMBER or COMPLEX)
+  ;;
+  ;; KLUDGE: A slot named CLASS for a non-CLASS value is bad.
+  ;; Especially when a CLASS value *is* stored in another slot (called
+  ;; CLASS-INFO:-). Perhaps this should be called CLASS-NAME? Also
+  ;; weird that comment above says "Numeric-Type is used to represent
+  ;; all numeric types" but this slot doesn't allow COMPLEX as an
+  ;; option.. how does this fall into "not specified" NIL case above?
+  ;; Perhaps someday we can switch to CLOS and make NUMERIC-TYPE
+  ;; be an abstract base class and INTEGER-TYPE, RATIONAL-TYPE, and
+  ;; whatnot be concrete subclasses..
+  (class nil :type (member integer rational float nil) :read-only t)
+  ;; "format" for a float type (i.e. type specifier for a CPU
+  ;; representation of floating point, e.g. 'SINGLE-FLOAT -- nothing
+  ;; to do with #'FORMAT), or NIL if not specified or not a float.
+  ;; Formats which don't exist in a given implementation don't appear
+  ;; here.
+  (format nil :type (or float-format null) :read-only t)
+  ;; Is this a complex numeric type?  Null if unknown (only in NUMBER).
+  ;;
+  ;; FIXME: I'm bewildered by FOO-P names for things not intended to
+  ;; interpreted as truth values. Perhaps rename this COMPLEXNESS?
+  (complexp :real :type (member :real :complex nil) :read-only t)
+  ;; The upper and lower bounds on the value, or NIL if there is no
+  ;; bound. If a list of a number, the bound is exclusive. Integer
+  ;; types never have exclusive bounds, i.e. they may have them on
+  ;; input, but they're canonicalized to inclusive bounds before we
+  ;; store them here.
+  (low nil :type (or number cons null) :read-only t)
+  (high nil :type (or number cons null) :read-only t))
+
+;;; A CONS-TYPE is used to represent a CONS type.
+(defstruct (cons-type (:include ctype (class-info (type-class-or-lose 'cons)))
+                      (:constructor
+                       %make-cons-type (car-type
+                                        cdr-type))
+                      (:copier nil))
+  ;; the CAR and CDR element types (to support ANSI (CONS FOO BAR) types)
+  (car-type (missing-arg) :type ctype :read-only t)
+  (cdr-type (missing-arg) :type ctype :read-only t))
+
+(in-package "SB!ALIEN")
+(def!struct (alien-type
+             (:make-load-form-fun sb!kernel:just-dump-it-normally)
+             (:constructor make-alien-type
+                           (&key class bits alignment
+                            &aux (alignment
+                                  (or alignment (guess-alignment bits))))))
+  (class 'root :type symbol :read-only t)
+  (bits nil :type (or null unsigned-byte))
+  (alignment nil :type (or null unsigned-byte)))
+
+(in-package "SB!KERNEL")
+(defstruct (alien-type-type
+            (:include ctype
+                      (class-info (type-class-or-lose 'alien)))
+            (:constructor %make-alien-type-type (alien-type))
+            (:copier nil))
+  (alien-type nil :type alien-type :read-only t))

@@ -22,7 +22,7 @@
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
   (:generator 13
-    (inst addu bytes rank (+ (* (1+ array-dimensions-offset) n-word-bytes)
+    (inst addu bytes rank (+ (* array-dimensions-offset n-word-bytes)
                              lowtag-mask))
     (inst srl bytes n-lowtag-bits)
     (inst sll bytes n-lowtag-bits)
@@ -64,18 +64,17 @@
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
-         (index :scs (any-reg descriptor-reg) :target result))
-  (:results (result :scs (any-reg descriptor-reg)))
+         (index :scs (any-reg descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 5
-    (let ((error (generate-error-code vop invalid-array-index-error
+    (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
+      (%test-fixnum index error t :temp temp)
       (inst sltu temp index bound)
       (inst beq temp error)
-      (inst nop)
-      (move result index))))
+      (inst nop))))
 
 ;;;; Accessors/Setters
 

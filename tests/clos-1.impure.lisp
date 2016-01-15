@@ -109,6 +109,7 @@
   (setq *method-with-no-next-method* (defmethod nnm-tester ((y (eql x))) (call-next-method))))
 (make-nnm-tester 1)
 (defmethod no-next-method ((gf (eql #'nnm-tester)) method &rest args)
+  (declare (ignore args))
   (assert (eql method *method-with-no-next-method*))
   (incf *nnm-count*))
 (with-test (:name (no-next-method :unknown-specializer))
@@ -156,7 +157,7 @@
   (assert
    (null (nth-value 1 (compile nil '(lambda () (foo 5 :w 10 :foo 15))))))
   (assert
-   (not (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))))
+   (not (sb-kernel::args-type-keyp (sb-int:proclaimed-ftype 'foo)))))
 
 ;; If the GF has &KEY and &ALLOW-OTHER-KEYS, the methods' keys can be
 ;; anything, and we don't warn about unrecognized keys.
@@ -164,14 +165,22 @@
 (with-test (:name :gf-allow-other-keys)
   (defgeneric foo (x &key &allow-other-keys))
   (defmethod foo ((i integer) &key y z) (list i y z))
+  ;; Correctness of a GF's ftype was previously ensured by the compiler,
+  ;; and only if a lambda was compiled that referenced the GF, in a way
+  ;; that was just barely non-broken enough to make the compiler happy.
+  ;; Now the FTYPE is computed the instant anyone asks for it.
+  (assert (equal (mapcar 'sb-kernel:key-info-name
+                         (sb-kernel:fun-type-keywords
+                          (sb-int:proclaimed-ftype 'foo)))
+                 '(:y :z)))
   (assert
    (null (nth-value 1 (compile nil '(lambda () (foo 5 :z 10 :y 15))))))
   (assert
    (null (nth-value 1 (compile nil '(lambda () (foo 5 :z 10 :foo 15))))))
   (assert
-   (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))
+   (sb-kernel::args-type-keyp (sb-int:proclaimed-ftype 'foo)))
   (assert
-   (sb-kernel::args-type-allowp (sb-c::info :function :type 'foo))))
+   (sb-kernel::args-type-allowp (sb-int:proclaimed-ftype 'foo))))
 
 ;; If any method has &ALLOW-OTHER-KEYS, 7.6.4 point 5 seems to say the
 ;; GF should be construed to have &ALLOW-OTHER-KEYS.
@@ -180,8 +189,8 @@
   (defgeneric foo (x &key))
   (defmethod foo ((x integer) &rest y &key &allow-other-keys) (list x y))
   (assert (null (nth-value 1 (compile nil '(lambda () (foo 10 :foo 20))))))
-  (assert (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))
-  (assert (sb-kernel::args-type-allowp (sb-c::info :function :type 'foo))))
+  (assert (sb-kernel::args-type-keyp (sb-int:proclaimed-ftype 'foo)))
+  (assert (sb-kernel::args-type-allowp (sb-int:proclaimed-ftype 'foo))))
 
 (fmakunbound 'foo)
 (with-test (:name (defmethod symbol-macrolet))

@@ -23,6 +23,10 @@
 
 (in-package "SB-COLD")
 
+;;; If TRUE, then COMPILE-FILE is being invoked only to process
+;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
+(defvar *compile-for-effect-only* nil)
+
 ;;; prefixes for filename stems when cross-compiling. These are quite arbitrary
 ;;; (although of course they shouldn't collide with anything we don't want to
 ;;; write over). In particular, they can be either relative path names (e.g.
@@ -125,7 +129,7 @@
 (let ((*print-length* nil)
       (*print-level* nil))
   (format t
-          "target features *SHEBANG-FEATURES*=~@<~S~:>~%"
+          "target features *SHEBANG-FEATURES*=~%~@<~S~:>~%"
           *shebang-features*))
 
 (defvar *shebang-backend-subfeatures*
@@ -142,10 +146,13 @@
           "target backend-subfeatures *SHEBANG-BACKEND-FEATURES*=~@<~S~:>~%"
           *shebang-backend-subfeatures*))
 
-(let ((arch (intersection '(:alpha :arm :hppa :mips :ppc :sparc :x86 :x86-64)
-                          *shebang-features*)))
-  (cond ((not arch) (error "No architecture selected"))
-        ((> (length arch) 1) (error "More than one architecture selected"))))
+;;; Call for effect of signaling an error if no target picked.
+(target-platform-name)
+
+;;; You can get all the way through make-host-1 without either one of these
+;;; features, but then 'bit-bash' will fail to cross-compile.
+(unless (intersection '(:big-endian :little-endian) *shebang-features*)
+  (warn "You'll have bad time without either endian-ness defined"))
 
 ;;; Some feature combinations simply don't work, and sometimes don't
 ;;; fail until quite a ways into the build.  Pick off the more obvious
@@ -154,13 +161,13 @@
 (let ((feature-compatibility-tests
        '(("(and sb-thread (not gencgc))"
           ":SB-THREAD requires :GENCGC")
-         ("(and sb-thread (not (or ppc x86 x86-64)))"
+         ("(and sb-thread (not (or ppc x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
          ("(and cheneygc (not (or alpha arm hppa mips ppc sparc)))"
           ":CHENEYGC not supported on selected architecture")
-         ("(and gencgc (not (or sparc ppc x86 x86-64 arm)))"
+         ("(and gencgc (not (or sparc ppc x86 x86-64 arm arm64)))"
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
@@ -174,6 +181,10 @@
           ;; updated to take the additional indirection into account.
           ;; Let's avoid this unusual combination.
           ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE and :SB-THREAD")
+         ("(and sb-eval sb-fasteval)"
+          ;; It sorta kinda works to have both, but there should be no need,
+          ;; and it's not really supported.
+          "At most one interpreter can be selected")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
@@ -252,14 +263,7 @@
     (if position
       (concatenate 'string
                    (subseq stem 0 (1+ position))
-                   #!+x86 "x86"
-                   #!+x86-64 "x86-64"
-                   #!+sparc "sparc"
-                   #!+ppc "ppc"
-                   #!+mips "mips"
-                   #!+alpha "alpha"
-                   #!+hppa "hppa"
-                   #!+arm "arm"
+                   (target-platform-name)
                    (subseq stem (+ position 7)))
       stem)))
 (compile 'stem-remap-target)
@@ -423,7 +427,11 @@
 
     ;; If we get to here, compilation succeeded, so it's OK to rename
     ;; the temporary output file to the permanent object file.
-    (rename-file-a-la-unix tmp-obj obj)
+    ;; ASSEMBLE-FILE produces no output in the preload pass.
+    ;; (The compiler produces an empty file.)
+    (if (and *compile-for-effect-only* (search "/assembly/" obj))
+        nil
+        (rename-file-a-la-unix tmp-obj obj))
 
     ;; nice friendly traditional return value
     (pathname obj)))
@@ -478,3 +486,21 @@
            (lambda ()
              (funcall *target-compile-file* filename))))
 (compile 'target-compile-file)
+
+(defun make-assembler-package (pkg-name)
+  (when (find-package pkg-name)
+    (delete-package pkg-name))
+  (let ((pkg (make-package pkg-name
+                           :use '("CL" "SB!INT" "SB!EXT" "SB!KERNEL" "SB!VM"
+                                  "SB!SYS" ; for SAP accessors
+                                  ;; Dependence of the assembler on the compiler
+                                  ;; feels a bit backwards, but assembly needs
+                                  ;; TN-SC, TN-OFFSET, etc. because the compiler
+                                  ;; doesn't speak the assembler's language.
+                                  ;; Rather vice-versa.
+                                  "SB!C"))))
+    ;; Both SB-ASSEM and SB-DISASSEM export these two symbols.
+    ;; Neither is shadowing-imported. If you need one, package-qualify it.
+    (shadow '("SEGMENT" "MAKE-SEGMENT") pkg)
+    (use-package '("SB!ASSEM" "SB!DISASSEM") pkg)
+    pkg))

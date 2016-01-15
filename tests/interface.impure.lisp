@@ -16,35 +16,45 @@
 (use-package "ASSERTOID")
 (use-package "TEST-UTIL")
 
+(defmacro silently (&rest things)
+  `(let ((*standard-output* (make-broadcast-stream))) ,@things))
 
-(with-test (:name :disassemble)
+;; Interpreted closure is a problem for COMPILE
+(with-test (:name :disassemble :skipped-on :interpreter)
 ;;; DISASSEMBLE shouldn't fail on closures or unpurified functions
   (defun disassemble-fun (x) x)
-  (disassemble 'disassemble-fun))
+  (silently (disassemble 'disassemble-fun)))
 
-(with-test (:name :disassemble-closure)
+(with-test (:name :disassemble-closure :skipped-on :interpreter)
   (let ((x 1)) (defun disassemble-closure (y) (if y (setq x y) x)))
-  (disassemble 'disassemble-closure))
+  (silently (disassemble 'disassemble-closure)))
 
 #+sb-eval
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (import 'sb-eval:interpreted-function-p))
+#+sb-fasteval
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (import 'sb-interpreter:interpreted-function-p))
+
+#+(or sb-eval sb-fasteval)
 (with-test (:name :disassemble-interpreted)
     ;; Nor should it fail on interpreted functions
     (let ((sb-ext:*evaluator-mode* :interpret))
       (eval `(defun disassemble-eval (x) x))
-      (disassemble 'disassemble-eval))
+      (silently (disassemble 'disassemble-eval)))
 
     ;; disassemble-eval should still be an interpreted function.
     ;; clhs disassemble: "(If that function is an interpreted function,
     ;; it is first compiled but the result of this implicit compilation
     ;; is not installed.)"
-    (assert (sb-eval:interpreted-function-p #'disassemble-eval)))
+    (assert (interpreted-function-p (symbol-function 'disassemble-eval))))
 
 (with-test (:name :disassemble-generic)
   ;; nor should it fail on generic functions or other funcallable instances
   (defgeneric disassemble-generic (x))
-  (disassemble 'disassemble-generic)
+  (silently (disassemble 'disassemble-generic))
   (let ((fin (make-instance 'sb-mop:funcallable-standard-object)))
-    (disassemble fin)))
+    (silently (disassemble fin))))
 
 ;;; while we're at it, much the same applies to
 ;;; FUNCTION-LAMBDA-EXPRESSION:
@@ -64,14 +74,14 @@
      (make-instance 'generic-function))
     (function-lambda-expression
      (make-instance 'standard-generic-function))
-    #+sb-eval
+    #+(or sb-eval sb-fasteval)
     (progn
       (let ((sb-ext:*evaluator-mode* :interpret))
         (eval `(defun fle-eval (x) x))
-        (assert (eql (fle-name #'fle-eval) 'fle-eval)))
+        (assert (eql (fle-name (symbol-function 'fle-eval)) 'fle-eval)))
 
       ;; fle-eval should still be an interpreted function.
-      (assert (sb-eval:interpreted-function-p #'fle-eval)))))
+      (assert (interpreted-function-p (symbol-function 'fle-eval))))))
 
 
 ;;; support for DESCRIBE tests
@@ -81,11 +91,12 @@
   (eval `(let (x) (defun closure-to-describe () (incf x)))))
 
 (with-test (:name :describe-empty-gf)
-  (describe (make-instance 'generic-function))
-  (describe (make-instance 'standard-generic-function)))
+  (silently (describe (make-instance 'generic-function)))
+  (silently (describe (make-instance 'standard-generic-function))))
 
 ;;; DESCRIBE should run without signalling an error.
 (with-test (:name (describe :no-error))
+ (silently
   (describe (make-to-be-described))
   (describe 12)
   (describe "a string")
@@ -94,7 +105,7 @@
   (describe '(a list))
   (describe #(a vector))
 ;; bug 824974
-  (describe 'closure-to-describe))
+  (describe 'closure-to-describe)))
 
 ;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
 ;;; FRESH-LINE and TERPRI neatly.
@@ -349,7 +360,7 @@
   ;; Signalled an error at one point
   (flet ((zoo () (gogo)))
     (defmethod gogo () nil)
-    (describe 'gogo)))
+    (silently (describe 'gogo))))
 
 (defmacro bug-643958-test ()
   "foo"
@@ -375,7 +386,7 @@
                  (when (plusp n)
                    (foo (1- n) x))
                  (when (zerop n)
-                   (sb-debug:backtrace 100 s))))
+                   (sb-debug:print-backtrace :count 100 :stream s))))
         (foo 100 (make-instance 'cannot-print-this))))))
 (with-test (:name :backtrace-and-circles)
   (handler-bind ((error #'continue))
@@ -384,7 +395,7 @@
                  (when (plusp n)
                    (foo (1- n) x))
                  (when (zerop n)
-                   (sb-debug:backtrace 100 s))))
+                   (sb-debug:print-backtrace :count 100 :stream s))))
         (foo 100 (let ((list (list t)))
                    (nconc list list)))))))
 
@@ -429,4 +440,37 @@
 
 (with-test (:name (apropos :once-only))
   (assert (= (length (apropos-list "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")) 1)))
+
+(defgeneric gf-arglist-1 (x &key y))
+(defmethod gf-arglist-1 (x &key (y nil) (z nil z-p))
+  (list x y z z-p))
+
+(defgeneric gf-arglist-2 (x &key y))
+(defmethod gf-arglist-2 ((x integer) &key (y nil) ((z f) nil z-p)) (list x y f z-p))
+(defmethod gf-arglist-2 ((x string) &key (y nil) ((z w) nil z-p)) (list x y w z-p))
+
+(defgeneric gf-arglist-3 (x &key ((:y y))))
+
+(defgeneric gf-arglist-4 (x &key ((:y z))))
+
+(defgeneric gf-arglist-5 (x &key y))
+(defmethod gf-arglist-5 ((x integer) &key z &allow-other-keys) (list x z))
+
+(with-test (:name (:generic-function-pretty-arglist 1))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-1)
+                 '(x &key y z))))
+(with-test (:name (:generic-function-pretty-arglist 2))
+  (assert (or (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z w))))
+              (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z f)))))))
+(with-test (:name (:generic-function-pretty-arglist 3))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-3)
+                 '(x &key y))))
+(with-test (:name (:generic-function-pretty-arglist 4))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-4)
+                 '(x &key ((:y z))))))
+(with-test (:name (:generic-function-pretty-arglist 5))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-5)
+                 '(x &key y z &allow-other-keys))))
 ;;;; success

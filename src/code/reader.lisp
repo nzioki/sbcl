@@ -718,6 +718,7 @@ standard Lisp readtable when NIL."
   #!+sb-doc
   "Read from STREAM and return the value read, preserving any whitespace
    that followed the object."
+  (declare (explicit-check))
   (check-for-recursive-read stream recursive-p 'read-preserving-whitespace)
   (%read-preserving-whitespace stream eof-error-p eof-value recursive-p))
 
@@ -751,6 +752,7 @@ standard Lisp readtable when NIL."
                        (recursive-p nil))
   #!+sb-doc
   "Read the next Lisp value from STREAM, and return it."
+  (declare (explicit-check))
   (check-for-recursive-read stream recursive-p 'read)
   (let* ((local-eof-val (load-time-value (cons nil nil) t))
          (result (%read-preserving-whitespace
@@ -858,6 +860,7 @@ standard Lisp readtable when NIL."
   #!+sb-doc
   "Read Lisp values from INPUT-STREAM until the next character after a
    value's representation is ENDCHAR, and return the objects as a list."
+    (declare (explicit-check))
     (check-for-recursive-read input-stream recursive-p 'read-delimited-list)
     (flet ((%read-delimited-list ()
              (with-list-reader (input-stream endchar)
@@ -1769,16 +1772,6 @@ extended <package-name>::<form-in-package> syntax."
 
 ;;;; READ-FROM-STRING
 
-(defun maybe-note-read-from-string-signature-issue (eof-error-p)
-  ;; The interface is so unintuitive that we explicitly check for the common
-  ;; error.
-  (when (member eof-error-p '(:start :end :preserve-whitespace))
-    (style-warn "~@<~S as EOF-ERROR-P argument to ~S: probable error. ~
-               Two optional arguments must be provided before the ~
-               first keyword argument.~:@>"
-                eof-error-p 'read-from-string)
-    t))
-
 (declaim (ftype (sfunction (string t t index (or null index) t) (values t index))
                 %read-from-string))
 (defun %read-from-string (string eof-error-p eof-value start end preserve-whitespace)
@@ -1803,45 +1796,6 @@ extended <package-name>::<form-in-package> syntax."
   (declare (string string))
   (maybe-note-read-from-string-signature-issue eof-error-p)
   (%read-from-string string eof-error-p eof-value start end preserve-whitespace)))
-
-(define-compiler-macro read-from-string (&whole form string &rest args)
-  ;; Check this at compile-time, and rewrite it so we're silent at runtime.
-  (destructuring-bind (&optional (eof-error-p t) eof-value &rest keys)
-      args
-    (cond ((maybe-note-read-from-string-signature-issue eof-error-p)
-           `(read-from-string ,string t ,eof-value ,@keys))
-          (t
-           (let* ((start (gensym "START"))
-                  (end (gensym "END"))
-                  (preserve-whitespace (gensym "PRESERVE-WHITESPACE"))
-                  bind seen ignore)
-             (do ()
-                 ((not (cdr keys))
-                  ;; Odd number of keys, punt.
-                  (when keys (return-from read-from-string form)))
-               (let* ((key (pop keys))
-                      (value (pop keys))
-                      (var (case key
-                             (:start start)
-                             (:end end)
-                             (:preserve-whitespace preserve-whitespace)
-                             (otherwise
-                              (return-from read-from-string form)))))
-                 (when (member key seen)
-                   (setf var (gensym "IGNORE"))
-                   (push var ignore))
-                 (push key seen)
-                 (push (list var value) bind)))
-             (dolist (default (list (list start 0)
-                                    (list end nil)
-                                    (list preserve-whitespace nil)))
-               (unless (assoc (car default) bind)
-                 (push default bind)))
-             (once-only ((string string))
-               `(let ,(nreverse bind)
-                  ,@(when ignore `((declare (ignore ,@ignore))))
-                  (%read-from-string ,string ,eof-error-p ,eof-value
-                                     ,start ,end ,preserve-whitespace))))))))
 
 ;;;; PARSE-INTEGER
 
@@ -1942,3 +1896,12 @@ extended <package-name>::<form-in-package> syntax."
   (unless (null new-alist)
     (error "Assignment to virtual DISPATCH-TABLES slot not allowed"))
   new-alist)
+
+;;; like LISTEN, but any whitespace in the input stream will be flushed
+(defun listen-skip-whitespace (&optional (stream *standard-input*))
+  (do ((char (read-char-no-hang stream nil nil nil)
+             (read-char-no-hang stream nil nil nil)))
+      ((null char) nil)
+    (cond ((not (whitespace[1]p char))
+           (unread-char char stream)
+           (return t)))))

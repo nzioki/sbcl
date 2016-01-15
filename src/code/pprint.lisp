@@ -10,102 +10,6 @@
 ;;;; files for more information.
 
 (in-package "SB!PRETTY")
-
-;;;; pretty streams
-
-;;; There are three different units for measuring character positions:
-;;;  COLUMN - offset (if characters) from the start of the current line
-;;;  INDEX  - index into the output buffer
-;;;  POSN   - some position in the stream of characters cycling through
-;;;           the output buffer
-(deftype column ()
-  '(and fixnum unsigned-byte))
-;;; The INDEX type is picked up from the kernel package.
-(deftype posn ()
-  'fixnum)
-
-(defconstant initial-buffer-size 128)
-
-(defconstant default-line-length 80)
-
-;; We're allowed to DXify the pretty-stream used by PPRINT-LOGICAL-BLOCK.
-;;   "pprint-logical-block and the pretty printing stream it creates have
-;;    dynamic extent. The consequences are undefined if, outside of this
-;;    extent, output is attempted to the pretty printing stream it creates."
-;; However doing that is slightly dangerous since there are a zillion ways
-;; for users to get a hold of the stream and stash it somewhere.
-;; Anyway, just a thought...
-(declaim (maybe-inline make-pretty-stream))
-(defstruct (pretty-stream (:include ansi-stream
-                                    (out #'pretty-out)
-                                    (sout #'pretty-sout)
-                                    (misc #'pretty-misc))
-                          (:constructor make-pretty-stream (target))
-                          (:copier nil))
-  ;; Where the output is going to finally go.
-  (target (missing-arg) :type stream :read-only t)
-  ;; Line length we should format to. Cached here so we don't have to keep
-  ;; extracting it from the target stream.
-  (line-length (or *print-right-margin*
-                   (sb!impl::line-length target)
-                   default-line-length)
-               :type column
-               :read-only t)
-  ;; If non-nil, a function to call before performing OUT or SOUT
-  (char-out-oneshot-hook nil :type (or null function))
-  ;; A simple string holding all the text that has been output but not yet
-  ;; printed.
-  (buffer (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; The index into BUFFER where more text should be put.
-  (buffer-fill-pointer 0 :type index)
-  ;; Whenever we output stuff from the buffer, we shift the remaining noise
-  ;; over. This makes it difficult to keep references to locations in
-  ;; the buffer. Therefore, we have to keep track of the total amount of
-  ;; stuff that has been shifted out of the buffer.
-  (buffer-offset 0 :type posn)
-  ;; The column the first character in the buffer will appear in. Normally
-  ;; zero, but if we end up with a very long line with no breaks in it we
-  ;; might have to output part of it. Then this will no longer be zero.
-  (buffer-start-column (or (sb!impl::charpos target) 0) :type column)
-  ;; The line number we are currently on. Used for *PRINT-LINES*
-  ;; abbreviations and to tell when sections have been split across
-  ;; multiple lines.
-  (line-number 0 :type index)
-  ;; the value of *PRINT-LINES* captured at object creation time. We
-  ;; use this, instead of the dynamic *PRINT-LINES*, to avoid
-  ;; weirdness like
-  ;;   (let ((*print-lines* 50))
-  ;;     (pprint-logical-block ..
-  ;;       (dotimes (i 10)
-  ;;         (let ((*print-lines* 8))
-  ;;           (print (aref possiblybigthings i) prettystream)))))
-  ;; terminating the output of the entire logical blockafter 8 lines.
-  (print-lines *print-lines* :type (or index null) :read-only t)
-  ;; Stack of logical blocks in effect at the buffer start.
-  (blocks (list (make-logical-block)) :type list)
-  ;; Buffer holding the per-line prefix active at the buffer start.
-  ;; Indentation is included in this. The length of this is stored
-  ;; in the logical block stack.
-  (prefix (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; Buffer holding the total remaining suffix active at the buffer start.
-  ;; The characters are right-justified in the buffer to make it easier
-  ;; to output the buffer. The length is stored in the logical block
-  ;; stack.
-  (suffix (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; Queue of pending operations. When empty, HEAD=TAIL=NIL. Otherwise,
-  ;; TAIL holds the first (oldest) cons and HEAD holds the last (newest)
-  ;; cons. Adding things to the queue is basically (setf (cdr head) (list
-  ;; new)) and removing them is basically (pop tail) [except that care must
-  ;; be taken to handle the empty queue case correctly.]
-  (queue-tail nil :type list)
-  (queue-head nil :type list)
-  ;; Block-start queue entries in effect at the queue head.
-  (pending-blocks nil :type list))
-(def!method print-object ((pstream pretty-stream) stream)
-  ;; FIXME: CMU CL had #+NIL'ed out this code and done a hand-written
-  ;; FORMAT hack instead. Make sure that this code actually works instead
-  ;; of falling into infinite regress or something.
-  (print-unreadable-object (pstream stream :type t :identity t)))
 
 #!-sb-fluid (declaim (inline index-posn posn-index posn-column))
 (defun index-posn (index stream)
@@ -290,10 +194,6 @@
 
 ;;;; the pending operation queue
 
-(defstruct (queued-op (:constructor nil)
-                      (:copier nil))
-  (posn 0 :type posn))
-
 (defmacro enqueue (stream type &rest args)
   (let ((constructor (symbolicate "MAKE-" type)))
     (once-only ((stream stream)
@@ -311,17 +211,6 @@
              (setf (pretty-stream-queue-tail ,stream) ,op))
          (setf (pretty-stream-queue-head ,stream) ,op)
          ,entry))))
-
-(defstruct (section-start (:include queued-op)
-                          (:constructor nil)
-                          (:copier nil))
-  (depth 0 :type index)
-  (section-end nil :type (or null newline block-end)))
-
-(defstruct (newline (:include section-start)
-                    (:copier nil))
-  (kind (missing-arg)
-        :type (member :linear :fill :miser :literal :mandatory)))
 
 (defun enqueue-newline (stream kind)
   (let* ((depth (length (pretty-stream-pending-blocks stream)))
@@ -369,10 +258,6 @@
                          :depth (length pending-blocks))))
     (setf (pretty-stream-pending-blocks stream)
           (cons start pending-blocks))))
-
-(defstruct (block-end (:include queued-op)
-                      (:copier nil))
-  (suffix nil :type (or null simple-string)))
 
 (defun end-logical-block (stream)
   (let* ((start (pop (pretty-stream-pending-blocks stream)))
@@ -824,11 +709,13 @@ line break."
 
 ;;;; pprint-dispatch tables
 
-(defvar *initial-pprint-dispatch-table*)
+(defglobal *initial-pprint-dispatch-table* nil)
 
-(defstruct (pprint-dispatch-entry (:copier nil) (:predicate nil))
+(defstruct (pprint-dispatch-entry
+            (:constructor make-pprint-dispatch-entry (type priority fun test-fn))
+            (:copier nil) (:predicate nil))
   ;; the type specifier for this entry
-  (type (missing-arg) :type t :read-only t)
+  (type nil :type t :read-only t)
   ;; a function to test to see whether an object is of this type,
   ;; either (LAMBDA (OBJ) (TYPEP OBJECT TYPE)) or a builtin predicate.
   ;; We don't bother computing this for entries in the CONS
@@ -837,10 +724,9 @@ line break."
   ;; the priority for this guy
   (priority 0 :type real :read-only t)
   ;; T iff one of the original entries.
-  (initial-p (eq *initial-pprint-dispatch-table* nil)
-             :type (member t nil) :read-only t)
+  (initial-p (null *initial-pprint-dispatch-table*) :type boolean :read-only t)
   ;; and the associated function
-  (fun (missing-arg) :type callable :read-only t))
+  (fun nil :type callable :read-only t))
 (def!method print-object ((entry pprint-dispatch-entry) stream)
   (print-unreadable-object (entry stream :type t)
     (format stream "type=~S, priority=~S~@[ [initial]~]"
@@ -897,7 +783,7 @@ line break."
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((orig (or table *initial-pprint-dispatch-table*))
          (new (make-pprint-dispatch-table
-               :entries (copy-list (pprint-dispatch-table-entries orig)))))
+               (copy-list (pprint-dispatch-table-entries orig)))))
     (replace/eql-hash-table (pprint-dispatch-table-cons-entries new)
                             (pprint-dispatch-table-cons-entries orig))
     new))
@@ -926,27 +812,6 @@ line break."
   (when (eq pprint-dispatch *standard-pprint-dispatch-table*)
     (cerror "Frob it anyway!" 'standard-pprint-dispatch-table-modified-error
             :operation operation)))
-
-;; Similar to (NOT CONTAINS-UNKNOWN-TYPE-P), but this is for when you
-;; want to pre-verify that TYPEP won't outright croak, given that you're
-;; going to call it really soon.
-;; Granted, certain checks could pass or fail by short-circuiting,
-;; such as (TYPEP 3 '(OR NUMBER (SATISFIES NO-SUCH-FUN))
-;; but this has to be maximally conservative.
-(defun testable-type-p (ctype)
-  (typecase ctype
-    (unknown-type nil) ; must precede HAIRY because an unknown is HAIRY
-    (hairy-type
-     (let ((spec (hairy-type-specifier ctype)))
-       ;; Anything other than (SATISFIES ...) is testable
-       ;; because there's no reason to suppose that it isn't.
-       (or (neq (car spec) 'satisfies) (fboundp (cadr spec)))))
-    (compound-type (every #'testable-type-p (compound-type-types ctype)))
-    (negation-type (testable-type-p (negation-type-type ctype)))
-    (cons-type (and (testable-type-p (cons-type-car-type ctype))
-                    (testable-type-p (cons-type-cdr-type ctype))))
-    (array-type (testable-type-p (array-type-element-type ctype)))
-    (t t)))
 
 (defun defer-type-checker (entry)
   (let ((saved-nonce sb!c::*type-cache-nonce*))
@@ -977,6 +842,7 @@ line break."
   (declare (type (or null callable) function)
            (type real priority)
            (type pprint-dispatch-table table))
+  (declare (explicit-check))
   (/show0 "entering SET-PPRINT-DISPATCH, TYPE=...")
   (/hexstr type)
   (assert-not-standard-pprint-dispatch-table table 'set-pprint-dispatch)
@@ -993,18 +859,12 @@ line break."
          (disabled-p (not (testable-type-p ctype)))
          (entry (if function
                     (make-pprint-dispatch-entry
-                     :type type
-                     :test-fn (unless (or consp disabled-p)
-                                (compute-test-fn ctype type function))
-                     :priority priority :fun function))))
+                     type priority function
+                     (unless (or consp disabled-p)
+                       (compute-test-fn ctype type function))))))
     (when (and function disabled-p)
       ;; a DISABLED-P test function has to close over the ENTRY
-      (setf (pprint-dispatch-entry-test-fn entry) (defer-type-checker entry))
-      (unless (unknown-type-p ctype) ; already warned in this case
-        ;; But (OR KNOWN UNKNOWN) did not signal - actually it is indeterminate
-        ;; - depending on whather it was cached. I think we should not cache
-        ;; any specifier that contains any unknown anywhere within it.
-        (warn "~S contains an unrecognized type specifier" type)))
+      (setf (pprint-dispatch-entry-test-fn entry) (defer-type-checker entry)))
     (if consp
         (let ((hashtable (pprint-dispatch-table-cons-entries table)))
           (dolist (key (member-type-members (cons-type-car-type ctype)))
@@ -1085,26 +945,31 @@ line break."
         (pprint-exit-if-list-exhausted)
         (unless first
           (write-char #\space stream))
-        (let ((arg (pprint-pop)))
-          (unless first
-            (case arg
-              (&optional
-               (setf state :optional)
-               (pprint-newline :linear stream))
-              ((&rest &body)
-               (setf state :required)
-               (pprint-newline :linear stream))
-              (&key
-               (setf state :key)
-               (pprint-newline :linear stream))
-              (&aux
-               (setf state :optional)
-               (pprint-newline :linear stream))
-              (t
-               (pprint-newline :fill stream))))
+       (let ((arg (pprint-pop)))
+          (case arg
+            ((&optional &aux)
+             (setf state :optional)
+             (pprint-newline :linear stream))
+            ((&rest &body)
+             (setf state :required)
+             (pprint-newline :linear stream))
+            (&key
+             (setf state :key)
+             (pprint-newline :linear stream))
+            (t
+             (pprint-newline :fill stream)))
           (ecase state
             (:required
-             (pprint-lambda-list stream arg))
+             ;; Make sure method specializers like
+             ;; (function (eql #'foo)) are printed right
+             (pprint-logical-block
+                 (stream arg :prefix "(" :suffix ")")
+               (pprint-exit-if-list-exhausted)
+               (loop
+                (output-object (pprint-pop) stream)
+                (pprint-exit-if-list-exhausted)
+                (write-char #\space stream)
+                (pprint-newline :linear stream))))
             ((:optional :key)
              (pprint-logical-block
                  (stream arg :prefix "(" :suffix ")")
@@ -1117,13 +982,13 @@ line break."
                      (pprint-exit-if-list-exhausted)
                      (write-char #\space stream)
                      (pprint-newline :fill stream)
-                     (pprint-lambda-list stream (pprint-pop))
+                     (output-object (pprint-pop) stream)
                      (loop
                        (pprint-exit-if-list-exhausted)
                        (write-char #\space stream)
                        (pprint-newline :fill stream)
                        (output-object (pprint-pop) stream)))
-                   (pprint-lambda-list stream (pprint-pop)))
+                   (output-object (pprint-pop) stream))
                (loop
                  (pprint-exit-if-list-exhausted)
                  (write-char #\space stream)
@@ -1437,27 +1302,17 @@ line break."
   (declare (ignore noise))
   (pprint-fill stream list))
 
-;;; Returns an Emacs-style indent spec: an integer N, meaning indent
-;;; the first N arguments specially then indent any further arguments
-;;; like a body.
+;;; Return the number of positional arguments that macro NAME accepts
+;;; by looking for &BODY. A dotted list is indented as it it had &BODY.
+;;; ANSI says that a dotted tail is like &REST, but the pretty-printer
+;;; can do whatever it likes anyway. I happen to think this makes sense.
 (defun macro-indentation (name)
-  (labels ((clean-arglist (arglist)
-             ;; FIXME: for purposes of introspection, we should never "leak"
-             ;; that a macro uses an &AUX variable, that it takes &WHOLE,
-             ;; or that it cares about its lexenv (though that's debatable).
-             ;; Certainly the first two aspects are not part of the macro's
-             ;; interface, and as such, should not be stored at all.
-             "Remove &whole, &enviroment, and &aux elements from ARGLIST."
-             (cond ((null arglist) '())
-                   ((member (car arglist) '(&whole &environment))
-                    (clean-arglist (cddr arglist)))
-                   ((eq (car arglist) '&aux)
-                    '())
-                   (t (cons (car arglist) (clean-arglist (cdr arglist)))))))
-    (let ((arglist (%fun-lambda-list (macro-function name))))
-      (if (proper-list-p arglist)       ; guard against dotted arglists
-          (position '&body (remove '&optional (clean-arglist arglist)))
-          nil))))
+  (do ((n 0)
+       (list (%fun-lambda-list (macro-function name)) (cdr list)))
+      ((or (atom list) (eq (car list) '&body))
+       (if (null list) nil n))
+    (unless (eq (car list) '&optional)
+      (incf n))))
 
 ;;; Pretty-Print macros by looking where &BODY appears in a macro's
 ;;; lambda-list.
@@ -1603,67 +1458,50 @@ line break."
   ;; it's used in WITH-STANDARD-IO-SYNTAX, and condition reportery
   ;; possibly performed in the following extent may use W-S-IO-SYNTAX.
   (setf *standard-pprint-dispatch-table* (make-pprint-dispatch-table))
-  (setf *initial-pprint-dispatch-table*  nil)
+  (setf *initial-pprint-dispatch-table* nil)
   (let ((*print-pprint-dispatch* (make-pprint-dispatch-table)))
     (/show0 "doing SET-PPRINT-DISPATCH for regular types")
-    (set-pprint-dispatch '(and array (not (or string bit-vector))) #'pprint-array)
+    (set-pprint-dispatch '(and array (not (or string bit-vector))) 'pprint-array)
     ;; MACRO-FUNCTION must have effectively higher priority than FBOUNDP.
     ;; The implementation happens to check identical priorities in the order added,
     ;; but that's unspecified behavior.  Both must be _strictly_ lower than the
     ;; default cons entries though.
     (set-pprint-dispatch '(cons (and symbol (satisfies macro-function)))
-                         #'pprint-macro-call -1)
+                         'pprint-macro-call -1)
     (set-pprint-dispatch '(cons (and symbol (satisfies fboundp)))
-                         #'pprint-fun-call -1)
+                         'pprint-fun-call -1)
     (set-pprint-dispatch '(cons symbol)
-                         #'pprint-data-list -2)
-    (set-pprint-dispatch 'cons #'pprint-fill -2)
-    (set-pprint-dispatch 'sb!impl::comma #'pprint-unquoting-comma -3)
+                         'pprint-data-list -2)
+    (set-pprint-dispatch 'cons 'pprint-fill -2)
+    (set-pprint-dispatch 'sb!impl::comma 'pprint-unquoting-comma -3)
     ;; cons cells with interesting things for the car
     (/show0 "doing SET-PPRINT-DISPATCH for CONS with interesting CAR")
 
     (dolist (magic-form '((lambda pprint-lambda)
-                          (declare pprint-declare)
+                          ((declare declaim) pprint-declare)
 
                           ;; special forms
-                          (block pprint-block)
-                          (catch pprint-block)
-                          (eval-when pprint-block)
-                          (flet pprint-flet)
-                          (function pprint-quote)
+                          ((block catch return-from throw eval-when
+                            multiple-value-call multiple-value-prog1
+                            unwind-protect) pprint-block)
+                          ((flet labels macrolet dx-flet) pprint-flet)
+                          ((function quasiquote quote) pprint-quote)
                           (if pprint-if)
-                          (labels pprint-flet)
-                          ((let let*) pprint-let)
-                          (locally pprint-progn)
-                          (macrolet pprint-flet)
-                          (multiple-value-call pprint-block)
-                          (multiple-value-prog1 pprint-block)
-                          (progn pprint-progn)
+                          ((let let* symbol-macrolet dx-let) pprint-let)
+                          ((locally progn) pprint-progn)
                           (progv pprint-progv)
-                          ((quasiquote quote) pprint-quote)
-                          (return-from pprint-block)
                           ((setq psetq setf psetf) pprint-setq)
-                          (symbol-macrolet pprint-let)
                           (tagbody pprint-tagbody)
-                          (throw pprint-block)
-                          (unwind-protect pprint-block)
 
                           ;; macros
                           ((case ccase ecase) pprint-case)
                           ((ctypecase etypecase typecase) pprint-typecase)
-                          (declaim pprint-declare)
-                          (defconstant pprint-block)
-                          (define-modify-macro pprint-defun)
-                          (define-setf-expander pprint-defun)
-                          (defmacro pprint-defun)
+                          ((defconstant defparameter defstruct defvar)
+                           pprint-block)
+                          ((define-modify-macro define-setf-expander
+                           defmacro defsetf deftype defun) pprint-defun)
                           (defmethod pprint-defmethod)
                           (defpackage pprint-defpackage)
-                          (defparameter pprint-block)
-                          (defsetf pprint-defun)
-                          (defstruct pprint-block)
-                          (deftype pprint-defun)
-                          (defun pprint-defun)
-                          (defvar pprint-block)
                           (destructuring-bind pprint-destructuring-bind)
                           ((do do*) pprint-do)
                           ((do-all-symbols do-external-symbols do-symbols
@@ -1671,39 +1509,25 @@ line break."
                           #+nil (handler-bind ...)
                           #+nil (handler-case ...)
                           (loop pprint-loop)
-                          (multiple-value-bind pprint-prog2)
-                          (multiple-value-setq pprint-block)
-                          (pprint-logical-block pprint-block)
-                          (print-unreadable-object pprint-block)
+                          ((multiple-value-bind prog2) pprint-prog2)
+                          ((multiple-value-setq prog1 pprint-logical-block
+                            print-unreadable-object prog1) pprint-block)
                           ((prog prog*) pprint-prog)
-                          (prog1 pprint-block)
-                          (prog2 pprint-prog2)
                           #+nil (restart-bind ...)
                           #+nil (restart-case ...)
-                          (step pprint-progn)
-                          (time pprint-progn)
+                          ((step time) pprint-progn)
                           ((unless when) pprint-block)
-                          (with-compilation-unit pprint-block)
                           #+nil (with-condition-restarts ...)
-                          (with-hash-table-iterator pprint-block)
-                          (with-input-from-string pprint-block)
-                          (with-open-file pprint-block)
-                          (with-open-stream pprint-block)
-                          (with-output-to-string pprint-block)
-                          (with-package-iterator pprint-block)
-                          (with-simple-restart pprint-block)
-                          (with-standard-io-syntax pprint-progn)
-
-                          ;; sbcl specific
-                          (sb!int:dx-flet pprint-flet)
-                          ))
+                          ((with-compilation-unit with-simple-restart
+                            with-hash-table-iterator with-package-iterator
+                            with-input-from-string with-output-to-string
+                            with-open-file with-open-stream) pprint-block)
+                          (with-standard-io-syntax pprint-progn)))
 
       ;; Grouping some symbols together in the above list looks pretty.
       ;; The sharing of dispatch entries is inconsequential.
-      (set-pprint-dispatch (let ((thing (first magic-form)))
-                             `(cons (member
-                                     ,@(if (consp thing) thing (list thing)))))
-                           (symbol-function (second magic-form))))
+      (set-pprint-dispatch `(cons (member ,@(ensure-list (first magic-form))))
+                           (second magic-form)))
     (setf *initial-pprint-dispatch-table* *print-pprint-dispatch*))
 
   (setf *standard-pprint-dispatch-table*

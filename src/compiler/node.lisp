@@ -20,6 +20,19 @@
 ;;; blocks -- with BLOCK-SUCC/BLOCK-PRED lists; data transfers are
 ;;; represented with LVARs.
 
+;;; FIXME: this file contains a ton of DEF!STRUCT definitions most of which
+;;; could be DEFSTRUCT, except for the fact that we use def!struct as
+;;; a workaround for the compiler's inability to cope with mutally referential
+;;; structures, even ones within the same file. The IR1 structures are tightly
+;;; knitted together - for example, starting from a CRETURN, you can reach
+;;; at least 15 other structure objects, not counting some like HASH-TABLE
+;;; which are fundamental. e.g. we have:
+;;;  CRETURN -> {NODE,CTRAN,CLAMBDA,LVAR}
+;;;  CTRAN -> {BLOCK},
+;;;  CLAMBDA -> {FUNCTIONAL,COMBINATION,BIND,PHYSENV,OPTIONAL-DISPATCH}
+;;; and so on.  DEF!STRUCT solves this problem by way of a terrible hack
+;;; that works only for compiling the compiler.
+
 ;;; "Lead-in" Control TRANsfer [to some node]
 (def!struct (ctran
              (:make-load-form-fun ignore-it)
@@ -85,6 +98,27 @@
   (print-unreadable-object (x stream :type t :identity t)
     (format stream "~D" (cont-num x))))
 
+#!-sb-fluid (declaim (inline lvar-has-single-use-p))
+(defun lvar-has-single-use-p (lvar)
+  (typep (lvar-uses lvar) '(not list)))
+
+;;; Return the unique node, delivering a value to LVAR.
+#!-sb-fluid (declaim (inline lvar-use))
+(defun lvar-use (lvar)
+  (the (not list) (lvar-uses lvar)))
+
+#!-sb-fluid (declaim (inline lvar-derived-type))
+(defun lvar-derived-type (lvar)
+  (declare (type lvar lvar))
+  (or (lvar-%derived-type lvar)
+      (setf (lvar-%derived-type lvar)
+            (%lvar-derived-type lvar))))
+
+#!-sb-fluid(declaim (inline flush-lvar-externally-checkable-type))
+(defun flush-lvar-externally-checkable-type (lvar)
+  (declare (type lvar lvar))
+  (setf (lvar-%externally-checkable-type lvar) nil))
+
 (def!struct (node (:constructor nil)
                   (:include sset-element (number (incf *compiler-sset-counter*)))
                   (:copier nil))
@@ -136,6 +170,11 @@
   ;; If the back-end breaks tail-recursion for some reason, then it
   ;; can null out this slot.
   (tail-p nil :type boolean))
+
+#!-sb-fluid (declaim (inline node-block))
+(defun node-block (node)
+  (ctran-block (node-prev node)))
+
 (defun %with-ir1-environment-from-node (node fun)
   (declare (type node node) (type function fun))
   (let ((*current-component* (node-component node))
@@ -153,6 +192,10 @@
   ;; Lvar, receiving the values, produced by this node. May be NIL if
   ;; the value is unused.
   (lvar nil :type (or lvar null)))
+
+#!-sb-fluid (declaim (inline node-dest))
+(defun node-dest (node)
+  (awhen (node-lvar node) (lvar-dest it)))
 
 ;;; Flags that are used to indicate various things about a block, such
 ;;; as what optimizations need to be done on it:
@@ -192,10 +235,10 @@
   (defattr block-type-asserted)
   (defattr block-test-modified))
 
-(defstruct (cloop (:conc-name loop-)
-                  (:predicate loop-p)
-                  (:constructor make-loop)
-                  (:copier copy-loop))
+(def!struct (cloop (:conc-name loop-)
+                   (:predicate loop-p)
+                   (:constructor make-loop)
+                   (:copier copy-loop))
   ;; The kind of loop that this is.  These values are legal:
   ;;
   ;;    :OUTER
@@ -334,6 +377,14 @@
 ;;;   size of flow analysis problems, this allows back-end data
 ;;;   structures to be reclaimed after the compilation of each
 ;;;   component.
+(locally
+  ;; This is really taking the low road. I couldn't think of a way to
+  ;; avoid a style warning regarding IR2-COMPONENT other than to declare
+  ;; the INFO slot as :type (or (satisfies ir2-component-p) ...)
+  ;; During make-host-2, the solution to this is the same hack
+  ;; as for everything else: use DEF!STRUCT for IR2-COMPONENT.
+  #!+(and (host-feature sb-xc-host) (host-feature sbcl))
+  (declare (sb-ext:muffle-conditions style-warning))
 (def!struct (component (:copier nil)
                        (:constructor
                         make-component
@@ -444,11 +495,19 @@
   ;; The default LOOP in the component.
   (outer-loop (missing-arg) :type cloop)
   ;; The current sset index
-  (sset-number 0 :type fixnum))
+  (sset-number 0 :type fixnum)))
 (defprinter (component :identity t)
   name
   #!+sb-show id
   (reanalyze :test reanalyze))
+
+(declaim (inline reoptimize-component))
+(defun reoptimize-component (component kind)
+  (declare (type component component)
+           (type (member nil :maybe t) kind))
+  (aver kind)
+  (unless (eq (component-reoptimize component) t)
+    (setf (component-reoptimize component) kind)))
 
 ;;; Check that COMPONENT is suitable for roles which involve adding
 ;;; new code. (gotta love imperative programming with lotso in-place
@@ -458,6 +517,7 @@
   ;; COMPILE-COMPONENT hasn't happened yet. Might it be even better
   ;; (certainly stricter, possibly also correct...) to assert that
   ;; IR1-FINALIZE hasn't happened yet?
+  #+sb-xc-host (declare (notinline component-info)) ; unknown type
   (aver (not (eql (component-info component) :dead))))
 
 ;;; A CLEANUP structure represents some dynamic binding action. Blocks
@@ -684,22 +744,6 @@
   (aver (leaf-has-source-name-p leaf))
   (leaf-%source-name leaf))
 
-;;; The CONSTANT structure is used to represent known constant values.
-;;; Since the same constant leaf may be shared between named and anonymous
-;;; constants, %SOURCE-NAME is never used.
-(def!struct (constant (:constructor make-constant (value
-                                                   &aux
-                                                   (type (ctype-of value))
-                                                   (%source-name '.anonymous.)
-                                                   (where-from :defined)))
-                      (:include leaf))
-  ;; the value of the constant
-  (value (missing-arg) :type t)
-  ;; Boxed TN for this constant, if any.
-  (boxed-tn nil :type (or null tn)))
-(defprinter (constant :identity t)
-  value)
-
 ;;; The BASIC-VAR structure represents information common to all
 ;;; variables which don't correspond to known local functions.
 (def!struct (basic-var (:include leaf)
@@ -720,10 +764,16 @@
   (defined-type :test (not (eq defined-type *universal-type*)))
   (where-from :test (not (eq where-from :assumed)))
   kind)
+
 (defun fun-locally-defined-p (name env)
-  (and env
-       (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
-         (and fun (not (global-var-p fun))))))
+  (typecase env
+    (null nil)
+    #!+(and sb-fasteval (host-feature sb-xc))
+    (sb!interpreter:basic-env
+     (values (sb!interpreter:find-lexical-fun env name)))
+    (t
+     (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
+       (and fun (not (global-var-p fun)))))))
 
 ;;; A DEFINED-FUN represents a function that is defined in the same
 ;;; compilation block, or that has an inline expansion, or that has a
@@ -1415,6 +1465,22 @@
   type-to-check
   vestigial-exit-lexenv
   vestigial-exit-entry-lexenv)
+
+;;; A cast that always follows %check-bound and they are deleted together.
+;;; Created via BOUND-CAST ir1-translator by chaining it together with %check-bound.
+;;; IR1-OPTIMIZE-CAST handles propagation from BOUND to CAST-ASSERTED-TYPE
+;;; DELETE-CAST deletes BOUND-CAST-CHECK
+;;; GENERATE-TYPE-CHECKS ignores it, it never translates to a type check,
+;;; %CHECK-BOUND does all the checking.
+(def!struct (bound-cast (:include cast (%type-check nil)))
+  ;; %check-bound combination before the cast
+  (check (missing-arg) :type (or null combination))
+  ;; Tells whether the type information is in a state where it can be
+  ;; optimized away, i.e. when BOUND is a constant.
+  (derived nil :type boolean)
+  (array (missing-arg) :type lvar)
+  (bound (missing-arg) :type lvar))
+
 
 ;;;; non-local exit support
 ;;;;
@@ -1462,16 +1528,30 @@
 ;;; but no, NIL was always an empty alist representing no qualities,
 ;;; which is a valid policy that makes each quality read as 1.
 ;;; In contrast, a LEXENV with NIL policy _does_ become *POLICY*.
+;;; The reason for NIL mapping to baseline is that all nodes are annotated
+;;; with a LEXENV, and the only object type that can be a LEXENV is LEXENV.
+;;; An indicator is needed that a LEXENV is devoid of a policy, so this is
+;;; what the NIL is for in lexenv-policy. But sometimes the compiler needs
+;;; a policy without reference to an IR object - which is weird - and in that
+;;; case it has nothing better to go with but the baseline policy.
+;;; It still seems like a bug though.
 (defun %coerce-to-policy (thing)
-  (cond ((policy-p thing) thing)
-        (thing (lexenv-policy (etypecase thing
-                                (lexenv thing)
-                                (node (node-lexenv thing))
-                                (functional (functional-lexenv thing)))))
-        (t **baseline-policy**)))
+  (typecase thing
+    (policy thing)
+    #!+(and sb-fasteval (host-feature sb-xc))
+    (sb!interpreter:basic-env (sb!interpreter:env-policy thing))
+    (null **baseline-policy**)
+    (t (lexenv-policy (etypecase thing
+                        (lexenv thing)
+                        (node (node-lexenv thing))
+                        (functional (functional-lexenv thing)))))))
 
 ;;;; Freeze some structure types to speed type testing.
 
+;; FIXME: the frozen-ness can't actually help optimize anything
+;; until this file is compiled by the cross-compiler.
+;; Anything compiled prior to then uses the non-frozen classoid as existed
+;; at load-time of the cross-compiler. SB!XC:PROCLAIM would likely work here.
 #!-sb-fluid
-(declaim (freeze-type node leaf lexenv ctran lvar cblock component cleanup
+(declaim (freeze-type node lexenv ctran lvar cblock component cleanup
                       physenv tail-set nlx-info))

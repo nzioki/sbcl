@@ -18,11 +18,12 @@
 ;;;; -- WHN 20000127
 
 (declaim (maybe-inline
-          tree-equal nth %setnth nthcdr make-list
+          tree-equal %setnth nthcdr
           tailp union
           nunion intersection nintersection set-difference nset-difference
           set-exclusive-or nset-exclusive-or subsetp acons
           subst subst-if
+          ;; NSUBLIS is >400 lines of assembly. How is it helpful to inline?
           subst-if-not nsubst nsubst-if nsubst-if-not sublis nsublis))
 
 ;;; These functions perform basic list operations.
@@ -333,6 +334,10 @@
 (defun make-list (size &key initial-element)
   #!+sb-doc
   "Constructs a list with size elements each set to value"
+  (%make-list size initial-element))
+;;; This entry point is to be preferred, irrespective of
+;;; whether or not the backend has vops for %MAKE-LIST.
+(defun %make-list (size initial-element)
   (declare (type index size))
   (do ((count size (1- count))
        (result '() (cons initial-element result)))
@@ -1255,9 +1260,16 @@
       (setf (car l) (cdar l)))
     (setq res (apply fun args))
     (case accumulate
-      (:nconc (when res
-                (setf (cdr temp) res
-                      temp (last res))))
+      (:nconc
+       (when res
+         (setf (cdr temp) res)
+         ;; KLUDGE: it is said that MAPCON is equivalent to
+         ;; (apply #'nconc (maplist ...)) which means (nconc 1) would
+         ;; return 1, but (nconc 1 1) should signal an error.
+         ;; The transformed MAP code returns the last result, do that
+         ;; here as well for consistency and simplicity.
+         (when (consp res)
+           (setf temp (last res)))))
       (:list (setf (cdr temp) (list res)
                    temp (cdr temp))))))
 
@@ -1357,6 +1369,7 @@
                      (declare (optimize speed (sb!c::verify-arg-count 0)))
                      ,@(when funs `((declare (function ,@funs))))
                      ,@(unless (member name '(member assoc adjoin rassoc)) `((declare (function x))))
+                     (declare (explicit-check))
                      ,body))))
          `(progn
             ,(%def 'adjoin)

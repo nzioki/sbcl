@@ -23,33 +23,11 @@
 
 ;;;; package hacking
 
-;;; Our cross-compilation host is out of the picture now, so we no
-;;; longer need to worry about collisions between our package names
-;;; and cross-compilation host package names, so now is a good time to
-;;; rename any package with a bootstrap-only name SB!FOO to its
-;;; permanent name SB-FOO.
-;;;
-;;; (In principle it might be tidier to do this when dumping the cold
-;;; image in genesis, but in practice the logic might be a little
-;;; messier because genesis dumps both symbols and packages, and we'd
-;;; need to make sure that dumped symbols were renamed in the same way
-;;; as dumped packages. Or we could do it in cold init, but it's
-;;; easier to experiment with and debug things here in warm init than
-;;; in cold init, so we do it here instead.)
-(let ((boot-prefix "SB!")
-      (perm-prefix "SB-"))
-  (dolist (package (list-all-packages))
-    (let ((old-package-name (package-name package)))
-      (when (and (>= (length old-package-name) (length boot-prefix))
-                 (string= boot-prefix old-package-name
-                          :end2 (length boot-prefix)))
-        (let ((new-package-name (concatenate 'string
-                                             perm-prefix
-                                             (subseq old-package-name
-                                                     (length boot-prefix)))))
-          (rename-package package
-                          new-package-name
-                          (package-nicknames package)))))))
+;;; Assert that genesis preserves shadowing symbols.
+(let ((p sb-assem::*backend-instruction-set-package*))
+  (unless (eq p (find-package "SB-VM"))
+    (dolist (expect '("SEGMENT" "MAKE-SEGMENT"))
+      (assert (find expect (package-shadowing-symbols p) :test 'string=)))))
 
 ;;; FIXME: This nickname is a deprecated hack for backwards
 ;;; compatibility with code which assumed the CMU-CL-style
@@ -105,10 +83,10 @@
                 ;; order dependencies from the old PCL defsys.lisp
                 ;; dependency database.
                 #+nil "src/pcl/walk" ; #+NIL = moved to build-order.lisp-expr
-                "SRC;PCL;EARLY-LOW"
+                #+nil "SRC;PCL;EARLY-LOW"
                 "SRC;PCL;MACROS"
                 "SRC;PCL;COMPILER-SUPPORT"
-                "SRC;PCL;LOW"
+                #+nil "SRC;PCL;LOW"
                 #+nil "SRC;PCL;SLOT-NAME" ; moved to build-order.lisp-expr
                 "SRC;PCL;DEFCLASS"
                 "SRC;PCL;DEFS"
@@ -157,6 +135,15 @@
                 ;; to warm init to reduce peak memory requirement in
                 ;; cold init
                 "SRC;CODE;DESCRIBE"
+
+                #+sb-fasteval "SRC;INTERPRETER;MACROS"
+                #+sb-fasteval "SRC;INTERPRETER;CHECKFUNS"
+                #+sb-fasteval "SRC;INTERPRETER;ENV"
+                #+sb-fasteval "SRC;INTERPRETER;SEXPR"
+                #+sb-fasteval "SRC;INTERPRETER;SPECIAL-FORMS"
+                #+sb-fasteval "SRC;INTERPRETER;EVAL"
+                #+sb-fasteval "SRC;INTERPRETER;DEBUG"
+
                 "SRC;CODE;DESCRIBE-POLICY"
                 "SRC;CODE;INSPECT"
                 "SRC;CODE;PROFILE"
@@ -230,6 +217,10 @@
                             (print-unreadable-object (obj stream :type t)
                               (write (sb-kernel:classoid-name obj) :stream stream))))
      (set-pprint-dispatch
+      'sb-kernel:ctype (lambda (stream obj)
+                         (print-unreadable-object (obj stream :type t)
+                           (prin1 (sb-kernel:type-specifier obj) stream))))
+     (set-pprint-dispatch
       'package (lambda (stream obj)
                  (print-unreadable-object (obj stream :type t)
                    (write (package-name obj) :stream stream))))
@@ -245,6 +236,24 @@
       'restart (lambda (stream obj)
                  (print-unreadable-object (obj stream :type t :identity t)
                    (write (restart-name obj) :stream stream))))
+     ;; These next two are coded in a totally brittle way, but no more wrong
+     ;; than typing the decoding expressions into the debugger to decipher
+     ;; a backtrace. Anyway, if it ceases to print right, just fix it again!
+     (set-pprint-dispatch
+      ;; Circumlocution avoids use of unknown type.
+      '(and function (satisfies sb-pcl::generic-function-p))
+      (lambda (stream obj)
+        (format stream "<~S ~S>" (type-of obj)
+                (svref (sb-kernel:%funcallable-instance-info obj 1) 5))))
+     ;; dangerous: this type doesn't exist, and the testable-type-p thing
+     ;; isn't working the way it should. It's supposed to enable the ppd entry
+     ;; as soon as CLASS becomes defined, but instead it goes bonkers.
+     #+nil
+     (set-pprint-dispatch
+      'class
+      (lambda (stream obj)
+        (format stream "<~S ~S>" (type-of obj)
+                (svref (sb-kernel:%instance-ref obj 1) 3))))
      (with-compilation-unit ()
        (let ((*compile-print* nil))
          (do-srcs pcl-srcs)))

@@ -37,16 +37,16 @@
 
            simple-array-unsigned-byte-31-p
            simple-array-unsigned-byte-32-p
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            simple-array-unsigned-byte-63-p
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            simple-array-unsigned-byte-64-p
            simple-array-signed-byte-8-p simple-array-signed-byte-16-p
 
            simple-array-fixnum-p
 
            simple-array-signed-byte-32-p
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            simple-array-signed-byte-64-p
            simple-array-single-float-p simple-array-double-float-p
            #!+long-float simple-array-long-float-p
@@ -55,13 +55,13 @@
            #!+long-float simple-array-complex-long-float-p
            simple-rank-1-array-*-p
            system-area-pointer-p realp
-           ;; #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+           ;; #!-64-bit
            unsigned-byte-32-p
-           ;; #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+           ;; #!-64-bit
            signed-byte-32-p
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            unsigned-byte-64-p
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            signed-byte-64-p
            weak-pointer-p code-component-p lra-p
            simple-fun-p
@@ -148,12 +148,16 @@
   ())
 (defknown %instance-length (instance) index
   (foldable flushable))
+(defknown %instance-cas (instance index t t) t ())
 (defknown %instance-ref (instance index) t
   (flushable always-translatable))
 (defknown %instance-set (instance index t) t
   (always-translatable))
 (defknown %layout-invalid-error (t layout) nil)
 
+#!+(or x86 x86-64)
+(defknown %raw-instance-cas/word (instance index sb!vm:word sb!vm:word)
+  sb!vm:word ())
 (defknown %raw-instance-ref/word (instance index) sb!vm:word
   (flushable always-translatable))
 (defknown %raw-instance-set/word (instance index sb!vm:word) sb!vm:word
@@ -181,10 +185,10 @@
   (complex double-float)
   (always-translatable))
 
-#!+(or x86 x86-64 ppc)
+#!+compare-and-swap-vops
 (defknown %raw-instance-atomic-incf/word (instance index sb!vm:word) sb!vm:word
     (always-translatable))
-#!+(or x86 x86-64 ppc)
+#!+compare-and-swap-vops
 (defknown %array-atomic-incf/word (t index sb!vm:word) sb!vm:word
   (always-translatable))
 

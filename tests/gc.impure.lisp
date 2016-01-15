@@ -22,7 +22,7 @@
                                   :dynamic '*posix-argv*)
   (let ((v (sb-kernel:symbol-info 'satisfies)) referers)
     (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
-                                    :dynamic v)
+                                    #+gencgc :dynamic #-gencgc :static v)
     (assert (member 'satisfies referers))))
 
 (defparameter *x* ())
@@ -116,7 +116,7 @@
                  (storage-condition ()
                    :oom))))))
 
-(with-test (:name :gc-logfile)
+(with-test (:name :gc-logfile :skipped-on '(not :gencgc))
   (assert (not (gc-logfile)))
   (let ((p #p"gc.log"))
     (assert (not (probe-file p)))

@@ -51,14 +51,11 @@
 
        (let (x) (locally (declare (special x))) ...)
 "
+  (setq env (copy-structure (sb-c::coerce-to-lexenv env)))
   (collect ((lvars)
             (clambdas))
     (unless (or variable symbol-macro function macro declare)
       (return-from augment-environment env))
-
-    (if (null env)
-        (setq env (make-null-lexenv))
-        (setq env (copy-structure env)))
 
     ;; a null policy is used to identify a null lexenv
     (when (sb-c::null-lexenv-p env)
@@ -172,7 +169,7 @@
     `(when ,test
        (list (cons ,car ,cdr)))))
 
-(declaim (ftype (sfunction ((or symbol cons) &optional (or null lexenv))
+(declaim (ftype (sfunction ((or symbol cons) &optional lexenv-designator)
                            (values (member nil :function :macro :special-form)
                                    boolean
                                    list))
@@ -245,7 +242,12 @@ CARS of the alist include:
 
 In addition to these declarations defined using DEFINE-DECLARATION may
 appear."
-  (let* ((*lexenv* (or env (make-null-lexenv)))
+  (let* ((*lexenv*
+           (typecase env
+             #+sb-fasteval
+             (sb-interpreter:basic-env (sb-interpreter::lexenv-from-env env))
+             (null (make-null-lexenv))
+             (t env)))
          (fun (lexenv-find name funs))
          binding localp ftype dx inlinep)
     (etypecase fun
@@ -267,6 +269,8 @@ appear."
        (setf binding :macro
              localp t))
       (null
+       ;; FIXME: we document above that :MACRO trumps :SPECIAL-FORM
+       ;; but that is clearly untrue.
        (case (info :function :kind name)
          (:macro
           (setf binding :macro
@@ -278,7 +282,7 @@ appear."
           (setf binding :function
                 localp nil
                 ftype (when (eq :declared (info :function :where-from name))
-                        (info :function :type name))
+                        (proclaimed-ftype name))
                 inlinep (info :function :inlinep name))))))
     (values binding
             localp
@@ -291,12 +295,14 @@ appear."
                    (list-cons-when (and ftype (neq *universal-fun-type* ftype))
                      'ftype (type-specifier ftype))
                    (list-cons-when dx 'dynamic-extent t)
+                   ;; FIXME: a local name shadowing a deprecated global
+                   ;; wrongly returns deprecation info.
                    (maybe-deprecation-entry
                     (info :function :deprecated name))
                    (extra-pairs :function name fun *lexenv*)))))
 
 (declaim (ftype (sfunction
-                 (symbol &optional (or null lexenv))
+                 (symbol &optional lexenv-designator)
                  (values (member nil :special :lexical :symbol-macro :constant :global :alien)
                          boolean
                          list))
@@ -384,7 +390,7 @@ CARS of the alist include:
 
 In addition to these declarations defined using DEFINE-DECLARATION may
 appear."
-  (let* ((*lexenv* (or env (make-null-lexenv)))
+  (let* ((*lexenv* (sb-c::coerce-to-lexenv env))
          (kind (info :variable :kind name))
          (var (lexenv-find name vars))
          binding localp dx ignorep type)
@@ -436,7 +442,28 @@ appear."
                     (info :variable :deprecated name))
                    (extra-pairs :variable name var *lexenv*)))))
 
-(declaim (ftype (sfunction (symbol &optional (or null lexenv)) t)
+;;; Unlike policy-related declarations which the interpeter itself needs
+;;; for correct operation of some macros, muffled conditions are irrelevant,
+;;; since warnings are not signaled much, if at all.
+;;; This is even more useless than env-package-locks.
+;;; It's only for SB-CLTL2, and not tested in the least.
+#+sb-fasteval
+(defun compute-handled-conditions (env)
+  (named-let recurse ((env env))
+    (let ((result (acond ((sb-interpreter::env-parent env)
+                          (compute-handled-conditions it))
+                         (t sb-c::*handled-conditions*))))
+      (sb-interpreter::do-decl-spec
+          (declaration (sb-interpreter::env-declarations env) result)
+        (let ((f (case (car declaration)
+                  (sb-ext:muffle-conditions
+                    #'sb-c::process-muffle-conditions-decl)
+                  (sb-ext:unmuffle-conditions
+                   #'sb-c::process-unmuffle-conditions-decl))))
+          (when f
+            (setq result (funcall f declaration result))))))))
+
+(declaim (ftype (sfunction (symbol &optional lexenv-designator) t)
                 declaration-information))
 (defun declaration-information (declaration-name &optional env)
   "Return information about declarations named by DECLARATION-NAME.
@@ -458,14 +485,29 @@ the condition types that have been muffled."
        ;; CLtL2-mandated behavior:
        ;; "The returned list always contains an entry for each of the standard
        ;; qualities and for each of the implementation-specific qualities"
-       (sb-c::policy-to-decl-spec (sb-c::lexenv-policy env) nil t))
+       (sb-c::policy-to-decl-spec
+        (typecase env
+          #+sb-fasteval
+          (sb-interpreter:basic-env (sb-interpreter:env-policy env))
+          (t (sb-c::lexenv-policy env)))
+        nil t))
       (sb-ext:muffle-conditions
-       (car (rassoc 'muffle-warning
-                    (sb-c::lexenv-handled-conditions env))))
+       (let ((handled-conditions
+              (typecase env
+                #+sb-fasteval
+                (sb-interpreter:basic-env (compute-handled-conditions env))
+                (t (sb-c::lexenv-handled-conditions env)))))
+         (sb-int:awhen (car (rassoc 'muffle-warning handled-conditions))
+           (sb-kernel:type-specifier it))))
       (declaration
        (copy-list sb-c::*recognized-declarations*))
       (t (if (info :declaration :handler declaration-name)
-             (extra-decl-info declaration-name env)
+             (extra-decl-info
+              declaration-name
+              (typecase env
+                #+sb-fasteval
+                (sb-interpreter:basic-env (sb-interpreter::lexenv-from-env env))
+                (t env)))
              (error "Unsupported declaration ~S." declaration-name))))))
 
 

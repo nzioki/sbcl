@@ -575,6 +575,11 @@
  (subtypep '(and function (not compiled-function)
              (not sb-eval:interpreted-function))
            nil))
+#+sb-fasteval
+(assert-t-t
+ (subtypep '(and function (not compiled-function)
+             (not sb-interpreter:interpreted-function))
+           nil))
 
 ;;; weakening of union type checks
 (defun weaken-union-1 (x)
@@ -993,5 +998,11 @@
       (try `(array ,spec (*)))
       (try `(simple-array ,spec (*)))
       (try `(and (not simple-array) (array ,spec (*)))))))
+
+;; The expansion of FRUITBAT is a class itself, not its name.
+(deftype fruitbat () (find-class 'hash-table))
+(with-test (:name :typexpand-into-classoid)
+  (assert (eq (sb-kernel:specifier-type 'fruitbat)
+              (sb-kernel:find-classoid 'hash-table))))
 
 ;;; success

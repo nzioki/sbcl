@@ -340,6 +340,28 @@ Examples:
         (malloc-error bytes (get-errno))
         sap)))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *saved-fp-and-pcs* nil)
+  ;; Can't use DECLAIM since always-bound is a non-standard declaration
+  (sb!xc:proclaim '(sb!ext:always-bound *saved-fp-and-pcs*)))
+
+#!+c-stack-is-control-stack
+(declaim (inline invoke-with-saved-fp-and-pc))
+;;; On :c-stack-is-control-stack platforms, this DEFUN must appear prior to the
+;;; first cross-compile-time use of ALIEN-FUNCALL, the transform of which is
+;;; an invocation of INVOKE-WITH-SAVED-FP-AND-PC, which should be inlined.
+;;; Makes no sense when compiling for the host.
+#!+(and c-stack-is-control-stack (host-feature sb-xc))
+(defun invoke-with-saved-fp-and-pc (fn)
+  (declare #-sb-xc-host (muffle-conditions compiler-note)
+           (optimize (speed 3)))
+  (dx-let ((fp-and-pc (make-array 2 :element-type 'word)))
+    (setf (aref fp-and-pc 0) (sb!kernel:get-lisp-obj-address
+                              (sb!kernel:%caller-frame))
+          (aref fp-and-pc 1) (sap-int (sb!kernel:%caller-pc)))
+    (dx-let ((*saved-fp-and-pcs* (cons fp-and-pc *saved-fp-and-pcs*)))
+      (funcall fn))))
+
 #!-sb-fluid (declaim (inline free-alien))
 (defun free-alien (alien)
   #!+sb-doc
@@ -938,10 +960,20 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
              ,(loop
                  with offset = 0
                  for spec in argument-specs
+                 ;; KLUDGE: At least one platform requires additional
+                 ;; alignment beyond a single machine word for certain
+                 ;; arguments.  Accept an additional delta (for the
+                 ;; alignment) to apply to subsequent arguments to
+                 ;; account for the alignment gaps as a secondary
+                 ;; value, so that we don't have to update unaffected
+                 ;; backends.
+                 for (accessor-form alignment)
+                   = (multiple-value-list
+                      (alien-callback-accessor-form spec 'args-sap offset))
                  collect `(,(pop argument-names) ,spec
-                            :local ,(alien-callback-accessor-form
-                                     spec 'args-sap offset))
-                 do (incf offset (alien-callback-argument-bytes spec env)))
+                            :local ,accessor-form)
+                 do (incf offset (+ (alien-callback-argument-bytes spec env)
+                                    (or alignment 0))))
            ,(flet ((store (spec real-type)
                           (if spec
                               `(setf (deref (sap-alien res-sap (* ,spec)))

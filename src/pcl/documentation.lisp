@@ -6,6 +6,45 @@
 ;;;; This software is in the public domain and is provided with absolutely no
 ;;;; warranty. See the COPYING and CREDITS files for more information.
 
+(in-package "SB-C") ; FIXME: not the best package for FDOCUMENTATION
+
+;;; FDOCUMENTATION refers to STRUCTURE-CLASS which has only a skeletal
+;;; representation during cross-compilation. Better to define this late.
+(defun fdocumentation (x doc-type)
+  (case doc-type
+    (variable
+     (typecase x
+       (symbol (values (info :variable :documentation x)))))
+    ;; FUNCTION is not used at the momemnt, just here for symmetry.
+    (function
+     (cond ((functionp x)
+            (%fun-doc x))
+           ((and (legal-fun-name-p x) (fboundp x))
+            (%fun-doc (or (and (symbolp x) (macro-function x))
+                          (fdefinition x))))))
+    (structure
+     (typecase x
+       (symbol (cond
+                 ((eq (info :type :kind x) :instance)
+                  (values (info :type :documentation x)))
+                 ((info :typed-structure :info x)
+                  (values (info :typed-structure :documentation x)))))))
+    (type
+     (typecase x
+       (structure-class (values (info :type :documentation (class-name x))))
+       (t (and (typep x 'symbol) (values (info :type :documentation x))))))
+    (setf (values (info :setf :documentation x)))
+    ((t)
+     (typecase x
+       (function (%fun-doc x))
+       (package (package-doc-string x))
+       (structure-class (values (info :type :documentation (class-name x))))
+       ((or symbol cons)
+        (random-documentation x doc-type))))
+    (t
+     (when (typep x '(or symbol cons))
+       (random-documentation x doc-type)))))
+
 (in-package "SB-PCL")
 
 (defun fun-doc (x)
@@ -45,7 +84,7 @@
          (fun-name (fdefinition name)))))
 
 (defun ignore-nil-doc (type)
-  (style-warn "Ignoring documentation of type ~a for ~a."
+  (style-warn "Ignoring doc-type ~a for ~a."
               type nil))
 
 (defun set-function-name-documentation (name documentation)
@@ -318,7 +357,7 @@
 
 ;;; default if DOC-TYPE doesn't match one of the specified types
 (defmethod documentation (object doc-type)
-  (warn "unsupported DOCUMENTATION: type ~S for object of type ~S"
+  (warn "unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
         doc-type
         (type-of object))
   nil)
@@ -328,7 +367,7 @@
   ;; CMU CL made this an error, but since ANSI says that even for supported
   ;; doc types an implementation is permitted to discard docs at any time
   ;; for any reason, this feels to me more like a warning. -- WHN 19991214
-  (warn "discarding unsupported DOCUMENTATION of type ~S for object ~S"
+  (warn "discarding unsupported DOCUMENTATION: doc-type ~S for object of type ~S"
         doc-type
         (type-of object))
   new-value)

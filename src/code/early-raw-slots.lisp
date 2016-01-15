@@ -9,10 +9,6 @@
 
 (in-package "SB!KERNEL")
 
-;;; This file has to be loaded during cold-init as early as you'd like to
-;;; have any defstructs that use raw slots.  %COMPILER-DEFSTRUCT needs the
-;;; raw-slot-data-list both at compile-time and load-time.
-
 ;;; STRUCTURE-OBJECT supports two different strategies to place raw slots
 ;;; (containing "just bits", not Lisp descriptors) within it in a way
 ;;; that GC has knowledge of. No backend supports both strategies though.
@@ -79,8 +75,6 @@
 ;;; For example COMPLEX-DOUBLE-FLOAT *should* be aligned to twice the
 ;;; alignment of a DOUBLE-FLOAT. It is not, as things stand,
 ;;; but this is considered a minor bug.
-;;; Interleaving is supported only on x86-64, but porting should be
-;;; straightforward, because if anything the VOPs become simpler.
 
 ;; To utilize a word-sized slot in a defstruct without having to resort to
 ;; writing (myslot :type (unsigned-byte #.sb!vm:n-word-bits)), or even
@@ -108,12 +102,8 @@
 (defstruct (raw-slot-data
             (:copier nil)
             (:predicate nil))
-  ;; the raw slot type, or T for a non-raw slot
-  ;;
-  ;; (Non-raw slots are in the ordinary place you'd expect, directly
-  ;; indexed off the instance pointer.  Raw slots are indexed from the end
-  ;; of the instance and skipped by GC.)
-  (raw-type (missing-arg) :type (or symbol cons) :read-only t)
+  ;; the type specifier, which must specify a numeric type.
+  (raw-type (missing-arg) :type symbol :read-only t)
   ;; What operator is used to access a slot of this type?
   (accessor-name (missing-arg) :type symbol :read-only t)
   (init-vop (missing-arg) :type symbol :read-only t)
@@ -129,7 +119,9 @@
 
 ;; Simulate DEFINE-LOAD-TIME-GLOBAL - always bound in the image
 ;; but not eval'd in the compiler.
-(defglobal *raw-slot-data-list* nil)
+(defglobal *raw-slot-data* nil)
+;; By making this a cold-init function, it is possible to use raw slots
+;; in cold toplevel forms.
 (defun !raw-slot-data-init ()
   (macrolet ((make-comparer (accessor-name)
                #+sb-xc-host
@@ -145,11 +137,11 @@
                      (,accessor-name y index)))))
     (let ((double-float-alignment
             ;; white list of architectures that can load unaligned doubles:
-            #!+(or x86 x86-64 ppc) 1
+            #!+(or x86 x86-64 ppc arm64) 1
             ;; at least sparc, mips and alpha can't:
-            #!-(or x86 x86-64 ppc) 2))
-     (setq *raw-slot-data-list*
-      (list
+            #!-(or x86 x86-64 ppc arm64) 2))
+     (setq *raw-slot-data*
+      (vector
        (make-raw-slot-data :raw-type 'sb!vm:word
                            :accessor-name '%raw-instance-ref/word
                            :init-vop 'sb!vm::raw-instance-init/word
@@ -201,14 +193,8 @@
                            :comparer (make-comparer %raw-instance-ref/complex-long)))))))
 
 #+sb-xc-host (!raw-slot-data-init)
-
-(declaim (ftype (sfunction (symbol) raw-slot-data) raw-slot-data-or-lose))
-(defun raw-slot-data-or-lose (type)
-  (or (car (member type *raw-slot-data-list* :key #'raw-slot-data-raw-type))
-      (error "Invalid raw slot type: ~S" type)))
-
-(defun raw-slot-words (type)
-  (raw-slot-data-n-words (raw-slot-data-or-lose type)))
+#+sb-xc
+(declaim (type (simple-vector #.(length *raw-slot-data*)) *raw-slot-data*))
 
 ;; DO-INSTANCE-TAGGED-SLOT iterates over the manifest slots of THING
 ;; that contain tagged objects. (The LAYOUT does not count as a manifest slot).

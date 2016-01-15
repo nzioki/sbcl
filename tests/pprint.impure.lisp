@@ -252,15 +252,21 @@
          (sb-int:standard-pprint-dispatch-table-modified-error ()
            :error)))))
 
+(defun pprint-to-string (form)
+  (let ((string (with-output-to-string (s) (pprint form s))))
+    (assert (eql #\newline (char string 0)))
+    (subseq string 1)))
 (with-test (:name :pprint-defmethod-lambda-list-function)
-  (flet ((to-string (form)
-           (let ((string (with-output-to-string (s) (pprint form s))))
-             (assert (eql #\newline (char string 0)))
-             (subseq string 1))))
-    (assert (equal "(DEFMETHOD FOO ((FUNCTION CONS)) FUNCTION)"
-                   (to-string `(defmethod foo ((function cons)) function))))
-    (assert (equal "(DEFMETHOD FOO :AFTER (FUNCTION CONS) FUNCTION)"
-                   (to-string `(defmethod foo :after (function cons) function))))))
+  (assert (equal "(DEFMETHOD FOO ((FUNCTION CONS)) FUNCTION)"
+                 (pprint-to-string `(defmethod foo ((function cons)) function))))
+  (assert (equal "(DEFMETHOD FOO :AFTER (FUNCTION CONS) FUNCTION)"
+                 (pprint-to-string `(defmethod foo :after (function cons) function))))
+  (assert (equal "(DEFMETHOD FOO :BEFORE ((FUNCTION (EQL #'FOO))) FUNCTION)"
+                 (pprint-to-string `(DEFMETHOD FOO :BEFORE ((FUNCTION (EQL #'FOO))) FUNCTION)))))
+
+(with-test (:name :pprint-lambda-list-quote)
+  (assert (equal "(LAMBDA (&KEY (BAR 'BAZ)))"
+                 (pprint-to-string '(lambda (&key (bar 'baz)))))))
 
 (defclass frob () ())
 
@@ -275,14 +281,15 @@
                        (*print-pretty* t))
                    (format nil "~@<~S~:>" (make-instance 'frob))))))
 
-(with-test (:name :pprint-logical-block-code-deletion-node)
+(with-test (:name :pprint-logical-block-code-deletion-node
+                  :skipped-on '(not :stack-allocatable-closures))
   (handler-case
       (compile nil
                `(lambda (words &key a b c)
                   (pprint-logical-block (nil words :per-line-prefix (or a b c))
                     (pprint-fill *standard-output* (sort (copy-seq words) #'string<) nil))))
     ((or sb-ext:compiler-note warning) (c)
-      (error c))))
+      (error "~A" c))))
 
 (with-test (:name :pprint-logical-block-multiple-per-line-prefix-eval)
   (funcall (compile nil
@@ -358,7 +365,7 @@
      (set-pprint-dispatch '(or weasel (and woodle (satisfies thing)))
                           (lambda (stream obj)
                             (format stream "hi ~A!" (type-of obj))))
-     warning 3)
+     warning 2)
     (write-to-string (macroexpand '(setf (values a b) (floor x y)))
                      :pretty t)
     ;; yay, we're not dead
@@ -412,12 +419,28 @@
 (let ((x 3)) (defmacro macdaddy (a b &body z) a b z `(who-cares ,x)) (incf x))
 
 (with-test (:name :closure-macro-arglist)
-  ;; assert correct test setup - MACDADDY is a closure
+  ;; assert correct test setup - MACDADDY is a closure if compiling,
+  ;; or a funcallable-instance if not
   (assert (eq (sb-kernel:fun-subtype (macro-function 'macdaddy))
-              sb-vm:closure-header-widetag))
+              #-interpreter sb-vm:closure-header-widetag
+              #+interpreter sb-vm:funcallable-instance-header-widetag))
   ;; MACRO-INDENTATION used %simple-fun-arglist instead of %fun-arglist.
   ;; Depending on your luck it would either not return the right answer,
   ;; or crash, depending on what lay at 4 words past the function address.
   (assert (= (sb-pretty::macro-indentation 'macdaddy) 2)))
+
+(defmacro try1 (a b &body fool) `(baz ,a ,b ,fool))
+(defmacro try2 (a b &optional &body fool) `(baz ,a ,b ,fool))
+(defmacro try3 (a b &optional c &body fool) `(baz ,a ,b ,c ,fool))
+(defmacro try4 (a b . fool) `(baz ,a ,b ,fool))
+(defmacro try5 (a b &optional . fool) `(baz ,a ,b ,fool))
+(defmacro try6 (a b &optional c . fool) `(baz ,a ,b ,c ,fool))
+(with-test (:name :macro-indentation)
+  (assert (= (sb-pretty::macro-indentation 'try1) 2))
+  (assert (= (sb-pretty::macro-indentation 'try2) 2))
+  (assert (= (sb-pretty::macro-indentation 'try3) 3))
+  (assert (= (sb-pretty::macro-indentation 'try4) 2))
+  (assert (= (sb-pretty::macro-indentation 'try5) 2))
+  (assert (= (sb-pretty::macro-indentation 'try6) 3)))
 
 ;;; success

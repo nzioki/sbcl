@@ -55,6 +55,7 @@
 (sb!xc:defstruct (package
                   (:constructor %make-package
                                 (%name internal-symbols external-symbols))
+                  (:copier nil)
                   (:predicate packagep))
   #!+sb-doc
   "the standard structure for the description of a package"
@@ -100,8 +101,7 @@
 ;;;; iteration macros
 
 (flet ((expand-iterator (range var body result-form)
-         (multiple-value-bind (forms decls)
-             (parse-body body :doc-string-allowed nil)
+         (multiple-value-bind (forms decls) (parse-body body nil)
            (with-unique-names (iterator winp next)
              `(block nil
                 (with-package-iterator (,iterator ,@range)
