@@ -23,8 +23,6 @@
             sb!vm::frame-byte-offset
             sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
 
-(!begin-instruction-definitions)
-
 ;;; Note: In CMU CL, this used to be a call to SET-DISASSEM-PARAMS.
 (setf *disassem-inst-alignment-bytes* 1)
 
@@ -40,18 +38,13 @@
 
 ;;; Default word size for the chip: if the operand size /= :dword
 ;;; we need to output #x66 (or REX) prefix
-(def!constant +default-operand-size+ :dword)
+(defconstant +default-operand-size+ :dword)
 
 ;;; The default address size for the chip. It could be overwritten
 ;;; to :dword with a #x67 prefix, but this is never needed by SBCL
 ;;; and thus not supported by this assembler/disassembler.
-(def!constant +default-address-size+ :qword)
+(defconstant +default-address-size+ :qword)
 
-(defun offset-next (value dstate)
-  (declare (type integer value)
-           (type disassem-state dstate))
-  (+ (dstate-next-addr dstate) value))
-
 (defparameter *byte-reg-names*
   #(al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b))
 (defparameter *high-byte-reg-names*
@@ -78,14 +71,23 @@
 ;;; REX-R            A REX prefix with the "register" bit set was found
 ;;; REX-X            A REX prefix with the "index" bit set was found
 ;;; REX-B            A REX prefix with the "base" bit set was found
+(defconstant +operand-size-8+  #b1000000)
+(defconstant +operand-size-16+ #b0100000)
+(defconstant +rex+             #b0010000)
+;;; The next 4 exactly correspond to the bits in the REX prefix itself,
+;;; to avoid unpacking and stuffing into inst-properties one at a time.
+(defconstant +rex-w+           #b0001000)
+(defconstant +rex-r+           #b0000100)
+(defconstant +rex-x+           #b0000010)
+(defconstant +rex-b+           #b0000001)
 
 ;;; Return the operand size depending on the prefixes and width bit as
 ;;; stored in DSTATE.
 (defun inst-operand-size (dstate)
   (declare (type disassem-state dstate))
-  (cond ((dstate-get-inst-prop dstate 'operand-size-8) :byte)
-        ((dstate-get-inst-prop dstate 'rex-w) :qword)
-        ((dstate-get-inst-prop dstate 'operand-size-16) :word)
+  (cond ((dstate-get-inst-prop dstate +operand-size-8+) :byte)
+        ((dstate-get-inst-prop dstate +rex-w+) :qword)
+        ((dstate-get-inst-prop dstate +operand-size-16+) :word)
         (t +default-operand-size+)))
 
 ;;; The same as INST-OPERAND-SIZE, but for those instructions (e.g.
@@ -93,120 +95,25 @@
 ;;; be overwritten to :word.
 (defun inst-operand-size-default-qword (dstate)
   (declare (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'operand-size-16) :word :qword))
-
-;;; This prefilter is used solely for its side effects, namely to put
-;;; the bits found in the REX prefix into the DSTATE for use by other
-;;; prefilters and by printers.
-(defun prefilter-wrxb (value dstate)
-  (declare (type (unsigned-byte 4) value)
-           (type disassem-state dstate))
-  (dstate-put-inst-prop dstate 'rex)
-  (when (plusp (logand value #b1000))
-    (dstate-put-inst-prop dstate 'rex-w))
-  (when (plusp (logand value #b0100))
-    (dstate-put-inst-prop dstate 'rex-r))
-  (when (plusp (logand value #b0010))
-    (dstate-put-inst-prop dstate 'rex-x))
-  (when (plusp (logand value #b0001))
-    (dstate-put-inst-prop dstate 'rex-b))
-  value)
-
-;;; The two following prefilters are used instead of prefilter-wrxb when
-;;; the bits of the REX prefix need to be treated individually. They are
-;;; always used together, so only the first one sets the REX property.
-(defun prefilter-rex-w (value dstate)
-  (declare (type bit value) (type disassem-state dstate))
-  (dstate-put-inst-prop dstate 'rex)
-  (when (plusp value)
-    (dstate-put-inst-prop dstate 'rex-w)))
-
-(defun prefilter-rex-b (value dstate)
-  (declare (type bit value) (type disassem-state dstate))
-  (when (plusp value)
-    (dstate-put-inst-prop dstate 'rex-b)))
+  (if (dstate-get-inst-prop dstate +operand-size-16+) :word :qword))
 
 ;;; This prefilter is used solely for its side effect, namely to put
 ;;; the property OPERAND-SIZE-8 into the DSTATE if VALUE is 0.
-(defun prefilter-width (value dstate)
+(defun prefilter-width (dstate value)
   (declare (type bit value) (type disassem-state dstate))
   (when (zerop value)
-    (dstate-put-inst-prop dstate 'operand-size-8))
+    (dstate-put-inst-prop dstate +operand-size-8+))
   value)
 
-;;; This prefilter is used solely for its side effect, namely to put
-;;; the property OPERAND-SIZE-16 into the DSTATE.
-(defun prefilter-x66 (value dstate)
-  (declare (type (eql #x66) value)
-           (ignore value)
-           (type disassem-state dstate))
-  (dstate-put-inst-prop dstate 'operand-size-16))
-
 ;;; A register field that can be extended by REX.R.
-(defun prefilter-reg-r (value dstate)
+(defun prefilter-reg-r (dstate value)
   (declare (type reg value) (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'rex-r) (+ value 8) value))
+  (if (dstate-get-inst-prop dstate +rex-r+) (+ value 8) value))
 
 ;;; A register field that can be extended by REX.B.
-(defun prefilter-reg-b (value dstate)
+(defun prefilter-reg-b (dstate value)
   (declare (type reg value) (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'rex-b) (+ value 8) value))
-
-;;; Returns either an integer, meaning a register, or a list of
-;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component
-;;; may be missing or nil to indicate that it's not used or has the
-;;; obvious default value (e.g., 1 for the index-scale). VALUE is a list
-;;; of the mod and r/m field of the ModRM byte of the instruction.
-;;; Depending on VALUE a SIB byte and/or an offset may be read. The
-;;; REX.B bit from DSTATE is used to extend the sole register or the
-;;; BASE-REG to a full register, the REX.X bit does the same for the
-;;; INDEX-REG.
-(defun prefilter-reg/mem (value dstate)
-  (declare (type list value)
-           (type disassem-state dstate))
-  (flet ((extend (bit-name reg)
-           (logior (if (dstate-get-inst-prop dstate bit-name) 8 0)
-                   reg)))
-    (declare (inline extend))
-    (let* ((mod (the (unsigned-byte 2) (first value)))
-           (r/m (the (unsigned-byte 3) (second value)))
-           (full-reg (extend 'rex-b r/m)))
-      (cond ((= mod #b11)
-             ;; registers
-             full-reg)
-            ((= r/m #b100) ; SIB byte - rex.b is "don't care"
-             (let* ((sib (the (unsigned-byte 8)
-                              (read-suffix 8 dstate)))
-                    (base-reg (ldb (byte 3 0) sib))
-                    (index-reg (extend 'rex-x (ldb (byte 3 3) sib)))
-                    (offset
-                         (case mod
-                               (#b00
-                                (if (= base-reg #b101)
-                                    (read-signed-suffix 32 dstate)
-                                  nil))
-                               (#b01
-                                (read-signed-suffix 8 dstate))
-                               (#b10
-                                (read-signed-suffix 32 dstate)))))
-               (list (unless (and (= mod #b00) (= base-reg #b101))
-                       (extend 'rex-b base-reg))
-                     offset
-                     (unless (= index-reg #b100) index-reg) ; index can't be RSP
-                     (ash 1 (ldb (byte 2 6) sib)))))
-            ;; rex.b is not decoded in determining RIP-relative mode
-            ((and (= mod #b00) (= r/m #b101))
-             (list 'rip (read-signed-suffix 32 dstate)))
-            ((= mod #b00)
-             (list full-reg))
-            ((= mod #b01)
-             (list full-reg (read-signed-suffix 8 dstate)))
-            (t                            ; (= mod #b10)
-             (list full-reg (read-signed-suffix 32 dstate)))))))
-
-(defun read-address (value dstate)
-  (declare (ignore value))              ; always nil anyway
-  (read-suffix (width-bits (inst-operand-size dstate)) dstate))
+  (if (dstate-get-inst-prop dstate +rex-b+) (+ value 8) value))
 
 (defun width-bits (width)
   (ecase width
@@ -219,10 +126,19 @@
 ;;;; disassembler argument types
 
 ;;; Used to capture the lower four bits of the REX prefix all at once ...
-(define-arg-type wrxb :prefilter #'prefilter-wrxb)
+(define-arg-type wrxb
+  :prefilter (lambda (dstate value)
+               (dstate-put-inst-prop dstate (logior +rex+ (logand value #b1111)))
+               value))
 ;;; ... or individually (not needed for REX.R and REX.X).
-(define-arg-type rex-w :prefilter #'prefilter-rex-w)
-(define-arg-type rex-b :prefilter #'prefilter-rex-b)
+;;; They are always used together, so only the first one sets the REX property.
+(define-arg-type rex-w
+  :prefilter  (lambda (dstate value)
+                (dstate-put-inst-prop dstate
+                                      (logior +rex+ (if (plusp value) +rex-w+ 0)))))
+(define-arg-type rex-b
+  :prefilter (lambda (dstate value)
+               (dstate-put-inst-prop dstate (if (plusp value) +rex-b+ 0))))
 
 (define-arg-type width
   :prefilter #'prefilter-width
@@ -232,11 +148,14 @@
                     stream)))
 
 ;;; Used to capture the effect of the #x66 operand size override prefix.
-(define-arg-type x66 :prefilter #'prefilter-x66)
+(define-arg-type x66
+  :prefilter (lambda (dstate junk)
+               (declare (ignore junk))
+               (dstate-put-inst-prop dstate +operand-size-16+)))
 
 (define-arg-type displacement
   :sign-extend t
-  :use-label #'offset-next
+  :use-label (lambda (value dstate) (+ (dstate-next-addr dstate) value))
   :printer (lambda (value stream dstate)
              (maybe-note-assembler-routine value nil dstate)
              (print-label value stream dstate)))
@@ -261,19 +180,22 @@
   :printer #'print-reg-default-qword)
 
 (define-arg-type imm-addr
-  :prefilter #'read-address
+  :prefilter (lambda (dstate)
+               (read-suffix (width-bits (inst-operand-size dstate)) dstate))
   :printer #'print-label)
 
 ;;; Normally, immediate values for an operand size of :qword are of size
 ;;; :dword and are sign-extended to 64 bits. For an exception, see the
 ;;; argument type definition of SIGNED-IMM-DATA-UPTO-QWORD below.
 (define-arg-type signed-imm-data
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (let ((width (width-bits (inst-operand-size dstate))))
                  (when (= width 64)
                    (setf width 32))
-                 (read-signed-suffix width dstate))))
+                 (read-signed-suffix width dstate)))
+  :printer (lambda (value stream dstate)
+             (maybe-note-static-symbol value dstate)
+             (princ value stream)))
 
 (define-arg-type signed-imm-data/asm-routine
   :type 'signed-imm-data
@@ -283,8 +205,7 @@
 ;;; move immediates of all sizes (i.e. including :qword) into a
 ;;; register.
 (define-arg-type signed-imm-data-upto-qword
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (read-signed-suffix
                 (width-bits (inst-operand-size dstate))
                 dstate)))
@@ -299,8 +220,7 @@
 ;;; The only instruction of this kind having a variant with an immediate
 ;;; argument is PUSH.
 (define-arg-type signed-imm-data-default-qword
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (let ((width (width-bits
                              (inst-operand-size-default-qword dstate))))
                  (when (= width 64)
@@ -308,19 +228,16 @@
                  (read-signed-suffix width dstate))))
 
 (define-arg-type signed-imm-byte
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (read-signed-suffix 8 dstate)))
 
 (define-arg-type imm-byte
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (read-suffix 8 dstate)))
 
 ;;; needed for the ret imm16 instruction
 (define-arg-type imm-word-16
-  :prefilter (lambda (value dstate)
-               (declare (ignore value)) ; always nil anyway
+  :prefilter (lambda (dstate)
                (read-suffix 16 dstate)))
 
 (define-arg-type reg/mem
@@ -1144,7 +1061,7 @@
   (index nil :type (or tn null))
   (scale 1 :type (member 1 2 4 8))
   (disp 0 :type (or (unsigned-byte 32) (signed-byte 32) fixup)))
-(def!method print-object ((ea ea) stream)
+(defmethod print-object ((ea ea) stream)
   (cond ((or *print-escape* *print-readably*)
          (print-unreadable-object (ea stream :type t)
            (format stream
@@ -1206,16 +1123,25 @@
                                              (- (+ offset posn)))))))
   (values))
 
+(defun emit-byte-displacement-backpatch (segment target)
+  (emit-back-patch segment 1
+                   (lambda (segment posn)
+                     (emit-byte segment
+                                (the (signed-byte 8)
+                                  (- (label-position target) (1+ posn)))))))
+
+(defun emit-dword-displacement-backpatch (segment target &optional (n-extra 0))
+  ;; N-EXTRA is how many more instruction bytes will follow, to properly compute
+  ;; the displacement from the beginning of the next instruction to TARGET.
+  (emit-back-patch segment 4
+                   (lambda (segment posn)
+                     (emit-signed-dword segment (- (label-position target)
+                                                   (+ 4 posn n-extra))))))
+
 (defun emit-label-rip (segment fixup reg remaining-bytes)
-  (let ((label (fixup-offset fixup)))
-    ;; RIP-relative addressing
-    (emit-mod-reg-r/m-byte segment #b00 reg #b101)
-    (emit-back-patch segment
-                     4
-                     (lambda (segment posn)
-                       (emit-signed-dword segment
-                                          (- (label-position label)
-                                             (+ posn 4 remaining-bytes))))))
+  ;; RIP-relative addressing
+  (emit-mod-reg-r/m-byte segment #b00 reg #b101)
+  (emit-dword-displacement-backpatch segment (fixup-offset fixup) remaining-bytes)
   (values))
 
 (defun emit-ea (segment thing reg &key allow-constants (remaining-bytes 0))
@@ -1362,7 +1288,7 @@
 
 ;;;; utilities
 
-(def!constant +operand-size-prefix-byte+ #b01100110)
+(defconstant +operand-size-prefix-byte+ #b01100110)
 
 (defun maybe-emit-operand-size-prefix (segment size)
   (unless (or (eq size :byte)
@@ -1674,7 +1600,8 @@
             ;; the linkage table) and for linkage table references, since
             ;; these should always end up in low memory.
             (aver (or (member (fixup-flavor src)
-                              '(:foreign :foreign-dataref :symbol-tls-index))
+                              '(:foreign :foreign-dataref :symbol-tls-index
+                                :assembly-routine))
                       (eq (ea-size dst) :dword)))
             (maybe-emit-rex-for-ea segment dst nil)
             (emit-byte segment #b11000111)
@@ -1866,13 +1793,6 @@
               (xchg-reg-with-something operand2 operand1))
              (t
               (error "bogus args to XCHG: ~S ~S" operand1 operand2)))))))
-
-;; If the filtered VALUE (R/M field of LEA) should be treated as a label,
-;; return the virtual address, otherwise the value unchanged.
-(defun lea-compute-label (value dstate)
-  (if (and (listp value) (eq (first value) 'rip))
-      (+ (dstate-next-addr dstate) (second value))
-      value))
 
 (define-instruction lea (segment dst src)
   (:printer
@@ -2469,27 +2389,14 @@
    (typecase where
      (label
       (emit-byte segment #b11101000) ; 32 bit relative
-      (emit-back-patch segment
-                       4
-                       (lambda (segment posn)
-                         (emit-signed-dword segment
-                                            (- (label-position where)
-                                               (+ posn 4))))))
+      (emit-dword-displacement-backpatch segment where))
      (fixup
-      ;; There is no CALL rel64...
-      (error "Cannot CALL a fixup: ~S" where))
+      (emit-byte segment #b11101000)
+      (emit-relative-fixup segment where))
      (t
       (maybe-emit-rex-for-ea segment where nil :operand-size :do-not-set)
       (emit-byte segment #b11111111)
       (emit-ea segment where #b010)))))
-
-(defun emit-byte-displacement-backpatch (segment target)
-  (emit-back-patch segment
-                   1
-                   (lambda (segment posn)
-                     (let ((disp (- (label-position target) (1+ posn))))
-                       (aver (<= -128 disp 127))
-                       (emit-byte segment disp)))))
 
 (define-instruction jmp (segment cond &optional where)
   ;; conditional jumps
@@ -3520,6 +3427,60 @@
   (:emitter
    (emit-byte segment #b00001111)
    (emit-byte segment #b00110001)))
+
+;;;; Intel TSX - some user library (STMX) used to define these,
+;;;; but it's not really supported and they actually belong here.
+
+(define-instruction-format
+    (xbegin 48 :default-printer '(:name :tab label))
+  (op :fields (list (byte 8 0) (byte 8 8)) :value '(#xc7 #xf8))
+  (label :field (byte 32 16) :type 'displacement))
+
+(define-instruction-format
+    (xabort 24 :default-printer '(:name :tab imm))
+  (op :fields (list (byte 8 0) (byte 8 8)) :value '(#xc6 #xf8))
+  (imm :field (byte 8 16)))
+
+(define-instruction xbegin (segment &optional where)
+  (:printer xbegin ())
+  (:emitter
+   (emit-byte segment #xc7)
+   (emit-byte segment #xf8)
+   (if where
+       ;; emit 32-bit, signed relative offset for where
+       (emit-dword-displacement-backpatch segment where)
+       ;; nowhere to jump: simply jump to the next instruction
+       (emit-skip segment 4 0))))
+
+(define-instruction xend (segment)
+  (:printer three-bytes ((op '(#x0f #x01 #xd5))))
+  (:emitter
+   (emit-byte segment #x0f)
+   (emit-byte segment #x01)
+   (emit-byte segment #xd5)))
+
+(define-instruction xabort (segment reason)
+  (:printer xabort ())
+  (:emitter
+   (aver (<= 0 reason #xff))
+   (emit-byte segment #xc6)
+   (emit-byte segment #xf8)
+   (emit-byte segment reason)))
+
+(define-instruction xtest (segment)
+  (:printer three-bytes ((op '(#x0f #x01 #xd6))))
+  (:emitter
+   (emit-byte segment #x0f)
+   (emit-byte segment #x01)
+   (emit-byte segment #xd6)))
+
+(define-instruction xacquire (segment) ;; same prefix byte as repne/repnz
+  (:emitter
+   (emit-byte segment #xf2)))
+
+(define-instruction xrelease (segment) ;; same prefix byte as rep/repe/repz
+  (:emitter
+   (emit-byte segment #xf3)))
 
 ;;;; Late VM definitions
 

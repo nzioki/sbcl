@@ -80,6 +80,8 @@
   (destructuring-bind (decl &rest names) spec
     (ecase decl
       (disable-package-locks
+       ;; Why are we using EQUAL here if the only way to disable the
+       ;; lock on (SETF CAR) is to list the name CAR and not (SETF CAR)?
        (union old names :test #'equal))
       (enable-package-locks
        (set-difference old names :test #'equal)))))
@@ -137,7 +139,7 @@
     (error "Cannot declare FTYPE of illegal function name ~S" name))
   (when (and (ctype-p type-oid)
              (not (csubtypep type-oid (specifier-type 'function))))
-    (error "Not a function type: ~S" (type-specifier type-oid)))
+    (error "Not a function type: ~/sb!impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
     (when (eq (info :function :where-from name) :declared)

@@ -94,8 +94,8 @@ collect_garbage(generation_index_t ignore)
     unsigned long size_retained;
     lispobj *current_static_space_free_pointer;
     unsigned long static_space_size;
-    unsigned long control_stack_size, binding_stack_size;
-    sigset_t tmp, old;
+    unsigned long binding_stack_size;
+    sigset_t old;
     struct thread *th=arch_os_get_current_thread();
 
 #ifdef PRINTNOISE
@@ -107,7 +107,7 @@ collect_garbage(generation_index_t ignore)
 
     /* it's possible that signals are blocked already if this was called
      * from a signal handler (e.g. with the sigsegv gc_trigger stuff) */
-    block_blockable_signals(0, &old);
+    block_blockable_signals(&old);
 
     current_static_space_free_pointer =
         (lispobj *) ((unsigned long)
@@ -342,7 +342,7 @@ print_garbage(lispobj *from_space, lispobj *from_space_free_pointer)
 #define WEAK_POINTER_NWORDS \
         CEILING((sizeof(struct weak_pointer) / sizeof(lispobj)), 2)
 
-static long
+static sword_t
 scav_weak_pointer(lispobj *where, lispobj object)
 {
     /* Do not let GC scavenge the value slot of the weak pointer */

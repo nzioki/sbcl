@@ -259,7 +259,6 @@
 ;;; operand or temporary at meta-compile time. Besides the obvious
 ;;; stuff, we also store the names of per-operand temporaries here.
 (def!struct (operand-parse
-             (:make-load-form-fun just-dump-it-normally)
              #-sb-xc-host (:pure t))
   ;; name of the operand (which we bind to the TN)
   (name nil :type symbol)
@@ -290,12 +289,11 @@
   (sc nil :type (or symbol null))
   ;; If non-null, we are a temp wired to this offset in SC.
   (offset nil :type (or unsigned-byte null)))
+(!set-load-form-method operand-parse (:host :xc :target))
 
 ;;; A VOP-PARSE object holds everything we need to know about a VOP at
 ;;; meta-compile time.
-(def!struct (vop-parse
-             (:make-load-form-fun just-dump-it-normally)
-             #-sb-xc-host (:pure t))
+(def!struct (vop-parse #-sb-xc-host (:pure t))
   ;; the name of this VOP
   (name nil :type symbol)
   ;; If true, then the name of the VOP we inherit from.
@@ -354,6 +352,7 @@
   ;; info about how to emit MOVE-ARG VOPs for the &MORE operand in
   ;; call/return VOPs
   (move-args nil :type (member nil :local-call :full-call :known-return)))
+(!set-load-form-method vop-parse (:host :xc :target))
 (defprinter (vop-parse)
   name
   (inherits :test inherits)
@@ -1577,7 +1576,7 @@
 ;;; :MOVE-ARGS {NIL | :FULL-CALL | :LOCAL-CALL | :KNOWN-RETURN}
 ;;;     Indicates if and how the more args should be moved into a
 ;;;     different frame.
-(def!macro define-vop ((name &optional inherits) &body specs)
+(defmacro define-vop ((name &optional inherits) &body specs)
   (declare (type symbol name))
   ;; Parse the syntax into a VOP-PARSE structure, and then expand into
   ;; code that creates the appropriate VOP-INFO structure at load time.
@@ -1823,7 +1822,7 @@
 ;;; beginning with T specifies a default. If it appears, it must be
 ;;; last. If no default is specified, and no clause matches, then an
 ;;; error is signalled.
-(def!macro sc-case (tn &body forms)
+(defmacro sc-case (tn &body forms)
   (let ((n-sc (gensym))
         (n-tn (gensym)))
     (collect ((clauses))

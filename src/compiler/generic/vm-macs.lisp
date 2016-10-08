@@ -34,7 +34,6 @@
 
 (def!struct (prim-object-slot
              (:constructor make-slot (name docs rest-p offset special options))
-             (:make-load-form-fun just-dump-it-normally)
              (:conc-name slot-))
   (name nil :type symbol :read-only t)
   (docs nil :type (or null simple-string) :read-only t)
@@ -45,7 +44,7 @@
   ;; referenced as special variables, this slot holds the name of that variable.
   (special nil :type symbol :read-only t))
 
-(def!struct (primitive-object (:make-load-form-fun just-dump-it-normally))
+(def!struct (primitive-object)
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
@@ -55,6 +54,9 @@
   (variable-length-p nil :type (member t nil) :read-only t))
 
 (declaim (freeze-type prim-object-slot primitive-object))
+(!set-load-form-method prim-object-slot (:host :xc))
+(!set-load-form-method primitive-object (:host :xc))
+
 (defvar *primitive-objects* nil)
 
 (defun !%define-primitive-object (primobj)
@@ -159,6 +161,26 @@
          (setf *!late-primitive-object-forms*
                (append *!late-primitive-object-forms*
                        ',(forms)))))))
+
+;;; We want small SC-NUMBERs for SCs whose numbers are frequently
+;;; embedded into machine code. We therefore fix the numbers for the
+;;; four (i.e two bits) most frequently embedded SCs (empirically
+;;; determined) and assign the rest sequentially.
+(defmacro !define-storage-classes (&rest classes)
+  (let* ((fixed-numbers '((descriptor-reg . 0)
+                          (any-reg        . 1)
+                          (signed-reg     . 2)
+                          (constant       . 3)))
+         (index (length fixed-numbers)))
+    (flet ((process-class (class-spec)
+             (destructuring-bind (sc-name sb-name &rest args) class-spec
+               (let* ((sc-number (or (cdr (assoc sc-name fixed-numbers))
+                                     (1- (incf index))))
+                      (constant-name (symbolicate sc-name "-SC-NUMBER")))
+                 `((define-storage-class ,sc-name ,sc-number
+                     ,sb-name ,@args)
+                   (def!constant ,constant-name ,sc-number))))))
+      `(progn ,@(mapcan #'process-class classes)))))
 
 ;;;; stuff for defining reffers and setters
 
@@ -268,15 +290,20 @@
           (merge 'list (list (cons width signedp)) (modular-class-widths class)
                  #'< :key #'car))))
 
-(defmacro define-modular-fun (name lambda-list prototype kind signedp width)
+(defun %check-modular-fun-macro-arguments
+    (name kind &optional (lambda-list nil lambda-list-p))
   (check-type name symbol)
-  (check-type prototype symbol)
   (check-type kind (member :untagged :tagged))
+  (when lambda-list-p
+    (dolist (arg lambda-list)
+      (when (member arg sb!xc:lambda-list-keywords)
+        (error "Lambda list keyword ~S is not supported for modular ~
+                function lambda lists." arg)))))
+
+(defmacro define-modular-fun (name lambda-list prototype kind signedp width)
+  (%check-modular-fun-macro-arguments name kind lambda-list)
+  (check-type prototype symbol)
   (check-type width unsigned-byte)
-  (dolist (arg lambda-list)
-    (when (member arg sb!xc:lambda-list-keywords)
-      (error "Lambda list keyword ~S is not supported for ~
-              modular function lambda lists." arg)))
   `(progn
      (%define-modular-fun ',name ',lambda-list ',prototype ',kind ',signedp ,width)
      (defknown ,name ,(mapcar (constantly 'integer) lambda-list)
@@ -293,19 +320,13 @@
   name)
 
 (defmacro define-good-modular-fun (name kind signedp)
-  (check-type name symbol)
-  (check-type kind (member :untagged :tagged))
+  (%check-modular-fun-macro-arguments name kind)
   `(%define-good-modular-fun ',name ',kind ',signedp))
 
 (defmacro define-modular-fun-optimizer
     (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH")))
      &body body)
-  (check-type name symbol)
-  (check-type kind (member :untagged :tagged))
-  (dolist (arg lambda-list)
-    (when (member arg sb!xc:lambda-list-keywords)
-      (error "Lambda list keyword ~S is not supported for ~
-              modular function lambda lists." arg)))
+  (%check-modular-fun-macro-arguments name kind lambda-list)
   (with-unique-names (call args)
     `(setf (gethash ',name (modular-class-funs (find-modular-class ',kind ',signedp)))
            (lambda (,call ,width)

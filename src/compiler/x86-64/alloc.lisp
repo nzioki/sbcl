@@ -68,6 +68,32 @@
 
 ;;;; special-purpose inline allocators
 
+;;; Special variant of 'storew' which might have a shorter encoding
+;;; when storing to the heap (which starts out zero-filled).
+(defun storew* (word object slot lowtag zeroed)
+  (if (or (not zeroed) (not (typep word '(signed-byte 32))))
+      (storew word object slot lowtag) ; Possibly use temp-reg-tn
+      (inst mov
+            (make-ea (cond ((typep word '(unsigned-byte 8)) :byte)
+                           ((and (not (logtest word #xff))
+                                 (typep (ash word -8) '(unsigned-byte 8)))
+                            ;; Array lengths 128 to 16384 which are multiples of 128
+                            (setq word (ash word -8))
+                            (decf lowtag 1) ; increment address by 1
+                            :byte)
+                           ((and (not (logtest word #xffff))
+                                 (typep (ash word -16) '(unsigned-byte 8)))
+                            ;; etc
+                            (setq word (ash word -16))
+                            (decf lowtag 2) ; increment address by 2
+                            :byte)
+                           ((typep word '(unsigned-byte 16)) :word)
+                           ;; Definitely a (signed-byte 32) due to pre-test.
+                           (t :dword))
+                     :base object
+                     :disp (- (* slot n-word-bytes) lowtag))
+            word)))
+
 ;;; ALLOCATE-VECTOR
 (macrolet ((calc-size-in-bytes (n-words result-tn)
              `(cond ((sc-is ,n-words immediate)
@@ -80,13 +106,14 @@
                                                    (* vector-data-offset n-word-bytes))))
                      (inst and ,result-tn (lognot lowtag-mask))
                      ,result-tn)))
-           (put-header (vector-tn type length)
-             `(progn (storew (if (sc-is ,type immediate) (tn-value ,type) ,type)
-                             ,vector-tn 0 other-pointer-lowtag)
-                     (storew (if (sc-is ,length immediate)
-                                 (fixnumize (tn-value ,length))
-                                 ,length)
-                             ,vector-tn vector-length-slot other-pointer-lowtag))))
+           (put-header (vector-tn type length zeroed)
+             `(progn (storew* (if (sc-is ,type immediate) (tn-value ,type) ,type)
+                              ,vector-tn 0 other-pointer-lowtag ,zeroed)
+                     (storew* (if (sc-is ,length immediate)
+                                  (fixnumize (tn-value ,length))
+                                  ,length)
+                              ,vector-tn vector-length-slot other-pointer-lowtag
+                              ,zeroed))))
 
   (define-vop (allocate-vector-on-heap)
     (:args (type :scs (unsigned-reg immediate))
@@ -101,7 +128,7 @@
       (let ((size (calc-size-in-bytes words result)))
         (pseudo-atomic
          (allocation result size nil nil other-pointer-lowtag)
-         (put-header result type length)))))
+         (put-header result type length t)))))
 
   (define-vop (allocate-vector-on-stack)
     (:args (type :scs (unsigned-reg immediate) :to :save)
@@ -110,6 +137,7 @@
     (:temporary (:sc any-reg :offset ecx-offset :from (:argument 2)) rcx)
     (:temporary (:sc any-reg :offset eax-offset :from :eval) rax)
     (:temporary (:sc any-reg :offset edi-offset) rdi)
+    (:temporary (:sc complex-double-reg) zero)
     (:results (result :scs (descriptor-reg) :from :load))
     (:arg-types positive-fixnum positive-fixnum positive-fixnum)
     (:translate allocate-vector)
@@ -118,29 +146,37 @@
     (:generator 100
       (let ((size (calc-size-in-bytes words result)))
         (allocation result size node t other-pointer-lowtag)
-        (put-header result type length)
-    ;; FIXME: It would be good to check for stack overflow here.
-    ;; It would also be good to skip zero-fill of specialized vectors
-    ;; perhaps in a policy-dependent way. At worst you'd see random
-    ;; bits, and CLHS says consequences are undefined.
+        (put-header result type length nil)
+        ;; FIXME: It would be good to check for stack overflow here.
+        ;; It would also be good to skip zero-fill of specialized vectors
+        ;; perhaps in a policy-dependent way. At worst you'd see random
+        ;; bits, and CLHS says consequences are undefined.
         (let ((data-addr
-               (make-ea :qword :base result
-                               :disp (- (* vector-data-offset n-word-bytes)
-                                        other-pointer-lowtag))))
+                (make-ea :qword :base result
+                                :disp (- (* vector-data-offset n-word-bytes)
+                                         other-pointer-lowtag))))
           (block zero-fill
-            (if (sc-is words immediate)
-                (let ((n (tn-value words)))
-                  (if (> n 6)
-                      (inst mov rcx (tn-value words))
-                      (let ((zero (if (<= n 2) ; do imm-to-mem moves
-                                      0
-                                      (progn (zeroize rax) rax))))
-                        (dotimes (i n (return-from zero-fill))
-                          (inst mov data-addr zero)
-                          (setq data-addr (copy-structure data-addr))
-                          (incf (ea-disp data-addr) n-word-bytes)))))
-                (progn (move rcx words)
-                       (inst shr rcx n-fixnum-tag-bits)))
+            (cond ((sc-is words immediate)
+                   (let ((n (tn-value words)))
+                     (cond ((> n 8)
+                            (inst mov rcx (tn-value words)))
+                           ((= n 1)
+                            (zeroize rax)
+                            (inst mov data-addr rax)
+                            (return-from zero-fill))
+                           (t
+                            (multiple-value-bind (double single) (truncate n 2)
+                              (inst xorpd zero zero)
+                              (dotimes (i double)
+                                (inst movapd data-addr zero)
+                                (setf data-addr (copy-structure data-addr))
+                                (incf (ea-disp data-addr) (* n-word-bytes 2)))
+                              (unless (zerop single)
+                                (inst movaps data-addr zero))
+                              (return-from zero-fill))))))
+                  (t
+                   (move rcx words)
+                   (inst shr rcx n-fixnum-tag-bits)))
             (inst lea rdi data-addr)
             (inst cld)
             (zeroize rax)
@@ -242,7 +278,7 @@
     (with-fixed-allocation (result fdefn-widetag fdefn-size node)
       (storew name result fdefn-name-slot other-pointer-lowtag)
       (storew nil-value result fdefn-fun-slot other-pointer-lowtag)
-      (storew (make-fixup "undefined_tramp" :foreign)
+      (storew (make-fixup 'undefined-tramp :assembly-routine)
               result fdefn-raw-addr-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
@@ -284,7 +320,7 @@
   (:args)
   (:results (result :scs (any-reg)))
   (:generator 1
-    (inst mov result (make-fixup "funcallable_instance_tramp" :foreign))))
+    (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
   (:args)
@@ -296,10 +332,8 @@
     (maybe-pseudo-atomic stack-allocate-p
      (allocation result (pad-data-block words) node stack-allocate-p lowtag)
      (when type
-       (storew (logior (ash (1- words) n-widetag-bits) type)
-               result
-               0
-               lowtag)))))
+       (storew* (logior (ash (1- words) n-widetag-bits) type)
+                result 0 lowtag (not stack-allocate-p))))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))

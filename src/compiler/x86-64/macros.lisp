@@ -49,14 +49,13 @@
 (defmacro loadw (value ptr &optional (slot 0) (lowtag 0))
   `(inst mov ,value (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
 
-(defmacro storew (value ptr &optional (slot 0) (lowtag 0))
-  (once-only ((value value))
-    `(cond ((and (integerp ,value)
-                 (not (typep ,value '(signed-byte 32))))
-            (inst mov temp-reg-tn ,value)
-            (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) temp-reg-tn))
-           (t
-            (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) ,value)))))
+(defun storew (value ptr &optional (slot 0) (lowtag 0))
+  (cond ((and (integerp value)
+              (not (typep value '(signed-byte 32))))
+         (inst mov temp-reg-tn value)
+         (inst mov (make-ea-for-object-slot ptr slot lowtag) temp-reg-tn))
+        (t
+         (inst mov (make-ea-for-object-slot ptr slot lowtag) value))))
 
 (defmacro pushw (ptr &optional (slot 0) (lowtag 0))
   `(inst push (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
@@ -172,7 +171,8 @@
 ;;; This macro should only be used inside a pseudo-atomic section,
 ;;; which should also cover subsequent initialization of the
 ;;; object.
-(defun allocation-tramp (alloc-tn size lowtag)
+(defun allocation-tramp (alloc-tn size lowtag
+                         &optional (result-tn alloc-tn))
   (cond ((typep size '(and integer (not (signed-byte 32))))
          ;; MOV accepts large immediate operands, PUSH does not
          (inst mov alloc-tn size)
@@ -181,9 +181,9 @@
          (inst push size)))
   (inst mov alloc-tn (make-fixup "alloc_tramp" :foreign))
   (inst call alloc-tn)
-  (inst pop alloc-tn)
+  (inst pop result-tn)
   (when lowtag
-    (inst or (reg-in-size alloc-tn :byte) lowtag))
+    (inst or (reg-in-size result-tn :byte) lowtag))
   (values))
 
 (defun allocation (alloc-tn size &optional ignored dynamic-extent lowtag)
@@ -237,17 +237,17 @@
            (inst cmp alloc-tn end-addr)
            (inst jmp :a NOT-INLINE)
            (inst mov free-pointer alloc-tn)
+           (emit-label DONE)
            (if lowtag
                (inst lea alloc-tn (make-ea :byte :base temp-reg-tn :disp lowtag))
                (inst mov alloc-tn temp-reg-tn))
-           (emit-label DONE)
            (assemble (*elsewhere*)
              (emit-label NOT-INLINE)
              (cond ((numberp size)
-                    (allocation-tramp alloc-tn size lowtag))
+                    (allocation-tramp alloc-tn size nil temp-reg-tn))
                    (t
                     (inst sub alloc-tn free-pointer)
-                    (allocation-tramp alloc-tn alloc-tn lowtag)))
+                    (allocation-tramp alloc-tn alloc-tn nil temp-reg-tn)))
              (inst jmp DONE))))
     (values)))
 
@@ -262,8 +262,9 @@
     `(maybe-pseudo-atomic ,stack-allocate-p
       (allocation ,result-tn (pad-data-block ,size) ,inline ,stack-allocate-p
                   other-pointer-lowtag)
-      (storew (logior (ash (1- ,size) n-widetag-bits) ,widetag)
-              ,result-tn 0 other-pointer-lowtag)
+      (storew* (logior (ash (1- ,size) n-widetag-bits) ,widetag)
+               ,result-tn 0 other-pointer-lowtag
+               (not ,stack-allocate-p))
       ,@forms)))
 
 ;;;; error code
@@ -286,18 +287,8 @@
     (case kind
       (#.invalid-arg-count-trap) ; there is no "payload" in this trap kind
       (t
-       (with-adjustable-vector (vector)       ; interr arguments
-         (write-var-integer code vector)
-         (dolist (tn values)
-        ;; classic CMU CL comment:
-        ;;   zzzzz jrd here. tn-offset is zero for constant
-        ;;   tns.
-           (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                              (or (tn-offset tn) 0))
-                              vector))
-         (inst byte (length vector))
-         (dotimes (i (length vector))
-           (inst byte (aref vector i))))))))
+       (inst byte code)
+       (encode-internal-error-args values)))))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc
@@ -579,7 +570,7 @@
 
 ;;; helper for alien stuff.
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   #!+sb-doc
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.

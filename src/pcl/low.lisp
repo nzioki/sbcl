@@ -86,10 +86,9 @@
 ;;; the inline functions defined by
 ;;; !DEFSTRUCT-WITH-ALTERNATE-METACLASS are as efficient as they could
 ;;; be; ordinary defstruct accessors are defined as source transforms.
+(declaim (inline fsc-instance-p))
 (defun fsc-instance-p (fin)
   (funcallable-instance-p fin))
-(define-compiler-macro fsc-instance-p (fin)
-  `(funcallable-instance-p ,fin))
 (defmacro fsc-instance-wrapper (fin)
   `(%funcallable-instance-layout ,fin))
 (defmacro fsc-instance-slots (fin)
@@ -108,25 +107,9 @@
 ;;; and normal instances, so we can return true on structures also. A
 ;;; few uses of (OR STD-INSTANCE-P FSC-INSTANCE-P) are changed to
 ;;; PCL-INSTANCE-P.
+(declaim (inline std-instance-p))
 (defun std-instance-p (x)
   (%instancep x))
-(define-compiler-macro std-instance-p (x)
-  `(%instancep ,x))
-
-;; a temporary definition used for debugging the bootstrap
-#!+sb-show
-(defun print-std-instance (instance stream depth)
-  (declare (ignore depth))
-  (print-unreadable-object (instance stream :type t :identity t)
-    (let ((class (class-of instance)))
-      (when (or (eq class (find-class 'standard-class nil))
-                (eq class (find-class 'funcallable-standard-class nil))
-                (eq class (find-class 'system-class nil))
-                (eq class (find-class 'built-in-class nil)))
-        (princ (early-class-name instance) stream)))))
-
-(defmacro std-instance-class (instance)
-  `(wrapper-class* (std-instance-wrapper ,instance)))
 
 ;;; When given a funcallable instance, SET-FUN-NAME *must* side-effect
 ;;; that FIN to give it the name. When given any other kind of

@@ -254,7 +254,7 @@
                                    fun-pointer-lowtag))
     (inst cmp type simple-fun-header-widetag)
     (inst jmp :e normal-fn)
-    (inst lea raw (make-fixup "closure_tramp" :foreign))
+    (inst lea raw (make-fixup 'closure-tramp :assembly-routine))
     NORMAL-FN
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
     (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
@@ -267,7 +267,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
-    (storew (make-fixup "undefined_tramp" :foreign)
+    (storew (make-fixup 'undefined-tramp :assembly-routine)
             fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
@@ -278,48 +278,43 @@
 ;;; symbol.
 ;;; See the "Chapter 9: Specials" of the SBCL Internals Manual.
 ;;
-;;; FIXME: Split into DYNBIND and BIND: DYNBIND needs to ensure
-;;; TLS-INDEX, whereas BIND should assume it is already in place. Make
-;;; LET &co compile into BIND, and PROGV into DYNBIND, plus ensure
-;;; TLS-INDEX at compile-time, and make loader and dumper preserve
-;;; the existence of a TLS-INDEX.
 #!+sb-thread
-(define-vop (bind)
-  (:args (val :scs (any-reg descriptor-reg))
-         (symbol :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) tls-index bsp
-                                 #!+win32 temp)
-  (:generator 10
-     (load-binding-stack-pointer bsp)
-     (loadw tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
-     (inst add bsp (* binding-size n-word-bytes))
-     (store-binding-stack-pointer bsp)
-     (inst test tls-index tls-index)
-     (inst jmp :ne tls-index-valid)
-     (inst mov tls-index symbol)
-     (inst call (make-fixup
-                 (ecase (tn-offset tls-index)
-                   (#.eax-offset 'alloc-tls-index-in-eax)
-                   (#.ebx-offset 'alloc-tls-index-in-ebx)
-                   (#.ecx-offset 'alloc-tls-index-in-ecx)
-                   (#.edx-offset 'alloc-tls-index-in-edx)
-                   (#.edi-offset 'alloc-tls-index-in-edi)
-                   (#.esi-offset 'alloc-tls-index-in-esi))
-                 :assembly-routine))
-     TLS-INDEX-VALID
+(macrolet
+    ((def (vopname symbol-arg info sc-offset load-tls-index)
+       `(define-vop (,vopname)
+          (:args (val :scs (any-reg descriptor-reg)) ,@symbol-arg)
+          ,@info
+          (:temporary (:sc unsigned-reg ,@sc-offset) tls-index)
+          (:temporary (:sc unsigned-reg) bsp #!+win32 temp)
+          (:generator 10 ; cost is irrelevant. we explicitly pick a vop
+           (load-binding-stack-pointer bsp)
+           ,@load-tls-index
+           (inst add bsp (* binding-size n-word-bytes))
+           (store-binding-stack-pointer bsp)
      ;; with-tls-ea on win32 causes tls-index to be an absolute address
      ;; which is problematic when UNBIND uses with-tls-ea too.
-     #!+win32(move temp tls-index)
-     (with-tls-ea (EA :base tls-index :base-already-live-p t)
-       (inst push EA :maybe-fs)
-       (popw bsp (- binding-value-slot binding-size))
-       (storew #!-win32 tls-index
-               #!+win32 temp
-               bsp (- binding-symbol-slot binding-size))
-       (inst mov EA val :maybe-fs))))
+           #!+win32(move temp tls-index)
+           (with-tls-ea (EA :base tls-index :base-already-live-p t)
+            (inst push EA :maybe-fs)
+            (popw bsp (- binding-value-slot binding-size))
+            (storew #!-win32 tls-index
+                    #!+win32 temp
+                    bsp (- binding-symbol-slot binding-size))
+            (inst mov EA val :maybe-fs))))))
+  (def bind ; bind a known symbol
+       nil ((:info symbol)) nil
+       ((inst mov tls-index (make-fixup symbol :symbol-tls-index))))
+  (def dynbind ; bind a symbol in a PROGV form
+       ((symbol :scs (descriptor-reg))) nil (:offset eax-offset)
+       ((inst mov tls-index (tls-index-of symbol))
+        (inst test tls-index tls-index)
+        (inst jmp :ne tls-index-valid)
+        (inst mov tls-index symbol)
+        (inst call (make-fixup 'alloc-tls-index :assembly-routine))
+        TLS-INDEX-VALID)))
 
 #!-sb-thread
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp bsp)
@@ -504,6 +499,37 @@
   (:args (object :scs (descriptor-reg))
          (value :scs (unsigned-reg)))
   (:arg-types * unsigned-num)
+  (:info index)
+  (:generator 5
+    (inst mov (make-ea-for-raw-slot object index) value)))
+
+(define-vop (raw-instance-ref/signed-word)
+  (:translate %raw-instance-ref/signed-word)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)) (index :scs (any-reg immediate)))
+  (:arg-types * tagged-num)
+  (:results (value :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 5
+    (inst mov value (make-ea-for-raw-slot object index))))
+
+(define-vop (raw-instance-set/signed-word)
+  (:translate %raw-instance-set/signed-word)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg immediate))
+         (value :scs (signed-reg) :target result))
+  (:arg-types * tagged-num signed-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 5
+    (inst mov (make-ea-for-raw-slot object index) value)
+    (move result value)))
+
+(define-vop (raw-instance-init/signed-word)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (signed-reg)))
+  (:arg-types * signed-num)
   (:info index)
   (:generator 5
     (inst mov (make-ea-for-raw-slot object index) value)))

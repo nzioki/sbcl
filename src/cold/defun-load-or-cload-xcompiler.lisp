@@ -18,14 +18,73 @@
 ;;; The table is populated later in this file.
 (defparameter *undefined-fun-whitelist* (make-hash-table :test 'equal))
 
+(defvar *symbol-values-for-genesis*)
 (export '*symbol-values-for-genesis*)
 (let ((pathname "output/init-symbol-values.lisp-expr"))
-  (defvar *symbol-values-for-genesis*
-    (and (probe-file pathname) (read-from-file pathname)))
+  (setq *symbol-values-for-genesis*
+        (and (probe-file pathname) (read-from-file pathname)))
   (defun save-initial-symbol-values ()
     (with-open-file (f pathname :direction :output :if-exists :supersede)
-      (declare (special *symbol-values-for-genesis*)) ; non-toplevel DEFVAR
       (write *symbol-values-for-genesis* :stream f :readably t))))
+
+(when (make-host-1-parallelism)
+  (require :sb-posix))
+#+#.(cl:if (cl:find-package "SB-POSIX") '(and) '(or))
+(defun parallel-make-host-1 (max-jobs)
+  (let ((subprocess-count 0)
+        (subprocess-list nil))
+    (flet ((wait ()
+             (multiple-value-bind (pid status) (sb-posix:wait)
+               (format t "~&; Subprocess ~D exit status ~D~%"  pid status)
+               (setq subprocess-list (delete pid subprocess-list)))
+             (decf subprocess-count)))
+      (do-stems-and-flags (stem flags)
+        (unless (position :not-host flags)
+          (when (>= subprocess-count max-jobs)
+            (wait))
+          (let ((pid (sb-posix:fork)))
+            (when (zerop pid)
+              (in-host-compilation-mode
+               (lambda () (compile-stem stem flags :host-compile)))
+              ;; FIXME: convey exit code based on COMPILE result.
+              (sb-sys:os-exit 0))
+            (push pid subprocess-list)
+            (incf subprocess-count)
+            ;; Do not wait for the compile to finish. Just load as source.
+            (let ((source (merge-pathnames (stem-remap-target stem)
+                                           (make-pathname :type "lisp"))))
+              (let ((sb-ext:*evaluator-mode* :interpret))
+                (in-host-compilation-mode
+                 (lambda ()
+                   (load source :verbose t :print nil))))))))
+      (loop (if (plusp subprocess-count) (wait) (return)))))
+
+  ;; We want to load compiled files, because that's what this function promises.
+  ;; Reloading is tricky because constructors for interned ctypes will construct
+  ;; new objects via their LOAD-TIME-VALUE forms, but globaldb already stored
+  ;; some objects from the interpreted pre-load.
+  ;; So wipe everything out that causes problems down the line.
+  ;; (Or perhaps we could make their effects idempotent)
+  (format t "~&; Parallel build: Clearing globaldb~%")
+  (do-all-symbols (s)
+    (when (get s :sb-xc-globaldb-info)
+      (remf (symbol-plist s) :sb-xc-globaldb-info)))
+  (fill (symbol-value 'sb!c::*info-types*) nil)
+  (clrhash (symbol-value 'sb!kernel::*forward-referenced-layouts*))
+  (setf (symbol-value 'sb!kernel:*type-system-initialized*) nil)
+  (makunbound 'sb!c::*backend-primitive-type-names*)
+  (makunbound 'sb!c::*backend-primitive-type-aliases*)
+
+  (format t "~&; Parallel build: Reloading compilation artifacts~%")
+  ;; Now it works to load fasls.
+  (in-host-compilation-mode
+   (lambda ()
+     (handler-bind ((sb-kernel:redefinition-warning #'muffle-warning))
+       (do-stems-and-flags (stem flags)
+         (unless (position :not-host flags)
+           (load (stem-object-path stem flags :host-compile)
+                 :verbose t :print nil))))))
+  (format t "~&; Parallel build: Fasl loading complete~%"))
 
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
@@ -66,7 +125,6 @@
                     "BOOLE-XOR"
                     "CALL-ARGUMENTS-LIMIT"
                     "CHAR-CODE-LIMIT"
-                    "DEFMETHOD"
                     "DOUBLE-FLOAT-EPSILON"
                     "DOUBLE-FLOAT-NEGATIVE-EPSILON"
                     "INTERNAL-TIME-UNITS-PER-SECOND"
@@ -153,10 +211,6 @@
                     "UPGRADED-COMPLEX-PART-TYPE"
                     "WITH-COMPILATION-UNIT"))
       (export (intern name package-name) package-name)))
-  ;; Symbols that can't be entered into the whitelist
-  ;; until this function executes.
-  (setf (gethash (intern "MAKE-LOAD-FORM" "SB-XC")
-                 *undefined-fun-whitelist*) t)
   ;; don't watch:
   (dolist (package (list-all-packages))
     (when (= (mismatch (package-name package) "SB!") 3)
@@ -182,10 +236,14 @@
   ;; with the ordinary Lisp compiler, and this is intentional, in
   ;; order to make the compiler aware of the definitions of assembly
   ;; routines.
-  (do-stems-and-flags (stem flags)
-    (unless (find :not-host flags)
-      (funcall load-or-cload-stem stem flags)
-      #!+sb-show (warn-when-cl-snapshot-diff *cl-snapshot*)))
+  (if (and (make-host-1-parallelism)
+           (eq load-or-cload-stem #'host-cload-stem))
+      (funcall (intern "PARALLEL-MAKE-HOST-1" 'sb-cold)
+               (make-host-1-parallelism))
+      (do-stems-and-flags (stem flags)
+        (unless (find :not-host flags)
+          (funcall load-or-cload-stem stem flags)
+          #!+sb-show (warn-when-cl-snapshot-diff *cl-snapshot*))))
 
   ;; If the cross-compilation host is SBCL itself, we can use the
   ;; PURIFY extension to freeze everything in place, reducing the
@@ -209,21 +267,25 @@
           '(allocate-instance
             compute-applicable-methods
             slot-makunbound
+            make-load-form-saving-slots
             sb!ext:run-program
             sb!kernel:profile-deinit)
           ;; CLOS implementation
           '(sb!mop:class-finalized-p
             sb!mop:class-prototype
+            sb!mop:class-slots
             sb!mop:eql-specializer-object
             sb!mop:finalize-inheritance
+            sb!mop:generic-function-name
+            sb!mop:slot-definition-allocation
+            sb!mop:slot-definition-name
             sb!pcl::%force-cache-flushes
             sb!pcl::check-wrapper-validity
             sb!pcl::class-has-a-forward-referenced-superclass-p
             sb!pcl::class-wrapper
             sb!pcl::compute-gf-ftype
             sb!pcl::definition-source
-            sb!pcl:ensure-class-finalized
-            sb!pcl::get-instance-hash-code)
+            sb!pcl:ensure-class-finalized)
           ;; CLOS-based packages
           '(sb!gray:stream-clear-input
             sb!gray:stream-clear-output
@@ -302,6 +364,7 @@
             sb!interpreter::flush-everything
             sb!interpreter::fun-lexically-notinline-p
             sb!interpreter:lexenv-from-env
+            sb!interpreter::lexically-unlocked-symbol-p
             sb!interpreter:list-locals
             sb!interpreter:prepare-for-compile
             sb!interpreter::reconstruct-syntactic-closure-env)

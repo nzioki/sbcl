@@ -50,6 +50,8 @@
 void os_preinit();
 #endif
 
+void os_link_runtime();
+
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
 
 typedef enum {
@@ -232,8 +234,14 @@ typedef pthread_t os_thread_t;
 typedef pid_t os_thread_t;
 #endif
 
+#ifndef LISP_FEATURE_ALPHA
 typedef uintptr_t uword_t;
 typedef intptr_t  sword_t;
+#else
+/* The alpha32 port uses non-intptr-sized words */
+typedef u32 uword_t;
+typedef s32 sword_t;
+#endif
 
 /* FIXME: we do things this way because of the alpha32 port.  once
    alpha64 has arrived, all this nastiness can go away */
@@ -349,8 +357,14 @@ fixnum_value(lispobj n)
     return n >> N_FIXNUM_TAG_BITS;
 }
 
+static inline uword_t
+code_header_words(lispobj header) // given header = code->header
+{
+  return HeaderValue(header);
+}
+
 static inline sword_t
-fixnum_word_value(lispobj n)
+code_instruction_words(lispobj n) // given n = code->code_size
 {
     /* Convert bytes into words, double-word aligned. */
     sword_t x = ((n >> N_FIXNUM_TAG_BITS) + LOWTAG_MASK) & ~LOWTAG_MASK;

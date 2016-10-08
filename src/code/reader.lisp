@@ -40,6 +40,7 @@
 ;;;; reader errors
 
 (defun reader-eof-error (stream context)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'reader-eof-error
          :stream stream
          :context context))
@@ -47,6 +48,7 @@
 ;;; If The Gods didn't intend for us to use multiple namespaces, why
 ;;; did They specify them?
 (defun simple-reader-error (stream control &rest args)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'simple-reader-error
          :stream stream
          :format-control control
@@ -270,24 +272,24 @@ and NIL to suppress normalization."
         entry)))
 
 (defun copy-readtable (&optional (from-readtable *readtable*) to-readtable)
+  #!+sb-doc
+  "Copies FROM-READTABLE and returns the result. Uses TO-READTABLE as a target
+for the copy when provided, otherwise a new readtable is created. The
+FROM-READTABLE defaults to the standard readtable when NIL and to the current
+readtable when not provided."
   (assert-not-standard-readtable to-readtable 'copy-readtable)
   (let ((really-from-readtable (or from-readtable *standard-readtable*))
         (really-to-readtable (or to-readtable (make-readtable))))
     (replace (character-attribute-array really-to-readtable)
              (character-attribute-array really-from-readtable))
     (replace/eql-hash-table
-     (character-attribute-hash-table really-to-readtable)
+     (clrhash (character-attribute-hash-table really-to-readtable))
      (character-attribute-hash-table really-from-readtable))
-    ;; CLHS says that when TO-READTABLE is non-nil "... the readtable specified
-    ;; ... is modified and returned." Is that to imply making TO-READTABLE look
-    ;; exactly like FROM-READTABLE, or does it mean to augment it?
-    ;; We have conflicting behaviors - everything in the base-char range,
-    ;; is overwritten, but above that range it's additive.
     (map-into (character-macro-array really-to-readtable)
               #'copy-cmt-entry
               (character-macro-array really-from-readtable))
     (replace/eql-hash-table
-     (character-macro-hash-table really-to-readtable)
+     (clrhash (character-macro-hash-table really-to-readtable))
      (character-macro-hash-table really-from-readtable)
      #'copy-cmt-entry)
     (setf (readtable-case really-to-readtable)
@@ -525,7 +527,7 @@ standard Lisp readtable when NIL."
   (only-base-chars t :type boolean))
 (declaim (freeze-type token-buf))
 
-(def!method print-object ((self token-buf) stream)
+(defmethod print-object ((self token-buf) stream)
   (print-unreadable-object (self stream :identity t :type t)
     (format stream "~@[next=~S~]" (token-buf-next self))))
 
@@ -658,15 +660,15 @@ standard Lisp readtable when NIL."
 
 ;;;; READ-PRESERVING-WHITESPACE, READ-DELIMITED-LIST, and READ
 
-;;; an alist for #=, used to keep track of objects with labels assigned that
-;;; have been completely read. Each entry is (integer-tag gensym-tag value).
+;;; A list for #=, used to keep track of objects with labels assigned that
+;;; have been completely read. Each entry is a SHARP-EQUAL-WRAPPER object.
 ;;;
-;;; KLUDGE: Should this really be an alist? It seems as though users
+;;; KLUDGE: Should this really be a list? It seems as though users
 ;;; could reasonably expect N log N performance for large datasets.
 ;;; On the other hand, it's probably very very seldom a problem in practice.
-;;; On the third hand, it might be just as easy to use a hash table
-;;; as an alist, so maybe we should. -- WHN 19991202
-(defvar *sharp-equal-alist* ())
+;;; On the third hand, it might be just as easy to use a hash table,
+;;; so maybe we should. -- WHN 19991202
+(defvar *sharp-equal* ())
 
 (declaim (ftype (sfunction (t t) (values bit t)) read-maybe-nothing))
 
@@ -704,7 +706,7 @@ standard Lisp readtable when NIL."
                     (when tracking-p
                       (funcall (form-tracking-stream-observer stream)
                                :reset nil nil))))))))
-      (let ((*sharp-equal-alist* nil))
+      (let ((*sharp-equal* nil))
         (with-read-buffer ()
           (%read-preserving-whitespace stream eof-error-p eof-value t)))))
 
@@ -891,34 +893,81 @@ standard Lisp readtable when NIL."
               (simple-reader-error
                stream "More than one object follows . in list.")))))))
 
+;;; Whether it is permissible to read strings as base-string
+;;; if no extended-chars are present. The system itself prefers this, but
+;;; otherwise it is a contentious issue. We don't (by default) use base-strings,
+;;; so that people can dubiously write:
+;;;   (SETF (CHAR (READ-STRING S) 0) #\PILE_OF_POO),
+;;; which is stupid because it makes an assumption about what READ does.
+#!+sb-unicode
+(defvar *read-prefer-base-string* t)
+(eval-when (:compile-toplevel :execute)
+  (sb!xc:defmacro token-elt-type (flag)
+    (declare (ignorable flag))
+    `(if (and ,flag #!+sb-unicode *read-prefer-base-string*)
+         'base-char
+         'character)))
+
 (defun read-string (stream closech)
   ;; This accumulates chars until it sees same char that invoked it.
-  ;; For a very long string, this could end up bloating the read buffer.
+  ;; We avoid copying any given input character more than twice-
+  ;; once to a temp buffer and then to the result. In the worst case,
+  ;; we can waste space equal the unwasted space, if the final character
+  ;; causes allocation of a new buffer for just that character,
+  ;; because the buffer size is doubled each time it overflows.
+  ;; (Would be better to peek at the frc-buffer if the stream has one.)
+  ;; Scratch vectors are GC-able as soon as this function returns though.
   (declare (character closech))
-  (let ((stream (in-synonym-of stream))
-        (buf *read-buffer*)
-        (rt *readtable*)
-        ;; *read-suppress* => "... macros will not construct any new objects"
-        (suppress *read-suppress*))
-    (reset-read-buffer buf)
-    (macrolet ((scan (read-a-char eofp &optional finish)
-                 `(loop (let ((char ,read-a-char))
-                          (cond (,eofp (error 'end-of-file :stream stream))
-                                ((eql char closech)
-                                 (return ,finish))
-                                ((single-escape-p char rt)
-                                 (setq char ,read-a-char)
-                                 (when ,eofp
-                                   (error 'end-of-file :stream stream))))
+  (macrolet ((scan (read-a-char eofp &optional finish)
+               `(loop (let ((char ,read-a-char))
+                        (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                        (cond (,eofp (error 'end-of-file :stream stream))
+                              ((eql char closech)
+                               (return ,finish))
+                              ((single-escape-p char rt)
+                               (setq char ,read-a-char)
+                               (when ,eofp
+                                 (error 'end-of-file :stream stream))))
+                        (when (>= ptr lim)
                           (unless suppress
-                            (ouch-read-buffer (truly-the character char)
-                                              buf))))))
+                            (push buf chain)
+                            (setq lim (the index (ash lim 1))
+                                  buf (make-array lim :element-type 'character)))
+                          (setq ptr 0))
+                        (setf (schar buf ptr) (truly-the character char))
+                        #!+sb-unicode ; BASE-CHAR-P does not exist if not
+                        (unless (base-char-p char) (setq only-base-chars nil))
+                        (incf ptr)))))
+    (let* ((token-buf *read-buffer*)
+           (buf (token-buf-string token-buf))
+           (rt *readtable*)
+           (stream (in-synonym-of stream))
+           (suppress *read-suppress*)
+           (lim (length buf))
+           (ptr 0)
+           (only-base-chars t)
+           (chain))
+      (declare (type (simple-array character (*)) buf))
+      (reset-read-buffer token-buf)
       (if (ansi-stream-p stream)
           (prepare-for-fast-read-char stream
            (scan (fast-read-char t) nil (done-with-fast-read-char)))
-        ;; CLOS stream
-          (scan (read-char stream nil +EOF+) (eq char +EOF+))))
-    (if suppress "" (copy-token-buf-string buf))))
+          ;; CLOS stream
+          (scan (read-char stream nil +EOF+) (eq char +EOF+)))
+      (if suppress
+          ""
+          (let* ((sum (loop for buf in chain sum (length buf)))
+                 (result
+                  (make-array (+ sum ptr)
+                              :element-type (token-elt-type only-base-chars))))
+            (setq ptr sum)
+            ;; Now work backwards from the end
+            (replace result buf :start1 ptr)
+            (dolist (buf chain result)
+              (declare (type (simple-array character (*)) buf))
+              (let ((len (length buf)))
+                (decf ptr len)
+                (replace result buf :start1 ptr))))))))
 
 (defun read-right-paren (stream ignore)
   (declare (ignore ignore))
@@ -952,37 +1001,32 @@ standard Lisp readtable when NIL."
                  (or (plusp (fill-pointer (token-buf-escapes read-buffer)))
                      seen-multiple-escapes)
                  colon)))
-    (cond ((single-escape-p char rt)
-           ;; It can't be a number, even if it's 1\23.
-           ;; Read next char here, so it won't be casified.
-           (let ((nextchar (read-char stream nil +EOF+)))
-             (if (eq nextchar +EOF+)
-                 (reader-eof-error stream "after escape character")
-                 (ouch-read-buffer-escaped nextchar read-buffer))))
-          ((multiple-escape-p char rt)
-           (setq seen-multiple-escapes t)
-           ;; Read to next multiple-escape, escaping single chars
-           ;; along the way.
-           (loop
-             (let ((ch (read-char stream nil +EOF+)))
-               (cond
-                ((eq ch +EOF+)
-                 (reader-eof-error stream "inside extended token"))
-                ((multiple-escape-p ch rt) (return))
-                ((single-escape-p ch rt)
-                 (let ((nextchar (read-char stream nil +EOF+)))
-                   (if (eq nextchar +EOF+)
-                       (reader-eof-error stream "after escape character")
-                       (ouch-read-buffer-escaped nextchar read-buffer))))
-                (t
-                 (ouch-read-buffer-escaped ch read-buffer))))))
-          (t
-           (when (and (not colon) ; easiest test first
-                      (constituentp char rt)
-                      (eql (get-constituent-trait char)
-                           +char-attr-package-delimiter+))
-             (setq colon t))
-           (ouch-read-buffer char read-buffer)))))
+    (flet ((escape-1-char ()
+             ;; It can't be a number, even if it's 1\23.
+             ;; Read next char here, so it won't be casified.
+             (let ((nextchar (read-char stream nil +EOF+)))
+               (if (eq nextchar +EOF+)
+                   (reader-eof-error stream "after escape character")
+                   (ouch-read-buffer-escaped nextchar read-buffer)))))
+      (cond ((single-escape-p char rt) (escape-1-char))
+            ((multiple-escape-p char rt)
+             (setq seen-multiple-escapes t)
+             ;; Read to next multiple-escape, escaping single chars
+             ;; along the way.
+             (loop
+              (let ((ch (read-char stream nil +EOF+)))
+                (cond ((eq ch +EOF+)
+                       (reader-eof-error stream "inside extended token"))
+                      ((multiple-escape-p ch rt) (return))
+                      ((single-escape-p ch rt) (escape-1-char))
+                      (t (ouch-read-buffer-escaped ch read-buffer))))))
+            (t
+             (when (and (not colon) ; easiest test first
+                        (constituentp char rt)
+                        (eql (get-constituent-trait char)
+                             +char-attr-package-delimiter+))
+               (setq colon t))
+             (ouch-read-buffer char read-buffer))))))
 
 ;;;; character classes
 
@@ -1005,7 +1049,7 @@ standard Lisp readtable when NIL."
 
 ;;; Return the character class for CHAR, which might be part of a
 ;;; rational number.
-(defmacro char-class2 (char attarray atthash)
+(defmacro char-class2 (char attarray atthash read-base)
   `(let ((att (if (typep (truly-the character ,char) 'base-char)
                   (aref ,attarray (char-code ,char))
                   (gethash ,char ,atthash +char-attr-constituent+))))
@@ -1015,7 +1059,7 @@ standard Lisp readtable when NIL."
        ((< att +char-attr-constituent+) att)
        (t (setf att (get-constituent-trait ,char))
           (cond
-            ((digit-char-p ,char *read-base*) +char-attr-constituent-digit+)
+            ((digit-char-p ,char ,read-base) +char-attr-constituent-digit+)
             ((= att +char-attr-constituent-digit+) +char-attr-constituent+)
             ((= att +char-attr-invalid+)
              (simple-reader-error stream "invalid constituent"))
@@ -1024,7 +1068,7 @@ standard Lisp readtable when NIL."
 ;;; Return the character class for a char which might be part of a
 ;;; rational or floating number. (Assume that it is a digit if it
 ;;; could be.)
-(defmacro char-class3 (char attarray atthash)
+(defmacro char-class3 (char attarray atthash read-base)
   `(let ((att (if (typep (truly-the character ,char) 'base-char)
                   (aref ,attarray (char-code ,char))
                   (gethash ,char ,atthash +char-attr-constituent+))))
@@ -1035,15 +1079,15 @@ standard Lisp readtable when NIL."
        (t (setf att (get-constituent-trait ,char))
           (when possibly-rational
             (setq possibly-rational
-                  (or (digit-char-p ,char *read-base*)
+                  (or (digit-char-p ,char ,read-base)
                       (= att +char-attr-constituent-slash+))))
           (when possibly-float
             (setq possibly-float
                   (or (digit-char-p ,char 10)
                       (= att +char-attr-constituent-dot+))))
           (cond
-            ((digit-char-p ,char (max *read-base* 10))
-             (if (digit-char-p ,char *read-base*)
+            ((digit-char-p ,char (max ,read-base 10))
+             (if (digit-char-p ,char ,read-base)
                  (if (= att +char-attr-constituent-expt+)
                      +char-attr-constituent-digit-or-expt+
                      +char-attr-constituent-digit+)
@@ -1066,9 +1110,8 @@ standard Lisp readtable when NIL."
 ;;; Normalize TOKEN-BUF to NFKC, returning a new TOKEN-BUF and the
 ;;; COLON value
 (defun normalize-read-buffer (token-buf &optional colon)
-  (unless (readtable-normalization *readtable*)
-    (return-from normalize-read-buffer (values token-buf colon)))
-  (when (token-buf-only-base-chars token-buf)
+  (when (or (token-buf-only-base-chars token-buf)
+            (not (readtable-normalization *readtable*)))
     (return-from normalize-read-buffer (values token-buf colon)))
   (let ((current-buffer (copy-token-buf-string token-buf))
         (old-escapes (copy-seq (token-buf-escapes token-buf)))
@@ -1183,6 +1226,7 @@ extended <package-name>::<form-in-package> syntax."
     (internal-read-extended-token stream firstchar nil)
     (return-from read-token nil))
   (let* ((rt *readtable*)
+         (base *read-base*)
          (attribute-array (character-attribute-array rt))
          (attribute-hash-table (character-attribute-hash-table rt))
          (buf *read-buffer*)
@@ -1199,7 +1243,7 @@ extended <package-name>::<form-in-package> syntax."
                  `(when (eq (setq char (read-char stream nil +EOF+)) +EOF+)
                     ,what)))
      (prog ((char firstchar))
-      (case (char-class3 char attribute-array attribute-hash-table)
+      (case (char-class3 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-sign+ (go SIGN))
         (#.+char-attr-constituent-digit+ (go LEFTDIGIT))
         (#.+char-attr-constituent-digit-or-expt+
@@ -1219,7 +1263,7 @@ extended <package-name>::<form-in-package> syntax."
       (getchar-or-else (go RETURN-SYMBOL))
       (setq possibly-rational t
             possibly-float t)
-      (case (char-class3 char attribute-array attribute-hash-table)
+      (case (char-class3 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-digit+ (go LEFTDIGIT))
         (#.+char-attr-constituent-digit-or-expt+
          (setq seen-digit-or-expt t)
@@ -1235,7 +1279,7 @@ extended <package-name>::<form-in-package> syntax."
       (ouch-read-buffer char buf)
       (getchar-or-else (return (make-integer)))
       (setq was-possibly-float possibly-float)
-      (case (char-class3 char attribute-array attribute-hash-table)
+      (case (char-class3 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-digit+ (go LEFTDIGIT))
         (#.+char-attr-constituent-decimal-digit+ (if possibly-float
                                                      (go LEFTDECIMALDIGIT)
@@ -1263,7 +1307,7 @@ extended <package-name>::<form-in-package> syntax."
      LEFTDIGIT-OR-EXPT
       (ouch-read-buffer char buf)
       (getchar-or-else (return (make-integer)))
-      (case (char-class3 char attribute-array attribute-hash-table)
+      (case (char-class3 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-digit+ (go LEFTDIGIT))
         (#.+char-attr-constituent-decimal-digit+ (bug "impossible!"))
         (#.+char-attr-constituent-dot+ (go SYMBOL))
@@ -1379,7 +1423,7 @@ extended <package-name>::<form-in-package> syntax."
      RATIO ; saw "[sign] {digit}+ slash"
       (ouch-read-buffer char buf)
       (getchar-or-else (go RETURN-SYMBOL))
-      (case (char-class2 char attribute-array attribute-hash-table)
+      (case (char-class2 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-digit+ (go RATIODIGIT))
         (#.+char-attr-delimiter+ (unread-char char stream) (go RETURN-SYMBOL))
         (#.+char-attr-single-escape+ (go SINGLE-ESCAPE))
@@ -1389,7 +1433,7 @@ extended <package-name>::<form-in-package> syntax."
      RATIODIGIT ; saw "[sign] {digit}+ slash {digit}+"
       (ouch-read-buffer char buf)
       (getchar-or-else (return (make-ratio stream)))
-      (case (char-class2 char attribute-array attribute-hash-table)
+      (case (char-class2 char attribute-array attribute-hash-table base)
         (#.+char-attr-constituent-digit+ (go RATIODIGIT))
         (#.+char-attr-delimiter+
          (unread-char char stream)
@@ -1469,8 +1513,7 @@ extended <package-name>::<form-in-package> syntax."
       (casify-read-buffer buf)
       (setq colons 1)
       (setq package-designator
-            (if (or (plusp (token-buf-fill-ptr *read-buffer*))
-                    seen-multiple-escapes)
+            (if (or (plusp (token-buf-fill-ptr buf)) seen-multiple-escapes)
                 (prog1 (sized-token-buf-string buf)
                   (let ((new (acquire-token-buf)))
                     (setf (token-buf-next new) buf ; new points to old
@@ -1511,27 +1554,28 @@ extended <package-name>::<form-in-package> syntax."
       RETURN-SYMBOL
       (setf buf (normalize-read-buffer buf))
       (casify-read-buffer buf)
-      (let ((pkg (if package-designator
-                     (reader-find-package package-designator stream)
-                     (or *reader-package* (sane-package)))))
-        (if (or (zerop colons) (= colons 2) (eq pkg *keyword-package*))
-            (return (%intern (token-buf-string buf) (token-buf-fill-ptr buf)
-                             pkg t))
-            (multiple-value-bind (symbol accessibility)
-                (%find-symbol (token-buf-string buf) (token-buf-fill-ptr buf)
-                              pkg)
-              (when (eq accessibility :external) (return symbol))
-              (let ((name (copy-token-buf-string buf)))
-                (with-simple-restart (continue "Use symbol anyway.")
-                  (error 'simple-reader-package-error
-                         :package pkg
-                         :stream stream
-                         :format-arguments (list name (package-name pkg))
-                         :format-control
-                         (if accessibility
-                             "The symbol ~S is not external in the ~A package."
-                             "Symbol ~S not found in the ~A package.")))
-                (return (intern name pkg))))))))))
+      (let* ((pkg (if package-designator
+                      (reader-find-package package-designator stream)
+                      (or *reader-package* (sane-package))))
+             (intern-p (or (/= colons 1) (eq pkg *keyword-package*))))
+        (unless intern-p ; Try %FIND-SYMBOL
+          (multiple-value-bind (symbol accessibility)
+              (%find-symbol (token-buf-string buf) (token-buf-fill-ptr buf) pkg)
+            (when (eq accessibility :external) (return symbol))
+            (with-simple-restart (continue "Use symbol anyway.")
+              (error 'simple-reader-package-error
+                     :package pkg
+                     :stream stream
+                     :format-arguments
+                     (list (copy-token-buf-string buf) (package-name pkg))
+                     :format-control
+                     (if accessibility
+                         "The symbol ~S is not external in the ~A package."
+                         "Symbol ~S not found in the ~A package.")))))
+        (return (%intern (token-buf-string buf)
+                         (token-buf-fill-ptr buf)
+                         pkg
+                         (token-elt-type (token-buf-only-base-chars buf)))))))))
 
 ;;; For semi-external use: Return 3 values: the token-buf,
 ;;; a flag for whether there was an escape char, and the position of
@@ -1744,6 +1788,7 @@ extended <package-name>::<form-in-package> syntax."
 ;;;; General reader for dispatch macros
 
 (defun dispatch-char-error (stream sub-char ignore)
+  (declare (optimize allow-non-returning-tail-call))
   (declare (ignore ignore))
   (if *read-suppress*
       (values)
@@ -1805,10 +1850,11 @@ extended <package-name>::<form-in-package> syntax."
   (default to the beginning and end of the string)  It skips over
   whitespace characters and then tries to parse an integer. The
   radix parameter must be between 2 and 36."
-  (macrolet ((parse-error (format-control)
-               `(error 'simple-parse-error
-                       :format-control ,format-control
-                       :format-arguments (list string))))
+  (flet ((parse-error (format-control)
+           (declare (optimize allow-non-returning-tail-call))
+           (error 'simple-parse-error
+                  :format-control format-control
+                  :format-arguments (list string))))
     (with-array-data ((string string :offset-var offset)
                       (start start)
                       (end end)
@@ -1843,7 +1889,7 @@ extended <package-name>::<form-in-package> syntax."
                    (incf index)
                    (when (= index end) (return))
                    (unless (whitespace[1]p (char string index))
-                      (parse-error "junk in string ~S")))
+                     (parse-error "junk in string ~S")))
                   (return nil))
                  (t
                   (parse-error "junk in string ~S"))))
@@ -1862,7 +1908,7 @@ extended <package-name>::<form-in-package> syntax."
   (!cold-init-constituent-trait-table)
   (!cold-init-standard-readtable))
 
-(def!method print-object ((readtable readtable) stream)
+(defmethod print-object ((readtable readtable) stream)
   (print-unreadable-object (readtable stream :identity t :type t)))
 
 ;; Backward-compatibility adapter. The "named-readtables" system in

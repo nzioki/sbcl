@@ -12,7 +12,7 @@
 
 (in-package "SB!VM")
 
-(def!macro !configure-dynamic-space-end (&optional default)
+(defmacro !configure-dynamic-space-end (&optional default)
   (with-open-file (f "output/dynamic-space-size.txt")
     (let ((line (read-line f)))
       (multiple-value-bind (number end)
@@ -20,7 +20,7 @@
         (if number
             (let* ((ext (subseq line end))
                    (mult (cond ((or (zerop (length ext))
-                                    (member ext '("MB MIB") :test #'equalp))
+                                    (member ext '("MB" "MIB") :test #'equalp))
                                 (expt 2 20))
                                ((member ext '("GB" "GIB") :test #'equalp)
                                 (expt 2 30))
@@ -59,15 +59,9 @@
 ;;     happy -- hence the need for an extra `alignment' configuration
 ;;     option below, which parms.lisp can set to #x10000 on Windows.
 ;;
-;; Cosmetic problem:
-;;
-;;     In the interest of readability, &KEY would be much nicer than
-;;     &OPTIONAL.  But is it possible to use keyword arguments to
-;;     DEF!MACRO?
-;;
-(def!macro !gencgc-space-setup
+(defmacro !gencgc-space-setup
     (small-spaces-start
-     &optional dynamic-space-start*
+          &key ((:dynamic-space-start dynamic-space-start*))
                default-dynamic-space-size
                ;; Smallest os_validate()able alignment; used as safepoint
                ;; page size.  Default suitable for POSIX platforms.
@@ -88,24 +82,25 @@
                     (decf end alignment)
                     (setf safepoint-address end))
                   (prog1
-                      `((def!constant ,(symbolicate space "-SPACE-START")
+                      `((defconstant ,(symbolicate space "-SPACE-START")
                             ,ptr)
-                        (def!constant ,(symbolicate space "-SPACE-END")
+                        (defconstant ,(symbolicate space "-SPACE-END")
                             ,(- end margin-size)))
                     (setf ptr next-start)))))
          (safepoint-page-forms
           (list #!+sb-safepoint
-                `(def!constant gc-safepoint-page-addr ,safepoint-address)))
+                `(defconstant gc-safepoint-page-addr ,safepoint-address)))
          (dynamic-space-start* (or dynamic-space-start* ptr))
          (optional-dynamic-space-end
           (when default-dynamic-space-size
             (list (+ dynamic-space-start* default-dynamic-space-size)))))
+    #+ccl safepoint-address ; workaround for incorrect "Unused" warning
     `(progn
        ,@safepoint-page-forms
        ,@small-space-forms
-       (def!constant dynamic-space-start ,dynamic-space-start*)
-       (def!constant dynamic-space-end (!configure-dynamic-space-end
-                                        ,@optional-dynamic-space-end)))))
+       (defconstant dynamic-space-start ,dynamic-space-start*)
+       (defconstant dynamic-space-end (!configure-dynamic-space-end
+                                       ,@optional-dynamic-space-end)))))
 
 (defparameter *c-callable-static-symbols*
   '(sub-gc
@@ -187,6 +182,10 @@
     #!+(and gencgc (not (or x86 x86-64)))
     *pinned-objects*
 
+    ;; for looking up assembler routine by name
+    ;; and patching them on runtime startup
+    sb!fasl::*assembler-routines*
+
     ;; hash table weaknesses
     :key
     :value
@@ -195,13 +194,13 @@
 
 ;;; Number of entries in the thread local storage. Limits the number
 ;;; of symbols with thread local bindings.
-(def!constant tls-size 4096)
+(defconstant tls-size 4096)
 ;;; Refer to the lengthy comment in 'src/runtime/interrupt.h' about
 ;;; the choice of this number. Rather than have to two copies
 ;;; of the comment, please see that file before adjusting this.
-(def!constant max-interrupts 1024)
+(defconstant max-interrupts 1024)
 
 #!+gencgc
 (progn
-  (def!constant +highest-normal-generation+ 5)
-  (def!constant +pseudo-static-generation+ 6))
+  (defconstant +highest-normal-generation+ 5)
+  (defconstant +pseudo-static-generation+ 6))

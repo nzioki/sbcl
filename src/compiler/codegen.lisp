@@ -58,12 +58,6 @@
 (defvar *code-segment* nil)
 (defvar *elsewhere* nil)
 (defvar *elsewhere-label* nil)
-#!+inline-constants
-(progn
-  (defvar *constant-segment* nil)
-  (defvar *constant-table*   nil)
-  (defvar *constant-vector*  nil))
-
 
 ;;;; noise to emit an instruction trace
 
@@ -120,28 +114,102 @@
                                :inst-hook (default-segment-inst-hook)
                                :alignment 0))
   #!+inline-constants
-  (setf *constant-segment*
-        (sb!assem:make-segment :type :elsewhere
-                               :run-scheduler nil
-                               :inst-hook (default-segment-inst-hook)
-                               :alignment 0)
-        *constant-table*  (make-hash-table :test #'equal)
-        *constant-vector* (make-array 16 :adjustable t :fill-pointer 0))
+  (setf *unboxed-constants* (make-unboxed-constants))
   (values))
 
 #!+inline-constants
-(defun emit-inline-constants ()
-  (unless (zerop (length *constant-vector*))
-    (let ((constants (sb!vm:sort-inline-constants *constant-vector*)))
-      (assemble (*constant-segment*)
+(defun emit-inline-constants (&aux (constant-holder *unboxed-constants*)
+                                   (vector (constant-vector constant-holder)))
+  (setf *unboxed-constants* nil)
+  (unless (zerop (length vector))
+    (let ((constants (sb!vm:sort-inline-constants vector)))
+      (assemble ((constant-segment constant-holder))
         (map nil (lambda (constant)
                    (sb!vm:emit-inline-constant (car constant) (cdr constant)))
              constants)))
-    (sb!assem:append-segment *constant-segment* *code-segment*)
-    (setf *code-segment* *constant-segment*))
-  (setf *constant-segment* nil
-        *constant-vector*  nil
-        *constant-table*   nil))
+    (setf *code-segment* (let ((seg (constant-segment constant-holder)))
+                           (sb!assem:append-segment seg *code-segment*)
+                           seg))))
+
+;;; If a constant is already loaded into a register use that register.
+(defun optimize-constant-loads (component)
+  (let* ((register-sb (sb-or-lose 'sb!vm::registers))
+         (loaded-constants
+           (make-array (sb-size register-sb)
+                       :initial-element nil)))
+    (do-ir2-blocks (block component)
+      (fill loaded-constants nil)
+      (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+          ((null vop))
+        (labels ((register-p (tn)
+                   (and (tn-p tn)
+                        (eq (sc-sb (tn-sc tn)) register-sb)))
+                 (constant-eql-p (a b)
+                   (or (eq a b)
+                       (and (eq (sc-name (tn-sc a)) 'constant)
+                            (eq (tn-sc a) (tn-sc b))
+                            (eql (tn-offset a) (tn-offset b)))))
+                 (remove-constant (tn)
+                   (when (register-p tn)
+                     (setf (svref loaded-constants (tn-offset tn)) nil)))
+                 (remove-written-tns ()
+                   (cond ((memq (vop-info-save-p (vop-info vop))
+                                '(t :force-to-stack))
+                          (fill loaded-constants nil))
+                         (t
+                          (do ((ref (vop-results vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-tn ref))
+                            (remove-constant (tn-ref-load-tn ref)))
+                          (do ((ref (vop-temps vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-tn ref)))
+                          (do ((ref (vop-args vop) (tn-ref-across ref)))
+                              ((null ref))
+                            (remove-constant (tn-ref-load-tn ref))))))
+                 (compatible-scs-p (a b)
+                   (or (eql a b)
+                       (and (eq (sc-name a) 'sb!vm::control-stack)
+                            (eq (sc-name b) 'sb!vm::descriptor-reg))
+                       (and (eq (sc-name b) 'sb!vm::control-stack)
+                            (eq (sc-name a) 'sb!vm::descriptor-reg))))
+                 (find-constant-tn (constant sc)
+                   (loop for (saved-constant . tn) across loaded-constants
+                         when (and saved-constant
+                                   (constant-eql-p saved-constant constant)
+                                   (compatible-scs-p (tn-sc tn) sc))
+                         return tn)))
+          (case (vop-name vop)
+            ((move sb!vm::move-arg)
+             (let* ((args (vop-args vop))
+                    (x (tn-ref-tn args))
+                    (y (tn-ref-tn (vop-results vop)))
+                    constant)
+               (cond ((and (eq (vop-name vop) 'move)
+                           (location= x y))
+                      ;; Helps subsequent optimization of adjacent VOPs
+                      (delete-vop vop))
+                     ((or (eq (sc-name (tn-sc x)) 'null)
+                          (not (eq (tn-kind x) :constant)))
+                      (remove-written-tns))
+                     ((setf constant (find-constant-tn x (tn-sc y)))
+                      (when (register-p y)
+                        (setf (svref loaded-constants (tn-offset y))
+                              (cons x y)))
+                      ;; XOR is more compact on x86oids and many
+                      ;; RISCs have a zero register
+                      (unless (and (constant-p (tn-leaf x))
+                                   (eql (tn-value x) 0)
+                                   (register-p y))
+                        (setf (tn-ref-tn args) constant)
+                        (setf (tn-ref-load-tn args) nil)))
+                     ((register-p y)
+                      (setf (svref loaded-constants (tn-offset y))
+                            (cons x y)))
+                     (t
+                      (remove-written-tns)))))
+            (t
+             (remove-written-tns))))))))
 
 (defun generate-code (component)
   (when *compiler-trace-output*
@@ -187,11 +255,19 @@
       (do ((vop (ir2-block-start-vop block) (vop-next vop)))
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
-          (if gen
-            (funcall gen vop)
-            (format t
-                    "missing generator for ~S~%"
-                    (template-name (vop-info vop)))))))
+          (cond ((not gen)
+                 (format t
+                         "missing generator for ~S~%"
+                         (template-name (vop-info vop))))
+                #!+arm64
+                ((and (vop-next vop)
+                      (eq (vop-name vop)
+                          (vop-name (vop-next vop)))
+                      (memq (vop-name vop) '(move move-operand sb!vm::move-arg))
+                      (sb!vm::load-store-two-words vop (vop-next vop)))
+                 (setf vop (vop-next vop)))
+                (t
+                 (funcall gen vop))))))
     (sb!assem:append-segment *code-segment* *elsewhere*)
     (setf *elsewhere* nil)
     #!+inline-constants
@@ -220,8 +296,9 @@
 #!+inline-constants
 (defun register-inline-constant (&rest constant-descriptor)
   (declare (dynamic-extent constant-descriptor))
-  (let ((constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
-    (or (gethash constant *constant-table*)
+  (let ((constants *unboxed-constants*)
+        (constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
+    (or (gethash constant (constant-table constants))
         (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
-          (vector-push-extend (cons constant label) *constant-vector*)
-          (setf (gethash constant *constant-table*) value)))))
+          (vector-push-extend (cons constant label) (constant-vector constants))
+          (setf (gethash constant (constant-table constants)) value)))))

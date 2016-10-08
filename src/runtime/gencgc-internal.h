@@ -42,8 +42,6 @@ int gencgc_handle_wp_violation(void *);
   typedef unsigned short page_bytes_t;
 #endif
 
-typedef char in_use_marker_t;
-
 /* Note that this structure is also used from Lisp-side in
  * src/code/room.lisp, and the Lisp-side structure layout is currently
  * not groveled from C code but hardcoded. Any changes to the
@@ -111,7 +109,7 @@ struct page {
        one.  Might be worth reviting by somebody with lots of platforms
        at hand.
      */
-    signed char has_dontmove_dwords;
+    signed char has_pin_map;
     /* the generation that this page belongs to. This should be valid
      * for all pages that may have objects allocated, even current
      * allocation region pages - this allows the space of an object to
@@ -135,7 +133,7 @@ void gencgc_apply_code_fixups(struct code *old_code, struct code *new_code);
 
 sword_t update_dynamic_space_free_pointer(void);
 void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);
-void gc_alloc_update_all_page_tables(void);
+void gc_alloc_update_all_page_tables(int);
 void gc_set_region_empty(struct alloc_region *region);
 
 /*
@@ -159,7 +157,7 @@ space_matches_p(lispobj obj, generation_index_t space,
     }
 }
 
-static boolean
+static boolean __attribute__((unused))
 from_space_p(lispobj obj)
 {
     extern boolean in_dontmove_nativeptr_p(page_index_t, lispobj*);

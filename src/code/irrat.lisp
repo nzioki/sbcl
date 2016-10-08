@@ -42,6 +42,9 @@
     ((double-float)
      (,function ,var))))
 
+(defun handle-complex (form)
+  `((((foreach (complex double-float) (complex single-float) (complex rational)))
+     ,form)))
 ) ; EVAL-WHEN
 
 #!+x86 ;; for constant folding
@@ -103,7 +106,7 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %exp number)
-    ((complex)
+    (handle-complex
      (* (exp (realpart number))
         (cis (imagpart number))))))
 
@@ -293,9 +296,12 @@
          (real-expt base power 'double-float))
         ;; Handle (expt <complex> <rational>), except the case dealt with
         ;; in the first clause above, (expt <(complex rational)> <integer>).
-        (((foreach (complex rational) (complex single-float)
-                   (complex double-float))
-          rational)
+        (((foreach (complex rational))
+          ratio)
+         (* (expt (abs base) power)
+            (cis (* power (phase base)))))
+        (((foreach (complex single-float) (complex double-float))
+          (foreach fixnum (or bignum ratio)))
          (* (expt (abs base) power)
             (cis (* power (phase base)))))
         ;; The next three clauses handle (expt <real> <complex>).
@@ -415,7 +421,7 @@
   (number-dispatch ((number number))
     (((foreach single-float double-float fixnum rational))
      (abs number))
-    ((complex)
+    (handle-complex
      (let ((rx (realpart number))
            (ix (imagpart number)))
        (etypecase rx
@@ -435,20 +441,20 @@
   For non-complex positive numbers, this is 0. For non-complex negative
   numbers this is PI."
   (declare (explicit-check))
-  (etypecase number
-    (rational
+  (number-dispatch ((number number))
+    ((rational)
      (if (minusp number)
          (coerce pi 'single-float)
          0.0f0))
-    (single-float
+    ((single-float)
      (if (minusp (float-sign number))
          (coerce pi 'single-float)
          0.0f0))
-    (double-float
+    ((double-float)
      (if (minusp (float-sign number))
          (coerce pi 'double-float)
          0.0d0))
-    (complex
+    (handle-complex
      (atan (imagpart number) (realpart number)))))
 
 (defun sin (number)
@@ -457,7 +463,7 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %sin number)
-    ((complex)
+    (handle-complex
      (let ((x (realpart number))
            (y (imagpart number)))
        (complex (* (sin x) (cosh y))
@@ -469,7 +475,7 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %cos number)
-    ((complex)
+    (handle-complex
      (let ((x (realpart number))
            (y (imagpart number)))
        (complex (* (cos x) (cosh y))
@@ -481,14 +487,20 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %tan number)
-    ((complex)
-     (complex-tan number))))
+    (handle-complex
+     ;; tan z = -i * tanh(i*z)
+     (let* ((result (complex-tanh (complex (- (imagpart number))
+                                           (realpart number)))))
+       (complex (imagpart result)
+                (- (realpart result)))))))
 
 (defun cis (theta)
   #!+sb-doc
   "Return cos(Theta) + i sin(Theta), i.e. exp(i Theta)."
-  (declare (type real theta) (explicit-check))
-  (complex (cos theta) (sin theta)))
+  (declare (explicit-check ))
+  (number-dispatch ((theta real))
+    (((foreach single-float double-float rational))
+     (complex (cos theta) (sin theta)))))
 
 (defun asin (number)
   #!+sb-doc
@@ -569,7 +581,7 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %sinh number)
-    ((complex)
+    (handle-complex
      (let ((x (realpart number))
            (y (imagpart number)))
        (complex (* (sinh x) (cos y))
@@ -581,7 +593,7 @@
   (declare (explicit-check))
   (number-dispatch ((number number))
     (handle-reals %cosh number)
-    ((complex)
+    (handle-complex
      (let ((x (realpart number))
            (y (imagpart number)))
        (complex (* (cosh x) (cos y))
@@ -679,10 +691,9 @@
 ;;;;   complex-asin
 ;;;;   complex-asinh
 ;;;;   complex-atan
-;;;;   complex-tan
 ;;;;
 ;;;; utility functions:
-;;;;   scalb logb
+;;;;   logb
 ;;;;
 ;;;; internal functions:
 ;;;;    square coerce-to-complex-type cssqs complex-log-scaled
@@ -726,19 +737,11 @@
   (declare (double-float x))
   (* x x))
 
-;;; original CMU CL comment, apparently re. SCALB and LOGB and
+;;; original CMU CL comment, apparently re. LOGB and
 ;;; perhaps CSSQS:
 ;;;   If you have these functions in libm, perhaps they should be used
 ;;;   instead of these Lisp versions. These versions are probably good
 ;;;   enough, especially since they are portable.
-
-;;; Compute 2^N * X without computing 2^N first. (Use properties of
-;;; the underlying floating-point format.)
-(declaim (inline scalb))
-(defun scalb (x n)
-  (declare (type double-float x)
-           (type double-float-exponent n))
-  (scale-float x n))
 
 ;;; This is like LOGB, but X is not infinity and non-zero and not a
 ;;; NaN, so we can always return an integer.
@@ -797,6 +800,7 @@
 #!+long-float (eval-when (:compile-toplevel :load-toplevel :execute)
                 (error "needs work for long float support"))
 (defun cssqs (z)
+  (declare (muffle-conditions t))
   (let ((x (float (realpart z) 1d0))
         (y (float (imagpart z) 1d0)))
     ;; Would this be better handled using an exception handler to
@@ -833,8 +837,8 @@
               ;; least one is non-zero.. Thus logb returns a nice
               ;; integer.
               (let ((k (- (logb-finite (max (abs x) (abs y))))))
-                (values (+ (square (scalb x k))
-                           (square (scalb y k)))
+                (values (+ (square (scale-float x k))
+                           (square (scale-float y k)))
                         (- k))))
              (t
               (values rho 0)))))))
@@ -858,14 +862,11 @@
           (y (float (imagpart z) 1.0d0))
           (eta 0d0)
           (nu 0d0))
-      (declare (double-float x y eta nu))
-
-      (locally
-         ;; space 0 to get maybe-inline functions inlined.
-         (declare (optimize (speed 3) (space 0)))
-
+      (declare (double-float x y eta nu)
+               ;; get maybe-inline functions inlined.
+               (optimize (space 0)))
       (if (not (float-nan-p x))
-          (setf rho (+ (scalb (abs x) (- k)) (sqrt rho))))
+          (setf rho (+ (scale-float (abs x) (- k)) (sqrt rho))))
 
       (cond ((oddp k)
              (setf k (ash k -1)))
@@ -873,23 +874,24 @@
              (setf k (1- (ash k -1)))
              (setf rho (+ rho rho))))
 
-      (setf rho (scalb (sqrt rho) k))
+      (setf rho (scale-float (sqrt rho) k))
 
       (setf eta rho)
       (setf nu y)
 
       (when (/= rho 0d0)
-            (when (not (float-infinity-p (abs nu)))
-                  (setf nu (/ (/ nu rho) 2d0)))
-            (when (< x 0d0)
-                  (setf eta (abs nu))
-                  (setf nu (float-sign y rho))))
-       (coerce-to-complex-type eta nu z)))))
+        (when (not (float-infinity-p (abs nu)))
+          (setf nu (/ (/ nu rho) 2d0)))
+        (when (< x 0d0)
+          (setf eta (abs nu))
+          (setf nu (float-sign y rho))))
+      (coerce-to-complex-type eta nu z))))
 
 ;;; Compute log(2^j*z).
 ;;;
 ;;; This is for use with J /= 0 only when |z| is huge.
 (defun complex-log-scaled (z j)
+  (declare (muffle-conditions t))
   (declare (type (or rational complex) z)
            (fixnum j))
   ;; The constants t0, t1, t2 should be evaluated to machine
@@ -946,6 +948,7 @@
 ;;; i*y is never 0 since we have positive and negative zeroes. -- rtoy
 ;;; Compute atanh z = (log(1+z) - log(1-z))/2.
 (defun complex-atanh (z)
+  (declare (muffle-conditions t))
   (declare (type (or rational complex) z))
   (let* (;; constants
          (theta (/ (sqrt most-positive-double-float) 4.0d0))
@@ -1003,6 +1006,7 @@
 
 ;;; Compute tanh z = sinh z / cosh z.
 (defun complex-tanh (z)
+  (declare (muffle-conditions t))
   (declare (type (or rational complex) z))
   (let ((x (float (realpart z) 1.0d0))
         (y (float (imagpart z) 1.0d0)))
@@ -1111,16 +1115,5 @@
   ;; atan z = -i * atanh (i*z)
   (let* ((iz (complex (- (imagpart z)) (realpart z)))
          (result (complex-atanh iz)))
-    (complex (imagpart result)
-             (- (realpart result)))))
-
-;;; Compute tan z = -i * tanh(i * z)
-;;;
-;;; Z may be any number, but the result is always a complex.
-(defun complex-tan (z)
-  (declare (type (or rational complex) z))
-  ;; tan z = -i * tanh(i*z)
-  (let* ((iz (complex (- (imagpart z)) (realpart z)))
-         (result (complex-tanh iz)))
     (complex (imagpart result)
              (- (realpart result)))))

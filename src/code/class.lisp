@@ -20,7 +20,8 @@
 ;;; The CLASSOID structure is a supertype of all classoid types.
 ;;; Its definition occurs in 'early-classoid.lisp'
 
-(defun classoid-make-load-form-fun (self)
+(defmethod make-load-form ((self classoid) &optional env)
+  (declare (ignore env))
   (let ((name (classoid-name self)))
     (if (and name (eq (find-classoid name nil) self))
         `(find-classoid ',name)
@@ -57,7 +58,7 @@
 (declaim (inline layout-for-std-class-p))
 (defun layout-for-std-class-p (x) (not (zerop (layout-%for-std-class-b x))))
 
-(def!method print-object ((layout layout) stream)
+(defmethod print-object ((layout layout) stream)
   (print-unreadable-object (layout stream :type t :identity t)
     (format stream
             "for ~S~@[, INVALID=~S~]"
@@ -116,27 +117,25 @@
                   (make-layout :classoid (or classoid (make-undefined-classoid name)))))))))
 
 ;;; If LAYOUT is uninitialized, initialize it with CLASSOID, LENGTH,
-;;; INHERITS, DEPTHOID, and RAW-SLOT-METADATA. Otherwise require
-;;; that it be consistent with the existing values.
+;;; INHERITS, DEPTHOID, and BITMAP.
+;;; Otherwise require that it be consistent with the existing values.
 ;;;
 ;;; UNDEFINED-CLASS values are interpreted specially as "we don't know
 ;;; anything about the class", so if LAYOUT is initialized, any
 ;;; preexisting class slot value is OK, and if it's not initialized,
 ;;; its class slot value is set to an UNDEFINED-CLASS. -- FIXME: This
 ;;; is no longer true, :UNINITIALIZED used instead.
-(declaim (ftype (function (layout classoid index simple-vector layout-depthoid
-                                  layout-raw-slot-metadata-type)
+(declaim (ftype (function (layout classoid index simple-vector layout-depthoid layout-bitmap)
                           layout)
                 %init-or-check-layout))
-(defun %init-or-check-layout
-    (layout classoid length inherits depthoid raw-slot-metadata)
+(defun %init-or-check-layout (layout classoid length inherits depthoid bitmap)
   (cond ((eq (layout-invalid layout) :uninitialized)
          ;; There was no layout before, we just created one which
          ;; we'll now initialize with our information.
          (setf (layout-length layout) length
                (layout-inherits layout) inherits
                (layout-depthoid layout) depthoid
-               (layout-raw-slot-metadata layout) raw-slot-metadata
+               (layout-bitmap layout) bitmap
                (layout-classoid layout) classoid
                (layout-invalid layout) nil))
         ;; FIXME: Now that LAYOUTs are born :UNINITIALIZED, maybe this
@@ -148,8 +147,7 @@
          ;; information, and we'll now check that old information
          ;; which was known with certainty is consistent with current
          ;; information which is known with certainty.
-         (check-layout layout classoid length inherits depthoid
-                       raw-slot-metadata)))
+         (check-layout layout classoid length inherits depthoid bitmap)))
   layout)
 
 ;;; In code for the target Lisp, we don't dump LAYOUTs using the
@@ -159,15 +157,8 @@
 ;;; to special non-ANSI low-level things like special fops, and we
 ;;; don't need to do that anyway because our code isn't going to be
 ;;; cold loaded, so we use the ordinary load form system.
-;;;
-;;; KLUDGE: A special hack causes this not to be called when we are
-;;; building code for the target Lisp. It would be tidier to just not
-;;; have it in place when we're building the target Lisp, but it
-;;; wasn't clear how to do that without rethinking DEF!STRUCT quite a
-;;; bit, so I punted. -- WHN 19990914
 #+sb-xc-host
-(defun make-load-form-for-layout (layout &optional env)
-  (declare (type layout layout))
+(defmethod make-load-form ((layout layout) &optional env)
   (declare (ignore env))
   (when (layout-invalid layout)
     (sb!c::compiler-error "can't dump reference to obsolete class: ~S"
@@ -189,7 +180,8 @@
                              ',(layout-length layout)
                              ',(layout-inherits layout)
                              ',(layout-depthoid layout)
-                             ',(layout-raw-slot-metadata layout)))))
+                             ',(layout-bitmap layout)))))
+(!set-load-form-method layout (:xc :target) :ignore-it)
 
 ;;; If LAYOUT's slot values differ from the specified slot values in
 ;;; any interesting way, then give a warning and return T.
@@ -199,11 +191,10 @@
                            index
                            simple-vector
                            layout-depthoid
-                           layout-raw-slot-metadata-type))
+                           layout-bitmap))
                 redefine-layout-warning))
 (defun redefine-layout-warning (old-context old-layout
-                                context length inherits depthoid
-                                raw-slot-metadata)
+                                context length inherits depthoid bitmap)
   (declare (type layout old-layout) (type simple-string old-context context))
   (let ((name (layout-proper-name old-layout))
         (old-inherits (layout-inherits old-layout)))
@@ -236,16 +227,8 @@
                   old-context old-length
                   context length)
             t))
-        (let ((old-metadata (layout-raw-slot-metadata old-layout)))
-          (unless (= old-metadata raw-slot-metadata)
-            #!-interleaved-raw-slots
-            (warn "change in instance layout of class ~S:~%  ~
-                   ~A untagged slots: ~W~%  ~
-                   ~A untagged slots: ~W"
-                  name
-                  old-context old-metadata
-                  context raw-slot-metadata)
-            #!+interleaved-raw-slots
+        (let ((old-bitmap (layout-bitmap old-layout)))
+          (unless (= old-bitmap bitmap)
             (warn "change in placement of raw slots of class ~S ~
 between the ~A definition and the ~A definition"
                   name old-context context)
@@ -257,16 +240,13 @@ between the ~A definition and the ~A definition"
           t))))
 
 ;;; Require that LAYOUT data be consistent with CLASSOID, LENGTH,
-;;; INHERITS, DEPTHOID, and RAW-SLOT-METADATA.
-(declaim (ftype (function
-                 (layout classoid index simple-vector layout-depthoid
-                         layout-raw-slot-metadata-type))
+;;; INHERITS, DEPTHOID, and BITMAP.
+(declaim (ftype (function (layout classoid index simple-vector layout-depthoid layout-bitmap))
                 check-layout))
-(defun check-layout (layout classoid length inherits depthoid raw-slot-metadata)
+(defun check-layout (layout classoid length inherits depthoid bitmap)
   (aver (eq (layout-classoid layout) classoid))
   (when (redefine-layout-warning "current" layout
-                                 "compile time" length inherits depthoid
-                                 raw-slot-metadata)
+                                 "compile time" length inherits depthoid bitmap)
     ;; Classic CMU CL had more options here. There are several reasons
     ;; why they might want more options which are less appropriate for
     ;; us: (1) It's hard to fit the classic CMU CL flexible approach
@@ -290,11 +270,10 @@ between the ~A definition and the ~A definition"
 ;;; Used by the loader to forward-reference layouts for classes whose
 ;;; definitions may not have been loaded yet. This allows type tests
 ;;; to be loaded when the type definition hasn't been loaded yet.
-(declaim (ftype (function (symbol index simple-vector layout-depthoid
-                                  layout-raw-slot-metadata-type)
+(declaim (ftype (function (symbol index simple-vector layout-depthoid layout-bitmap)
                           layout)
                 find-and-init-or-check-layout))
-(defun find-and-init-or-check-layout (name length inherits depthoid metadata)
+(defun find-and-init-or-check-layout (name length inherits depthoid bitmap)
   (truly-the ; avoid an "assertion too complex to check" optimizer note
    (values layout &optional)
    (with-world-lock ()
@@ -305,7 +284,7 @@ between the ~A definition and the ~A definition"
                              length
                              inherits
                              depthoid
-                             metadata)))))
+                             bitmap)))))
 
 ;;; Record LAYOUT as the layout for its class, adding it as a subtype
 ;;; of all superclasses. This is the operation that "installs" a
@@ -352,8 +331,7 @@ between the ~A definition and the ~A definition"
                 (layout-inherits destruct-layout) (layout-inherits layout)
                 (layout-depthoid destruct-layout) (layout-depthoid layout)
                 (layout-length destruct-layout) (layout-length layout)
-                (layout-raw-slot-metadata destruct-layout)
-                (layout-raw-slot-metadata layout)
+                (layout-bitmap destruct-layout) (layout-bitmap layout)
                 (layout-info destruct-layout) (layout-info layout)
                 (classoid-layout classoid) destruct-layout)
           (setf (layout-invalid layout) nil
@@ -562,10 +540,11 @@ between the ~A definition and the ~A definition"
                    (warn "Changing meta-class of ~S from ~S to ~S."
                          name (classoid-name old) (classoid-name new))))))
             (:primitive
-             (error "Cannot redefine standard type ~S." name))
+             (error "Cannot redefine standard type ~
+                     ~/sb!impl:print-type-specifier/." name))
             (:defined
              (warn "redefining DEFTYPE type to be a class: ~
-                    ~/sb-impl::print-symbol-with-prefix/" name)
+                    ~/sb!impl::print-symbol-with-prefix/" name)
              (clear-info :type :expander name)
              (clear-info :type :source-location name)))
 
@@ -601,7 +580,8 @@ between the ~A definition and the ~A definition"
       ((nil))
       (:defined)
       (:primitive
-       (error "Attempt to remove :PRIMITIVE type: ~S" name))
+       (error "Attempt to remove :PRIMITIVE type: ~
+              ~/sb!impl:print-type-specifier/" name))
       ((:forthcoming-defclass-type :instance)
        (when cell
          ;; Note: We cannot remove the classoid cell from the table,
@@ -670,6 +650,15 @@ between the ~A definition and the ~A definition"
   (defun classoid-enumerable-p (x) (eq (classoid-name x) 'character)))
 (!define-type-class classoid :enumerable #'classoid-enumerable-p
                     :might-contain-other-types nil)
+
+(defun classoid-inherits-from (sub super-or-name)
+  (declare (type classoid sub)
+           (type (or symbol classoid) super-or-name))
+  (let ((super (if (symbolp super-or-name)
+                   (find-classoid super-or-name)
+                   super-or-name)))
+    (find (classoid-layout super)
+          (layout-inherits (classoid-layout sub)))))
 
 ;;; We might be passed classoids with invalid layouts; in any pairwise
 ;;; class comparison, we must ensure that both are valid before
@@ -790,6 +779,15 @@ between the ~A definition and the ~A definition"
           ((eq (classoid-state class2) :sealed)
            ;; checking whether a subclass of both can be defined:
            (sealed-class-intersection2 class2 class1))
+          ;; If exactly one of CLASS{1,2} is a CONDITION-CLASSOID,
+          ;; there can be no intersection: sub-/superclass relations
+          ;; between CONDITION-CLASSOIDs and other CLASSOIDs are not
+          ;; possible and a CONDITION-CLASSOIDs cannot be changed into
+          ;; different CLASSOIDs.
+          ((let ((c1 (condition-classoid-p class1))
+                 (c2 (condition-classoid-p class2)))
+             (or (and c1 (not c2)) (and (not c1) c2)))
+           *empty-type*)
           (t
            ;; uncertain, since a subclass of both might be defined
            nil))))
@@ -798,9 +796,15 @@ between the ~A definition and the ~A definition"
 ;;; FUNCALLABLE-INSTANCE types (which used to be CLASSOIDs until CSR
 ;;; discovered that this was incompatible with the MOP class
 ;;; hierarchy).  See NAMED :COMPLEX-SUBTYPEP-ARG2
-(defvar *non-instance-classoid-types*
+(declaim (type cons **non-instance-classoid-types**))
+(defglobal **non-instance-classoid-types**
   '(symbol system-area-pointer weak-pointer code-component
     lra fdefn random-class))
+
+(defun classoid-non-instance-p (classoid)
+  (declare (type classoid classoid))
+  (member classoid **non-instance-classoid-types**
+          :key #'find-classoid))
 
 ;;; KLUDGE: we need this because of the need to represent
 ;;; intersections of two classes, even when empty at a given time, as
@@ -1219,21 +1223,29 @@ between the ~A definition and the ~A definition"
                                      (list (car inherits))
                                      '(t))))
         x
-      (declare (ignore codes state translation prototype-form)
-               (notinline info (setf info)))
+      (declare (ignore codes state translation prototype-form))
       (let ((inherits-list (if (eq name t)
                                ()
                                (cons t (reverse inherits))))
-            (classoid (make-built-in-classoid
-                       :name name
-                       :translation (if trans-p :initializing nil)
-                       :direct-superclasses
-                       (if (eq name t)
-                           nil
-                           (mapcar #'find-classoid direct-superclasses)))))
-        (mark-ctype-interned classoid)
-        (setf (info :type :kind name) :primitive
-              (classoid-cell-classoid (find-classoid-cell name :create t)) classoid)
+            (classoid
+             (acond #+sb-xc ; genesis dumps some classoid literals
+                    ((find-classoid name nil)
+                     ;; Unseal it so that REGISTER-LAYOUT doesn't warn
+                     (setf (classoid-state it) nil)
+                     it)
+                    (t
+                     (setf (classoid-cell-classoid
+                            (find-classoid-cell name :create t))
+                           (mark-ctype-interned
+                            (make-built-in-classoid
+                             :name name
+                             :translation (if trans-p :initializing nil)
+                             :direct-superclasses
+                             (if (eq name t)
+                                 nil
+                                 (mapcar #'find-classoid
+                                         direct-superclasses)))))))))
+        (setf (info :type :kind name) :primitive)
         (unless trans-p
           (setf (info :type :builtin name) classoid))
         (let* ((inherits-vector
@@ -1253,7 +1265,7 @@ between the ~A definition and the ~A definition"
                                           0
                                           inherits-vector
                                           depthoid
-                                          0)
+                                          +layout-all-tagged+)
            :invalidate nil)))))
   (/show0 "done with loop over *!BUILT-IN-CLASSES*"))
 
@@ -1299,7 +1311,8 @@ between the ~A definition and the ~A definition"
                              (classoid-layout (find-classoid x)))
                            inherits-list)))
         #-sb-xc-host (/show0 "INHERITS=..") #-sb-xc-host (/hexstr inherits)
-        (register-layout (find-and-init-or-check-layout name 0 inherits -1 0)
+        (register-layout (find-and-init-or-check-layout name 0 inherits
+                                                        -1 +layout-all-tagged+)
                          :invalidate nil))))
   (/show0 "done defining temporary STANDARD-CLASSes"))
 
@@ -1318,11 +1331,9 @@ between the ~A definition and the ~A definition"
 #-sb-xc-host
 (defun %modify-classoid (classoid)
   (clear-type-caches)
-  (when (member (classoid-state classoid) '(:read-only :frozen))
+  (awhen (classoid-state classoid)
     ;; FIXME: This should probably be CERROR.
-    (warn "making ~(~A~) class ~S writable"
-          (classoid-state classoid)
-          (classoid-name classoid))
+    (warn "making ~(~A~) class ~S writable" it (classoid-name classoid))
     (setf (classoid-state classoid) nil)))
 
 ;;; Mark LAYOUT as invalid. Setting DEPTHOID -1 helps cause unsafe

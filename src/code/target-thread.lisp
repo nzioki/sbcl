@@ -175,7 +175,7 @@ exited. The offending thread can be accessed using THREAD-ERROR-THREAD."))
  "Name of the thread. Can be assigned to using SETF. Thread names can be
 arbitrary printable objects, and need not be unique.")
 
-(def!method print-object ((thread thread) stream)
+(defmethod print-object ((thread thread) stream)
   (print-unreadable-object (thread stream :type t :identity t)
     (let* ((cookie (list thread))
            (info (if (thread-alive-p thread)
@@ -214,7 +214,7 @@ arbitrary printable objects, and need not be unique.")
           (format stream "~@[~S ~]~2I~_owner: ~S" name owner)
           (format stream "~@[~S ~](free)" name)))))
 
-(def!method print-object ((mutex mutex) stream)
+(defmethod print-object ((mutex mutex) stream)
   (print-lock mutex (mutex-name mutex) (mutex-owner mutex) stream))
 
 (defun thread-alive-p (thread)
@@ -251,6 +251,33 @@ potentially stale even before the function returns, as new threads may be
 created and old ones may exit at any time."
   (with-all-threads-lock
     (copy-list *all-threads*)))
+
+;;; used by debug-int.lisp to access interrupt contexts
+
+;;; The two uses immediately below of (unsigned-byte 27) are arbitrary,
+;;; as a more reasonable type restriction is an integer from 0 to
+;;;  (+ (primitive-object-size
+;;;      (find 'thread *primitive-objects* :key #'primitive-object-name))
+;;;     MAX-INTERRUPTS) ; defined only for C in 'interrupt.h'
+;;;
+;;; The x86 32-bit port is helped slightly by having a stricter constraint
+;;; than the (unsigned-byte 32) from its DEFKNOWN of this function.
+;;; Ideally a single defknown would work for any backend because the thread
+;;; structure is, after all, defined in the generic objdefs. But the VM needs
+;;; the defknown before the VOP, and this file comes too late, so we'd
+;;; need to pick some other place - maybe 'thread.lisp'?
+
+#!-(or sb-fluid sb-thread) (declaim (inline sb!vm::current-thread-offset-sap))
+#!-sb-thread
+(defun sb!vm::current-thread-offset-sap (n)
+  (declare (type (unsigned-byte 27) n))
+  (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
+               (* n sb!vm:n-word-bytes)))
+
+#!+sb-thread
+(defun sb!vm::current-thread-offset-sap (n)
+  (declare (type (unsigned-byte 27) n))
+  (sb!vm::current-thread-offset-sap n))
 
 (declaim (inline current-thread-sap))
 (defun current-thread-sap ()
@@ -395,34 +422,6 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
     (define-alien-routine "futex_wake"
         int (word unsigned) (n unsigned-long))))
 
-;;; used by debug-int.lisp to access interrupt contexts
-
-;;; The two uses immediately below of (unsigned-byte 27) are arbitrary,
-;;; as a more reasonable type restriction is an integer from 0 to
-;;;  (+ (primitive-object-size
-;;;      (find 'thread *primitive-objects* :key #'primitive-object-name))
-;;;     MAX-INTERRUPTS) ; defined only for C in 'interrupt.h'
-;;;
-;;; The x86 32-bit port is helped slightly by having a stricter constraint
-;;; than the (unsigned-byte 32) from its DEFKNOWN of this function.
-;;; Ideally a single defknown would work for any backend because the thread
-;;; structure is, after all, defined in the generic objdefs. But the VM needs
-;;; the defknown before the VOP, and this file comes too late, so we'd
-;;; need to pick some other place - maybe 'thread.lisp'?
-
-#!-(or sb-fluid sb-thread) (declaim (inline sb!vm::current-thread-offset-sap))
-#!-sb-thread
-(defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (unsigned-byte 27) n))
-  (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
-               (* n sb!vm:n-word-bytes)))
-
-#!+sb-thread
-(defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (unsigned-byte 27) n))
-  (sb!vm::current-thread-offset-sap n))
-
-
 (defmacro with-deadlocks ((thread lock &optional (timeout nil timeoutp)) &body forms)
   (with-unique-names (n-thread n-lock new n-timeout)
     `(let* ((,n-thread ,thread)
@@ -459,9 +458,10 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 
 #!+(and sb-thread sb-futex)
 (progn
-  (define-structure-slot-addressor mutex-state-address
-      :structure mutex
-      :slot state)
+  (locally (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
+    (define-structure-slot-addressor mutex-state-address
+        :structure mutex
+        :slot state))
   ;; Important: current code assumes these are fixnums or other
   ;; lisp objects that don't need pinning.
   (defconstant +lock-free+ 0)
@@ -655,6 +655,7 @@ HOLDING-MUTEX-P."
 
 #!+sb-thread
 (defun %wait-for-mutex (mutex self timeout to-sec to-usec stop-sec stop-usec deadlinep)
+  (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
   (with-deadlocks (self mutex timeout)
     (with-interrupts (check-deadlock))
     (tagbody
@@ -817,7 +818,7 @@ IF-NOT-OWNER is :FORCE)."
                (decf n)))
     nil))
 
-(def!method print-object ((waitqueue waitqueue) stream)
+(defmethod print-object ((waitqueue waitqueue) stream)
   (print-unreadable-object (waitqueue stream :type t :identity t)
     (format stream "~@[~A~]" (waitqueue-name waitqueue))))
 
@@ -828,9 +829,10 @@ IF-NOT-OWNER is :FORCE)."
       "Create a waitqueue.")
 
 #!+(and sb-thread sb-futex)
-(define-structure-slot-addressor waitqueue-token-address
-    :structure waitqueue
-    :slot token)
+(locally (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
+  (define-structure-slot-addressor waitqueue-token-address
+      :structure waitqueue
+      :slot token))
 
 (declaim (inline %condition-wait))
 (defun %condition-wait (queue mutex
@@ -984,8 +986,9 @@ around the call, checking the the associated data:
   (locally (declare (inline %condition-wait))
     (multiple-value-bind (to-sec to-usec stop-sec stop-usec deadlinep)
         (decode-timeout timeout)
-      (%condition-wait queue mutex timeout
-                       to-sec to-usec stop-sec stop-usec deadlinep))))
+      (values
+       (%condition-wait queue mutex timeout
+                        to-sec to-usec stop-sec stop-usec deadlinep)))))
 
 (defun condition-notify (queue &optional (n 1))
   #!+sb-doc
@@ -1595,7 +1598,7 @@ supplied, return two values: 1) DEFAULT 2) :TIMEOUT. If DEFAULT is not
 supplied, signal a JOIN-THREAD-ERROR with JOIN-THREAD-PROBLEM equal
 to :TIMEOUT.
 
-If THREAD did not exit normally (i.e. aborted) and DEFAULT is
+If THREAD does not exit normally (i.e. aborted) and DEFAULT is
 supplied, return two values: 1) DEFAULT 2) :ABORT. If DEFAULT is not
 supplied, signal a JOIN-THREAD-ERROR with JOIN-THREAD-PROBLEM equal
 to :ABORT.
@@ -1603,8 +1606,8 @@ to :ABORT.
 If THREAD is the current thread, signal a JOIN-THREAD-ERROR with
 JOIN-THREAD-PROBLEM equal to :SELF-JOIN.
 
-Trying to join the main thread will cause JOIN-THREAD to block until
-TIMEOUT occurs or the process exits: when main thread exits, the
+Trying to join the main thread causes JOIN-THREAD to block until
+TIMEOUT occurs or the process exits: when the main thread exits, the
 entire process exits.
 
 NOTE: Return convention in case of a timeout is experimental and

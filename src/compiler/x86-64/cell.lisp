@@ -30,20 +30,12 @@
   (:results)
   (:generator 1
     (if (sc-is value immediate)
-        (let ((val (tn-value value)))
-          (move-immediate (make-ea :qword
-                                   :base object
-                                   :disp (- (* offset n-word-bytes)
-                                            lowtag))
-                          (etypecase val
-                            (integer
-                             (fixnumize val))
-                            (symbol
-                             (+ nil-value (static-symbol-offset val)))
-                            (character
-                             (logior (ash (char-code val) n-widetag-bits)
-                                     character-widetag)))
-                          temp))
+        (move-immediate (make-ea :qword
+                                 :base object
+                                 :disp (- (* offset n-word-bytes)
+                                          lowtag))
+                        (encode-value-if-immediate value)
+                        temp)
         ;; Else, value not immediate.
         (storew value object offset lowtag))))
 
@@ -350,7 +342,7 @@
                             fun-pointer-lowtag)))
     (inst cmp (reg-in-size type :byte) simple-fun-header-widetag)
     (inst jmp :e NORMAL-FUN)
-    (inst mov raw (make-fixup "closure_tramp" :foreign))
+    (inst mov raw (make-fixup 'closure-tramp :assembly-routine))
     NORMAL-FUN
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
     (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
@@ -363,7 +355,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
-    (storew (make-fixup "undefined_tramp" :foreign)
+    (storew (make-fixup 'undefined-tramp :assembly-routine)
             fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
@@ -376,10 +368,9 @@
 
 #!+sb-thread
 (progn
-(define-vop (bind)
+(define-vop (dynbind) ; bind a symbol in a PROGV form
   (:args (val :scs (any-reg descriptor-reg))
-         (symbol :scs (descriptor-reg) :target tmp
-                 :to :load))
+         (symbol :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset rax-offset) tls-index)
   (:temporary (:sc unsigned-reg) bsp tmp)
   (:generator 10
@@ -398,12 +389,7 @@
     (storew tls-index bsp (- binding-symbol-slot binding-size))
     (inst mov (make-ea :qword :base thread-base-tn :index tls-index) val)))
 
-;; Nikodemus hypothetically terms the above VOP DYNBIND (in x86/cell.lisp)
-;; with this "new" one being BIND, but to re-purpose concepts in that way
-;; - though it be rational - is fraught with peril.
-;; So BIND/LET is for (LET ((*a-special* ...)))
-;;
-(define-vop (bind/let)
+(define-vop (bind) ; bind a known symbol
   (:args (val :scs (any-reg descriptor-reg)))
   (:temporary (:sc unsigned-reg) bsp tmp)
   (:info symbol)
@@ -424,16 +410,10 @@
       ;; a REX prefix if 'bsp' happens to be any of the low 8 registers.
       (inst mov (make-ea :dword :base bsp
                          :disp (ash binding-symbol-slot word-shift)) tls-index)
-      (inst mov tls-cell val))
-    ;; Emission of this VOP informs the compiler that later SYMBOL-VALUE calls
-    ;; should use a load-time constant displacement to the TLS for this symbol.
-    (unless (info :variable :wired-tls symbol)
-      ;; setting INFO is inefficient when done repeatedly for no reason.
-      ;; (I should fix that)
-      (setf (info :variable :wired-tls symbol) :always-has-tls)))))
+      (inst mov tls-cell val)))))
 
 #!-sb-thread
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp bsp)
@@ -449,20 +429,24 @@
 #!+sb-thread
 (define-vop (unbind)
   (:temporary (:sc unsigned-reg) temp bsp tls-index)
+  (:temporary (:sc complex-double-reg) zero)
+  (:info n)
   (:generator 0
     (load-binding-stack-pointer bsp)
-    (inst sub bsp (* binding-size n-word-bytes))
-    ;; Load TLS-INDEX of the SYMBOL from stack
-    (loadw tls-index bsp binding-symbol-slot)
-    ;; Load VALUE from stack, then restore it to the TLS area.
-    (loadw temp bsp binding-value-slot)
-    (inst mov (make-ea :qword :base thread-base-tn :index tls-index)
-          temp)
-    ;; Zero out the stack.
-    (zeroize temp)
+    (inst xorpd zero zero)
+    (loop repeat n
+          do
+          (inst sub bsp (* binding-size n-word-bytes))
+          ;; Load TLS-INDEX of the SYMBOL from stack
+          (inst mov (reg-in-size tls-index :dword)
+                (make-ea :dword :base bsp :disp (* binding-symbol-slot n-word-bytes)))
 
-    (storew temp bsp binding-symbol-slot)
-    (storew temp bsp binding-value-slot)
+          ;; Load VALUE from stack, then restore it to the TLS area.
+          (loadw temp bsp binding-value-slot)
+          (inst mov (make-ea :qword :base thread-base-tn :index tls-index)
+                temp)
+          ;; Zero out the stack.
+          (inst movapd (make-ea :qword :base bsp) zero))
     (store-binding-stack-pointer bsp)))
 
 #!-sb-thread
@@ -480,17 +464,26 @@
 
 (define-vop (unbind-to-here)
   (:args (where :scs (descriptor-reg any-reg)))
-  (:temporary (:sc unsigned-reg) symbol value bsp zero)
+  (:temporary (:sc unsigned-reg) symbol value bsp)
+  (:temporary (:sc complex-double-reg) zero)
   (:generator 0
     (load-binding-stack-pointer bsp)
     (inst cmp where bsp)
     (inst jmp :e DONE)
-    (zeroize zero)
+    (inst xorpd zero zero)
     LOOP
     (inst sub bsp (* binding-size n-word-bytes))
-    ;; on sb-thread symbol is actually a tls-index
-    (loadw symbol bsp binding-symbol-slot)
-    (inst test symbol symbol)
+    ;; on sb-thread symbol is actually a tls-index, and it fits into
+    ;; 32-bits.
+    #!+sb-thread
+    (let ((tls-index (reg-in-size symbol :dword)))
+      (inst mov tls-index
+            (make-ea :dword :base bsp :disp (* binding-symbol-slot n-word-bytes)))
+      (inst test tls-index tls-index))
+    #!-sb-thread
+    (progn
+      (loadw symbol bsp binding-symbol-slot)
+      (inst test symbol symbol))
     (inst jmp :z SKIP)
     (loadw value bsp binding-value-slot)
     #!-sb-thread
@@ -498,10 +491,9 @@
     #!+sb-thread
     (inst mov (make-ea :qword :base thread-base-tn :index symbol)
           value)
-    (storew zero bsp binding-symbol-slot)
 
     SKIP
-    (storew zero bsp binding-value-slot)
+    (inst movapd (make-ea :qword :base bsp) zero)
 
     (inst cmp where bsp)
     (inst jmp :ne LOOP)
@@ -578,351 +570,113 @@
 
 ;;;; raw instance slot accessors
 
-(defun make-ea-for-raw-slot (object index)
-  (etypecase index
-    (integer
-       (make-ea :qword
-                :base object
-                :disp (+ (* (+ instance-slots-offset index)
-                            n-word-bytes)
-                         (- instance-pointer-lowtag))))
-    (tn
-       (make-ea :qword
-                :base object
-                :index index
-                :scale (ash 1 (- word-shift n-fixnum-tag-bits))
-                :disp (+ (* instance-slots-offset n-word-bytes)
-                         (- instance-pointer-lowtag))))))
+(flet ((make-ea-for-raw-slot (object index)
+         (etypecase index
+           (integer
+              (make-ea :qword
+                       :base object
+                       :disp (+ (* (+ instance-slots-offset index) n-word-bytes)
+                                (- instance-pointer-lowtag))))
+           (tn
+              (make-ea :qword
+                       :base object
+                       :index index
+                       :scale (ash 1 (- word-shift n-fixnum-tag-bits))
+                       :disp (+ (* instance-slots-offset n-word-bytes)
+                                (- instance-pointer-lowtag)))))))
+  (macrolet
+      ((def (suffix result-sc result-type inst &optional (inst/c inst))
+         `(progn
+            (define-vop (,(symbolicate "RAW-INSTANCE-REF/" suffix))
+              (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
+              (:policy :fast-safe)
+              (:args (object :scs (descriptor-reg)) (index :scs (any-reg)))
+              (:arg-types * tagged-num)
+              (:results (value :scs (,result-sc)))
+              (:result-types ,result-type)
+              (:generator 5
+                (inst ,inst value (make-ea-for-raw-slot object index))))
+            (define-vop (,(symbolicate "RAW-INSTANCE-REF-C/" suffix))
+              (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
+              (:policy :fast-safe)
+              (:args (object :scs (descriptor-reg)))
+              ;; Why are we pedantic about the index constraint here
+              ;; if we're not equally so in the init vop?
+              (:arg-types * (:constant (load/store-index #.n-word-bytes
+                                                         #.instance-pointer-lowtag
+                                                         #.instance-slots-offset)))
+              (:info index)
+              (:results (value :scs (,result-sc)))
+              (:result-types ,result-type)
+              (:generator 4
+                (inst ,inst/c value (make-ea-for-raw-slot object index))))
+            (define-vop (,(symbolicate "RAW-INSTANCE-SET/" suffix))
+              (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
+              (:policy :fast-safe)
+              (:args (object :scs (descriptor-reg))
+                     (index :scs (any-reg))
+                     (value :scs (,result-sc) :target result))
+              (:arg-types * tagged-num ,result-type)
+              (:results (result :scs (,result-sc)))
+              (:result-types ,result-type)
+              (:generator 5
+                (inst ,inst (make-ea-for-raw-slot object index) value)
+                (move result value)))
+            (define-vop (,(symbolicate "RAW-INSTANCE-SET-C/" suffix))
+              (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
+              (:policy :fast-safe)
+              (:args (object :scs (descriptor-reg))
+                     (value :scs (,result-sc) :target result))
+              (:arg-types * (:constant (load/store-index #.n-word-bytes
+                                                         #.instance-pointer-lowtag
+                                                         #.instance-slots-offset))
+                          ,result-type)
+              (:info index)
+              (:results (result :scs (,result-sc)))
+              (:result-types ,result-type)
+              (:generator 4
+                (inst ,inst/c (make-ea-for-raw-slot object index) value)
+                (move result value)))
+            (define-vop (,(symbolicate "RAW-INSTANCE-INIT/" suffix))
+              (:args (object :scs (descriptor-reg))
+                     (value :scs (,result-sc)))
+              (:arg-types * ,result-type)
+              (:info index)
+              (:generator 4
+                (inst ,inst/c (make-ea-for-raw-slot object index) value))))))
+    (def word unsigned-reg unsigned-num mov)
+    (def signed-word signed-reg signed-num mov)
+    (def single single-reg single-float movss)
+    (def double double-reg double-float movsd)
+    (def complex-single complex-single-reg complex-single-float movq)
+    (def complex-double complex-double-reg complex-double-float
+         movupd (if (oddp index) 'movapd 'movupd)))
 
-(define-vop (raw-instance-ref/word)
-  (:translate %raw-instance-ref/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)) (index :scs (any-reg)))
-  (:arg-types * tagged-num)
-  (:results (value :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 5
-    (inst mov value (make-ea-for-raw-slot object index))))
+  (define-vop (raw-instance-atomic-incf/word)
+    (:translate %raw-instance-atomic-incf/word)
+    (:policy :fast-safe)
+    (:args (object :scs (descriptor-reg))
+           (index :scs (any-reg))
+           (diff :scs (unsigned-reg) :target result))
+    (:arg-types * tagged-num unsigned-num)
+    (:results (result :scs (unsigned-reg)))
+    (:result-types unsigned-num)
+    (:generator 5
+      (inst xadd (make-ea-for-raw-slot object index) diff :lock)
+      (move result diff)))
 
-(define-vop (raw-instance-ref-c/word)
-  (:translate %raw-instance-ref/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset)))
-  (:info index)
-  (:results (value :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 4
-    (inst mov value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-set/word)
-  (:translate %raw-instance-set/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (unsigned-reg) :target result))
-  (:arg-types * tagged-num unsigned-num)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 5
-    (inst mov (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-set-c/word)
-  (:translate %raw-instance-set/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (unsigned-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              unsigned-num)
-  (:info index)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 4
-    (inst mov (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-init/word)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (unsigned-reg)))
-  (:arg-types * unsigned-num)
-  (:info index)
-  (:generator 4
-    (inst mov (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-atomic-incf/word)
-  (:translate %raw-instance-atomic-incf/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (diff :scs (unsigned-reg) :target result))
-  (:arg-types * tagged-num unsigned-num)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 5
-    (inst xadd (make-ea-for-raw-slot object index) diff :lock)
-    (move result diff)))
-
-(define-vop (raw-instance-atomic-incf-c/word)
-  (:translate %raw-instance-atomic-incf/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (diff :scs (unsigned-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              unsigned-num)
-  (:info index)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num)
-  (:generator 4
-    (inst xadd (make-ea-for-raw-slot object index) diff :lock)
-    (move result diff)))
-
-(define-vop (raw-instance-ref/single)
-  (:translate %raw-instance-ref/single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types * positive-fixnum)
-  (:results (value :scs (single-reg)))
-  (:result-types single-float)
-  (:generator 5
-    (inst movss value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-ref-c/single)
-  (:translate %raw-instance-ref/single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset)))
-  (:info index)
-  (:results (value :scs (single-reg)))
-  (:result-types single-float)
-  (:generator 4
-    (inst movss value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-set/single)
-  (:translate %raw-instance-set/single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (single-reg) :target result))
-  (:arg-types * positive-fixnum single-float)
-  (:results (result :scs (single-reg)))
-  (:result-types single-float)
-  (:generator 5
-    (inst movss (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-set-c/single)
-  (:translate %raw-instance-set/single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (single-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              single-float)
-  (:info index)
-  (:results (result :scs (single-reg)))
-  (:result-types single-float)
-  (:generator 4
-    (inst movss (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-init/single)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (single-reg)))
-  (:arg-types * single-float)
-  (:info index)
-  (:generator 4
-    (inst movss (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-ref/double)
-  (:translate %raw-instance-ref/double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types * positive-fixnum)
-  (:results (value :scs (double-reg)))
-  (:result-types double-float)
-  (:generator 5
-    (inst movsd value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-ref-c/double)
-  (:translate %raw-instance-ref/double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset)))
-  (:info index)
-  (:results (value :scs (double-reg)))
-  (:result-types double-float)
-  (:generator 4
-    (inst movsd value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-set/double)
-  (:translate %raw-instance-set/double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (double-reg) :target result))
-  (:arg-types * positive-fixnum double-float)
-  (:results (result :scs (double-reg)))
-  (:result-types double-float)
-  (:generator 5
-    (inst movsd (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-set-c/double)
-  (:translate %raw-instance-set/double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (double-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              double-float)
-  (:info index)
-  (:results (result :scs (double-reg)))
-  (:result-types double-float)
-  (:generator 4
-    (inst movsd (make-ea-for-raw-slot object index) value)
-    (move result value)))
-
-(define-vop (raw-instance-init/double)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (double-reg)))
-  (:arg-types * double-float)
-  (:info index)
-  (:generator 4
-    (inst movsd (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-ref/complex-single)
-  (:translate %raw-instance-ref/complex-single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types * positive-fixnum)
-  (:results (value :scs (complex-single-reg)))
-  (:result-types complex-single-float)
-  (:generator 5
-    (inst movq value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-ref-c/complex-single)
-  (:translate %raw-instance-ref/complex-single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset)))
-  (:info index)
-  (:results (value :scs (complex-single-reg)))
-  (:result-types complex-single-float)
-  (:generator 4
-    (inst movq value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-set/complex-single)
-  (:translate %raw-instance-set/complex-single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (complex-single-reg) :target result))
-  (:arg-types * positive-fixnum complex-single-float)
-  (:results (result :scs (complex-single-reg)))
-  (:result-types complex-single-float)
-  (:generator 5
-    (move result value)
-    (inst movq (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-set-c/complex-single)
-  (:translate %raw-instance-set/complex-single)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (complex-single-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              complex-single-float)
-  (:info index)
-  (:results (result :scs (complex-single-reg)))
-  (:result-types complex-single-float)
-  (:generator 4
-    (move result value)
-    (inst movq (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-init/complex-single)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (complex-single-reg)))
-  (:arg-types * complex-single-float)
-  (:info index)
-  (:generator 4
-    (inst movq (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-ref/complex-double)
-  (:translate %raw-instance-ref/complex-double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types * positive-fixnum)
-  (:results (value :scs (complex-double-reg)))
-  (:result-types complex-double-float)
-  (:generator 5
-    (inst movdqu value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-ref-c/complex-double)
-  (:translate %raw-instance-ref/complex-double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset)))
-  (:info index)
-  (:results (value :scs (complex-double-reg)))
-  (:result-types complex-double-float)
-  (:generator 4
-    (inst movdqu value (make-ea-for-raw-slot object index))))
-
-(define-vop (raw-instance-set/complex-double)
-  (:translate %raw-instance-set/complex-double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (complex-double-reg) :target result))
-  (:arg-types * positive-fixnum complex-double-float)
-  (:results (result :scs (complex-double-reg)))
-  (:result-types complex-double-float)
-  (:generator 5
-    (move result value)
-    (inst movdqu (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-set-c/complex-double)
-  (:translate %raw-instance-set/complex-double)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (complex-double-reg) :target result))
-  (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                             #.instance-pointer-lowtag
-                                             #.instance-slots-offset))
-              complex-double-float)
-  (:info index)
-  (:results (result :scs (complex-double-reg)))
-  (:result-types complex-double-float)
-  (:generator 4
-    (move result value)
-    (inst movdqu (make-ea-for-raw-slot object index) value)))
-
-(define-vop (raw-instance-init/complex-double)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (complex-double-reg)))
-  (:arg-types * complex-double-float)
-  (:info index)
-  (:generator 4
-    (inst movdqu (make-ea-for-raw-slot object index) value)))
+  (define-vop (raw-instance-atomic-incf-c/word)
+    (:translate %raw-instance-atomic-incf/word)
+    (:policy :fast-safe)
+    (:args (object :scs (descriptor-reg))
+           (diff :scs (unsigned-reg) :target result))
+    (:arg-types * (:constant (load/store-index #.n-word-bytes
+                                               #.instance-pointer-lowtag
+                                               #.instance-slots-offset))
+                unsigned-num)
+    (:info index)
+    (:results (result :scs (unsigned-reg)))
+    (:result-types unsigned-num)
+    (:generator 4
+      (inst xadd (make-ea-for-raw-slot object index) diff :lock)
+      (move result diff))))

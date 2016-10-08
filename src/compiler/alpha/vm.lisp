@@ -19,7 +19,7 @@
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (def!constant ,offset-sym ,offset)
+                  (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym)
                         ,(symbol-name name)))))
            (defregset (name &rest regs)
@@ -90,32 +90,6 @@
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
-
-;;; a handy macro so we don't have to keep changing all the numbers
-;;; whenever we insert a new storage class.
-
-(defmacro !define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       ;; (The CMU CL version of this macro did
-                       ;;   `(EXPORT ',CONSTANT-NAME)
-                       ;; here, but in SBCL we try to have package
-                       ;; structure described statically in one
-                       ;; master source file, instead of building it
-                       ;; dynamically by letting all the system code
-                       ;; modify it as the system boots.)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
 
 (!define-storage-classes
 
@@ -240,8 +214,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;; Make some random tns for important registers.
 (macrolet ((defregtn (name sc)
@@ -319,18 +293,18 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
+(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 
 (eval-when  (:compile-toplevel :load-toplevel :execute)
 
 ;;; offsets of special stack frame locations
-(def!constant ocfp-save-offset 0)
-(def!constant lra-save-offset 1)
-(def!constant nfp-save-offset 2)
+(defconstant ocfp-save-offset 0)
+(defconstant lra-save-offset 1)
+(defconstant nfp-save-offset 2)
 
 ;;; the number of arguments/return values passed in registers
-(def!constant register-arg-count 6)
+(defconstant register-arg-count 6)
 
 ;;; (Names to use for the argument registers would go here, but there
 ;;; are none.)
@@ -346,7 +320,7 @@
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 4)
+(defconstant single-value-return-byte-offset 4)
 
 ;;; This function is called by debug output routines that want a
 ;;; pretty name for a TN's location. It returns a thing that can be

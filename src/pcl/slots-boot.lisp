@@ -56,53 +56,6 @@
     (setf reader-specializers (mapcar #'find-class reader-specializers))
     (setf writer-specializers (mapcar #'find-class writer-specializers))))
 
-(defmacro quiet-funcall (fun &rest args)
-  ;; Don't give a style-warning about undefined function here.
-  `(funcall (locally (declare (muffle-conditions style-warning))
-              ,fun)
-            ,@args))
-
-(defmacro accessor-slot-value (object slot-name &environment env)
-  (aver (constantp slot-name env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (reader-name (slot-reader-name slot-name)))
-    `(let ((.ignore. (load-time-value
-                      (ensure-accessor 'reader ',reader-name ',slot-name))))
-       (declare (ignore .ignore.))
-       (truly-the (values t &optional)
-                  (quiet-funcall #',reader-name ,object)))))
-
-(defmacro accessor-set-slot-value (object slot-name new-value &environment env)
-  (aver (constantp slot-name env))
-  (setq object (%macroexpand object env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (bind-object (unless (or (constantp new-value env) (atom new-value))
-                        (let* ((object-var (gensym))
-                               (bind `((,object-var ,object))))
-                          (setf object object-var)
-                          bind)))
-         (writer-name (slot-writer-name slot-name))
-         (form
-          `(let ((.ignore.
-                  (load-time-value
-                   (ensure-accessor 'writer ',writer-name ',slot-name)))
-                 (.new-value. ,new-value))
-            (declare (ignore .ignore.))
-            (quiet-funcall #',writer-name .new-value. ,object)
-            .new-value.)))
-    (if bind-object
-        `(let ,bind-object ,form)
-        form)))
-
-(defmacro accessor-slot-boundp (object slot-name &environment env)
-  (aver (constantp slot-name env))
-  (let* ((slot-name (constant-form-value slot-name env))
-         (boundp-name (slot-boundp-name slot-name)))
-    `(let ((.ignore. (load-time-value
-                      (ensure-accessor 'boundp ',boundp-name ',slot-name))))
-      (declare (ignore .ignore.))
-      (funcall #',boundp-name ,object))))
-
 (defun make-structure-slot-boundp-function (slotd)
   (declare (ignore slotd))
   (named-lambda always-bound (object)
@@ -479,90 +432,80 @@
         class-or-name
         (find-class class-or-name nil))))
 
-(defun make-std-reader-method-function (class-or-name slot-name)
-  (ecase (slot-access-strategy (maybe-class class-or-name) slot-name 'reader t)
-    (:standard
-     (let* ((initargs (copy-tree
-                       (make-method-function
-                        (lambda (instance)
-                          (pv-binding1 ((bug "Please report this")
-                                        (instance) (instance-slots))
-                            (instance-read-standard
-                             .pv. instance-slots 0
-                             (slot-value instance slot-name))))))))
-       (setf (getf (getf initargs 'plist) :slot-name-lists)
-             (list (list nil slot-name)))
-       initargs))
-    ((:custom :accessor)
-     (let* ((initargs (copy-tree
-                       (make-method-function
-                        (lambda (instance)
-                          (pv-binding1 ((bug "Please report this")
-                                        (instance) nil)
-                            (instance-read-custom .pv. 0 instance)))))))
-       (setf (getf (getf initargs 'plist) :slot-name-lists)
-             (list (list nil slot-name)))
-       initargs))))
+(flet ((make-initargs (slot-name kind method-function)
+         (let ((initargs (copy-tree method-function))
+               (slot-names (list slot-name)))
+           (setf (getf (getf initargs 'plist) :slot-name-lists)
+                 (ecase kind
+                   ((:reader :boundp) (list slot-names))
+                   (:writer (list '() slot-names))))
+           initargs)))
 
-(defun make-std-writer-method-function (class-or-name slot-name)
-  (let ((class (maybe-class class-or-name)))
-    (ecase (slot-access-strategy class slot-name 'writer t)
-      (:standard
-       (let ((initargs (copy-tree
-                        (if (and class (safe-p class))
-                            (make-method-function
-                             (lambda (nv instance)
-                               (pv-binding1 ((bug "Please report this")
-                                             (instance) (instance-slots))
-                                 (instance-write-standard
-                                  .pv. instance-slots 0 nv
-                                  (setf (slot-value instance slot-name) .good-new-value.)
-                                  nil t))))
-                            (make-method-function
-                             (lambda (nv instance)
-                               (pv-binding1 ((bug "Please report this")
-                                             (instance) (instance-slots))
-                                 (instance-write-standard
-                                  .pv. instance-slots 0 nv
-                                  (setf (slot-value instance slot-name) .good-new-value.)))))))))
-         (setf (getf (getf initargs 'plist) :slot-name-lists)
-               (list nil (list nil slot-name)))
-         initargs))
-     ((:custom :accessor)
-      (let ((initargs (copy-tree
-                       (make-method-function
-                        (lambda (nv instance)
-                          (pv-binding1 ((bug "Please report this")
-                                        (instance) nil)
-                            (instance-write-custom .pv. 0 instance nv)))))))
-        (setf (getf (getf initargs 'plist) :slot-name-lists)
-              (list nil (list nil slot-name)))
-        initargs)))))
+  (defun make-std-reader-method-function (class-or-name slot-name)
+    (let ((class (maybe-class class-or-name)))
+      (make-initargs
+       slot-name :reader
+       (ecase (slot-access-strategy class slot-name 'reader t)
+         (:standard
+          (make-method-function
+           (lambda (instance)
+             (pv-binding1 ((bug "Please report this")
+                           (instance) (instance-slots))
+               (instance-read-standard
+                .pv. instance-slots 0
+                (slot-value instance slot-name))))))
+         ((:custom :accessor)
+          (make-method-function
+           (lambda (instance)
+             (pv-binding1 ((bug "Please report this")
+                           (instance) nil)
+               (instance-read-custom .pv. 0 instance)))))))))
 
-(defun make-std-boundp-method-function (class-or-name slot-name)
-  (ecase (slot-access-strategy (maybe-class class-or-name) slot-name 'boundp t)
-    (:standard
-     (let ((initargs (copy-tree
-                      (make-method-function
-                       (lambda (instance)
-                         (pv-binding1 ((bug "Please report this")
-                                       (instance) (instance-slots))
-                           (instance-boundp-standard
-                            .pv. instance-slots 0
-                            (slot-boundp instance slot-name))))))))
-       (setf (getf (getf initargs 'plist) :slot-name-lists)
-             (list (list nil slot-name)))
-       initargs))
-    ((:custom :accessor)
-     (let ((initargs (copy-tree
-                      (make-method-function
-                       (lambda (instance)
-                         (pv-binding1 ((bug "Please report this")
-                                       (instance) nil)
-                           (instance-boundp-custom .pv. 0 instance)))))))
-       (setf (getf (getf initargs 'plist) :slot-name-lists)
-             (list (list nil slot-name)))
-       initargs))))
+  (defun make-std-writer-method-function (class-or-name slot-name)
+    (let ((class (maybe-class class-or-name)))
+      (make-initargs
+       slot-name :writer
+       (ecase (slot-access-strategy class slot-name 'writer t)
+         (:standard
+          (macrolet ((writer-method-function (safe)
+                       `(make-method-function
+                         (lambda (nv instance)
+                           (pv-binding1 ((bug "Please report this")
+                                         (instance) (instance-slots))
+                             (instance-write-standard
+                              .pv. instance-slots 0 nv
+                              (setf (slot-value instance slot-name)
+                                    .good-new-value.)
+                              ,@(when safe '(nil t))))))))
+            (if (and class (safe-p class))
+                (writer-method-function t)
+                (writer-method-function nil))))
+         ((:custom :accessor)
+          (make-method-function
+           (lambda (nv instance)
+             (pv-binding1 ((bug "Please report this")
+                           (instance) nil)
+               (instance-write-custom .pv. 0 instance nv)))))))))
+
+  (defun make-std-boundp-method-function (class-or-name slot-name)
+    (let ((class (maybe-class class-or-name)))
+      (make-initargs
+       slot-name :boundp
+       (ecase (slot-access-strategy class slot-name 'boundp t)
+         (:standard
+          (make-method-function
+           (lambda (instance)
+             (pv-binding1 ((bug "Please report this")
+                           (instance) (instance-slots))
+               (instance-boundp-standard
+                .pv. instance-slots 0
+                (slot-boundp instance slot-name))))))
+         ((:custom :accessor)
+          (make-method-function
+           (lambda (instance)
+             (pv-binding1 ((bug "Please report this")
+                           (instance) nil)
+               (instance-boundp-custom .pv. 0 instance))))))))))
 
 ;;;; FINDING SLOT DEFINITIONS
 ;;;

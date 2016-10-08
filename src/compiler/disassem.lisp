@@ -13,7 +13,7 @@
 
 ;;; types and defaults
 
-(def!constant label-column-width 7)
+(defconstant label-column-width 7)
 
 (deftype text-width () '(integer 0 1000))
 (deftype alignment () '(integer 0 64))
@@ -22,7 +22,7 @@
 (deftype disassem-length () '(unsigned-byte 24))
 (deftype column () '(integer 0 1000))
 
-(def!constant max-filtered-value-index 32)
+(defconstant max-filtered-value-index 32)
 (deftype filtered-value-index ()
   `(integer 0 (,max-filtered-value-index)))
 (deftype filtered-value-vector ()
@@ -78,24 +78,31 @@
 #!-sb-fluid
 (declaim (inline dchunk-or dchunk-and dchunk-clear dchunk-not
                  dchunk-make-mask dchunk-make-field
-                 sap-ref-dchunk
                  dchunk-extract
                  dchunk=
                  dchunk-count-bits))
 
-(def!constant dchunk-bits #.sb!vm:n-word-bits)
+;;; For variable-length instruction sets, such as x86, it is better to
+;;; define the dchunk size to be the smallest number of bits necessary
+;;; and sufficient to decode any instruction format, if that quantity
+;;; of bits is small enough to avoid bignum consing.
+;;; Ideally this constant would go in the 'insts' file for the architecture,
+;;; but there's really no easy way to do that at present.
+(defconstant dchunk-bits
+  #!+x86-64 56
+  #!-x86-64 sb!vm:n-word-bits)
 
 (deftype dchunk ()
   `(unsigned-byte ,dchunk-bits))
 (deftype dchunk-index ()
   `(integer 0 ,dchunk-bits))
 
-(def!constant dchunk-zero 0)
-(def!constant dchunk-one #.(1- (expt 2 sb!vm:n-word-bits)))
+(defconstant dchunk-zero 0)
+(defconstant dchunk-one (ldb (byte dchunk-bits 0) -1))
 
-(defun dchunk-extract (from pos)
-  (declare (type dchunk from))
-  (the dchunk (ldb pos (the dchunk from))))
+(defun dchunk-extract (chunk byte-spec)
+  (declare (type dchunk chunk))
+  (the dchunk (ldb byte-spec (the dchunk chunk))))
 
 (defmacro dchunk-copy (x)
   `(the dchunk ,x))
@@ -128,41 +135,6 @@
 (defmacro make-dchunk (value)
   `(the dchunk ,value))
 
-#-sb-xc-host ;; FIXME: function belongs in 'target-disassem'
-(defun sap-ref-dchunk (sap byte-offset byte-order)
-  (declare (type sb!sys:system-area-pointer sap)
-           (type offset byte-offset)
-           (muffle-conditions compiler-note) ; returns possible bignum
-           (optimize (speed 3) (safety 0)))
-  (the dchunk
-       (ecase dchunk-bits
-         (32 (if (eq byte-order :big-endian)
-                 (+ (ash (sb!sys:sap-ref-8 sap byte-offset) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 8)
-                    (sb!sys:sap-ref-8 sap (+ 3 byte-offset)))
-                 (+ (sb!sys:sap-ref-8 sap byte-offset)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 8)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 24))))
-         (64 (if (eq byte-order :big-endian)
-                 (+ (ash (sb!sys:sap-ref-8 sap byte-offset) 56)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 48)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 40)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 32)
-                    (ash (sb!sys:sap-ref-8 sap (+ 4 byte-offset)) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 5 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 6 byte-offset)) 8)
-                    (sb!sys:sap-ref-8 sap (+ 7 byte-offset)))
-                 (+ (sb!sys:sap-ref-8 sap byte-offset)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 8)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 4 byte-offset)) 32)
-                    (ash (sb!sys:sap-ref-8 sap (+ 5 byte-offset)) 40)
-                    (ash (sb!sys:sap-ref-8 sap (+ 6 byte-offset)) 48)
-                    (ash (sb!sys:sap-ref-8 sap (+ 7 byte-offset)) 56)))))))
-
 (defun dchunk-corrected-extract (from pos unit-bits byte-order)
   (declare (type dchunk from))
   (if (eq byte-order :big-endian)
@@ -190,13 +162,9 @@
 
 (defstruct (instruction (:conc-name inst-)
                         (:constructor
-                         make-instruction (name
-                                           format-name
-                                           print-name
-                                           length
-                                           mask id
-                                           printer
-                                           labeller prefilter control))
+                         make-instruction (name format-name print-name
+                                           length mask id printer labeller
+                                           prefilters control))
                         (:copier nil))
   (name nil :type (or symbol string) :read-only t)
   (format-name nil :type (or symbol string) :read-only t)
@@ -208,16 +176,16 @@
 
   (print-name nil :type symbol :read-only t)
 
-  ;; disassembly functions
-  (prefilter nil :type (or null function))
-  (labeller nil :type (or null function))
-  (printer (missing-arg) :type (or null function))
+  ;; disassembly "functions"
+  (prefilters nil :type list :read-only t)
+  (labeller nil :type (or list vector) :read-only t)
+  (printer nil :type (or null function) :read-only t)
   (control nil :type (or null function) :read-only t)
 
   ;; instructions that are the same as this instruction but with more
   ;; constraints
   (specializers nil :type list))
-(def!method print-object ((inst instruction) stream)
+(defmethod print-object ((inst instruction) stream)
   (print-unreadable-object (inst stream :type t :identity t)
     (format stream "~A(~A)" (inst-name inst) (inst-format-name inst))))
 
@@ -228,7 +196,7 @@
                        (:copier nil))
   (valid-mask dchunk-zero :type dchunk) ; applies to *children*
   (choices nil :type list))
-(def!method print-object ((ispace inst-space) stream)
+(defmethod print-object ((ispace inst-space) stream)
   (print-unreadable-object (ispace stream :type t :identity t)))
 
 ;;; now that we've defined the structure, we can declaim the type of
@@ -239,70 +207,10 @@
                               (:copier nil))
   (common-id dchunk-zero :type dchunk)  ; applies to *parent's* mask
   (subspace (missing-arg) :type (or inst-space instruction)))
-
-(defmacro !begin-instruction-definitions () nil) ; FIXME: remove
 
-;;; FIXME: If we we interned the temp vars,
-;;; and wouldn't use symbols qua strings, then this would reduce to EQUAL.
-(defun equal-mod-gensyms (a b)
-  (named-let recurse ((a a) (b b))
-    (etypecase a
-      (null (null b))
-      (list (and (listp b) (recurse (car a) (car b)) (recurse (cdr a) (cdr b))))
-      (symbol (or (eq a b)
-                  (and (symbolp b)
-                       (not (symbol-package a))
-                       (not (symbol-package b))
-                       ;; If "strings", then comparison by STRING= is right,
-                       ;; and if lexical vars, it's also right because
-                       ;; we never rebind a given temp within a function.
-                       (string= a b))))
-      ((or number character function) (eql a b))
-      (vector (and (vectorp b) (every #'recurse a b))))))
-
-;;; Previously there were complicated checker functions which tried to attempt to
-;;; decide, given two FUNSTATEs, whether all their args were similarly used,
-;;; where "similarity" required that the prefilter and such be identical.
-;;; Instead we can just look at two sexprs and decide whether they act the same,
-;;; which is of course impossible in general; however, for this purpose,
-;;; if sexprs are EQUAL disregarding variations in gensyms, then their code
-;;; can be folded. If we miss (don't fold) things that act the same, it's ok.
-;;; N.B.: This definition of equivalence is admissible because there can be
-;;; no "interesting" non-null lexical environment. While it could be non-null,
-;;; it can't matter, because our auto-generated code can't depend on the lexenv.
-(defvar *current-instruction-flavor* nil)
-(defun generate-function (kind forms funstate code-folding-cache skeleton)
-  (let* ((sub-table (assq kind code-folding-cache))
-         (bindings (make-arg-temp-bindings funstate))
-         (guts `(let* ,bindings ,@forms)))
-    (or (cdr (assoc guts (cdr sub-table) :test #'equal-mod-gensyms))
-        (let* ((name (concatenate 'string "INST-" (string kind) "-"
-                                  (write-to-string (length sub-table))))
-               (definition
-                 (compile nil
-                   `(named-lambda ,name ,@(subst guts :body (cdr skeleton))))))
-          (push (cons guts definition) (cdr sub-table))
-          definition))))
-
-(defstruct (arg (:copier nil)
-                (:predicate nil)
-                (:constructor %make-arg (name))
-                (:constructor standard-make-arg) ; only so #S readmacro works
-                (:print-object
-                 (lambda (self stream)
-                   (if *print-readably*
-                       (call-next-method)
-                       (print-unreadable-object (self stream :type t)
-                         (format stream
-                                 "~A ~:[~;+~]~:S~@[=~S~]~@[ filt=~S~]~
-~@[ lbl=~S~]~@[ prt=~S~]"
-                                 (arg-name self)
-                                 (arg-sign-extend-p self)
-                                 (arg-fields self)
-                                 (arg-value self)
-                                 (arg-prefilter self)
-                                 (arg-use-label self)
-                                 (arg-printer self)))))))
+(defstruct (arg (:constructor %make-arg (name))
+                (:copier nil)
+                (:predicate nil))
   (name nil :type symbol)
   (fields nil :type list)
 
@@ -340,17 +248,11 @@
   (or (car (assoc name funstate :key #'arg-name :test #'eq))
       (pd-error "unknown argument ~S" name)))
 
-;;;; Since we can't include some values in compiled output as they are
-;;;; (notably functions), we sometimes use a VALSRC structure to keep
-;;;; track of the source from which they were derived.
-
 ;;; machinery to provide more meaningful error messages during compilation
+(defvar *current-instruction-flavor*)
 (defun pd-error (fmt &rest args)
-  (if *current-instruction-flavor*
-      (error "~@<in printer-definition for ~S(~S): ~3I~:_~?~:>"
-             (car *current-instruction-flavor*)
-             (cdr *current-instruction-flavor*)
-             fmt args)
+  (if (boundp '*current-instruction-flavor*)
+      (error "~{A printer ~D~}: ~?" *current-instruction-flavor* fmt args)
       (apply #'error fmt args)))
 
 (defun format-or-lose (name)
@@ -479,6 +381,7 @@
                                 (arg (find ',(car arg-spec) format-args
                                            :key #'arg-name))
                                 (funstate (make-funstate format-args))
+                                (*!temp-var-counter* 0)
                                 (expr (arg-value-form arg funstate :numeric)))
                            `(let* ,(make-arg-temp-bindings funstate) ,expr))))
                     (reader)))))))
@@ -582,27 +485,34 @@
               (push `(,vars ,vals) bindings)))))))
 
 ;;; Return the form(s) that should be evaluated to render ARG in the chosen
-;;; RENDERING style, which is one of :RAW, :SIGN-EXTENDED, :FILTERING,
+;;; RENDERING style, which is one of :RAW, :SIGN-EXTENDED,
 ;;; :FILTERED, :NUMERIC, and :FINAL. Each rendering depends on the preceding
 ;;; one, so asking for :FINAL will implicitly compute all renderings.
+(defvar *!temp-var-counter*)
 (defun gen-arg-forms (arg rendering funstate)
-  (let* ((arg-cell (assq arg funstate))
-         (rendering-temps (cdr (assq rendering (cdr arg-cell))))
-         (vars (car rendering-temps))
-         (forms (cdr rendering-temps)))
-    (unless forms
-      (multiple-value-bind (new-forms single-value-p)
-          (%gen-arg-forms arg rendering funstate)
-        (setq forms new-forms
-              vars (cond ((or single-value-p (atom forms))
-                          (if (symbolp forms) vars (sb!xc:gensym "_")))
-                         ((every #'symbolp forms)
-                          ;; just use the same as the forms
-                          nil)
-                         (t
-                          (make-gensym-list (length forms) "_"))))
-        (push (list* rendering vars forms) (cdr arg-cell))))
-    (or vars forms)))
+  (labels ((tempvars (n)
+             (if (plusp n)
+                 (cons (package-symbolicate
+                        (load-time-value (find-package "SB!DISASSEM"))
+                        ".T" (write-to-string (incf *!temp-var-counter*)))
+                       (tempvars (1- n))))))
+    (let* ((arg-cell (assq arg funstate))
+           (rendering-temps (cdr (assq rendering (cdr arg-cell))))
+           (vars (car rendering-temps))
+           (forms (cdr rendering-temps)))
+      (unless forms
+        (multiple-value-bind (new-forms single-value-p)
+            (%gen-arg-forms arg rendering funstate)
+          (setq forms new-forms
+                vars (cond ((or single-value-p (atom forms))
+                            (if (symbolp forms) vars (car (tempvars 1))))
+                           ((every #'symbolp forms)
+                            ;; just use the same as the forms
+                            nil)
+                           (t
+                            (tempvars (length forms)))))
+          (push (list* rendering vars forms) (cdr arg-cell))))
+      (or vars forms))))
 
 (defun maybe-listify (forms)
   (cond ((atom forms)
@@ -675,15 +585,6 @@
                    raw-forms
                    (arg-fields arg))
            raw-forms)))
-    (:filtering ; pass the sign-extended arg to the filter function
-     ;; The prefilter is not required to be side-effect-free -
-     ;; e.g. it might touch DSTATE-CUR-OFFS - so it stores :FILTERING values
-     ;; into :FILTERED values, which can be repeatedly accessed as needed.
-     (let ((sign-extended-forms (gen-arg-forms arg :sign-extended funstate))
-           (pf (arg-prefilter arg)))
-       (if pf
-           (values `(local-filter ,(maybe-listify sign-extended-forms) ,pf) t)
-           (values sign-extended-forms nil))))
     (:filtered ; extract from the prefiltered value vector
      (let ((pf (arg-prefilter arg)))
        (if pf
@@ -699,26 +600,26 @@
            `((adjust-label ,(maybe-listify filtered-forms) ,use-label))
            filtered-forms)))
     (:final ; if arg is not a label, return numeric value, otherwise a string
-     (let ((numeric-forms (gen-arg-forms arg :numeric funstate))
-           (use-label (arg-use-label arg)))
-       (cond ((not use-label) numeric-forms)
-             ((and (eq use-label t) (listp numeric-forms) (cdr numeric-forms))
-              (pd-error "cannot label multi-field ~S without a labeller" arg))
-             (t `((lookup-label ,(maybe-listify numeric-forms)))))))))
+     (let ((numeric-forms (gen-arg-forms arg :numeric funstate)))
+       (if (arg-use-label arg)
+           `((lookup-label ,(maybe-listify numeric-forms)))
+           numeric-forms)))))
 
-(defun find-printer-fun (printer-source args cache)
-  (let ((source (preprocess-printer printer-source args))
-        (funstate (make-funstate args)))
-   (generate-function
-    :printer
-    (let ((sb!xc:*gensym-counter* 0)) (compile-printer-list source funstate))
-    funstate
-    cache
-    '(lambda (chunk inst stream dstate)
-       (declare (type dchunk chunk)
-                (type instruction inst)
-                (type stream stream)
-                (type disassem-state dstate))
+(defun find-printer-fun (printer-source args cache *current-instruction-flavor*)
+  (let* ((source (preprocess-printer printer-source args))
+         (funstate (make-funstate args))
+         (forms (let ((*!temp-var-counter* 0))
+                  (compile-printer-list source funstate)))
+         (bindings (make-arg-temp-bindings funstate))
+         (guts `(let* ,bindings ,@forms))
+         (sub-table (assq :printer cache)))
+    (or (cdr (assoc guts (cdr sub-table) :test #'equal))
+        (let ((template
+     '(lambda (chunk inst stream dstate
+               &aux (chunk (truly-the dchunk chunk))
+                    (inst (truly-the instruction inst))
+                    (stream (truly-the stream stream))
+                    (dstate (truly-the disassem-state dstate)))
        (macrolet ((local-format-arg (arg fmt)
                     `(funcall (formatter ,fmt) stream ,arg)))
          (flet ((local-tab-to-arg-column ()
@@ -759,8 +660,10 @@
                             local-call-arg-printer local-call-global-printer
                             local-filtered-value local-extract
                             lookup-label adjust-label))
-           :body))))))
-
+           :body)))))
+          (cdar (push (cons guts (compile nil (subst guts :body template)))
+                      (cdr sub-table)))))))
+
 (defun preprocess-test (subj form args)
   (multiple-value-bind (subj test)
       (if (and (consp form) (symbolp (car form)) (not (keywordp (car form))))
@@ -904,24 +807,7 @@
       (return choice))))
 
 (defun compile-printer-list (sources funstate)
-  (unless (null sources)
-    ;; Coalesce adjacent symbols/strings, and convert to strings if possible,
-    ;; since they require less consing to write.
-    (do ((el (car sources) (car sources))
-         (names nil (cons (strip-quote el) names)))
-        ((not (string-or-qsym-p el))
-         (when names
-           ;; concatenate adjacent strings and symbols
-           (let ((string
-                  (apply #'concatenate
-                         'string
-                         (mapcar #'string (nreverse names)))))
-             ;; WTF? Everything else using INST-PRINT-NAME writes a string.
-             (push (if (some #'alpha-char-p string)
-                       `',(make-symbol string) ; Preserve casifying output.
-                       string)
-                   sources))))
-      (pop sources))
+  (when sources
     (cons (compile-printer-body (car sources) funstate)
           (compile-printer-list (cdr sources) funstate))))
 
@@ -994,18 +880,6 @@
        `(,(if (arg-use-label arg) 'local-princ16 'local-princ)
          ,(arg-value-form arg funstate))))))
 
-(defun string-or-qsym-p (thing)
-  (or (stringp thing)
-      (and (consp thing)
-           (eq (car thing) 'quote)
-           (or (stringp (cadr thing))
-               (symbolp (cadr thing))))))
-
-(defun strip-quote (thing)
-  (if (and (consp thing) (eq (car thing) 'quote))
-      (cadr thing)
-      thing))
-
 (defun compare-fields-form (val-form-1 val-form-2)
   (flet ((listify-fields (fields)
            (cond ((symbolp fields) fields)
@@ -1070,66 +944,6 @@
           (t
            (pd-error "bogus test-form: ~S" test)))))
 
-(defun find-labeller-fun (args cache)
-  (let ((funstate (make-funstate args))
-        (labels-form 'labels))
-    (let ((sb!xc:*gensym-counter* 0))
-      (dolist (arg args)
-        (when (arg-use-label arg)
-          (setf labels-form
-                `(let ((labels ,labels-form)
-                       (addr ,(arg-value-form arg funstate :numeric nil)))
-                   ;; if labeler didn't return an integer, it isn't a label
-                   (if (or (not (integerp addr)) (assoc addr labels))
-                       labels
-                       (cons (cons addr nil) labels)))))))
-    (generate-function
-            :labeller (list labels-form) funstate cache
-            '(lambda (chunk labels dstate)
-               (declare (type list labels)
-                        (type dchunk chunk)
-                        (type disassem-state dstate))
-               (flet ((local-filtered-value (offset)
-                        (declare (type filtered-value-index offset))
-                        (aref (dstate-filtered-values dstate) offset))
-                      (local-extract (bytespec)
-                        (dchunk-extract chunk bytespec))
-                      (adjust-label (val adjust-fun)
-                        (funcall adjust-fun val dstate)))
-                 (declare (ignorable #'local-filtered-value #'local-extract
-                                     #'adjust-label)
-                          (inline local-filtered-value local-extract
-                                  adjust-label))
-                 :body)))))
-
-(defun find-prefilter-fun (args cache)
-  (let* ((funstate (make-funstate args))
-         (forms
-          (let ((sb!xc:*gensym-counter* 0))
-            (mapcan (lambda (arg &aux (pf (arg-prefilter arg)))
-                      (when pf
-                        (list `(setf (local-filtered-value ,(arg-position arg funstate))
-                                     ,(maybe-listify
-                                       (gen-arg-forms arg :filtering funstate))))))
-                    args))))
-    (generate-function
-            :prefilter forms funstate cache
-            '(lambda (chunk dstate)
-               (declare (type dchunk chunk)
-                        (type disassem-state dstate))
-               (flet (((setf local-filtered-value) (value offset)
-                        (declare (type filtered-value-index offset))
-                        (setf (aref (dstate-filtered-values dstate) offset)
-                              value))
-                      (local-filter (value filter)
-                        (funcall filter value dstate))
-                      (local-extract (bytespec)
-                        (dchunk-extract chunk bytespec)))
-                (declare (ignorable #'local-filter #'local-extract)
-                         (inline (setf local-filtered-value)
-                                 local-filter local-extract))
-                :body)))))
-
 (defun compute-mask-id (args)
   (let ((mask dchunk-zero)
         (id dchunk-zero))
@@ -1191,13 +1005,6 @@
 (defun princ16 (value stream)
   (write value :stream stream :radix t :base 16 :escape nil))
 
-(declaim (ftype function read-suffix))
-(defun read-signed-suffix (length dstate)
-  (declare (type (member 8 16 32 64) length)
-           (type disassem-state dstate)
-           (optimize (speed 3) (safety 0)))
-  (sign-extend (read-suffix length dstate) length))
-
 (defstruct (storage-info (:copier nil))
   (groups nil :type list)               ; alist of (name . location-group)
   (debug-vars #() :type vector))
@@ -1206,17 +1013,13 @@
                     (:constructor %make-segment)
                     (:copier nil))
   (sap-maker (missing-arg)
-             :type (function () sb!sys:system-area-pointer))
+             :type (function () system-area-pointer))
   ;; Length in bytes of the range of memory covered by this segment.
   (length 0 :type disassem-length)
-  ;; Length of the memory range excluding any trailing untagged data.
-  ;; Defaults to 'length' but could be shorter.
-  ;; FIXME: can opcodes-length really be shorter? Nothing ever alters it.
-  (opcodes-length 0 :type disassem-length)
   (virtual-location 0 :type address)
   (storage-info nil :type (or null storage-info))
   ;; KLUDGE: CODE-COMPONENT is not a type the host understands
-  #-sb-xc-host (code nil :type (or null sb!kernel:code-component))
+  #-sb-xc-host (code nil :type (or null code-component))
   (unboxed-data-range nil :type (or null (cons fixnum fixnum)))
   (hooks nil :type list))
 
@@ -1231,9 +1034,12 @@
   ;; offset of next position
   (next-offs 0 :type offset)
   ;; a sap pointing to our segment
-  (segment-sap nil :type (or null sb!sys:system-area-pointer))
+  (segment-sap nil :type (or null system-area-pointer))
   ;; the current segment
   (segment nil :type (or null segment))
+  ;; to avoid buffer overrun at segment end, we might need to copy bytes
+  ;; here first because sap-ref-dchunk reads a fixed length.
+  (scratch-buf (make-array 8 :element-type '(unsigned-byte 8)))
   ;; what to align to in most cases
   (alignment sb!vm:n-word-bytes :type alignment)
   (byte-order :little-endian
@@ -1242,9 +1048,14 @@
   (properties nil :type list)
   ;; for user code to hang stuff off of, cleared each time after a
   ;; non-prefix instruction is processed
-  (inst-properties nil :type list)
+  (inst-properties nil :type (or fixnum list))
   (filtered-values (make-array max-filtered-value-index)
                    :type filtered-value-vector)
+  ;; to avoid consing decoded values, a prefilter can keep a chain
+  ;; of objects in these slots. The objects returned here
+  ;; are reusable for the next instruction.
+  (filtered-arg-pool-in-use)
+  (filtered-arg-pool-free)
   ;; used for prettifying printing
   (addr-print-len nil :type (or null (integer 0 20)))
   (argument-column 0 :type column)
@@ -1271,7 +1082,7 @@
 
   ;; currently active source variables
   (current-valid-locations nil :type (or null (vector bit))))
-(def!method print-object ((dstate disassem-state) stream)
+(defmethod print-object ((dstate disassem-state) stream)
   (print-unreadable-object (dstate stream :type t)
     (format stream
             "+~W~@[ in ~S~]"
@@ -1296,11 +1107,25 @@
 (defmacro dstate-get-prop (dstate name)
   `(getf (dstate-properties ,dstate) ,name))
 
-;;; Push NAME on the list of instruction properties in DSTATE.
-(defun dstate-put-inst-prop (dstate name)
-  (push name (dstate-inst-properties dstate)))
+;;; Put PROPERTY into the set of instruction properties in DSTATE.
+;;; PROPERTY can be a fixnum or symbol, but any given backend
+;;; must exclusively use one or the other property representation.
+(defun dstate-put-inst-prop (dstate property)
+  (if (fixnump property)
+      (setf (dstate-inst-properties dstate)
+            (logior (or (dstate-inst-properties dstate) 0) property))
+      (push property (dstate-inst-properties dstate))))
 
-;;; Return non-NIL if NAME is on the list of instruction properties in
-;;; DSTATE.
-(defun dstate-get-inst-prop (dstate name)
-  (member name (dstate-inst-properties dstate) :test #'eq))
+;;; Return non-NIL if PROPERTY is in the set of instruction properties in
+;;; DSTATE. As with -PUT-INST-PROP, we can have a bitmask or a plist.
+(defun dstate-get-inst-prop (dstate property)
+  (if (fixnump property)
+      (logtest (or (dstate-inst-properties dstate) 0) property)
+      (memq property (dstate-inst-properties dstate))))
+
+(declaim (ftype function read-suffix))
+(defun read-signed-suffix (length dstate)
+  (declare (type (member 8 16 32 64) length)
+           (type disassem-state dstate)
+           (optimize (speed 3) (safety 0)))
+  (sign-extend (read-suffix length dstate) length))

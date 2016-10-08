@@ -223,16 +223,8 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
     (when vop
       (note-this-location vop :internal-error))
     (inst break 0 kind)
-    (with-adjustable-vector (vector)
-      (write-var-integer code vector)
-      (dolist (tn values)
-        (write-var-integer (make-sc-offset (sc-number
-                                            (tn-sc tn))
-                                           (tn-offset tn))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i))))
+    (inst byte code)
+    (encode-internal-error-args values)
     (emit-alignment word-shift)))
 
 (defun error-call (vop error-code &rest values)
@@ -290,7 +282,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (let ((label (gen-label)))
          (inst bgez ,flag-tn label)
          (inst addu alloc-tn (1- ,extra))
-         (inst break 0 16)
+         (inst break 0 pending-interrupt-trap)
          (emit-label label)))))
 
 ;;;; memory accessor vop generators
@@ -457,7 +449,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
            (move result value))))))
 
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger

@@ -24,29 +24,32 @@
 (defvar *debug-io* () #!+sb-doc "interactive debugging stream")
 
 (defun stream-element-type-stream-element-mode (element-type)
-  (when (eq element-type :default)
-    (return-from stream-element-type-stream-element-mode :bivalent))
-
-  (unless (valid-type-specifier-p element-type)
-    (return-from stream-element-type-stream-element-mode :bivalent))
-
-  (let* ((characterp (subtypep element-type 'character))
-         (unsigned-byte-p (subtypep element-type 'unsigned-byte))
-         ;; Every UNSIGNED-BYTE subtype is a SIGNED-BYTE
-         ;; subtype. Therefore explicitly check for intersection with
-         ;; the negative integers.
-         (signed-byte-p (and (subtypep element-type 'signed-byte)
-                             (not (subtypep `(and ,element-type (integer * -1))
-                                            nil)))))
-    (cond
-      ((and characterp (not unsigned-byte-p) (not signed-byte-p))
-       'character)
-      ((and (not characterp) unsigned-byte-p (not signed-byte-p))
-       'unsigned-byte)
-      ((and (not characterp) (not unsigned-byte-p) signed-byte-p)
-       'signed-byte)
-      (t
-       :bivalent))))
+  (cond ((or (not element-type)
+             (eq element-type t)
+             (eq element-type :default)) :bivalent)
+        ((or (eq element-type 'character)
+             (eq element-type 'base-char))
+         'character)
+        ((memq element-type '(signed-byte unsigned-byte))
+         element-type)
+        ((and (proper-list-of-length-p element-type 2)
+              (memq (car element-type)
+                    '(signed-byte unsigned-byte)))
+         (car element-type))
+        ((not (ignore-errors
+               (setf element-type
+                     (type-or-nil-if-unknown element-type t))))
+         :bivalent)
+        ((eq element-type *empty-type*)
+         :bivalent)
+        ((csubtypep element-type (specifier-type 'character))
+         'character)
+        ((csubtypep element-type (specifier-type 'unsigned-byte))
+         'unsigned-byte)
+        ((csubtypep element-type (specifier-type 'signed-byte))
+         'signed-byte)
+        (t
+         :bivalent)))
 
 (defun ill-in (stream &rest ignore)
   (declare (ignore ignore))
@@ -768,6 +771,9 @@
      (finish-output stream))
     (:element-type
      (stream-element-type stream))
+    (:element-mode
+     (stream-element-type-stream-element-mode
+      (stream-element-type stream)))
     (:stream-external-format
      (stream-external-format stream))
     (:interactive-p
@@ -782,6 +788,18 @@
      (file-string-length stream arg1))
     (:file-position
      (file-position stream arg1))))
+
+(declaim (inline stream-element-mode))
+(defun stream-element-mode (stream)
+  (declare (type stream stream))
+  (cond
+    ((fd-stream-p stream)
+     (fd-stream-element-mode stream))
+    ((and (ansi-stream-p stream)
+          (funcall (ansi-stream-misc stream) stream :element-mode)))
+    (t
+     (stream-element-type-stream-element-mode
+      (stream-element-type stream)))))
 
 ;;;; broadcast streams
 
@@ -845,6 +863,9 @@
          (if last
              (stream-element-type (car last))
              t)))
+      (:element-mode
+       (awhen (last streams)
+         (stream-element-mode (car it))))
       (:external-format
        (let ((last (last streams)))
          (if last
@@ -882,7 +903,7 @@
 
 ;;;; synonym streams
 
-(def!method print-object ((x synonym-stream) stream)
+(defmethod print-object ((x synonym-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream ":SYMBOL ~S" (synonym-stream-symbol x))))
 
@@ -999,7 +1020,13 @@
        (let ((in-type (stream-element-type in))
              (out-type (stream-element-type out)))
          (if (equal in-type out-type)
-             in-type `(and ,in-type ,out-type))))
+             in-type
+             `(and ,in-type ,out-type))))
+      (:element-mode
+       (let ((in-mode (stream-element-mode in))
+             (out-mode (stream-element-mode out)))
+         (when (equal in-mode out-mode)
+           in-mode)))
       (:close
        (set-closed-flame stream))
       (t
@@ -1026,7 +1053,7 @@
 
 (declaim (freeze-type concatenated-stream))
 
-(def!method print-object ((x concatenated-stream) stream)
+(defmethod print-object ((x concatenated-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":STREAMS ~S"
@@ -1123,7 +1150,7 @@
 
 (declaim (freeze-type echo-stream))
 
-(def!method print-object ((x echo-stream) stream)
+(defmethod print-object ((x echo-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":INPUT-STREAM ~S :OUTPUT-STREAM ~S"
@@ -1281,7 +1308,8 @@
     (:listen (or (/= (the index (string-input-stream-current stream))
                      (the index (string-input-stream-end stream)))
                  :eof))
-    (:element-type (array-element-type (string-input-stream-string stream)))))
+    (:element-type (array-element-type (string-input-stream-string stream)))
+    (:element-mode 'character)))
 
 (defun make-string-input-stream (string &optional (start 0) end)
   #!+sb-doc
@@ -1317,7 +1345,7 @@
 ;;;; string-output-streams with element-type base-char. This would
 ;;;; mean either a separate subclass, or typecases in functions.
 
-(defparameter *string-output-stream-buffer-initial-size* 64)
+(defconstant +string-output-stream-buffer-initial-size+ 64)
 
 (defstruct (string-output-stream
             (:include ansi-stream
@@ -1329,7 +1357,7 @@
             (:predicate nil))
   ;; The string we throw stuff in.
   (buffer (make-string
-           *string-output-stream-buffer-initial-size*)
+           +string-output-stream-buffer-initial-size+)
    :type (simple-array character (*)))
   ;; Chains of buffers to use
   (prev nil :type list)
@@ -1368,7 +1396,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
   (setf (string-output-stream-buffer stream)
         (or (pop (string-output-stream-next stream))
             ;; FIXME: This would be the correct place to detect that
-            ;; more then FIXNUM characters are being written to the
+            ;; more than FIXNUM characters are being written to the
             ;; stream, and do something about it.
             (make-string size))))
 
@@ -1542,7 +1570,8 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
     (:close
      (/noshow0 "/string-out-misc close")
      (set-closed-flame stream))
-    (:element-type (string-output-stream-element-type stream))))
+    (:element-type (string-output-stream-element-type stream))
+    (:element-mode 'character)))
 
 ;;; Return a string of all the characters sent to a stream made by
 ;;; MAKE-STRING-OUTPUT-STREAM since the last call to this function.
@@ -1738,9 +1767,10 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
            (if found
                (- end (the fixnum found))
                current)))))
-     (:element-type
+    (:element-type
       (array-element-type
-       (fill-pointer-output-stream-string stream)))))
+       (fill-pointer-output-stream-string stream)))
+    (:element-mode 'character)))
 
 ;;;; case frobbing streams, used by FORMAT ~(...~)
 
@@ -1793,6 +1823,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
   (case op
     (:close
      (set-closed-flame stream))
+    (:element-mode 'character)
     (t
      (let ((target (case-frob-stream-target stream)))
        (if (ansi-stream-p target)
@@ -1982,16 +2013,8 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
 
 ;;;; Shared {READ,WRITE}-SEQUENCE support functions
 
-(declaim (inline stream-element-mode
-                 stream-compute-io-function
+(declaim (inline stream-compute-io-function
                  compatible-vector-and-stream-element-types-p))
-
-(defun stream-element-mode (stream)
-  (declare (type stream stream))
-  (if (fd-stream-p stream)
-      (fd-stream-element-mode stream)
-      (stream-element-type-stream-element-mode
-       (stream-element-type stream))))
 
 (defun stream-compute-io-function (stream
                                    stream-element-mode sequence-element-type

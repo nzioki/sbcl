@@ -135,12 +135,19 @@
              (if (typep type '(cons (eql function))) ; sanity test
                  (try-cache type)
                  (classoid-of x)))))
-      (symbol (if x (try-cache x) *null-type*))
+      (symbol (if x (try-cache x) (specifier-type 'null)))
       (number (try-cache x))
       (array (ctype-of-array x))
-      (cons *cons-t-t-type*)
-      ;; This makes no distinction for BASE/EXTENDED-CHAR. Should it?
-      (character *character-type*)
+      (cons (specifier-type 'cons))
+      (character
+       (typecase x
+         (standard-char (specifier-type 'standard-char))
+         (base-char (specifier-type 'base-char))
+         ;; If the last case were expressed as EXTENDED-CHAR,
+         ;; we wrongly get "this is not a (VALUES CTYPE): NIL"
+         ;; because the compiler is too naive to see that
+         ;; the last 2 cases partition CHARACTER.
+         (t (specifier-type 'extended-char))))
       #!+sb-simd-pack
       (simd-pack
        (let ((tag (%simd-pack-tag x)))
@@ -252,6 +259,7 @@ Examples:
 
 Experimental."
   (declare (ignore env))
-  (handler-case (prog1 t (values-specifier-type type-specifier))
-    (parse-unknown-type () nil)
-    (error () nil)))
+  ;; We don't even care if the spec is parseable -
+  ;; just deem it invalid.
+  (not (null (ignore-errors
+               (type-or-nil-if-unknown type-specifier t)))))

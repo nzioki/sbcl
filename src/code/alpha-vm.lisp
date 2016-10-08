@@ -49,7 +49,9 @@
           (setf (sap-ref-8 sap (1+ offset)) (ldb (byte 8 24) value))))
        (:lda
         (setf (sap-ref-8 sap offset) (ldb (byte 8 0) value))
-        (setf (sap-ref-8 sap (1+ offset)) (ldb (byte 8 8) value)))))))
+        (setf (sap-ref-8 sap (1+ offset)) (ldb (byte 8 8) value)))
+       (:absolute32
+        (setf (sap-ref-32 sap offset) value))))))
 
 ;;;; "sigcontext" access functions, cut & pasted from x86-vm.lisp then
 ;;;; hacked for types.
@@ -133,32 +135,11 @@
 
 
 ;;;; INTERNAL-ERROR-ARGS
-
-;;; Given a (POSIX) signal context, extract the internal error
-;;; arguments from the instruction stream.  This is e.g.
-;;; 4       23      254     240     2       0       0       0
-;;; |       ~~~~~~~~~~~~~~~~~~~~~~~~~
-;;; length         data              (everything is an octet)
-;;;  (pc)
-;;; (example from undefined_tramp: "(gdb) x/40ub 0x10148" for yourself
-;;; to replicate)
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (let ((pc (context-pc context)))
+  (let* ((pc (context-pc context))
+         (error-number (sap-ref-8 pc 4)))
     (declare (type system-area-pointer pc))
-    ;; pc is a SAP pointing at - or actually, shortly after -
-    ;; the instruction that got us into this mess in the first place
-    (let* ((length (sap-ref-8 pc 4))
-           (vector (make-array length :element-type '(unsigned-byte 8))))
-      (declare (type (unsigned-byte 8) length)
-               (type (simple-array (unsigned-byte 8) (*)) vector))
-      (copy-ub8-from-system-area pc 5 vector 0 length)
-      (let* ((index 0)
-             (error-number (sb!c:read-var-integer vector index)))
-        (collect ((sc-offsets))
-                 (loop
-                  (when (>= index length)
-                    (return))
-                  (sc-offsets (sb!c:read-var-integer vector index)))
-                 (values error-number (sc-offsets)))))))
+    (values error-number
+            (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
 

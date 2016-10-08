@@ -48,7 +48,8 @@
 ;;; our guess for the preferred order in which to do type tests
 ;;; (cheaper and/or more probable first.)
 (defparameter *type-test-ordering*
-  '(fixnum single-float double-float integer #!+long-float long-float bignum
+  '(fixnum single-float double-float integer #!+long-float long-float
+    sb!vm:signed-word word bignum
     complex ratio))
 
 ;;; Should TYPE1 be tested before TYPE2?
@@ -653,13 +654,8 @@
         (foreach single-float double-float #!+long-float long-float))
        (truncate-float (dispatch-type divisor))))))
 
-;; Only inline when no VOP exists
-#!-multiply-high-vops (declaim (inline %multiply-high))
 (defun %multiply-high (x y)
   (declare (type word x y))
-  #!-multiply-high-vops
-  (values (sb!bignum:%multiply x y))
-  #!+multiply-high-vops
   (%multiply-high x y))
 
 (defun floor (number &optional (divisor 1))
@@ -856,8 +852,41 @@ the first."
       (when (< arg n)
         (setf n arg)))))
 
-(eval-when (:compile-toplevel :execute)
+(defmacro make-fixnum-float-comparer (operation integer float float-type)
+  (multiple-value-bind (min max)
+      (ecase float-type
+        (single-float
+         (values most-negative-fixnum-single-float most-positive-fixnum-single-float))
+        (double-float
+         (values most-negative-fixnum-double-float most-positive-fixnum-double-float)))
+    ` (cond ((> ,float ,max)
+             ,(ecase operation
+                ((= >) nil)
+                (< t)))
+            ((< ,float ,min)
+             ,(ecase operation
+                ((= <) nil)
+                (> t)))
+            (t
+             (let ((quot (%unary-truncate ,float)))
+               ,(ecase operation
+                  (=
+                   `(and (= quot ,integer)
+                         (= (float quot ,float) ,float)))
+                  (>
+                   `(cond ((> ,integer quot))
+                          ((< ,integer quot)
+                           nil)
+                          ((<= ,integer 0)
+                           (> (float quot ,float) ,float))))
+                  (<
+                   `(cond ((< ,integer quot))
+                          ((> ,integer quot)
+                           nil)
+                          ((>= ,integer 0)
+                           (< (float quot ,float) ,float))))))))))
 
+(eval-when (:compile-toplevel :execute)
 ;;; The INFINITE-X-FINITE-Y and INFINITE-Y-FINITE-X args tell us how
 ;;; to handle the case when X or Y is a floating-point infinity and
 ;;; the other arg is a rational. (Section 12.1.4.1 of the ANSI spec
@@ -865,65 +894,46 @@ the first."
 ;;; rational when comparing with a rational, but infinities can't be
 ;;; converted to a rational, so we show some initiative and do it this
 ;;; way instead.)
-(defun basic-compare (op &key infinite-x-finite-y infinite-y-finite-x)
-  `(((fixnum fixnum) (,op x y))
+  (defun basic-compare (op &key infinite-x-finite-y infinite-y-finite-x)
+    `(((fixnum fixnum) (,op x y))
+      ((single-float single-float) (,op x y))
+      #!+long-float
+      (((foreach single-float double-float long-float) long-float)
+       (,op (coerce x 'long-float) y))
+      #!+long-float
+      ((long-float (foreach single-float double-float))
+       (,op x (coerce y 'long-float)))
+      ((fixnum (foreach single-float double-float))
+       (if (float-infinity-p y)
+           ,infinite-y-finite-x
+           (make-fixnum-float-comparer ,op x y (dispatch-type y))))
+      (((foreach single-float double-float) fixnum)
+       (if (eql y 0)
+           (,op x (coerce 0 '(dispatch-type x)))
+           (if (float-infinity-p x)
+               ,infinite-x-finite-y
+               ;; Likewise
+               (make-fixnum-float-comparer ,(case op
+                                              (> '<)
+                                              (< '>)
+                                              (= '=))
+                                           y x (dispatch-type x)))))
+      (((foreach single-float double-float) double-float)
+       (,op (coerce x 'double-float) y))
+      ((double-float single-float)
+       (,op x (coerce y 'double-float)))
+      (((foreach single-float double-float #!+long-float long-float) rational)
+       (if (eql y 0)
+           (,op x (coerce 0 '(dispatch-type x)))
+           (if (float-infinity-p x)
+               ,infinite-x-finite-y
+               (,op (rational x) y))))
+      (((foreach bignum fixnum ratio) float)
+       (if (float-infinity-p y)
+           ,infinite-y-finite-x
+           (,op x (rational y))))))
+  )                                     ; EVAL-WHEN
 
-    ((single-float single-float) (,op x y))
-    #!+long-float
-    (((foreach single-float double-float long-float) long-float)
-     (,op (coerce x 'long-float) y))
-    #!+long-float
-    ((long-float (foreach single-float double-float))
-     (,op x (coerce y 'long-float)))
-    ((fixnum (foreach single-float double-float))
-     (if (float-infinity-p y)
-         ,infinite-y-finite-x
-         ;; If the fixnum has an exact float representation, do a
-         ;; float comparison. Otherwise do the slow float -> ratio
-         ;; conversion.
-         (multiple-value-bind (lo hi)
-             (case '(dispatch-type y)
-               (single-float
-                (values most-negative-exactly-single-float-fixnum
-                        most-positive-exactly-single-float-fixnum))
-               (double-float
-                (values most-negative-exactly-double-float-fixnum
-                        most-positive-exactly-double-float-fixnum)))
-           (if (<= lo y hi)
-               (,op (coerce x '(dispatch-type y)) y)
-               (,op x (rational y))))))
-    (((foreach single-float double-float) fixnum)
-     (if (eql y 0)
-         (,op x (coerce 0 '(dispatch-type x)))
-         (if (float-infinity-p x)
-             ,infinite-x-finite-y
-             ;; Likewise
-             (multiple-value-bind (lo hi)
-                 (case '(dispatch-type x)
-                   (single-float
-                    (values most-negative-exactly-single-float-fixnum
-                            most-positive-exactly-single-float-fixnum))
-                   (double-float
-                    (values most-negative-exactly-double-float-fixnum
-                            most-positive-exactly-double-float-fixnum)))
-               (if (<= lo y hi)
-                   (,op x (coerce y '(dispatch-type x)))
-                   (,op (rational x) y))))))
-    (((foreach single-float double-float) double-float)
-     (,op (coerce x 'double-float) y))
-    ((double-float single-float)
-     (,op x (coerce y 'double-float)))
-    (((foreach single-float double-float #!+long-float long-float) rational)
-     (if (eql y 0)
-         (,op x (coerce 0 '(dispatch-type x)))
-         (if (float-infinity-p x)
-             ,infinite-x-finite-y
-             (,op (rational x) y))))
-    (((foreach bignum fixnum ratio) float)
-     (if (float-infinity-p y)
-         ,infinite-y-finite-x
-         (,op x (rational y))))))
-) ; EVAL-WHEN
 
 (macrolet ((def-two-arg-</> (name op ratio-arg1 ratio-arg2 &rest cases)
              `(defun ,name (x y)
@@ -1037,7 +1047,7 @@ the first."
        #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
   (def lognor t lognor
        (lambda (x y) (lognot (bignum-logical-ior x y)))
-       #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
+       #!+sb-doc "Complement the logical OR of INTEGER1 and INTEGER2.")
   ;; ... but BIGNUM-LOGICAL-NOT on a bignum will always return a bignum
   (def logandc1 t logandc1
        (lambda (x y) (bignum-logical-and (bignum-logical-not x) y))
@@ -1098,7 +1108,7 @@ and the number of 0 bits if INTEGER is negative."
               (cond ((and (plusp count)
                           (>= (+ length count)
                               sb!vm:n-word-bits))
-                     (bignum-ashift-left (make-small-bignum integer) count))
+                     (bignum-ashift-left-fixnum integer count))
                     (t
                      (truly-the (signed-byte #.sb!vm:n-word-bits)
                                 (ash (truly-the fixnum integer) count))))))
@@ -1167,8 +1177,14 @@ and the number of 0 bits if INTEGER is negative."
 
 (defun %ldb (size posn integer)
   (declare (type bit-index size posn) (explicit-check))
-  (logand (ash integer (- posn))
-          (1- (ash 1 size))))
+  ;; The naive algorithm is horrible in the general case.
+  ;; Consider (LDB (BYTE 1 2) (SOME-GIANT-BIGNUM)) which has to shift the
+  ;; input rightward 2 bits, consing a new bignum just to read 1 bit.
+  (if (and (<= 0 size sb!vm:n-positive-fixnum-bits)
+           (typep integer 'bignum))
+      (sb!bignum::ldb-bignum=>fixnum size posn integer)
+      (logand (ash integer (- posn))
+              (1- (ash 1 size)))))
 
 (defun %mask-field (size posn integer)
   (declare (type bit-index size posn) (explicit-check))

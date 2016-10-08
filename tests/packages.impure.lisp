@@ -809,3 +809,27 @@ if a restart was invoked."
    (let ((tot-missing 0))
      (dolist (thread threads (assert (zerop tot-missing)))
        (incf tot-missing (sb-thread:join-thread thread))))))
+
+(with-test (:name :defpackage-multiple-nicknames)
+  (let* ((name1 (string (gensym)))
+         (name2 (string (gensym)))
+         (names (package-nicknames
+                 (eval `(defpackage ,(gensym)
+                          (:nicknames ,name1)
+                          (:nicknames ,name2))))))
+    (assert (or (equal
+                 names
+                 (list name1 name2))
+                (equal
+                 names
+                 (list name2 name1))))))
+
+(with-test (:name (defpackage :local-nicknames :lock))
+  (destructuring-bind (name1 name2 name3)
+      (loop :repeat 3 :collect (string (gensym)))
+    (let ((package1 (eval `(defpackage ,name1)))
+          (package2 (eval `(defpackage ,name2
+                             (:local-nicknames (,name3 ,name1))
+                             (:lock t)))))
+      (assert (equal (package-local-nicknames package2) `((,name3 . ,package1))))
+      (assert (package-locked-p package2)))))

@@ -461,26 +461,17 @@ static void brief_struct(lispobj obj)
 }
 
 #include "genesis/layout.h"
-static boolean untagged_slot_p(struct layout * layout,
+static boolean tagged_slot_p(struct layout * layout,
                                int slot_index)
 {
-#ifdef LISP_FEATURE_INTERLEAVED_RAW_SLOTS
   extern boolean positive_bignum_logbitp(int,struct bignum*);
-  lispobj bitmap = layout->untagged_bitmap;
+  lispobj bitmap = layout->bitmap;
+  sword_t fixnum = (sword_t)bitmap >> N_FIXNUM_TAG_BITS; // optimistically
   return fixnump(bitmap)
-         ? (fixnum_value(bitmap) >> slot_index) & 1
+         ? bitmap == make_fixnum(-1) ||
+            (slot_index < N_WORD_BITS && ((fixnum >> slot_index) & 1) != 0)
          : positive_bignum_logbitp(slot_index,
                                    (struct bignum*)native_pointer(bitmap));
-#else
-  // STANDARD-OBJECT has layout-length = number of defined slots, but
-  // the primitive object always occupies 4 physical words. The guard on
-  // n_untagged_slots ensures that for classes with no slots, we don't
-  // wrongly show all words of the primitive object as untagged,
-  // because the second half of the expression reduces to slot_index>=1.
-  return layout->n_untagged_slots > 0
-         && slot_index >= (fixnum_value(layout->length)|1)
-                          - fixnum_value(layout->n_untagged_slots);
-#endif
 }
 
 static void print_struct(lispobj obj)
@@ -496,11 +487,12 @@ static void print_struct(lispobj obj)
         struct layout * layout = (struct layout*)native_pointer(layout_obj);
         for (i=INSTANCE_DATA_START; i<instance_length(instance->header); i++) {
             sprintf(buffer, "slot %d: ", i);
-            if (layout==NULL || untagged_slot_p(layout, i)) {
+            if (layout != NULL && tagged_slot_p(layout, i)) {
+                print_obj(buffer, instance->slots[i]);
+            } else {
                 newline(NULL);
                 printf("\n\t    %s0x%"OBJ_FMTX" [raw]", buffer, instance->slots[i]);
-            } else
-                print_obj(buffer, instance->slots[i]);
+            }
         }
     }
 }
@@ -598,7 +590,7 @@ static char *symbol_slots[] = {"value: ", "hash: ",
     NULL};
 static char *ratio_slots[] = {"numer: ", "denom: ", NULL};
 static char *complex_slots[] = {"real: ", "imag: ", NULL};
-static char *code_slots[] = {"words: ", "entry: ", "debug: ", NULL};
+static char *code_slots[] = {"bytes: ", "entry: ", "debug: ", NULL};
 static char *fn_slots[] = {
     "self: ", "next: ", "name: ", "arglist: ", "type: ", "info: ", NULL};
 static char *closure_slots[] = {"fn: ", NULL};

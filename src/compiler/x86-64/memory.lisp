@@ -19,12 +19,19 @@
 ;;; SETF function (new value first, as apposed to a SETF macro, which
 ;;; takes the new value last).
 (define-vop (cell-ref)
-  (:args (object :scs (descriptor-reg)))
+  (:args (object :scs (descriptor-reg)
+                 :load-if (not (and (sc-is object immediate)
+                                    (symbolp (tn-value object))))))
   (:results (value :scs (descriptor-reg any-reg)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (loadw value object offset lowtag)))
+    (if (sc-is object immediate)
+        (inst mov value
+              (make-ea :qword :disp
+                       (+ nil-value (static-symbol-offset (tn-value object))
+                          (- (* offset n-word-bytes) lowtag))))
+        (loadw value object offset lowtag))))
 (define-vop (cell-set)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
@@ -184,19 +191,11 @@
   (:info offset)
   (:generator 4
      (if (sc-is value immediate)
-         (let ((val (tn-value value)))
-           (move-immediate (make-ea :qword :base object
-                                    :disp (- (* (+ base offset) n-word-bytes)
-                                             lowtag))
-                           (etypecase val
-                             (integer
-                              (fixnumize val))
-                             (symbol
-                              (+ nil-value (static-symbol-offset val)))
-                             (character
-                              (logior (ash (char-code val) n-widetag-bits)
-                                      character-widetag)))
-                           temp))
+         (move-immediate (make-ea :qword :base object
+                                         :disp (- (* (+ base offset) n-word-bytes)
+                                                  lowtag))
+                         (encode-value-if-immediate value)
+                         temp)
          ;; Else, value not immediate.
          (storew value object (+ base offset) lowtag))))
 

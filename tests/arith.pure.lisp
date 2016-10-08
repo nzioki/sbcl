@@ -721,3 +721,27 @@
                   (let (z)
                     (expt (setf z (complex -0.123 -0.789)) 2)))))
              #C(-0.60739195 0.194094))))
+
+(with-test (:name :complex-sqrt)
+  (assert (= (expt (sqrt least-negative-double-float) 2)
+             least-negative-double-float)))
+
+(with-test (:name :ldb-sign)
+  (assert (= (funcall (checked-compile
+                       `(lambda (x)
+                          (ldb (byte ,(1- sb-vm:n-word-bits) 0) x)))
+                      12)
+             12)))
+
+(with-test (:name :mod-arith-large-constant)
+  (assert (= (funcall (checked-compile
+                       '(lambda (x)
+                         (declare (sb-ext:word x))
+                         (logand sb-ext:most-positive-word
+                          (+ x 2312423423))))
+                      12)
+             2312423435)))
+
+(with-test (:name :bignum-ashift-left-fixnum)
+  (assert (= (eval '(ash most-negative-fixnum (1- sb-vm:n-word-bits)))
+             (eval '(* most-negative-fixnum (expt 2 (1- sb-vm:n-word-bits)))))))

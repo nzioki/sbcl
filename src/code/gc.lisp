@@ -194,22 +194,6 @@ statistics are appended to it."
 
 (defvar *already-in-gc* (sb!thread:make-mutex :name "GC lock"))
 
-;;; A unique GC id. This is supplied for code that needs to detect
-;;; whether a GC has happened since some earlier point in time. For
-;;; example:
-;;;
-;;;   (let ((epoch *gc-epoch*))
-;;;      ...
-;;;      (unless (eql epoch *gc-epoch)
-;;;        ....))
-;;;
-;;; This isn't just a fixnum counter since then we'd have theoretical
-;;; problems when exactly 2^29 GCs happen between epoch
-;;; comparisons. Unlikely, but the cost of using a cons instead is too
-;;; small to measure. -- JES, 2007-09-30
-(declaim (type cons *gc-epoch*))
-(!defvar *gc-epoch* '(nil . nil))
-
 (defun sub-gc (&key (gen 0))
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
@@ -361,7 +345,7 @@ guaranteed to be collected."
 (defun unsafe-clear-roots (gen)
   #!-gencgc (declare (ignore gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
-  ;; as having these cons more then we have space left leads to huge
+  ;; as having these cons more than we have space left leads to huge
   ;; badness.
   (scrub-control-stack)
   ;; Power cache of the bignum printer: drops overly large bignums and
@@ -369,8 +353,12 @@ guaranteed to be collected."
   (scrub-power-cache)
   ;; Clear caches depending on the generation being collected.
   #!+gencgc
-  (cond ((eql 0 gen))
+  (cond ((eql 0 gen)
+         ;; Drop strings because the hash is pointer-hash
+         ;; but there is no automatic cache rehashing after GC.
+         (sb!format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
+         (sb!format::tokenize-control-string-cache-clear)
          (ctype-of-cache-clear))
         (t
          (drop-all-hash-caches)))

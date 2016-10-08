@@ -19,7 +19,7 @@
                                        :key #'car :from-end t))))
                `(progn
                   (declaim ((simple-vector ,n) **internal-error-handlers**))
-                  (defglobal **internal-error-handlers**
+                  (!defglobal **internal-error-handlers**
                     (make-array ,n :initial-element 0))))))
   (def-it))
 
@@ -53,14 +53,15 @@
 (defun undefined-alien-fun-error ()
   (error 'undefined-alien-function-error))
 
-(deferr invalid-arg-count-error (nargs &optional (fname nil fnamep))
-  (if fnamep
-      (error 'simple-program-error
+(deferr invalid-arg-count-error (nargs)
+  (error 'simple-program-error
+         :format-control "invalid number of arguments: ~S"
+         :format-arguments (list nargs)))
+
+(deferr local-invalid-arg-count-error (nargs name)
+  (error 'simple-program-error
          :format-control "~S called with invalid number of arguments: ~S"
-         :format-arguments (list fname nargs))
-      (error 'simple-program-error
-             :format-control "invalid number of arguments: ~S"
-             :format-arguments (list nargs))))
+         :format-arguments (list name nargs)))
 
 (deferr bogus-arg-to-values-list-error (list)
   (error 'simple-type-error
@@ -84,6 +85,8 @@
     (when (listp tag)
       (multiple-value-bind (name frame)
           (sb!debug::find-interrupted-name-and-frame)
+        ;; KLUDGE: can't inline due to build ordering problem.
+        (declare (notinline sb!di:frame-debug-fun))
         (let ((down (and (eq name 'sb!c::unwind) ; is this tautological ?
                          (sb!di:frame-down frame))))
           (when frame
@@ -143,9 +146,6 @@
          :format-control "unknown &KEY argument: ~S"
          :format-arguments (list key-name)))
 
-;; FIXME: missing (deferr wrong-number-of-indices)
-;; we don't ever raise that error through a primitive trap I guess.
-
 ;; TODO: make the arguments (ARRAY INDEX &optional BOUND)
 ;; and don't need the bound for vectors. Just read it.
 (deferr invalid-array-index-error (array bound index)
@@ -159,47 +159,6 @@
   ;; recursive error.
   (%primitive print "Thread local storage exhausted.")
   (sb!impl::%halt))
-
-
-;;;; fetching errorful function name
-
-;;; This flag is used to prevent infinite recursive lossage when
-;;; we can't find the caller for some reason.
-(defvar *finding-frame* nil)
-
-(defun find-caller-frame ()
-  (unless *finding-frame*
-    (handler-case
-        (let* ((*finding-frame* t)
-               (frame (sb!di:frame-down (sb!di:frame-down (sb!di:top-frame)))))
-          (sb!di:flush-frames-above frame)
-          frame)
-      ((or error sb!di:debug-condition) ()))))
-
-(defun find-interrupted-frame ()
-  (when (plusp *free-interrupt-context-index*)
-    (handler-case
-        (sb!di::signal-context-frame (sb!alien::alien-sap
-                                      (sb!di::nth-interrupt-context
-                                       (1- *free-interrupt-context-index*))))
-      ((or error sb!di:debug-condition) ()))))
-
-(defun find-caller-of-named-frame (name)
-  (unless *finding-frame*
-    (handler-case
-        (let ((*finding-frame* t))
-          (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
-              ((null frame))
-            (when (and (sb!di::compiled-frame-p frame)
-                       (eq name (sb!di:debug-fun-name
-                                 (sb!di:frame-debug-fun frame))))
-              (let ((caller (sb!di:frame-down frame)))
-                (sb!di:flush-frames-above caller)
-                (return caller)))))
-      ((or error sb!di:debug-condition) ()
-        nil)
-      (sb!di:debug-condition ()
-        nil))))
 
 
 ;;; Returns true if number of arguments matches required/optional
@@ -344,6 +303,7 @@
      (error *heap-exhausted-error-condition*))))
 
 (defun undefined-alien-variable-error ()
+  (declare (optimize allow-non-returning-tail-call))
   (error 'undefined-alien-variable-error))
 
 #!-win32

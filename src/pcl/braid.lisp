@@ -31,35 +31,22 @@
 
 (in-package "SB-PCL")
 
-(defun allocate-standard-instance (wrapper
-                                   &optional (slots-init nil slots-init-p))
-  (let ((instance (%make-standard-instance nil 0))
-        (no-of-slots (wrapper-no-of-instance-slots wrapper)))
+(defun allocate-standard-instance (wrapper)
+  (let* ((no-of-slots (wrapper-no-of-instance-slots wrapper))
+         (instance (%make-standard-instance (make-array no-of-slots
+                                                        :initial-element +slot-unbound+)
+                                            0)))
     (setf (std-instance-wrapper instance) wrapper)
-    (setf (std-instance-slots instance)
-          (cond (slots-init-p
-                 ;; Inline the slots vector allocation and initialization.
-                 (let ((slots (make-array no-of-slots :initial-element 0)))
-                   (do ((rem-slots slots-init (rest rem-slots))
-                        (i 0 (1+ i)))
-                       ((>= i no-of-slots)) ;endp rem-slots))
-                     (declare (list rem-slots)
-                              (type index i))
-                     (setf (aref slots i) (first rem-slots)))
-                   slots))
-                (t
-                 (make-array no-of-slots
-                             :initial-element +slot-unbound+))))
     instance))
 
 (defmacro allocate-standard-funcallable-instance-slots
     (wrapper &optional slots-init-p slots-init)
   `(let ((no-of-slots (wrapper-no-of-instance-slots ,wrapper)))
-    ,(if slots-init-p
-         `(if ,slots-init-p
-           (make-array no-of-slots :initial-contents ,slots-init)
-           (make-array no-of-slots :initial-element +slot-unbound+))
-         `(make-array no-of-slots :initial-element +slot-unbound+))))
+     ,(if slots-init-p
+          `(if ,slots-init-p
+               (make-array no-of-slots :initial-contents ,slots-init)
+               (make-array no-of-slots :initial-element +slot-unbound+))
+          `(make-array no-of-slots :initial-element +slot-unbound+))))
 
 (define-condition unset-funcallable-instance-function
     (reference-condition simple-error)
@@ -71,7 +58,7 @@
 (defun allocate-standard-funcallable-instance
     (wrapper &optional (slots-init nil slots-init-p))
   (let ((fin (%make-standard-funcallable-instance
-              nil (get-instance-hash-code))))
+              nil (sb-impl::new-instance-hash-code))))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -206,7 +193,6 @@
                                   (t
                                    (!boot-make-wrapper (length slots) name))))
                    (proto nil))
-              (when (eq name t) (setq *the-wrapper-of-t* wrapper))
               (set (make-class-symbol name) class)
               (dolist (slot slots)
                 (unless (eq (getf slot :allocation :instance) :instance)
@@ -271,21 +257,32 @@
                     (symbol-value (make-class-symbol name)))
                   *standard-method-class-names*))
 
-    (let* ((smc-class (find-class 'standard-method-combination))
-           (smc-wrapper (!bootstrap-get-slot 'standard-class
-                                             smc-class
-                                             'wrapper))
-           (smc (allocate-standard-instance smc-wrapper)))
-      (flet ((set-slot (name value)
-               (!bootstrap-set-slot 'standard-method-combination
-                                    smc
-                                    name
-                                    value)))
-        (set-slot 'source nil)
-        (set-slot 'type-name 'standard)
-        (set-slot '%documentation "The standard method combination.")
-        (set-slot 'options ()))
-      (setq *standard-method-combination* smc))))
+    (flet ((make-method-combination (class-name)
+             (let* ((class (find-class class-name))
+                    (wrapper (!bootstrap-get-slot
+                              'standard-class class 'wrapper))
+                    (instance (allocate-standard-instance wrapper)))
+               (flet ((set-slot (name value)
+                        (!bootstrap-set-slot class-name instance name value)))
+                 (values instance #'set-slot)))))
+      ;; Create the STANDARD method combination object.
+      (multiple-value-bind (method-combination set-slot)
+          (make-method-combination 'standard-method-combination)
+        (funcall set-slot 'source nil)
+        (funcall set-slot 'type-name 'standard)
+        (funcall set-slot 'options '())
+        (funcall set-slot '%documentation "The standard method combination.")
+        (setq *standard-method-combination* method-combination))
+      ;; Create the OR method combination object.
+      (multiple-value-bind (method-combination set-slot)
+          (make-method-combination 'short-method-combination)
+        (funcall set-slot 'source 'nil)
+        (funcall set-slot 'type-name 'or)
+        (funcall set-slot 'operator 'or)
+        (funcall set-slot 'identity-with-one-argument t)
+        (funcall set-slot '%documentation nil)
+        (funcall set-slot 'options '(:most-specific-first))
+        (setq *or-method-combination* method-combination)))))
 
 ;;; Initialize a class metaobject.
 (defun !bootstrap-initialize-class
@@ -540,7 +537,6 @@
                (lclass (find-classoid name))
                (wrapper (classoid-layout lclass)))
           (set (get-built-in-class-symbol name) class)
-          (set (get-built-in-wrapper-symbol name) wrapper)
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class

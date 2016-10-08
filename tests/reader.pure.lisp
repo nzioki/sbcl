@@ -211,6 +211,13 @@
     (let ((*readtable* (copy-readtable nil)))
       (assert (null (loop for c across standard-chars append (frob c)))))))
 
+(with-test (:name :copy-readtable-with-unicode-macro)
+  (let ((rt (copy-readtable)))
+    (set-macro-character #\u100fa #'error nil rt)
+    (assert (plusp (hash-table-count (sb-impl::character-macro-hash-table rt))))
+    (copy-readtable nil rt)
+    (assert (null (get-macro-character #\UFC rt)))))
+
 ;;; All these must return a primary value of NIL when *read-suppress* is T
 ;;; Reported by Bruno Haible on cmucl-imp 2004-10-25.
 (with-test (:name :read-suppress-char-macros)
@@ -427,3 +434,6 @@
   (sb-int:collect ((l))
     (read-from-string "a" (l 'first) (l 'second) :start (progn (l 'third) 0))
     (assert (equal (l) '(first second third)))))
+
+(with-test (:name :sharp-star-reader-error)
+  (assert-error (read-from-string (format nil "#~D*" (1+ most-positive-fixnum))) reader-error))

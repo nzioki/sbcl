@@ -146,6 +146,7 @@
 ;;; all.
 (macrolet ((def (class)
              `(defmethod class-prototype ((class ,class))
+                (declare (notinline allocate-instance))
                 (with-slots (prototype) class
                   (or prototype
                       (setf prototype (allocate-instance class)))))))
@@ -560,17 +561,23 @@
 (defmethod reinitialize-instance :after ((class condition-class) &key)
   (let* ((name (class-name class))
          (classoid (find-classoid name))
-         (slots (condition-classoid-slots classoid)))
+         (slots (condition-classoid-slots classoid))
+         (source (sb-kernel::layout-source-location (classoid-layout classoid))))
     ;; to balance the REMOVE-SLOT-ACCESSORS call in
     ;; REINITIALIZE-INSTANCE :BEFORE (SLOT-CLASS).
-    (dolist (slot slots)
-      (let ((slot-name (condition-slot-name slot)))
-        (dolist (reader (condition-slot-readers slot))
-          ;; FIXME: see comment in SHARED-INITIALIZE :AFTER
-          ;; (CONDITION-CLASS T), below.  -- CSR, 2005-11-18
-          (sb-kernel::install-condition-slot-reader reader name slot-name))
-        (dolist (writer (condition-slot-writers slot))
-          (sb-kernel::install-condition-slot-writer writer name slot-name))))))
+    (flet ((add-source-location (method)
+             (when source
+               (setf (slot-value method 'source) source))))
+     (dolist (slot slots)
+       (let ((slot-name (condition-slot-name slot)))
+         (dolist (reader (condition-slot-readers slot))
+           ;; FIXME: see comment in SHARED-INITIALIZE :AFTER
+           ;; (CONDITION-CLASS T), below.  -- CSR, 2005-11-18
+           (add-source-location
+            (sb-kernel::install-condition-slot-reader reader name slot-name)))
+         (dolist (writer (condition-slot-writers slot))
+           (add-source-location
+            (sb-kernel::install-condition-slot-writer writer name slot-name))))))))
 
 (defmethod shared-initialize :after ((class condition-class) slot-names
                                      &key direct-slots direct-superclasses)
@@ -728,6 +735,7 @@
 ;;; The way to fix that is to ensure that every defstruct has a zero-argument
 ;;; constructor made by the compiler and stashed in a random symbol.
 (defun make-defstruct-allocation-function (name class)
+  (declare (muffle-conditions code-deletion-note))
   ;; FIXME: Why don't we go class->layout->info == dd
   (let ((dd (find-defstruct-description name)))
     (ecase (dd-type dd)
@@ -939,27 +947,27 @@
          (not (find-in-superclasses (find-class 'function) (list class))))))))
 
 (defun %update-cpl (class cpl)
-  (when (eq (class-of class) *the-class-standard-class*)
-    (when (find (find-class 'function) cpl)
-      (error 'cpl-protocol-violation :class class :cpl cpl)))
-  (when (eq (class-of class) *the-class-funcallable-standard-class*)
-    (unless (find (find-class 'function) cpl)
-      (error 'cpl-protocol-violation :class class :cpl cpl)))
-  (if (class-finalized-p class)
-      (unless (and (equal (class-precedence-list class) cpl)
+  (when (or (and
+             (eq (class-of class) *the-class-standard-class*)
+             (find *the-class-function* cpl))
+            (and (eq (class-of class) *the-class-funcallable-standard-class*)
+                 (not (and (find (find-class 'function) cpl)))))
+    (error 'cpl-protocol-violation :class class :cpl cpl))
+  (cond ((not (class-finalized-p class))
+         (setf (slot-value class '%class-precedence-list) cpl
+               (slot-value class 'cpl-available-p) t))
+        ((not (and (equal (class-precedence-list class) cpl)
                    (dolist (c cpl t)
                      (when (position :class (class-direct-slots c)
                                      :key #'slot-definition-allocation)
-                       (return nil))))
-        ;; comment from the old CMU CL sources:
-        ;;   Need to have the cpl setup before %update-lisp-class-layout
-        ;;   is called on CMU CL.
-        (setf (slot-value class '%class-precedence-list) cpl)
-        (setf (slot-value class 'cpl-available-p) t)
-        (%force-cache-flushes class))
-      (progn
-        (setf (slot-value class '%class-precedence-list) cpl)
-        (setf (slot-value class 'cpl-available-p) t)))
+                       (return nil)))))
+
+         ;; comment from the old CMU CL sources:
+         ;;   Need to have the cpl setup before %update-lisp-class-layout
+         ;;   is called on CMU CL.
+         (setf (slot-value class '%class-precedence-list) cpl
+               (slot-value class 'cpl-available-p) t)
+         (%force-cache-flushes class)))
   (update-class-can-precede-p cpl))
 
 (defun update-class-can-precede-p (cpl)
@@ -1043,13 +1051,15 @@
   (multiple-value-bind (instance-slots class-slots custom-slots)
       (classify-slotds eslotds)
     (let* ((nslots (length instance-slots))
-           (owrapper (when (class-finalized-p class) (class-wrapper class)))
+           (owrapper (class-wrapper class))
            (nwrapper
-             (cond ((null owrapper)
-                    (make-wrapper nslots class))
-                   ((slot-layouts-compatible-p (layout-slot-list owrapper)
-                                               instance-slots class-slots custom-slots)
+             (cond ((and owrapper
+                         (slot-layouts-compatible-p (layout-slot-list owrapper)
+                                                    instance-slots class-slots custom-slots))
                     owrapper)
+                   ((or (not owrapper)
+                        (not (class-finalized-p class)))
+                    (make-wrapper nslots class))
                    (t
                     ;; This will initialize the new wrapper to have the
                     ;; same state as the old wrapper. We will then have
@@ -1603,6 +1613,7 @@
 
 
 (defun %change-class (instance new-class initargs)
+  (declare (notinline allocate-instance))
   (binding* ((old-class (class-of instance))
              (copy (allocate-instance new-class))
              (new-wrapper (get-wrapper copy))
@@ -1610,12 +1621,13 @@
              (old-slots (get-slots instance))
              (new-slots (get-slots copy))
              (safe (safe-p new-class))
-             (new-instance-slots
-              (classify-slotds (layout-slot-list new-wrapper)))
-             ((old-instance-slots old-class-slots)
-              (classify-slotds (layout-slot-list old-wrapper))))
-    (labels ((find-slot (name slots)
-               (find name slots :key #'slot-definition-name))
+             (new-wrapper-slots (layout-slot-list new-wrapper))
+             (old-wrapper-slots (layout-slot-list old-wrapper)))
+    (labels ((find-instance-slot (name slots)
+               (loop for slot in slots
+                     when (and (eq (slot-definition-allocation slot) :instance)
+                               (eq (slot-definition-name slot) name))
+                     return slot))
              (initarg-for-slot-p (slot)
                (dolist (slot-initarg (slot-definition-initargs slot))
                  ;; Abuse +slot-unbound+
@@ -1630,20 +1642,22 @@
       ;; "The values of local slots specified by both the class CTO
       ;; and CFROM are retained. If such a local slot was unbound, it
       ;; remains unbound."
-      (dolist (new new-instance-slots)
-        (unless (initarg-for-slot-p new)
-          (binding* ((old (find-slot (slot-definition-name new) old-instance-slots)
+      (dolist (new new-wrapper-slots)
+        (when (and (not (initarg-for-slot-p new))
+                   (eq (slot-definition-allocation new) :instance))
+          (binding* ((old (find-instance-slot (slot-definition-name new) old-wrapper-slots)
                           :exit-if-null)
                      (value (clos-slots-ref old-slots (slot-definition-location old))))
             (set-value value new))))
 
       ;; "The values of slots specified as shared in the class CFROM and
       ;; as local in the class CTO are retained."
-      (dolist (old old-class-slots)
-        (binding* ((slot-and-val (slot-definition-location old))
-                   (new (find-slot (car slot-and-val) new-instance-slots)
-                        :exit-if-null))
-          (set-value (cdr slot-and-val) new))))
+      (dolist (old old-wrapper-slots)
+        (when (eq (slot-definition-allocation old) :class)
+         (binding* ((slot-and-val (slot-definition-location old))
+                    (new (find-instance-slot (car slot-and-val) new-wrapper-slots)
+                         :exit-if-null))
+           (set-value (cdr slot-and-val) new)))))
 
     ;; Make the copy point to the old instance's storage, and make the
     ;; old instance point to the new storage.
@@ -1736,7 +1750,8 @@
              `(defmethod ,name ,args
                 (declare (ignore initargs))
                 (error 'metaobject-initialization-violation
-                       :format-control ,(format nil "~@<~A~@:>" control)
+                       :format-control ,(coerce (format nil "~@<~A~@:>" control)
+                                                'base-string)
                        :format-arguments (list (class-name class))
                        :references (list '(:amop :initialization "Class"))))))
   (def initialize-instance ((class system-class) &rest initargs)

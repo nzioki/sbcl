@@ -90,9 +90,13 @@
 (let ((sb-ext:*evaluator-mode* :compile))
   (eval `(let (x) (defun closure-to-describe () (incf x)))))
 
-(with-test (:name :describe-empty-gf)
-  (silently (describe (make-instance 'generic-function)))
-  (silently (describe (make-instance 'standard-generic-function))))
+(with-test (:name (describe :empty-gf))
+  (assert-no-signal
+   (silently (describe (make-instance 'generic-function)))
+   warning)
+  (assert-signal
+   (silently (describe (make-instance 'standard-generic-function)))
+   warning))
 
 ;;; DESCRIBE should run without signalling an error.
 (with-test (:name (describe :no-error))
@@ -109,35 +113,46 @@
 
 ;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
 ;;; FRESH-LINE and TERPRI neatly.
-(dolist (i (list (make-to-be-described :a 14) 12 "a string"
-                 #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
-                 (find-package :keyword) (list 1 2 3)
-                 nil (cons 1 2) (make-hash-table)
-                 (let ((h (make-hash-table)))
-                   (setf (gethash 10 h) 100
-                         (gethash 11 h) 121)
-                   h)
-                 (make-condition 'simple-error)
-                 (make-condition 'simple-error :format-control "fc")
-                 #'car #'make-to-be-described (lambda (x) (+ x 11))
-                 (constantly 'foo) #'(setf to-be-described-a)
-                 #'describe-object (find-class 'to-be-described)
-                 (find-class 'forward-describe-class)
-                 (find-class 'forward-describe-ref) (find-class 'cons)))
-  (let ((s (with-output-to-string (s)
-             (write-char #\x s)
-             (describe i s))))
-    (macrolet ((check (form)
-                 `(or ,form
-                      (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
-      (check (char= #\x (char s 0)))
-      ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
-      (check (char= #\newline (char s 1)))
-      (check (char/= #\newline (char s 2)))
-      ;; one trailing #\NEWLINE from TERPRI or the like, no more
-      (let ((n (length s)))
-        (check (char= #\newline (char s (- n 1))))
-        (check (char/= #\newline (char s (- n 2))))))))
+(with-test (:name (describe fresh-line terpri))
+  (dolist (i (list (make-to-be-described :a 14) 12 "a string"
+                   #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
+                   (find-package :keyword) (list 1 2 3)
+                   nil (cons 1 2) (make-hash-table)
+                   (let ((h (make-hash-table)))
+                     (setf (gethash 10 h) 100
+                           (gethash 11 h) 121)
+                     h)
+                   (make-condition 'simple-error)
+                   (make-condition 'simple-error :format-control "fc")
+                   #'car #'make-to-be-described (lambda (x) (+ x 11))
+                   (constantly 'foo) #'(setf to-be-described-a)
+                   #'describe-object (find-class 'to-be-described)
+                   (find-class 'forward-describe-class)
+                   (find-class 'forward-describe-ref) (find-class 'cons)))
+    (let ((s (with-output-to-string (s)
+               (write-char #\x s)
+               (describe i s))))
+      (macrolet ((check (form)
+                   `(or ,form
+                        (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
+        (check (char= #\x (char s 0)))
+        ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
+        (check (char= #\newline (char s 1)))
+        (check (char/= #\newline (char s 2)))
+        ;; one trailing #\NEWLINE from TERPRI or the like, no more
+        (let ((n (length s)))
+          (check (char= #\newline (char s (- n 1))))
+          (check (char/= #\newline (char s (- n 2)))))))))
+
+(with-test (:name (describe :argument-precedence-order))
+  ;; Argument precedence order information is only interesting for two
+  ;; or more required parameters.
+  (assert (not (search "Argument precedence order"
+                       (with-output-to-string (stream)
+                         (describe #'class-name stream)))))
+  (assert (search "Argument precedence order"
+                  (with-output-to-string (stream)
+                    (describe #'add-method stream)))))
 
 
 ;;; Tests of documentation on types and classes
@@ -210,6 +225,50 @@
 
   (with-test (:name (documentation condition))
     (do-class baz "BAZ")))
+
+(defclass documentation-metaclass (standard-class)
+  ()
+  (:documentation "metaclass with methods on DOCUMENTATION."))
+
+(defmethod documentation ((thing documentation-metaclass)
+                          (doc-type (eql 't)))
+  (sb-int:awhen (call-next-method)
+    (concatenate 'string ":" sb-int:it)))
+
+(defmethod (setf documentation) (new-value
+                                 (thing documentation-metaclass)
+                                 (doc-type (eql 't)))
+  (call-next-method (when new-value
+                      (substitute #\! #\. new-value))
+                    thing doc-type))
+
+(defmethod sb-mop:validate-superclass ((class documentation-metaclass)
+                                       (superclass standard-class))
+  t)
+
+(defclass documentation-class ()
+  ()
+  (:metaclass documentation-metaclass)
+  (:documentation "normal"))
+
+(with-test (:name (documentation :non-stanadard :metaclass))
+  (flet ((check (expected class-name)
+           (let ((class (find-class class-name)))
+             (assert-documentation class-name 'type expected)
+             (assert-documentation class 'type expected)
+             (assert-documentation class t expected))))
+    ;; Make sure methods specialized on the metaclass are not bypassed
+    ;; when retrieving and modifying class documentation.
+    (check ":normal" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) "2.")
+    (check ":2!" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) nil)
+    (check nil 'documentation-class)
+
+    ;; Sanity check: make sure the metaclass has its own documentation
+    ;; and is not affected by the above modifications.
+    (check "metaclass with methods on DOCUMENTATION."
+           'documentation-metaclass)))
 
 (defstruct (frob (:type vector)) "FROB")
 
@@ -356,11 +415,15 @@
        (declare (ignore x))
        nil))))
 
-(with-test (:name :describe-generic-function-with-assumed-type)
+(with-test (:name (describe generic-function :assumed-type))
   ;; Signalled an error at one point
-  (flet ((zoo () (gogo)))
-    (defmethod gogo () nil)
-    (silently (describe 'gogo))))
+  (let ((fun (checked-compile '(lambda ()
+                                 (flet ((zoo () (gogo)))
+                                   (defmethod gogo () nil)
+                                   (describe 'gogo)))
+                              :allow-style-warnings t)))
+    (handler-bind ((warning #'muffle-warning)) ; implicit gf
+      (silently (funcall fun)))))
 
 (defmacro bug-643958-test ()
   "foo"

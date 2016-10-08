@@ -21,6 +21,7 @@
            #:find-value-cell-values
            #:find-code-constants
            #:find-named-callees
+           #:find-anonymous-callees
            #:file-compile))
 
 (cl:in-package :ctu)
@@ -36,15 +37,15 @@
 
 (defun find-value-cell-values (fun)
   (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (get-header-data code)
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
           for c = (code-header-ref code i)
-          when (= sb-vm::value-cell-header-widetag (widetag-of c))
+          when (= sb-vm:value-cell-header-widetag (widetag-of c))
           collect (sb-vm::value-cell-ref c))))
 
 (defun find-named-callees (fun &key (type t) (name nil namep))
-  (let ((code (sb-kernel:fun-code-header (sb-kernel:%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (sb-kernel:get-header-data code)
-          for c = (sb-kernel:code-header-ref code i)
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+          for c = (code-header-ref code i)
           when (and (typep c 'sb-impl::fdefn)
                     (let ((fun (sb-impl::fdefn-fun c)))
                       (and (typep fun type)
@@ -52,10 +53,17 @@
                                (equal name (sb-impl::fdefn-name c))))))
           collect (sb-impl::fdefn-fun c))))
 
+(defun find-anonymous-callees (fun &key (type 'function))
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+          for fun = (code-header-ref code i)
+          when (typep fun type)
+          collect fun)))
+
 (defun find-code-constants (fun &key (type t))
-  (let ((code (sb-kernel:fun-code-header (sb-kernel:%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (sb-kernel:get-header-data code)
-          for c = (sb-kernel:code-header-ref code i)
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+          for c = (code-header-ref code i)
           when (typep c type)
           collect c)))
 
@@ -115,12 +123,13 @@
 ;; Pretty horrible, but does the job
 (defun count-full-calls (name function)
   (let ((code (with-output-to-string (s)
-                (disassemble function :stream s)))
+                (let ((*print-right-margin* 120))
+                  (disassemble function :stream s))))
         (n 0))
     (with-input-from-string (s code)
       (loop for line = (read-line s nil nil)
             while line
             when (and (search name line)
-                      (search "#<FDEFINITION" line))
+                      (search "FDEFN" line))
             do (incf n)))
     n))

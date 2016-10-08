@@ -43,8 +43,8 @@
 #define LEAVE_PA \
         STORE_STATIC_SYMBOL_VALUE(reg_NULL,PSEUDO_ATOMIC_ATOMIC) ;\
         LOAD_STATIC_SYMBOL_VALUE(reg_TMP,PSEUDO_ATOMIC_INTERRUPTED) ;\
-        cbz     reg_TMP, 1f     ; \
-	blr     reg_TMP         ; \
+        cbz reg_TMP, 1f     ; \
+	brk trap_PendingInterrupt         ; \
 1:
 #endif
 	.align
@@ -73,7 +73,7 @@ call_into_lisp:
         stp     d14,d15, [sp,#144]
 
 	// Start by finding NIL.
-	ldr	reg_NULL, .known_nil
+	ldr	reg_NULL, =NIL
 
 	// Set up NARGS.
 	lsl	reg_NARGS, x2, #N_FIXNUM_TAG_BITS
@@ -347,98 +347,7 @@ call_into_c:
         ret
 
 	.size	call_into_c, .-call_into_c
-
-	.align	4
-	.global	undefined_tramp
-	.type	undefined_tramp, %object
-        .equ    undefined_tramp_header, . + FUN_POINTER_LOWTAG
-	.dword	SIMPLE_FUN_HEADER_WIDETAG
-        .dword	undefined_tramp_header
-.known_nil:
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-undefined_tramp:
-
-        // As in ppc-assem.S, point reg_CODE to the header with a
-        // function lowtag
-        adr     reg_CODE, undefined_tramp_header
-
-
-        brk UNDEFINED_FUN_ERROR << 8 | trap_Error
-
-        .byte  .error_args_end - . - 1
-        // Encode LEXENV
-        // produced with
-        // (let ((result (make-array 10 :fill-pointer 0)))
-        //  (sb-c:write-var-integer
-        //   (sb-c:make-sc-offset sb-vm:descriptor-reg-sc-number sb-vm::lexenv-offset)
-        //   result)
-        //  result)
-        .byte   254
-        .byte   69
-        .byte   5
-.error_args_end:
-
 
-        .align	4
-	.global	undefined_alien_function
-	.type	undefined_alien_function, %object
-        .equ    undefined_alien_function_header, . + FUN_POINTER_LOWTAG
-	.dword	SIMPLE_FUN_HEADER_WIDETAG
-        .dword	undefined_alien_function_header
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-undefined_alien_function:
-        adr     reg_CODE, undefined_alien_function_header
-
-        brk     UNDEFINED_ALIEN_FUN_ERROR << 8 | trap_Error
-
-        // Error arguments for an undefined function.
-        .byte   3
-        // Encode unsigned R8, which comes from call_into_c
-        .byte   0xFE
-        .byte   0x92
-        .byte   0x04
-
-
-	.align	4
-	.global	closure_tramp
-	.type	closure_tramp, %object
-	.dword	SIMPLE_FUN_HEADER_WIDETAG
-        .dword	closure_tramp - SIMPLE_FUN_CODE_OFFSET
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-closure_tramp:
-	ldr	reg_LEXENV, [reg_LEXENV, #FDEFN_FUN_OFFSET]
-	ldr	reg_CODE, [reg_LEXENV, #CLOSURE_FUN_OFFSET]
-	add	reg_LR, reg_CODE, #SIMPLE_FUN_CODE_OFFSET
-        br      reg_LR
-
-	.align	4
-	.global	funcallable_instance_tramp
-	.type	funcallable_instance_tramp, %object
-        .equ	funcallable_instance_tramp, .+ FUN_POINTER_LOWTAG
-	.dword	SIMPLE_FUN_HEADER_WIDETAG
-	.dword	funcallable_instance_tramp
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        .dword	NIL
-        ldr	reg_LEXENV, [reg_LEXENV, #FUNCALLABLE_INSTANCE_FUNCTION_OFFSET]
-	ldr	reg_CODE, [reg_LEXENV, #CLOSURE_FUN_OFFSET]
-	add	reg_LR, reg_CODE, #SIMPLE_FUN_CODE_OFFSET
-        br      reg_LR
-
         // FIXME-ARM: The following is random garbage, to make
         // code/debug-int compile. To get the debugger working, this
         // needs to be implemented.
@@ -546,50 +455,6 @@ alloc_tramp:
         ldp     reg_NL2,reg_NL3, [sp,#16]
         ldp     reg_NL0,reg_NL1, [sp],#80
 
-	ret
-
-        .align
-	.global	fpu_save
-	.type	fpu_save, %function
-fpu_save:
-        stp     q0, q1, [x0]
-        stp     q2,q3, [x0,#32]
-        stp     q4,q5, [x0,#64]
-        stp     q6,q7, [x0,#96]
-        stp     q8,q9, [x0,#128]
-        stp     q10,q11, [x0,#160]
-        stp     q12,q13, [x0,#192]
-        stp     q14,q15, [x0,#224]
-        stp     q16,q17, [x0,#256]
-        stp     q18,q19, [x0,#288]
-        stp     q20,q21, [x0,#320]
-        stp     q22,q23, [x0,#352]
-        stp     q24,q25, [x0,#384]
-        stp     q26,q27, [x0,#416]
-        stp     q28,q29, [x0,#448]
-        stp     q30,q31, [x0,#480]
-	ret
-
-        .align
-	.global	fpu_restore
-	.type	fpu_restore, %function
-fpu_restore:
-        ldp     q0, q1, [x0]
-        ldp     q2,q3, [x0,#32]
-        ldp     q4,q5, [x0,#64]
-        ldp     q6,q7, [x0,#96]
-        ldp     q8,q9, [x0,#128]
-        ldp     q10,q11, [x0,#160]
-        ldp     q12,q13, [x0,#192]
-        ldp     q14,q15, [x0,#224]
-        ldp     q16,q17, [x0,#256]
-        ldp     q18,q19, [x0,#288]
-        ldp     q20,q21, [x0,#320]
-        ldp     q22,q23, [x0,#352]
-        ldp     q24,q25, [x0,#384]
-        ldp     q26,q27, [x0,#416]
-        ldp     q28,q29, [x0,#448]
-        ldp     q30,q31, [x0,#480]
 	ret
 
         .align

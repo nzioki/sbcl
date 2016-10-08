@@ -127,6 +127,14 @@
 (defun xref/14 ()
   *a*)
 
+(sb-ext:defglobal **global** 31)
+
+(defun xref/15 ()
+  **global**)
+
+(defun xref/16 (x)
+  (setf **global** x))
+
 ;; calling a function in a macro body
 (defmacro macro/1 ()
   (when nil
@@ -233,5 +241,17 @@
 
 (defun traced-fun ()
   (called-by-traced-fun))
-
 (trace traced-fun)
+
+#+sb-eval
+(progn
+  (defun called-by-interpreted-funs ())
+
+  (let ((sb-ext:*evaluator-mode* :interpret))
+    (eval '(defun interpreted-fun ()
+             (called-by-interpreted-funs))))
+
+  (let ((sb-ext:*evaluator-mode* :interpret))
+    (eval '(defun traced-interpreted-fun ()
+            (called-by-interpreted-funs))))
+  (trace traced-interpreted-fun))

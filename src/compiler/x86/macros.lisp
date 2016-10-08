@@ -100,6 +100,10 @@
   `(inst mov (make-ea-for-symbol-value ,symbol) ,reg))
 
 #!+sb-thread
+(progn
+(defmacro tls-index-of (symbol)
+  `(make-ea-for-object-slot ,symbol ,sb!vm:symbol-tls-index-slot
+                            ,other-pointer-lowtag))
 (defmacro make-ea-for-symbol-tls-index (symbol)
   (declare (type symbol symbol))
   `(make-ea :dword
@@ -108,25 +112,24 @@
            (ash symbol-tls-index-slot word-shift)
            (- other-pointer-lowtag))))
 
-#!+sb-thread
 (defmacro load-tl-symbol-value (reg symbol)
   `(with-tls-ea (EA :base ,reg
                     :disp-type :index
                     :disp (make-ea-for-symbol-tls-index ,symbol))
      (inst mov ,reg (make-ea :dword :base ,reg) :maybe-fs)))
-#!-sb-thread
-(defmacro load-tl-symbol-value (reg symbol) `(load-symbol-value ,reg ,symbol))
 
-#!+sb-thread
 (defmacro store-tl-symbol-value (reg symbol temp)
   `(with-tls-ea (EA :base ,temp
                     :disp-type :index
                     :disp (make-ea-for-symbol-tls-index ,symbol))
-     (inst mov EA ,reg :maybe-fs)))
+     (inst mov EA ,reg :maybe-fs))))
+
 #!-sb-thread
+(progn
+(defmacro load-tl-symbol-value (reg symbol) `(load-symbol-value ,reg ,symbol))
 (defmacro store-tl-symbol-value (reg symbol temp)
   (declare (ignore temp))
-  `(store-symbol-value ,reg ,symbol))
+  `(store-symbol-value ,reg ,symbol)))
 
 (defmacro load-binding-stack-pointer (reg)
   #!+sb-thread
@@ -350,18 +353,8 @@
     (when vop
       (note-this-location vop :internal-error))
     (inst byte kind)                    ; e.g. trap_xyyy
-    (with-adjustable-vector (vector)    ; interr arguments
-      (write-var-integer code vector)
-      (dolist (tn values)
-        ;; classic CMU CL comment:
-        ;;   zzzzz jrd here. tn-offset is zero for constant
-        ;;   tns.
-        (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                           (or (tn-offset tn) 0))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i))))))
+    (inst byte code)
+    (encode-internal-error-args values)))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc
@@ -601,7 +594,7 @@
 
 ;;; helper for alien stuff.
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger

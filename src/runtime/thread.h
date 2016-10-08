@@ -100,11 +100,15 @@ union per_thread_data {
  * pointers can be later shoved into the thread struct. */
 struct nonpointer_thread_data
 {
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_SAFEPOINT)
+#ifdef LISP_FEATURE_SB_THREAD
+    pthread_attr_t os_attr;
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     os_sem_t state_sem;
     os_sem_t state_not_running_sem;
     os_sem_t state_not_stopped_sem;
 #endif
+#endif
+    struct interrupt_data interrupt_data;
 };
 
 extern struct thread *all_threads;
@@ -320,7 +324,7 @@ static inline struct thread *arch_os_get_current_thread(void)
 
 #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
 extern kern_return_t mach_lisp_thread_init(struct thread *thread);
-extern kern_return_t mach_lisp_thread_destroy(struct thread *thread);
+extern void mach_lisp_thread_destroy(struct thread *thread);
 #endif
 
 typedef struct init_thread_data {

@@ -34,10 +34,12 @@
 ;;; entry for a closure is the shared function entry object.
 (defvar *traced-funs* (make-hash-table :test 'eq :synchronized t))
 
+(deftype trace-report-type ()
+  '(member nil trace))
+
 ;;; A TRACE-INFO object represents all the information we need to
 ;;; trace a given function.
 (def!struct (trace-info
-             (:make-load-form-fun sb-kernel:just-dump-it-normally)
              (:print-object (lambda (x stream)
                               (print-unreadable-object (x stream :type t)
                                 (prin1 (trace-info-what x) stream)))))
@@ -67,6 +69,8 @@
   ;; functions, but the argument is ignored. NIL means unspecified
   ;; (the default.)
 
+  ;; report type
+  (report 'trace :type trace-report-type)
   ;; current environment forms
   (condition nil)
   (break nil)
@@ -77,6 +81,7 @@
   (break-after nil)
   ;; list of null environment forms
   (print-after () :type list))
+(!set-load-form-method trace-info (:target))
 
 ;;; This is a list of conses (fun-end-cookie . condition-satisfied),
 ;;; which we use to note distinct dynamic entries into functions. When
@@ -189,15 +194,11 @@
 ;;; Print indentation according to the number of trace entries.
 ;;; Entries whose condition was false don't count.
 (defun print-trace-indentation ()
-  (let ((depth 0))
-    (dolist (entry *traced-entries*)
-      (when (cdr entry) (incf depth)))
-    (format t
-            "~V,0@T~W: "
-            (+ (mod (* depth *trace-indentation-step*)
-                    (- *max-trace-indentation* *trace-indentation-step*))
-               *trace-indentation-step*)
-            depth)))
+  (let* ((depth (count-if #'cdr *traced-entries*))
+         (step *trace-indentation-step*)
+         (max *max-trace-indentation*)
+         (indent (+ (mod (* depth step) (- max step)) step)))
+    (format t "~V,0@T~W: " indent depth)))
 
 ;;; Return true if any of the NAMES appears on the stack below FRAME.
 (defun trace-wherein-p (frame names)
@@ -217,6 +218,13 @@
             (car ele)
             (multiple-value-list (apply (cdr ele) frame args)))
     (terpri)))
+
+;;; Handle PRINT and PRINT-AFTER options when :REPORT style is NIL.
+(defun trace-print-unadorned (frame forms &rest args)
+  (dolist (ele forms)
+    (let ((values (multiple-value-list (apply (cdr ele) frame args))))
+      (when values
+        (format t "~&~{~A~^, ~}~%" values)))))
 
 ;;; Test a BREAK option, and if true, break.
 (defun trace-maybe-break (info break where frame &rest args)
@@ -263,14 +271,18 @@
          (let ((sb-kernel:*current-level-in-print* 0)
                (*standard-output* (make-string-output-stream))
                (*in-trace* t))
-           (fresh-line)
-           (print-trace-indentation)
-           (if (trace-info-encapsulated info)
-               (prin1 `(,(trace-info-what info)
-                        ,@(mapcar #'ensure-printable-object args)))
-               (print-frame-call frame *standard-output*))
-           (terpri)
-           (apply #'trace-print frame (trace-info-print info) args)
+           (ecase (trace-info-report info)
+             (trace
+              (fresh-line)
+              (print-trace-indentation)
+              (if (trace-info-encapsulated info)
+                  (prin1 `(,(trace-info-what info)
+                            ,@(mapcar #'ensure-printable-object args)))
+                  (print-frame-call frame *standard-output*))
+              (terpri)
+              (apply #'trace-print frame (trace-info-print info) args))
+             ((nil)
+              (apply #'trace-print-unadorned frame (trace-info-print info) args)))
            (write-sequence (get-output-stream-string *standard-output*)
                            *trace-output*)
            (finish-output *trace-output*))
@@ -302,18 +314,22 @@
         (let ((sb-kernel:*current-level-in-print* 0)
               (*standard-output* (make-string-output-stream))
               (*in-trace* t))
-          (fresh-line)
-          (let ((*print-pretty* t))
-            (pprint-logical-block (*standard-output* nil)
-              (print-trace-indentation)
-              (pprint-indent :current 2)
-              (format t "~S returned" (trace-info-what info))
-              (dolist (v values)
-                (write-char #\space)
-                (pprint-newline :linear)
-                (prin1 (ensure-printable-object v))))
-            (terpri))
-          (apply #'trace-print frame (trace-info-print-after info) values)
+          (ecase (trace-info-report info)
+            (trace
+             (fresh-line)
+             (let ((*print-pretty* t))
+               (pprint-logical-block (*standard-output* nil)
+                 (print-trace-indentation)
+                 (pprint-indent :current 2)
+                 (format t "~S returned" (trace-info-what info))
+                 (dolist (v values)
+                   (write-char #\space)
+                   (pprint-newline :linear)
+                   (prin1 (ensure-printable-object v))))
+               (terpri))
+             (apply #'trace-print frame (trace-info-print-after info) values))
+            ((nil)
+             (apply #'trace-print-unadorned frame (trace-info-print-after info) values)))
           (write-sequence (get-output-stream-string *standard-output*)
                           *trace-output*)
           (finish-output *trace-output*))
@@ -375,6 +391,7 @@
                     :methods (trace-info-methods info)
                     :condition (coerce-form (trace-info-condition info) loc)
                     :break (coerce-form (trace-info-break info) loc)
+                    :report (trace-info-report info)
                     :print (coerce-form-list (trace-info-print info) loc)
                     :break-after (coerce-form (trace-info-break-after info) nil)
                     :condition-after
@@ -451,7 +468,11 @@
       (let ((option (first current))
             (value (cons (second current) nil)))
         (case option
-          (:report (error "stub: The :REPORT option is not yet implemented."))
+          (:report
+           (unless (typep (car value) 'trace-report-type)
+             (error "~S is not a valid ~A ~S type."
+                    (car value) 'trace :report))
+           (setf (trace-info-report info) (car value)))
           (:condition (setf (trace-info-condition info) value))
           (:condition-after
            (setf (trace-info-condition info) (cons nil nil))
@@ -563,19 +584,15 @@ global options.
 
 By default, TRACE causes a printout on *TRACE-OUTPUT* each time that
 one of the named functions is entered or returns. (This is the basic,
-ANSI Common Lisp behavior of TRACE.) As an SBCL extension, the
-:REPORT SB-EXT:PROFILE option can be used to instead cause information
-to be silently recorded to be inspected later using the SB-EXT:PROFILE
-function.
+ANSI Common Lisp behavior of TRACE.)
 
 The following options are defined:
 
    :REPORT Report-Type
-       If Report-Type is TRACE (the default) then information is reported
-       by printing immediately. If Report-Type is SB-EXT:PROFILE, information
-       is recorded for later summary by calls to SB-EXT:PROFILE. If
-       Report-Type is NIL, then the only effect of the trace is to execute
-       other options (e.g. PRINT or BREAK).
+       If Report-Type is TRACE (the default) then information is
+       reported by printing immediately. If Report-Type is NIL, then
+       the only effect of the trace is to execute other
+       options (e.g. PRINT or BREAK).
 
    :CONDITION Form
    :CONDITION-AFTER Form
@@ -584,7 +601,6 @@ The following options are defined:
        evaluates to true at the time of the call. :CONDITION-AFTER is
        similar, but suppresses the initial printout, and is tested when the
        function returns. :CONDITION-ALL tries both before and after.
-       This option is not supported with :REPORT PROFILE.
 
    :BREAK Form
    :BREAK-AFTER Form
@@ -605,8 +621,7 @@ The following options are defined:
        If specified, Names is a function name or list of names. TRACE does
        nothing unless a call to one of those functions encloses the call to
        this function (i.e. it would appear in a backtrace.)  Anonymous
-       functions have string names like \"DEFUN FOO\". This option is not
-       supported with :REPORT PROFILE.
+       functions have string names like \"DEFUN FOO\".
 
    :ENCAPSULATE {:DEFAULT | T | NIL}
        If T, the tracing is done via encapsulation (redefining the function
@@ -623,8 +638,7 @@ The following options are defined:
    :FUNCTION Function-Form
        This is a not really an option, but rather another way of specifying
        what function to trace. The Function-Form is evaluated immediately,
-       and the resulting function is instrumented, i.e. traced or profiled
-       as specified in REPORT.
+       and the resulting function is traced.
 
 :CONDITION, :BREAK and :PRINT forms are evaluated in a context which
 mocks up the lexical environment of the called function, so that

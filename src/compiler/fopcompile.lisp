@@ -47,7 +47,7 @@
            (and (symbolp thing)
                 (integerp index)
                 (eq (info :variable :kind thing) :global)
-                (typep value '(cons (eql function) (cons symbol null)))))))
+                (typep value '(cons (member lambda named-lambda function)))))))
  (defun fopcompilable-p (form &optional (expand t))
   ;; We'd like to be able to handle
   ;;   -- simple funcalls, nested recursively, e.g.
@@ -80,8 +80,16 @@
                   ;; carefully controlled, and recursion on fopcompilable-p
                   ;; would say "yes".
                   (or (member function '(sb!impl::%defun
-                                         sb!impl::%defsetf
                                          sb!kernel::%defstruct))
+                      (and (eq function 'sb!c::%defconstant)
+                           ;; %DEFCONSTANT is fopcompilable only if the value
+                           ;; is trivially a compile-time constant,
+                           ;; and not, e.g. (COMPLICATED-FOLDABLE-EXPR),
+                           ;; because we can't compute that with fasl ops.
+                           (let ((val (third form)))
+                             (and (typep val '(or rational (cons (eql quote))))
+                                  (constant-fopcompilable-p
+                                   (constant-form-value val)))))
                       (and (symbolp function) ; no ((lambda ...) ...)
                            (get-properties (symbol-plist function)
                                            '(:sb-cold-funcall-handler/for-effect
@@ -271,20 +279,9 @@
                    ((array t)
                     (dotimes (i (array-total-size value))
                       (grovel (row-major-aref value i))))
-                   ;; This is the same kludge as appears in EMIT-MAKE-LOAD-FORM
-                   ;; which informs the xc that LAYOUTs are leaf-like nodes.
-                   ;; This case was never reached before because cross-compiling
-                   ;; used to generate target machine code for everything.
-                   #+sb-xc-host (layout)
                    (instance
-                    (multiple-value-bind (creation-form init-form)
-                        (handler-case
-                            (sb!xc:make-load-form value (make-null-lexenv))
-                          (error (condition)
-                            (compiler-error condition)))
-                      (declare (ignore init-form))
-                      (case creation-form
-                        (:sb-just-dump-it-normally
+                    (case (%make-load-form value)
+                      (sb!fasl::fop-struct
                          ;; FIXME: Why is this needed? If the constant
                          ;; is deemed fopcompilable, then when we dump
                          ;; it we bind *dump-only-valid-structures* to
@@ -294,9 +291,8 @@
                          ;; there's never a need to grovel a layout.
                          (do-instance-tagged-slot (i value)
                            (grovel (%instance-ref value i))))
-                        (:ignore-it)
-                        (t
-                         (return-from constant-fopcompilable-p nil)))))
+                      (:ignore-it)
+                      (t (return-from constant-fopcompilable-p nil))))
                    (t
                     (return-from constant-fopcompilable-p nil))))))
       (grovel constant))
@@ -461,7 +457,7 @@
                                (= 1 (length args))
                                for-value-p)
                           (fopcompile (first args) path t)
-                          (sb!fasl::dump-fop 'sb!fasl::fop-package fasl))
+                          (dump-fop 'sb!fasl::fop-package fasl))
                          (t
                           (when (eq (info :function :where-from operator) :assumed)
                             (note-undefined-reference operator :function))
@@ -469,9 +465,8 @@
                           (dolist (arg args)
                             (fopcompile arg path t))
                           (if for-value-p
-                              (sb!fasl::dump-fop 'sb!fasl::fop-funcall fasl)
-                              (sb!fasl::dump-fop 'sb!fasl::fop-funcall-for-effect
-                                                 fasl))
+                              (dump-fop 'sb!fasl::fop-funcall fasl)
+                              (dump-fop 'sb!fasl::fop-funcall-for-effect fasl))
                           (let ((n-args (length args)))
                             ;; stub: FOP-FUNCALL isn't going to be usable
                             ;; to compile more than this, since its count
@@ -502,7 +497,7 @@
       (sb!fasl::dump-integer else-label fasl)
       (fopcompile condition path t)
       ;; If condition was false, skip to the ELSE
-      (sb!fasl::dump-fop 'sb!fasl::fop-skip-if-false fasl)
+      (dump-fop 'sb!fasl::fop-skip-if-false fasl)
       (fopcompile then path for-value-p)
       ;; The THEN branch will have produced a value even if we were
       ;; currently skipping to the ELSE branch (or over this whole
@@ -511,25 +506,25 @@
       ;; executed even when skipping over code. But this particular
       ;; value will be bogus, so we drop it.
       (when for-value-p
-        (sb!fasl::dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
+        (dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
       ;; Now skip to the END
       (sb!fasl::dump-integer end-label fasl)
-      (sb!fasl::dump-fop 'sb!fasl::fop-skip fasl)
+      (dump-fop 'sb!fasl::fop-skip fasl)
       ;; Start of the ELSE branch
       (sb!fasl::dump-integer else-label fasl)
-      (sb!fasl::dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
+      (dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
       (fopcompile else path for-value-p)
       ;; As before
       (when for-value-p
-        (sb!fasl::dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
+        (dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
       ;; End of IF
       (sb!fasl::dump-integer end-label fasl)
-      (sb!fasl::dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
+      (dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
       ;; If we're still skipping, we must've triggered both of the
       ;; drop-if-skipping fops. To keep the stack balanced, push a
       ;; dummy value if needed.
       (when for-value-p
-        (sb!fasl::dump-fop 'sb!fasl::fop-push-nil-if-skipping fasl)))))
+        (dump-fop 'sb!fasl::fop-push-nil-if-skipping fasl)))))
 
 (defun fopcompile-constant (fasl form for-value-p)
   (when for-value-p
@@ -539,80 +534,3 @@
     ;; with EMIT-MAKE-LOAD-FORM.
     (let ((sb!fasl::*dump-only-valid-structures* nil))
       (dump-object form fasl))))
-
-;; Return CLASS if CREATION-FORM is `(allocate-instance (find-class ',CLASS))
-(defun canonical-instance-maker-form-p (creation-form)
-  (let ((arg (and (typep creation-form
-                         '(cons (eql allocate-instance) (cons t null)))
-                  (cadr creation-form))))
-    (when (and arg (typep arg '(cons (eql find-class) (cons t null))))
-      (let ((class (cadr arg)))
-        (when (typep class '(cons (eql quote) (cons symbol null)))
-          (cadr class))))))
-
-;; If FORM can be implemented by FOP-ALLOCATE-INSTANCE,
-;; then fopcompile it and return a table index, otherwise return NIL.
-(defun fopcompile-allocate-instance (fasl form)
-  (let ((class-name (canonical-instance-maker-form-p form)))
-    (when class-name
-        (dump-object class-name fasl)
-        (sb!fasl::dump-fop 'sb!fasl::fop-allocate-instance fasl)
-        (let ((index (sb!fasl::fasl-output-table-free fasl)))
-          (setf (sb!fasl::fasl-output-table-free fasl) (1+ index))
-          index))))
-
-;; If FORM is one that we recognize as coming from MAKE-LOAD-FORM-SAVING-SLOTS,
-;; then return 3 values: the instance being affected, a slot name, and a value.
-;; Otherwise return three NILs.
-(defun trivial-load-form-initform-args (form)
-  (multiple-value-bind (args const)
-      ;; these expressions suck, but here goes...
-      (cond ((typep form
-                    '(cons
-                      (eql setf)
-                      (cons (cons (eql slot-value)
-                                  (cons instance
-                                        (cons (cons (eql quote) (cons symbol null))
-                                              null)))
-                            (cons (cons (eql quote) (cons t null)) null))))
-             (values (cdadr form) (second (third form))))
-            ((typep form
-                    '(cons
-                      (eql slot-makunbound)
-                      (cons instance
-                            (cons (cons (eql quote) (cons symbol null)) null))))
-             (values (cdr form) sb!pcl:+slot-unbound+)))
-    (if args
-        (values (car args) (cadadr args) const)
-        (values nil nil nil))))
-
-;; If FORMS contains exactly one PROGN with an expected shape,
-;; then dump it using fops and return T. Otherwise return NIL.
-(defun fopcompile-constant-init-forms (fasl forms)
-  ;; It should be possible to extend this to allow FORMS to have
-  ;; any number of forms in the requisite shape.
-  (when (and (singleton-p forms)
-             (typep (car forms)
-                    '(cons (eql progn) (satisfies list-length))))
-    (let ((forms (cdar forms))
-          (instance)
-          (slot-names)
-          (values))
-      (dolist (form forms
-               (progn
-                 (mapc (lambda (x) (dump-object x fasl)) (nreverse values))
-                 (dump-object (cons (length slot-names) (nreverse slot-names))
-                              fasl)
-                 (dump-object instance fasl)
-                 (sb!fasl::dump-fop 'sb!fasl::fop-initialize-instance fasl)
-                 t))
-        (multiple-value-bind (obj slot val)
-            (trivial-load-form-initform-args form)
-          (unless (if instance
-                      (eq obj instance)
-                      (typep (setq instance obj) 'instance))
-            (return nil))
-          ;; invoke recursive MAKE-LOAD-FORM stuff as necessary
-          (find-constant val)
-          (push slot slot-names)
-          (push val values))))))

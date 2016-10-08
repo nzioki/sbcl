@@ -20,6 +20,8 @@
   (without-gcing
    (let ((sap (%primitive code-instructions code)))
      (ecase kind
+       (:absolute
+        (setf (sap-ref-32 sap offset) fixup))
        (:b
         (error "Can't deal with CALL fixups, yet."))
        (:ba
@@ -121,7 +123,9 @@
          (regnum (ldb (byte 5 0) op)))
     (declare (type system-area-pointer pc))
     (cond ((= op (logior (ash 3 10) (ash 6 5)))
-           (args-for-unimp-inst context))
+           (let ((error-number (sap-ref-8 pc 4)))
+             (values error-number
+                     (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
           #!-precise-arg-count-error
           ((and (= (ldb (byte 6 10) op) 3)
                 (= (ldb (byte 5 5) op) 24))
@@ -154,22 +158,4 @@
                          '(#.arg-count-sc)))))
           (t
            (values #.(error-number-or-lose 'unknown-error) nil)))))
-
-(defun args-for-unimp-inst (context)
-  (declare (type (alien (* os-context-t)) context))
-  (let* ((pc (context-pc context))
-         (length (sap-ref-8 pc 4))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer pc)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (copy-ub8-from-system-area pc 5 vector 0 length)
-    (let* ((index 0)
-           (error-number (read-var-integer vector index)))
-      (collect ((sc-offsets))
-               (loop
-                (when (>= index length)
-                  (return))
-                (sc-offsets (read-var-integer vector index)))
-               (values error-number (sc-offsets))))))
 

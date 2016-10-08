@@ -68,7 +68,7 @@
   (define-fasl-format-features))
 
 ;;; the code for a character which terminates a fasl file header
-(def!constant +fasl-header-string-stop-char-code+ 255)
+(defconstant +fasl-header-string-stop-char-code+ 255)
 
 ;;; This value should be incremented when the system changes in such a
 ;;; way that it will no longer work reliably with old fasl files. In
@@ -76,7 +76,7 @@
 ;;; versions which break binary compatibility. But it certainly should
 ;;; be incremented for release versions which break binary
 ;;; compatibility.
-(def!constant +fasl-file-version+ 78)
+(defconstant +fasl-file-version+ 78)
 ;;; (description of versions before 0.9.0.1 deleted in 0.9.17)
 ;;; 56: (2005-05-22) Something between 0.9.0.1 and 0.9.0.14. My money is
 ;;;     on 0.9.0.6 (MORE CASE CONSISTENCY).
@@ -126,7 +126,7 @@
 ;;;     have packages and that sort of native Lisp stuff associated
 ;;;     with them. We can compare them with EQ.
 (declaim (type hash-table *assembler-routines*))
-(defvar *assembler-routines* (make-hash-table :test 'eq))
+(defglobal *assembler-routines* (make-hash-table :test 'eq))
 
 
 ;;;; the FOP database
@@ -173,6 +173,8 @@
   (stream nil :type ansi-stream :read-only t)
   (table (make-fop-vector 1000) :type simple-vector)
   (stack (make-fop-vector 100) :type simple-vector)
+  (name-buffer (vector (make-string  1 :element-type 'character)
+                       (make-string 31 :element-type 'base-char)))
   (deprecated-stuff nil :type list)
   ;; Sometimes we want to skip over any FOPs with side-effects (like
   ;; function calls) while executing other FOPs. SKIP-UNTIL will

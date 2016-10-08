@@ -90,6 +90,11 @@
     (who-calls 'called-by-traced-fun)
   (traced-fun))
 
+#+sb-eval
+(define-xref-test who-calls.18
+    (who-calls 'called-by-interpreted-fun)
+  nil)
+
 
 (define-xref-test who-macroexpands.1
     (who-macroexpands 'macro/1)
@@ -109,6 +114,9 @@
     (who-sets '*a*)
   (xref/2 xref/13))
 
+(define-xref-test who-sets.2
+    (who-sets '**global**)
+  (xref/16))
 
 (define-xref-test who-references.1
     (who-references '*a*)
@@ -118,6 +126,9 @@
     (who-references '+z+)
   (inline/1))
 
+(define-xref-test who-references.3
+    (who-references '**global**)
+  (xref/15))
 
 (define-xref-test who-calls.struct-slot.1
     (who-calls 'struct-slot)

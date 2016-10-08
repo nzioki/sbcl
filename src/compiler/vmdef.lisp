@@ -91,7 +91,7 @@
   ;; -- AL 20010218
   ;;
   ;; See also the description of VOP-INFO-TARGETS. -- APD, 2002-01-30
-  (def!constant max-vop-tn-refs 256))
+  (defconstant max-vop-tn-refs 256))
 
 ;;; FIXME: This is a remarkably eccentric way of implementing what
 ;;; would appear to be by nature a closure.  A closure isn't any more
@@ -101,7 +101,7 @@
 (declaim (type (simple-vector #.max-vop-tn-refs) *vop-tn-refs*))
 (defvar *vop-tn-refs* (make-array max-vop-tn-refs :initial-element nil))
 
-(def!constant sc-bits (integer-length (1- sc-number-limit)))
+(defconstant sc-bits (integer-length (1- sc-number-limit)))
 
 ;;; Emit a VOP for TEMPLATE. Arguments:
 ;;; NODE Node for source context.
@@ -231,3 +231,10 @@
                  ,(if (= (length results) 1)
                       (first results)
                       `(values ,@results))))))
+
+(defun template-translates-arg-p (function argument type)
+  (let ((primitive-type (primitive-type (specifier-type type))))
+    (loop for template in (fun-info-templates (info :function :info function))
+          for arg-type = (nth argument (template-arg-types template))
+          thereis (and (consp arg-type)
+                       (memq primitive-type (cdr arg-type))))))

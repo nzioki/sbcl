@@ -66,17 +66,14 @@
 ;;; Symbol contruction utilities
 (defun format-symbol (package format-string &rest format-arguments)
   (without-package-locks
-   (intern (apply #'format nil format-string format-arguments) package)))
+   (intern (possibly-base-stringize
+            (apply #'format nil format-string format-arguments))
+           package)))
 
 (defun make-class-symbol (class-name)
   ;; Reference a package that is now SB!PCL but later SB-PCL
   (format-symbol (load-time-value (find-package "SB!PCL") t)
                  "*THE-CLASS-~A*" (symbol-name class-name)))
-
-(defun make-wrapper-symbol (class-name)
-  ;; Reference a package that is now SB!PCL but later SB-PCL
-  (format-symbol (load-time-value (find-package "SB!PCL") t)
-                 "*THE-WRAPPER-~A*" (symbol-name class-name)))
 
 (defun condition-type-p (type)
   (and (symbolp type)
@@ -96,6 +93,7 @@
                   *the-class-slot-object*
                   *the-class-structure-object*
                   *the-class-standard-object*
+                  *the-class-function*
                   *the-class-funcallable-standard-object*
                   *the-class-class*
                   *the-class-generic-function*
@@ -123,17 +121,6 @@
 
                   *the-eslotd-standard-class-slots*
                   *the-eslotd-funcallable-standard-class-slots*))
-
-(declaim (special *the-wrapper-of-t*
-                  *the-wrapper-of-vector* *the-wrapper-of-symbol*
-                  *the-wrapper-of-string* *the-wrapper-of-sequence*
-                  *the-wrapper-of-rational* *the-wrapper-of-ratio*
-                  *the-wrapper-of-number* *the-wrapper-of-null*
-                  *the-wrapper-of-list* *the-wrapper-of-integer*
-                  *the-wrapper-of-float* *the-wrapper-of-cons*
-                  *the-wrapper-of-complex* *the-wrapper-of-character*
-                  *the-wrapper-of-bit-vector* *the-wrapper-of-array*))
-
 ;;;; PCL instances
 
 (sb!kernel::!defstruct-with-alternate-metaclass standard-instance

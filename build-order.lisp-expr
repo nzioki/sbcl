@@ -42,16 +42,32 @@
 
  ;; This comes early because it's useful for debugging everywhere.
  ("src/code/show")
+ ("src/compiler/early-constantp")
+ ("src/code/defsetfs" :not-host)
 
- ("src/code/early-constants")
+ ;; Declare all target special variables defined by ANSI
+ ("src/code/cl-specials" :not-host)
 
- ;; This comes early because the cross-compilation host's backquote
- ;; logic can expand into something which can't be executed on the
- ;; target Lisp (e.g. in CMU CL where it expands into internal
- ;; functions like BACKQ-LIST), and by replacing the host backquote
- ;; logic with our own as early as possible, we minimize the chance of
- ;; any forms referring to cross-compilation host internal functions
- ;; leaking into target SBCL code.
+ ;; Things like DX-FLET and AWHEN are available for use in both the host
+ ;; and target very early, with no DEF! obfuscation necessary.
+ ("src/code/primordial-extensions")
+ ("src/code/cold-init-helper-macros")
+ ("src/code/early-defmethod" :not-host)
+
+ ;; ASAP we replace the host's backquote reader with our own, to avoid leaking
+ ;; details of the host into the target. This is not a concern in make-host-2
+ ;; becase IN-TARGET-CROSS-COMPILATION-MODE assigns the reader macros before
+ ;; compiling anything. It is, however, a minor concern for make-host-1, but
+ ;; usually a problem can be exposed only by contrived code / poor style.
+ ;; e.g. if the host's reader were used when compiling
+ ;;  (EVAL-WHEN (#-SB-XC :COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+ ;;    (DEFUN A-MACRO-HELPER () '`(FOO ,A ,B))
+ ;; then A-MACRO-HELPER returns host code, and calling it might be wrong, either
+ ;; obviously or subtly. If the result is (LIST* 'FOO (LIST* A (LIST B)))
+ ;; then it's subtly wrong because it might not be the optimal strategy;
+ ;; whereas if it's (BACKQUOTE (FOO (UNQUOTE A) (UNQUOTE B))) then it's
+ ;; flat out wrong. At any rate, judicious avoidance of EVAL-WHEN and nested
+ ;; quasiquotation in 'primordial-extensions' prevents any such issues.
  ("src/code/backq")
 
  ;; It's difficult to be too early with a DECLAIM SPECIAL (or DEFVAR
@@ -59,10 +75,7 @@
  ;; of CL special binding when the variable is undeclared.
  ("src/code/globals" :not-host)
 
- ("src/code/defsetfs")
- ("src/code/cmacros" :not-host)
-
- ("src/code/cold-init-helper-macros")
+ ("src/code/cmacros" :not-host :slam-forcibly)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; cross-compiler-only replacements for stuff which in target Lisp would be
@@ -76,24 +89,20 @@
  ("src/code/cross-io"    :not-target)
  ("src/code/cross-sap"   :not-target)
  ("src/code/cross-thread" :not-target)
- ("src/code/cross-make-load-form" :not-target)
  ("src/code/cross-condition" :not-target)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; stuff needed early both in cross-compilation host and in target Lisp
 
  ("src/code/uncross")
- ("src/code/primordial-type")
- ("src/code/early-defbangmethod")
 
  ("src/code/defbangtype")
- ("src/code/defbangmacro")
  ("src/code/defbangconstant")
+ ("src/code/early-constants") ; needs DEF!CONSTANT
 
+ ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
  ("src/compiler/early-lexenv")
  ("src/compiler/early-globaldb")
- ("src/code/primordial-extensions")
- ("src/compiler/constantp")
 
  ;; comes early so that stuff can reason about function names
  ("src/code/function-names")
@@ -115,16 +124,14 @@
  ("src/code/barrier" :not-host)
  ("src/code/parse-body")       ; on host for PARSE-BODY
  ("src/code/unportable-float")
- ("src/compiler/policy")
+ ("src/compiler/policy" :slam-forcibly)
  #!+sb-fasteval ("src/interpreter/basic-env")
  ;; PARSE-{UNKNOWN,DEPRECATED}-TYPE and other things should be known
  ;; condition subtypes as soon as possible
  ("src/code/condition-boot" :not-host)
  ("src/code/early-extensions") ; on host for COLLECT, SYMBOLICATE, etc.
  ("src/compiler/parse-lambda-list")
- ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
  ("src/code/restart" :not-host) ; %DEFCONSTANT can bind a restart
- ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/specializable-array")
 
@@ -152,15 +159,29 @@
 
  ("src/compiler/defconstant")
 
- ("src/code/early-defstructs" :not-host) ; gotta-be-first DEFSTRUCTs
  ("src/code/early-raw-slots")
 
  ("src/code/funutils" :not-host)
 
+ ("src/code/maphash" :not-host :slam-forcibly)
+ ("src/code/xset") ; for representation of MEMBER type
  ;; This needs DEF!STRUCT, and is itself needed early so that structure
  ;; accessors and inline functions defined here can be compiled inline
  ;; later. (Avoiding full calls increases efficiency)
  ("src/code/type-class")
+ ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
+
+ ("src/code/cas" :not-host)
+ ("src/compiler/early-c")
+ ("src/compiler/fun-info")
+ ("src/pcl/slot-name") ; for calls from 'info-vector'
+ ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
+ ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
+ ("src/code/signal" :not-host)
+ ("src/compiler/info-vector")
+ ("src/compiler/globaldb")
+ ("src/code/primordial-type")
+ ("src/code/early-classoid")
 
  ("src/code/sysmacs" :not-host)
 
@@ -177,19 +198,13 @@
  ("output/stuff-groveled-from-headers" :not-host)
 
  ("src/code/cold-error"  :not-host)
- ("src/pcl/slot-name") ; for calls from 'info-vector'
- ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
- ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
- ("src/compiler/info-vector")
  ("src/code/fdefinition" :not-host)
-
- ("src/code/maphash" :not-host)
- ("src/code/pred" :not-host)
 
  ("src/compiler/generic/vm-array")
  ("src/code/weak"          :not-host)
  ;; 'target-alieneval' needs FILL-POINTER which is defined in 'array'
  ("src/code/array"         :not-host) ; needs WEAK-POINTER-VALUE
+ ("src/code/pred" :not-host)
 
  ("src/code/target-alieneval" :not-host)
  ("src/code/target-c-call"    :not-host)
@@ -257,12 +272,9 @@
  ("src/code/target-unicode" :not-host)
  ("src/code/misc")
 
- ("src/code/room"   :not-host)
-
+ ("src/code/symbol"        :not-host)
  ("src/code/fd-stream"     :not-host)
  ("src/code/stream"        :not-host)
- ("src/code/symbol"        :not-host) ; uses STRING-OUTPUT-STREAM
- ("src/code/print"         :not-host)
  ("src/code/early-format")
  ("src/code/defpackage"    :not-host)
 
@@ -278,8 +290,6 @@
  ("src/code/time"  :not-host)
  ("src/code/final" :not-host)
 
- ("src/code/setf-funs" :not-host)
-
  ("src/code/stubs" :not-host)
 
  ("src/code/exhaust" :not-host)
@@ -288,17 +298,13 @@
  ;;; compiler (and a few miscellaneous files whose dependencies make it
  ;;; convenient to stick them here)
 
- ("src/compiler/early-c")
  ("src/compiler/policies")
 
  ;; ("src/code/defbangmacro" was here until sbcl-0.6.7.3.)
 
  ("src/compiler/macros")
 
- ("src/compiler/fun-info")
- ("src/compiler/late-constantp")
- ("src/code/early-classoid")
- ("src/compiler/globaldb")
+ ("src/compiler/constantp")
  ("src/compiler/info-functions")
 
  ("src/compiler/generic/vm-macs")
@@ -306,7 +312,6 @@
 
  ;; needed by "compiler/vop"
  ("src/compiler/sset")
- ("src/code/xset") ; for representation of MEMBER type
  ("src/code/early-type")
 
  ;; for e.g. BLOCK-ANNOTATION, needed by "compiler/vop"
@@ -330,12 +335,11 @@
 
  ;; needs "backend"
  ("src/compiler/target/backend-parms")
+ ("src/code/room" :not-host) ; needs GENCGC-CARD-BYTES
 
  ("src/code/force-delayed-defbangconstants")
  ("src/code/defmacro")
- ("src/code/force-delayed-defbangmacros")
-
- ("src/compiler/late-macros")
+ ("src/code/destructuring-bind")
 
  ;; for e.g. !DEF-PRIMITIVE-TYPE, needed by primtype.lisp, and
  ;; DEFINE-STORAGE-CLASS, needed by target/vm.lisp
@@ -359,8 +363,9 @@
 
  ("src/code/debug-info")
  ("src/code/source-location")
- ;; The type definition for INTERPRETED-FUNCTION
- #!+sb-fasteval ("src/interpreter/function")
+ ;; Define at most one INTERPRETED-FUNCTION type based on target features
+ #!+sb-eval ("src/code/early-full-eval" :not-host)
+ #!+sb-fasteval ("src/interpreter/function" :not-host)
  ("src/code/early-condition")
  ("src/code/condition" :not-host)
  ("src/code/toplevel"  :not-host)
@@ -414,7 +419,8 @@
  ;; "code/late-type", and SB!XC:TYPEP, defined in "code/cross-type",
  ;; and SPECIALIZE-ARRAY-TYPE, defined in "compiler/generic/vm-type",
  ;; and SB!XC:PROCLAIM, defined in "src/compiler/proclaim"
- ("src/code/defstruct")
+ ;; FIXME: #+ should be (and sb-xc-host) but it isn't set yet.
+ ("src/code/defstruct" #+cmucl :ignore-failure-p)
  ("src/code/target-defstruct" :not-host)
 
  ;; ALIEN-VALUE has to be defined as a class (done by DEFSTRUCT
@@ -426,19 +432,9 @@
  ;; CHECK-FUN-NAME defined in proclaim.lisp.
  ("src/code/force-delayed-defbangstructs")
 
- ;; early-full-eval uses !DEFSTRUCT-WITH-ALTERNATE-METACLASS and
- ;; DEF!METHOD.  It split out from the rest of full-eval because
- ;; defstruct/metaclass fun makes it unslammable, and to define
- ;; INTERPRETED-FUNCTION before it is used in compiler/main and in the
- ;; definition of the COMPILED-FUNCTION type.
- #!+sb-eval
- ("src/code/early-full-eval")
-
  ("src/code/typep" :not-host)
 
  ("src/compiler/compiler-error")
-
- ("src/code/late-deftypes-for-target")
 
  ("src/code/type-init")
  ;; Now that the type system is initialized, fix up UNKNOWN types that
@@ -451,8 +447,6 @@
  ("src/code/hash-table")
  ("src/code/readtable")
  ("src/code/pathname")
- ("src/code/host-pprint")
- ("src/code/pprint" :not-host)
 
  ;; KLUDGE: Much stuff above here is the type system and/or the INFO
  ;; system, not really the compiler proper. It might be easier to
@@ -504,7 +498,8 @@
  ("src/compiler/ir1tran")
  ("src/compiler/ir1tran-lambda")
  ("src/compiler/ir1-translators")
- ("src/compiler/ir1util")
+ ;; FIXME: #+ should be (and sb-xc-host) but it isn't set yet.
+ ("src/compiler/ir1util" #+cmucl :ignore-failure-p)
  ("src/compiler/ir1opt")
  ("src/compiler/loop")
 
@@ -610,6 +605,7 @@
  ("src/assembly/target/array"      :assem :not-host)
  ("src/assembly/target/arith"      :assem :not-host)
  ("src/assembly/target/alloc"      :assem :not-host)
+ ("src/assembly/target/tramps"     :assem :not-host :not-genesis)
 
  ("src/compiler/pseudo-vops")
 
@@ -661,6 +657,9 @@
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
+ ("src/code/host-pprint") ; defines QUEUED-OP needed by 'pprint'
+ ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
+ ("src/code/print" :not-host)
  ("src/code/reader"            :not-host) ; needs "code/readtable"
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
  ("src/code/target-pathname"   :not-host) ; needs "code/pathname"
@@ -739,12 +738,6 @@
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; target macros and DECLAIMs installed at build-the-cross-compiler time
 
- ;; Declare all target special variables defined by ANSI now, so that
- ;; we don't have to worry about any of them being bound incorrectly
- ;; when the compiler processes code which appears before the appropriate
- ;; DEFVAR or DEFPARAMETER.
- ("src/code/cl-specials")
-
  ;; FIXME: here? earlier?  can probably be as late as possible.  Also
  ;; maybe call it FORCE-DELAYED-PROCLAIMS?
  ("src/compiler/late-proclaim")
@@ -752,12 +745,9 @@
  ;; fundamental target macros (e.g. CL:DO and CL:DEFUN) and support
  ;; for them
  ("src/code/defboot")
- ("src/code/destructuring-bind")
  ("src/code/setf")
  ("src/code/macros")
  ("src/code/loop")
- ("src/code/cas")
- ("src/code/late-cas")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; other target-code-building stuff which can't be processed until
@@ -765,8 +755,7 @@
 
  ("src/code/late-format") ; needs SB!XC:DEFMACRO
  ("src/code/sxhash") ; needs SB!XC:DEFINE-MODIFY-MACRO
- ("src/code/signal")
- ("src/code/late-defbangmethod")
+ ("src/code/late-cas" :not-host)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; PCL-related stuff, which shouldn't need to be done earlier than

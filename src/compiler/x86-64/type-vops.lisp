@@ -293,13 +293,13 @@
         (inst cmp rax-tn (+ (ash 1 n-widetag-bits) bignum-widetag))
         (inst jmp :e single-word)
         ;; If it's other than two, we can't be an (unsigned-byte 64)
-        (inst cmp rax-tn (+ (ash 2 n-widetag-bits) bignum-widetag))
+        ;: Leave RAX holding 0 in the affirmative case.
+        (inst sub rax-tn (+ (ash 2 n-widetag-bits) bignum-widetag))
         (inst jmp :ne nope)
-        ;; Get the second digit.
-        (loadw rax-tn value (1+ bignum-digits-offset) other-pointer-lowtag)
-        ;; All zeros, its an (unsigned-byte 64).
-        (inst test rax-tn rax-tn)
-        (inst jmp :z yep)
+        ;; Compare the second digit to zero (in RAX).
+        (inst cmp (make-ea-for-object-slot value (1+ bignum-digits-offset)
+                                           other-pointer-lowtag) rax-tn)
+        (inst jmp :z yep) ; All zeros, its an (unsigned-byte 64).
         (inst jmp nope)
 
         (emit-label single-word)
@@ -400,6 +400,6 @@
   (:arg-types * (:constant t)) ; voodoo - 'target' and 'not-p' are absent
   (:generator 15 ; arbitrary
     (multiple-value-bind (headers exceptions)
-        (canonicalize-headers-and-exceptions widetags)
+        (canonicalize-widetags+exceptions widetags)
       (%test-headers value target not-p nil headers
                      :except exceptions))))

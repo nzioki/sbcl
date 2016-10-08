@@ -16,8 +16,7 @@
 (defvar *assem-scheduler-p* nil)
 (declaim (type boolean *assem-scheduler-p*))
 
-(defvar *assem-instructions* (make-hash-table :test 'equal))
-(declaim (type hash-table *assem-instructions*))
+(defvar *assem-instructions* (make-hash-table))
 
 (defvar *assem-max-locations* 0)
 (declaim (type index *assem-max-locations*))
@@ -195,7 +194,7 @@
   ;; branch delay slot.
   variable-length)
 
-(def!struct (instruction
+(defstruct (instruction
             (:include sset-element)
             (:conc-name inst-)
             (:constructor make-instruction (number emitter attributes delay))
@@ -227,7 +226,7 @@
   (read-dependents (make-sset) :type sset))
 #!+sb-show-assem (defvar *inst-ids* (make-hash-table :test 'eq))
 #!+sb-show-assem (defvar *next-inst-id* 0)
-(sb!int:def!method print-object ((inst instruction) stream)
+(defmethod print-object ((inst instruction) stream)
   (print-unreadable-object (inst stream :type t :identity t)
     #!+sb-show-assem
     (princ (or (gethash inst *inst-ids*)
@@ -487,7 +486,7 @@
             ;; just pick one of the emittable insts. If there is
             ;; nothing to do, then emit a nop. ### Note: despite the
             ;; fact that this is a loop, it really won't work for
-            ;; repetitions other then zero and one. For example, if
+            ;; repetitions other than zero and one. For example, if
             ;; the branch has two dependents and one of them dpends on
             ;; the other, then the stuff that grabs a dependent could
             ;; easily grab the wrong one. But I don't feel like fixing
@@ -685,7 +684,7 @@
 ;;;; structure used during output emission
 
 ;;; a constraint on how the output stream must be aligned
-(def!struct (alignment-note (:include annotation)
+(defstruct (alignment-note (:include annotation)
                             (:conc-name alignment-)
                             (:predicate alignment-p)
                             (:constructor make-alignment (bits size pattern))
@@ -701,7 +700,7 @@
 
 ;;; a reference to someplace that needs to be back-patched when
 ;;; we actually know what label positions, etc. are
-(def!struct (back-patch (:include annotation)
+(defstruct (back-patch (:include annotation)
                         (:constructor make-back-patch (size fun))
                         (:copier nil))
   ;; the area affected by this back-patch
@@ -713,7 +712,7 @@
 ;;; amount of stuff output depends on label positions, etc.
 ;;; BACK-PATCHes can't change their mind about how much stuff to emit,
 ;;; but CHOOSERs can.
-(def!struct (chooser (:include annotation)
+(defstruct (chooser (:include annotation)
                      (:constructor make-chooser
                                    (size alignment maybe-shrink worst-case-fun))
                      (:copier nil))
@@ -732,7 +731,7 @@
 
 ;;; This is used internally when we figure out a chooser or alignment
 ;;; doesn't really need as much space as we initially gave it.
-(def!struct (filler (:include annotation)
+(defstruct (filler (:include annotation)
                     (:constructor make-filler (bytes))
                     (:copier nil))
   ;; the number of bytes of filler here
@@ -1170,83 +1169,61 @@
 ;;; segment so uses of %%CURRENT-SEGMENT%% inside the body don't have
 ;;; to keep dereferencing the symbol. Given that ASSEMBLE is the only
 ;;; interface to **CURRENT-SEGMENT**, we don't have to worry about the
-;;; special value becomming out of sync with the lexical value. Unless
+;;; special value becoming out of sync with the lexical value. Unless
 ;;; some bozo closes over it, but nobody does anything like that...
-;;;
-;;; FIXME: The way this macro uses MACROEXPAND internally breaks my
-;;; old assumptions about macros which are needed both in the host and
-;;; the target. (This is more or less the same way that PUSH-IN,
-;;; DELETEF-IN, and !DEF-BOOLEAN-ATTRIBUTE break my old assumptions,
-;;; except that they used GET-SETF-EXPANSION instead of MACROEXPAND to
-;;; do the dirty deed.) The quick and dirty "solution" here is the
-;;; same as there: use cut and paste to duplicate the defmacro in a
-;;; (SB!INT:DEF!MACRO FOO (..) .. CL:MACROEXPAND ..) #+SB-XC-HOST
-;;; (DEFMACRO FOO (..) .. SB!XC:MACROEXPAND ..) idiom. This is
-;;; disgusting and unmaintainable, and there are obviously better
-;;; solutions and maybe even good solutions, but I'm disinclined to
-;;; hunt for good solutions until the system works and I can test them
-;;; in isolation.
-;;;
-;;; The above comment remains true, except that instead of a cut-and-paste
-;;; copy we now have a macrolet. This is charitably called progress.
-;;; -- NS 2008-09-19
-(macrolet
-    ((def (defmacro macroexpand)
-       `(,defmacro assemble ((&optional segment vop &key labels) &body body
-                             &environment env)
-          #!+sb-doc
-          "Execute BODY (as a progn) with SEGMENT as the current segment."
-          (flet ((label-name-p (thing)
-                   (and thing (symbolp thing))))
-            (let* ((seg-var (gensym "SEGMENT-"))
-                   (vop-var (gensym "VOP-"))
-                   (visible-labels (remove-if-not #'label-name-p body))
-                   (inherited-labels
-                    (multiple-value-bind (expansion expanded)
-                        (,macroexpand '..inherited-labels.. env)
-                      (if expanded (copy-list expansion) nil)))
-                   (new-labels
-                    (sort (append labels
-                                  (set-difference visible-labels
-                                                  inherited-labels))
-                          #'string<))
-                   (nested-labels
-                    (sort (set-difference (append inherited-labels new-labels)
-                                          visible-labels)
-                          #'string<)))
-              (when (intersection labels inherited-labels)
-                (error "duplicate nested labels: ~S"
-                       (intersection labels inherited-labels)))
-              `(let* ((,seg-var ,(or segment '(%%current-segment%%)))
-                      (,vop-var ,(or vop '(%%current-vop%%)))
-                      ,@(when segment
-                              `((**current-segment** ,seg-var)))
-                      ,@(when vop
-                              `((**current-vop** ,vop-var)))
-                      ,@(mapcar (lambda (name)
-                                  `(,name (gen-label)))
-                                new-labels))
-                 (declare (ignorable ,vop-var ,seg-var)
-                          ;; Must be done so that contribs and user code doing
-                          ;; low-level stuff don't need to worry about this.
-                          (disable-package-locks %%current-segment%% %%current-vop%%))
-                 (macrolet ((%%current-segment%% () ',seg-var)
-                            (%%current-vop%% () ',vop-var))
-                   ;; KLUDGE: Some host lisps (CMUCL 18e Sparc at least)
-                   ;; can't deal with this declaration, so disable it on host.
-                   ;; Ditto for later ENABLE-PACKAGE-LOCKS %%C-S%% declaration.
-                   #-sb-xc-host
-                   (declare (enable-package-locks %%current-segment%% %%current-vop%%))
-                   (symbol-macrolet (,@(when (or inherited-labels nested-labels)
-                                             `((..inherited-labels.. ,nested-labels))))
-                     ,@(mapcar (lambda (form)
-                                 (if (label-name-p form)
-                                     `(emit-label ,form)
-                                     form))
-                               body)))))))))
-  (def sb!int:def!macro macroexpand)
-  #+sb-xc-host
-  (def sb!xc:defmacro %macroexpand))
+(defmacro assemble ((&optional segment vop &key labels) &body body
+                    &environment env)
+  #!+sb-doc
+  "Execute BODY (as a progn) with SEGMENT as the current segment."
+  (flet ((label-name-p (thing)
+           (and thing (symbolp thing))))
+    (let* ((seg-var (gensym "SEGMENT-"))
+           (vop-var (gensym "VOP-"))
+           (visible-labels (remove-if-not #'label-name-p body))
+           (inherited-labels
+            (multiple-value-bind (expansion expanded)
+                (#+sb-xc-host cl:macroexpand
+                 #-sb-xc-host %macroexpand '..inherited-labels.. env)
+              (if expanded (copy-list expansion) nil)))
+           (new-labels
+            (sort (append labels
+                          (set-difference visible-labels
+                                          inherited-labels))
+                  #'string<))
+           (nested-labels
+            (sort (set-difference (append inherited-labels new-labels)
+                                  visible-labels)
+                  #'string<)))
+      (when (intersection labels inherited-labels)
+        (error "duplicate nested labels: ~S"
+               (intersection labels inherited-labels)))
+      `(let* ((,seg-var ,(or segment '(%%current-segment%%)))
+              (,vop-var ,(or vop '(%%current-vop%%)))
+              ,@(when segment
+                      `((**current-segment** ,seg-var)))
+              ,@(when vop
+                      `((**current-vop** ,vop-var)))
+              ,@(mapcar (lambda (name)
+                          `(,name (gen-label)))
+                        new-labels))
+         (declare (ignorable ,vop-var ,seg-var)
+                  ;; Must be done so that contribs and user code doing
+                  ;; low-level stuff don't need to worry about this.
+                  (disable-package-locks %%current-segment%% %%current-vop%%))
+         (macrolet ((%%current-segment%% () ',seg-var)
+                    (%%current-vop%% () ',vop-var))
+           ;; KLUDGE: Some host lisps (CMUCL 18e Sparc at least)
+           ;; can't deal with this declaration, so disable it on host.
+           ;; Ditto for later ENABLE-PACKAGE-LOCKS %%C-S%% declaration.
+           #-sb-xc-host
+           (declare (enable-package-locks %%current-segment%% %%current-vop%%))
+           (symbol-macrolet (,@(when (or inherited-labels nested-labels)
+                                     `((..inherited-labels.. ,nested-labels))))
+             ,@(mapcar (lambda (form)
+                         (if (label-name-p form)
+                             `(emit-label ,form)
+                             form))
+                       body)))))))
 
 (defun inst-emitter-symbol (symbol &optional create)
   (values (funcall (if create 'intern 'find-symbol)
@@ -1256,11 +1233,17 @@
 (defmacro inst (&whole whole instruction &rest args &environment env)
   #!+sb-doc
   "Emit the specified instruction to the current segment."
-  (let ((sym (inst-emitter-symbol instruction)))
-    ;; An ordinary style-warning will suffice to indicate a missing emitter.
-    ;; There's no need for an extra check.
-    (cond ((get sym :macro) (funcall sym (cdr whole) env))
-          (t `(,sym (%%current-segment%%) (%%current-vop%%) ,@args)))))
+  (let* ((stringablep (typep instruction '(or symbol string character)))
+         (sym (and stringablep (inst-emitter-symbol instruction))))
+    (cond ((and stringablep
+                (null sym))
+           (warn "Undefined instruction: ~s in~% ~s" instruction whole)
+           `(error "Undefined instruction: ~s in~% ~s" ',instruction ',whole))
+          ((#-sb-xc macro-function #+sb-xc sb!xc:macro-function sym env)
+           `(,sym ,@args))
+          (t
+           `(,@(if stringablep `(,sym) `(funcall (inst-emitter-symbol ,instruction)))
+             (%%current-segment%%) (%%current-vop%%) ,@args)))))
 
 ;;; Note: The need to capture MACROLET bindings of %%CURRENT-SEGMENT%%
 ;;; and %%CURRENT-VOP%% prevents this from being an ordinary function.
@@ -1491,14 +1474,6 @@
       (values `(,@required ,@(reconstruction) ,@(if rest `((values-list ,@rest))))
               (make-lambda-list llks nil required optional rest keys aux)))))
 
-(defun extract-nths (index glue list-of-lists-of-lists)
-  (mapcar (lambda (list-of-lists)
-            (cons glue
-                  (mapcar (lambda (list)
-                            (nth index list))
-                          list-of-lists)))
-          list-of-lists-of-lists))
-
 (defmacro define-instruction (name lambda-list &rest options)
   (binding* ((sym-name (symbol-name name))
              (defun-name (inst-emitter-symbol sym-name t))
@@ -1629,9 +1604,4 @@
            (values))))))
 
 (defmacro define-instruction-macro (name lambda-list &body body)
-  (let* ((namestring (symbol-name name))
-         (defun-name (inst-emitter-symbol namestring t)))
-    `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (setf (get ',defun-name :macro) t
-             (symbol-function ',defun-name)
-             ,(make-macro-lambda namestring lambda-list body 'inst name)))))
+  `(defmacro ,(inst-emitter-symbol (symbol-name name) t) ,lambda-list ,@body))

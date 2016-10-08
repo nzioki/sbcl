@@ -22,8 +22,6 @@
             sb!vm::zero-tn
             sb!vm::null-offset sb!vm::code-offset sb!vm::zero-offset)))
 
-(!begin-instruction-definitions)
-
 ; normally assem-scheduler-p is t, and nil if debugging the assembler
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf *assem-scheduler-p* nil))
@@ -431,33 +429,6 @@
   (im13 :field (byte 13 13))
   (q2   :field (byte 8 5) :value 0)
   (im5  :field (byte 5 0) :reader break-im5))
-
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
 
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))

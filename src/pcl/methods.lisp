@@ -53,7 +53,8 @@
                  (declare (ignore initargs))
                  (error 'metaobject-initialization-violation
                   ;; FIXME: I'm pretty sure this wants to be "~~@<~A~~@:>"
-                  :format-control ,(format nil "~@<~A~@:>" control)
+                  :format-control ,(coerce (format nil "~@<~A~@:>" control)
+                                           'base-string)
                   :format-arguments (list ',name)
                   :references (list '(:amop :initialization method))))))
   (def reinitialize-instance ((method method) &rest initargs)
@@ -1603,11 +1604,11 @@
                              (make-caching-dfun gf (copy-cache initial-print-object-cache))
                            (set-dfun gf dfun cache info)))
                         ;; the relevant PRINT-OBJECT methods get defined
-                        ;; late, by delayed DEF!METHOD.  We mustn't cache
+                        ;; late, by delayed DEFMETHOD.  We mustn't cache
                         ;; the effective method for our classes earlier
                         ;; than the relevant PRINT-OBJECT methods are
                         ;; defined...
-                        ((boundp 'sb-impl::*delayed-def!method-args*)
+                        ((boundp '*!delayed-defmethod-args*)
                          (make-initial-dfun gf))
                         (t (multiple-value-bind (dfun cache info)
                                (make-final-dfun-internal

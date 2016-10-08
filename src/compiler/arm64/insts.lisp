@@ -27,8 +27,6 @@
             sb!vm::complex-single-reg sb!vm::complex-double-reg
             sb!vm::tmp-tn sb!vm::zr-tn sb!vm::nsp-offset)))
 
-(!begin-instruction-definitions)
-
 (setf *disassem-inst-alignment-bytes* 4)
 
 
@@ -144,6 +142,11 @@
   (defun print-immediate (value stream dstate)
     (declare (ignore dstate))
     (format stream "#~D" value))
+
+  (defun print-test-branch-immediate (value stream dstate)
+    (declare (ignore dstate))
+    (format stream "#~D"
+            (dpb (car value) (byte 1 5) (car value))))
 
   (defun decode-scaled-immediate (value)
     (destructuring-bind (size opc value simd) value
@@ -380,6 +383,8 @@
 
   (define-arg-type pair-imm-writeback :printer #'print-pair-imm-writeback)
 
+  (define-arg-type test-branch-immediate :printer #'print-test-branch-immediate)
+
   (define-arg-type reg :printer #'print-reg)
 
   (define-arg-type x-reg :printer #'print-x-reg)
@@ -410,32 +415,26 @@
 
 ;;;; special magic to support decoding internal-error and related traps
 (defun snarf-error-junk (sap offset &optional length-only)
-  (let ((length (sap-ref-8 sap offset)))
-    (declare (type system-area-pointer sap)
+  (let* ((inst (sap-ref-32 sap (- offset 4)))
+         (error-number (ldb (byte 8 13) inst))
+         (length (sb!kernel::error-length error-number))
+         (index offset))
+    (declare (type sb!sys:system-area-pointer sap)
              (type (unsigned-byte 8) length))
     (cond (length-only
-           (values 0 (1+ length) nil nil))
+           (loop repeat length do (sb!c::sap-read-var-integerf sap index))
+           (values 0 (- index offset) nil nil))
           (t
-           (let* ((inst (sap-ref-32 sap (- offset 4)))
-                  (vector (make-array length :element-type '(unsigned-byte 8)))
-                  (index 0)
-                  (error-number (ldb (byte 8 13) inst)))
-             (declare (type (simple-array (unsigned-byte 8) (*)) vector))
-             (sb!kernel:copy-ub8-from-system-area sap (1+ offset)
-                                                  vector 0 length)
-             (collect ((sc-offsets)
-                       (lengths))
-               (lengths 1) ; the length byte
-               (loop
-                (when (>= index length)
-                  (return))
-                (let ((old-index index))
-                  (sc-offsets (read-var-integer vector index))
-                  (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
+           (collect ((sc-offsets)
+                     (lengths))
+             (loop repeat length do
+                  (let ((old-index index))
+                    (sc-offsets (sb!c::sap-read-var-integerf sap index))
+                    (lengths (- index old-index))))
+             (values error-number
+                     (- index offset)
+                     (sc-offsets)
+                     (lengths)))))))
 
 (defun brk-control (chunk inst stream dstate)
   (declare (ignore inst chunk))
@@ -1295,7 +1294,7 @@
             '((:cond
                 ((rn :same-as rm) 'ror)
                 (t :name))
-              :tab rd  ", " rn (:unless (:same-as rn) "," rm) ", " imm))
+              :tab rd  ", " rn (:unless (:same-as rn) ", " rm) ", " imm))
   (:emitter
    (assert-same-size rd rn rm)
    (let ((size (reg-size rd)))
@@ -1617,9 +1616,7 @@
      :include ldr-str)
   (op4 :field (byte 1 21) :value #b0)
   (imm-writeback :fields (list (byte 9 12) (byte 2 10)) :type 'imm-writeback)
-  (op5 :field (byte 2 10) :value #b00)
   (ldr-str-annotation :field (byte 9 12)))
-
 
 (def-emitter ldr-str-reg
   (size 2 30)
@@ -2074,10 +2071,19 @@
   (#b011011 6 25)
   (op 1 24)
   (b40 5 19)
-  (imm 14 5)
+  (label 14 5)
   (rt 5 0))
 
+(define-instruction-format (test-branch-imm 32
+                            :default-printer '(:name :tab rt ", " index ", " label))
+  (op1 :field (byte 6 25) :value #b011011)
+  (op  :field (byte 1 24))
+  (index :fields (list (byte 1 31) (byte 5 19)) :type 'test-branch-immediate)
+  (label :field (byte 14 5) :type 'label)
+  (rt :field (byte 5 0) :type 'reg))
+
 (define-instruction tbz (segment rt bit label)
+  (:printer test-branch-imm ((op 0)))
   (:emitter
    (assert (label-p label))
    (check-type bit (integer 0 63))
@@ -2091,6 +2097,7 @@
                                             (tn-offset rt))))))
 
 (define-instruction tbnz (segment rt bit label)
+  (:printer test-branch-imm ((op 1)))
   (:emitter
    (assert (label-p label))
    (check-type bit (integer 0 63))
@@ -2144,22 +2151,23 @@
   (label :fields (list (byte 2 29) (byte 19 5)) :type 'label)
   (rd :field (byte 5 0) :type 'x-reg))
 
-(defun emit-pc-relative-inst (op segment rd label)
+(defun emit-pc-relative-inst (op segment rd label &optional (offset 0))
   (assert (label-p label))
   (assert (register-p rd))
   (emit-back-patch segment 4
                    (lambda (segment posn)
-                     (let ((offset (- (label-position label) posn)))
+                     (let ((offset (+ (- (label-position label) posn)
+                                      offset)))
                        (emit-pc-relative segment
                                          op
                                          (ldb (byte 2 0) offset)
                                          (ldb (byte 19 2) offset)
                                          (tn-offset rd))))))
 
-(define-instruction adr (segment rd label)
+(define-instruction adr (segment rd label &optional (offset 0))
   (:printer pc-relative ((op 0)))
   (:emitter
-   (emit-pc-relative-inst 0 segment rd label)))
+   (emit-pc-relative-inst 0 segment rd label offset)))
 
 (define-instruction adrp (segment rd label)
   (:printer pc-relative ((op 1)))
@@ -2641,7 +2649,7 @@
      #'multi-instruction-maybe-shrink
      #'multi-instruction-emitter)))
 
-(define-instruction compute-code (segment code lip object-label temp)
+(define-instruction compute-code (segment code lip object-label)
   (:vop-var vop)
   (:emitter
    (emit-compute segment vop code lip

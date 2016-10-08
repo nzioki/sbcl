@@ -61,6 +61,15 @@
 
     DONE
     (move result rax)))
+
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (load-type result object (- other-pointer-lowtag))))
 
 (define-vop (fun-subtype)
   (:translate fun-subtype)
@@ -320,7 +329,7 @@
   (:generator 2
     (inst mov sap
           (make-ea :qword :base thread-base-tn :index n
-                          :scale (ash 1 (- 3 n-fixnum-tag-bits)))))))
+                          :scale (ash 1 (- word-shift n-fixnum-tag-bits)))))))
 
 (define-vop (halt)
   (:generator 1
@@ -450,11 +459,11 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;;
 
-(defknown %cons-cas-pair (cons t t t t) (values t t &optional))
+(defknown %cons-cas-pair (cons t t t t) (values t t))
 ;; These unsafely permits cmpxchg on any kind of vector, boxed or unboxed
 ;; and the same goes for instances.
-(defknown %vector-cas-pair (simple-array index t t t t) (values t t &optional))
-(defknown %instance-cas-pair (instance index t t t t) (values t t &optional))
+(defknown %vector-cas-pair (simple-array index t t t t) (values t t))
+(defknown %instance-cas-pair (instance index t t t t) (values t t))
 
 ;; 32-bit register names here are not an accident - it's a deliberate attempt
 ;; to keep this exactly in sync with 32-bit code in the hope that somebody

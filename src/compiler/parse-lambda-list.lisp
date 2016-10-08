@@ -28,7 +28,9 @@
                                      &key &allow-other-keys &aux))
                                   ((and val (symbolp val)) (list val))
                                   (t val))
-              sum (ash 1 (position symbol lambda-list-parser-states))))
+              for weight = (or (position symbol lambda-list-parser-states)
+                               (error "Not a parser state: ~S" symbol))
+              sum (ash 1 weight)))
       ;; Otherwise the input is required to be a list of symbols.
       (with-unique-names (k)
         `(loop for ,k in ,list
@@ -68,7 +70,7 @@
 ;;; wrong, we use COMPILER-ERROR, aborting compilation to the last
 ;;; recovery point.
 (declaim (ftype (sfunction
-                 (list &key (:context t) (:accept integer) (:silent boolean)
+                 (list &key (:context t) (:accept integer) (:silent t)
                             (:condition-class symbol))
                  (values (unsigned-byte 13) list list list list list list list))
                 parse-lambda-list))
@@ -849,7 +851,7 @@
 (defun ds-bind-error (input min max pattern)
   (multiple-value-bind (name kind lambda-list) (get-ds-bind-context pattern)
     #-sb-xc-host
-    (declare (optimize sb!c::allow-non-returning-tail-call))
+    (declare (optimize allow-non-returning-tail-call))
     (case kind
      (:special-form
       ;; IR1 translators should call COMPILER-ERROR instead of
@@ -908,7 +910,7 @@
              (setq tail (cdr next))))))
     (multiple-value-bind (kind name) (get-ds-bind-context pattern)
       #-sb-xc-host
-      (declare (optimize sb!c::allow-non-returning-tail-call))
+      (declare (optimize allow-non-returning-tail-call))
       ;; KLUDGE: Compiling (COERCE x 'list) transforms to COERCE-TO-LIST,
       ;; but COERCE-TO-LIST is an inline function not yet defined, and
       ;; its subsequent definition would signal an inlining failure warning.
@@ -1036,16 +1038,6 @@
            ;; Typecheck the next cell so that calling code doesn't get an atom.
            (return (the cons (cdr plist)))))))
 
-;;; This is a variant of destructuring-bind that provides the name
-;;; of the containing construct in generated error messages.
-(def!macro named-ds-bind (context lambda-list data &body body &environment env)
-  (declare (ignorable env))
-  `(binding* ,(expand-ds-bind lambda-list data t nil context
-                              (and (eq (car context) :macro)
-                                   (eq (cddr context) 'deftype)
-                                   ''*))
-     ,@body))
-
 ;;; Make a lambda expression that receives an s-expression, destructures it
 ;;; according to LAMBDA-LIST, and executes BODY.
 ;;; NAME and KIND provide error-reporting context.
@@ -1109,26 +1101,26 @@
           (append whole env (ds-lambda-list-variables parse nil)))
     (values `(,@(if lambda-name `(named-lambda ,lambda-name) '(lambda))
                   (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
-               ,@(when (and docstring (eq doc-string-allowed :internal))
-                   (prog1 (list docstring) (setq docstring nil)))
-               ;; MACROLET doesn't produce an object capable of reflection,
-               ;; so don't bother inserting a different lambda-list.
-               ,@(unless (eq kind 'macrolet)
-                   ;; Normalize the lambda list by unparsing.
-                   `((declare (lambda-list ,(unparse-ds-lambda-list parse)))))
-               ,@(if outer-decls (list outer-decls))
-               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
-               ,@(sb!c:macro-policy-decls)
-               (,@(if kind
-                      `(named-ds-bind ,(if (eq kind :special-form)
-                                           `(:special-form . ,name)
-                                           `(:macro ,name . ,kind)))
-                      '(destructuring-bind))
-                   ,new-ll (,accessor ,ll-whole)
-                 ,@decls
-                 ,@(if wrap-block
-                       `((block ,(fun-name-block-name name) ,@forms))
-                       forms)))
+              ,@(when (and docstring (eq doc-string-allowed :internal))
+                  (prog1 (list docstring) (setq docstring nil)))
+              ;; MACROLET doesn't produce an object capable of reflection,
+              ;; so don't bother inserting a different lambda-list.
+              ,@(unless (eq kind 'macrolet)
+                  ;; Normalize the lambda list by unparsing.
+                  `((declare (lambda-list ,(unparse-ds-lambda-list parse)))))
+              ,@(if outer-decls (list outer-decls))
+              ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
+              ,@(sb!c:macro-policy-decls)
+              (,@(if kind
+                     `(named-ds-bind ,(if (eq kind :special-form)
+                                          `(:special-form . ,name)
+                                          `(:macro ,name . ,kind)))
+                     '(destructuring-bind))
+                  ,new-ll (,accessor ,ll-whole)
+               ,@decls
+               ,@(if wrap-block
+                     `((block ,(fun-name-block-name name) ,@forms))
+                     forms)))
             docstring)))
 
 ;;; Functions should probably not retain &AUX variables as part

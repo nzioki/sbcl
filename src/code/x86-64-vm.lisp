@@ -46,12 +46,11 @@
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
 (defun fixup-code-object (code offset fixup kind)
-  (declare (type index offset))
+  (declare (type index offset)
+           (type (member :absolute :absolute64 :relative) kind))
   (without-gcing
     (let ((sap (truly-the system-area-pointer
                           (code-instructions code))))
-      (unless (member kind '(:absolute :absolute64 :relative))
-        (error "Unknown code-object-fixup kind ~S." kind))
       (ecase kind
         (:absolute64
          ;; Word at sap + offset contains a value to be replaced by
@@ -60,7 +59,7 @@
         (:absolute
          ;; Word at sap + offset contains a value to be replaced by
          ;; adding that value to fixup.
-         (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset))))
+         (setf (sap-ref-32 sap offset) (+ fixup (signed-sap-ref-32 sap offset))))
         (:relative
          ;; Fixup is the actual address wanted.
          ;; Replace word with value to add to that loc to get there.
@@ -208,35 +207,16 @@
   (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
   (/hexstr context)
   (let* ((pc (context-pc context))
-         (trap-number (sap-ref-8 pc 0) ))
+         (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
     (/show0 "got PC")
     ;; using INT3 the pc is .. INT3 <here> code length bytes...
     (if (= trap-number invalid-arg-count-trap)
         (values #.(error-number-or-lose 'invalid-arg-count-error)
                 '(#.arg-count-sc))
-        (let* ((length (sap-ref-8 pc 1))
-               (vector (make-array length :element-type '(unsigned-byte 8))))
-          (declare (type (unsigned-byte 8) length)
-                   (type (simple-array (unsigned-byte 8) (*)) vector))
-          (/show0 "LENGTH,VECTOR,ERROR-NUMBER=..")
-          (/hexstr length)
-          (/hexstr vector)
-          (copy-ub8-from-system-area pc 2 vector 0 length)
-          (let* ((index 0)
-                 (error-number (sb!c:read-var-integer vector index)))
-            (/hexstr error-number)
-            (collect ((sc-offsets))
-              (loop
-               (/show0 "INDEX=..")
-               (/hexstr index)
-               (when (>= index length)
-                 (return))
-               (let ((sc-offset (sb!c:read-var-integer vector index)))
-                 (/show0 "SC-OFFSET=..")
-                 (/hexstr sc-offset)
-                 (sc-offsets sc-offset)))
-              (values error-number (sc-offsets))))))))
+        (let ((error-number (sap-ref-8 pc 1)))
+          (values error-number
+                  (sb!kernel::decode-internal-error-args (sap+ pc 2) error-number))))))
 
 
 ;;; the current alien stack pointer; saved/restored for non-local exits

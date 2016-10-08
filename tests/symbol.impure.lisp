@@ -202,3 +202,20 @@
 
 (with-test (:name :check-cl-symbols)
   (check-symbols *cl-classification*))
+
+(with-test (:name :makunbound-constant)
+  (let ((name (gensym)))
+    (eval `(defconstant ,name 32))
+    (handler-bind ((error #'continue))
+      (makunbound name))
+    (eval `(defvar ,name 33))
+    (assert (= (symbol-value name) 33))))
+
+(with-test (:name (:defvar :no-eval-of-docstring))
+  (assert-error (defvar #.(gensym) 10 (print "docstring"))))
+
+(with-test (:name (:defparameter :no-eval-of-docstring))
+  (assert-error (defparameter #.(gensym) 10 (print "docstring"))))
+
+(with-test (:name (:defconstant :no-eval-of-docstring))
+  (assert-error (defconstant #.(gensym) 10 (print "docstring"))))

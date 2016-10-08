@@ -22,8 +22,6 @@
             sb!vm::zero-tn sb!vm::lip-tn
             sb!vm::zero-offset sb!vm::null-offset)))
 
-(!begin-instruction-definitions)
-
 ;;; needs a little more work in the assembler, to realise that the
 ;;; delays requested here are not mandatory, so that the assembler
 ;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
@@ -1960,11 +1958,16 @@
 ;;;; Instructions for dumping data and header objects.
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) word))
   :pinned
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction short (segment short)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))

@@ -548,6 +548,7 @@ lra:
 	the tagged lisp registers may now contain garbage (since the
 	registers were saved by C and not seen by the GC.)  Put something
 	harmless in all such registers before allowing an interrupt */
+        li reg_FDEFN,0
 	li reg_CODE,0
 	li reg_CNAME,0
 	li reg_LEXENV,0
@@ -620,80 +621,6 @@ lra:
 	blr
 
 	SET_SIZE(call_into_c)
-
-	GFUNCDEF(xundefined_tramp)
-	.globl CSYMBOL(undefined_tramp)
-	.long	SIMPLE_FUN_HEADER_WIDETAG                         /* header */
-	.long	CSYMBOL(undefined_tramp) - SIMPLE_FUN_CODE_OFFSET /* self */
-	.long	NIL                                               /* next */
-	.long   NIL                                               /* name */
-	.long	NIL                                               /* arglist */
-	.long	NIL                                               /* type */
-	.long	NIL                                               /* xref */
-CSYMBOL(undefined_tramp):
-	/* Point reg_CODE to the header and tag it as function, since
-	   the debugger regards a function pointer in reg_CODE which
-	   doesn't point to a code object as undefined function.  */
-	/* We are given that reg_LIP points to undefined_tramp by
-	   virtue of the calling convention.  */
-	addi reg_CODE,reg_LIP,-SIMPLE_FUN_CODE_OFFSET
-
-	/* If we are called with stack arguments (or in a tail-call
-	   scenario), we end up with an allocated stack frame, but the
-	   frame link information is uninitialized.  Fix things by
-	   allocating and initializing our stack frame "properly". */
-	cmpwi cr0,reg_NARGS,16
-	bt gt,1f
-	addi reg_CSP,reg_CFP,16
-	b 2f
-1:	add reg_CSP,reg_CFP,reg_NARGS
-2:	stw reg_OCFP,0(reg_CFP)
-	stw reg_LRA,4(reg_CFP)
-
-	/* Now that the preliminaries are dealt with, actually trap. */
-	twllei reg_ZERO,trap_Cerror
-	.byte 4
-	.byte UNDEFINED_FUN_ERROR
-	.byte 254, sc_DescriptorReg+0x80, 0x2 /* 280 */
-	/* This stuff is for the continuable error.  I don't think there's
-	 * any support for it on the lisp side */
-	.align 2
-1:	lwz reg_CODE,FDEFN_RAW_ADDR_OFFSET(reg_FDEFN)
-	la reg_LIP,SIMPLE_FUN_CODE_OFFSET(reg_CODE)
-	mtctr reg_LIP
-	bctr
-	mr reg_CSP,reg_CFP
-	b 1b
-
-	SET_SIZE(xundefined_tramp)
-
-	GFUNCDEF(xclosure_tramp)
-	.globl CSYMBOL(closure_tramp)
-CSYMBOL(closure_tramp):
-	lwz reg_LEXENV,FDEFN_FUN_OFFSET(reg_FDEFN)
-	lwz reg_CODE,CLOSURE_FUN_OFFSET(reg_LEXENV)
-	la reg_LIP,SIMPLE_FUN_CODE_OFFSET(reg_CODE)
-	mtctr reg_LIP
-	bctr
-
-	SET_SIZE(xclosure_tramp)
-
-	GFUNCDEF(xfuncallable_instance_tramp)
-	.globl CSYMBOL(funcallable_instance_tramp)
-	.long SIMPLE_FUN_HEADER_WIDETAG
-CSYMBOL(funcallable_instance_tramp) = . + 1
-	.long CSYMBOL(funcallable_instance_tramp)
-	.long NIL
-	.long NIL
-	.long NIL
-	.long NIL
-	.long NIL
-	lwz reg_LEXENV,FUNCALLABLE_INSTANCE_FUNCTION_OFFSET(reg_LEXENV)
-	lwz reg_FDEFN,CLOSURE_FUN_OFFSET(reg_LEXENV)
-	addi reg_LIP,reg_FDEFN,SIMPLE_FUN_CODE_OFFSET
-	mtctr reg_LIP
-	bctr
-	SET_SIZE(funcallable_instance_tramp)
 
 	/* The fun_end_breakpoint support here is considered by the
 	authors of the other $ARCH-assem.S files to be magic, and it
@@ -779,77 +706,3 @@ CSYMBOL(fun_end_breakpoint_end):
 	blr
 /* King Nato's branch has a nop here. Do we need this? */
 	SET_SIZE(do_pending_interrupt)
-	
-#if defined LISP_FEATURE_GENCGC
-
-        GFUNCDEF(fpu_save)
-        stfd	FREG(1), 0(REG(3))
-	stfd	FREG(2), 8(REG(3))
-	stfd	FREG(3), 16(REG(3))
-	stfd	FREG(4), 24(REG(3))
-	stfd	FREG(5), 32(REG(3))
-	stfd	FREG(6), 40(REG(3))
-	stfd	FREG(7), 48(REG(3))
-	stfd	FREG(8), 56(REG(3))
-	stfd	FREG(9), 64(REG(3))
-	stfd	FREG(10), 72(REG(3))
-	stfd	FREG(11), 80(REG(3))
-	stfd	FREG(12), 88(REG(3))
-	stfd	FREG(13), 96(REG(3))
-	stfd	FREG(14), 104(REG(3))
-	stfd	FREG(15), 112(REG(3))
-	stfd	FREG(16), 120(REG(3))
-	stfd	FREG(17), 128(REG(3))
-	stfd	FREG(18), 136(REG(3))
-	stfd	FREG(19), 144(REG(3))
-	stfd	FREG(20), 152(REG(3))
-	stfd	FREG(21), 160(REG(3))
-	stfd	FREG(22), 168(REG(3))
-	stfd	FREG(23), 176(REG(3))
-	stfd	FREG(24), 184(REG(3))
-	stfd	FREG(25), 192(REG(3))
-	stfd	FREG(26), 200(REG(3))
-	stfd	FREG(27), 208(REG(3))
-	stfd	FREG(28), 216(REG(3))
-	stfd	FREG(29), 224(REG(3))
-	stfd	FREG(30), 232(REG(3))
-	stfd	FREG(31), 240(REG(3))
-	blr
-	SET_SIZE(fpu_save)
-	
-	GFUNCDEF(fpu_restore)
-	lfd	FREG(1), 0(REG(3))
-	lfd	FREG(2), 8(REG(3))
-	lfd	FREG(3), 16(REG(3))
-	lfd	FREG(4), 24(REG(3))
-	lfd	FREG(5), 32(REG(3))
-	lfd	FREG(6), 40(REG(3))
-	lfd	FREG(7), 48(REG(3))
-	lfd	FREG(8), 56(REG(3))
-	lfd	FREG(9), 64(REG(3))
-	lfd	FREG(10), 72(REG(3))
-	lfd	FREG(11), 80(REG(3))
-	lfd	FREG(12), 88(REG(3))
-	lfd	FREG(13), 96(REG(3))
-	lfd	FREG(14), 104(REG(3))
-	lfd	FREG(15), 112(REG(3))
-	lfd	FREG(16), 120(REG(3))
-	lfd	FREG(17), 128(REG(3))
-	lfd	FREG(18), 136(REG(3))
-	lfd	FREG(19), 144(REG(3))
-	lfd	FREG(20), 152(REG(3))
-	lfd	FREG(21), 160(REG(3))
-	lfd	FREG(22), 168(REG(3))
-	lfd	FREG(23), 176(REG(3))
-	lfd	FREG(24), 184(REG(3))
-	lfd	FREG(25), 192(REG(3))
-	lfd	FREG(26), 200(REG(3))
-	lfd	FREG(27), 208(REG(3))
-	lfd	FREG(28), 216(REG(3))
-	lfd	FREG(29), 224(REG(3))
-	lfd	FREG(30), 232(REG(3))
-	lfd	FREG(31), 240(REG(3))
-        blr
-	SET_SIZE(fpu_restore)
-	
-#endif	

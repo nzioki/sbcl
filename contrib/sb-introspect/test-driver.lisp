@@ -463,14 +463,6 @@
                 '(function (&rest t) *))
   t)
 
-#+sb-eval
-(progn
-  (interpret (defun some-interpreted-fun-to-trace (x) (car x)))
-  (trace some-interpreted-fun-to-trace)
-  (deftest get-simple-fun
-      (sb-introspect::get-simple-fun #'some-interpreted-fun-to-trace)
-    nil))
-
 ;; Generic functions
 
 (defgeneric earth (x y))
@@ -619,4 +611,12 @@
 
 (deftest alien-variable
   (matchp-name :variable 'cl-user::test-alien-var 32)
+  t)
+
+(deftest condition-slot-reader
+  (matchp-name :method 'cl-user::condition-slot-reader 33)
+  t)
+
+(deftest condition-slot-writer
+  (matchp-name :method 'cl-user::condition-slot-writer 33)
   t)

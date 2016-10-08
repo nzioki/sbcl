@@ -28,7 +28,7 @@
            ;; check for EQL types and singleton numeric types
            (values (type-singleton-p (lvar-type thing))))))
 
-;;; Same as above except for EQL types
+;;; Same as above except it doesn't consider EQL types
 (defun strictly-constant-lvar-p (thing)
   (declare (type (or lvar null) thing))
   (and (lvar-p thing)
@@ -885,7 +885,7 @@
     (let ((*compiler-error-context* node))
       (compiler-style-warn
        "The return value of ~A should not be discarded."
-       (lvar-fun-name (basic-combination-fun node))))))
+       (lvar-fun-name (basic-combination-fun node) t)))))
 
 ;;; Do IR1 optimizations on a COMBINATION node.
 (declaim (ftype (function (combination) (values)) ir1-optimize-combination))
@@ -913,15 +913,13 @@
        (cond (info
               (check-important-result node info)
               (let ((fun (fun-info-destroyed-constant-args info)))
-                (when fun
-                  (let ((destroyed-constant-args (funcall fun args)))
-                    (when destroyed-constant-args
-                      (let ((*compiler-error-context* node))
-                        (warn 'constant-modified
-                              :fun-name (lvar-fun-name
-                                         (basic-combination-fun node)))
-                        (setf (basic-combination-kind node) :error)
-                        (return-from ir1-optimize-combination))))))
+                (when (and fun (funcall fun args))
+                  (let ((*compiler-error-context* node))
+                    (warn 'constant-modified
+                          :fun-name (lvar-fun-name
+                                     (basic-combination-fun node) t))
+                    (setf (basic-combination-kind node) :error)
+                    (return-from ir1-optimize-combination))))
               (let ((fun (fun-info-derive-type info)))
                 (when fun
                   (let ((res (funcall fun node)))
@@ -960,14 +958,7 @@
                  (return-from ir1-optimize-combination))))))
 
        (let ((attr (fun-info-attributes info)))
-         (when (and (ir1-attributep attr foldable)
-                    ;; KLUDGE: The next test could be made more sensitive,
-                    ;; only suppressing constant-folding of functions with
-                    ;; CALL attributes when they're actually passed
-                    ;; function arguments. -- WHN 19990918
-                    (not (ir1-attributep attr call))
-                    (every #'constant-lvar-p args)
-                    (node-lvar node))
+         (when (constant-fold-call-p node)
            (constant-fold-call node)
            (return-from ir1-optimize-combination))
          (when (and (ir1-attributep attr commutative)
@@ -1351,7 +1342,8 @@
 ;;; good idea to go OO, representing the reasons by objects, using
 ;;; CLOS methods on the objects instead of CASE, and (possibly) using
 ;;; SIGNAL instead of THROW.
-(declaim (ftype (function (&rest t) nil) give-up-ir1-transform))
+(declaim (ftype (function (&rest t) #+(and sb-xc-host ccl) *
+                                    #-(and sb-xc-host ccl) nil) give-up-ir1-transform))
 (defun give-up-ir1-transform (&rest args)
   (throw 'give-up-ir1-transform (values :failure args)))
 (defun abort-ir1-transform (&rest args)
@@ -1451,6 +1443,37 @@
         (locall-analyze-component *current-component*))))
   (values))
 
+(defun constant-fold-arg-p (name)
+  (typecase name
+    (null
+     t)
+    ((or symbol cons)
+     (let* ((info (info :function :info name))
+            (attributes (and info
+                             (fun-info-attributes info))))
+       (and info
+            (ir1-attributep attributes foldable)
+            (not (ir1-attributep attributes call)))))))
+
+;;; Return T if the function is foldable and if it's marked as CALL
+;;; all function arguments are FOLDABLE too.
+(defun constant-fold-call-p (combination)
+  (let* ((info (basic-combination-fun-info combination))
+         (attr (fun-info-attributes info))
+         (args (basic-combination-args combination)))
+    (cond ((not (ir1-attributep attr foldable))
+           nil)
+          ((ir1-attributep attr call)
+           (apply (fun-info-foldable-call-check info)
+                  (mapcar (lambda (lvar)
+                            (or (lvar-fun-name lvar t)
+                                (if (constant-lvar-p lvar)
+                                    (lvar-value lvar)
+                                    (return-from constant-fold-call-p nil))))
+                          args)))
+          (t
+           (every #'constant-lvar-p args)))))
+
 ;;; Replace a call to a foldable function of constant arguments with
 ;;; the result of evaluating the form. If there is an error during the
 ;;; evaluation, we give a warning and leave the call alone, making the
@@ -1459,7 +1482,12 @@
 ;;; If there is more than one value, then we transform the call into a
 ;;; VALUES form.
 (defun constant-fold-call (call)
-  (let ((args (mapcar #'lvar-value (combination-args call)))
+  (let ((args (mapcar (lambda (lvar)
+                        (let ((name (lvar-fun-name lvar t)))
+                          (if name
+                              (fdefinition name)
+                              (lvar-value lvar))))
+                      (combination-args call)))
         (fun-name (combination-fun-source-name call)))
     (multiple-value-bind (values win)
         (careful-call fun-name
@@ -2018,55 +2046,49 @@
         (*compiler-error-context* node)
         (ref (lvar-uses (basic-combination-fun node)))
         (args (basic-combination-args node)))
-
-    (unless (and (ref-p ref) (constant-reference-p ref)
-                 (singleton-p args))
-      (return-from ir1-optimize-mv-call))
-
-    (multiple-value-bind (min max)
-        (fun-type-nargs (lvar-type fun))
-      (let ((total-nvals
-             (multiple-value-bind (types nvals)
-                 (values-types (lvar-derived-type (first args)))
-               (declare (ignore types))
-               (if (eq nvals :unknown) nil nvals))))
-
-        (when total-nvals
-          (when (and min (< total-nvals min))
-            (compiler-warn
-             "MULTIPLE-VALUE-CALL with ~R values when the function expects ~
+    (when (and (ref-p ref)
+               (constant-reference-p ref))
+      (multiple-value-bind (min max) (fun-type-nargs (lvar-type fun))
+        (let ((total-nvals
+                (loop for arg in args
+                      for nvals = (nth-value 1 (values-types (lvar-derived-type arg)))
+                      when (eq nvals :unknown) return nil
+                      sum nvals)))
+          (when total-nvals
+            (when (and min (< total-nvals min))
+              (compiler-warn
+               "MULTIPLE-VALUE-CALL with ~R values when the function expects ~
               at least ~R."
-             total-nvals min)
-            (setf (basic-combination-kind node) :error)
-            (return-from ir1-optimize-mv-call))
-          (when (and max (> total-nvals max))
-            (compiler-warn
-             "MULTIPLE-VALUE-CALL with ~R values when the function expects ~
+               total-nvals min)
+              (setf (basic-combination-kind node) :error)
+              (return-from ir1-optimize-mv-call))
+            (when (and max (> total-nvals max))
+              (compiler-warn
+               "MULTIPLE-VALUE-CALL with ~R values when the function expects ~
               at most ~R."
-             total-nvals max)
-            (setf (basic-combination-kind node) :error)
-            (return-from ir1-optimize-mv-call)))
-
-        (let ((count (cond (total-nvals)
-                           ((and (policy node (zerop verify-arg-count))
-                                 (eql min max))
-                            min)
-                           (t nil))))
-          (when count
-            (with-ir1-environment-from-node node
-              (let* ((dums (make-gensym-list count))
-                     (ignore (gensym))
-                     (leaf (ref-leaf ref))
-                     (fun (ir1-convert-lambda
-                           `(lambda (&optional ,@dums &rest ,ignore)
-                              (declare (ignore ,ignore))
-                              (%funcall ,leaf ,@dums))
-                           :source-name (leaf-%source-name leaf)
-                           :debug-name (leaf-%debug-name leaf))))
-                (change-ref-leaf ref fun)
-                (aver (eq (basic-combination-kind node) :full))
-                (locall-analyze-component *current-component*)
-                (aver (eq (basic-combination-kind node) :local)))))))))
+               total-nvals max)
+              (setf (basic-combination-kind node) :error)
+              (return-from ir1-optimize-mv-call)))
+          (when (singleton-p args)
+            (let ((count (cond (total-nvals)
+                               ((and (policy node (zerop verify-arg-count))
+                                     (eql min max))
+                                min)
+                               (t nil))))
+              (when count
+                (with-ir1-environment-from-node node
+                  (let* ((dums (make-gensym-list count))
+                         (ignore (gensym))
+                         (leaf (ref-leaf ref))
+                         (fun (ir1-convert-lambda
+                               `(lambda (&optional ,@dums &rest ,ignore)
+                                  (declare (ignore ,ignore))
+                                  (%funcall ,leaf ,@dums))
+                               :debug-name (leaf-%debug-name leaf))))
+                    (change-ref-leaf ref fun)
+                    (aver (eq (basic-combination-kind node) :full))
+                    (locall-analyze-component *current-component*)
+                    (aver (eq (basic-combination-kind node) :local)))))))))))
   (values))
 
 ;;; If we see:
@@ -2211,10 +2233,13 @@
       ;; RETURN-FROM.  We may delete them only when we can show that
       ;; there are no other code paths that use the entry LVAR that
       ;; are live from within the block that contained the deleted
-      ;; EXIT (our predecessor block).  The conservative version of
-      ;; this is that there are no EXITs for any ENTRY introduced
-      ;; between the LEXENV of the deleted EXIT and the LEXENV of the
-      ;; target ENTRY.
+      ;; EXIT (our predecessor block) and that all uses of the entry
+      ;; LVAR have the same dynamic-extent environment.  The
+      ;; conservative version of this is that there are no EXITs for
+      ;; any ENTRY introduced between the LEXENV of the deleted EXIT
+      ;; and the LEXENV of the target ENTRY and that both the LEXENV
+      ;; of the deleted EXIT and the LEXENV of the ENTRY have the same
+      ;; set of :DYNAMIC-EXTENT variables and functions.
       (let* ((entry-lexenv (cast-vestigial-exit-entry-lexenv cast))
              (entry-blocks (lexenv-blocks entry-lexenv))
              (entry-tags (lexenv-tags entry-lexenv)))
@@ -2225,6 +2250,23 @@
         (do ((current-tag (lexenv-tags exit-lexenv) (cdr current-tag)))
             ((eq current-tag entry-tags))
           (when (entry-exits (cadar current-tag))
+            (return-from may-delete-vestigial-exit nil)))
+        (do ((vars (lexenv-vars exit-lexenv) (cdr vars)))
+            ((eq vars (lexenv-vars entry-lexenv)))
+          ;; (CDAR VARS) is the actual variable we're looking at,
+          ;; except that if it's a symbol-macro then it's (MACRO
+          ;; . <form>), and that's not a leaf, so ignore the
+          ;; non-LEAF-P variables.
+          (when (and (leaf-p (cdar vars))
+                     (leaf-dynamic-extent (cdar vars)))
+            (return-from may-delete-vestigial-exit nil)))
+        (do ((funs (lexenv-funs exit-lexenv) (cdr funs)))
+            ((eq funs (lexenv-funs entry-lexenv)))
+          ;; Like with VARS, we can have FUNS of the form (MACRO
+          ;; . <something>), though in this case it's an expander
+          ;; function.  Again, ignore the non-LEAF-P functions.
+          (when (and (leaf-p (cdar funs))
+                     (leaf-dynamic-extent (cdar funs)))
             (return-from may-delete-vestigial-exit nil))))))
   (values t))
 
@@ -2337,5 +2379,3 @@
   (unless do-not-optimize
     (setf (node-reoptimize cast) nil)))
 
-(deftransform make-symbol ((string) (simple-string))
-  `(%make-symbol string))

@@ -150,33 +150,6 @@
   (when (and (= rs1 alloc-offset) (= rd zero-offset) (= immed-val 3))
     (note "pseudo-atomic interrupted?" dstate)))
 
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
-
 (defun unimp-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
@@ -187,8 +160,6 @@
       (#.cerror-trap
        (nt "Cerror trap")
        (handle-break-args #'snarf-error-junk stream dstate))
-      (#.object-not-list-trap
-       (nt "Object not list trap"))
       (#.breakpoint-trap
        (nt "Breakpoint trap"))
       (#.pending-interrupt-trap
@@ -196,6 +167,4 @@
       (#.halt-trap
        (nt "Halt trap"))
       (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap"))
-      (#.object-not-instance-trap
-       (nt "Object not instance trap")))))
+       (nt "Function end breakpoint trap")))))

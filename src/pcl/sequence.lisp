@@ -280,7 +280,7 @@
   (:method ((s vector) iterator)
     (aref s iterator))
   (:method ((s sequence) iterator)
-    (elt s iterator))
+    (sequence:elt s iterator))
   #+sb-doc
   (:documentation
    "Returns the element of SEQUENCE associated to the position of
@@ -292,7 +292,7 @@
   (:method (o (s vector) iterator)
     (setf (aref s iterator) o))
   (:method (o (s sequence) iterator)
-    (setf (elt s iterator) o))
+    (setf (sequence:elt s iterator) o))
   #+sb-doc
   (:documentation
    "Destructively modifies SEQUENCE by replacing the sequence element
@@ -435,10 +435,10 @@
       (%map-for-effect #'counting-visit sequences))
     ;; Map local function over SEQUENCES that steps through the result
     ;; sequence and stores results of applying FUNCTION.
-    (binding* ((result (make-sequence (class-of result-prototype) min-length))
+    (binding* ((result (sequence:make-sequence-like result-prototype min-length))
                ((state nil from-end step nil nil setelt)
                 (sequence:make-sequence-iterator result)))
-      (declare (type function state step setelt))
+      (declare (type function step setelt))
       (flet ((one-element (&rest args)
                (declare (truly-dynamic-extent args))
                (funcall setelt (apply function args) result state)

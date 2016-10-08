@@ -944,6 +944,8 @@
   (declare (type fasl-output file))
   (let* ((pname (symbol-name s))
          (pname-length (length pname))
+         (base-string-p (typep pname (or #-sb-xc-host 'base-string t)))
+         (length+flag (logior (ash pname-length 1) (if base-string-p 1 0)))
          (dumped-as-copy nil)
          (pkg (symbol-package s)))
     ;; see comment in genesis: we need this here for repeatable fasls
@@ -957,15 +959,11 @@
         (setq pkg sb!int:*cl-package*)))
 
     (cond ((null pkg)
-           (let ((this-base-p #+sb-xc-host t
-                              #-sb-xc-host (typep pname 'base-string)))
+           (let ((this-base-p base-string-p))
              (dolist (lookalike (gethash pname (fasl-output-string=-table file))
                                 (dump-fop 'fop-uninterned-symbol-save
-                                          file pname-length))
+                                          file length+flag))
                ;; Find the right kind of lookalike symbol.
-               ;; actually this seems pretty bogus - afaict, we don't correctly
-               ;; preserve the type of the string (base or character) anyway,
-               ;; but if we did, then this would be right also.
                ;; [what about a symbol whose name is a (simple-array nil (0))?]
                (let ((that-base-p
                       #+sb-xc-host t
@@ -975,27 +973,19 @@
                    (dump-fop 'fop-copy-symbol-save file
                              (gethash lookalike (fasl-output-eq-table file)))
                    (return (setq dumped-as-copy t)))))))
-          ;; CMU CL had FOP-SYMBOL-SAVE/FOP-SMALL-SYMBOL-SAVE fops which
-          ;; used the current value of *PACKAGE*. Unfortunately that's
-          ;; broken w.r.t. ANSI Common Lisp semantics, so those are gone
-          ;; from SBCL.
-          ;;((eq pkg *package*)
-          ;; (dump-fop* pname-length
-          ;;        fop-small-symbol-save
-          ;;        fop-symbol-save file))
           ((eq pkg sb!int:*cl-package*)
-           (dump-fop 'fop-lisp-symbol-save file pname-length))
+           (dump-fop 'fop-lisp-symbol-save file length+flag))
           ((eq pkg sb!int:*keyword-package*)
-           (dump-fop 'fop-keyword-symbol-save file pname-length))
+           (dump-fop 'fop-keyword-symbol-save file length+flag))
           (t
            (dump-fop 'fop-symbol-in-package-save file
-                     (dump-package pkg file) pname-length)))
+                     (dump-package pkg file) length+flag)))
 
     (unless dumped-as-copy
-      #+sb-xc-host (dump-base-chars-of-string pname file)
-      #-sb-xc-host (#!+sb-unicode dump-characters-of-string
-                    #!-sb-unicode dump-base-chars-of-string
-                    pname file)
+      (funcall (if base-string-p
+                   'dump-base-chars-of-string
+                   'dump-characters-of-string)
+               pname file)
       (push s (gethash (symbol-name s) (fasl-output-string=-table file))))
 
     (setf (gethash s (fasl-output-eq-table file))
@@ -1128,6 +1118,8 @@
         (push (dump-to-table fasl-output)
               (fasl-output-debug-info fasl-output)))
 
+      (dump-object (if (eq (sb!c::component-kind component) :toplevel) :toplevel nil)
+                   fasl-output)
       (let ((num-consts (- header-length sb!vm:code-constants-offset)))
         (dump-fop 'fop-code fasl-output num-consts code-length))
 
@@ -1282,32 +1274,21 @@
 ;; But if it learns a layout by cross-compiling a DEFSTRUCT, that's ok too.
 (defun dump-structure (struct file)
   (when (and *dump-only-valid-structures*
-             (not (gethash struct (fasl-output-valid-structures file)))
-             #+sb-xc-host
-             (not (sb!kernel::xc-dumpable-structure-instance-p struct)))
+             (not (gethash struct (fasl-output-valid-structures file))))
     (error "attempt to dump invalid structure:~%  ~S~%How did this happen?"
            struct))
   (note-potential-circularity struct file)
   (do* ((length (%instance-length struct))
         (layout (%instance-layout struct))
-        #!-interleaved-raw-slots
-        (ntagged (- length (layout-n-untagged-slots layout)))
-        #!+interleaved-raw-slots
-        (bitmap (layout-untagged-bitmap layout))
+        (bitmap (layout-bitmap layout))
         (circ (fasl-output-circularity-table file))
-        ;; last slot first on the stack, so that the layout is on top:
-        (index (1- length) (1- index)))
-      ((< index sb!vm:instance-data-start)
+        (index sb!vm:instance-data-start (1+ index)))
+      ((>= index length)
        (dump-non-immediate-object layout file)
        (dump-fop 'fop-struct file length))
-    (let* ((obj #!-interleaved-raw-slots
-                (if (>= index ntagged)
-                    (%raw-instance-ref/word struct (- length index 1))
-                    (%instance-ref struct index))
-                #!+interleaved-raw-slots
-                (if (logbitp index bitmap)
-                    (%raw-instance-ref/word struct index)
-                    (%instance-ref struct index)))
+    (let* ((obj (if (logbitp index bitmap)
+                    (%instance-ref struct index)
+                    (%raw-instance-ref/word struct index)))
            (ref (gethash obj circ)))
       (sub-dump-object (cond (ref
                               (push (make-circularity :type :struct-set
@@ -1339,5 +1320,5 @@
   (sub-dump-object (layout-inherits obj) file)
   (sub-dump-object (layout-depthoid obj) file)
   (sub-dump-object (layout-length obj) file)
-  (sub-dump-object (layout-raw-slot-metadata obj) file)
+  (sub-dump-object (layout-bitmap obj) file)
   (dump-fop 'fop-layout file))

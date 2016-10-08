@@ -305,16 +305,9 @@
     (when vop
       (note-this-location vop :internal-error))
     (inst unimp kind)
-    (with-adjustable-vector (vector)
-      (write-var-integer code vector)
-      (dolist (tn values)
-        (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                           (or (tn-offset tn) 0))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i)))
-      (emit-alignment word-shift))))
+    (inst byte code)
+    (encode-internal-error-args values)
+    (emit-alignment word-shift)))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc
@@ -371,7 +364,7 @@
 (defun emit-safepoint ()
   (inst lwz zero-tn null-tn (- (+ 4096 4 other-pointer-lowtag))))
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger

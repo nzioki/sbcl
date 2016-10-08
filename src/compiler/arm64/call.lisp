@@ -114,7 +114,6 @@
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
@@ -125,7 +124,7 @@
     (inst simple-fun-header-word)
     (dotimes (i (1- simple-fun-code-offset))
       (inst dword 0))
-    (inst compute-code code-tn lip start-lab temp)))
+    (inst compute-code code-tn lip start-lab)))
 
 (define-vop (xep-setup-sp)
   (:vop-var vop)
@@ -201,7 +200,7 @@
     (note-this-location vop (if (<= nvals 1)
                                 :single-value-return
                                 :unknown-return))
-    (inst compute-code code-tn lip lra-label temp)
+    (inst compute-code code-tn lip lra-label)
     ;; Pick off the single-value case first.
     (sb!assem:without-scheduling ()
 
@@ -274,10 +273,10 @@
 ;;;    Args and Nargs are TNs wired to the named locations.  We must
 ;;; explicitly allocate these TNs, since their lifetimes overlap with the
 ;;; results Start and Count (also, it's nice to be able to target them).
-(defun receive-unknown-values (args nargs start count lra-label temp lip)
-  (declare (type tn args nargs start count temp))
+(defun receive-unknown-values (args nargs start count lra-label lip)
+  (declare (type tn args nargs start count))
   (assemble ()
-    (inst compute-code code-tn lip lra-label temp)
+    (inst compute-code code-tn lip lra-label)
     (inst b :eq MULTIPLE)
     (move start csp-tn)
     (inst add csp-tn csp-tn n-word-bytes)
@@ -285,14 +284,15 @@
     (inst mov count (fixnumize 1))
     (inst b DONE)
     MULTIPLE
-    (do ((arg *register-arg-tns* (rest arg))
-         (i 0 (1+ i)))
+    #.(assert (evenp register-arg-count))
+    (do ((arg *register-arg-tns* (cddr arg))
+         (i 0 (+ i 2)))
         ((null arg))
-      (storew (first arg) args i 0))
+      (inst stp (first arg) (second arg)
+            (@ args (* i n-word-bytes))))
     (move start args)
     (move count nargs)
     DONE))
-
 
 ;;; VOP that can be inherited by unknown values receivers.  The main
 ;;; thing this handles is allocation of the result temporaries.
@@ -494,8 +494,7 @@
 
       ;; Grab one value.
       ENTER
-      (loadw temp context)
-      (inst add context context n-word-bytes)
+      (inst ldr temp (@ context n-word-bytes :post-index))
 
       ;; Dec count, and if != zero, go back for more.
       (inst subs count count (fixnumize 1))
@@ -541,24 +540,25 @@
   (:generator 3
     (let ((err-lab
            (generate-error-code vop 'invalid-arg-count-error)))
-      (flet ((load-immediate (x)
-               (add-sub-immediate (fixnumize x))))
+      (labels ((load-immediate (x)
+                 (add-sub-immediate (fixnumize x)))
+               (check-min ()
+                 (cond ((= min 1)
+                        (inst cbz nargs err-lab))
+                       ((plusp min)
+                        (inst cmp nargs (load-immediate min))
+                        (inst b :lo err-lab)))))
         (cond ((eql max 0)
                (inst cbnz nargs err-lab))
               ((not min)
                (inst cmp nargs (load-immediate max))
                (inst b :ne err-lab))
-             (max
-              (when (plusp min)
-                (inst cmp nargs (load-immediate min))
-                (inst b :lo err-lab))
-              (inst cmp nargs (load-immediate max))
-              (inst b :hi err-lab))
-             ((eql min 1)
-              (inst cbz nargs err-lab))
-             ((plusp min)
-              (inst cmp nargs (load-immediate min))
-              (inst b :lo err-lab)))))))
+              (max
+               (check-min)
+               (inst cmp nargs (load-immediate max))
+               (inst b :hi err-lab))
+              (t
+               (check-min)))))))
 
 ;;;; Local call with unknown values convention return:
 
@@ -632,7 +632,6 @@
   (:ignore args save)
   (:vop-var vop)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 20
     (let ((label (gen-label))
@@ -650,7 +649,7 @@
       (inst b target)
       (emit-return-pc label)
       (note-this-location vop :unknown-return)
-      (receive-unknown-values values-start nvals start count label temp lip)
+      (receive-unknown-values values-start nvals start count label lip)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
 
@@ -818,12 +817,12 @@
                          ,name))
                  *register-arg-names* *register-arg-offsets*))
      ,@(when (eq return :fixed)
-         '((:temporary (:scs (descriptor-reg) :from :eval) move-temp)
+         '((:temporary (:scs (non-descriptor-reg)) temp)
+           (:temporary (:scs (descriptor-reg) :from :eval) move-temp)
            (:temporary (:sc any-reg :from :eval :offset ocfp-offset) ocfp-temp)))
 
      ,@(unless (eq return :tail)
-         '((:temporary (:scs (non-descriptor-reg)) temp)
-           (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)))
+         '((:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)))
 
      (:temporary (:scs (interior-reg)) lip)
 
@@ -867,10 +866,14 @@
                                (inst add csp-tn nargs-pass (* 2 n-word-bytes))
                                (inst sub nargs-pass nargs-pass new-fp)
                                (inst asr nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits))
-                               ,@(let ((index -1))
-                                   (mapcar #'(lambda (name)
-                                               `(loadw ,name new-fp ,(incf index)))
-                                           *register-arg-names*))
+                               ,@(do ((arg *register-arg-names* (cddr arg))
+                                      (i 0 (+ i 2))
+                                      (insts))
+                                     ((null arg) (nreverse insts))
+                                   #.(assert (evenp register-arg-count))
+                                   (push `(inst ldp ,(first arg) ,(second arg)
+                                                (@ new-fp ,(* i n-word-bytes)))
+                                         insts))
                                (storew cfp-tn new-fp ocfp-save-offset))
                              '((inst mov nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)
@@ -965,7 +968,7 @@
               '((emit-return-pc lra-label)
                 (note-this-location vop :unknown-return)
                 (receive-unknown-values values-start nvals start count
-                                        lra-label temp lip)
+                                        lra-label lip)
                 (when cur-nfp
                   (load-stack-tn cur-nfp nfp-save))))
              (:tail))))))

@@ -46,6 +46,7 @@
 
 ;;; the type of LAYOUT-DEPTHOID slot values
 (def!type layout-depthoid () '(or index (integer -1 -1)))
+(def!type layout-bitmap () '(and integer (not (eql 0))))
 
 ;;; An INLINEP value describes how a function is called. The values
 ;;; have these meanings:
@@ -109,9 +110,17 @@
 (defvar *fixup-notes*)
 #!+inline-constants
 (progn
-  (defvar *constant-segment*)
-  (defvar *constant-table*)
-  (defvar *constant-vector*))
+  (defvar *unboxed-constants*)
+  (defstruct (unboxed-constants (:conc-name constant-)
+                                (:predicate nil) (:copier nil))
+    (table (make-hash-table :test #'equal) :read-only t)
+    (segment
+     (sb!assem:make-segment :type :elsewhere
+                            :run-scheduler nil
+                            :inst-hook (default-segment-inst-hook)
+                            :alignment 0) :read-only t)
+    (vector (make-array 16 :adjustable t :fill-pointer 0) :read-only t))
+  (declaim (freeze-type unboxed-constants)))
 (defvar *source-info*)
 (defvar *source-plist*)
 (defvar *source-namestring*)
@@ -221,8 +230,7 @@ the stack without triggering overflow protection.")
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:make-load-form-fun dump-debug-name-marker)
-                               (:print-function print-debug-name-marker)))
+(def!struct (debug-name-marker (:print-function print-debug-name-marker)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -230,20 +238,19 @@ the stack without triggering overflow protection.")
 (defvar *debug-name-sharp*)
 (defvar *debug-name-ellipsis*)
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun dump-debug-name-marker (marker &optional env)
-    (declare (ignore env))
-    (cond ((eq marker *debug-name-sharp*)
-           `(if (boundp '*debug-name-sharp*)
-                *debug-name-sharp*
-                (make-debug-name-marker)))
-          ((eq marker *debug-name-ellipsis*)
-           `(if (boundp '*debug-name-ellipsis*)
-                *debug-name-ellipsis*
-                (make-debug-name-marker)))
-          (t
-           (warn "Dumping unknown debug-name marker.")
-           '(make-debug-name-marker)))))
+(defmethod make-load-form ((marker debug-name-marker) &optional env)
+  (declare (ignore env))
+  (cond ((eq marker *debug-name-sharp*)
+         `(if (boundp '*debug-name-sharp*)
+              *debug-name-sharp*
+              (make-debug-name-marker)))
+        ((eq marker *debug-name-ellipsis*)
+         `(if (boundp '*debug-name-ellipsis*)
+              *debug-name-ellipsis*
+              (make-debug-name-marker)))
+        (t
+         (warn "Dumping unknown debug-name marker.")
+         '(make-debug-name-marker))))
 
 (defun print-debug-name-marker (marker stream level)
   (declare (ignore level))
@@ -294,3 +301,15 @@ the stack without triggering overflow protection.")
 ;;; Set this to NIL to inhibit assembly-level optimization. (For
 ;;; compiler debugging, rather than policy control.)
 (defvar *assembly-optimize* t)
+
+(in-package "SB!ALIEN")
+
+;;; Information describing a heap-allocated alien.
+(def!struct (heap-alien-info)
+  ;; The type of this alien.
+  (type (missing-arg) :type alien-type)
+  ;; Its name.
+  (alien-name (missing-arg) :type simple-string)
+  ;; Data or code?
+  (datap (missing-arg) :type boolean))
+(!set-load-form-method heap-alien-info (:xc :target))

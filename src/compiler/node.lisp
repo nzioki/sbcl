@@ -34,9 +34,7 @@
 ;;; that works only for compiling the compiler.
 
 ;;; "Lead-in" Control TRANsfer [to some node]
-(def!struct (ctran
-             (:make-load-form-fun ignore-it)
-             (:constructor make-ctran))
+(def!struct (ctran (:constructor make-ctran))
   ;; an indication of the way that this continuation is currently used
   ;;
   ;; :UNUSED
@@ -64,15 +62,13 @@
   ;; :UNUSED continuations.
   (block nil :type (or cblock null)))
 
-(def!method print-object ((x ctran) stream)
+(defmethod print-object ((x ctran) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream "~D" (cont-num x))))
 
 ;;; Linear VARiable. Multiple-value (possibly of unknown number)
 ;;; temporal storage.
-(def!struct (lvar
-             (:make-load-form-fun ignore-it)
-             (:constructor make-lvar (&optional dest)))
+(def!struct (lvar (:constructor make-lvar (&optional dest)))
   ;; The node which receives this value. NIL only temporarily.
   (dest nil :type (or node null))
   ;; cached type of this lvar's value. If NIL, then this must be
@@ -93,8 +89,9 @@
   (dynamic-extent nil :type (or null cleanup))
   ;; something or other that the back end annotates this lvar with
   (info nil))
+(!set-load-form-method lvar (:xc :target) :ignore-it)
 
-(def!method print-object ((x lvar) stream)
+(defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream "~D" (cont-num x))))
 
@@ -317,7 +314,6 @@
   ;; in copy propagation: list of killed TNs
   (kill nil)
   ;; other sets used in constraint propagation and/or copy propagation
-  (gen nil)
   (in nil)
   (out nil)
   ;; Set of all blocks that dominate this block. NIL is interpreted
@@ -346,7 +342,7 @@
   ;; Cache the physenv of a block during lifetime analysis. :NONE if
   ;; no cached value has been stored yet.
   (physenv-cache :none :type (or null physenv (member :none))))
-(def!method print-object ((cblock cblock) stream)
+(defmethod print-object ((cblock cblock) stream)
   (print-unreadable-object (cblock stream :type t :identity t)
     (format stream "~W :START c~W"
             (block-number cblock)
@@ -635,9 +631,9 @@
              (:constructor make-nlx-info (cleanup
                                           exit
                                           &aux
-                                          (block (first (block-succ
-                                                         (node-block exit))))))
-             (:make-load-form-fun ignore-it))
+                                          (block
+                                           (first (block-succ
+                                                   (node-block exit)))))))
   ;; the cleanup associated with this exit. In a catch or
   ;; unwind-protect, this is the :CATCH or :UNWIND-PROTECT cleanup,
   ;; and not the cleanup for the escape block. The CLEANUP-KIND of
@@ -665,6 +661,7 @@
   (safe-p nil :type boolean)
   ;; some kind of info used by the back end
   info)
+(!set-load-form-method nlx-info (:xc :target) :ignore-it)
 (defprinter (nlx-info :identity t)
   block
   target
@@ -676,8 +673,7 @@
 ;;; structures. A reference to a LEAF is indicated by a REF node. This
 ;;; allows us to easily substitute one for the other without actually
 ;;; hacking the flow graph.
-(def!struct (leaf (:make-load-form-fun ignore-it)
-                  (:include sset-element (number (incf *compiler-sset-counter*)))
+(def!struct (leaf (:include sset-element (number (incf *compiler-sset-counter*)))
                   (:constructor nil))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
@@ -728,6 +724,7 @@
   (extent nil :type (member nil :maybe-dynamic :always-dynamic :indefinite))
   ;; some kind of info used by the back end
   (info nil))
+(!set-load-form-method leaf (:xc :target) :ignore-it)
 
 (defun leaf-dynamic-extent (leaf)
   (let ((extent (leaf-extent leaf)))

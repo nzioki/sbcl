@@ -74,11 +74,13 @@
   (:generator 22
     (inst add block cfp-tn (add-sub-immediate (* (tn-offset tn) n-word-bytes)))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    #.(assert (and (= unwind-block-uwp-slot 0)
+                   (= unwind-block-cfp-slot 1)))
+    (inst stp temp cfp-tn (@ block))
     (inst compute-lra temp lip entry-label)
-    (storew temp block catch-block-entry-pc-slot)))
+    #.(assert (and (= unwind-block-code-slot 2)
+                   (= unwind-block-entry-pc-slot 3)))
+    (inst stp code-tn temp (@ block (* n-word-bytes 2)))))
 
 ;;; Like Make-Unwind-Block, except that we also store in the specified tag, and
 ;;; link the block into the Current-Catch list.
@@ -93,15 +95,17 @@
   (:generator 44
     (inst add result cfp-tn (add-sub-immediate (* (tn-offset tn) n-word-bytes)))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    #.(assert (and (= catch-block-uwp-slot 0)
+                   (= catch-block-cfp-slot 1)))
+    (inst stp temp cfp-tn (@ result))
+    #.(assert (and (= catch-block-code-slot 2)
+                   (= catch-block-entry-pc-slot 3)))
     (inst compute-lra temp lip entry-label)
-    (storew temp result catch-block-entry-pc-slot)
-
-    (storew tag result catch-block-tag-slot)
+    (inst stp code-tn temp (@ result (* n-word-bytes 2)))
+    #.(assert (and (= catch-block-tag-slot 4)
+                   (= catch-block-previous-catch-slot 5)))
     (load-tl-symbol-value temp *current-catch-block*)
-    (storew temp result catch-block-previous-catch-slot)
+    (inst stp tag temp (@ result (* n-word-bytes 4)))
     (store-tl-symbol-value result *current-catch-block*)
 
     (move block result)))
@@ -130,7 +134,7 @@
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-tl-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-tl-symbol-value block *current-unwind-protect-block*)))
 
 ;;;; NLX entry VOPs:
@@ -258,10 +262,10 @@
       ;; Set up magic catch / UWP block.
 
       (loadw temp uwp sap-pointer-slot other-pointer-lowtag)
-      (storew temp block unwind-block-current-uwp-slot)
+      (storew temp block unwind-block-uwp-slot)
       (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
-      (storew temp block unwind-block-current-cont-slot)
-      ;; Don't need to save code at unwind-block-current-code-slot since
+      (storew temp block unwind-block-cfp-slot)
+      ;; Don't need to save code at unwind-block-code-slot since
       ;; it's not going to be used and will be overwritten after the
       ;; function call
 

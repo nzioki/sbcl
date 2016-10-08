@@ -121,7 +121,8 @@
 
 (defknown lowtag-of (t) (unsigned-byte #.sb!vm:n-lowtag-bits)
   (flushable movable))
-(defknown widetag-of (t) (unsigned-byte #.sb!vm:n-widetag-bits)
+(defknown (widetag-of %other-pointer-widetag) (t)
+  (unsigned-byte #.sb!vm:n-widetag-bits)
   (flushable movable))
 
 ;; FIXME: Sure looks like 24 should be (- n-word-bytes n-widetag-bits).
@@ -135,8 +136,13 @@
   (flushable))
 (defknown %set-array-dimension (t index index) index
   ())
-(defknown %array-rank (t) index
+(defknown %array-rank (t) array-rank
   (flushable))
+
+(defknown sb!kernel::check-array-shape (simple-array list)
+  (simple-array)
+  (flushable)
+  :result-arg 0)
 
 (defknown %make-instance (index) instance
   (flushable))
@@ -152,38 +158,33 @@
 (defknown %instance-ref (instance index) t
   (flushable always-translatable))
 (defknown %instance-set (instance index t) t
-  (always-translatable))
+  (always-translatable)
+  :derive-type #'result-type-last-arg)
 (defknown %layout-invalid-error (t layout) nil)
 
 #!+(or x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb!vm:word sb!vm:word)
   sb!vm:word ())
-(defknown %raw-instance-ref/word (instance index) sb!vm:word
-  (flushable always-translatable))
-(defknown %raw-instance-set/word (instance index sb!vm:word) sb!vm:word
-  (always-translatable))
-(defknown %raw-instance-ref/single (instance index) single-float
-  (flushable always-translatable))
-(defknown %raw-instance-set/single (instance index single-float) single-float
-  (always-translatable))
-(defknown %raw-instance-ref/double (instance index) double-float
-  (flushable always-translatable))
-(defknown %raw-instance-set/double (instance index double-float) double-float
-  (always-translatable))
-(defknown %raw-instance-ref/complex-single (instance index)
-  (complex single-float)
-  (flushable always-translatable))
-(defknown %raw-instance-set/complex-single
-    (instance index (complex single-float))
-  (complex single-float)
-  (always-translatable))
-(defknown %raw-instance-ref/complex-double (instance index)
-  (complex double-float)
-  (flushable always-translatable))
-(defknown %raw-instance-set/complex-double
-    (instance index (complex double-float))
-  (complex double-float)
-  (always-translatable))
+#.`(progn
+     ,@(map 'list
+            (lambda (rsd)
+              (let* ((reader (sb!kernel::raw-slot-data-accessor-name rsd))
+                     (name (copy-seq (string reader)))
+                     (writer (intern (replace name "-SET/"
+                                              :start1 (search "-REF/" name))))
+                     (type (sb!kernel::raw-slot-data-raw-type rsd)))
+                `(progn
+                   (defknown ,reader (instance index) ,type
+                     (flushable always-translatable))
+                   (defknown ,writer (instance index ,type) ,type
+                     (always-translatable) :derive-type #'result-type-last-arg)
+                   ;; Interpreter stubs, harmless but unnecessary on host
+                   #-sb-xc-host
+                   (progn (defun ,reader (instance index)
+                            (,reader instance index))
+                          (defun ,writer (instance index new-value)
+                            (,writer instance index new-value))))))
+            sb!kernel::*raw-slot-data*))
 
 #!+compare-and-swap-vops
 (defknown %raw-instance-atomic-incf/word (instance index sb!vm:word) sb!vm:word
@@ -218,6 +219,7 @@
 (defknown make-array-header ((unsigned-byte 8) (unsigned-byte 24)) array
   (flushable movable))
 
+(defknown make-array-header* (&rest t) array (flushable movable))
 
 (defknown make-weak-pointer (t) weak-pointer
   (flushable))
@@ -412,7 +414,10 @@
 (defknown code-header-ref (t index) t (flushable))
 (defknown code-header-set (t index t) t ())
 
-(defknown fun-subtype (function) (unsigned-byte #.sb!vm:n-widetag-bits)
+(defknown fun-subtype (function)
+  (member #.sb!vm:simple-fun-header-widetag
+          #.sb!vm:closure-header-widetag
+          #.sb!vm:funcallable-instance-header-widetag)
   (flushable))
 (defknown ((setf fun-subtype))
           ((unsigned-byte #.sb!vm:n-widetag-bits) function)
@@ -431,6 +436,7 @@
   (flushable))
 (defknown (setf %simple-fun-self) (function function) function
   ())
+(defknown %simple-fun-type (function) t (flushable))
 
 (defknown %closure-fun (function) function
   (flushable))
@@ -438,11 +444,17 @@
 (defknown %closure-index-ref (function index) t
   (flushable))
 
+(defknown %fun-fun (function) function (flushable recursive))
+
 (defknown %make-funcallable-instance (index) function
   ())
 
 (defknown %funcallable-instance-info (function index) t (flushable))
 (defknown %set-funcallable-instance-info (function index t) t ())
+
+#!+sb-fasteval
+(defknown sb!interpreter:fun-proto-fn (sb!interpreter:interpreted-function)
+  sb!interpreter::interpreted-fun-prototype (flushable))
 
 
 (defknown %data-vector-and-index (array index)

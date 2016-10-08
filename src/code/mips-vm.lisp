@@ -22,6 +22,8 @@
   (without-gcing
    (let ((sap (%primitive sb!c::code-instructions code)))
      (ecase kind
+       (:absolute
+        (setf (sap-ref-32 sap offset) fixup))
        (:jump
         (aver (zerop (ash value -28)))
         (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
@@ -105,25 +107,16 @@
     unsigned-int
   (context (* os-context-t) :in))
 
-;;;; Internal-error-arguments.
-
-;;; INTERNAL-ERROR-ARGUMENTS -- interface.
-;;;
-;;; Given the sigcontext, extract the internal error arguments from the
-;;; instruction stream.  This is e.g.
-;;; 4       23      254     206     1       0       0       0
-;;; |       ~~~~~~~~~~~~~~~~~~~~~~~~~
-;;; length         data              (everything is an octet)
-;;; (pc + 4)
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
   (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
   (/hexstr context)
-  (let ((pc (context-pc context))
-        (cause (context-bd-cause-int context)))
+  (let* ((pc (context-pc context))
+         (cause (context-bd-cause-int context))
+         ;; KLUDGE: This exposure of the branch delay mechanism hurts.
+         (offset (if (logbitp 31 cause) 8 4))
+         (error-number (sap-ref-8 pc offset)))
     (declare (type system-area-pointer pc))
-    (multiple-value-bind (error-number length sc-offsets)
-        ;; KLUDGE: This exposure of the branch delay mechanism hurts.
-        (snarf-error-junk pc (if (logbitp 31 cause) 8 4))
-      (declare (ignore length))
-      (values error-number sc-offsets))))
+    (values error-number
+            (sb!kernel::decode-internal-error-args (sap+ pc (1+ offset))
+                                                   error-number))))

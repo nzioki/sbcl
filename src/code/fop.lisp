@@ -8,14 +8,14 @@
 ;;; to elide bounds checking.
 (defmacro with-fop-stack (((stack-var &optional stack-expr) ptr-var count)
                           &body body)
-  `(let* (,@(when stack-expr
-              (list `(,stack-var (the simple-vector ,stack-expr))))
-          (,ptr-var (truly-the index (fop-stack-pop-n ,stack-var ,count))))
-     (macrolet ((fop-stack-ref (i)
-                  `(locally
-                       #-sb-xc-host
-                       (declare (optimize (sb!c::insert-array-bounds-checks 0)))
-                     (svref ,',stack-var (truly-the index ,i)))))
+  `(macrolet ((fop-stack-ref (i)
+                `(locally
+                     #-sb-xc-host
+                     (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                   (svref ,',stack-var (truly-the index ,i)))))
+     (let* (,@(when stack-expr
+                (list `(,stack-var (the simple-vector ,stack-expr))))
+            (,ptr-var (truly-the index (fop-stack-pop-n ,stack-var ,count))))
        ,@body)))
 
 ;;; Define NAME as a fasl operation, with op-code FOP-CODE.
@@ -160,39 +160,26 @@
 
 ;; %MAKE-INSTANCE does not exist on the host.
 (!define-fop 48 :not-host (fop-struct ((:operands size) layout))
-  (let* ((res (%make-instance size)) ; number of words excluding header
-         ;; Compute count of elements to pop from stack, sans layout.
-         ;; If instance-data-start is 0, then size is the count,
-         ;; otherwise subtract 1 because the layout consumes a slot.
-         (n-data-words (- size sb!vm:instance-data-start)))
-    (declare (type index size))
+  (let ((res (%make-instance size)) ; number of words excluding header
+        ;; Discount the layout from number of user-visible words.
+        (n-data-words (- size sb!vm:instance-data-start)))
+    (setf (%instance-layout res) layout)
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
-      (let ((ptr (+ ptr n-data-words)))
-        (declare (type index ptr))
-        (setf (%instance-layout res) layout)
-        #!-interleaved-raw-slots
-        (let* ((nuntagged (layout-n-untagged-slots layout))
-               (ntagged (- size nuntagged)))
-          (dotimes (n (1- ntagged))
-            (declare (type index n))
-            (setf (%instance-ref res (1+ n)) (fop-stack-ref (decf ptr))))
-          (dotimes (n nuntagged)
-            (declare (type index n))
-            (setf (%raw-instance-ref/word res (- nuntagged n 1))
-                  (fop-stack-ref (decf ptr)))))
-        #!+interleaved-raw-slots
-        (let ((metadata (layout-untagged-bitmap layout)))
-          (do ((i sb!vm:instance-data-start (1+ i)))
-              ((>= i size))
-            (declare (type index i))
-            (let ((val (fop-stack-ref (decf ptr))))
-              (if (logbitp i metadata)
-                  (setf (%raw-instance-ref/word res i) val)
-                  (setf (%instance-ref res i) val)))))))
+      (declare (type index ptr))
+      (let ((bitmap (layout-bitmap layout)))
+        ;; Values on the stack are in the same order as in the structure itself.
+        (do ((i sb!vm:instance-data-start (1+ i)))
+            ((>= i size))
+          (declare (type index i))
+          (let ((val (fop-stack-ref ptr)))
+            (if (logbitp i bitmap)
+                (setf (%instance-ref res i) val)
+                (setf (%raw-instance-ref/word res i) val))
+            (incf ptr)))))
     res))
 
-(!define-fop 45 (fop-layout (name inherits depthoid length metadata))
-  (find-and-init-or-check-layout name length inherits depthoid metadata))
+(!define-fop 45 (fop-layout (name inherits depthoid length bitmap))
+  (find-and-init-or-check-layout name length inherits depthoid bitmap))
 
 ;; Allocate a CLOS object. This is used when the compiler detects that
 ;; MAKE-LOAD-FORM returned a simple use of MAKE-LOAD-FORM-SAVING-SLOTS,
@@ -206,18 +193,17 @@
 ;; This wants a 'count' as the first item in the SLOT-NAMES argument
 ;; rather than using read-arg because many calls of this might share
 ;; the list, which must be constructed into the fop-table no matter what.
-(!define-fop 69 :not-host (fop-initialize-instance (slot-names obj) nil)
+(!define-fop 69 :not-host (fop-set-slot-values (slot-names obj) nil)
   (let* ((n-slots (pop slot-names))
          (stack (operand-stack))
          (ptr (fop-stack-pop-n stack n-slots)))
       (dotimes (i n-slots)
         (let ((val (svref stack (+ ptr i)))
               (slot-name (pop slot-names)))
-          (if (eq val 'sb!pcl::..slot-unbound..)
+          (if (eq val sb!pcl:+slot-unbound+)
               ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
               (slot-makunbound obj slot-name)
-              ;; FIXME: the DEFSETF for this isn't defined until warm load
-              (sb!pcl::set-slot-value obj slot-name val))))))
+              (setf (slot-value obj slot-name) val))))))
 
 (!define-fop 64 (fop-end-group () nil)
   (/show0 "THROWing FASL-GROUP-END")
@@ -241,54 +227,57 @@
   (error nil :read-only t))
 (declaim (freeze-type undefined-package))
 
-;; cold loader has its own implementation of this and all symbol fops.
-#-sb-xc-host
-(defun aux-fop-intern (size package fasl-input)
-  (declare (optimize speed))
-  (let ((input-stream (%fasl-input-stream fasl-input))
-        (buffer (make-string size)))
-    #!+sb-unicode (read-string-as-unsigned-byte-32 input-stream buffer size)
-    #!-sb-unicode (read-string-as-bytes input-stream buffer size)
-    (if (undefined-package-p package)
-        (error 'simple-package-error
-               :format-control "Error finding package for symbol ~s:~% ~a"
-               :format-arguments
-               (list (subseq buffer 0 size)
-                     (undefined-package-error package)))
-        (push-fop-table (without-package-locks
-                          (%intern buffer size package nil))
-                        fasl-input))))
+;; Cold load has its own implementation of all symbol fops,
+;; but we have to execute define-fop now to assign their numbers.
+(labels #+sb-xc-host ()
+        #-sb-xc-host
+        ((read-symbol-name (length+flag fasl-input)
+           (let* ((namelen (ash (the fixnum length+flag) -1))
+                  (base-p (logand length+flag 1))
+                  (elt-type (if (eql base-p 1) 'base-char 'character))
+                  (buffer (%fasl-input-name-buffer fasl-input))
+                  (string (the string (svref buffer base-p))))
+             (when (< (length string) namelen) ; grow
+               (setf string (make-string namelen :element-type elt-type)
+                     (svref buffer base-p) string))
+             (funcall (if (eql base-p 1)
+                          'read-base-string-as-bytes
+                          'read-string-as-unsigned-byte-32)
+                      (%fasl-input-stream fasl-input) string namelen)
+             (values string namelen elt-type)))
+         (aux-fop-intern (length+flag package fasl-input)
+           (multiple-value-bind (name length elt-type)
+               (read-symbol-name length+flag fasl-input)
+             (if (undefined-package-p package)
+                 (error 'simple-package-error
+                        :format-control "Error finding package for symbol ~s:~% ~a"
+                        :format-arguments
+                        (list (subseq name 0 length)
+                              (undefined-package-error package)))
+                 (push-fop-table (without-package-locks
+                                  (%intern name length package elt-type))
+                                 fasl-input))))
+         ;; Symbol-hash is usually computed lazily and memoized into a symbol.
+         ;; Laziness slightly improves the speed of allocation.
+         ;; But when loading fasls, the time spent in the loader totally swamps
+         ;; any time savings of not precomputing symbol-hash.
+         ;; INTERN hashes everything anyway, so let's be consistent
+         ;; and precompute the hashes of uninterned symbols too.
+         (ensure-hashed (symbol)
+           (ensure-symbol-hash symbol)
+           symbol))
 
-(!define-fop 80 :not-host (fop-lisp-symbol-save ((:operands namelen)))
-  (aux-fop-intern namelen *cl-package* (fasl-input)))
-(!define-fop 84 :not-host (fop-keyword-symbol-save ((:operands namelen)))
-  (aux-fop-intern namelen *keyword-package* (fasl-input)))
+  #-sb-xc-host (declare (inline ensure-hashed))
+  (!define-fop 80 :not-host (fop-lisp-symbol-save ((:operands length+flag)))
+    (aux-fop-intern length+flag *cl-package* (fasl-input)))
+  (!define-fop 84 :not-host (fop-keyword-symbol-save ((:operands length+flag)))
+    (aux-fop-intern length+flag *keyword-package* (fasl-input)))
+  (!define-fop #xF0 :not-host (fop-symbol-in-package-save ((:operands pkg-index length+flag)))
+    (aux-fop-intern length+flag (ref-fop-table (fasl-input) pkg-index) (fasl-input)))
 
-;; But srsly? Most of the space is wasted by UCS4 encoding of ASCII.
-;; An extra word per symbol for the package is nothing by comparison.
-  ;; FIXME: Because we don't have FOP-SYMBOL-SAVE any more, an
-  ;; enormous number of symbols will fall through to this case,
-  ;; probably resulting in bloated fasl files. A new
-  ;; FOP-SYMBOL-IN-LAST-PACKAGE-SAVE/FOP-SMALL-SYMBOL-IN-LAST-PACKAGE-SAVE
-  ;; cloned fop pair could undo some of this bloat.
-(!define-fop #xF0 :not-host (fop-symbol-in-package-save ((:operands pkg-index namelen)))
-  (aux-fop-intern namelen (ref-fop-table (fasl-input) pkg-index) (fasl-input)))
-
-;;; Symbol-hash is usually computed lazily and memoized into a symbol.
-;;; Laziness slightly improves the speed of allocation.
-;;; But when loading fasls, the time spent in the loader totally swamps
-;;; any time savings of not precomputing symbol-hash.
-;;; INTERN hashes everything anyway, so let's be consistent
-;;; and precompute the hashes of uninterned symbols too.
-(macrolet ((ensure-hashed (symbol-form)
-             `(let ((symbol ,symbol-form))
-                (ensure-symbol-hash symbol)
-                symbol)))
-  (!define-fop 96 :not-host (fop-uninterned-symbol-save ((:operands namelen)))
-    (let ((res (make-string namelen)))
-      #!-sb-unicode (read-string-as-bytes (fasl-input-stream) res)
-      #!+sb-unicode (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
-      (push-fop-table (ensure-hashed (make-symbol res))
+  (!define-fop 96 :not-host (fop-uninterned-symbol-save ((:operands length+flag)))
+    (multiple-value-bind (name len) (read-symbol-name length+flag (fasl-input))
+      (push-fop-table (ensure-hashed (make-symbol (subseq name 0 len)))
                       (fasl-input))))
 
   (!define-fop 104 :not-host (fop-copy-symbol-save ((:operands table-index)))
@@ -531,10 +520,11 @@
          (obj (ref-fop-table (fasl-input) obi))
          (idx (read-word-arg (fasl-input-stream))))
     (if (%instancep obj) ; suspicious. should have been FOP-STRUCTSET
-        (setf (%instance-ref obj idx) val)
+        #+sb-xc (setf (%instance-ref obj idx) val)
+        #-sb-xc (bug "%instance-set?")
         (setf (svref obj idx) val))))
 
-(!define-fop 204 (fop-structset (val) nil)
+(!define-fop 204 :not-host (fop-structset (val) nil)
   (setf (%instance-ref (ref-fop-table (fasl-input)
                                       (read-word-arg (fasl-input-stream)))
                        (read-word-arg (fasl-input-stream)))
@@ -556,7 +546,8 @@
 
 ;; Cold-load calls COLD-LOAD-CODE instead
 (!define-fop #xE0 :not-host (fop-code ((:operands n-boxed-words n-unboxed-bytes)))
-  (with-fop-stack ((stack (operand-stack)) ptr (1+ n-boxed-words))
+  ;; add 1 word for the toplevel-p flag and one for the debug-info
+  (with-fop-stack ((stack (operand-stack)) ptr (+ n-boxed-words 2))
     (load-code n-boxed-words n-unboxed-bytes stack ptr (fasl-input-stream))))
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
@@ -723,7 +714,6 @@ a bug.~@:>")
                           specs))))
   (frob (#x6c t)
         (#x6d structure-object)
-        (#x6e structure!object)
         (#x6f definition-source-location)
         (#x70 sb!c::debug-fun)
         (#x71 sb!c::compiled-debug-fun)

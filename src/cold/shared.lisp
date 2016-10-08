@@ -23,8 +23,38 @@
 
 (in-package "SB-COLD")
 
+(defun parse-make-host-parallelism (str)
+  (multiple-value-bind (value1 end) (parse-integer str :junk-allowed t)
+    (when value1
+      (let ((value2 (if (and value1
+                             (< end (1- (length str))) ; ~ /,[\d]+/
+                             (eql (char str end) #\,))
+                        (parse-integer str :start (1+ end)))))
+        ;; If only 1 integer, assume same parallelism for both passes.
+        (unless value2
+          (setq value2 value1))
+        ;; 0 means no parallelism. 1 means use at most one subjob,
+        ;; just in case you want to test the controlling loop.
+        (when (eql value1 0) (setq value1 nil))
+        (when (eql value2 0) (setq value2 nil))
+        ;; Parallelism on pass 1 works only if LOAD does not compile.
+        ;; Otherwise it's slower than compiling serially.
+        ;; (And this has only been tested with sb-fasteval, not sb-eval.)
+        (cons (and (find-package "SB-INTERPRETER") value1)
+              value2)))))
+
+(defvar *make-host-parallelism*
+  (or #+sbcl
+      (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
+        (when envvar
+          (parse-make-host-parallelism envvar)))))
+
+(defun make-host-1-parallelism () (car *make-host-parallelism*))
+(defun make-host-2-parallelism () (cdr *make-host-parallelism*))
+
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
+;;; This is part of the implementation of parallelized make-host-2.
 (defvar *compile-for-effect-only* nil)
 
 ;;; prefixes for filename stems when cross-compiling. These are quite arbitrary
@@ -224,6 +254,11 @@
     ;; SBCL. ("not target code" -- but still presumably host code,
     ;; used to support the cross-compilation process)
     :not-target
+    ;; meaning: This file must always be compiled by 'slam.lisp' even if
+    ;; the object is not out of date with respect to its source.
+    ;; Necessary if there are compile-time-too effects that are not
+    ;; reflected into make-host-2 by load-time actions of make-host-1.
+    :slam-forcibly
     ;; meaning: The #'COMPILE-STEM argument :TRACE-FILE should be T.
     ;; When the compiler is SBCL's COMPILE-FILE or something like it,
     ;; compiling "foo.lisp" will generate "foo.trace" which contains lots
@@ -242,7 +277,10 @@
     ;; never figured out but which were apparently acceptable in CMU
     ;; CL. Eventually, it would be great to just get rid of all
     ;; warnings and remove support for this flag. -- WHN 19990323)
-    :ignore-failure-p))
+    :ignore-failure-p
+    ;; meaning: Build this file, but don't put it on the list for
+    ;; genesis to include in the cold core.
+    :not-genesis))
 
 (defparameter *stems-and-flags* (read-from-file "build-order.lisp-expr"))
 
@@ -339,7 +377,11 @@
          ;; -- WHN 19990815
          (src (stem-source-path stem))
          (obj (stem-object-path stem flags mode))
-         (tmp-obj (concatenate 'string obj "-tmp"))
+         ;; Compile-for-effect happens simultaneously with a forked compile,
+         ;; so we need the for-effect output not to stomp on the real output.
+         (tmp-obj
+          (concatenate 'string obj
+                       (if *compile-for-effect-only* "-scratch" "-tmp")))
 
          (compile-file (ecase mode
                          (:host-compile #'compile-file)
@@ -356,7 +398,7 @@
     ;; delete any preexisting object file in order to avoid confusing
     ;; ourselves later should we happen to bail out of compilation
     ;; with an error.
-    (when (probe-file obj)
+    (when (and (not *compile-for-effect-only*) (probe-file obj))
       (delete-file obj))
 
     ;; Original comment:
@@ -427,11 +469,10 @@
 
     ;; If we get to here, compilation succeeded, so it's OK to rename
     ;; the temporary output file to the permanent object file.
-    ;; ASSEMBLE-FILE produces no output in the preload pass.
-    ;; (The compiler produces an empty file.)
-    (if (and *compile-for-effect-only* (search "/assembly/" obj))
-        nil
-        (rename-file-a-la-unix tmp-obj obj))
+    (cond ((not *compile-for-effect-only*)
+           (rename-file-a-la-unix tmp-obj obj))
+          ((probe-file tmp-obj)
+           (delete-file tmp-obj))) ; clean up the trash
 
     ;; nice friendly traditional return value
     (pathname obj)))
@@ -455,15 +496,20 @@
 ;;; (if necessary) in the appropriate environment, then loading it
 ;;; into the cross-compilation host Common lisp.
 (defun host-cload-stem (stem flags)
-  (let ((compiled-filename (in-host-compilation-mode
-                            (lambda ()
-                              (compile-stem stem flags :host-compile)))))
-    (load compiled-filename)))
+  (loop
+   (with-simple-restart (recompile "Recompile")
+     (let ((compiled-filename (in-host-compilation-mode
+                               (lambda ()
+                                 (compile-stem stem flags :host-compile)))))
+       (return
+         (load compiled-filename))))))
 (compile 'host-cload-stem)
 
 ;;; like HOST-CLOAD-STEM, except that we don't bother to compile
 (defun host-load-stem (stem flags)
-  (load (stem-object-path stem flags :host-compile)))
+  (loop
+   (with-simple-restart (recompile "Reload")
+     (return (load (stem-object-path stem flags :host-compile))))))
 (compile 'host-load-stem)
 
 ;;;; tools to compile SBCL sources to create object files which will

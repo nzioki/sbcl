@@ -32,14 +32,14 @@
 ;;;    SC-Offset of primary location (as var-length integer)
 ;;;    [If has save SC, SC-OFFSET of save location (as var-length integer)]
 
-(def!constant compiled-debug-var-more-context-p         #b00000001)
-(def!constant compiled-debug-var-more-count-p           #b00000010)
-(def!constant compiled-debug-var-environment-live       #b00000100)
-(def!constant compiled-debug-var-save-loc-p             #b00001000)
-(def!constant compiled-debug-var-id-p                   #b00010000)
-(def!constant compiled-debug-var-minimal-p              #b00100000)
-(def!constant compiled-debug-var-deleted-p              #b01000000)
-(def!constant compiled-debug-var-indirect-p             #b10000000)
+(defconstant compiled-debug-var-more-context-p         #b00000001)
+(defconstant compiled-debug-var-more-count-p           #b00000010)
+(defconstant compiled-debug-var-environment-live       #b00000100)
+(defconstant compiled-debug-var-save-loc-p             #b00001000)
+(defconstant compiled-debug-var-id-p                   #b00010000)
+(defconstant compiled-debug-var-minimal-p              #b00100000)
+(defconstant compiled-debug-var-deleted-p              #b01000000)
+(defconstant compiled-debug-var-indirect-p             #b10000000)
 
 ;;;; compiled debug blocks
 ;;;;
@@ -246,11 +246,6 @@
   ;; the universal time that the source was written, or NIL if
   ;; unavailable
   (created nil :type (or unsigned-byte null))
-  ;; the source path root number of the first form read from this
-  ;; source (i.e. the total number of forms converted previously in
-  ;; this compilation).  (Note: this will always be 0 so long as the
-  ;; SOURCE-INFO structure has exactly one FILE-INFO.)
-  (source-root 0 :type index)
   ;; The FILE-POSITIONs of the truly top level forms read from this
   ;; file (if applicable). The vector element type will be chosen to
   ;; hold the largest element.
@@ -333,10 +328,6 @@
   (untruename nil :type (or pathname null))
   ;; the file's write date (if relevant)
   (write-date nil :type (or unsigned-byte null))
-  ;; the source path root number of the first form in this file (i.e.
-  ;; the total number of forms converted previously in this
-  ;; compilation)
-  (source-root 0 :type unsigned-byte)
   ;; parallel vectors containing the forms read out of the file and
   ;; the file positions that reading of each form started at (i.e. the
   ;; end of the previous form)

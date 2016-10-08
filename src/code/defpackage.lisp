@@ -27,9 +27,10 @@
     ;; is free to :USE (PACKAGE-USE-LIST :CL-USER) anyway.:-|
     nil))
 
-;; "mundanely" because this macro can't work (never has, never will)
-;; until the target system is fully operational.
-(defmacro-mundanely defpackage (package &rest options)
+;; this macro can't work (never has, never will) until the target system
+;; is fully operational, so push it down to non-toplevel.
+(let ()
+(defmacro defpackage (package &rest options)
   #!+sb-doc
   #.(format nil
   "Defines a new package called PACKAGE. Each of OPTIONS should be one of the
@@ -72,7 +73,10 @@
                :format-arguments (list option)))
       (case (car option)
         (:nicknames
-         (setf nicknames (stringify-package-designators (cdr option))))
+         (setf nicknames
+               (append
+                nicknames
+                (stringify-package-designators (cdr option)))))
         (:local-nicknames
          (setf local-nicknames
                (append local-nicknames
@@ -158,6 +162,7 @@
                     ',lock (sb!c:source-location)
                     ,@(and doc
                            `(,doc))))))
+)
 
 (defun check-disjoint (&rest args)
   ;; An arg is (:key . set)
@@ -248,6 +253,10 @@
   (export (mapcar (lambda (symbol-name) (intern symbol-name package))
                   exports)
           package)
+  ;; 5. :local-nicknames
+  (setf (package-%local-nicknames package) nil) ; throw out the old ones.
+  (loop :for (nickname . nickname-package) :in local-nicknames :do
+     (add-package-local-nickname nickname nickname-package package))
   ;; Everything was created: update metadata
   (when source-location
     (setf (package-source-location package) source-location))
@@ -259,10 +268,6 @@
       (add-implementation-package package p))
     ;; Handle lock
     (setf (package-lock package) lock))
-  ;; Local nicknames. Throw out the old ones.
-  (setf (package-%local-nicknames package) nil)
-  (dolist (spec local-nicknames)
-    (add-package-local-nickname (car spec) (cdr spec) package))
   package)
 
 (declaim (type list *on-package-variance*))

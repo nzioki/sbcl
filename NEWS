@@ -1,6 +1,123 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
-changes relative to sbcl-1.3.1
+changes relative to sbcl-1.3.10:
+  * enhancement: TRACE ... :REPORT {TRACE,NIL} now work as advertised in the
+    documentation string (based on patch by Patrick Stein)
+  * enhancement: support unboxed signed-word structure slots on x86, x86-64
+    and ARM64. (lp#377616)
+  * optimization: faster logical bit-array operations on multidimensional
+    arrays.
+  * optimization: better GC performance in the presence of many threads.
+    (patch by Ilya Perminov, lp#1339924)
+  * bug fix: MAKE-ALIEN-STRING returns the number of allocated bytes as a
+    second value as advertised (reported by Johann 'Myrkraverk' Oskarsson)
+  * bug fix: when TO-READTABLE is supplied to COPY-READTABLE, it will
+    contain only the macros in FROM-READTABLE and no others. (lp#1631506)
+
+changes in sbcl-1.3.10 relative to sbcl-1.3.9:
+  * enhancement: more compact low-level error signaling code
+  * enhancement: more compact encoding of cross-reference information
+  * optimization: faster out of line fixnum-float comparisons.
+  * optimization: filling a known simple-vector with a constant value
+    is about as fast in unoptimized code as in code compiled with (SPEED 3),
+    and the x86-64 implementation is able to use SSE instructions.
+  * bug fix: correctly handle the case of a non-local exit within a function
+    terminating the extent of dynamic-extent functions and variables in the
+    presence of multiple-values (lp#1563127)
+  * bug fix: restore builds on the latest OSX with the latest Xcode
+    (lp#1470996)
+
+changes in sbcl-1.3.9 relative to sbcl-1.3.8:
+  * minor incompatible change: NAMESTRING prefers to return a BASE-STRING
+    instead of (ARRAY CHARACTER (*)) when possible.
+  * enhancement: cached make-instance/allocate-instance constructors can now
+    get garbage collected.
+  * optimization: better performance for some unoptimized operations on
+    complex numbers.
+  * bug fix: using the options :LOCAL-NICKNAMES and :LOCK in the same
+    DEFPACKAGE form no longer signals a bogus error
+
+changes in sbcl-1.3.8 relative to sbcl-1.3.7:
+  * minor incompatible change: the system now understands that the CONDITION
+    type is disjoint with many other system types.
+  * minor incompatible change: argument types in condition report functions
+    are now declared (in combination with the above change, this can result in
+    early detection of erroneous code).
+  * enhancement: simple arrays of any rank can be stack-allocated
+    on platforms supporting stack allocation of vectors.
+  * optimization: improved type derivation for FIND, POSITION, COUNT, SEARCH,
+    MISMATCH and other array and sequence functions.
+  * optimization: ALLOCATE-INSTANCE is now as fast as MAKE-INSTANCE.
+  * optimization: more efficient CHANGE-CLASS.
+  * bug fix: versions of getresuid() and getresgid() in SB-POSIX no longer
+    cause memory faults, and should work properly (lp#1603806, reported by
+    Kieran Grant)
+  * bug fix: handle ENOENT from getprotobyname() (lp#1596043, reported by
+    Stephen Hassard)
+
+changes in sbcl-1.3.7 relative to sbcl-1.3.6:
+  * bug fix: preserve the name of the destructive function for the destroyed
+    constant and important result warnings, even when declared NOTINLINE.
+  * optimization: faster operations on list-sets.
+  * optimization: better type derivation of set functions.
+    (lp#1592152)
+  * optimization: load-time TLS-INDEX assignment, and other
+    microoptimizations, on x86.
+  * optimizations in:
+    ** APPEND;
+    ** ECASE/ETYPECASE;
+    ** ARRAY-DIMENSIONS;
+    ** ARRAY-TOTAL-SIZE;
+    ** REMOVE, REMOVE-DUPLICATES, DELETE and DELETE-DUPLICATES on lists.
+
+changes in sbcl-1.3.6 relative to sbcl-1.3.5:
+  * bug fix: do not insert conditional newlines in print-unreadable-object
+    (lp#1398290). This reverses a change made in lp#488979 which reversed
+    a fix advertised in release 0.8.14 to pass the GCL ANSI Test Suite.
+  * bug fix: constant negative rotations of 32-bit quantities are compiled
+    correctly on x86-64 and arm.  (lp#1586614, reported by Guillaume Le
+    Vaillant)
+
+changes in sbcl-1.3.5 relative to sbcl-1.3.4:
+  * enhancement: the platform's strtod() is exposed as SB-POSIX:STRTOD
+  * enhancement: speed up debug info creation for highly nested functions.
+    (lp#1563355)
+  * enhancement: the interleaved structure slot optimization from
+    release 1.2.6 has been ported to all architectures.
+  * enhancement: support run-program I/O redirection into lisp streams on
+    Windows.
+  * bug fix: better wording in missed optimization note. (lp#1003265)
+  * bug fix: interpreted (CAS SVREF) was broken
+  * bug fix: support CLISP as build host for ARM (lp#1568256, thanks to Tomas
+    Hlavaty)
+
+changes in sbcl-1.3.4 relative to sbcl-1.3.3:
+  * enhancement: who-sets and who-references work on DEFGLOBAL. (lp#1552997)
+  * enhancement: CONSTANTP understands backquote.
+    e.g. (CONSTANTP '`(0 (,CHAR-CODE-LIMIT))) => T
+  * optimization: improvements to sequence functions: CONCATENATE, SUBSTITUTE,
+    REVERSE.
+  * bug fix: SB-EVAL does not signal an error for (THE KEYWORD :FOO)
+  * bug fix: a DEFTYPE name that is redefined into a DEFSTRUCT name
+    is less likely to cause confusion in the compiler.
+  * bug fix: DOCUMENTATION works as intended for classes with non-standard
+    metaclasses
+  * bug fix: (TYPEP <extended-sequence> <extended-sequence-class>) no longer
+    returns NIL in certain situations
+  * bug fix: MAKE-SEQUENCE, MAP, CONCATENATE and MERGE accept class objects as
+    result-type
+  * bug fix: MAKE-SEQUENCE, MAP, CONCATENATE and MERGE expand DEFTYPEs in
+    result-type
+
+changes in sbcl-1.3.3 relative to sbcl-1.3.2:
+  * enhancement: warn about argument mismatch for functions passed as
+    arguments to other functions (e.g. REDUCE, MAP) at compile-time.
+  * optimization: functions accepting other functions (e.g. REDUCE, FIND) can
+    now be constant-folded if all function arguments are declared as foldable.
+  * optimization: improved logical operations on integers of unknown type.
+  * bug fix: exception handling no longer leaks memory on OS X. (lp#326238)
+
+changes in sbcl-1.3.2 relative to sbcl-1.3.1:
   * enhancement: {READ,WRITE}-SEQUENCE are much faster for some combinations
     of short sequences and stream types
   * enhancement: MAKE-LIST's result can be stack-allocated on x86-64
@@ -4112,7 +4229,7 @@ changes in sbcl-0.9.8 relative to sbcl-0.9.7:
   * fixed some bugs revealed by Paul Dietz' test suite:
     ** DOCUMENTATION returns NIL instead of "" for method combinations
        that don't have a docstring
-
+
 changes in sbcl-0.9.7 relative to sbcl-0.9.6:
   * minor incompatible change: (SETF CLASS-NAME) and (SETF
     GENERIC-FUNCTION-NAME) are no longer generic functions, and

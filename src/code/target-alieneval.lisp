@@ -119,108 +119,107 @@ This is SETFable."
   ;;        is allocated at load time, so the same piece of memory is used each time
   ;;        this form executes.
   (/show "entering WITH-ALIEN" bindings)
-  (with-auxiliary-alien-types env
-    (dolist (binding (reverse bindings))
-      (/show binding)
-      (destructuring-bind
-          (symbol type &optional opt1 (opt2 nil opt2p))
-          binding
-        (/show symbol type opt1 opt2)
-        (let* ((alien-type (parse-alien-type type env))
-               (datap (not (alien-fun-type-p alien-type))))
-          (/show alien-type)
-          (multiple-value-bind (allocation initial-value)
-              (if opt2p
-                  (values opt1 opt2)
-                  (case opt1
-                    (:extern
-                     (values opt1 (guess-alien-name-from-lisp-name symbol)))
-                    (:static
-                     (values opt1 nil))
-                    (t
-                     (values :local opt1))))
-            (/show allocation initial-value)
-            (setf body
-                  (ecase allocation
-                    #+nil
-                    (:static
-                     (let ((sap
-                            (make-symbol (concatenate 'string "SAP-FOR-"
-                                                      (symbol-name symbol)))))
-                       `((let ((,sap (load-time-value (%make-alien ...))))
-                           (declare (type system-area-pointer ,sap))
-                           (symbol-macrolet
-                               ((,symbol (sap-alien ,sap ,type)))
-                             ,@(when initial-value
-                                 `((setq ,symbol ,initial-value)))
-                             ,@body)))))
-                    (:extern
-                     (/show0 ":EXTERN case")
-                     `((symbol-macrolet
-                           ((,symbol
-                              (%alien-value
-                               (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
-                         ,@body)))
-                    (:local
-                     (/show0 ":LOCAL case")
-                     (let* ((var (sb!xc:gensym "VAR"))
-                            (initval (if initial-value (sb!xc:gensym "INITVAL")))
-                            (info (make-local-alien-info :type alien-type))
-                            (inner-body
-                             `((note-local-alien-type ',info ,var)
-                               (symbol-macrolet ((,symbol (local-alien ',info ,var)))
-                                 ,@(when initial-value
-                                     `((setq ,symbol ,initval)))
-                                 ,@body)))
-                            (body-forms
-                             (if initial-value
-                                 `((let ((,initval ,initial-value))
-                                     ,@inner-body))
-                                 inner-body)))
-                       (/show var initval info)
-                       #!+(or x86 x86-64)
-                       `((let ((,var (make-local-alien ',info)))
-                           ,@body-forms))
-                       ;; FIXME: This version is less efficient then it needs to be, since
-                       ;; it could just save and restore the number-stack pointer once,
-                       ;; instead of doing multiple decrements if there are multiple bindings.
-                       #!-(or x86 x86-64)
-                       `((let ((,var (make-local-alien ',info)))
-                           (multiple-value-prog1
-                               (progn ,@body-forms)
-                             ;; No need for unwind protect here, since
-                             ;; allocation involves modifying NSP, and
-                             ;; NSP is saved and restored during NLX.
-                             ;; And in non-transformed case it
-                             ;; performs finalization.
-                             (dispose-local-alien ',info ,var))))))))))))
-    (/show "revised" body)
-    (verify-local-auxiliaries-okay)
-    (/show0 "back from VERIFY-LOCAL-AUXILIARIES-OK, returning")
-    `(symbol-macrolet ((&auxiliary-type-definitions&
-                        ,(append *new-auxiliary-types*
-                                 (auxiliary-type-definitions env))))
-       #!+(or x86 x86-64)
-       (let ((sb!vm::*alien-stack-pointer* sb!vm::*alien-stack-pointer*))
-         ,@body)
-       #!-(or x86 x86-64)
-       ,@body)))
+  (let (#!+c-stack-is-control-stack
+        bind-alien-stack-pointer)
+    (with-auxiliary-alien-types env
+      (dolist (binding (reverse bindings))
+        (/show binding)
+        (destructuring-bind
+            (symbol type &optional opt1 (opt2 nil opt2p))
+            binding
+          (/show symbol type opt1 opt2)
+          (let* ((alien-type (parse-alien-type type env))
+                 (datap (not (alien-fun-type-p alien-type))))
+            (/show alien-type)
+            (multiple-value-bind (allocation initial-value)
+                (if opt2p
+                    (values opt1 opt2)
+                    (case opt1
+                      (:extern
+                       (values opt1 (guess-alien-name-from-lisp-name symbol)))
+                      (:static
+                       (values opt1 nil))
+                      (t
+                       (values :local opt1))))
+              (/show allocation initial-value)
+              (setf body
+                    (ecase allocation
+                      #+nil
+                      (:static
+                       (let ((sap
+                               (make-symbol (concatenate 'string "SAP-FOR-"
+                                                         (symbol-name symbol)))))
+                         `((let ((,sap (load-time-value (%make-alien ...))))
+                             (declare (type system-area-pointer ,sap))
+                             (symbol-macrolet
+                                 ((,symbol (sap-alien ,sap ,type)))
+                               ,@(when initial-value
+                                   `((setq ,symbol ,initial-value)))
+                               ,@body)))))
+                      (:extern
+                       (/show0 ":EXTERN case")
+                       `((symbol-macrolet
+                             ((,symbol
+                                (%alien-value
+                                 (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
+                           ,@body)))
+                      (:local
+                       (/show0 ":LOCAL case")
+                       (let* ((var (sb!xc:gensym "VAR"))
+                              (initval (if initial-value (sb!xc:gensym "INITVAL")))
+                              (info (make-local-alien-info :type alien-type))
+                              (inner-body
+                                `((note-local-alien-type ',info ,var)
+                                  (symbol-macrolet ((,symbol (local-alien ',info ,var)))
+                                    ,@(when initial-value
+                                        `((setq ,symbol ,initval)))
+                                    ,@body)))
+                              (body-forms
+                                (if initial-value
+                                    `((let ((,initval ,initial-value))
+                                        ,@inner-body))
+                                    inner-body)))
+                         (/show var initval info)
+                         #!+c-stack-is-control-stack
+                         (progn (setf bind-alien-stack-pointer t)
+                                `((let ((,var (make-local-alien ',info)))
+                                    ,@body-forms)))
+                         ;; FIXME: This version is less efficient then it needs to be, since
+                         ;; it could just save and restore the number-stack pointer once,
+                         ;; instead of doing multiple decrements if there are multiple bindings.
+                         #!-c-stack-is-control-stack
+                         `((let ((,var (make-local-alien ',info)))
+                             (multiple-value-prog1
+                                 (progn ,@body-forms)
+                               ;; No need for unwind protect here, since
+                               ;; allocation involves modifying NSP, and
+                               ;; NSP is saved and restored during NLX.
+                               ;; And in non-transformed case it
+                               ;; performs finalization.
+                               (dispose-local-alien ',info ,var))))))))))))
+      (/show "revised" body)
+      (verify-local-auxiliaries-okay)
+      (/show0 "back from VERIFY-LOCAL-AUXILIARIES-OK, returning")
+      `(symbol-macrolet ((&auxiliary-type-definitions&
+                           ,(append *new-auxiliary-types*
+                                    (auxiliary-type-definitions env))))
+         ,@(cond
+             #!+c-stack-is-control-stack
+             (bind-alien-stack-pointer
+              `((let ((sb!vm::*alien-stack-pointer* sb!vm::*alien-stack-pointer*))
+                  ,@body)))
+             (t
+              body))))))
 
 ;;;; runtime C values that don't correspond directly to Lisp types
 
-;;; Note: The DEFSTRUCT for ALIEN-VALUE lives in a separate file
-;;; 'cause it has to be real early in the cold-load order.
-#!-sb-fluid (declaim (freeze-type alien-value))
-(def!method print-object ((value alien-value) stream)
+(defmethod print-object ((value alien-value) stream)
+  ;; Don't use ":TYPE T" here - TYPE-OF isn't what we want.
   (print-unreadable-object (value stream)
-    ;; See identical kludge in host-alieneval.
-    (let ((sb!pretty:*pprint-quote-with-syntactic-sugar* nil))
-      (declare (special sb!pretty:*pprint-quote-with-syntactic-sugar*))
-      (format stream
-            "~S ~S #X~8,'0X ~S ~S"
+    (format stream "~S ~S #X~8,'0X ~S ~/sb!impl:print-type-specifier/"
             'alien-value
             :sap (sap-int (alien-value-sap value))
-            :type (unparse-alien-type (alien-value-type value))))))
+            :type (unparse-alien-type (alien-value-type value)))))
 
 #!-sb-fluid (declaim (inline null-alien))
 (defun null-alien (x)
@@ -236,11 +235,6 @@ This is SETFable."
     (if (eq (compute-alien-rep-type alien-type) 'system-area-pointer)
         `(%sap-alien ,sap ',alien-type)
         (error "cannot make an alien of type ~S out of a SAP" type))))
-
-(defun %sap-alien (sap type)
-  (declare (type system-area-pointer sap)
-           (type alien-type type))
-  (make-alien-value :sap sap :type type))
 
 (defun alien-sap (alien)
   #!+sb-doc
@@ -371,7 +365,8 @@ allocated by MAKE-ALIEN, MAKE-ALIEN-STRING or malloc(3)."
                  (alien-sap alien))
   nil)
 
-(declaim (type (sfunction * system-area-pointer) %make-alien-string))
+(declaim (type (function * (values system-area-pointer index))
+               %make-alien-string))
 (defun %make-alien-string (string &key (start 0) end
                                        (external-format :default)
                                        (null-terminate t))
@@ -385,7 +380,7 @@ allocated by MAKE-ALIEN, MAKE-ALIEN-STRING or malloc(3)."
          (count (length octets))
          (buf (%make-alien count)))
     (sb!kernel:copy-ub8-to-system-area octets 0 buf 0 count)
-    buf))
+    (values buf count)))
 
 (defun make-alien-string (string &rest rest
                                  &key (start 0) end
@@ -1053,6 +1048,7 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
 
 ;;;; interface (not public, yet) for alien callbacks
 
+(let ()
 (defmacro alien-callback (specifier function &environment env)
   #!+sb-doc
   "Returns an alien-value with of alien ftype SPECIFIER, that can be passed to
@@ -1072,7 +1068,7 @@ one."
                                               ',(alien-callback-lisp-wrapper-lambda
                                                  specifier result-type argument-types env))))
                            ,call-type)
-      ',(parse-alien-type specifier env))))
+      ',(parse-alien-type specifier env)))))
 
 (defun alien-callback-p (alien)
   #!+sb-doc
@@ -1129,6 +1125,7 @@ callback signal an error."
 ;;;
 ;;; For lambdas that result in simple-funs we get the callback from
 ;;; the cache on subsequent calls.
+(let ()
 (defmacro alien-lambda (result-type typed-lambda-list &body forms)
   (multiple-value-bind (specifier lambda-list)
       (parse-callback-specification result-type typed-lambda-list)
@@ -1148,3 +1145,4 @@ the alien callback for that function with the given alien type."
     `(progn
        (defun ,name ,lambda-list ,@forms)
        (defparameter ,name (alien-callback ,specifier #',name)))))
+)

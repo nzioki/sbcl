@@ -79,13 +79,43 @@
 (define-internal-pcl-function-name-syntax sb-pcl::slow-method (list)
   (valid-function-name-p (cadr list)))
 
-(declaim (ftype function sb-pcl::std-instance-p sb-pcl::fsc-instance-p))
-(define-internal-pcl-function-name-syntax sb-pcl::ctor (list)
-  (let ((class-or-name (cadr list)))
-    (cond
-      ((symbolp class-or-name)
-       (values (valid-function-name-p class-or-name) nil))
-      ((or (sb-pcl::std-instance-p class-or-name)
-           (sb-pcl::fsc-instance-p class-or-name))
-       (values t nil)))))
+(defun interned-symbol-p (x) (and (symbolp x) (symbol-package x)))
 
+(flet ((struct-accessor-p (object slot-name)
+         (let ((c-slot-name (lvar-value slot-name)))
+           (unless (interned-symbol-p c-slot-name)
+             (give-up-ir1-transform "slot name is not an interned symbol"))
+           (let* ((type (lvar-type object))
+                  (dd (when (structure-classoid-p type)
+                        (find-defstruct-description
+                         (sb-kernel::structure-classoid-name type)))))
+              (when dd
+                (find c-slot-name (dd-slots dd) :key #'dsd-name))))))
+
+  (deftransform slot-boundp ((object slot-name) (t (constant-arg symbol)) *
+                             :node node)
+    (cond ((struct-accessor-p object slot-name) t) ; always boundp
+          (t (delay-ir1-transform node :constraint)
+             `(sb-pcl::accessor-slot-boundp object ',(lvar-value slot-name)))))
+
+  (deftransform slot-value ((object slot-name) (t (constant-arg symbol)) *
+                            :node node)
+    (acond ((struct-accessor-p object slot-name)
+            `(,(dsd-accessor-name it) object))
+           (t
+            (delay-ir1-transform node :constraint)
+            `(sb-pcl::accessor-slot-value object ',(lvar-value slot-name)))))
+
+  (deftransform sb-pcl::set-slot-value ((object slot-name new-value)
+                                        (t (constant-arg symbol) t)
+                                        * :node node)
+    (acond ((struct-accessor-p object slot-name)
+            `(setf (,(dsd-accessor-name it) object) new-value))
+           ((policy node (= safety 3))
+            ;; Safe code wants to check the type, and the global
+            ;; accessor won't do that.
+            (give-up-ir1-transform "cannot use optimized accessor in safe code"))
+           (t
+            (delay-ir1-transform node :constraint)
+            `(sb-pcl::accessor-set-slot-value object ',(lvar-value slot-name)
+                                              new-value)))))

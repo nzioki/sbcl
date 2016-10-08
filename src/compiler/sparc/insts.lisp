@@ -24,8 +24,6 @@
             sb!vm::zero-tn
             sb!vm::zero-offset sb!vm::null-offset sb!vm::alloc-offset)))
 
-(!begin-instruction-definitions)
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf *assem-scheduler-p* t)
   (setf *assem-max-locations* 100))
@@ -188,7 +186,7 @@ about function addresses and register values.")
       (error "Unknown branch condition: ~S~%Must be one of: ~S"
              condition branch-conditions)))
 
-(def!constant branch-cond-true
+(defconstant branch-cond-true
   #b1000)
 
 (defconstant-eqx branch-fp-conditions
@@ -551,8 +549,14 @@ about function addresses and register values.")
   '(:reserved :z :lez :lz :reserved :nz :gz :gez)
   #'equalp)
 
+;;; Why "#.(coerce)" instead of just coerce: as a consequence of revision
+;;; c7791afe76, cross-compiled DEFCONSTANT-EQX requires that the assigned
+;;; value be "constant per se" - only an expression for which CONSTANTP
+;;; returns T. Uses of the constant symbol in cold-load will read its value
+;;; from the cold symbol, therefore a literal value must be dumped for it.
+;;; A lambda computing the value is no good - it would be target machine code.
 (defconstant-eqx cond-move-integer-condition-vec
-  (coerce cond-move-integer-conditions 'vector)
+  #.(coerce cond-move-integer-conditions 'vector)
   #'equalp)
 
 (deftype cond-move-integer-condition ()
@@ -734,7 +738,6 @@ about function addresses and register values.")
                                 op3 (reg-tn-encoding src1) 1
                                 (if extended 1 0) src2))))
 
-;;; have to do this because def!constant is evalutated in the null lex env.
 (defmacro with-ref-format (printer)
   `(let* ((addend
            '(:choose (:plus-integer immed) ("+" rs2)))
@@ -744,11 +747,11 @@ about function addresses and register values.")
      ,printer))
 
 (defconstant-eqx load-printer
-  (with-ref-format `(:NAME :TAB ,ref-format ", " rd))
+  '#.(with-ref-format `(:NAME :TAB ,ref-format ", " rd))
   #'equalp)
 
 (defconstant-eqx store-printer
-  (with-ref-format `(:NAME :TAB rd ", " ,ref-format))
+  '#.(with-ref-format `(:NAME :TAB rd ", " ,ref-format))
   #'equalp)
 
 (macrolet ((define-f3-inst (name op op3 &key fixup load-store (dest-kind 'reg)
@@ -1594,11 +1597,16 @@ about function addresses and register values.")
 ;;;; Instructions for dumping data and header objects.
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) word))
   :pinned
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction short (segment short)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))

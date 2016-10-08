@@ -14,11 +14,6 @@
 
 ;;; Forward declarations
 
-#!+sb-fasteval
-(declaim (ftype function
-                sb!interpreter::interpreted-function-proto-fn
-                sb!interpreter::interpreted-function-env))
-
 ;;; In correct code, TRULY-THE has only a performance impact and can
 ;;; be safely degraded to ordinary THE.
 (defmacro truly-the (type expr)
@@ -200,3 +195,6 @@
 (defun sb!impl::split-seconds-for-sleep (&rest args)
   (declare (ignore args))
   (error "Can't call SPLIT-SECONDS-FOR-SLEEP"))
+
+;;; Avoid an unknown type reference from globaldb.
+(deftype fdefn () '(satisfies fdefn-p))

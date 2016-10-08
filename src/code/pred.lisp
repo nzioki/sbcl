@@ -276,7 +276,7 @@
 ;;; IR1 might potentially transform EQL into %EQL/INTEGER.
 #!+integer-eql-vop
 (defun %eql/integer (obj1 obj2)
-  ;; This is just for constand folding, no need to transform into the %EQL/INTEGER VOP
+  ;; This is just for constant folding, no need to transform into the %EQL/INTEGER VOP
   (eql obj1 obj2))
 
 (declaim (inline %eql))
@@ -312,7 +312,15 @@
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
                      (eql (denominator x) (denominator y)))))
-             (complex
+             ((complex single-float)
+              (lambda (x y)
+                (and (eql (realpart x) (realpart y))
+                     (eql (imagpart x) (imagpart y)))))
+             ((complex double-float)
+              (lambda (x y)
+                (and (eql (realpart x) (realpart y))
+                     (eql (imagpart x) (imagpart y)))))
+             ((complex rational)
               (lambda (x y)
                 (and (eql (realpart x) (realpart y))
                      (eql (imagpart x) (imagpart y))))))))))
@@ -328,12 +336,15 @@
          (bit-vector-= x y))            ; DEFTRANSFORM
         (t
          (and (= (length x) (length y))
-              (do ((i 0 (1+ i))
-                   (length (length x)))
-                  ((= i length) t)
-                (declare (fixnum i))
-                (unless (= (bit x i) (bit y i))
-                  (return nil)))))))
+              (with-array-data ((x x) (start-x) (end-x) :force-inline t
+                                                        :check-fill-pointer t)
+                (with-array-data ((y y) (start-y) (end-y) :force-inline t
+                                                          :check-fill-pointer t)
+                  (declare (ignore end-y))
+                  (loop for x-i fixnum from start-x below end-x
+                        for y-i fixnum from start-y
+                        always (or (= (sbit x x-i)
+                                      (sbit y y-i))))))))))
 
 (defun equal (x y)
   #!+sb-doc
@@ -379,6 +390,80 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                       x)
              t))))
 
+(defun instance-equalp (x y)
+  (let ((layout-x (%instance-layout x)))
+    (and
+     (eq layout-x (%instance-layout y))
+     ;; TODO: store one bit in the layout indicating whether EQUALP
+     ;; should scan slots. (basically a STRUCTURE-CLASSOID-P bit)
+     (structure-classoid-p (layout-classoid layout-x))
+     (macrolet ((slot-ref-equalp ()
+                  `(let ((x-el (%instance-ref x i))
+                         (y-el (%instance-ref y i)))
+                     (or (eq x-el y-el) (equalp x-el y-el)))))
+         (if (eql (layout-bitmap layout-x) sb!kernel::+layout-all-tagged+)
+             (loop for i of-type index from sb!vm:instance-data-start
+                   below (layout-length layout-x)
+                   always (slot-ref-equalp))
+             (let ((comparators (layout-equalp-tests layout-x)))
+               (unless (= (length comparators)
+                          (- (layout-length layout-x) sb!vm:instance-data-start))
+                 (bug "EQUALP got incomplete instance layout"))
+               ;; See remark at the source code for %TARGET-DEFSTRUCT
+               ;; explaining how to use the vector of comparators.
+               (loop for i of-type index from sb!vm:instance-data-start
+                     below (layout-length layout-x)
+                     for test = (data-vector-ref
+                                 comparators (- i sb!vm:instance-data-start))
+                     always (cond ((eql test 0) (slot-ref-equalp))
+                                  ((functionp test)
+                                   (funcall test i x y))
+                                  (t)))))))))
+
+;;; Doesn't work on simple vectors
+(defun array-equal-p (x y)
+  (declare (array x y))
+  (let ((rank (array-rank x)))
+    (and
+     (= rank (array-rank y))
+     (dotimes (axis rank t)
+       (unless (= (%array-dimension x axis)
+                  (%array-dimension y axis))
+         (return nil)))
+     (with-array-data ((x x) (start-x) (end-x) :force-inline t
+                                               :array-header-p t)
+       (with-array-data ((y y) (start-y) (end-y) :force-inline t
+                                                 :array-header-p t)
+         (declare (ignore end-y))
+         (let* ((reffers %%data-vector-reffers%%)
+                (getter-x (truly-the function (svref reffers (%other-pointer-widetag x))))
+                (getter-y (truly-the function (svref reffers (%other-pointer-widetag y)))))
+           (loop for x-i fixnum from start-x below end-x
+                 for y-i fixnum from start-y
+                 for x-el = (funcall getter-x x x-i)
+                 for y-el = (funcall getter-y y y-i)
+                 always (or (eq x-el y-el)
+                            (equalp x-el y-el)))))))))
+
+(defun vector-equalp (x y)
+  (declare (vector x y))
+  (let ((length (length x)))
+    (and (= length (length y))
+         (with-array-data ((x x) (start-x) (end-x) :force-inline t
+                                                   :check-fill-pointer t)
+           (with-array-data ((y y) (start-y) (end-y) :force-inline t
+                                                     :check-fill-pointer t)
+             (declare (ignore end-y))
+             (let* ((reffers %%data-vector-reffers%%)
+                    (getter-x (truly-the function (svref reffers (%other-pointer-widetag x))))
+                    (getter-y (truly-the function (svref reffers (%other-pointer-widetag y)))))
+               (loop for x-i fixnum from start-x below end-x
+                     for y-i fixnum from start-y
+                     for x-el = (funcall getter-x x x-i)
+                     for y-el = (funcall getter-y y y-i)
+                     always (or (eq x-el y-el)
+                                (equalp x-el y-el)))))))))
+
 (defun equalp (x y)
   #+nil ; KLUDGE: If doc string, should be accurate: Talk about structures
   ; and HASH-TABLEs.
@@ -400,67 +485,17 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
          (and (hash-table-p y)
               (hash-table-equalp x y)))
         ((%instancep x)
-         (let ((layout-x (%instance-layout x)))
-           (and (%instancep y)
-                (eq layout-x (%instance-layout y))
-                ;; TODO: store one bit in the layout indicating whether EQUALP
-                ;; should scan slots. (basically a STRUCTURE-CLASSOID-P bit)
-                (structure-classoid-p (layout-classoid layout-x))
-                (macrolet ((slot-ref-equalp ()
-                             `(let ((x-el (%instance-ref x i))
-                                    (y-el (%instance-ref y i)))
-                                (or (eq x-el y-el) (equalp x-el y-el)))))
-                  #!-interleaved-raw-slots
-                  (let ((raw-len (layout-n-untagged-slots layout-x))
-                        (total-len (layout-length layout-x)))
-                    (and (dotimes (i (- total-len raw-len) t)
-                           (unless (slot-ref-equalp)
-                             (return nil)))
-                         (or (zerop raw-len)
-                             (raw-instance-slots-equalp layout-x x y))))
-                  #!+interleaved-raw-slots
-                  (let ((metadata (layout-untagged-bitmap layout-x)))
-                    (if (zerop metadata)
-                        (loop for i of-type index from sb!vm:instance-data-start
-                              below (layout-length layout-x)
-                              always (slot-ref-equalp))
-                        (let ((comparators (layout-equalp-tests layout-x)))
-                          (unless (= (length comparators)
-                                     (- (layout-length layout-x) sb!vm:instance-data-start))
-                            (bug "EQUALP got incomplete instance layout"))
-                          ;; See remark at the source code for %TARGET-DEFSTRUCT
-                          ;; explaining how to use the vector of comparators.
-                          (loop for i of-type index from sb!vm:instance-data-start
-                                below (layout-length layout-x)
-                                for test = (data-vector-ref
-                                            comparators (- i sb!vm:instance-data-start))
-                                always (cond ((eql test 0) (slot-ref-equalp))
-                                             ((functionp test)
-                                              (funcall test i x y))
-                                             (t))))))))))
+         (and (%instancep y)
+              (instance-equalp x y)))
+        ((and (bit-vector-p x)
+              (bit-vector-p y))
+         (bit-vector-= x y))
         ((vectorp x)
-         (let ((length (length x)))
-           (and (vectorp y)
-                (= length (length y))
-                (dotimes (i length t)
-                  (let ((x-el (aref x i))
-                        (y-el (aref y i)))
-                    (unless (or (eq x-el y-el)
-                                (equalp x-el y-el))
-                      (return nil)))))))
+         (and (vectorp y)
+              (vector-equalp x y)))
         ((arrayp x)
          (and (arrayp y)
-              (= (array-rank x) (array-rank y))
-              (dotimes (axis (array-rank x) t)
-                (unless (= (array-dimension x axis)
-                           (array-dimension y axis))
-                  (return nil)))
-              (dotimes (index (array-total-size x) t)
-                (let ((x-el (row-major-aref x index))
-                      (y-el (row-major-aref y index)))
-                  (unless (or (eq x-el y-el)
-                              (equalp x-el y-el))
-                    (return nil))))))
+              (array-equal-p x y)))
         (t nil)))
 
 (/show0 "about to do test cases in pred.lisp")

@@ -22,7 +22,6 @@
 ;;; COMPILE-FILE, but in fact it's arguably more like LOAD, even down
 ;;; to the return convention. It LOADs a file, then writes out any
 ;;; assembly code created by the process.
-#+sb-xc-host
 (defun assemble-file (name
                       &key
                       (output-file (make-pathname :defaults name
@@ -40,12 +39,7 @@
          (*elsewhere* nil)
          (*assembly-optimize* nil)
          (*fixup-notes* nil)
-         #!+inline-constants
-         *constant-segment*
-         #!+inline-constants
-         *constant-table*
-         #!+inline-constants
-         *constant-vector*)
+         #!+inline-constants (*unboxed-constants* nil))
     (unwind-protect
         (let ((*features* (cons :sb-assembling *features*)))
           (init-assembler)
@@ -70,7 +64,7 @@
   (temp nil :type symbol)
   (scs nil :type (or list symbol))
   (offset nil))
-(def!method print-object ((spec reg-spec) stream)
+(defmethod print-object ((spec reg-spec) stream)
   (print-unreadable-object (spec stream :type t)
     (format stream
             ":KIND ~S :NAME ~S :SCS ~S :OFFSET ~S"
@@ -137,7 +131,7 @@
          ,@(generate-return-sequence
             (or (cadr (assoc :return-style options)) :raw))
          (emit-alignment sb!vm:n-lowtag-bits))
-       (when sb!xc:*compile-print*
+       (when *compile-print*
          (format *error-output* "~S assembled~%" ',name)))))
 
 (defun arg-or-res-spec (reg)
@@ -214,14 +208,3 @@
                        #!-(or hppa alpha) `(move ,(reg-spec-name res)
                                                  ,(reg-spec-temp res)))
                      results))))))
-
-(def!macro define-assembly-routine (name&options vars &body code)
-  (multiple-value-bind (name options)
-      (if (atom name&options)
-          (values name&options nil)
-          (values (car name&options)
-                  (cdr name&options)))
-    (let ((regs (mapcar (lambda (var) (apply #'parse-reg-spec var)) vars)))
-      (if *emit-assembly-code-not-vops-p*
-          (emit-assemble name options regs code)
-          (emit-assemble-vop name options regs)))))

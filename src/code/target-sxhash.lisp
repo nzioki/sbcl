@@ -173,12 +173,28 @@
 ;; simple cases
 (declaim (ftype (sfunction (integer) hash) sxhash-bignum))
 
+(defun new-instance-hash-code ()
+  ;; ANSI SXHASH wants us to make a good-faith effort to produce
+  ;; hash-codes that are well distributed within the range of
+  ;; non-negative fixnums, and this address-based operation does that.
+  ;; This is faster than calling RANDOM, and is random enough.
+  (loop
+   (let ((answer
+          (truly-the fixnum
+           (quasi-random-address-based-hash
+            (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte))
+                             t)
+            most-positive-fixnum))))
+     (when (plusp answer)
+       ;; Make sure we never return 0 (almost no chance of that anyway).
+       (return answer)))))
+
 (declaim (inline std-instance-hash))
 (defun std-instance-hash (instance)
   (let ((hash (%instance-ref instance sb!pcl::std-instance-hash-slot-index)))
     (if (not (eql hash 0))
         hash
-        (let ((new (sb!pcl::get-instance-hash-code)))
+        (let ((new (new-instance-hash-code)))
           ;; At most one thread will compute a random hash.
           ;; %INSTANCE-CAS is a full call if there is no vop for it.
           (let ((old (%instance-cas instance sb!pcl::std-instance-hash-slot-index
@@ -195,22 +211,42 @@
   ;; fast, in case it is the bottleneck somewhere.  -- CSR, 2003-03-14
   (declare (optimize speed))
   (labels ((sxhash-number (x)
-             (etypecase x
-               (fixnum (sxhash x))      ; through DEFTRANSFORM
-               (integer (sb!bignum:sxhash-bignum x))
-               (single-float (sxhash x)) ; through DEFTRANSFORM
-               (double-float (sxhash x)) ; through DEFTRANSFORM
-               #!+long-float (long-float (error "stub: no LONG-FLOAT"))
-               (ratio (let ((result 127810327))
-                        (declare (type fixnum result))
-                        (mixf result (sxhash-number (numerator x)))
-                        (mixf result (sxhash-number (denominator x)))
-                        result))
-               (complex (let ((result 535698211))
+             (macrolet ((hash-complex-float ()
+                          `(let ((result 535698211))
+                             (declare (type fixnum result))
+                             (mixf result (sxhash (realpart x)))
+                             (mixf result (sxhash (imagpart x)))
+                             result)))
+               (etypecase x
+                 (fixnum (sxhash x))    ; through DEFTRANSFORM
+                 (integer (sb!bignum:sxhash-bignum x))
+                 (single-float (sxhash x)) ; through DEFTRANSFORM
+                 (double-float (sxhash x)) ; through DEFTRANSFORM
+                 #!+long-float (long-float (error "stub: no LONG-FLOAT"))
+                 (ratio (let ((result 127810327))
                           (declare (type fixnum result))
-                          (mixf result (sxhash-number (realpart x)))
-                          (mixf result (sxhash-number (imagpart x)))
-                          result))))
+                          (mixf result (sxhash-number (numerator x)))
+                          (mixf result (sxhash-number (denominator x)))
+                          result))
+                 #!+long-float
+                 ((complex long-float)
+                  (hash-complex-float))
+                 ((complex double-float)
+                  (hash-complex-float))
+                 ((complex single-float)
+                  (hash-complex-float))
+                 ((complex rational)
+                  (let ((result 535698211)
+                        (realpart (realpart x))
+                        (imagpart (imagpart x)))
+                    (declare (type fixnum result))
+                    (mixf result (if (fixnump imagpart)
+                                     (sxhash imagpart)
+                                     (sxhash-number imagpart)))
+                    (mixf result (if (fixnump realpart)
+                                     (sxhash realpart)
+                                     (sxhash-number realpart)))
+                    result)))))
            (sxhash-recurse (x depthoid)
              (declare (type index depthoid))
              (typecase x
@@ -318,16 +354,16 @@
     ;; that we must respect fill pointers.
     (vector
      (macrolet ((frob ()
-                  '(let ((result 572539))
+                  `(let ((result 572539))
                      (declare (type fixnum result))
                      (mixf result (length key))
-                    (when (plusp depthoid)
-                      (decf depthoid)
-                      (dotimes (i (length key))
-                       (declare (type fixnum i))
-                       (mixf result
-                             (psxhash (aref key i) depthoid))))
-                    result))
+                     (when (plusp depthoid)
+                       (decf depthoid)
+                       (dotimes (i (length key))
+                         (declare (type fixnum i))
+                         (mixf result
+                               (psxhash (aref key i) depthoid))))
+                     result))
                 (make-dispatch (types)
                   `(typecase key
                      ,@(loop for type in types
@@ -345,12 +381,15 @@
      (let ((result 60828))
        (declare (type fixnum result))
        (dotimes (i (array-rank key))
-         (mixf result (array-dimension key i)))
+         (mixf result (%array-dimension key i)))
        (when (plusp depthoid)
          (decf depthoid)
-         (dotimes (i (array-total-size key))
-          (mixf result
-                (psxhash (row-major-aref key i) depthoid))))
+         (with-array-data ((key key) (start) (end))
+           (let ((getter (truly-the function (svref %%data-vector-reffers%%
+                                                    (%other-pointer-widetag key)))))
+             (loop for i from start below end
+                   do (mixf result
+                            (psxhash (funcall getter key i) depthoid))))))
        result))))
 
 (defun structure-object-psxhash (key depthoid)
@@ -369,7 +408,7 @@
       (let ((max-iterations depthoid)
             (depthoid (1- depthoid)))
         ;; We don't mix in LAYOUT here because it was already done above.
-        (do-instance-tagged-slot (i key :layout layout :exclude-padding t)
+        (do-instance-tagged-slot (i key :layout layout :pad nil)
           (mixf result (psxhash (%instance-ref key i) depthoid))
           (if (zerop (decf max-iterations)) (return)))))
     ;; [The following comment blurs some issues: indeed it would take
@@ -406,49 +445,84 @@
     result))
 
 (defun number-psxhash (key)
-  (declare (optimize speed))
-  (declare (type number key))
+  (declare (type number key)
+           (muffle-conditions compiler-note)
+           (optimize speed))
   (flet ((sxhash-double-float (val)
            (declare (type double-float val))
            ;; FIXME: Check to make sure that the DEFTRANSFORM kicks in and the
            ;; resulting code works without consing. (In Debian cmucl 2.4.17,
            ;; it didn't.)
            (sxhash val)))
-    (etypecase key
-      (integer (sxhash key))
-      (float (macrolet ((frob (type)
-                          (let ((lo (coerce sb!xc:most-negative-fixnum type))
-                                (hi (coerce sb!xc:most-positive-fixnum type)))
-                            `(cond (;; This clause allows FIXNUM-sized integer
-                                    ;; values to be handled without consing.
-                                    (<= ,lo key ,hi)
-                                    (multiple-value-bind (q r)
-                                        (floor (the (,type ,lo ,hi) key))
-                                      (if (zerop (the ,type r))
-                                          (sxhash q)
-                                          (sxhash-double-float
-                                           (coerce key 'double-float)))))
-                                   (t
-                                    (multiple-value-bind (q r) (floor key)
-                                      (if (zerop (the ,type r))
-                                          (sxhash q)
-                                          (sxhash-double-float
-                                           (coerce key 'double-float)))))))))
-               (etypecase key
-                 (single-float (frob single-float))
-                 (double-float (frob double-float))
-                 #!+long-float
-                 (long-float (error "LONG-FLOAT not currently supported")))))
-      (rational (if (and (<= most-negative-double-float
-                             key
-                             most-positive-double-float)
-                         (= (coerce key 'double-float) key))
-                    (sxhash-double-float (coerce key 'double-float))
-                    (sxhash key)))
-      (complex (if (zerop (imagpart key))
-                   (number-psxhash (realpart key))
-                   (let ((result 330231))
-                     (declare (type fixnum result))
-                     (mixf result (number-psxhash (realpart key)))
-                     (mixf result (number-psxhash (imagpart key)))
-                     result))))))
+    (macrolet ((hash-float (type key)
+                 (let ((lo (coerce sb!xc:most-negative-fixnum type))
+                       (hi (coerce sb!xc:most-positive-fixnum type)))
+                   `(let ((key ,key))
+                      (cond ( ;; This clause allows FIXNUM-sized integer
+                             ;; values to be handled without consing.
+                             (<= ,lo key ,hi)
+                             (multiple-value-bind (q r)
+                                 (floor (the (,type ,lo ,hi) key))
+                               (if (zerop (the ,type r))
+                                   (sxhash q)
+                                   (sxhash-double-float
+                                    (coerce key 'double-float)))))
+                            (t
+                             (multiple-value-bind (q r) (floor key)
+                               (if (zerop (the ,type r))
+                                   (sxhash q)
+                                   (sxhash-double-float
+                                    (coerce key 'double-float)))))))))
+               (hash-complex (&optional (hasher '(number-psxhash)))
+                 `(if (zerop (imagpart key))
+                      (,@hasher (realpart key))
+                      (let ((result 330231))
+                        (declare (type fixnum result))
+                        (mixf result (,@hasher (realpart key)))
+                        (mixf result (,@hasher (imagpart key)))
+                        result))))
+     (etypecase key
+       (integer (sxhash key))
+       (float (macrolet ()
+                (etypecase key
+                  (single-float (hash-float single-float key))
+                  (double-float (hash-float double-float key))
+                  #!+long-float
+                  (long-float (error "LONG-FLOAT not currently supported")))))
+       (rational (if (and (<= most-negative-double-float
+                              key
+                              most-positive-double-float)
+                          (= (coerce key 'double-float) key))
+                     (sxhash-double-float (coerce key 'double-float))
+                     (sxhash key)))
+       ((complex double-float)
+        (hash-complex (hash-float double-float)))
+       ((complex single-float)
+        (hash-complex (hash-float single-float)))
+       ((complex rational)
+        (hash-complex))))))
+
+;;; Semantic equivalent of SXHASH, but better-behaved for function names.
+;;; It performs more work by not cutting off as soon in the CDR direction.
+;;; More work here equates to less work in the global hashtable.
+;;; To wit: (eq (sxhash '(foo a b c bar)) (sxhash '(foo a b c d))) => T
+;;; but the corresponding globaldb-sxhashoids differ.
+(defun sb!c::globaldb-sxhashoid (name)
+  (locally
+      (declare (optimize (safety 0))) ; after the argc check
+    ;; TRAVERSE will walk across more cons cells than RECURSE will descend.
+    ;; That's why this isn't just one self-recursive function.
+    (labels ((traverse (accumulator x length-limit)
+               (declare (fixnum length-limit))
+               (cond ((atom x) (mix (sxhash x) accumulator))
+                     ((zerop length-limit) accumulator)
+                     (t (traverse (mix (recurse (car x) 4) accumulator)
+                                  (cdr x) (1- length-limit)))))
+             (recurse (x depthoid) ; depthoid = a blend of level and length
+               (declare (fixnum depthoid))
+               (cond ((atom x) (sxhash x))
+                     ((zerop depthoid)
+                      #.(logand sb!xc:most-positive-fixnum #36Rglobaldbsxhashoid))
+                     (t (mix (recurse (car x) (1- depthoid))
+                             (recurse (cdr x) (1- depthoid)))))))
+      (traverse 0 name 10))))

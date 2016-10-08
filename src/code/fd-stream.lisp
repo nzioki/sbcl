@@ -47,12 +47,12 @@
   (tail 0 :type index))
 (declaim (freeze-type buffer))
 
-(defvar *available-buffers* ()
+(defglobal *available-buffers* ()
   #!+sb-doc
   "List of available buffers.")
 
-(defvar *available-buffers-lock* (sb!thread:make-mutex
-                                  :name "lock for *AVAILABLE-BUFFERS*")
+(defglobal *available-buffers-lock*
+  (sb!thread:make-mutex :name "lock for *AVAILABLE-BUFFERS*")
   #!+sb-doc
   "Mutex for access to *AVAILABLE-BUFFERS*.")
 
@@ -178,7 +178,7 @@
 (defun fd-stream-bivalent-p (stream)
   (eq (fd-stream-element-mode stream) :bivalent))
 
-(def!method print-object ((fd-stream fd-stream) stream)
+(defmethod print-object ((fd-stream fd-stream) stream)
   (declare (type stream stream))
   (print-unreadable-object (fd-stream stream :type t :identity t)
     (format stream "for ~S" (fd-stream-name fd-stream))))
@@ -471,11 +471,13 @@
 
 ;;; common idioms for reporting low-level stream and file problems
 (defun simple-stream-perror (note-format stream errno)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'simple-stream-error
          :stream stream
          :format-control "~@<~?: ~2I~_~A~:>"
          :format-arguments (list note-format (list stream) (strerror errno))))
 (defun simple-file-perror (note-format pathname errno)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'simple-file-error
          :pathname pathname
          :format-control "~@<~?: ~2I~_~A~:>"
@@ -483,10 +485,12 @@
          (list note-format (list pathname) (strerror errno))))
 
 (defun c-string-encoding-error (external-format code)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'c-string-encoding-error
          :external-format external-format
          :code code))
 (defun c-string-decoding-error (external-format sap offset count)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'c-string-decoding-error
          :external-format external-format
          :octets (sap-ref-octets sap offset count)))
@@ -1320,6 +1324,28 @@
            (sap (buffer-sap ibuf)))
       (declare (type index remaining-request head tail available))
       (declare (type index n-this-copy))
+      #!+cheneygc
+      ;; Prevent failure caused by memmove() hitting a write-protected page
+      ;; and the fault handler losing, since it thinks you're not in Lisp.
+      ;; This is wasteful, but better than being randomly broken (lp#1366263).
+      (when (> this-end this-start)
+        (typecase buffer
+          (system-area-pointer
+           (setf (sap-ref-8 buffer this-start) (sap-ref-8 buffer this-start)
+                 (sap-ref-8 buffer (1- this-end)) (sap-ref-8 buffer (1- this-end))))
+          ((simple-array (unsigned-byte 8) (*))
+           (setf (aref buffer this-start) (aref buffer this-start)
+                 (aref buffer (1- this-end)) (aref buffer (1- this-end))))
+          ((simple-array * (*))
+           ;; We might have an array of UNSIGNED-BYTE-32 here, but the
+           ;; bounding indices act as if it were UNSIGNED-BYTE-8.
+           ;; This is strange, and in direct contradiction to what %BYTE-BLT
+           ;; believes it accepts. i.e. according to the comments,
+           ;; it's for want of error checking that this works at all.
+           (with-pinned-objects (buffer)
+             (let ((sap (vector-sap buffer)))
+               (setf (sap-ref-8 sap this-start) (sap-ref-8 sap this-start)
+                     (sap-ref-8 sap (1- this-end)) (sap-ref-8 sap (1- this-end))))))))
       ;; Copy data from stream buffer into user's buffer.
       (%byte-blt sap head buffer this-start this-end)
       (incf (buffer-head ibuf) n-this-copy)
@@ -1779,20 +1805,22 @@
       (setf external-format (default-external-format)))
 
     (when input-p
-      (when (or (not character-stream-p) bivalent-stream-p)
-        (setf (values bin-routine bin-type bin-size read-n-characters
-                      char-size normalized-external-format)
-              (pick-input-routine (if bivalent-stream-p '(unsigned-byte 8)
-                                      target-type)
-                                  external-format))
-        (unless bin-routine
-          (error "could not find any input routine for ~S" target-type)))
-      (when character-stream-p
-        (setf (values cin-routine cin-type cin-size read-n-characters
-                      char-size normalized-external-format)
-              (pick-input-routine target-type external-format))
-        (unless cin-routine
-          (error "could not find any input routine for ~S" target-type)))
+      (flet ((no-input-routine ()
+               (error "could not find any input routine for ~
+                        ~/sb!impl:print-type-specifier/"
+                      target-type)))
+        (when (or (not character-stream-p) bivalent-stream-p)
+          (setf (values bin-routine bin-type bin-size read-n-characters
+                        char-size normalized-external-format)
+                (pick-input-routine (if bivalent-stream-p '(unsigned-byte 8)
+                                        target-type)
+                                    external-format))
+          (unless bin-routine (no-input-routine)))
+        (when character-stream-p
+          (setf (values cin-routine cin-type cin-size read-n-characters
+                        char-size normalized-external-format)
+                (pick-input-routine target-type external-format))
+          (unless cin-routine (no-input-routine))))
       (setf (fd-stream-in fd-stream) cin-routine
             (fd-stream-bin fd-stream) bin-routine)
       ;; character type gets preferential treatment
@@ -1883,9 +1911,10 @@
                 ((subtypep output-type input-type)
                  output-type)
                 (t
-                 (error "Input type (~S) and output type (~S) are unrelated?"
-                        input-type
-                        output-type))))))
+                 (error "Input type (~/sb!impl:print-type-specifier/) and
+                         output type (~/sb!impl:print-type-specifier/) ~
+                         are unrelated?"
+                        input-type output-type))))))
 
 ;;; Handles the resource-release aspects of stream closing, and marks
 ;;; it as closed.
@@ -2055,6 +2084,8 @@
      (finish-fd-stream-output fd-stream))
     (:element-type
      (fd-stream-element-type fd-stream))
+    (:element-mode
+     (fd-stream-element-mode fd-stream))
     (:external-format
      (fd-stream-external-format fd-stream))
     (:interactive-p
@@ -2322,8 +2353,10 @@
                (if-exists nil if-exists-given)
                (if-does-not-exist nil if-does-not-exist-given)
                (external-format :default)
-               ;; :class is a private option - use it at your own risk
+               ;; private options - use at your own risk
                (class 'fd-stream)
+               #!+win32
+               (overlapped t)
              &aux                       ; Squelch assignment warning.
              (direction direction)
              (if-does-not-exist if-does-not-exist)
@@ -2359,6 +2392,7 @@
                                        (not if-does-not-exist-given)))
                               (native-namestring physical :as-file t)))))
       (flet ((open-error (format-control &rest format-arguments)
+               (declare (optimize allow-non-returning-tail-call))
                (error 'simple-file-error
                       :pathname pathname
                       :format-control format-control
@@ -2470,8 +2504,10 @@
           ;; Now we can try the actual Unix open(2).
           (multiple-value-bind (fd errno)
               (if namestring
-                  (sb!unix:unix-open namestring mask mode)
-                  (values nil sb!unix:enoent))
+                  (sb!unix:unix-open namestring mask mode
+                                     #!+win32 :overlapped #!+win32 overlapped)
+                  (values nil #!-win32 sb!unix:enoent
+                              #!+win32 sb!win32::error_file_not_found))
             (flet ((vanilla-open-error ()
                      (simple-file-perror "error opening ~S" pathname errno)))
               (cond ((numberp fd)
@@ -2503,14 +2539,17 @@
                                                  :element-type element-type)))
                           (close stream)
                           stream))))
-                    ((eql errno sb!unix:enoent)
+                    ((eql errno #!-win32 sb!unix:enoent
+                                #!+win32 sb!win32::error_file_not_found)
                      (case if-does-not-exist
                        (:error (vanilla-open-error))
                        (:create
                         (open-error "~@<The path ~2I~_~S ~I~_does not exist.~:>"
                                     pathname))
                        (t nil)))
-                    ((and (eql errno sb!unix:eexist) (null if-exists))
+                    ((and (eql errno #!-win32 sb!unix:eexist
+                                     #!+win32 sb!win32::error_already_exists)
+                          (null if-exists))
                      nil)
                     (t
                      (vanilla-open-error))))))))))
@@ -2548,9 +2587,7 @@
 (defun stream-deinit ()
   ;; Unbind to make sure we're not accidently dealing with it
   ;; before we're ready (or after we think it's been deinitialized).
-  (with-available-buffers-lock ()
-    (without-package-locks
-        (makunbound '*available-buffers*))))
+  (with-available-buffers-lock () (%makunbound '*available-buffers*)))
 
 (defun stdstream-external-format (fd outputp)
   #!-win32 (declare (ignore fd outputp))
@@ -2582,11 +2619,11 @@
                         (nul-handle
                           (cond
                             ((and inputp outputp)
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdwr 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_rdwr))
                             (inputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdonly 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_rdonly))
                             (outputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_wronly 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_wronly))
                             (t
                              ;; Not quite sure what to do in this case.
                              nil))))

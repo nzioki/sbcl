@@ -31,6 +31,8 @@
 #include "thread.h"
 #include "monitor.h"
 #include "breakpoint.h"
+#include "var-io.h"
+#include "sc-offset.h"
 
 /* the way that we shut down the system on a fatal error */
 
@@ -116,7 +118,7 @@ lose(char *fmt, ...)
     va_list ap;
     /* Block signals to prevent other threads, timers and such from
      * interfering. If only all threads could be stopped somehow. */
-    block_blockable_signals(0, 0);
+    block_blockable_signals(0);
     fprintf(stderr, "fatal error encountered");
     va_start(ap, fmt);
     print_message(fmt, ap);
@@ -134,7 +136,7 @@ corruption_warning_and_maybe_lose(char *fmt, ...)
     va_list ap;
 #ifndef LISP_FEATURE_WIN32
     sigset_t oldset;
-    block_blockable_signals(0, &oldset);
+    block_blockable_signals(&oldset);
 #endif
     fprintf(stderr, "CORRUPTION WARNING");
     va_start(ap, fmt);
@@ -158,7 +160,7 @@ void print_constant(os_context_t *context, int offset) {
     lispobj code = find_code(context);
     if (code != NIL) {
         struct code *codeptr = (struct code *)native_pointer(code);
-        int length = HeaderValue(codeptr->header);
+        int length = code_header_words(codeptr->header);
         putchar('\t');
         if (offset >= length) {
             printf("Constant offset %d out of bounds for the code object of length %d.\n",
@@ -171,6 +173,7 @@ void print_constant(os_context_t *context, int offset) {
 }
 
 char *internal_error_descriptions[] = {INTERNAL_ERROR_NAMES};
+char internal_error_nargs[] = INTERNAL_ERROR_NARGS;
 /* internal error handler for when the Lisp error system doesn't exist
  *
  * FIXME: Shouldn't error output go to stderr instead of stdout? (Alas,
@@ -180,47 +183,33 @@ void
 describe_internal_error(os_context_t *context)
 {
     unsigned char *ptr = arch_internal_error_arguments(context);
-    int len, scoffset, sc, offset, ch;
+    char count;
+    int position, sc_offset, sc_number, offset, ch;
+    void * pc = (void*)*os_context_pc_addr(context);
 
 #ifdef LISP_FEATURE_ARM64
     u32 trap_instruction = *(u32 *)ptr;
-    unsigned code = trap_instruction >> 13 & 0xFF;
-    printf("Internal error #%d \"%s\" at %p\n", code,
-           internal_error_descriptions[code],
-           (void*)*os_context_pc_addr(context));
+    unsigned char code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
-    len = *ptr++;
 #else
-    len = *ptr++;
-    printf("Internal error #%d \"%s\" at %p\n", *ptr,
-           internal_error_descriptions[*ptr],
-           (void*)*os_context_pc_addr(context));
+    unsigned char code = *ptr;
     ptr++;
-    len--;
 #endif
 
-    while (len > 0) {
-        scoffset = *ptr++;
-        len--;
-        if (scoffset == 253) {
-            scoffset = *ptr++;
-            len--;
-        }
-        else if (scoffset == 254) {
-            scoffset = ptr[0] + ptr[1]*256;
-            ptr += 2;
-            len -= 2;
-        }
-        else if (scoffset == 255) {
-            scoffset = ptr[0] + (ptr[1]<<8) + (ptr[2]<<16) + (ptr[3]<<24);
-            ptr += 4;
-            len -= 4;
-        }
-        sc = scoffset & 0x3F;
-        offset = scoffset >> 6;
+    if (code > sizeof(internal_error_nargs)) {
+        printf("Unknown error code %d at %p\n", code, pc);
+    }
+    printf("Internal error #%d \"%s\" at %p\n", code, internal_error_descriptions[code], pc);
 
-        printf("    SC: %d, Offset: %d", sc, offset);
-        switch (sc) {
+    for (count = internal_error_nargs[code], position = 0;
+         count > 0;
+         --count) {
+        sc_offset = read_var_integer(ptr, &position);
+        sc_number = sc_offset_sc_number(sc_offset);
+        offset = sc_offset_offset(sc_offset);
+
+        printf("    SC: %d, Offset: %d", sc_number, offset);
+        switch (sc_number) {
         case sc_AnyReg:
         case sc_DescriptorReg:
             putchar('\t');

@@ -21,8 +21,6 @@
   (import '(sb!vm::nil-value sb!vm::registers sb!vm::null-tn sb!vm::null-offset
             sb!vm::pc-tn sb!vm::pc-offset sb!vm::code-offset)))
 
-(!begin-instruction-definitions)
-
 (setf *disassem-inst-alignment-bytes* 4)
 
 
@@ -59,150 +57,6 @@
 
 ;;;; disassembler field definitions
 
-(defun maybe-add-notes (dstate)
-  (let* ((inst (sap-ref-int (dstate-segment-sap dstate)
-                            (dstate-cur-offs dstate) n-word-bytes
-                            (dstate-byte-order dstate)))
-         (op (ldb (byte 8 20) inst))
-         (offset (ldb (byte 12 0) inst))
-         (rn (ldb (byte 4 16) inst)))
-    (cond ((and (= rn null-offset))
-           (let ((offset (+ nil-value offset)))
-             (case op
-               ((88 89) ;; LDR/STR
-                (maybe-note-assembler-routine offset nil dstate)
-                (maybe-note-static-symbol
-                 (logior offset other-pointer-lowtag) dstate))
-               (40 ;; ADD
-                (maybe-note-static-symbol offset dstate)))))
-          (t
-           (case op
-             (89 ;; LDR
-              (case rn
-                (#.code-offset
-                 (note-code-constant offset dstate))
-                (#.pc-offset
-                 (let ((value (sap-ref-int (dstate-segment-sap dstate)
-                                           (+ (dstate-cur-offs dstate) offset 8)
-                                           n-word-bytes
-                                           (dstate-byte-order dstate))))
-                   (maybe-note-assembler-routine value nil dstate))))))))))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; DEFINE-ARG-TYPE requires that any :PRINTER be defined at
-  ;; compile-time...  Why?
-
-  (defun print-condition (value stream dstate)
-    (declare (type stream stream)
-             (fixnum value)
-             (ignore dstate))
-    (unless (= value 14) ;; Don't print :al
-      (princ (aref *condition-name-vec* value) stream)))
-
-  (defun print-reg (value stream dstate)
-    (declare (type stream stream)
-             (fixnum value)
-             (ignore dstate))
-    (princ (aref sb!vm::*register-names* value) stream))
-
-  (defun print-float-reg (value stream dstate)
-    (declare (type stream stream)
-             (list value)
-             (ignore dstate))
-    (destructuring-bind (double high low) value
-      (format stream "~[S~;D~]~a"
-              double
-              (if (= double 1)
-                  high
-                  (logior (ash high 1) low)))))
-
-  (defun print-float-sys-reg (value stream dstate)
-    (declare (type stream stream)
-             (fixnum value)
-             (ignore dstate))
-    (princ (ecase value
-             (#b0000 "FPSID")
-             (#b0001 "FPSCR")
-             (#b1000 "FPEXC")) stream))
-
-  (defun print-shift-type (value stream dstate)
-    (declare (type stream stream)
-             (fixnum value)
-             (ignore dstate))
-    (princ (aref #(lsl lsr asr ror) value) stream))
-
-  (defun print-immediate-shift (value stream dstate)
-    (declare (type stream stream)
-             (type (cons fixnum (cons fixnum null)) value)
-             (ignore dstate))
-    (destructuring-bind (amount shift) value
-      (cond
-        ((and (zerop amount)
-              (zerop shift))) ;; No shift
-        ((and (zerop amount)
-              (= shift 3))
-         (princ ", RRX" stream))
-        (t
-         (princ ", " stream)
-         (princ (aref #(lsl lsr asr ror) shift) stream)
-         (princ " #" stream)
-         (princ amount stream)))))
-
-  (defun print-shifter-immediate (value stream dstate)
-    (declare (type stream stream)
-             (fixnum value))
-    (maybe-add-notes dstate)
-    (let* ((rotate (ldb (byte 4 8) value))
-           (immediate (mask-field (byte 8 0) value))
-           (left (mask-field (byte 32 0)
-                             (ash immediate (- 32 rotate rotate))))
-           (right (ash immediate (- 0 rotate rotate))))
-      (princ (logior left right) stream)))
-
-  (defun use-label-relative-label (value dstate)
-    (declare (type (signed-byte 24) value)
-             (type disassem-state dstate))
-    (+ 8 (ash value 2) (dstate-cur-addr dstate)))
-
-  (defun print-load/store-immediate (value stream dstate)
-    (declare (type stream stream)
-             (type (cons bit (cons bit (cons bit (cons fixnum null)))) value))
-    (maybe-add-notes dstate)
-    (destructuring-bind (p u w offset) value
-      (if (zerop offset)
-          (princ "]" stream)
-          (progn
-            (princ (if (zerop p) "], #" ", #") stream)
-            (when (zerop u)
-              (princ "-" stream))
-            (princ offset stream)
-            (unless (zerop p)
-              (princ (if (zerop w) "]" "]!") stream))))))
-
-  (defun print-load/store-register (value stream dstate)
-    (destructuring-bind (p u w shift-imm shift rm) value
-      (when (zerop p)
-        (princ "]" stream))
-      (princ (if (zerop u) ", -" ", ") stream)
-      (print-reg rm stream dstate)
-      (print-immediate-shift (list shift-imm shift) stream dstate)
-      (unless (zerop p)
-        (princ (if (zerop w) "]" "]!") stream))))
-
-  (defun print-msr-field-mask (value stream dstate)
-    (declare (type stream stream)
-             (type (cons bit (cons (unsigned-byte 4) null)) value)
-             (ignore dstate))
-    (destructuring-bind (spsr-p field-mask) value
-      (if (zerop spsr-p)
-          (princ "CPSR_" stream)
-          (princ "SPSR_" stream))
-      (when (logbitp 0 field-mask) (princ "c" stream))
-      (when (logbitp 1 field-mask) (princ "x" stream))
-      (when (logbitp 2 field-mask) (princ "s" stream))
-      (when (logbitp 3 field-mask) (princ "f" stream))))
-) ; EVAL-WHEN
-
 (define-arg-type condition-code :printer #'print-condition)
 
 (define-arg-type reg :printer #'print-reg)
@@ -224,17 +78,6 @@
 (define-arg-type load/store-immediate :printer #'print-load/store-immediate)
 
 (define-arg-type load/store-register :printer #'print-load/store-register)
-
-;; We use a prefilter in order to read trap codes in order to avoid
-;; encoding the code within the instruction body (requiring the use of
-;; a different trap instruction and a SIGILL handler) and in order to
-;; avoid attempting to include the code in the decoded instruction
-;; proper (requiring moving to a 40-bit instruction for disassembling
-;; trap codes, and being affected by endianness issues).
-(define-arg-type debug-trap-code
-    :prefilter (lambda (value dstate)
-                 (declare (ignore value))
-                 (read-suffix 8 dstate)))
 
 (define-arg-type msr-field-mask :printer #'print-msr-field-mask)
 
@@ -322,7 +165,14 @@
 
 (define-instruction-format (debug-trap 32 :default-printer '(:name :tab code))
   (opcode-32 :field (byte 32 0))
-  (code :type 'debug-trap-code :reader debug-trap-code))
+  ;; We use a prefilter in order to read trap codes in order to avoid
+  ;; encoding the code within the instruction body (requiring the use of
+  ;; a different trap instruction and a SIGILL handler) and in order to
+  ;; avoid attempting to include the code in the decoded instruction
+  ;; proper (requiring moving to a 40-bit instruction for disassembling
+  ;; trap codes, and being affected by endianness issues).
+  (code :prefilter (lambda (dstate) (read-suffix 8 dstate))
+        :reader debug-trap-code))
 
 (define-instruction-format (msr-immediate 32
                             :default-printer
@@ -463,60 +313,6 @@
 (define-instruction-format (conditional 32 :default-printer '(:name cond))
   (cond :field (byte 4 28) :type 'condition-code)
   (op :field (byte 28 0)))
-
-;;;; special magic to support decoding internal-error and related traps
-
-;; snarf-error-junk is basically identical on all platforms that
-;; define it (meaning, not Alpha).  Shouldn't it be common somewhere?
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (sb!c:read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (sb!c:read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
-
-(defun debug-trap-control (chunk inst stream dstate)
-  (declare (ignore inst))
-  (flet ((nt (x) (if stream (note x dstate))))
-    (case (debug-trap-code chunk dstate)
-      (#.halt-trap
-       (nt "Halt trap"))
-      (#.pending-interrupt-trap
-       (nt "Pending interrupt trap"))
-      (#.error-trap
-       (nt "Error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "Cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "Breakpoint trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "Single step around trap"))
-      (#.single-step-before-trap
-       (nt "Single step before trap")))))
 
 ;;;; primitive emitters
 
@@ -1525,6 +1321,20 @@
         segment 8 2
         #'two-instruction-maybe-shrink
         #'two-instruction-emitter)))))
+
+(define-instruction adr (segment code label &optional (offset 0))
+  (:vop-var vop)
+  (:emitter
+   (emit-back-patch
+    segment 4
+    (lambda (segment position)
+      (assemble (segment vop)
+        (let ((offset (+ (- (label-position label)
+                            (+ position 8))
+                         offset)))
+          (if (plusp offset)
+              (inst add code pc-tn offset)
+              (inst sub code pc-tn (- offset)))))))))
 
 ;; data processing floating point instructions
 (define-bitfield-emitter emit-fp-dp-instruction 32

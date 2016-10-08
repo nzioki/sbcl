@@ -76,9 +76,8 @@
   (once-only ((n-target target)
               (n-source source)
               (n-offset offset))
-    (let ((target-offset (ecase *backend-byte-order*
-                           (:little-endian n-offset)
-                           (:big-endian `(+ ,n-offset (1- n-word-bytes))))))
+    (let ((target-offset #!+little-endian n-offset
+                         #!+big-endian `(+ ,n-offset (1- n-word-bytes))))
       `(inst ldrb ,n-target (@ ,n-source ,target-offset)))))
 
 ;;; Macros to handle the fact that our stack pointer isn't actually in
@@ -278,8 +277,8 @@
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
        (when ,type-code
-         (inst mov ,flag-tn (ash (1- ,size) n-widetag-bits))
-         (inst add ,flag-tn ,flag-tn ,type-code)
+         (load-immediate-word ,flag-tn (+ (ash (1- ,size) n-widetag-bits)
+                                          ,type-code))
          (storew ,flag-tn ,result-tn 0 ,lowtag))
        ,@body)))
 
@@ -292,15 +291,8 @@
     (inst brk (dpb code (byte 8 8) kind))
     ;; NARGS is implicitely assumed for invalid-arg-count
     (unless (= kind invalid-arg-count-trap)
-     (with-adjustable-vector (vector)
-       (dolist (tn values)
-         (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                            (or (tn-offset tn) 0))
-                            vector))
-       (inst byte (length vector))
-       (dotimes (i (length vector))
-         (inst byte (aref vector i)))
-       (emit-alignment 2)))))
+      (encode-internal-error-args values)
+      (emit-alignment 2))))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc
@@ -350,8 +342,6 @@
          (inst ldr (32-bit-reg ,flag-tn)
                (@ thread-tn
                   (+ (* n-word-bytes thread-pseudo-atomic-bits-slot) 4))))
-       ;; When *pseudo-atomic-interrupted* is not 0 it contains the address of
-       ;; do_pending_interrupt
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
@@ -446,7 +436,7 @@
                    (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
        (move result value))))
 
-(def!macro with-pinned-objects ((&rest objects) &body body)
+(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger

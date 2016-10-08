@@ -41,7 +41,8 @@
 
 unsigned int cpuid_fn1_ecx;
 
-static void cpuid(unsigned info, unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx)
+static void cpuid(unsigned info, unsigned subinfo,
+                  unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx)
 {
 #ifdef _MSC_VER
   int regs[4];
@@ -53,7 +54,8 @@ static void cpuid(unsigned info, unsigned *eax, unsigned *ebx, unsigned *ecx, un
 #else
   __asm__("cpuid;"                                            /* assembly code */
           :"=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx) /* outputs */
-          :"a" (info)                                         /* input: info into eax */
+          :"a" (info), "c" (subinfo)                          /* input: info into eax,
+                                                                 subinfo to ecx */
            /* clobbers: none */
           );
 #endif
@@ -63,11 +65,38 @@ void arch_init(void)
 {
   unsigned int eax, ebx, ecx, edx;
 
-  cpuid(0, &eax, &ebx, &ecx, &edx);
+  cpuid(0, 0, &eax, &ebx, &ecx, &edx);
   if (eax >= 1) { // see if we can execute basic id function 1
-      cpuid(1, &eax, &ebx, &ecx, &edx);
+      cpuid(1, 0, &eax, &ebx, &ecx, &edx);
       cpuid_fn1_ecx = ecx;
   }
+}
+
+#define FILL_VECTOR_T "FILL-VECTOR/T"
+
+// Poke in a byte that changes an opcode to enable faster vector fill.
+// Using fixed offsets and bytes is no worse than what we do elsewhere.
+void tune_asm_routines_for_microarch(void)
+{
+    // I don't know if this works on Windows
+#ifndef _MSC_VER
+    unsigned int eax, ebx, ecx, edx;
+    cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    if (eax >= 7) {
+        cpuid(7, 0, &eax, &ebx, &ecx, &edx);
+        if (ebx & (1<<9)) // Enhanced Repeat Movs/Stos
+          asm_routine_poke(FILL_VECTOR_T, 0x12, 0x7C); // Change JMP to JL
+    }
+#endif
+}
+
+/* Undo code patches so that the core file applies to the most generic
+   microarchitecture on startup. As it happens, FILL-VECTOR/T is fine
+   either way, but in general this might not be true for code using
+   instructions that don't exist on some cpu family members */
+void untune_asm_routines_for_microarch(void)
+{
+    asm_routine_poke(FILL_VECTOR_T, 0x12, 0xEB); // Change JL to JMP
 }
 
 #ifndef _WIN64
@@ -428,31 +457,31 @@ arch_install_interrupt_handlers()
  */
 
 void
-arch_write_linkage_table_jmp(char * reloc, void * fun)
+arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 {
-    uword_t addr = (uword_t) fun;
+    uword_t addr = (uword_t)target_addr;
     int i;
 
-    *reloc++ = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
-    *reloc++ = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
-    *reloc++ = 0x00; /* 32-bit displacement field = 0 */
-    *reloc++ = 0x00; /* ... */
-    *reloc++ = 0x00; /* ... */
-    *reloc++ = 0x00; /* ... */
+    *reloc_addr++ = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
+    *reloc_addr++ = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
+    *reloc_addr++ = 0x00; /* 32-bit displacement field = 0 */
+    *reloc_addr++ = 0x00; /* ... */
+    *reloc_addr++ = 0x00; /* ... */
+    *reloc_addr++ = 0x00; /* ... */
 
     for (i = 0; i < 8; i++) {
-        *reloc++ = addr & 0xff;
+        *reloc_addr++ = addr & 0xff;
         addr >>= 8;
     }
 
     /* write a nop for good measure. */
-    *reloc = 0x90;
+    *reloc_addr = 0x90;
 }
 
 void
-arch_write_linkage_table_ref(void * reloc, void * data)
+arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
 {
-    *(uword_t *)reloc = (uword_t)data;
+    *(uword_t *)reloc_addr = (uword_t)target_addr;
 }
 
 #endif

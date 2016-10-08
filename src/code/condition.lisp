@@ -51,7 +51,8 @@
 
 (setf (condition-classoid-report (find-classoid 'condition))
       (lambda (cond stream)
-        (format stream "Condition ~S was signalled." (type-of cond))))
+        (format stream "Condition ~/sb!impl:print-type-specifier/ was signalled."
+                (type-of cond))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -92,7 +93,7 @@
 ;;;     (defmethod print-object ((x c) stream)
 ;;;       (if *print-escape* (call-next-method) (report-name x stream)))
 ;;; The current code doesn't seem to quite match that.
-(def!method print-object ((x condition) stream)
+(def*method print-object ((x condition) stream)
   (if *print-escape*
       (if (and (typep x 'simple-condition) (slot-value x 'format-control))
           (print-unreadable-object (x stream :type t :identity t)
@@ -108,6 +109,13 @@
         (let ((report (condition-classoid-report class)))
           (when report
             (return (funcall report x stream)))))))
+
+;;; It is essential that there be a method that works in warm load
+;;; because any conditions signaled are not printable otherwise,
+;;; except by the method on type T which is completely unhelpful.
+(defmethod print-object ((x condition) stream)
+  (print-unreadable-object (x stream :type t :identity t)
+    (write (%instance-ref x 1) :stream stream :escape t)))
 
 ;;;; slots of CONDITION objects
 
@@ -435,6 +443,8 @@
            (let ((arg (second option)))
              (setq report
                    `#'(named-lambda (condition-report ,name) (condition stream)
+                        (declare (type condition condition)
+                                 (type stream stream))
                         ,@(if (stringp arg)
                               `((declare (ignore condition))
                                 (write-string ,arg stream))
@@ -506,12 +516,14 @@
    (expected-type :reader type-error-expected-type :initarg :expected-type))
   (:report
    (lambda (condition stream)
-     (format stream
-             "~@<The value ~2I~:_~S ~I~_is not of type ~2I~_~S.~:>"
+     (format stream  "~@<The value~
+                      ~@:_~2@T~S~@:_~
+                      is not of type~
+                      ~@:_~2@T~/sb!impl:print-type-specifier/~:@>"
              (type-error-datum condition)
              (type-error-expected-type condition)))))
 
-(def!method print-object ((condition type-error) stream)
+(def*method print-object ((condition type-error) stream)
   (if (and *print-escape*
            (slot-boundp condition 'expected-type)
            (slot-boundp condition 'datum))
@@ -522,7 +534,10 @@
               (datum (maybe-string (type-error-datum condition))))
           (if (and type datum)
               (print-unreadable-object (condition stream :type t)
-                (format stream "~@<expected-type: ~A ~_datum: ~A~:@>" type datum))
+                (format stream "~@<expected-type: ~
+                                 ~/sb-impl:print-type-specifier/~_datum: ~
+                                 ~A~:@>"
+                        type datum))
               (call-next-method))))
       (call-next-method)))
 
@@ -560,7 +575,7 @@
 (define-condition cell-error (error)
   ((name :reader cell-error-name :initarg :name)))
 
-(def!method print-object ((condition cell-error) stream)
+(def*method print-object ((condition cell-error) stream)
   (if (and *print-escape* (slot-boundp condition 'name))
       (print-unreadable-object (condition stream :type t :identity t)
         (princ (cell-error-name condition) stream))
@@ -761,7 +776,7 @@
 (define-condition reference-condition ()
   ((references :initarg :references :reader reference-condition-references)))
 (defvar *print-condition-references* t)
-(def!method print-object :around ((o reference-condition) s)
+(def*method print-object :around ((o reference-condition) s)
   (call-next-method)
   (unless (or *print-escape* *print-readably*)
     (when (and *print-condition-references*
@@ -793,7 +808,7 @@
 ;; not cause the ERRORP value from COMPILE-TIME to be T.
 ;; Nor do we cite section 3.2.2.3 as the governing prohibition.
 (defun report-duplicate-definition (condition stream)
-  (format stream "~@<Duplicate definition for ~S found in  one file.~@:>"
+  (format stream "~@<Duplicate definition for ~S found in one file.~@:>"
           (slot-value condition 'name)))
 
 (define-condition duplicate-definition (reference-condition warning)
@@ -1013,10 +1028,11 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
    (lambda (condition stream)
      (let ((*print-array* nil))
        (format stream
-               "~@<Displaced array originally of type ~S has been invalidated ~
-                due its displaced-to array ~S having become too small to hold ~
-                it: the displaced array's dimensions have all been set to zero ~
-                to trap accesses to it.~:@>"
+               "~@<Displaced array originally of type ~
+                 ~/sb!impl:print-type-specifier/ has been invalidated ~
+                 due its displaced-to array ~S having become too small ~
+                 to hold it: the displaced array's dimensions have all ~
+                 been set to zero to trap accesses to it.~:@>"
                (type-error-expected-type condition)
                (array-displacement (type-error-datum condition))))))
   (:default-initargs
@@ -1151,8 +1167,10 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                                                    simple-error)
   ()
   (:default-initargs
-      :format-control "symbol ~S cannot be both the name of a type and the name of a declaration"
-    :references (list '(:ansi-cl :section (3 8 21)))))
+   :format-control  "Symbol ~/sb-impl:print-symbol-with-prefix/ cannot ~
+                     be both the name of a type and the name of a ~
+                     declaration"
+   :references (list '(:ansi-cl :section (3 8 21)))))
 
 ;;; Single stepping conditions
 
@@ -1219,7 +1237,7 @@ the values returned by the form as a list. No associated restarts."))
 (defvar *muffled-warnings* 'uninteresting-redefinition
   #!+sb-doc
   "A type that ought to specify a subtype of WARNING.  Whenever a
-warning is signaled, if the warning if of this type and is not
+warning is signaled, if the warning is of this type and is not
 handled by any other handler, it will be muffled.")
 
 ;;; Various STYLE-WARNING signaled in the system.
@@ -1492,13 +1510,12 @@ the usual naming convention (names like *FOO*) for special variables"
    (new :initarg :new :reader proclamation-mismatch-new))
   (:report
    (lambda (condition stream)
-     ;; if we later decide we want package-qualified names, bind
-     ;; *PACKAGE* to (find-package "KEYWORD") here.
      (format stream
-             "~@<The new ~A proclamation for~@[ ~A~] ~S~
-              ~@:_~2@T~S~@:_~
-              does not match the old ~4:*~A~3* proclamation~
-              ~@:_~2@T~S~@:>"
+             "~@<The new ~A proclamation for~@[ ~A~] ~
+               ~/sb!impl:print-symbol-with-prefix/~
+               ~@:_~2@T~/sb!impl:print-type-specifier/~@:_~
+               does not match the old ~4:*~A~3* proclamation~
+               ~@:_~2@T~/sb!impl:print-type-specifier/~@:>"
              (proclamation-mismatch-kind condition)
              (proclamation-mismatch-description condition)
              (proclamation-mismatch-name condition)
@@ -1555,7 +1572,7 @@ the usual naming convention (names like *FOO*) for special variables"
    "Superclass for deprecation-related error and warning
 conditions."))
 
-(def!method print-object ((condition deprecation-condition) stream)
+(defmethod print-object ((condition deprecation-condition) stream)
   (flet ((print-it (stream)
            (print-deprecation-message
             (deprecation-condition-namespace condition)
@@ -1578,7 +1595,7 @@ conditions."))
                   ,@(when documentation
                       `((:documentation ,documentation))))
 
-                (def!method print-object :after ((condition ,name) stream)
+                (def*method print-object :after ((condition ,name) stream)
                   (when (and (not *print-escape*)
                              ,@(when check-runtime-error
                                 `((deprecation-condition-runtime-error condition))))
@@ -1586,11 +1603,15 @@ conditions."))
                             (deprecation-condition-software condition)
                             (deprecation-condition-name condition)))))))
 
+  ;; These print methods aren't defined until after PCL is compiled,
+  ;; at which point FORMAT has no auto-uncrossing macro.
+  ;; Better to just write PRINT-SYMBOL-WITH-PREFIX with a target package
+  ;; which drives home the point that you can't print the conditions
+  ;; until much later anyway, making them basically not helpful.
   (define-deprecation-warning early-deprecation-warning style-warning nil
-    (!uncross-format-control
      "~%~@<~:@_In future ~A versions ~
-      ~/sb!impl:print-symbol-with-prefix/ will signal a full warning ~
-      at compile-time.~:@>")
+      ~/sb-impl:print-symbol-with-prefix/ will signal a full warning ~
+      at compile-time.~:@>"
     #!+sb-doc
     "This warning is signaled when the use of a variable,
 function, type, etc. in :EARLY deprecation is detected at
@@ -1598,10 +1619,9 @@ compile-time. The use will work at run-time with no warning or
 error.")
 
   (define-deprecation-warning late-deprecation-warning warning t
-    (!uncross-format-control
      "~%~@<~:@_In future ~A versions ~
-      ~/sb!impl:print-symbol-with-prefix/ will signal a runtime ~
-      error.~:@>")
+      ~/sb-impl:print-symbol-with-prefix/ will signal a runtime ~
+      error.~:@>"
     #!+sb-doc
     "This warning is signaled when the use of a variable,
 function, type, etc. in :LATE deprecation is detected at
@@ -1609,9 +1629,8 @@ compile-time. The use will work at run-time with no warning or
 error.")
 
   (define-deprecation-warning final-deprecation-warning warning t
-    (!uncross-format-control
      "~%~@<~:@_~*An error will be signaled at runtime for ~
-      ~/sb!impl:print-symbol-with-prefix/.~:@>")
+      ~/sb-impl:print-symbol-with-prefix/.~:@>"
     #!+sb-doc
     "This warning is signaled when the use of a variable,
 function, type, etc. in :FINAL deprecation is detected at

@@ -286,11 +286,11 @@
              (defaulting-done (gen-label))
              (default-stack-slots (gen-label)))
          (note-this-location vop :unknown-return)
+         (inst mov rax-tn nil-value)
          ;; Branch off to the MV case.
          (inst jmp :c regs-defaulted)
          ;; Do the single value case.
          ;; Default the register args
-         (inst mov rax-tn nil-value)
          (do ((i 1 (1+ i))
               (val (tn-ref-across values) (tn-ref-across val)))
              ((= i (min nvals register-arg-count)))
@@ -300,7 +300,6 @@
          (move rbx-tn rsp-tn)
          (inst jmp default-stack-slots)
          (emit-label regs-defaulted)
-         (inst mov rax-tn nil-value)
          (collect ((defaults))
            (do ((i register-arg-count (1+ i))
                 (val (do ((i 0 (1+ i))
@@ -1052,11 +1051,15 @@
   (:temporary (:sc any-reg :offset r8-offset) copy-index)
   (:temporary (:sc any-reg :offset r9-offset) source)
   (:temporary (:sc descriptor-reg :offset r10-offset) temp)
-  (:info fixed)
+  (:info fixed min-verified)
   (:generator 20
     ;; Avoid the copy if there are no more args.
     (cond ((zerop fixed)
            (inst jrcxz JUST-ALLOC-FRAME))
+          ((and (eql min-verified fixed)
+                (> fixed 1))
+           ;; verify-arg-count will do a CMP
+           (inst jmp :e JUST-ALLOC-FRAME))
           (t
            (inst cmp rcx-tn (fixnumize fixed))
            (inst jmp :be JUST-ALLOC-FRAME)))
@@ -1083,9 +1086,6 @@
 
     ;; Now: nargs>=1 && nargs>fixed
 
-    ;; Save the original count of args.
-    (inst mov rbx-tn rcx-tn)
-
     (cond ((< fixed register-arg-count)
            ;; the code above only moves the final value of rsp in
            ;; rsp directly if that condition is satisfied.  Currently,
@@ -1096,12 +1096,15 @@
            ;; We must stop when we run out of stack args, not when we
            ;; run out of more args.
            ;; Number to copy = nargs-3
+           ;; Save the original count of args.
+           (inst mov rbx-tn rcx-tn)
            (inst sub rbx-tn (fixnumize register-arg-count))
            ;; Everything of interest in registers.
            (inst jmp :be DO-REGS))
           (t
            ;; Number to copy = nargs-fixed
-           (inst sub rbx-tn (fixnumize fixed))))
+           (inst lea rbx-tn (make-ea :qword :base rcx-tn
+                                     :disp (- (fixnumize fixed))))))
 
     ;; Initialize R8 to be the end of args.
     ;; Swap with SP if necessary to mirror the previous condition
@@ -1311,21 +1314,27 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
-    (let ((err-lab (generate-error-code vop 'invalid-arg-count-error)))
-      (cond ((not min)
-             (if (zerop max)
-                 (inst test nargs nargs)
-                 (inst cmp nargs (fixnumize max)))
-             (inst jmp :ne err-lab))
-            (max
-             (when (plusp min)
-               (inst cmp nargs (fixnumize min))
-               (inst jmp :b err-lab))
-             (inst cmp nargs (fixnumize max))
-             (inst jmp :a err-lab))
-            ((plusp min)
-             (inst cmp nargs (fixnumize min))
-             (inst jmp :b err-lab))))))
+    ;; NOTE: copy-more-arg expects this to issue a CMP for min > 1
+    (let ((err-lab
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
+      (flet ((check-min ()
+               (cond ((= min 1)
+                      (inst test nargs nargs)
+                      (inst jmp :e err-lab))
+                     ((plusp min)
+                      (inst cmp nargs (fixnumize min))
+                      (inst jmp :b err-lab)))))
+        (cond ((not min)
+               (if (zerop max)
+                   (inst test nargs nargs)
+                   (inst cmp nargs (fixnumize max)))
+               (inst jmp :ne err-lab))
+              (max
+               (check-min)
+               (inst cmp nargs (fixnumize max))
+               (inst jmp :a err-lab))
+              (t
+               (check-min)))))))
 
 ;; Signal an error about an untagged number.
 ;; These are pretty much boilerplate and could be generic except:
@@ -1341,7 +1350,7 @@
   (:args (object :scs (signed-reg unsigned-reg))
          ;; Types are trees of symbols, so 'any-reg' is not
          ;; really possible.
-         (type :scs (any-reg descriptor-reg)))
+         (type :scs (any-reg descriptor-reg constant)))
   (:arg-types untagged-num *)
   (:vop-var vop)
   (:save-p :compute-only)

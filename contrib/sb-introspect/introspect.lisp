@@ -78,21 +78,21 @@ include the pathname of the file and the position of the definition."
   "Debug function represent static compile-time information about a function."
   'sb-c::compiled-debug-fun)
 
-(declaim (ftype (function (function) debug-info) function-debug-info))
+(declaim (ftype (sb-int:sfunction (function) debug-info) function-debug-info))
 (defun function-debug-info (function)
   (let* ((function-object (sb-kernel::%fun-fun function))
          (function-header (sb-kernel:fun-code-header function-object)))
     (sb-kernel:%code-debug-info function-header)))
 
-(declaim (ftype (function (function) debug-source) function-debug-source))
+(declaim (ftype (sb-int:sfunction (function) debug-source) function-debug-source))
 (defun function-debug-source (function)
   (debug-info-source (function-debug-info function)))
 
-(declaim (ftype (function (debug-info) debug-source) debug-info-source))
+(declaim (ftype (sb-int:sfunction (debug-info) debug-source) debug-info-source))
 (defun debug-info-source (debug-info)
   (sb-c::debug-info-source debug-info))
 
-(declaim (ftype (function (t debug-info) debug-function) debug-info-debug-function))
+(declaim (ftype (sb-int:sfunction (t debug-info) debug-function) debug-info-debug-function))
 (defun debug-info-debug-function (function debug-info)
   (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
         (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
@@ -117,7 +117,7 @@ FBOUNDP."
   "Call FN for each constant in CODE's constant pool."
   (check-type code sb-kernel:code-component)
   (loop for i from sb-vm:code-constants-offset below
-       (sb-kernel:get-header-data code)
+       (sb-kernel:code-header-words code)
      do (funcall fn (sb-kernel:code-header-ref code i))))
 
 (declaim (inline map-allocated-code-components))
@@ -307,8 +307,7 @@ If an unsupported TYPE is requested, the function will return NIL.
         (when (and (consp name)
                    (eq (car name) 'setf))
           (setf name (cadr name)))
-        (let ((expander (or (sb-int:info :setf :inverse name)
-                            (sb-int:info :setf :expander name))))
+        (let ((expander (sb-int:info :setf :expander name)))
           (when expander
             (find-definition-source
              (cond ((symbolp expander) (symbol-function expander))
@@ -512,6 +511,7 @@ If an unsupported TYPE is requested, the function will return NIL.
 Works for special-operators, macros, simple functions, interpreted functions,
 and generic functions. Signals an error if FUNCTION is not a valid extended
 function designator."
+  ;; FIXME: sink this logic into SB-KERNEL:%FUN-LAMBDA-LIST and just call that?
   (cond ((and (symbolp function) (special-operator-p function))
          (function-lambda-list (sb-int:info :function :ir1-convert function)))
         ((valid-function-name-p function)
@@ -608,111 +608,53 @@ value."
 
 ;;; XREF facility
 
-(defun get-simple-fun (functoid)
-  (etypecase functoid
-    (sb-kernel:fdefn
-     (get-simple-fun (sb-kernel:fdefn-fun functoid)))
-    ((or null sb-kernel:funcallable-instance)
-     nil)
-    (sb-kernel:closure
-     ;; FIXME: should use ENCAPSULATION-INFO instead of hardwiring an index.
-     (let ((fun (sb-kernel:%closure-fun functoid)))
-       (if (and (eq (sb-kernel:%fun-name fun) 'sb-impl::encapsulation)
-                (plusp (sb-kernel:get-closure-length functoid))
-                (typep (sb-kernel:%closure-index-ref functoid 0) 'sb-impl::encapsulation-info))
-           (get-simple-fun
-            (sb-impl::encapsulation-info-definition
-             (sb-kernel:%closure-index-ref functoid 0)))
-           fun)))
-    (function
-     (sb-kernel:%fun-fun functoid))))
-
-;; Call FUNCTION with two args, NAME and VALUE, for each value that is
-;; either the FDEFINITION or MACRO-FUNCTION of some global name.
-;;
-(defun call-with-each-global-functoid (function)
-  (sb-c::call-with-each-globaldb-name
-   (lambda (name)
-     ;; In general it might be unsafe to call INFO with a NAME that is not
-     ;; valid for the kind of info being retrieved, as when the defaulting
-     ;; function tries to perform a sanity-check. But here it's safe.
-     (let ((functoid (or (sb-int:info :function :macro-function name)
-                         (sb-int:info :function :definition name))))
-             (if functoid
-                 (funcall function name functoid))))))
-
-(defun collect-xref (kind-index wanted-name)
-  (let ((ret nil))
-    (flet ((process (info-name value)
-             ;; Get a simple-fun for the definition, and an xref array
-             ;; from the table if available.
-             (let* ((simple-fun (get-simple-fun value))
-                    (xrefs (when simple-fun
-                             (sb-kernel:%simple-fun-xrefs simple-fun)))
-                    (array (when xrefs
-                             (aref xrefs kind-index))))
-               ;; Loop through the name/path xref entries in the table
-               (loop for i from 0 below (length array) by 2
-                     for xref-name = (aref array i)
-                     for xref-path = (aref array (1+ i))
-                     do (when (equal xref-name wanted-name)
-                          (let ((source-location
-                                  (find-function-definition-source simple-fun)))
-                            ;; Use the more accurate source path from
-                            ;; the xref entry.
-                            (setf (definition-source-form-path source-location)
-                                  xref-path)
-                            (push (cons info-name source-location)
-                                  ret)))))))
-      (call-with-each-global-functoid
-       (lambda (info-name value)
-         ;; Functions with EQL specializers no longer get a fdefinition,
-         ;; process all the methods from a generic function
-         (cond ((and (sb-kernel:fdefn-p value)
-                     (typep (sb-kernel:fdefn-fun value) 'generic-function))
-                (loop for method in (sb-mop:generic-function-methods (sb-kernel:fdefn-fun value))
-                      for fun = (sb-pcl::safe-method-fast-function method)
-                      when fun
-                      do
-                      (process (sb-kernel:%fun-name fun) fun)))
-               ;; Methods are alredy processed above
-               ((and (sb-kernel:fdefn-p value)
-                     (consp (sb-kernel:fdefn-name value))
-                     (member (car (sb-kernel:fdefn-name value))
-                             '(sb-pcl::slow-method sb-pcl::fast-method))))
-               (t
-                (process info-name value))))))
-    ret))
+(defun collect-xref (wanted-kind wanted-name)
+  (let ((result '()))
+    (sb-c::map-simple-funs
+     (lambda (name fun)
+       (sb-int:binding* ((xrefs (sb-kernel:%simple-fun-xrefs fun) :exit-if-null))
+         (sb-c::map-packed-xref-data
+          (lambda (xref-kind xref-name xref-form-number)
+            (when (and (eq xref-kind wanted-kind)
+                       (equal xref-name wanted-name))
+              (let ((source-location (find-function-definition-source fun)))
+                ;; Use the more accurate source path from the xref
+                ;; entry.
+                (setf (definition-source-form-number source-location)
+                      xref-form-number)
+                (push (cons name source-location) result))))
+          xrefs))))
+    result))
 
 (defun who-calls (function-name)
   "Use the xref facility to search for source locations where the
 global function named FUNCTION-NAME is called. Returns a list of
 function name, definition-source pairs."
-  (collect-xref #.(position :calls sb-c::*xref-kinds*) function-name))
+  (collect-xref :calls function-name))
 
 (defun who-binds (symbol)
   "Use the xref facility to search for source locations where the
 special variable SYMBOL is rebound. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :binds sb-c::*xref-kinds*) symbol))
+  (collect-xref :binds symbol))
 
 (defun who-references (symbol)
   "Use the xref facility to search for source locations where the
 special variable or constant SYMBOL is read. Returns a list of function
 name, definition-source pairs."
-  (collect-xref #.(position :references sb-c::*xref-kinds*) symbol))
+  (collect-xref :references symbol))
 
 (defun who-sets (symbol)
   "Use the xref facility to search for source locations where the
 special variable SYMBOL is written to. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :sets sb-c::*xref-kinds*) symbol))
+  (collect-xref :sets symbol))
 
 (defun who-macroexpands (macro-name)
   "Use the xref facility to search for source locations where the
 macro MACRO-NAME is expanded. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :macroexpands sb-c::*xref-kinds*) macro-name))
+  (collect-xref :macroexpands macro-name))
 
 (defun who-specializes-directly (class-designator)
   "Search for source locations of methods directly specializing on
@@ -1010,7 +952,7 @@ Experimental: interface subject to change."
          (call (sb-kernel:%code-entry-points object))
          (call (sb-kernel:%code-debug-info object))
          (loop for i from sb-vm:code-constants-offset
-               below (sb-kernel:get-header-data object)
+               below (sb-kernel:code-header-words object)
                do (call (sb-kernel:code-header-ref object i))))
         (sb-kernel:fdefn
          (call (sb-kernel:fdefn-name object))

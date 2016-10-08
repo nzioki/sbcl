@@ -498,7 +498,7 @@ check_pending_thruptions(os_context_t *ctx)
     if (ctx) fake_foreign_function_call(ctx);
 #else
     sigset_t oldset;
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 #endif
 
     funcall0(StaticSymbolFunction(RUN_INTERRUPTION));
@@ -573,7 +573,7 @@ check_pending_gc(os_context_t *ctx)
             lispobj gc_happened = NIL;
 
             bind_variable(IN_SAFEPOINT,T,self);
-            block_deferrable_signals(NULL,&sigset);
+            block_deferrable_signals(&sigset);
             if(SymbolTlValue(GC_PENDING,self)==T)
                 gc_happened = funcall0(StaticSymbolFunction(SUB_GC));
             unbind(self);
@@ -805,7 +805,7 @@ wake_thread_posix(os_thread_t os_thread)
     /* We are not in a signal handler here, so need to block signals
      * manually. */
     sigset_t oldset;
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 
     gc_state_lock();
     if (gc_state.phase == GC_NONE) {
@@ -898,31 +898,28 @@ thruption_handler(int signal, siginfo_t *info, os_context_t *ctx)
     /* In C code.  As a rule, we assume that running thruptions is OK. */
     *self->csp_around_foreign_call = 0;
     thread_in_lisp_raised(ctx);
-    *self->csp_around_foreign_call = transition_sp;
+    *self->csp_around_foreign_call = (intptr_t) transition_sp;
 }
 # endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 
+#define XSTR(s) STR(s)
+#define STR(s) #s
 /* Designed to be of the same type as call_into_lisp.  Ignores its
  * arguments. */
 lispobj
 handle_global_safepoint_violation(lispobj fun, lispobj *args, int nargs)
 {
-#if trap_GlobalSafepoint != 0x1a
-# error trap_GlobalSafepoint mismatch
-#endif
-    asm("int3; .byte 0x1a;");
+
+    asm("int3; .byte " XSTR(trap_GlobalSafepoint));
     return 0;
 }
 
 lispobj
 handle_csp_safepoint_violation(lispobj fun, lispobj *args, int nargs)
 {
-#if trap_CspSafepoint != 0x1b
-# error trap_CspSafepoint mismatch
-#endif
-    asm("int3; .byte 0x1b;");
+    asm("int3; .byte " XSTR(trap_CspSafepoint));
     return 0;
 }
 

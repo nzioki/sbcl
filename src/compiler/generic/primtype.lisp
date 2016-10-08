@@ -125,6 +125,7 @@
 
 ;;; miscellaneous primitive types that don't exist at the LISP level
 (!def-primitive-type catch-block (catch-block) :type nil)
+(!def-primitive-type unwind-block (unwind-block) :type nil)
 
 ;;;; PRIMITIVE-TYPE-OF and friends
 
@@ -371,7 +372,7 @@
            ((extended-sequence) (any))
            ((nil) (any))))
         (character-set-type
-         (if (eq type sb!kernel::*character-type*)
+         (if (eq type (specifier-type 'character))
              (exactly character)
              (part-of character)))
         #!+sb-simd-pack

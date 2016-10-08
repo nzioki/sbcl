@@ -34,6 +34,7 @@
 #include "validate.h"
 #include "gc-internal.h"
 #include "thread.h"
+#include "arch.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
@@ -215,6 +216,7 @@ open_core_for_saving(char *filename)
     return fopen(filename, "wb");
 }
 
+#define N_SPACES_TO_SAVE 3
 boolean
 save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                    boolean make_executable,
@@ -223,6 +225,10 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 {
     struct thread *th;
     os_vm_offset_t core_start_pos;
+
+#ifdef LISP_FEATURE_X86_64
+    untune_asm_routines_for_microarch();
+#endif
 
     /* Smash the enclosing state. (Once we do this, there's no good
      * way to go back, which is a sufficient reason that this ends up
@@ -258,9 +264,9 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     }
 
     write_lispobj(NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE, file);
-    write_lispobj(/* (word count = 3 spaces described by 5 words each, plus the
+    write_lispobj(/* (word count = N spaces described by 5 words each, plus the
           * entry type code, plus this count itself) */
-         (5*3)+2, file);
+         (5*N_SPACES_TO_SAVE)+2, file);
     output_space(file,
                  READ_ONLY_CORE_SPACE_ID,
                  (lispobj *)READ_ONLY_SPACE_START,
@@ -275,7 +281,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  core_compression_level);
 #ifdef LISP_FEATURE_GENCGC
     /* Flush the current_region, updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(1);
     update_dynamic_space_free_pointer();
 #endif
 #ifdef reg_ALLOC
@@ -365,6 +371,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     printf("done]\n");
     exit(0);
 }
+#undef N_SPACES_TO_SAVE
 
 /* Check if the build_id for the current runtime is present in a
  * buffer. */
@@ -407,7 +414,7 @@ load_runtime(char *runtime_path, size_t *size_out)
     size = (size_t) ftell(input);
     fseek(input, 0, SEEK_SET);
 
-    if (core_offset != -1 && size > core_offset)
+    if (core_offset != -1 && size > (size_t) core_offset)
         size = core_offset;
 
     buf = successful_malloc(size);

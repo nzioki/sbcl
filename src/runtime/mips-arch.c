@@ -398,17 +398,12 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 static void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int code = (os_context_insn(context) >> 6) & 0xfffff;
-    /* FIXME: This magic number is pseudo-atomic-trap from parms.lisp.
-     * Genesis should provide the proper #define, but it specialcases
-     * pseudo-atomic-trap to work around some oddity on SPARC.
-     * Eventually this should go into handle_trap. */
-    if (code==0x10) {
+    unsigned int code = (os_context_insn(context) >> 6) & 0x1f;
+    if (code == trap_PendingInterrupt) {
+        /* KLUDGE: is this neccessary or will handle_trap do the same? */
         arch_clear_pseudo_atomic_interrupted(context);
-        arch_skip_instruction(context);
-        interrupt_handle_pending(context);
-    } else
-        handle_trap(context,code & 0x1f);
+    }
+    handle_trap(context, code);
 }
 
 static void
@@ -452,7 +447,7 @@ arch_install_interrupt_handlers(void)
 
 /* Insert the necessary jump instructions at the given address. */
 void
-arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
+arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 {
   /* Make JMP to function entry. The instruction sequence is:
        lui    $25, 0, %hi(addr)

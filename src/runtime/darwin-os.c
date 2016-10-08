@@ -24,11 +24,14 @@
 #include <stdio.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <mach/mach.h>
+#include <mach/clock.h>
+#include <stdlib.h>
+#include <time.h>
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-#include <mach/mach.h>
 #include <libkern/OSAtomic.h>
-#include <stdlib.h>
 #endif
 
 #if defined(LISP_FEATURE_SB_WTIMER)
@@ -47,6 +50,23 @@ os_get_runtime_executable_path(int external)
         return NULL;
 
     return copied_string(path);
+}
+
+extern int __semwait_signal(int, int, int, int, __int64_t, __int32_t);
+
+semaphore_t clock_sem = MACH_PORT_NULL;
+mach_port_t clock_port = MACH_PORT_NULL;
+
+void init_mach_clock() {
+    if (host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &clock_port)
+        != KERN_SUCCESS) {
+        lose("Error initializing clocks");
+    }
+
+    if (semaphore_create(mach_task_self_, &clock_sem, SYNC_POLICY_FIFO, 0)
+        != KERN_SUCCESS) {
+        lose("Error initializing clocks");
+    }
 }
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
@@ -74,7 +94,6 @@ mach_exception_handler(void *port)
    signal handlers run in the relevant thread directly. */
 
 mach_port_t mach_exception_handler_port_set = MACH_PORT_NULL;
-mach_port_t current_mach_task = MACH_PORT_NULL;
 
 pthread_t
 setup_mach_exception_handling_thread()
@@ -83,10 +102,8 @@ setup_mach_exception_handling_thread()
     pthread_t mach_exception_handling_thread = NULL;
     pthread_attr_t attr;
 
-    current_mach_task = mach_task_self();
-
     /* allocate a mach_port for this process */
-    ret = mach_port_allocate(current_mach_task,
+    ret = mach_port_allocate(mach_task_self(),
                              MACH_PORT_RIGHT_PORT_SET,
                              &mach_exception_handler_port_set);
 
@@ -98,71 +115,10 @@ setup_mach_exception_handling_thread()
     pthread_create(&mach_exception_handling_thread,
                    &attr,
                    mach_exception_handler,
-                   (void*) mach_exception_handler_port_set);
+                   (void*)(long)mach_exception_handler_port_set);
     pthread_attr_destroy(&attr);
 
     return mach_exception_handling_thread;
-}
-
-struct exception_port_record
-{
-    struct thread * thread;
-    struct exception_port_record * next;
-};
-
-static OSQueueHead free_records = OS_ATOMIC_QUEUE_INIT;
-
-/* We can't depend on arbitrary addresses to be accepted as mach port
- * names, particularly not on 64-bit platforms.  Instead, we allocate
- * records that point to the thread struct, and loop until one is accepted
- * as a port name.
- *
- * Threads are mapped to exception ports with a slot in the thread struct,
- * and exception ports are casted to records that point to the corresponding
- * thread.
- *
- * The lock-free free-list above is used as a cheap fast path.
- */
-static mach_port_t
-find_receive_port(struct thread * thread)
-{
-    mach_port_t ret;
-    struct exception_port_record * curr, * to_free = NULL;
-    unsigned long i;
-    for (i = 1;; i++) {
-        curr = OSAtomicDequeue(&free_records, offsetof(struct exception_port_record, next));
-        if (curr == NULL) {
-            curr = calloc(1, sizeof(struct exception_port_record));
-            if (curr == NULL)
-                lose("unable to allocate exception_port_record\n");
-        }
-#ifdef LISP_FEATURE_X86_64
-        if ((mach_port_t)curr != (unsigned long)curr)
-            goto skip;
-#endif
-
-        if (mach_port_allocate_name(current_mach_task,
-                                    MACH_PORT_RIGHT_RECEIVE,
-                                    (mach_port_t)curr))
-            goto skip;
-        curr->thread = thread;
-        ret = (mach_port_t)curr;
-        break;
-        skip:
-        curr->next = to_free;
-        to_free = curr;
-        if ((i % 1024) == 0)
-            FSHOW((stderr, "Looped %lu times trying to allocate an exception port\n"));
-    }
-    while (to_free != NULL) {
-        struct exception_port_record * current = to_free;
-        to_free = to_free->next;
-        free(current);
-    }
-
-    FSHOW((stderr, "Allocated exception port %x for thread %p\n", ret, thread));
-
-    return ret;
 }
 
 /* tell the kernel that we want EXC_BAD_ACCESS exceptions sent to the
@@ -174,13 +130,21 @@ mach_lisp_thread_init(struct thread * thread)
     kern_return_t ret;
     mach_port_t current_mach_thread, thread_exception_port;
 
-    /* allocate a named port for the thread */
-    thread_exception_port
-        = thread->mach_port_name
-        = find_receive_port(thread);
+    if (mach_port_allocate(mach_task_self(),
+                           MACH_PORT_RIGHT_RECEIVE,
+                           &thread_exception_port) != KERN_SUCCESS) {
+        lose("Cannot allocate thread_exception_port");
+    }
+
+    if (mach_port_set_context(mach_task_self(), thread_exception_port,
+                              (mach_port_context_t)thread)
+        != KERN_SUCCESS) {
+        lose("Cannot set thread_exception_port context");
+    }
+    thread->mach_port_name = thread_exception_port;
 
     /* establish the right for the thread_exception_port to send messages */
-    ret = mach_port_insert_right(current_mach_task,
+    ret = mach_port_insert_right(mach_task_self(),
                                  thread_exception_port,
                                  thread_exception_port,
                                  MACH_MSG_TYPE_MAKE_SEND);
@@ -198,12 +162,12 @@ mach_lisp_thread_init(struct thread * thread)
         lose("thread_set_exception_ports failed with return_code %d\n", ret);
     }
 
-    ret = mach_port_deallocate (current_mach_task, current_mach_thread);
+    ret = mach_port_deallocate (mach_task_self(), current_mach_thread);
     if (ret) {
         lose("mach_port_deallocate failed with return_code %d\n", ret);
     }
 
-    ret = mach_port_move_member(current_mach_task,
+    ret = mach_port_move_member(mach_task_self(),
                                 thread_exception_port,
                                 mach_exception_handler_port_set);
     if (ret) {
@@ -213,19 +177,21 @@ mach_lisp_thread_init(struct thread * thread)
     return ret;
 }
 
-kern_return_t
+void
 mach_lisp_thread_destroy(struct thread *thread) {
-    kern_return_t ret;
     mach_port_t port = thread->mach_port_name;
     FSHOW((stderr, "Deallocating mach port %x\n", port));
-    mach_port_move_member(current_mach_task, port, MACH_PORT_NULL);
-    mach_port_deallocate(current_mach_task, port);
+    if (mach_port_move_member(mach_task_self(), port, MACH_PORT_NULL)
+        != KERN_SUCCESS) {
+        lose("Error destroying an exception port");
+    }
+    if (mach_port_deallocate(mach_task_self(), port) != KERN_SUCCESS) {
+        lose("Error destroying an exception port");
+    }
 
-    ret = mach_port_destroy(current_mach_task, port);
-    ((struct exception_port_record*)port)->thread = NULL;
-    OSAtomicEnqueue(&free_records, (void*)port, offsetof(struct exception_port_record, next));
-
-    return ret;
+    if (mach_port_destroy(mach_task_self(), port) != KERN_SUCCESS) {
+        lose("Error destroying an exception port");
+    }
 }
 
 void
@@ -248,6 +214,7 @@ mach_fork() {
 
 void darwin_init(void)
 {
+    init_mach_clock();
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     setup_mach_exception_handling_thread();
 #endif
@@ -259,7 +226,7 @@ void darwin_init(void)
 inline void
 os_sem_init(os_sem_t *sem, unsigned int value)
 {
-    if (KERN_SUCCESS!=semaphore_create(current_mach_task, sem, SYNC_POLICY_FIFO, (int)value))
+    if (KERN_SUCCESS!=semaphore_create(mach_task_self(), sem, SYNC_POLICY_FIFO, (int)value))
         lose("os_sem_init(%p): %s", sem, strerror(errno));
 }
 
@@ -302,7 +269,7 @@ os_sem_post(os_sem_t *sem, char *what)
 void
 os_sem_destroy(os_sem_t *sem)
 {
-    if (-1==semaphore_destroy(current_mach_task, *sem))
+    if (-1==semaphore_destroy(mach_task_self(), *sem))
         lose("os_sem_destroy(%p): %s", sem, strerror(errno));
 }
 
@@ -375,3 +342,58 @@ os_cancel_wtimer(int kq)
         perror("os_cancel_wtimer: kevent");
 }
 #endif
+
+/* nanosleep() is not re-entrant on some versions of Darwin,
+ * reimplement it using the underlying syscalls. */
+int
+sb_nanosleep(time_t sec, int nsec) {
+    int ret;
+    mach_timespec_t current_time;
+    mach_timespec_t start_time;
+
+    if (sec < 0 || nsec >= NSEC_PER_SEC) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret = clock_get_time(clock_port, &start_time);
+    if (ret != KERN_SUCCESS) {
+            lose(mach_error_string(ret));
+    }
+
+    for (;;) {
+        ret = __semwait_signal(clock_sem, MACH_PORT_NULL, 1, 1, sec, nsec);
+        if (ret < 0) {
+            if (errno == ETIMEDOUT) {
+                return 0;
+            }
+            if (errno == EINTR) {
+                ret = clock_get_time(clock_port, &current_time);
+                if (ret != KERN_SUCCESS) {
+                    lose(mach_error_string(ret));
+                }
+                time_t elapsed_sec = current_time.tv_sec - start_time.tv_sec;
+                int elapsed_nsec = current_time.tv_nsec - start_time.tv_nsec;
+                if (elapsed_nsec < 0) {
+                    elapsed_sec--;
+                    elapsed_nsec += NSEC_PER_SEC;
+                }
+                sec -= elapsed_sec;
+                nsec -= elapsed_nsec;
+                if (nsec < 0) {
+                    sec--;
+                    nsec += NSEC_PER_SEC;
+                }
+                if (sec < 0 || (sec == 0 && nsec == 0)) {
+                    return 0;
+                }
+                start_time = current_time;
+            } else {
+                errno = EINVAL;
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
+}

@@ -68,72 +68,84 @@
          res)
     (move-lvar-result node block locs lvar)))
 
-(defun emit-inits (node block name object lowtag instance-length inits args)
-  #!+interleaved-raw-slots (declare (ignore instance-length))
-  #!-raw-instance-init-vops
-  (declare (ignore instance-length))
+(defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
-        (funcallable-instance-tramp-tn nil))
-    (dolist (init inits)
-      (let ((kind (car init))
-            (slot (cdr init)))
-        (case kind
-          (:slot
-           ;; FIXME: with #!+interleaved-raw-slots the only reason INIT-SLOT
-           ;; and its raw variants exist is to avoid an extra MOVE -
-           ;; setters are expected to return something, but INITers don't.
-           ;; It would probably produce better code by not assuming that
-           ;; setters return a value, because as things are, if you call
-           ;; 8 setters in a row, then you probably produce 7 extraneous moves,
-           ;; because not all of them can deliver a value to the final result.
-           (let* ((raw-type (pop slot))
-                  (arg (pop args))
-                  (arg-tn (lvar-tn node block arg)))
-             (macrolet
-                 ((make-case (&optional rsd-list)
-                    `(ecase raw-type
-                       ((t)
-                        (vop init-slot node block object arg-tn
-                             name (+ sb!vm:instance-slots-offset slot) lowtag))
-                       ,@(map 'list
-                          (lambda (rsd)
-                            `(,(sb!kernel::raw-slot-data-raw-type rsd)
-                              (vop ,(sb!kernel::raw-slot-data-init-vop rsd)
-                                   node block object arg-tn
-                                   #!-interleaved-raw-slots instance-length
-                                   slot)))
-                          (symbol-value rsd-list)))))
-               (make-case #!+raw-instance-init-vops
-                          sb!kernel::*raw-slot-data*))))
-          (:dd
-           (vop init-slot node block object
-                (emit-constant (sb!kernel::dd-layout-or-lose slot))
-                name sb!vm:instance-slots-offset lowtag))
-          (otherwise
-           (vop init-slot node block object
-                (ecase kind
-                  (:arg
-                   (aver args)
-                   (lvar-tn node block (pop args)))
-                  (:unbound
-                   (or unbound-marker-tn
-                       (setf unbound-marker-tn
-                             (let ((tn (make-restricted-tn
-                                        nil
-                                        (sc-number-or-lose 'sb!vm::any-reg))))
-                               (vop make-unbound-marker node block tn)
-                               tn))))
-                  (:null
-                   (emit-constant nil))
-                  (:funcallable-instance-tramp
-                   (or funcallable-instance-tramp-tn
-                       (setf funcallable-instance-tramp-tn
-                             (let ((tn (make-restricted-tn
-                                        nil
-                                        (sc-number-or-lose 'sb!vm::any-reg))))
-                               (vop make-funcallable-instance-tramp node block tn)
-                               tn)))))
-                name slot lowtag))))))
+        (funcallable-instance-tramp-tn nil)
+        (lvar (node-lvar node)))
+    (flet ((zero-init-p (x)
+             ;; dynamic-space is already zeroed
+             (and (or (not lvar)
+                      (not (lvar-dynamic-extent lvar)))
+                  ;; KLUDGE: can't ignore type-derived
+                  ;; constants since they can be closed over
+                  ;; and not using them confuses the register
+                  ;; allocator.
+                  ;; See compiler.pure/cons-zero-initialization
+                  (strictly-constant-lvar-p x)
+                  (eql (lvar-value x) 0))))
+     (dolist (init inits)
+       (let ((kind (car init))
+             (slot (cdr init)))
+         (case kind
+           (:slot
+            ;; FIXME: the only reason INIT-SLOT raw variants exist is to avoid
+            ;; an extra MOVE - setters return a value, but INITers don't.
+            ;; It would probably produce better code by not assuming that
+            ;; setters return a value, because as things are, if you call
+            ;; 8 setters in a row, then you probably produce 7 extraneous moves,
+            ;; because not all of them can deliver a value to the final result.
+            (let ((raw-type (pop slot))
+                  (arg (pop args)))
+              (unless (and (or (eq raw-type t)
+                               (eq raw-type 'word)) ;; can be made to handle floats
+                           (zero-init-p arg))
+                (let ((arg-tn (lvar-tn node block arg)))
+                  (macrolet
+                      ((make-case (&optional rsd-list)
+                         `(ecase raw-type
+                            ((t)
+                             (vop init-slot node block object arg-tn
+                                  name (+ sb!vm:instance-slots-offset slot) lowtag))
+                            ,@(map 'list
+                               (lambda (rsd)
+                                 `(,(sb!kernel::raw-slot-data-raw-type rsd)
+                                   (vop ,(sb!kernel::raw-slot-data-init-vop rsd)
+                                        node block object arg-tn slot)))
+                               (symbol-value rsd-list)))))
+                    (make-case #!+raw-instance-init-vops
+                               sb!kernel::*raw-slot-data*))))))
+           (:dd
+            (vop init-slot node block object
+                 (emit-constant (sb!kernel::dd-layout-or-lose slot))
+                 name sb!vm:instance-slots-offset lowtag))
+           (otherwise
+            (if (and (eq kind :arg)
+                     (zero-init-p (car args)))
+                (pop args)
+                (vop init-slot node block object
+                     (ecase kind
+                       (:arg
+                        (aver args)
+                        (lvar-tn node block (pop args)))
+                       (:unbound
+                        (or unbound-marker-tn
+                            (setf unbound-marker-tn
+                                  (let ((tn (make-restricted-tn
+                                             nil
+                                             (sc-number-or-lose 'sb!vm::any-reg))))
+                                    (vop make-unbound-marker node block tn)
+                                    tn))))
+                       (:null
+                        (emit-constant nil))
+                       (:funcallable-instance-tramp
+                        (or funcallable-instance-tramp-tn
+                            (setf funcallable-instance-tramp-tn
+                                  (let ((tn (make-restricted-tn
+                                             nil
+                                             (sc-number-or-lose 'sb!vm::any-reg))))
+                                    (vop make-funcallable-instance-tramp node block tn)
+                                    tn)))))
+                     name slot lowtag))))))))
   (unless (null args)
     (bug "Leftover args: ~S" args)))
 
@@ -150,7 +162,7 @@
          (locs (lvar-result-tns lvar (list *backend-t-primitive-type*)))
          (result (first locs)))
     (emit-fixed-alloc node block name words type lowtag result lvar)
-    (emit-inits node block name result lowtag words inits args)
+    (emit-inits node block name result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-variable-allocation
@@ -163,7 +175,7 @@
           (emit-fixed-alloc node block name words type lowtag result lvar))
         (vop var-alloc node block (lvar-tn node block extra) name words
              type lowtag result))
-    (emit-inits node block name result lowtag nil inits args)
+    (emit-inits node block name result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-structure-allocation
@@ -172,13 +184,12 @@
   (let* ((lvar (node-lvar node))
          (locs (lvar-result-tns lvar (list *backend-t-primitive-type*)))
          (result (first locs)))
-    (aver (constant-lvar-p dd))
-    (aver (constant-lvar-p slot-specs))
+    (aver (and (constant-lvar-p dd) (constant-lvar-p slot-specs) (= words 1)))
     (let* ((c-dd (lvar-value dd))
            (c-slot-specs (lvar-value slot-specs))
-           (words (+ (sb!kernel::dd-instance-length c-dd) words)))
+           (words (+ (dd-length c-dd) words)))
       (emit-fixed-alloc node block name words type lowtag result lvar)
-      (emit-inits node block name result lowtag words `((:dd . ,c-dd) ,@c-slot-specs) args)
+      (emit-inits node block name result lowtag `((:dd . ,c-dd) ,@c-slot-specs) args)
       (move-lvar-result node block locs lvar))))
 
 (defoptimizer (initialize-vector ir2-convert)
@@ -229,11 +240,42 @@
              #!+x86-64
              index))
       (let ((setter (compute-setter))
-            (length (length initial-contents)))
+            (length (length initial-contents))
+            (dx-p (and lvar
+                       (lvar-dynamic-extent lvar)))
+            (character (eq (primitive-type-name elt-ptype)
+                           'character)))
         (dotimes (i length)
-          (emit-move node block (lvar-tn node block (pop initial-contents)) tmp)
-          (funcall setter (tnify i) tmp))))
+          (let ((value (pop initial-contents)))
+            ;; dynamic-space is already zeroed
+            (unless (and (not dx-p)
+                         ;; KLUDGE: can't ignore type-derived
+                         ;; constants since they can be closed over
+                         ;; and not using them confuses the register
+                         ;; allocator.
+                         ;; See compiler.pure/vector-zero-initialization
+                         (strictly-constant-lvar-p value)
+                         (if character
+                             (eql (char-code (lvar-value value)) 0)
+                             (eql (lvar-value value) 0)))
+              (emit-move node block (lvar-tn node block value) tmp)
+              (funcall setter (tnify i) tmp))))))
     (move-lvar-result node block locs lvar)))
+
+;;; An array header for simple non-unidimensional arrays is a fixed alloc,
+;;; because the rank has to be known.
+;;; (There are no compile-time optimizations for unknown rank arrays)
+(defoptimizer (make-array-header* ir2-convert) ((&rest args) node block)
+  (let ((n-args (length args)))
+    (ir2-convert-fixed-allocation
+     node block 'make-array
+     ;; Each argument fills in one slot of the array header.
+     ;; Add one word for the primitive object's header word.
+     (1+ n-args)
+     ;; MAKE-ARRAY optimizations will not kick in for complex arrays.
+     sb!vm:simple-array-widetag
+     sb!vm:other-pointer-lowtag
+     (loop for i from 1 to n-args collect `(:arg . ,i)))))
 
 ;;; :SET-TRANS (in objdef.lisp !DEFINE-PRIMITIVE-OBJECT) doesn't quite
 ;;; cut it for symbols, where under certain compilation options
@@ -254,6 +296,9 @@
 ;;; Stack allocation optimizers per platform support
 #!+stack-allocatable-vectors
 (progn
+  (defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
+    args dx
+    t)
   (defoptimizer (allocate-vector stack-allocate-result)
       ((type length words) node dx)
     (declare (ignorable type) (ignore length))
@@ -347,3 +392,23 @@
     (vectorish-ltn-annotate-helper call ltn-policy
                                    'sb!vm::allocate-list-on-stack)))
 
+
+(in-package "SB!VM")
+;;; Return a list of parameters with which to call MAKE-ARRAY-HEADER*
+;;; given the mandatory slots for a simple array of rank 0 or > 1.
+(defun make-array-header-inits (storage n-elements dimensions)
+  (macrolet ((expand ()
+               `(list* ,@(mapcar (lambda (slot)
+                                   (ecase (slot-name slot)
+                                     (data           'storage)
+                                     (fill-pointer   'n-elements)
+                                     (elements       'n-elements)
+                                     (fill-pointer-p nil)
+                                     (displacement   0)
+                                     (displaced-p    nil)
+                                     (displaced-from nil)))
+                                 (butlast (primitive-object-slots
+                                           (find 'array *primitive-objects*
+                                                 :key 'primitive-object-name))))
+                       dimensions)))
+    (expand)))

@@ -20,8 +20,6 @@
             sb!vm::zero-tn sb!vm::fp-single-zero-tn sb!vm::fp-double-zero-tn
             sb!vm::zero-offset sb!vm::null-offset sb!vm::code-offset)))
 
-(!begin-instruction-definitions)
-
 (setf *disassem-inst-alignment-bytes* 4)
 
 
@@ -101,14 +99,6 @@
                (declare (type (signed-byte 21) value)
                         (type disassem-state dstate))
                (+ 4 (ash value 2) (dstate-cur-addr dstate))))
-
-;; We use CALL-PAL BUGCHK as part of our trap logic.  It is invariably
-;; followed by a trap-code word, which we pick out with the
-;; semi-traditional prefilter approach.
-(define-arg-type bugchk-trap-code
-    :prefilter (lambda (value dstate)
-                 (declare (ignore value))
-                 (read-suffix 32 dstate)))
 
 ;;;; DEFINE-INSTRUCTION-FORMATs for the disassembler
 
@@ -172,7 +162,11 @@
                             :default-printer '('call_pal :tab 'pal_bugchk "," code))
   (op      :field (byte 6 26) :value 0)
   (palcode :field (byte 26 0) :value #x81)
-  (code :type 'bugchk-trap-code :reader bugchk-trap-code))
+  ;; We use CALL-PAL BUGCHK as part of our trap logic.  It is invariably
+  ;; followed by a trap-code word, which we pick out with the
+  ;; semi-traditional prefilter approach.
+  (code :prefilter (lambda (dstate) (read-suffix 32 dstate))
+        :reader bugchk-trap-code))
 
 ;;;; emitters
 
@@ -450,14 +444,14 @@
   (define-fp-operate subt #x16 #x0a1)
 
 ;;; IEEE support
-  (def!constant +su+   #x500)           ; software, underflow enabled
-  (def!constant +sui+  #x700)           ; software, inexact & underflow enabled
-  (def!constant +sv+   #x500)           ; software, interger overflow enabled
-  (def!constant +svi+  #x700)
-  (def!constant +rnd+  #x0c0)           ; dynamic rounding mode
-  (def!constant +sud+  #x5c0)
-  (def!constant +svid+ #x7c0)
-  (def!constant +suid+ #x7c0)
+  (defconstant +su+   #x500)           ; software, underflow enabled
+  (defconstant +sui+  #x700)           ; software, inexact & underflow enabled
+  (defconstant +sv+   #x500)           ; software, interger overflow enabled
+  (defconstant +svi+  #x700)
+  (defconstant +rnd+  #x0c0)           ; dynamic rounding mode
+  (defconstant +sud+  #x5c0)
+  (defconstant +svid+ #x7c0)
+  (defconstant +suid+ #x7c0)
 
   (define-fp-operate cvtqs_su #x16 (logior +su+ #x0bc) 2)
   (define-fp-operate cvtqs_sui #x16 (logior +sui+ #x0bc) 2)
@@ -485,33 +479,6 @@
 
 (define-instruction imb (segment)
   (:emitter (emit-lword segment #x00000086)))
-
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
 
 (defun bugchk-trap-control (chunk inst stream dstate)
   (declare (ignore inst))
@@ -641,10 +608,15 @@
 ;;;;
 
 (define-instruction lword (segment lword)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) lword))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) lword))
   (:cost 0)
   (:emitter
-   (emit-lword segment lword)))
+   (etypecase lword
+     (fixup
+      (note-fixup segment :absolute32 lword)
+      (emit-lword segment 0))
+     (integer
+      (emit-lword segment lword)))))
 
 (define-instruction short (segment word)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) word))

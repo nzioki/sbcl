@@ -373,20 +373,14 @@
                     ;; user-defined MAKE-LOAD-FORM methods?
                     (when (emit-make-load-form value)
                       #+sb-xc-host
-                      (aver (zerop (layout-raw-slot-metadata
-                                    (%instance-layout value))))
+                      (aver (eql (layout-bitmap (%instance-layout value))
+                                 sb!kernel::+layout-all-tagged+))
                       (do-instance-tagged-slot (i value)
                         (grovel (%instance-ref value i)))))
-                   ;; The cross-compiler can dump certain instances that are not
-                   ;; subtypes of STRUCTURE!OBJECT, as long as it has processed
-                   ;; the defstruct.
-                   #+sb-xc-host
-                   ((satisfies sb!kernel::xc-dumpable-structure-instance-p)
-                    (do-instance-tagged-slot (i value)
-                      (grovel (%instance-ref value i))))
                    (t
                     (compiler-error
-                     "Objects of type ~S can't be dumped into fasl files."
+                      "Objects of type ~/sb!impl:print-type-specifier/ ~
+                       can't be dumped into fasl files."
                      (type-of value)))))))
       ;; Dump all non-trivial named constants using the name.
       (if (and namep (not (typep constant '(or symbol character
@@ -683,7 +677,7 @@
     (:always-bound t)
     ;; Compiling to fasl considers a symbol always-bound if its
     ;; :always-bound info value is now T or will eventually be T.
-    (:eventually (fasl-output-p *compile-object*))))
+    (:eventually (producing-fasl-file))))
 
 ;;; Convert a reference to a symbolic constant or variable. If the
 ;;; symbol is entered in the LEXENV-VARS we use that definition,
@@ -950,6 +944,18 @@
 
 
 ;;;; code coverage
+
+;;; Used as the CDR of the code coverage instrumentation records
+;;; (instead of NIL) to ensure that any well-behaving user code will
+;;; not have constants EQUAL to that record. This avoids problems with
+;;; the records getting coalesced with non-record conses, which then
+;;; get mutated when the instrumentation runs. Note that it's
+;;; important for multiple records for the same location to be
+;;; coalesced. -- JES, 2008-01-02
+;;; Use of #. mandates :COMPILE-TOPLEVEL for several Lisps
+;;; even though for us it's immediately accessible to EVAL.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%))
 
 ;;; Check the policy for whether we should generate code coverage
 ;;; instrumentation. If not, just return the original START
@@ -1266,12 +1272,12 @@
                                (warn
                                 'type-warning
                                 :format-control
-                                "The type declarations ~S and ~S for ~S conflict."
+                                 "The type declarations ~
+                                  ~/sb!impl:print-type/ and ~
+                                  ~/sb!impl:print-type/ for ~
+                                  ~S conflict."
                                 :format-arguments
-                                (list
-                                 (type-specifier old-type)
-                                 (type-specifier type)
-                                 var-name))))
+                                (list old-type type var-name))))
                             (bound-var
                              (setf (leaf-type bound-var) int
                                    (leaf-where-from bound-var) :declared))
@@ -1672,15 +1678,20 @@
                                   `(values ,@types)))))))
                    ((and allow-explicit-check
                          (typep spec '(cons (eql explicit-check))))
-                    ;; EXPLICIT-CHECK can specify that all arguments will be
-                    ;; checked by the function body, and/or all results.
-                    ;; Alternatively, a subset of arguments can be listed,
-                    ;; so that sequence operations can dispatch on the sequence
-                    ;; arguments, but benefit from automatic checks of others.
-                    ;; You can't actually specify anything yet, as the goal
-                    ;; is to be 100% compatible with the globaldb attribute.
-                    (aver (not (cdr spec)))
-                    (setq explicit-check t
+                    ;; EXPLICIT-CHECK by itself specifies that all argument and
+                    ;; result types are checked by the function body.
+                    ;; Alternatively, a subset of arguments, and/or :RESULT,
+                    ;; can be specified to indicate that only a subset are
+                    ;; checked; in that case, the compiler asserts all others.
+                    (awhen (remove-if (lambda (x)
+                                        (or (member x vars
+                                                    :test #'eq
+                                                    :key #'lambda-var-%source-name)
+                                            (eq x :result)))
+                                      (cdr spec))
+                      (compiler-error "explicit-check list ~S must refer to lambda vars"
+                                      it))
+                    (setq explicit-check (or (cdr spec) t)
                           allow-explicit-check nil)) ; at most one of this decl
                    (t
                     (multiple-value-bind (new-env new-qualities)

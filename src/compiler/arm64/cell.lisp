@@ -24,7 +24,7 @@
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg)))
+         (value :scs (descriptor-reg any-reg null)))
   (:info name offset lowtag)
   (:ignore name)
   (:results)
@@ -258,7 +258,7 @@
     (load-type type function (- fun-pointer-lowtag))
     (inst cmp type simple-fun-header-widetag)
     (inst b :eq SIMPLE-FUN)
-    (load-inline-constant lip '(:fixup "closure_tramp" :foreign) lip)
+    (load-inline-constant lip '(:fixup closure-tramp :assembly-routine) lip)
     SIMPLE-FUN
     (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
@@ -273,7 +273,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (load-inline-constant temp '(:fixup "undefined_tramp" :foreign) lip)
+    (load-inline-constant temp '(:fixup undefined-tramp :assembly-routine) lip)
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
@@ -286,7 +286,7 @@
 ;;; symbol.
 #!+sb-thread
 (progn
-  (define-vop (bind)
+  (define-vop (dynbind)
     (:args (value :scs (any-reg descriptor-reg) :to :save)
            (symbol :scs (descriptor-reg)))
     (:temporary (:sc descriptor-reg) value-temp)
@@ -313,19 +313,22 @@
       (inst str value (@ thread-tn tls-index))))
 
   (define-vop (unbind)
+    (:info n)
     (:temporary (:sc descriptor-reg) value)
     (:temporary (:sc any-reg) tls-index bsp)
     (:generator 0
       (load-binding-stack-pointer bsp)
-      (inst ldp value tls-index (@ bsp (* (- binding-value-slot binding-size)
-                                          n-word-bytes)))
-      (inst str value (@ thread-tn tls-index))
+      (loop repeat n
+            do
+            (inst ldp value tls-index (@ bsp (* (- binding-value-slot binding-size)
+                                                n-word-bytes)))
+            (inst str value (@ thread-tn tls-index))
 
-      ;; The order of stores here is reversed with respect to interrupt safety,
-      ;; but STP cannot be interrupted in the middle.
-      (inst stp zr-tn zr-tn (@ bsp (* (- binding-value-slot binding-size)
-                                      n-word-bytes)
-                                   :pre-index))
+            ;; The order of stores here is reversed with respect to interrupt safety,
+            ;; but STP cannot be interrupted in the middle.
+            (inst stp zr-tn zr-tn (@ bsp (* (- binding-value-slot binding-size)
+                                            n-word-bytes)
+                                         :pre-index)))
       (store-binding-stack-pointer bsp))))
 
 (define-vop (unbind-to-here)
@@ -360,7 +363,7 @@
     (store-binding-stack-pointer bsp)))
 #!-sb-thread
 (progn
-  (define-vop (bind)
+  (define-vop (dynbind)
     (:args (val :scs (any-reg descriptor-reg))
            (symbol :scs (descriptor-reg)))
     (:temporary (:scs (descriptor-reg)) value-temp)
@@ -502,6 +505,7 @@
                 (:temporary (:scs (non-descriptor-reg)) offset)
                 (:generator 5 ,@(emit-generator 'str t))))))))
   (define-raw-slot-vops word unsigned-num unsigned-reg)
+  (define-raw-slot-vops signed-word signed-num signed-reg)
   (define-raw-slot-vops single single-float single-reg
     move-float)
   (define-raw-slot-vops double double-float double-reg

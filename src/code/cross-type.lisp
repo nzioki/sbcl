@@ -411,6 +411,8 @@
                              (array-dimensions obj))))
                (values t t)
                (values nil t)))
+        ((and (structure-classoid-p ctype) (symbolp obj))
+         (values nil t))
         (t
          (let ( ;; the Common Lisp type specifier corresponding to CTYPE
                (type (type-specifier ctype)))
@@ -446,8 +448,6 @@
     (cons (specifier-type 'cons))
     (character
      (cond ((typep x 'standard-char)
-            ;; (Note that SBCL doesn't distinguish between BASE-CHAR and
-            ;; CHARACTER.)
             (specifier-type 'base-char))
            ((not (characterp x))
             nil)

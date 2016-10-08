@@ -133,15 +133,6 @@
         (slot-unbound (wrapper-class* wrapper) object slot-name)
         value)))
 
-;;; This is used during the PCL build, but gets replaced by a deftransform
-;;; in fixup.lisp.
-(define-compiler-macro slot-value (&whole form object slot-name
-                                   &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env)))
-      `(accessor-slot-value ,object ,slot-name)
-      form))
-
 (defun set-slot-value (object slot-name new-value)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (or (find-slot-cell wrapper slot-name)
@@ -173,21 +164,6 @@
 ;;;   * Isn't special-cased in WALK-METHOD-LAMBDA
 (defun safe-set-slot-value (object slot-name new-value)
   (set-slot-value object slot-name new-value))
-
-;;; This is used during the PCL build, but gets replaced by a deftransform
-;;; in fixup.lisp.
-(define-compiler-macro set-slot-value (&whole form object slot-name new-value
-                                      &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env))
-           ;; We can't use the ACCESSOR-SET-SLOT-VALUE path in safe
-           ;; code, since it'll use the global automatically generated
-           ;; accessor, which won't do typechecking. (SLOT-OBJECT
-           ;; won't have been compiled with SAFETY 3, so SAFE-P will
-           ;; be NIL in MAKE-STD-WRITER-METHOD-FUNCTION).
-           (not (safe-code-p env)))
-      `(accessor-set-slot-value ,object ,slot-name ,new-value)
-      form))
 
 (defun (cas slot-value) (old-value new-value object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
@@ -239,13 +215,6 @@
                  (bug "Bogus slot cell in SLOT-VALUE: ~S" cell)))))
     (not (eq +slot-unbound+ value))))
 
-(define-compiler-macro slot-boundp (&whole form object slot-name
-                                    &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env)))
-      `(accessor-slot-boundp ,object ,slot-name)
-      form))
-
 (defun slot-makunbound (object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (find-slot-cell wrapper slot-name))
@@ -274,15 +243,10 @@
 (defun slot-exists-p (object slot-name)
   (not (null (find-slot-cell (valid-wrapper-of object) slot-name))))
 
-(defvar *unbound-slot-value-marker* (make-unprintable-object "unbound slot"))
-
-;;; This isn't documented, but is used within PCL in a number of print
-;;; object methods. (See NAMED-OBJECT-PRINT-FUNCTION.)
-(defun slot-value-or-default (object slot-name &optional
-                              (default *unbound-slot-value-marker*))
+(defun slot-value-for-printing (object slot-name)
   (if (slot-boundp object slot-name)
       (slot-value object slot-name)
-      default))
+      (load-time-value (make-unprintable-object "unbound slot") t)))
 
 (defmethod slot-value-using-class ((class std-class)
                                    (object standard-object)
@@ -493,11 +457,12 @@
       (cons
        (car position))))))
 
-;;; FIXME: AMOP says that allocate-instance imples finalize-inheritance
+;;; FIXME: AMOP says that allocate-instance implies finalize-inheritance
 ;;; if the class is not yet finalized, but we don't seem to be taking
 ;;; care of this for non-standard-classes.
 (defmethod allocate-instance ((class standard-class) &rest initargs)
-  (declare (ignore initargs))
+  (declare (ignore initargs)
+           (inline ensure-class-finalized))
   (allocate-standard-instance
    (class-wrapper (ensure-class-finalized class))))
 
@@ -512,11 +477,9 @@
   (declare (ignore initargs))
   (values (allocate-condition (class-name class))))
 
-(macrolet ((def (name class)
-             `(defmethod ,name ((class ,class) &rest initargs)
-                (declare (ignore initargs))
-                (error "Cannot allocate an instance of ~S." class))))
-  (def allocate-instance system-class))
+(defmethod allocate-instance ((class system-class) &rest initargs)
+  (declare (ignore initargs))
+  (error "Cannot allocate an instance of ~S." class))
 
 ;;; AMOP says that CLASS-SLOTS signals an error for unfinalized classes.
 (defmethod class-slots :before ((class slot-class))
@@ -525,3 +488,11 @@
            :format-control "~S called on ~S, which is not yet finalized."
            :format-arguments (list 'class-slots class)
            :references (list '(:amop :generic-function class-slots)))))
+
+(defun %set-slots (object names &rest values)
+  (mapc (lambda (name value)
+          (if (eq value +slot-unbound+)
+              ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
+              (slot-makunbound object name)
+              (setf (slot-value object name) value)))
+        names values))

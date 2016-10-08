@@ -23,22 +23,24 @@
 
 ;;;; IN-PACKAGE
 
-(defmacro-mundanely in-package (string-designator)
+(sb!xc:proclaim '(special *package*))
+(sb!xc:defmacro in-package (string-designator)
   (let ((string (string string-designator)))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
        (setq *package* (find-undeleted-package-or-lose ,string)))))
 
 ;;;; MULTIPLE-VALUE-FOO
 
-(defun list-of-symbols-p (x)
-  (and (listp x)
-       (every #'symbolp x)))
+(flet ((validate-vars (vars)
+         (unless (and (listp vars) (every #'symbolp vars))
+           (error "Vars is not a list of symbols: ~S" vars))))
 
-(defmacro-mundanely multiple-value-bind (vars value-form &body body)
-  (if (list-of-symbols-p vars)
-    ;; It's unclear why it would be important to special-case the LENGTH=1 case
-    ;; at this level, but the CMU CL code did it, so.. -- WHN 19990411
-    (if (= (length vars) 1)
+(sb!xc:defmacro multiple-value-bind (vars value-form &body body)
+  (validate-vars vars)
+  (if (= (length vars) 1)
+      ;; Not only does it look nicer to reduce to LET in this special case,
+      ;; if might produce better code or at least compile quicker.
+      ;; Certainly for the evaluator it's preferable.
       `(let ((,(car vars) ,value-form))
          ,@body)
       (let ((ignore (sb!xc:gensym)))
@@ -46,27 +48,25 @@
                                          &rest ,ignore)
                                   (declare (ignore ,ignore))
                                   ,@body)
-                              ,value-form)))
-    (error "Vars is not a list of symbols: ~S" vars)))
+                              ,value-form))))
 
-(defmacro-mundanely multiple-value-setq (vars value-form)
-  (unless (list-of-symbols-p vars)
-    (error "Vars is not a list of symbols: ~S" vars))
+(sb!xc:defmacro multiple-value-setq (vars value-form)
+  (validate-vars vars)
   ;; MULTIPLE-VALUE-SETQ is required to always return just the primary
   ;; value of the value-from, even if there are no vars. (SETF VALUES)
   ;; in turn is required to return as many values as there are
   ;; value-places, hence this:
   (if vars
       `(values (setf (values ,@vars) ,value-form))
-      `(values ,value-form)))
+      `(values ,value-form))))
 
-(defmacro-mundanely multiple-value-list (value-form)
+(sb!xc:defmacro multiple-value-list (value-form)
   `(multiple-value-call #'list ,value-form))
 
 ;;;; various conditional constructs
 
 ;;; COND defined in terms of IF
-(defmacro-mundanely cond (&rest clauses)
+(sb!xc:defmacro cond (&rest clauses)
   (if (endp clauses)
       nil
       (let ((clause (first clauses))
@@ -98,19 +98,19 @@
          (cond ((singleton-p forms) (car forms))
                ((not forms) nil)
                (t `(progn ,@forms)))))
-  (defmacro-mundanely when (test &body forms)
+  (sb!xc:defmacro when (test &body forms)
   #!+sb-doc
   "If the first argument is true, the rest of the forms are
 evaluated as a PROGN."
   `(if ,test ,(prognify forms)))
 
-  (defmacro-mundanely unless (test &body forms)
+  (sb!xc:defmacro unless (test &body forms)
   #!+sb-doc
   "If the first argument is not true, the rest of the forms are
 evaluated as a PROGN."
   `(if ,test nil ,(prognify forms))))
 
-(defmacro-mundanely and (&rest forms)
+(sb!xc:defmacro and (&rest forms)
   (cond ((endp forms) t)
         ((endp (rest forms))
          ;; Preserve non-toplevelness of the form!
@@ -120,7 +120,7 @@ evaluated as a PROGN."
               (and ,@(rest forms))
               nil))))
 
-(defmacro-mundanely or (&rest forms)
+(sb!xc:defmacro or (&rest forms)
   (cond ((endp forms) nil)
         ((endp (rest forms))
          ;; Preserve non-toplevelness of the form!
@@ -140,18 +140,18 @@ evaluated as a PROGN."
               (,let ,varlist
                 ,@decls
                 (tagbody ,@body))))))
-  (defmacro-mundanely prog (varlist &body body-decls)
+  (sb!xc:defmacro prog (varlist &body body-decls)
     (prog-expansion-from-let varlist body-decls 'let))
-  (defmacro-mundanely prog* (varlist &body body-decls)
+  (sb!xc:defmacro prog* (varlist &body body-decls)
     (prog-expansion-from-let varlist body-decls 'let*)))
 
-(defmacro-mundanely prog1 (result &body body)
+(sb!xc:defmacro prog1 (result &body body)
   (let ((n-result (gensym)))
     `(let ((,n-result ,result))
        ,@body
        ,n-result)))
 
-(defmacro-mundanely prog2 (form1 result &body body)
+(sb!xc:defmacro prog2 (form1 result &body body)
   `(prog1 (progn ,form1 ,result) ,@body))
 
 ;;;; DEFUN
@@ -176,7 +176,7 @@ evaluated as a PROGN."
    ;; the only unsurprising choice.
    (info :function :inline-expansion-designator name)))
 
-(defmacro-mundanely defun (&environment env name lambda-list &body body)
+(sb!xc:defmacro defun (&environment env name lambda-list &body body)
   #!+sb-doc
   "Define a function at top level."
   #+sb-xc-host
@@ -184,13 +184,10 @@ evaluated as a PROGN."
     (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
   (multiple-value-bind (forms decls doc) (parse-body body t)
     (let* (;; stuff shared between LAMBDA and INLINE-LAMBDA and NAMED-LAMBDA
-           (lambda-guts `(,lambda-list
-                          ,@(when doc (list doc))
-                          ,@decls
-                          (block ,(fun-name-block-name name)
-                            ,@forms)))
-           (lambda `(lambda ,@lambda-guts))
-           (named-lambda `(named-lambda ,name ,@lambda-guts))
+           (lambda-guts `(,@decls (block ,(fun-name-block-name name) ,@forms)))
+           (lambda `(lambda ,lambda-list ,@lambda-guts))
+           (named-lambda `(named-lambda ,name ,lambda-list
+                            ,@(when doc (list doc)) ,@lambda-guts))
            (inline-thing
             (or (sb!kernel::defstruct-generated-defn-p name lambda-list body)
                 (when (inline-fun-name-p name)
@@ -215,36 +212,30 @@ evaluated as a PROGN."
          ;; function, then the warning ought not to have been issued at all.
          ,@(when (typep name '(cons (eql setf)))
              `((eval-when (:compile-toplevel :execute)
-                 (sb!c::warn-if-setf-macro ',name))))))))
+                 (sb!c::warn-if-setf-macro ',name))
+               ',name))))))
 
 #-sb-xc-host
-(progn
-  (defun %defun (name def source-location &optional inline-lambda)
-    (declare (type function def))
-    ;; should've been checked by DEFMACRO DEFUN
-    (aver (legal-fun-name-p name))
-    (sb!c:%compiler-defun name inline-lambda nil)
-    (when (fboundp name)
-      (warn 'redefinition-with-defun
-            :name name :new-function def :new-location source-location))
-    (setf (sb!xc:fdefinition name) def)
+(defun %defun (name def source-location &optional inline-lambda)
+  (declare (type function def))
+  ;; should've been checked by DEFMACRO DEFUN
+  (aver (legal-fun-name-p name))
+  (sb!c:%compiler-defun name inline-lambda nil)
+  (when (fboundp name)
+    (warn 'redefinition-with-defun
+          :name name :new-function def :new-location source-location))
+  (setf (sb!xc:fdefinition name) def)
   ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
   ;; also checks package locks. By doing this here we let (SETF
   ;; FDEFINITION) do the load-time package lock checking before
   ;; we frob any existing inline expansions.
-    (sb!c::%set-inline-expansion name nil inline-lambda)
-    (sb!c::note-name-defined name :function)
-    name)
-  ;; During cold-init we don't touch the fdefinition.
-  (defun !%quietly-defun (name inline-lambda)
-    (sb!c:%compiler-defun name nil nil) ; makes :WHERE-FROM = :DEFINED
-    (sb!c::%set-inline-expansion name nil inline-lambda)
-    ;; and no need to call NOTE-NAME-DEFINED. It would do nothing.
-    ))
+  (sb!c::%set-inline-expansion name nil inline-lambda)
+  (sb!c::note-name-defined name :function)
+  name)
 
 ;;;; DEFVAR and DEFPARAMETER
 
-(defmacro-mundanely defvar (var &optional (val nil valp) (doc nil docp))
+(sb!xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
   #!+sb-doc
   "Define a special variable at top level. Declare the variable
   SPECIAL and, optionally, initialize it. If the variable already has a
@@ -258,9 +249,9 @@ evaluated as a PROGN."
               ,@(and valp
                      `((unless (boundp ',var) ,val)))
               ,@(and docp
-                     `(,doc)))))
+                     `(',doc)))))
 
-(defmacro-mundanely defparameter (var val &optional (doc nil docp))
+(sb!xc:defmacro defparameter (var val &optional (doc nil docp))
   #!+sb-doc
   "Define a parameter that is not normally changed by the program,
   but that may be changed without causing an error. Declare the
@@ -272,7 +263,7 @@ evaluated as a PROGN."
        (%compiler-defvar ',var))
      (%defparameter ',var ,val (sb!c:source-location)
                     ,@(and docp
-                           `(,doc)))))
+                           `(',doc)))))
 
 (defun %compiler-defvar (var)
   (sb!xc:proclaim `(special ,var)))
@@ -301,12 +292,45 @@ evaluated as a PROGN."
 
 ;;;; iteration constructs
 
-;;; (These macros are defined in terms of a function FROB-DO-BODY which
-;;; is also used by SB!INT:DO-ANONYMOUS. Since these macros should not
-;;; be loaded on the cross-compilation host, but SB!INT:DO-ANONYMOUS
-;;; and FROB-DO-BODY should be, these macros can't conveniently be in
-;;; the same file as FROB-DO-BODY.)
-(defmacro-mundanely do (varlist endlist &body body)
+(flet
+    ((frob-do-body (varlist endlist decls-and-code bind step name block)
+       ;; Check for illegal old-style DO.
+       (when (or (not (listp varlist)) (atom endlist))
+         (error "ill-formed ~S -- possibly illegal old style DO?" name))
+       (collect ((steps))
+         (let ((inits
+                (mapcar (lambda (var)
+                          (or (cond ((symbolp var) var)
+                                    ((listp var)
+                                     (unless (symbolp (first var))
+                                       (error "~S step variable is not a symbol: ~S"
+                                              name (first var)))
+                                     (case (length var)
+                                       ((1 2) var)
+                                       (3 (steps (first var) (third var))
+                                          (list (first var) (second var))))))
+                              (error "~S is an illegal form for a ~S varlist."
+                                     var name)))
+                        varlist)))
+           (multiple-value-bind (code decls) (parse-body decls-and-code nil)
+             (let ((label-1 (sb!xc:gensym)) (label-2 (sb!xc:gensym)))
+               `(block ,block
+                  (,bind ,inits
+                    ,@decls
+                    (tagbody
+                     (go ,label-2)
+                     ,label-1
+                     (tagbody ,@code)
+                     (,step ,@(steps))
+                     ,label-2
+                     (unless ,(first endlist) (go ,label-1))
+                     (return-from ,block (progn ,@(rest endlist))))))))))))
+
+  ;; This is like DO, except it has no implicit NIL block.
+  (sb!xc:defmacro do-anonymous (varlist endlist &rest body)
+    (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (sb!xc:gensym)))
+
+  (sb!xc:defmacro do (varlist endlist &body body)
   #!+sb-doc
   "DO ({(Var [Init] [Step])}*) (Test Exit-Form*) Declaration* Form*
   Iteration construct. Each Var is initialized in parallel to the value of the
@@ -317,7 +341,8 @@ evaluated as a PROGN."
   named NIL is established around the entire expansion, allowing RETURN to be
   used as an alternate exit mechanism."
   (frob-do-body varlist endlist body 'let 'psetq 'do nil))
-(defmacro-mundanely do* (varlist endlist &body body)
+
+  (sb!xc:defmacro do* (varlist endlist &body body)
   #!+sb-doc
   "DO* ({(Var [Init] [Step])}*) (Test Exit-Form*) Declaration* Form*
   Iteration construct. Each Var is initialized sequentially (like LET*) to the
@@ -327,31 +352,19 @@ evaluated as a PROGN."
   the Exit-Forms are evaluated as a PROGN, with the result being the value
   of the DO. A block named NIL is established around the entire expansion,
   allowing RETURN to be used as an alternate exit mechanism."
-  (frob-do-body varlist endlist body 'let* 'setq 'do* nil))
+  (frob-do-body varlist endlist body 'let* 'setq 'do* nil)))
 
-;;; DOTIMES and DOLIST could be defined more concisely using
-;;; destructuring macro lambda lists or DESTRUCTURING-BIND, but then
-;;; it'd be tricky to use them before those things were defined.
-;;; They're used enough times before destructuring mechanisms are
-;;; defined that it looks as though it's worth just implementing them
-;;; ASAP, at the cost of being unable to use the standard
-;;; destructuring mechanisms.
-(defmacro-mundanely dotimes ((var count &optional (result nil)) &body body)
-  (cond ((integerp count)
-        `(do ((,var 0 (1+ ,var)))
-             ((>= ,var ,count) ,result)
-           (declare (type unsigned-byte ,var))
-           ,@body))
-        (t
-         (let ((c (gensym "COUNT")))
-           `(do ((,var 0 (1+ ,var))
-                 (,c ,count))
-                ((>= ,var ,c) ,result)
-              (declare (type unsigned-byte ,var)
-                       (type integer ,c))
-              ,@body)))))
+(sb!xc:defmacro dotimes ((var count &optional (result nil)) &body body)
+  ;; A nice optimization would be that if VAR is never referenced,
+  ;; it's slightly more efficient to count backwards, but that's tricky.
+  (let ((c (if (integerp count) count (sb!xc:gensym))))
+    `(do ((,var 0 (1+ ,var))
+          ,@(if (symbolp c) `((,c (the integer ,count)))))
+         ((>= ,var ,c) ,result)
+       (declare (type unsigned-byte ,var))
+       ,@body)))
 
-(defmacro-mundanely dolist ((var list &optional (result nil)) &body body &environment env)
+(sb!xc:defmacro dolist ((var list &optional (result nil)) &body body &environment env)
   ;; We repeatedly bind the var instead of setting it so that we never
   ;; have to give the var an arbitrary value such as NIL (which might
   ;; conflict with a declaration). If there is a result form, we
@@ -424,7 +437,7 @@ evaluated as a PROGN."
 (setf (info :variable :always-bound '*restart-clusters*)
       #+sb-xc :always-bound #-sb-xc :eventually)
 
-(defmacro-mundanely with-condition-restarts
+(sb!xc:defmacro with-condition-restarts
     (condition-form restarts-form &body body)
   #!+sb-doc
   "Evaluates the BODY in a dynamic environment where the restarts in the list
@@ -444,7 +457,7 @@ evaluated as a PROGN."
          (dolist (,restart ,restarts)
            (pop (restart-associated-conditions ,restart)))))))
 
-(defmacro-mundanely restart-bind (bindings &body forms)
+(sb!xc:defmacro restart-bind (bindings &body forms)
   #!+sb-doc
   "(RESTART-BIND ({(case-name function {keyword value}*)}*) forms)
    Executes forms in a dynamic context where the given bindings are in
@@ -503,7 +516,7 @@ evaluated as a PROGN."
               expression))
         expression)))
 
-(defmacro-mundanely restart-case (expression &body clauses &environment env)
+(sb!xc:defmacro restart-case (expression &body clauses &environment env)
   #!+sb-doc
   "(RESTART-CASE form {(case-name arg-list {keyword value}* body)}*)
    The form is evaluated in a dynamic context where the clauses have
@@ -595,7 +608,7 @@ evaluated as a PROGN."
                     ,(munge-restart-case-expression expression env)))
                 ,@(mapcan #'make-apply-and-return clauses-data))))))))
 
-(defmacro-mundanely with-simple-restart ((restart-name format-string
+(sb!xc:defmacro with-simple-restart ((restart-name format-string
                                                        &rest format-arguments)
                                          &body forms)
   #!+sb-doc
@@ -615,7 +628,7 @@ evaluated as a PROGN."
                   (format ,stream ,format-string ,@format-arguments))
         (values nil t)))))
 
-(defmacro-mundanely %handler-bind (bindings form &environment env)
+(sb!xc:defmacro %handler-bind (bindings form &environment env)
   (unless bindings
     (return-from %handler-bind form))
   ;; As an optimization, this looks at the handler parts of BINDINGS
@@ -745,7 +758,7 @@ evaluated as a PROGN."
                          *handler-clusters*)))
            ,form)))))
 
-(defmacro-mundanely handler-bind (bindings &body forms)
+(sb!xc:defmacro handler-bind (bindings &body forms)
   #!+sb-doc
   "(HANDLER-BIND ( {(type handler)}* ) body)
 
@@ -763,7 +776,7 @@ condition."
                   ;; Need to catch FP errors here!
                   #!+x86 (multiple-value-prog1 (progn ,@forms) (float-wait))))
 
-(defmacro-mundanely handler-case (form &rest cases)
+(sb!xc:defmacro handler-case (form &rest cases)
   #!+sb-doc
   "(HANDLER-CASE form { (type ([var]) body) }* )
 
@@ -832,18 +845,18 @@ specification."
 
 ;;;; miscellaneous
 
-(defmacro-mundanely return (&optional (value nil))
+(sb!xc:defmacro return (&optional (value nil))
   `(return-from nil ,value))
 
-(defmacro-mundanely lambda (&whole whole args &body body)
+(sb!xc:defmacro lambda (&whole whole args &body body)
   (declare (ignore args body))
   `#',whole)
 
-(defmacro-mundanely named-lambda (&whole whole name args &body body)
+(sb!xc:defmacro named-lambda (&whole whole name args &body body)
   (declare (ignore name args body))
   `#',whole)
 
-(defmacro-mundanely lambda-with-lexenv (&whole whole
+(sb!xc:defmacro lambda-with-lexenv (&whole whole
                                         declarations macros symbol-macros
                                         &body body)
   (declare (ignore declarations macros symbol-macros body))
