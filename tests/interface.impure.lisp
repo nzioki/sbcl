@@ -20,12 +20,12 @@
   `(let ((*standard-output* (make-broadcast-stream))) ,@things))
 
 ;; Interpreted closure is a problem for COMPILE
-(with-test (:name :disassemble :skipped-on :interpreter)
-;;; DISASSEMBLE shouldn't fail on closures or unpurified functions
+(with-test (:name (disassemble function) :skipped-on :interpreter)
+  ;; DISASSEMBLE shouldn't fail on closures or unpurified functions
   (defun disassemble-fun (x) x)
   (silently (disassemble 'disassemble-fun)))
 
-(with-test (:name :disassemble-closure :skipped-on :interpreter)
+(with-test (:name (disassemble :closure) :skipped-on :interpreter)
   (let ((x 1)) (defun disassemble-closure (y) (if y (setq x y) x)))
   (silently (disassemble 'disassemble-closure)))
 
@@ -37,7 +37,7 @@
   (import 'sb-interpreter:interpreted-function-p))
 
 #+(or sb-eval sb-fasteval)
-(with-test (:name :disassemble-interpreted)
+(with-test (:name (disassemble :interpreted))
     ;; Nor should it fail on interpreted functions
     (let ((sb-ext:*evaluator-mode* :interpret))
       (eval `(defun disassemble-eval (x) x))
@@ -49,7 +49,7 @@
     ;; is not installed.)"
     (assert (interpreted-function-p (symbol-function 'disassemble-eval))))
 
-(with-test (:name :disassemble-generic)
+(with-test (:name (disassemble generic-function))
   ;; nor should it fail on generic functions or other funcallable instances
   (defgeneric disassemble-generic (x))
   (silently (disassemble 'disassemble-generic))
@@ -62,7 +62,12 @@
 
 (let ((x 1)) (defun fle-closure (y) (if y (setq x y) x)))
 
-(with-test (:name :function-lambda-expression)
+(defclass non-standard-generic-function (generic-function) ()
+  (:metaclass sb-mop:funcallable-standard-class))
+(defmethod sb-mop:generic-function-name ((generic-function non-standard-generic-function))
+  'name)
+
+(with-test (:name function-lambda-expression)
   (flet ((fle-name (x)
            (nth-value 2 (function-lambda-expression x))))
     (assert (eql (fle-name #'fle-fun) 'fle-fun))
@@ -71,7 +76,7 @@
     (function-lambda-expression
      (make-instance 'sb-mop:funcallable-standard-object))
     (function-lambda-expression
-     (make-instance 'generic-function))
+     (make-instance 'non-standard-generic-function))
     (function-lambda-expression
      (make-instance 'standard-generic-function))
     #+(or sb-eval sb-fasteval)
@@ -82,78 +87,6 @@
 
       ;; fle-eval should still be an interpreted function.
       (assert (interpreted-function-p (symbol-function 'fle-eval))))))
-
-
-;;; support for DESCRIBE tests
-(defstruct to-be-described a b)
-(defclass forward-describe-class (forward-describe-ref) (a))
-(let ((sb-ext:*evaluator-mode* :compile))
-  (eval `(let (x) (defun closure-to-describe () (incf x)))))
-
-(with-test (:name (describe :empty-gf))
-  (assert-no-signal
-   (silently (describe (make-instance 'generic-function)))
-   warning)
-  (assert-signal
-   (silently (describe (make-instance 'standard-generic-function)))
-   warning))
-
-;;; DESCRIBE should run without signalling an error.
-(with-test (:name (describe :no-error))
- (silently
-  (describe (make-to-be-described))
-  (describe 12)
-  (describe "a string")
-  (describe 'symbolism)
-  (describe (find-package :cl))
-  (describe '(a list))
-  (describe #(a vector))
-;; bug 824974
-  (describe 'closure-to-describe)))
-
-;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
-;;; FRESH-LINE and TERPRI neatly.
-(with-test (:name (describe fresh-line terpri))
-  (dolist (i (list (make-to-be-described :a 14) 12 "a string"
-                   #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
-                   (find-package :keyword) (list 1 2 3)
-                   nil (cons 1 2) (make-hash-table)
-                   (let ((h (make-hash-table)))
-                     (setf (gethash 10 h) 100
-                           (gethash 11 h) 121)
-                     h)
-                   (make-condition 'simple-error)
-                   (make-condition 'simple-error :format-control "fc")
-                   #'car #'make-to-be-described (lambda (x) (+ x 11))
-                   (constantly 'foo) #'(setf to-be-described-a)
-                   #'describe-object (find-class 'to-be-described)
-                   (find-class 'forward-describe-class)
-                   (find-class 'forward-describe-ref) (find-class 'cons)))
-    (let ((s (with-output-to-string (s)
-               (write-char #\x s)
-               (describe i s))))
-      (macrolet ((check (form)
-                   `(or ,form
-                        (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
-        (check (char= #\x (char s 0)))
-        ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
-        (check (char= #\newline (char s 1)))
-        (check (char/= #\newline (char s 2)))
-        ;; one trailing #\NEWLINE from TERPRI or the like, no more
-        (let ((n (length s)))
-          (check (char= #\newline (char s (- n 1))))
-          (check (char/= #\newline (char s (- n 2)))))))))
-
-(with-test (:name (describe :argument-precedence-order))
-  ;; Argument precedence order information is only interesting for two
-  ;; or more required parameters.
-  (assert (not (search "Argument precedence order"
-                       (with-output-to-string (stream)
-                         (describe #'class-name stream)))))
-  (assert (search "Argument precedence order"
-                  (with-output-to-string (stream)
-                    (describe #'add-method stream)))))
-
 
 ;;; Tests of documentation on types and classes
 
@@ -376,10 +309,10 @@
   (assert (not (setf (documentation 'docfoo 'function) nil)))
   (assert-documentation 'docfoo 'function nil))
 
-(with-test (:name (documentation :built-in-macro) :skipped-on '(not :sb-doc))
+(with-test (:name (documentation :built-in-macro) :skipped-on (not :sb-doc))
   (assert (documentation 'trace 'function)))
 
-(with-test (:name (documentation :built-in-function) :skipped-on '(not :sb-doc))
+(with-test (:name (documentation :built-in-function) :skipped-on (not :sb-doc))
   (assert (documentation 'cons 'function)))
 
 (defvar documentation.variable nil
@@ -434,35 +367,7 @@
   (setf (documentation 'bug-643958-test 'function) "bar")
   (assert (equal "bar" (documentation 'bug-643958-test 'function))))
 
-(defclass cannot-print-this ()
-  ())
-(defmethod print-object ((oops cannot-print-this) stream)
-  (error "No go!"))
-(with-test (:name :describe-suppresses-print-errors)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (describe (make-instance 'cannot-print-this) s))))
-(with-test (:name :backtrace-suppresses-print-errors)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (labels ((foo (n x)
-                 (when (plusp n)
-                   (foo (1- n) x))
-                 (when (zerop n)
-                   (sb-debug:print-backtrace :count 100 :stream s))))
-        (foo 100 (make-instance 'cannot-print-this))))))
-(with-test (:name :backtrace-and-circles)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (labels ((foo (n x)
-                 (when (plusp n)
-                   (foo (1- n) x))
-                 (when (zerop n)
-                   (sb-debug:print-backtrace :count 100 :stream s))))
-        (foo 100 (let ((list (list t)))
-                   (nconc list list)))))))
-
-(with-test (:name :endianness-in-features)
+(with-test (:name (:endianness :in *features*))
   (assert
    (or (member :big-endian *features*)
        (member :little-endian *features*))))

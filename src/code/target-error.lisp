@@ -18,12 +18,6 @@
 
 ;; Host lisp does not need a value for this, so start it out as NIL.
 (defglobal **initial-handler-clusters** nil)
-(setq **initial-handler-clusters**
-  `(((,(find-classoid-cell 'warning :create t)
-      .
-      ,(named-lambda "MAYBE-MUFFLE" (warning)
-         (when (muffle-warning-p warning)
-           (muffle-warning warning)))))))
 
 ;;; Each cluster is an alist of the form
 ;;;
@@ -39,18 +33,23 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-(defvar *handler-clusters* **initial-handler-clusters**)
+#!+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
+#!-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
 
 ;;; a list of lists of currently active RESTART instances. maintained
 ;;; by RESTART-BIND.
-;;; This variable is proclaimed to be "eventually" always-bound,
-;;; meaning in the loaded code. If DEFVAR were used, the compiler knows that
-;;; BOUNDP will be T, and therefore a code deletion note should be issused
-;;; for the initialization expression (UNLESS (BOUNDP x) <initform>).
-;;; Technically it's not even right to use DEFVAR because it works only
-;;; if the initializer is really NIL, since that is what %DEFVAR will assign
-;;; on account of the fact that an initializer was supplied at all.
-(defparameter *restart-clusters* '())
+(!define-thread-local *restart-clusters* nil)
+
+(defun !target-error-cold-init ()
+  (setq **initial-handler-clusters**
+        `(((,(find-classoid-cell 'warning :create t)
+            .
+            ,(named-lambda "MAYBE-MUFFLE" (warning)
+               (when (muffle-warning-p warning)
+                 (muffle-warning warning)))))))
+  ;;; If multithreaded, *HANDLER-CLUSTERS* is #<unbound> at this point.
+  ;;; This SETQ assigns to TLS since the value is not no-tls-value-marker.
+  (setq *handler-clusters* **initial-handler-clusters**))
 
 (defmethod print-object ((restart restart) stream)
   (if *print-escape*
@@ -58,7 +57,6 @@
         (prin1 (restart-name restart) stream))
       (restart-report restart stream)))
 
-#!+sb-doc
 (setf (fdocumentation 'restart-name 'function)
       "Return the name of the given restart object.")
 
@@ -99,7 +97,6 @@
           (funcall function restart))))))
 
 (defun compute-restarts (&optional condition)
-  #!+sb-doc
   "Return a list of all the currently active restarts ordered from most recently
 established to less recently established. If CONDITION is specified, then only
 restarts associated with CONDITION (or with no condition) will be returned."
@@ -143,7 +140,6 @@ restarts associated with CONDITION (or with no condition) will be returned."
         (map-restarts #'named-restart-p condition call-test-p))))
 
 (defun find-restart (identifier &optional condition)
-  #!+sb-doc
   "Return the first restart identified by IDENTIFIER. If IDENTIFIER is a symbol,
 then the innermost applicable restart with that name is returned. If IDENTIFIER
 is a restart, it is returned if it is currently active. Otherwise NIL is
@@ -163,7 +159,6 @@ with that condition (or with no condition) will be returned."
              :format-arguments (list identifier condition))))
 
 (defun invoke-restart (restart &rest values)
-  #!+sb-doc
   "Calls the function associated with the given restart, passing any given
    arguments. If the argument restart is not a restart or a currently active
    non-nil restart name, then a CONTROL-ERROR is signalled."
@@ -202,7 +197,6 @@ with that condition (or with no condition) will be returned."
         '())))
 
 (defun invoke-restart-interactively (restart)
-  #!+sb-doc
   "Calls the function associated with the given restart, prompting for any
    necessary arguments. If the argument restart is not a restart or a
    currently active non-NIL restart name, then a CONTROL-ERROR is signalled."
@@ -213,11 +207,27 @@ with that condition (or with no condition) will be returned."
          (args (interactive-restart-arguments real-restart)))
     (apply (restart-function real-restart) args)))
 
+;;; To reduce expansion size of RESTART-CASE
+(defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
+  (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint*
+                                       'with-simple-condition-restarts))
+        (condition (apply #'coerce-to-condition datum
+                          (case function
+                            (warn 'simple-warning)
+                            (signal 'simple-condition)
+                            (t 'simple-error))
+                          function
+                          arguments)))
+    (with-condition-restarts condition (car *restart-clusters*)
+      (if (eq function 'cerror)
+          (cerror cerror-arg condition)
+          (funcall function condition)))))
+
 
-(defun assert-error (assertion args-and-values places datum &rest arguments)
+(defun assert-error (assertion &optional args-and-values places datum &rest arguments)
   (let ((cond (if datum
-                  (coerce-to-condition
-                   datum arguments 'simple-error 'error)
+                  (apply #'coerce-to-condition
+                         datum 'simple-error 'error arguments)
                   (make-condition
                    'simple-error
                    :format-control "~@<The assertion ~S failed~:[.~:; ~
@@ -245,7 +255,16 @@ with that condition (or with no condition) will be returned."
   (finish-output *query-io*)
   (list (eval (read *query-io*))))
 
-(defun check-type-error (place place-value type type-string)
+;;; Same as above but returns multiple values
+(defun mv-read-evaluated-form (&optional (prompt-control nil promptp)
+                            &rest prompt-args)
+  (apply #'format *query-io*
+         (if promptp prompt-control "~&Type a form to be evaluated: ")
+         prompt-args)
+  (finish-output *query-io*)
+  (multiple-value-list (eval (read *query-io*))))
+
+(defun check-type-error (place place-value type &optional type-string)
   (let ((condition
          (make-condition
           'simple-type-error

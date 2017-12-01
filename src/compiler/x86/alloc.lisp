@@ -38,8 +38,7 @@
                              temp))))
                      (storew reg ,list ,slot list-pointer-lowtag))))
              (let ((cons-cells (if star (1- num) num))
-                   (stack-allocate-p (awhen (sb!c::node-lvar node)
-                                       (sb!c::lvar-dynamic-extent it))))
+                   (stack-allocate-p (node-stack-allocate-p node)))
                (maybe-pseudo-atomic stack-allocate-p
                 (allocation res (* (pad-data-block cons-size) cons-cells) node
                             stack-allocate-p list-pointer-lowtag)
@@ -168,7 +167,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:sc any-reg) temp)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
@@ -178,9 +178,14 @@
        (allocation result (pad-data-block size) node
                    stack-allocate-p
                    fun-pointer-lowtag)
-       (storew (logior (ash (1- size) n-widetag-bits) closure-header-widetag)
+       (storew (logior (ash (1- size) n-widetag-bits) closure-widetag)
                result 0 fun-pointer-lowtag))
-    (loadw temp function closure-fun-slot fun-pointer-lowtag)
+    ;; These two instructions are within the scope of PSEUDO-ATOMIC.
+    ;; This is due to scav_closure() assuming that it can always subtract
+    ;; FUN_RAW_ADDR_OFFSET from closure->fun to obtain a Lisp object,
+    ;; without any precheck for whether that word is currently 0.
+    (inst lea temp (make-ea-for-object-slot function simple-fun-code-offset
+                                            fun-pointer-lowtag))
     (storew temp result closure-fun-slot fun-pointer-lowtag))))
 
 ;;; The compiler likes to be able to directly make value cells.
@@ -191,7 +196,7 @@
   (:node-var node)
   (:generator 10
     (with-fixed-allocation
-        (result value-cell-header-widetag value-cell-size node stack-allocate-p)
+        (result value-cell-widetag value-cell-size node stack-allocate-p)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; automatic allocators for primitive objects
@@ -229,7 +234,7 @@
                #.(loop for offset in *dword-regs*
                     collect `(,offset
                               ',(intern (format nil "ALLOCATE-CONS-TO-~A"
-                                                (svref *dword-register-names*
+                                                (svref +dword-register-names+
                                                        offset)))) into cases
                     finally (return `(case (tn-offset result)
                                        ,@cases)))))

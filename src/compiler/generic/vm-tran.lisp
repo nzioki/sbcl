@@ -31,7 +31,13 @@
   '(if (< x 0) (- x) x))
 
 (deftransform make-symbol ((string) (simple-string))
-  `(%make-symbol string))
+  `(%make-symbol 0 string))
+
+#!-immobile-space
+(define-source-transform %make-symbol (kind string)
+  (declare (ignore kind))
+  ;; Set "logically read-only" bit in pname.
+  `(sb!vm::%%make-symbol (set-header-data ,string sb!vm:+vector-shareable+)))
 
 ;;; We don't want to clutter the bignum code.
 #!+(or x86 x86-64)
@@ -81,14 +87,16 @@
 ;;; The layout is stored in slot 0.
 ;;; *** These next two transforms should be the only code, aside from
 ;;;     some parts of the C runtime, with knowledge of the layout index.
-(define-source-transform %instance-layout (x)
-  `(truly-the layout (%instance-ref ,x 0)))
-(define-source-transform %set-instance-layout (x val)
-  `(%instance-set ,x 0 (the layout ,val)))
-(define-source-transform %funcallable-instance-layout (x)
-  `(truly-the layout (%funcallable-instance-info ,x 0)))
-(define-source-transform %set-funcallable-instance-layout (x val)
-  `(setf (%funcallable-instance-info ,x 0) (the layout ,val)))
+#!-compact-instance-header
+(progn
+  (define-source-transform %instance-layout (x)
+    `(truly-the layout (%instance-ref ,x 0)))
+  (define-source-transform %set-instance-layout (x val)
+    `(%instance-set ,x 0 (the layout ,val)))
+  (define-source-transform %funcallable-instance-layout (x)
+    `(truly-the layout (%funcallable-instance-info ,x 0)))
+  (define-source-transform %set-funcallable-instance-layout (x val)
+    `(setf (%funcallable-instance-info ,x 0) (the layout ,val))))
 
 ;;;; simplifying HAIRY-DATA-VECTOR-REF and HAIRY-DATA-VECTOR-SET
 
@@ -151,7 +159,7 @@
                             (reduce #'* dims))))
         `(data-vector-ref (truly-the (simple-array ,(type-specifier el-type)
                                                    (,total-size))
-                                     (%array-data-vector array))
+                                     (%array-data array))
                           index)))))
 
 ;;; Transform data vector access to a form that opens up optimization
@@ -192,9 +200,11 @@
            (data-vector-set string index new-value))
           #!+sb-unicode
           ((simple-array base-char (*))
-           (data-vector-set string index new-value))
+           (data-vector-set string index (the* (base-char :context :aref
+                                                          :silent-conflict t)
+                                               new-value)))
           ((simple-array nil (*))
-           (%type-check-error/c string 'nil-array-accessed-error))))))
+           (%type-check-error/c string 'nil-array-accessed-error nil))))))
 
 ;;; This and the corresponding -REF transform work equally well on non-simple
 ;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
@@ -239,7 +249,7 @@
                             (reduce #'* dims))))
         `(data-vector-set (truly-the (simple-array ,(type-specifier el-type)
                                                    (,total-size))
-                                     (%array-data-vector array))
+                                     (%array-data array))
                           index
                           new-value)))))
 
@@ -292,7 +302,7 @@
 (deftransform array-storage-vector ((array) ((simple-array * (*))))
   'array)
 
-(defoptimizer (%array-data-vector derive-type) ((array))
+(defoptimizer (%array-data derive-type) ((array))
   (let ((atype (lvar-type array)))
     (when (array-type-p atype)
       (specifier-type (or
@@ -336,7 +346,7 @@
   (upgraded-element-type-specifier-or-give-up %array)
 
   '(if (array-header-p %array)
-       (values (%array-data-vector %array) %index)
+       (values (%array-data %array) %index)
        (values %array %index)))
 
 ;;;; BIT-VECTOR hackery
@@ -766,3 +776,15 @@
 (deftransform sb!vm::get-lisp-obj-address ((obj) ((constant-arg character)))
   (logior sb!vm::character-widetag
           (ash (char-code (lvar-value obj)) sb!vm::n-widetag-bits)))
+
+;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
+;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.
+#-sb-xc-host
+(defun make-unbound-marker () ; for interpreters
+  (sb!sys:%primitive make-unbound-marker))
+;; Get the main compiler to transform MAKE-UNBOUND-MARKER
+;; without the fopcompiler seeing it - the fopcompiler does
+;; expand compiler-macros, but not source-transforms -
+;; because %PRIMITIVE is not generally fopcompilable.
+(sb!c:define-source-transform make-unbound-marker ()
+  `(sb!sys:%primitive make-unbound-marker))

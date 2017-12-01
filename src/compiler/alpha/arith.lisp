@@ -60,8 +60,6 @@
   (:results (r :scs (any-reg)))
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-unsigned-binop)
@@ -71,8 +69,6 @@
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:note "inline (unsigned-byte 64) arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-signed-binop)
@@ -82,8 +78,6 @@
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (signed-byte 64) arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-fixnum-c-binop fast-fixnum-binop)
@@ -443,8 +437,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:policy :fast-safe))
 
@@ -829,27 +821,3 @@
   (:translate sb!bignum:%ashl)
   (:generator 1
     (inst sll digit count result)))
-
-;;;; static functions
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)

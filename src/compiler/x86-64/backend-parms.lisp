@@ -19,10 +19,6 @@
 
 (defconstant +backend-fasl-file-implementation+ :x86-64)
 
-(setf *backend-register-save-penalty* 3)
-
-(setf *backend-byte-order* :little-endian)
-
 ;;; KLUDGE: It would seem natural to set this by asking our C runtime
 ;;; code for it, but mostly we need it for GENESIS, which doesn't in
 ;;; general have our C runtime code running to ask, so instead we set
@@ -32,13 +28,12 @@
 ;;; useless in SBCL, since it's possible for otherwise binary
 ;;; compatible systems to return different values for getpagesize().
 ;;; -- JES, 2007-01-06
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf *backend-page-bytes* 32768))
+(defconstant +backend-page-bytes+ #!+win32 65536 #!-win32 32768)
 
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes *backend-page-bytes*)
+(defconstant gencgc-card-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -46,8 +41,6 @@
 (defconstant gencgc-alloc-granularity 0)
 ;;; The minimum size at which we release address ranges to the OS.
 ;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity *backend-page-bytes*)
-
-#!+sb-safepoint
-(defconstant thread-saved-csp-offset
-    (- (/ *backend-page-bytes* n-word-bytes)))
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+;;; The card size for immobile/low space
+#!+immobile-space (def!constant immobile-card-bytes 4096)

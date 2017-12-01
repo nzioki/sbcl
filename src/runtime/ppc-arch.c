@@ -271,14 +271,11 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 static int
 allocation_trap_p(os_context_t * context)
 {
-    int result;
     unsigned int *pc;
     unsigned inst;
     unsigned opcode;
     unsigned src;
-    unsigned dst;
-
-    result = 0;
+    unsigned __attribute__((unused)) dst;
 
     /*
      * First, the instruction has to be a TWLGE temp, NL3, which has the
@@ -331,7 +328,8 @@ handle_allocation_trap(os_context_t * context)
 {
     unsigned int *pc;
     unsigned int inst;
-    unsigned int target, target_ptr, end_addr;
+    unsigned int target;
+    unsigned int __attribute__((unused)) target_ptr, end_addr;
     unsigned int opcode;
     int size;
     boolean were_in_lisp;
@@ -421,7 +419,7 @@ handle_allocation_trap(os_context_t * context)
     fprintf(stderr, "Alloc %d to %s\n", size, lisp_register_names[target]);
 #endif
 
-#if INLINE_ALLOC_DEBUG
+#ifdef INLINE_ALLOC_DEBUG
     if ((((unsigned long)boxed_region.end_addr + size) / PAGE_SIZE) ==
         (((unsigned long)boxed_region.end_addr) / PAGE_SIZE)) {
       fprintf(stderr,"*** possibly bogus trap allocation of %d bytes at %p\n",
@@ -454,6 +452,7 @@ handle_allocation_trap(os_context_t * context)
 #endif
 
     {
+        extern lispobj* alloc(sword_t);
         struct interrupt_data *data =
             arch_os_get_current_thread()->interrupt_data;
         data->allocation_trap_context = context;
@@ -496,9 +495,9 @@ handle_allocation_trap(os_context_t * context)
      * instructions when threading is enabled and four instructions
      * otherwise. */
 #ifdef LISP_FEATURE_SB_THREAD
-    (*os_context_pc_addr(context)) = pc + 2;
+    (*os_context_pc_addr(context)) = (unsigned int)(pc + 2);
 #else
-    (*os_context_pc_addr(context)) = pc + 4;
+    (*os_context_pc_addr(context)) = (unsigned int)(pc + 4);
 #endif
 
 }
@@ -573,9 +572,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     }
     /* twi :ne ... or twi ... nargs */
     if (((code >> 26) == 3) && (((code >> 21) & 31) == 24
-#ifdef LISP_FEATURE_PRECISE_ARG_COUNT_ERROR
                                 || ((code >> 16) & 31) == reg_NARGS
-#endif
         )) {
         interrupt_internal_error(context, 0);
         return;

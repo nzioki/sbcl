@@ -34,54 +34,46 @@
   ;; string used in efficiency notes
   (note (missing-arg) :type string)
   ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
-  (important nil :type (member nil :slightly t)))
+  (important nil :type (member nil :slightly t))
+  ;; A function with NODE as an argument that checks wheteher the
+  ;; transform applies in its policy.
+  ;; It used to be checked in the FUNCTION body but it would produce
+  ;; notes about failed transformation due to types even though it
+  ;; wouldn't have been applied with the right types anyway,
+  ;; or if another transform could be applied with the right policy.
+  (policy nil :type (or null function)))
 
 (defprinter (transform) type note important)
 
 ;;; Grab the FUN-INFO and enter the function, replacing any old
 ;;; one with the same type and note.
-(declaim (ftype (function (t list function &optional (or string null)
-                             (member nil :slightly t))
-                          *)
-                %deftransform))
-(defun %deftransform (name type fun &optional note important)
+(defun %deftransform (name type fun &optional note important policy)
   (let* ((ctype (specifier-type type))
          (note (or note "optimize"))
          (info (fun-info-or-lose name))
-         (old (find-if (lambda (x)
-                         (and (type= (transform-type x) ctype)
-                              (string-equal (transform-note x) note)
-                              (eq (transform-important x) important)))
-                       (fun-info-transforms info))))
+         (old (find ctype (fun-info-transforms info)
+                    :test #'type=
+                    :key #'transform-type)))
     (cond (old
            (style-warn 'redefinition-with-deftransform
                        :transform old)
            (setf (transform-function old) fun
-                 (transform-note old) note))
+                 (transform-note old) note
+                 (transform-important old) important
+                 (transform-policy old) policy))
           (t
            (push (make-transform :type ctype :function fun :note note
-                                 :important important)
+                                 :important important
+                                 :policy policy)
                  (fun-info-transforms info))))
     name))
 
 ;;; Make a FUN-INFO structure with the specified type, attributes
 ;;; and optimizers.
-(declaim (ftype (function (list list attributes t &key
-                                (:derive-type (or function null))
-                                (:optimizer (or function null))
-                                (:destroyed-constant-args (or function null))
-                                (:result-arg (or index null))
-                                (:overwrite-fndb-silently boolean)
-                                (:foldable-call-check (or function null))
-                                (:callable-check (or function null))
-                                (:call-type-deriver (or function null)))
-                          *)
-                %defknown))
 (defun %defknown (names type attributes location
                   &key derive-type optimizer destroyed-constant-args result-arg
                        overwrite-fndb-silently
-                       foldable-call-check
-                       callable-check
+                       callable-map
                        call-type-deriver)
   (let ((ctype (specifier-type type)))
     (dolist (name names)
@@ -109,8 +101,7 @@
                            :optimizer optimizer
                            :destroyed-constant-args destroyed-constant-args
                            :result-arg result-arg
-                           :foldable-call-check foldable-call-check
-                           :callable-check callable-check
+                           :callable-map callable-map
                            :call-type-deriver call-type-deriver))
       (if location
           (setf (getf (info :source-location :declaration name) 'defknown)
@@ -124,6 +115,22 @@
   (or (info :function :info name) (error "~S is not a known function." name)))
 
 ;;;; generic type inference methods
+
+(defun symeval-derive-type (node &aux (args (basic-combination-args node))
+                                      (lvar (pop args)))
+  (unless (and lvar (endp args))
+    (return-from symeval-derive-type))
+  (if (constant-lvar-p lvar)
+      (let* ((sym (lvar-value lvar))
+             (var (maybe-find-free-var sym))
+             (local-type (when var
+                           (let ((*lexenv* (node-lexenv node)))
+                             (lexenv-find var type-restrictions))))
+             (global-type (info :variable :type sym)))
+        (if local-type
+            (type-intersection local-type global-type)
+            global-type))
+      *universal-type*))
 
 ;;; Derive the type to be the type of the xxx'th arg. This can normally
 ;;; only be done when the result value is that argument.

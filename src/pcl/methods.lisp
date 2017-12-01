@@ -56,7 +56,7 @@
                   :format-control ,(coerce (format nil "~@<~A~@:>" control)
                                            'base-string)
                   :format-arguments (list ',name)
-                  :references (list '(:amop :initialization method))))))
+                  :references '((:amop :initialization method))))))
   (def reinitialize-instance ((method method) &rest initargs)
     "Method objects cannot be redefined by ~S.")
   (def change-class ((method method) new &rest initargs)
@@ -167,9 +167,9 @@
   (declare (ignore slot-names method-cell))
   (initialize-method-function initargs method))
 
-(defvar *the-class-generic-function*
+(define-load-time-global *the-class-generic-function*
   (find-class 'generic-function))
-(defvar *the-class-standard-generic-function*
+(define-load-time-global *the-class-standard-generic-function*
   (find-class 'standard-generic-function))
 
 (defmethod shared-initialize :before
@@ -225,16 +225,13 @@
 
 (defun real-add-named-method (generic-function-name qualifiers
                               specializers lambda-list &rest other-initargs)
-  (unless (and (fboundp generic-function-name)
-               (typep (fdefinition generic-function-name) 'generic-function))
-    (warn 'implicit-generic-function-warning :name generic-function-name))
   (let* ((existing-gf (find-generic-function generic-function-name nil))
          (generic-function
-          (if existing-gf
-              (ensure-generic-function
-               generic-function-name
-               :generic-function-class (class-of existing-gf))
-              (ensure-generic-function generic-function-name)))
+           (if existing-gf
+               (ensure-generic-function
+                generic-function-name
+                :generic-function-class (class-of existing-gf))
+               (ensure-generic-function generic-function-name)))
          (proto (method-prototype-for-gf generic-function-name)))
     ;; FIXME: Destructive modification of &REST list.
     (setf (getf (getf other-initargs 'plist) :name)
@@ -248,40 +245,39 @@
 (define-condition find-method-length-mismatch
     (reference-condition simple-error)
   ()
-  (:default-initargs :references (list '(:ansi-cl :function find-method))))
+  (:default-initargs :references '((:ansi-cl :function find-method))))
 
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
                         always-check-specializers)
-  (let ((lspec (length specializers))
+  (let ((specializer-count (length specializers))
         (methods (generic-function-methods generic-function)))
     (when (or methods always-check-specializers)
-      (let ((nreq (length (arg-info-metatypes (gf-arg-info
-                                               generic-function)))))
+      (let ((required-parameter-count
+             (length (arg-info-metatypes (gf-arg-info generic-function)))))
         ;; Since we internally bypass FIND-METHOD by using GET-METHOD
-        ;; instead we need to to this here or users may get hit by a
+        ;; instead we need to do this here or users may get hit by a
         ;; failed AVER instead of a sensible error message.
-        (when (/= lspec nreq)
+        (unless (= specializer-count required-parameter-count)
           (error
            'find-method-length-mismatch
-           :format-control
-           "~@<The generic function ~S takes ~D required argument~:P; ~
-            was asked to find a method with specializers ~S~@:>"
-           :format-arguments (list generic-function nreq specializers)))))
-    (let ((hit
-           (dolist (method methods)
-             (let ((mspecializers (method-specializers method)))
-               (aver (= lspec (length mspecializers)))
-               (when (and (equal qualifiers (safe-method-qualifiers method))
-                          (every #'same-specializer-p specializers
-                                 (method-specializers method)))
-                 (return method))))))
-      (cond (hit hit)
+           :format-control   "~@<The generic function ~S takes ~D ~
+                              required argument~:P; was asked to ~
+                              find a method with specializers ~:S~@:>"
+           :format-arguments (list generic-function required-parameter-count
+                                   (unparse-specializers generic-function specializers))))))
+    (flet ((congruentp (other-method)
+             (let ((other-specializers (method-specializers other-method)))
+               (aver (= specializer-count (length other-specializers)))
+               (and (equal qualifiers (safe-method-qualifiers other-method))
+                    (every #'same-specializer-p specializers other-specializers)))))
+      (declare (dynamic-extent #'congruentp))
+      (cond ((find-if #'congruentp methods))
             ((null errorp) nil)
             (t
-             (error "~@<There is no method on ~S with ~
-                    ~:[no qualifiers~;~:*qualifiers ~S~] ~
-                    and specializers ~S.~@:>"
+             (error "~@<There is no method on ~S with ~:[no ~
+                     qualifiers~;~:*qualifiers ~:S~] and specializers ~
+                     ~:S.~@:>"
                     generic-function qualifiers specializers))))))
 
 (defmethod find-method ((generic-function standard-generic-function)
@@ -397,13 +393,18 @@
 (defmethod initialize-instance :after ((gf standard-generic-function)
                                        &key (lambda-list nil lambda-list-p)
                                        argument-precedence-order)
-  (with-slots (arg-info) gf
+  ;; FIXME: Because ARG-INFO is a STRUCTURE-OBJECT, it does not get
+  ;; a permutation vector, and therefore the code that SLOT-VALUE transforms
+  ;; to winds up punting to #'(SLOT-ACCESSOR :GLOBAL ARG-INFO READER).
+  ;; Using SLOT-VALUE the "slow" way sidesteps some bootstrap issues.
+  (declare (notinline slot-value))
+  (progn ; WAS: with-slots (arg-info) gf
     (if lambda-list-p
         (set-arg-info gf
                       :lambda-list lambda-list
                       :argument-precedence-order argument-precedence-order)
         (set-arg-info gf))
-    (when (arg-info-valid-p arg-info)
+    (when (arg-info-valid-p (slot-value gf 'arg-info))
       (update-dfun gf))))
 
 (defmethod reinitialize-instance :around
@@ -468,7 +469,7 @@
 (define-condition print-object-stream-specializer (reference-condition simple-warning)
   ()
   (:default-initargs
-   :references (list '(:ansi-cl :function print-object))
+   :references '((:ansi-cl :function print-object))
    :format-control "~@<Specializing on the second argument to ~S has ~
                     unportable effects, and also interferes with ~
                     precomputation of print functions for exceptional ~
@@ -516,10 +517,10 @@
                        (analyze-lambda-list (method-lambda-list old-method)))
                       ((b-llks b-nreq b-nopt)
                        (analyze-lambda-list new-lambda-list)))
-               (and (= a-nreq b-nreq)
-                    (= a-nopt b-nopt)
-                    (eq (ll-keyp-or-restp a-llks)
-                        (ll-keyp-or-restp b-llks))))))
+             (and (= a-nreq b-nreq)
+                  (= a-nopt b-nopt)
+                  (eq (ll-keyp-or-restp a-llks)
+                      (ll-keyp-or-restp b-llks))))))
     (multiple-value-bind (lock qualifiers specializers new-lambda-list
                           method-gf name)
         (values-for-add-method generic-function method)
@@ -582,25 +583,25 @@
               ;; invocation time; I dunno what the rationale was, and it
               ;; sucks.  Nevertheless, it's probably a programmer error, so
               ;; let's warn anyway. -- CSR, 2003-08-20
-              (let ((mc (generic-function-method-combination generic-functioN)))
-                (cond
-                  ((eq mc *standard-method-combination*)
-                   (when (and qualifiers
-                              (or (cdr qualifiers)
-                                  (not (memq (car qualifiers)
-                                             '(:around :before :after)))))
-                     (warn "~@<Invalid qualifiers for standard method ~
-                            combination in method ~S:~2I~_~S.~@:>"
-                           method qualifiers)))
-                  ((short-method-combination-p mc)
-                   (let ((mc-name (method-combination-type-name mc)))
-                     (when (or (null qualifiers)
-                               (cdr qualifiers)
-                               (and (neq (car qualifiers) :around)
-                                    (neq (car qualifiers) mc-name)))
-                       (warn "~@<Invalid qualifiers for ~S method combination ~
-                              in method ~S:~2I~_~S.~@:>"
-                             mc-name method qualifiers))))))
+              (let* ((mc (generic-function-method-combination generic-function))
+                     (type-name (method-combination-type-name mc)))
+                (flet ((invalid ()
+                         (warn "~@<Invalid qualifiers for ~S method ~
+                                combination in method ~S:~2I~_~S.~@:>"
+                               type-name method qualifiers)))
+                  (cond
+                    ((and (eq mc *standard-method-combination*)
+                          qualifiers
+                          (or (cdr qualifiers)
+                              (not (standard-method-combination-qualifier-p
+                                    (car qualifiers)))))
+                     (invalid))
+                    ((and (short-method-combination-p mc)
+                          (or (null qualifiers)
+                              (cdr qualifiers)
+                              (not (short-method-combination-qualifier-p
+                                    type-name (car qualifiers)))))
+                     (invalid)))))
               (unless skip-dfun-update-p
                 (update-ctors 'add-method
                               :generic-function generic-function
@@ -791,7 +792,7 @@
         (setq x (cdr x)
               y (cdr y))))
 
-(defvar *std-cam-methods* nil)
+(define-load-time-global *std-cam-methods* nil)
 
 (defun compute-applicable-methods-emf (generic-function)
   (if (eq **boot-state** 'complete)
@@ -932,15 +933,15 @@
           (update-accessor-info *new-class*)
           (map-all-classes #'update-accessor-info 'slot-object)))))
 
-(defvar *standard-slot-value-using-class-method* nil)
-(defvar *standard-setf-slot-value-using-class-method* nil)
-(defvar *standard-slot-boundp-using-class-method* nil)
-(defvar *condition-slot-value-using-class-method* nil)
-(defvar *condition-setf-slot-value-using-class-method* nil)
-(defvar *condition-slot-boundp-using-class-method* nil)
-(defvar *structure-slot-value-using-class-method* nil)
-(defvar *structure-setf-slot-value-using-class-method* nil)
-(defvar *structure-slot-boundp-using-class-method* nil)
+(define-load-time-global *standard-slot-value-using-class-method* nil)
+(define-load-time-global *standard-setf-slot-value-using-class-method* nil)
+(define-load-time-global *standard-slot-boundp-using-class-method* nil)
+(define-load-time-global *condition-slot-value-using-class-method* nil)
+(define-load-time-global *condition-setf-slot-value-using-class-method* nil)
+(define-load-time-global *condition-slot-boundp-using-class-method* nil)
+(define-load-time-global *structure-slot-value-using-class-method* nil)
+(define-load-time-global *structure-setf-slot-value-using-class-method* nil)
+(define-load-time-global *structure-slot-boundp-using-class-method* nil)
 
 (defun standard-svuc-method (type)
   (case type
@@ -1561,8 +1562,9 @@
 ;;; function of a standard-generic-function
 (let (initial-print-object-cache)
   (defun standard-compute-discriminating-function (gf)
+    (declare (notinline slot-value))
     (let ((dfun-state (slot-value gf 'dfun-state)))
-          (when (special-case-for-compute-discriminating-function-p gf)
+      (when (special-case-for-compute-discriminating-function-p gf)
             ;; if we have a special case for
             ;; COMPUTE-DISCRIMINATING-FUNCTION, then (at least for the
             ;; special cases implemented as of 2006-05-09) any information
@@ -1570,16 +1572,16 @@
             (aver (null dfun-state)))
           (typecase dfun-state
             (null
-             (when (eq gf #'compute-applicable-methods)
+             (when (eq gf (load-time-value #'compute-applicable-methods t))
                (update-all-c-a-m-gf-info gf))
              (cond
-               ((eq gf #'slot-value-using-class)
+               ((eq gf (load-time-value #'slot-value-using-class t))
                 (update-slot-value-gf-info gf 'reader)
                 #'slot-value-using-class-dfun)
-               ((eq gf #'(setf slot-value-using-class))
+               ((eq gf (load-time-value #'(setf slot-value-using-class) t))
                 (update-slot-value-gf-info gf 'writer)
                 #'setf-slot-value-using-class-dfun)
-               ((eq gf #'slot-boundp-using-class)
+               ((eq gf (load-time-value #'slot-boundp-using-class t))
                 (update-slot-value-gf-info gf 'boundp)
                 #'slot-boundp-using-class-dfun)
                ;; KLUDGE: PRINT-OBJECT is not a special-case in the sense
@@ -1587,12 +1589,8 @@
                ;; However, it is important that the machinery for printing
                ;; conditions for stack and heap exhaustion, and the
                ;; restarts offered by the debugger, work without consuming
-               ;; many extra resources.  This way (testing by name of GF
-               ;; rather than by identity) was the only way I found to get
-               ;; this to bootstrap, given that the PRINT-OBJECT generic
-               ;; function is only set up later, in
-               ;; SRC;PCL;PRINT-OBJECT.LISP.  -- CSR, 2008-06-09
-               ((eq (slot-value gf 'name) 'print-object)
+               ;; many extra resources.  -- CSR, 2008-06-09
+               ((eq gf (locally (declare (optimize (safety 0))) #'print-object))
                 (let ((nkeys (nth-value 3 (get-generic-fun-info gf))))
                   (cond ((/= nkeys 1)
                          ;; KLUDGE: someone has defined a method

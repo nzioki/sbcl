@@ -47,6 +47,7 @@
 ;;; Interference graph data structure
 (defstruct (ordered-set
             (:include sset)
+            (:copier nil)
             (:conc-name #:oset-))
   (members nil :type list))
 
@@ -71,26 +72,31 @@
 ;; vertex in an interference graph
 (def!struct (vertex
              (:include sset-element)
-             (:constructor make-vertex (tn pack-type)))
+             (:copier nil)
+             (:constructor %make-vertex (tn element-size pack-type)))
   ;; incidence set, as an ordered list (for reproducibility)
-  (incidence (make-ordered-set) :type ordered-set)
+  (full-incidence  (make-ordered-set) :type ordered-set :read-only t)
+  (incidence       (vector)           :type simple-vector)
+  (incidence-count 0                  :type index)
   ;; list of potential locations in the TN's preferred SB for the
   ;; vertex, taking into account reserve locations and preallocated
   ;; TNs.
   (initial-domain nil :type list)
   (initial-domain-size 0 :type index)
   ;; TN this is a vertex for.
-  (tn nil :type tn)
+  (tn           nil :type tn                                  :read-only t)
+  (element-size nil :type fixnum                              :read-only t)
   ;; type of packing necessary. We should only have to determine
   ;; colors for :normal TNs/vertices
-  (pack-type nil :type (member :normal :wired :restricted))
-  ;; color offset
-  (color nil :type (or fixnum null))
-  ;; current status, removed from the interference graph or not (on
-  ;; stack or not)
-  (invisible nil :type t)
+  (pack-type    nil :type (member :normal :wired :restricted) :read-only t)
   ;; (tn-spill-cost (vertex-tn vertex))
-  (spill-cost 0 :type fixnum))
+  (spill-cost   0   :type fixnum)
+  ;; color offset
+  (color nil :type (or fixnum null)))
+
+(declaim (inline make-vertex))
+(defun make-vertex (tn pack-type)
+  (%make-vertex tn (sc-element-size (tn-sc tn)) pack-type))
 
 (declaim (inline vertex-sc))
 (defun vertex-sc (vertex)
@@ -98,18 +104,18 @@
 
 ;; interference graph
 (def!struct (interference-graph
+             (:copier nil)
              (:constructor %make-interference-graph)
              (:conc-name #:ig-))
   ;; sorted set of yet-uncolored (and not necessarily spilled)
   ;; vertices: vertices with lower spill cost come first.
   (vertices nil :type list)
   ;; unsorted set of precolored vertices.
-  (precolored-vertices nil :type list)
-  (tn-vertex (bug "missing arg") :type hash-table)
+  (precolored-vertices nil :type list :read-only t)
   ;; A function that maps TNs to vertices, and then to the vertex's
   ;; assigned offset, if any.  The offset (or NIL) is returned first,
   ;; then the vertex as a second value.
-  (tn-vertex-mapping (bug "missing arg") :type function))
+  (tn-vertex-mapping (bug "missing arg") :type function :read-only t))
 
 ;;; Interference graph construction
 ;;;
@@ -132,9 +138,9 @@
   (unless (or (neq (sc-sb (vertex-sc a)) (sc-sb (vertex-sc b)))
               (tn-offset (vertex-tn a))
               (tn-offset (vertex-tn b)))
-    (aver (or (oset-adjoin (vertex-incidence a) b)
+    (aver (or (oset-adjoin (vertex-full-incidence a) b)
               perhaps-redundant))
-    (aver (or (oset-adjoin (vertex-incidence b) a)
+    (aver (or (oset-adjoin (vertex-full-incidence b) a)
               perhaps-redundant))))
 
 ;; Partition the global TNs that appear in that IR2 block, between
@@ -251,8 +257,8 @@
   (let* ((sc (tn-sc tn))
          (reserve (sc-reserve-locations sc)))
     (loop
-      for loc in (sc-locations sc)
-      unless (or (and reserve (memq loc reserve)) ; common case: no reserve
+      for loc across (sc-locations sc)
+      unless (or (and reserve (find loc reserve)) ; common case: no reserve
                  (conflicts-in-sc tn sc loc))
         collect loc)))
 
@@ -263,7 +269,7 @@
   (let (component-vertices
         global-vertices
         local-vertices
-        (tn-vertex (make-hash-table)))
+        (tn-vertex (make-hash-table :test #'eq)))
     (loop for i upfrom 0
           for vertex in vertices
           do (let* ((tn (vertex-tn vertex))
@@ -273,11 +279,9 @@
                               (restricted-tn-locations tn))))
                (aver (not (unbounded-tn-p tn)))
                (setf (vertex-number vertex) i
-                     (vertex-incidence vertex) (make-ordered-set)
                      (vertex-initial-domain vertex) locs
                      (vertex-initial-domain-size vertex) (length locs)
                      (vertex-color vertex) offset
-                     (vertex-invisible vertex) nil
                      (vertex-spill-cost vertex) (tn-cost tn)
                      (gethash tn tn-vertex) vertex)
                (cond (offset) ; precolored -> no need to track conflict
@@ -306,10 +310,11 @@
     (collect ((colored)
               (uncolored))
       (dolist (v vertices)
-        (let ((incidence (vertex-incidence v)))
-          (setf (oset-members incidence)
+        (let ((full-incidence (vertex-full-incidence v)))
+          (setf (oset-members full-incidence)
                 ;; this really doesn't matter, but minimises variability
-                (sort (oset-members incidence) #'< :key #'vertex-number)))
+                (sort (oset-members full-incidence) #'< :key #'vertex-number)
+                (vertex-incidence v) (make-array (oset-count full-incidence))))
         (cond ((vertex-color v)
                (aver (tn-offset (vertex-tn v)))
                (colored v))
@@ -320,26 +325,22 @@
       (%make-interference-graph
        :vertices (stable-sort (uncolored) #'< :key #'vertex-spill-cost)
        :precolored-vertices (colored)
-       :tn-vertex tn-vertex
        :tn-vertex-mapping (lambda (tn)
                             (awhen (gethash tn tn-vertex)
                               (values (vertex-color it) it)))))))
 
-;; &key reset: whether coloring/invisibility information should be
-;; removed from all the remaining vertices
-(defun remove-vertex-from-interference-graph (vertex graph &key reset)
+;;; Coloring information is removed from all remaining vertices.
+(defun reset-interference-graph-without-vertex (graph vertex)
   (declare (type vertex vertex) (type interference-graph graph))
-  (let ((vertices (if reset
-                      (loop for v in (ig-vertices graph)
-                            unless (eql v vertex)
-                              do (aver (not (tn-offset (vertex-tn v))))
-                                 (setf (vertex-invisible v) nil
-                                       (vertex-color v) nil)
-                              and collect v)
-                      (remove vertex (ig-vertices graph)))))
+  (let ((vertices (loop for v in (ig-vertices graph)
+                        unless (eql v vertex)
+                          do (aver (not (tn-offset (vertex-tn v))))
+                             (setf (vertex-color v) nil
+                                   (vertex-incidence-count v) 0)
+                          and collect v)))
     (setf (ig-vertices graph) vertices)
-    (do-oset-elements (neighbor (vertex-incidence vertex) graph)
-      (oset-delete (vertex-incidence neighbor) vertex))))
+    (do-oset-elements (neighbor (vertex-full-incidence vertex) graph)
+      (oset-delete (vertex-full-incidence neighbor) vertex))))
 
 ;;; Support code
 
@@ -349,20 +350,24 @@
   (declare (type fixnum color)
            (type vertex vertex)
            (optimize speed (safety 0)))
-  (let ((color+size (+ color (sc-element-size (vertex-sc vertex)))))
+  (let ((incidence (vertex-incidence vertex))
+        (incidence-count (vertex-incidence-count vertex))
+        (color+size (+ color (vertex-element-size vertex))))
     (flet ((intervals-intersect-p (color2 vertex2)
              (declare (fixnum color2))
              (if (< color2 color)
-                 (< color (+ color2 (sc-element-size (vertex-sc vertex2))))
+                 (< color (+ color2 (vertex-element-size vertex2)))
                  (< color2 color+size))))
-      (do-oset-elements (neighbor (vertex-incidence vertex) t)
-        (cond ((vertex-invisible neighbor))
-              ((intervals-intersect-p (vertex-color neighbor) neighbor)
-               (return nil)))))))
+      (dotimes (i incidence-count t)
+        #-sb-xc-host (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+        (let ((neighbor (aref incidence i)))
+          (when (intervals-intersect-p (vertex-color neighbor) neighbor)
+            (return nil)))))))
 
 ;; Assumes that VERTEX pack-type is :WIRED.
 (defun vertex-color-possible-p (vertex color)
-  (declare (type fixnum color) (type vertex vertex))
+  (declare (type fixnum color)
+           (type vertex vertex))
   (and (or (and (neq (vertex-pack-type vertex) :wired)
                 (not (tn-offset (vertex-tn vertex))))
            (= color (the fixnum (vertex-color vertex))))
@@ -384,7 +389,7 @@
 (defun vertex-target-vertices (vertex tn-offset)
   (declare (type vertex vertex) (type function tn-offset))
   (let ((sb (sc-sb (vertex-sc vertex)))
-        (neighbors (vertex-incidence vertex))
+        (neighbors (vertex-full-incidence vertex))
         vertices)
     (do-target-tns (current (vertex-tn vertex) :limit 20)
       (multiple-value-bind (offset target)
@@ -395,13 +400,33 @@
           (pushnew target vertices))))
     (nreverse vertices)))
 
-;; Choose the "best" color for these vertices: a color is good if as
-;; many of these vertices simultaneously take that color, and those
-;; that can't have a low spill cost.
-(defun vertices-best-color (vertices colors)
-  (let ((best-color      nil)
-        (best-compatible '())
-        (best-cost       nil))
+;;; Choose the "best" color for these vertices: a color is good if as
+;;; many of these vertices simultaneously take that color, and those
+;;; that can't have a low spill cost.
+(defun vertices-best-color/single-color (vertices color)
+  (let ((compatible '()))
+    (dolist (vertex vertices)
+      (when (and (notany (lambda (existing)
+                           (oset-member (vertex-full-incidence existing)
+                                        vertex))
+                         compatible)
+                 (vertex-color-possible-p vertex color))
+        (push vertex compatible)))
+    (values color compatible)))
+
+(defun vertices-best-color/single-vertex (vertex colors)
+  (dolist (color colors)
+    (when (vertex-color-possible-p vertex color)
+      (return-from vertices-best-color/single-vertex
+        (values color (list vertex)))))
+  (values (first colors) '()))
+
+(declaim (ftype (function (cons cons) (values fixnum list &optional))
+                vertices-best-color/general))
+(defun vertices-best-color/general (vertices colors)
+  (let* ((best-color      nil)
+         (best-compatible '())
+         (best-cost       nil))
     ;; TODO: sort vertices by spill cost, so that high-spill cost ones
     ;; are more likely to be compatible?  We're trying to find a
     ;; maximal 1-colorable subgraph here, ie. a maximum independent
@@ -412,7 +437,7 @@
             (cost 0))
         (dolist (vertex vertices)
           (when (and (notany (lambda (existing)
-                               (oset-member (vertex-incidence existing)
+                               (oset-member (vertex-full-incidence existing)
                                             vertex))
                              compatible)
                      (vertex-color-possible-p vertex color))
@@ -424,6 +449,18 @@
                 best-compatible compatible
                 best-cost       cost))))
     (values best-color best-compatible)))
+
+(declaim (inline vertices-best-color))
+(defun vertices-best-color (vertices colors)
+  (cond
+    ((null vertices)
+     (values (first colors) '()))
+    ((null (rest vertices))
+     (vertices-best-color/single-vertex (first vertices) colors))
+    ((null (rest colors))
+     (vertices-best-color/single-color vertices (first colors)))
+    (t
+     (vertices-best-color/general vertices colors))))
 
 ;;; Coloring inner loop
 
@@ -435,9 +472,7 @@
            (sc (vertex-sc vertex))
            (sb (sc-sb sc)))
       (multiple-value-bind (color recolor-vertices)
-          (if targets
-              (vertices-best-color targets it)
-              (values (first it) nil))
+          (vertices-best-color targets it)
         (aver color)
         (dolist (target recolor-vertices)
           (aver (vertex-color target))
@@ -457,10 +492,7 @@
   (flet ((domain-size (vertex)
            (vertex-initial-domain-size vertex))
          (degree (vertex)
-           (count-if-not #'vertex-invisible
-                         (oset-members (vertex-incidence vertex))))
-         (eliminate-vertex (vertex)
-           (setf (vertex-invisible vertex) t)))
+           (vertex-incidence-count vertex)))
     (let* ((precoloring-stack '())
            (prespilling-stack '())
            (vertices (ig-vertices interference-graph)))
@@ -469,7 +501,6 @@
       ;; at the head of the colouring lists.
       (loop for vertex in vertices do
         (aver (not (vertex-color vertex))) ; we already took those out above
-        (eliminate-vertex vertex)
         ;; FIXME: some interference will be with vertices that don't
         ;;  take the same number of slots. Find a smarter heuristic.
         (cond ((< (degree vertex) (domain-size vertex))
@@ -478,14 +509,20 @@
                (push vertex prespilling-stack))))
       (values precoloring-stack prespilling-stack))))
 
+(defun color-vertex (vertex color)
+  (declare (type vertex vertex))
+  (setf (vertex-color vertex) color)
+  (do-oset-elements (neighbor (vertex-full-incidence vertex) vertex)
+    (let ((new-count (incf (vertex-incidence-count neighbor))))
+      (setf (aref (vertex-incidence neighbor) (1- new-count)) vertex))))
+
 ;; Try and color the interference graph once.
 (defun color-interference-graph (interference-graph)
   (let ((tn-vertex (ig-tn-vertex-mapping interference-graph)))
     (flet ((color-vertices (vertices)
              (dolist (vertex vertices)
                (awhen (find-vertex-color vertex tn-vertex)
-                 (setf (vertex-color vertex) it
-                       (vertex-invisible vertex) nil)))))
+                 (color-vertex vertex it)))))
       (multiple-value-bind (probably-colored probably-spilled)
           (partition-and-order-vertices interference-graph)
         (color-vertices probably-colored)
@@ -508,7 +545,7 @@
 #+nil
 (defun collect-min-spill-candidates (vertex)
   (let ((colors '()))
-    (do-oset-elements (neighbor (vertex-incidence vertex))
+    (do-oset-elements (neighbor (vertex-full-incidence vertex))
       (when (eql :normal (vertex-pack-type neighbor))
         (let* ((color (vertex-color neighbor))
                (cell (assoc color colors))
@@ -532,27 +569,27 @@
                                 :key (lambda (vertex)
                                        (tn-loop-depth
                                         (vertex-tn vertex)))))
-         (nvertices (length vertices))
-         (graph (make-interference-graph vertices component))
-         to-spill)
+         (graph (make-interference-graph vertices component)))
     (labels ((spill-candidates-p (vertex)
                (unless (vertex-color vertex)
                  (aver (eql :normal (vertex-pack-type vertex)))
                  t))
-             (iter (to-spill)
-               (when to-spill
-                 (setf (vertex-invisible to-spill) t
-                       (vertex-color to-spill) nil)
-                 (push to-spill spill-list)
-                 (setf graph (remove-vertex-from-interference-graph
-                              to-spill graph :reset t)))
+             (try-color ()
                (color-interference-graph graph)
-               (find-if #'spill-candidates-p (ig-vertices graph))))
+               (find-if #'spill-candidates-p (ig-vertices graph)))
+             (spill (vertex)
+               (setf (vertex-color vertex) nil)
+               (push vertex spill-list)
+               (setf graph (reset-interference-graph-without-vertex
+                            graph vertex))))
       (loop repeat iterations
-            while (setf to-spill (iter to-spill))))
+            for uncolored = (try-color)
+            while uncolored
+            do (spill uncolored)))
     (let ((colored (ig-vertices graph)))
-      (aver (= nvertices (+ (length spill-list) (length colored)
-                            (length (ig-precolored-vertices graph)))))
+      (aver (= (length vertices)
+               (+ (length spill-list) (length colored)
+                  (length (ig-precolored-vertices graph)))))
       colored)))
 
 ;;; Nice interface

@@ -20,10 +20,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
-
 ;;; flags for the generational garbage collector
 (defconstant pseudo-atomic-interrupted-flag 1)
 (defconstant pseudo-atomic-flag 4)
@@ -177,21 +173,12 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(
-     #!+gencgc *restart-lisp-function*
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+)
+  #'equalp)
 
-     ;; CLH: 20060210 Taken from x86-64/parms.lisp per JES' suggestion
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*)))
-
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -209,4 +196,5 @@
     two-arg-xor
     two-arg-eqv
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

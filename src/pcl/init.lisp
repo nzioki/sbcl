@@ -105,7 +105,7 @@
   ((initarg :initarg :initarg :reader slotd-initialization-error-initarg)
    (kind :initarg :kind :reader slotd-initialization-error-kind)
    (value :initarg :value :initform nil :reader slotd-initialization-error-value))
-  (:default-initargs :references (list '(:amop :initialization slot-definition)))
+  (:default-initargs :references '((:amop :initialization slot-definition)))
   (:report (lambda (condition stream)
              (let ((initarg (slotd-initialization-error-initarg condition))
                    (kind (slotd-initialization-error-kind condition))
@@ -306,13 +306,16 @@
 (define-condition initarg-error (reference-condition program-error)
   ((class :reader initarg-error-class :initarg :class)
    (initargs :reader initarg-error-initargs :initarg :initargs))
-  (:default-initargs :references (list '(:ansi-cl :section (7 1 2))))
+  (:default-initargs :references '((:ansi-cl :section (7 1 2))))
   (:report (lambda (condition stream)
              (format stream "~@<Invalid initialization argument~P: ~2I~_~
                              ~<~{~S~^, ~} ~@:>~I~_in call for class ~S.~:>"
                      (length (initarg-error-initargs condition))
                      (list (initarg-error-initargs condition))
                      (initarg-error-class condition)))))
+
+(defun initarg-error (class invalid-keys)
+  (error 'initarg-error :class class :initargs invalid-keys))
 
 (defun check-initargs-2-plist (initargs class legal &optional (error-p t))
   (let ((invalid-keys ()))
@@ -325,7 +328,7 @@
                     (eq key :allow-other-keys))
           (push key invalid-keys)))
       (when (and invalid-keys error-p)
-        (error 'initarg-error :class class :initargs invalid-keys)))
+        (initarg-error class invalid-keys)))
     invalid-keys))
 
 (defun check-initargs-2-list (initkeys class legal &optional (error-p t))
@@ -337,5 +340,5 @@
         (unless (memq key legal)
           (push key invalid-keys)))
       (when (and invalid-keys error-p)
-        (error 'initarg-error :class class :initargs invalid-keys)))
+        (initarg-error class invalid-keys)))
     invalid-keys))

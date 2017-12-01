@@ -101,7 +101,6 @@
 ;;;; power functions
 
 (defun exp (number)
-  #!+sb-doc
   "Return e raised to the power NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -111,21 +110,33 @@
         (cis (imagpart number))))))
 
 ;;; INTEXP -- Handle the rational base, integer power case.
-
-(declaim (type (or integer null) *intexp-maximum-exponent*))
-(defparameter *intexp-maximum-exponent* nil)
-
 ;;; This function precisely calculates base raised to an integral
 ;;; power. It separates the cases by the sign of power, for efficiency
 ;;; reasons, as powers can be calculated more efficiently if power is
 ;;; a positive integer. Values of power are calculated as positive
 ;;; integers, and inverted if negative.
 (defun intexp (base power)
-  (when (and *intexp-maximum-exponent*
-             (> (abs power) *intexp-maximum-exponent*))
-    (error "The absolute value of ~S exceeds ~S."
-            power '*intexp-maximum-exponent*))
-  (cond ((minusp power)
+  (cond ((eql base 1)
+         base)
+        ((eql base -1)
+         (if (evenp power)
+             1
+             base))
+        ((ratiop base)
+         (let ((den (denominator base))
+               (num (numerator base)))
+           (if (minusp power)
+               (let ((negated (- power)))
+                 (cond ((eql num 1)
+                        (intexp den negated))
+                       ((eql num -1)
+                        (intexp (- den) negated))
+                       (t
+                        (build-ratio (intexp den negated)
+                                     (intexp num negated)))))
+               (build-ratio (intexp num power)
+                            (intexp den power)))))
+        ((minusp power)
          (/ (intexp base (- power))))
         ((eql base 2)
          (ash 1 power))
@@ -144,7 +155,6 @@
 ;;; result. We also separate the complex-real and real-complex cases
 ;;; from the general complex case.
 (defun expt (base power)
-  #!+sb-doc
   "Return BASE raised to the POWER."
   (declare (explicit-check))
   (if (zerop power)
@@ -152,7 +162,7 @@
         (error 'arguments-out-of-domain-error
                :operands (list base power)
                :operation 'expt
-               :references (list '(:ansi-cl :function expt)))
+               :references '((:ansi-cl :function expt)))
         (let ((result (1+ (* base power))))
           (if (and (floatp result) (float-nan-p result))
               (float 1 result)
@@ -347,7 +357,6 @@
                     2.0d0))))))
 
 (defun log (number &optional (base nil base-p))
-  #!+sb-doc
   "Return the logarithm of NUMBER in the base BASE, which defaults to e."
   (declare (explicit-check))
   (if base-p
@@ -396,26 +405,27 @@
          (complex-log number)))))
 
 (defun sqrt (number)
-  #!+sb-doc
   "Return the square root of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
     (((foreach fixnum bignum ratio))
      (if (minusp number)
-         (complex-sqrt number)
+         (complex 0f0
+                  (coerce (%sqrt (- (coerce number 'double-float))) 'single-float))
          (coerce (%sqrt (coerce number 'double-float)) 'single-float)))
     (((foreach single-float double-float))
      (if (minusp number)
-         (complex-sqrt (complex number))
+         (complex (coerce 0.0 '(dispatch-type number))
+                  (coerce (%sqrt (- (coerce number 'double-float)))
+                          '(dispatch-type number)))
          (coerce (%sqrt (coerce number 'double-float))
                  '(dispatch-type number))))
-     ((complex)
-      (complex-sqrt number))))
+    ((complex)
+     (complex-sqrt number))))
 
 ;;;; trigonometic and related functions
 
 (defun abs (number)
-  #!+sb-doc
   "Return the absolute value of the number."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -435,7 +445,6 @@
           (%hypot rx (truly-the double-float ix))))))))
 
 (defun phase (number)
-  #!+sb-doc
   "Return the angle part of the polar representation of a complex number.
   For complex numbers, this is (atan (imagpart number) (realpart number)).
   For non-complex positive numbers, this is 0. For non-complex negative
@@ -458,7 +467,6 @@
      (atan (imagpart number) (realpart number)))))
 
 (defun sin (number)
-  #!+sb-doc
   "Return the sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -470,7 +478,6 @@
                 (* (cos x) (sinh y)))))))
 
 (defun cos (number)
-  #!+sb-doc
   "Return the cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -482,7 +489,6 @@
                 (- (* (sin x) (sinh y))))))))
 
 (defun tan (number)
-  #!+sb-doc
   "Return the tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -495,7 +501,6 @@
                 (- (realpart result)))))))
 
 (defun cis (theta)
-  #!+sb-doc
   "Return cos(Theta) + i sin(Theta), i.e. exp(i Theta)."
   (declare (explicit-check ))
   (number-dispatch ((theta real))
@@ -503,7 +508,6 @@
      (complex (cos theta) (sin theta)))))
 
 (defun asin (number)
-  #!+sb-doc
   "Return the arc sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -521,7 +525,6 @@
      (complex-asin number))))
 
 (defun acos (number)
-  #!+sb-doc
   "Return the arc cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -539,7 +542,6 @@
      (complex-acos number))))
 
 (defun atan (y &optional (x nil xp))
-  #!+sb-doc
   "Return the arc tangent of Y if X is omitted or Y/X if X is supplied."
   (declare (explicit-check))
   (if xp
@@ -576,7 +578,6 @@
 ;;; complex numbers can also lose big.
 
 (defun sinh (number)
-  #!+sb-doc
   "Return the hyperbolic sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -588,7 +589,6 @@
                 (* (cosh x) (sin y)))))))
 
 (defun cosh (number)
-  #!+sb-doc
   "Return the hyperbolic cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -600,7 +600,6 @@
                 (* (sinh x) (sin y)))))))
 
 (defun tanh (number)
-  #!+sb-doc
   "Return the hyperbolic tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -609,7 +608,6 @@
      (complex-tanh number))))
 
 (defun asinh (number)
-  #!+sb-doc
   "Return the hyperbolic arc sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -618,7 +616,6 @@
      (complex-asinh number))))
 
 (defun acosh (number)
-  #!+sb-doc
   "Return the hyperbolic arc cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -636,7 +633,6 @@
      (complex-acosh number))))
 
 (defun atanh (number)
-  #!+sb-doc
   "Return the hyperbolic arc tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -696,7 +692,7 @@
 ;;;;   logb
 ;;;;
 ;;;; internal functions:
-;;;;    square coerce-to-complex-type cssqs complex-log-scaled
+;;;;    square coerce-to-complex-type cssqs
 ;;;;
 ;;;; references:
 ;;;;   Kahan, W. "Branch Cuts for Complex Elementary Functions, or Much
@@ -887,13 +883,12 @@
           (setf nu (float-sign y rho))))
       (coerce-to-complex-type eta nu z))))
 
-;;; Compute log(2^j*z).
+;;; log of Z = log |Z| + i * arg Z
 ;;;
-;;; This is for use with J /= 0 only when |z| is huge.
-(defun complex-log-scaled (z j)
+;;; Z may be any number, but the result is always a complex.
+(defun complex-log (z)
   (declare (muffle-conditions t))
-  (declare (type (or rational complex) z)
-           (fixnum j))
+  (declare (type (or rational complex) z))
   ;; The constants t0, t1, t2 should be evaluated to machine
   ;; precision.  In addition, Kahan says the accuracy of log1p
   ;; influences the choices of these constants but doesn't say how to
@@ -923,24 +918,17 @@
       (let ((beta (max (abs x) (abs y)))
             (theta (min (abs x) (abs y))))
         (coerce-to-complex-type (if (and (zerop k)
-                 (< t0 beta)
-                 (or (<= beta t1)
-                     (< rho t2)))
-                                  (/ (%log1p (+ (* (- beta 1.0d0)
-                                       (+ beta 1.0d0))
-                                    (* theta theta)))
-                                     2d0)
-                                  (+ (/ (log rho) 2d0)
-                                     (* (+ k j) ln2)))
+                                         (< t0 beta)
+                                         (or (<= beta t1)
+                                             (< rho t2)))
+                                    (/ (%log1p (+ (* (- beta 1.0d0)
+                                                     (+ beta 1.0d0))
+                                                  (* theta theta)))
+                                       2d0)
+                                    (+ (/ (log rho) 2d0)
+                                       (* k ln2)))
                                 (atan y x)
                                 z)))))
-
-;;; log of Z = log |Z| + i * arg Z
-;;;
-;;; Z may be any number, but the result is always a complex.
-(defun complex-log (z)
-  (declare (type (or rational complex) z))
-  (complex-log-scaled z 0))
 
 ;;; KLUDGE: Let us note the following "strange" behavior. atanh 1.0d0
 ;;; is +infinity, but the following code returns approx 176 + i*pi/4.

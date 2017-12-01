@@ -11,6 +11,8 @@
 
 (in-package :cl-user)
 
+(load "compiler-test-util.lisp")
+
 ;;; Array initialization has complicated defaulting for :ELEMENT-TYPE,
 ;;; and both compile-time and run-time logic takes a whack at it.
 (with-test (:name (make-array :element-type :bug-126))
@@ -160,12 +162,42 @@
     (assert fail)
     (assert-error (funcall fun) sb-int:invalid-array-index-error)))
 
-(with-test (:name (make-array :element-type :compile-time-error))
+(with-test (:name (make-array :element-type :compile-time error))
   (multiple-value-bind (fun fail warnings style-warnings)
       (checked-compile `(lambda () (make-array 5 :element-type 'undefined-type))
                        :allow-style-warnings t)
     (declare (ignore fun fail warnings))
     (assert style-warnings)))
+
+(with-test (:name (make-array :default :element-type :supplied :compile-time warning))
+  ;; Supplied :initial-element, EQL to the default initial element,
+  ;; results in full warning, even if not "used" due to 0 array total
+  ;; size.
+  (flet ((check (dimensions)
+           (multiple-value-bind (fun fail warnings)
+               (checked-compile
+                `(lambda ()
+                   (make-array ,dimensions
+                               :initial-element 0 :element-type 'string))
+                :allow-warnings t)
+             (declare (ignore fun fail))
+             (assert (= (length warnings) 1)))))
+    (check 1)
+    (check 0)))
+
+(with-test (:name (make-array :default :element-type :implicit :compile-time style-warning))
+  ;; Implicit default initial element used to initialize array
+  ;; elements results in a style warning.
+  (multiple-value-bind (fun fail warnings style-warnings)
+      (checked-compile `(lambda () (make-array 5 :element-type 'string))
+                       :allow-style-warnings t)
+    (declare (ignore fun fail warnings))
+    (assert (= (length style-warnings) 1)))
+
+  ;; But not if the default initial-element is not actually used to
+  ;; initialize any elements due to 0 array total size.
+  (checked-compile `(lambda () (make-array 0 :element-type 'string)))
+  (checked-compile `(lambda () (make-array '(0 2) :element-type 'string))))
 
 (flet ((opaque-identity (x) x))
   (declare (notinline opaque-identity))
@@ -354,26 +386,42 @@
        (string= (simple-condition-format-control c)
                 "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS")))))
 
-(with-test (:name :make-array-sanity-check-dims-first)
+(with-test (:name (make-array :sanity-check-dims-first))
   ;; A full call to %MAKE-ARRAY will signal a TYPE-ERROR on these inputs
   ;; instead of trying to consume a massive amount of memory.
   ;; Additionally, the relevent IR1 transform should give up.
-  (locally
-    (declare (notinline make-array))
-    (assert-error (make-array `(-1 -1 ,(- (ash array-dimension-limit -2) 4)))
-                  type-error))
-  (locally
-    (declare (inline make-array))
-    (assert-error (make-array `(-1 -1 ,(- (ash array-dimension-limit -2) 4)))
-                  type-error)))
+  (flet ((test (inline)
+           (multiple-value-bind (fun failure-p warnings)
+               (checked-compile
+                `(lambda ()
+                   (declare (,inline make-array))
+                   (make-array `(-1 -1 ,(- (ash array-dimension-limit -2) 4))))
+                :allow-failure t :allow-warnings t)
+             (ecase inline
+               (inline
+                (assert failure-p)
+                (assert (= 1 (length warnings))))
+               (notinline
+                (assert (not failure-p))
+                (assert (null warnings))))
+             (assert-error (funcall fun) type-error))))
+    (test 'inline)
+    (test 'notinline)))
 
-(with-test (:name :make-array-size-overflow)
+(with-test (:name (make-array :size-overflow))
   ;; 1-bit fixnum tags make array limits overflow the word length
   ;; when converted to bytes
   (when (= sb-vm:n-fixnum-tag-bits 1)
-    (assert-error (make-array (1- array-total-size-limit)) error)))
+    (multiple-value-bind (fun failure-p warnings)
+        (checked-compile
+         '(lambda ()
+            (make-array (1- array-total-size-limit)))
+         :allow-failure t :allow-warnings t)
+      (assert failure-p)
+      (assert (= 1 (length warnings)))
+      (assert-error (funcall fun) type-error))))
 
-(with-test (:name :adjust-non-adjustable-array)
+(with-test (:name (adjust-array :non-adjustable))
   (let* ((a (make-array '(2 3) :initial-contents '((0 1 2) (3 4 5))))
          (b (adjust-array a '(2 2))))
     (setf (aref a 0 0) 11)
@@ -394,19 +442,19 @@
                         4)
                #\Nul)))
 
-(with-test (:name :adjust-array-transform)
+(with-test (:name (adjust-array :transform))
   (assert (equalp (funcall
                   (checked-compile
                    `(lambda ()
                       (adjust-array #(1 2 3) 3 :displaced-to #(4 5 6)))))
                  #(4 5 6))))
 
-(with-test (:name :adjust-array-fill-pointer)
+(with-test (:name (adjust-array :fill-pointer))
   (let ((array (make-array 10 :fill-pointer t)))
     (assert (= (fill-pointer (adjust-array array 5 :fill-pointer 2))
                2))))
 
-(with-test (:name :adjust-array-initial-element)
+(with-test (:name (adjust-array :initial-element))
   (assert (equal (funcall
                   (checked-compile
                    `(lambda (x)
@@ -414,7 +462,7 @@
                   "abc")
                  "abcxx")))
 
-(with-test (:name :array-initial-contents-1)
+(with-test (:name (make-array :initial-contents 1))
   (flet ((f (x y)
            (sb-int:dx-let ((a (make-array `(,x ,y)
                                           :initial-contents
@@ -424,7 +472,7 @@
     (f 2 3)
     (assert-error (f 3 2))))
 
-(with-test (:name :array-initial-contents-2)
+(with-test (:name (make-array :initial-contents 2))
   (labels ((compute-contents () '((a b c) (1 2 3)))
            (f (x y)
              (sb-int:dx-let ((a (make-array `(,x ,y)
@@ -436,13 +484,54 @@
     (f 2 3)
     (assert-error (f 3 2))))
 
-(with-test (:name :array-initial-contents-3)
-  (multiple-value-bind (f warningp errorp)
-      ;; FIXME: should be CHECKED-COMPILE
-      (let ((*error-output* (make-broadcast-stream)))
-        (compile nil '(lambda (z)
-                        (symbol-macrolet ((x (+ 1 1)) (y (* 2 1)))
-                          (make-array `(,x ,y)
-                                      :initial-contents
-                                      `((,z ,z 1) (,z ,z ,z)))))))
-    (assert (and f warningp errorp))))
+(with-test (:name (make-array :initial-contents 3))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile
+       '(lambda (z)
+          (symbol-macrolet ((x (+ 1 1)) (y (* 2 1)))
+            (make-array `(,x ,y)
+                        :initial-contents
+                        `((,z ,z 1) (,z ,z ,z)))))
+       :allow-failure t :allow-warnings t)
+    (assert failure-p)
+    (assert (= 1 (length warnings)))
+    (assert-error (funcall fun) error)))
+
+(with-test (:name (adjust-array :element-type))
+  (let ((fun (checked-compile '(lambda (array)
+                                (adjust-array array 3 :element-type '(signed-byte 2))))))
+    (assert-error (funcall fun #(1 2 3))))
+  (let ((fun (checked-compile '(lambda (array)
+                                (adjust-array array 5 :displaced-to #(1 2 3))))))
+    (assert-error (funcall fun (make-array 5 :adjustable t :element-type 'fixnum)))))
+
+(with-test (:name (make-array :transform :fill-pointer nil))
+  (flet ((test (form)
+           (let ((fun (checked-compile `(lambda () ,form))))
+             (assert (not (ctu:find-named-callees
+                           fun :name 'sb-kernel:%make-array))))))
+    (test '(make-array 3      :fill-pointer nil))
+    (test '(make-array 3      :fill-pointer nil))
+    (test '(make-array 3      :fill-pointer t))
+    (test '(make-array 3      :adjustable nil))
+    (test '(make-array '(3 3) :adjustable nil))
+    (test '(make-array '(3 3) :fill-pointer nil))))
+
+(with-test (:name (make-array :transform :adjustable :fill-pointer))
+  (let ((fun (checked-compile '(lambda (fp)
+                                (make-array 3 :adjustable t :fill-pointer fp)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+    (assert (= (length (funcall fun t)) 3))
+    (assert (array-has-fill-pointer-p (funcall fun t)))
+    (assert (= (length (funcall fun 2)) 2))
+    (assert (= (array-total-size (funcall fun 2)) 3))
+    (assert-error (funcall fun 4))
+    (assert-error (funcall fun 'abc))
+    (assert (not (array-has-fill-pointer-p (funcall fun nil))))
+    (assert (= (length (funcall fun nil)) 3))))
+
+(with-test (:name :check-bound-fixnum-check)
+  (assert-error
+   (funcall (checked-compile `(lambda (x) (aref #100(a) x)))
+            #\Nul)
+   type-error))

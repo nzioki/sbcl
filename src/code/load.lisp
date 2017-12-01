@@ -16,12 +16,6 @@
 
 (in-package "SB!FASL")
 
-;;;; There looks to be an exciting amount of state being modified
-;;;; here: certainly enough that I (dan, 2003.1.22) don't want to mess
-;;;; around deciding how to thread-safetify it.  So we use a Big Lock.
-;;;; Because this code is mutually recursive with the compiler, we use
-;;;; the **WORLD-LOCK**.
-
 ;;;; miscellaneous load utilities
 
 ;;; Output the current number of semicolons after a fresh-line.
@@ -105,20 +99,27 @@
       `(with-fast-read-byte ((unsigned-byte 8) ,fasl-input-stream)
          (fast-read-u-integer ,n))))
 
+(defun read-varint-arg (fasl-input)
+  (let ((accumulator 0)
+        (shift 0))
+    (declare (fixnum shift) (type word accumulator))
+    (with-fast-read-byte ((unsigned-byte 8) (%fasl-input-stream fasl-input))
+      (loop
+       (let ((octet (fast-read-byte)))
+         (setq accumulator (logior accumulator (ash (logand octet #x7F) shift)))
+         (incf shift 7)
+         (unless (logbitp 7 octet) (return accumulator)))))))
+
 ;; FIXME: on x86-64, these functions exceed 600, 900, and 1200 bytes of code
 ;; respectively. Either don't inline them, or make a "really" fast inline case
 ;; that punts if inapplicable. e.g. if the fast-read-byte buffer will not be
 ;; refilled, then SAP-REF-WORD could work to read 8 bytes.
 ;; But this would only be feasible on machines that are little-endian
 ;; and that allow unaligned reads. (like x86)
-(declaim (inline read-byte-arg read-halfword-arg read-word-arg))
+(declaim (inline read-byte-arg read-word-arg))
 (defun read-byte-arg (stream)
   (declare (optimize (speed 0)))
   (read-arg 1 stream))
-
-(defun read-halfword-arg (stream)
-  (declare (optimize (speed 0)))
-  (read-arg #.(/ sb!vm:n-word-bytes 2) stream)) ; READ-ARG doesn't eval N
 
 (defun read-word-arg (stream)
   (declare (optimize (speed 0)))
@@ -249,19 +250,13 @@
              (invalid-fasl-expected condition)))))
 
 (define-condition invalid-fasl-features (invalid-fasl)
-  ((potential-features :reader invalid-fasl-potential-features
-                       :initarg :potential-features)
-   (features :reader invalid-fasl-features :initarg :features))
+  ((features :reader invalid-fasl-features :initarg :features))
   (:report
    (lambda (condition stream)
-     (format stream "~@<incompatible ~S in fasl file ~S: ~2I~_~
-                     Of features affecting binary compatibility, ~4I~_~S~2I~_~
-                     the fasl has ~4I~_~A,~2I~_~
-                     while the runtime expects ~4I~_~A.~:>"
-             '*features*
-             (invalid-fasl-stream condition)
-             (invalid-fasl-potential-features condition)
+     (format stream "~@<incompatible features ~A ~_in fasl file ~S: ~2I~_~
+                     Runtime expects ~A~:>"
              (invalid-fasl-features condition)
+             (invalid-fasl-stream condition)
              (invalid-fasl-expected condition)))))
 
 ;;; Skips past the shebang line on stream, if any.
@@ -380,12 +375,12 @@
                        :expected expected-version)
               (continue () :report "Load the fasl file anyway"))))
         ;; Read and validate *FEATURES* which affect binary compatibility.
-        (let ((faff-in-this-file (string-from-stream)))
-          (unless (string= faff-in-this-file *features-affecting-fasl-format*)
+        (let ((faff-in-this-file (string-from-stream))
+              (expected (compute-features-affecting-fasl-format)))
+          (unless (string= faff-in-this-file expected)
             (error 'invalid-fasl-features
                    :stream stream
-                   :potential-features *features-potentially-affecting-fasl-format*
-                   :expected *features-affecting-fasl-format*
+                   :expected expected
                    :features faff-in-this-file)))
         ;; success
         t))))
@@ -394,14 +389,13 @@
 ;; executed.
 #!+sb-show
 (defvar *show-fops-p* nil)
-
+(defvar *fasl-source-info*)
 ;;;
 ;;; a helper function for LOAD-AS-FASL
 ;;;
 ;;; Return true if we successfully load a group from the stream, or
 ;;; NIL if EOF was encountered while trying to read from the stream.
 ;;; Dispatch to the right function for each fop.
-(defconstant +2-operand-fops+ #xE0) ; start of the range
 (defun load-fasl-group (fasl-input print)
   ;;
   ;; PRINT causes most tlf-equivalent forms to print their primary value.
@@ -414,45 +408,46 @@
   ;;
   (declare (ignorable print))
   (let ((stream (%fasl-input-stream fasl-input))
-        #!+sb-show (trace *show-fops-p*))
+        *fasl-source-info*
+        (trace #!+sb-show *show-fops-p*))
     (unless (check-fasl-header stream)
       (return-from load-fasl-group))
     (catch 'fasl-group-end
      (setf (svref (%fasl-input-table fasl-input) 0) 0)
-     (macrolet ((tracing (&body forms)
-                  #!+sb-show `(when trace ,@forms)
-                  #!-sb-show (progn forms nil)))
+     (macrolet ((tracing (&body forms) `(when trace ,@forms)))
       (loop
-       (let ((byte (the (unsigned-byte 8) (read-byte stream))))
+       (let* ((byte (the (unsigned-byte 8) (read-byte stream)))
+              (function (svref **fop-funs** byte))
+              (n-operands (aref (car **fop-signatures**) byte)))
          ;; Do some debugging output.
          (tracing
-           (format *trace-output* "~&~6x : [~D,~D] ~2,'0x(~A)"
-                   (1- (file-position stream))
-                   (svref (%fasl-input-stack fasl-input) 0) ; stack pointer
-                   (svref (%fasl-input-table fasl-input) 0) ; table pointer
-                   byte (aref **fop-names** byte)))
+          (format *trace-output* "~&~6x : [~D,~D] ~2,'0x(~A)"
+                  (1- (file-position stream))
+                  (svref (%fasl-input-stack fasl-input) 0) ; stack pointer
+                  (svref (%fasl-input-table fasl-input) 0) ; table pointer
+                  byte (and (functionp function) (%fun-name function))))
          ;; Actually execute the fop.
          (let ((result
-                (let ((function (svref **fop-funs** byte)))
-                  (cond ((not (functionp function))
-                         (error "corrupt fasl file: FOP code #x~x" byte))
-                        ((zerop (sbit (car **fop-signatures**) (ash byte -2)))
-                         ;; takes no arguments from the fasl file
-                         (funcall function fasl-input))
-                        (t
-                         ;; one or two arguments come from the fasl file
-                         (let (arg1 arg2) ; See !%DEFINE-FOP for encoding
-                           (with-fast-read-byte ((unsigned-byte 8) stream)
-                             (setq arg1 (fast-read-var-u-integer
-                                         (ash 1 (logand byte 3))))
-                             (when (>= byte +2-operand-fops+)
-                               (setq arg2 (fast-read-var-u-integer
-                                           (ash 1 (ldb (byte 2 2) byte))))))
-                           (tracing
-                             (format *trace-output* "{~D~@[,~D~]}" arg1 arg2))
-                           (if arg2
-                               (funcall function fasl-input arg1 arg2)
-                               (funcall function fasl-input arg1))))))))
+                 (cond ((not (functionp function))
+                        (error "corrupt fasl file: FOP code #x~x" byte))
+                       ((zerop n-operands)
+                        (funcall function fasl-input))
+                       (t
+                        (let (arg1 arg2 arg3)
+                          (with-fast-read-byte ((unsigned-byte 8) stream)
+                            ;; The low 2 bits of the opcode determine the
+                            ;; number of octets used for the 1st operand.
+                            (setq arg1 (fast-read-var-u-integer (ash 1 (logand byte 3)))))
+                          (when (>= n-operands 2)
+                            (setq arg2 (read-varint-arg fasl-input))
+                            (when (>= n-operands 3)
+                              (setq arg3 (read-varint-arg fasl-input))))
+                          (tracing (format *trace-output* "{~D~@[,~D~@[,~D~]~]}"
+                                           arg1 arg2 arg3))
+                          (case n-operands
+                            (3 (funcall function fasl-input arg1 arg2 arg3))
+                            (2 (funcall function fasl-input arg1 arg2))
+                            (1 (funcall function fasl-input arg1))))))))
            (when (plusp (sbit (cdr **fop-signatures**) byte))
              (push-fop-stack result fasl-input))
            (let ((stack (%fasl-input-stack fasl-input)))
@@ -517,7 +512,7 @@
                    (dotimes (i 255)
                      (declare (fixnum i))
                      (let ((n (svref ,vec i)))
-                       (push (cons (svref *fop-names* i) n) ,lvar)
+                       (push (cons (%fun-name (svref **fop-funs** i)) n) ,lvar)
                        (incf ,tvar n)))
                    (setq ,lvar (subseq (sort ,lvar (lambda (x y)
                                                      (> (cdr x) (cdr y))))

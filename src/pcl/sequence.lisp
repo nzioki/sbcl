@@ -22,12 +22,11 @@
      (let ((operation (sequence::protocol-unimplemented-operation condition))
            (datum (type-error-datum condition)))
        (format stream "~@<The operation ~
-                       ~/sb-impl:print-symbol-with-prefix/ is not ~
+                       ~/sb-ext:print-symbol-with-prefix/ is not ~
                        implemented for ~A which is an instance of the ~
-                       ~/sb-impl:print-symbol-with-prefix/ subclass ~
+                       ~/sb-ext:print-symbol-with-prefix/ subclass ~
                        ~S.~@:>"
                operation datum 'sequence (class-of datum)))))
-  #+sb-doc
   (:documentation
    "This error is signaled if a sequence operation is applied to an
    instance of a sequence class that does not support the
@@ -43,7 +42,6 @@
   (:method ((s list)) (null s))
   (:method ((s vector)) (zerop (length s)))
   (:method ((s sequence)) (zerop (length s)))
-  #+sb-doc
   (:documentation
    "Returns T if SEQUENCE is an empty sequence and NIL
    otherwise. Signals an error if SEQUENCE is not a sequence."))
@@ -53,7 +51,6 @@
   (:method ((s vector)) (length s))
   (:method ((s sequence))
     (sequence:protocol-unimplemented 'sequence:length s))
-  #+sb-doc
   (:documentation
    "Returns the length of SEQUENCE or signals a PROTOCOL-UNIMPLEMENTED
    error if the sequence protocol is not implemented for the class of
@@ -64,7 +61,6 @@
   (:method ((s vector) index) (elt s index))
   (:method ((s sequence) index)
     (sequence:protocol-unimplemented 'sequence:elt s))
-  #+sb-doc
   (:documentation
    "Returns the element at position INDEX of SEQUENCE or signals a
    PROTOCOL-UNIMPLEMENTED error if the sequence protocol is not
@@ -76,7 +72,6 @@
   (:method (new-value (s vector) index) (setf (elt s index) new-value))
   (:method (new-value (s sequence) index)
     (sequence:protocol-unimplemented '(setf sequence:elt) s))
-  #+sb-doc
   (:documentation
    "Replaces the element at position INDEX of SEQUENCE with NEW-VALUE
    and returns NEW-VALUE or signals a PROTOCOL-UNIMPLEMENTED error if
@@ -108,7 +103,6 @@
   (:method ((s sequence) length &key initial-element initial-contents)
     (declare (ignore initial-element initial-contents))
     (sequence:protocol-unimplemented 'sequence:make-sequence-like s))
-  #+sb-doc
   (:documentation
    "Returns a freshly allocated sequence of length LENGTH and of the
    same class as SEQUENCE. Elements of the new sequence are
@@ -149,7 +143,6 @@
   (:method ((s sequence) length &rest args)
     (declare (ignore args))
     (sequence:protocol-unimplemented 'sequence:adjust-sequence s))
-  #+sb-doc
   (:documentation
    "Return destructively modified SEQUENCE or a freshly allocated
    sequence of the same class as SEQUENCE of length LENGTH. Elements
@@ -165,6 +158,10 @@
 ;;; The general protocol
 
 (defgeneric sequence:make-sequence-iterator (sequence &key from-end start end)
+  (:method ((s vector) &key from-end (start 0) end)
+    (make-vector-iterator s from-end start end))
+  (:method ((s list) &key from-end (start 0) end)
+    (make-list-iterator s from-end start end))
   (:method ((s sequence) &key from-end (start 0) end)
     (multiple-value-bind (iterator limit from-end)
         (sequence:make-simple-sequence-iterator
@@ -178,7 +175,6 @@
     (error 'type-error
            :datum s
            :expected-type 'sequence))
-  #+sb-doc
   (:documentation
    "Returns a sequence iterator for SEQUENCE or, if START and/or END
    are supplied, the subsequence bounded by START and END as nine
@@ -198,12 +194,83 @@
    elements in the order in which they appear in SEQUENCE. Otherwise,
    the elements are visited in the opposite order."))
 
-;;; the simple protocol: the simple iterator returns three values,
-;;; STATE, LIMIT and FROM-END.
-
 ;;; magic termination value for list :from-end t
 (defvar *exhausted* (cons nil nil))
 
+(defun make-list-iterator (list from-end start end)
+  (multiple-value-bind (iterator limit from-end)
+      (if from-end
+          (let* ((termination (if (= start 0) *exhausted* (nthcdr (1- start) list)))
+                 (init (if (<= (or end (length list)) start)
+                           termination
+                           (if end (last list (- (length list) (1- end))) (last list)))))
+            (values init termination t))
+          (cond
+            ((not end) (values (nthcdr start list) nil nil))
+            (t (let ((st (nthcdr start list)))
+                 (values st (nthcdr (- end start) st) nil)))))
+    (values iterator limit from-end
+            (if from-end
+                (lambda (list iterator from-end)
+                  (declare (ignore from-end))
+                  (if (eq iterator list)
+                      *exhausted*
+                      (do* ((cdr list (cdr cdr)))
+                           ((eq (cdr cdr) iterator) cdr)))
+                  (1+ iterator))
+                (lambda (list iterator from-end)
+                  (declare (ignore list from-end))
+                  (cdr iterator)))
+            (lambda (list iterator limit from-end)
+              (declare (ignore list from-end))
+              (eq iterator limit))
+            (lambda (list iterator)
+              (declare (ignore list))
+              (car iterator))
+            (lambda (new-value list iterator)
+              (declare (ignore list))
+              (setf (car iterator) new-value))
+            (lambda (list iterator)
+              (loop for cdr on list
+                    for i from 0
+                    when (eq cdr iterator)
+                    return i))
+            (lambda (list iterator)
+              (declare (ignore list))
+              iterator))))
+
+(defun make-vector-iterator (vector from-end start end)
+  (let* ((end (or end (length vector)))
+         (iterator (if from-end
+                       (1- end)
+                       start))
+         (limit (if from-end
+                    (1- start)
+                    end)))
+    (values iterator limit from-end
+            (if from-end
+                (lambda (sequence iterator from-end)
+                  (declare (ignore sequence from-end))
+                  (1- iterator))
+                (lambda (sequence iterator from-end)
+                  (declare (ignore sequence from-end))
+                  (1+ iterator)))
+            (lambda (sequence iterator limit from-end)
+              (declare (ignore sequence from-end))
+              (= iterator limit))
+            (lambda (sequence iterator)
+              (aref sequence iterator))
+            (lambda (new-value sequence iterator)
+              (setf (aref sequence iterator) new-value))
+            (lambda (sequence iterator)
+              (declare (ignore sequence))
+              iterator)
+            (lambda (sequence iterator)
+              (declare (ignore sequence))
+              iterator))))
+
+;;; the simple protocol: the simple iterator returns three values,
+;;; STATE, LIMIT and FROM-END.
 (defgeneric sequence:make-simple-sequence-iterator
     (sequence &key from-end start end)
   (:method ((s list) &key from-end (start 0) end)
@@ -227,7 +294,6 @@
       (if from-end
           (values (1- end) (1- start) from-end)
           (values start end nil))))
-  #+sb-doc
   (:documentation
    "Returns a sequence iterator for SEQUENCE, START, END and FROM-END
    as three values:
@@ -256,7 +322,6 @@
     (if from-end
         (1- iterator)
         (1+ iterator)))
-  #+sb-doc
   (:documentation
    "Moves ITERATOR one position forward or backward in SEQUENCE
    depending on the iteration direction encoded in FROM-END."))
@@ -268,7 +333,6 @@
     (= iterator limit))
   (:method ((s sequence) iterator limit from-end)
     (= iterator limit))
-  #+sb-doc
   (:documentation
    "Returns non-NIL when ITERATOR has reached LIMIT (which may
    correspond to the end of SEQUENCE) with respect to the iteration
@@ -281,7 +345,6 @@
     (aref s iterator))
   (:method ((s sequence) iterator)
     (sequence:elt s iterator))
-  #+sb-doc
   (:documentation
    "Returns the element of SEQUENCE associated to the position of
    ITERATOR."))
@@ -293,7 +356,6 @@
     (setf (aref s iterator) o))
   (:method (o (s sequence) iterator)
     (setf (sequence:elt s iterator) o))
-  #+sb-doc
   (:documentation
    "Destructively modifies SEQUENCE by replacing the sequence element
    associated to position of ITERATOR with NEW-VALUE."))
@@ -305,7 +367,6 @@
     (loop for l on s for i from 0 when (eq l iterator) return i))
   (:method ((s vector) iterator) iterator)
   (:method ((s sequence) iterator) iterator)
-  #+sb-doc
   (:documentation
    "Returns the position of ITERATOR in SEQUENCE."))
 
@@ -313,35 +374,47 @@
   (:method ((s list) iterator) iterator)
   (:method ((s vector) iterator) iterator)
   (:method ((s sequence) iterator) iterator)
-  #+sb-doc
   (:documentation
    "Returns a copy of ITERATOR which also traverses SEQUENCE but can
    be mutated independently of ITERATOR."))
 
+(defun %make-sequence-iterator (sequence from-end start end)
+  (typecase sequence
+    (vector
+     (make-vector-iterator sequence from-end start end))
+    (list
+     (make-list-iterator sequence from-end start end))
+    (t
+     (sequence:make-sequence-iterator sequence :end end :start start
+                                               :from-end from-end))))
+
 (defmacro sequence:with-sequence-iterator
-    ((&rest vars) (sequence &rest args &key from-end start end) &body body)
-  #+sb-doc
+    ((&whole vars
+      &optional iterator limit from-end-p
+                step endp element set-element index copy)
+     (sequence &key from-end (start 0) end) &body body)
   "Executes BODY with the elements of VARS bound to the iteration
   state returned by MAKE-SEQUENCE-ITERATOR for SEQUENCE and
   ARGS. Elements of VARS may be NIL in which case the corresponding
   value returned by MAKE-SEQUENCE-ITERATOR is ignored."
-  (declare (ignore from-end start end))
+  (declare (ignore iterator limit from-end-p
+                   step endp element set-element index copy))
   (let* ((ignored '())
          (vars (mapcar (lambda (x)
                          (or x (let ((name (gensym)))
                                  (push name ignored)
                                  name)))
                        vars)))
-   `(multiple-value-bind (,@vars) (sequence:make-sequence-iterator ,sequence ,@args)
-      (declare (type function ,@(nthcdr 3 vars))
-               (ignore ,@ignored))
-      ,@body)))
+    `(multiple-value-bind (,@vars)
+         (%make-sequence-iterator ,sequence ,from-end ,start ,end)
+       (declare (type function ,@(nthcdr 3 vars))
+                (ignore ,@ignored))
+       ,@body)))
 
 (defmacro sequence:with-sequence-iterator-functions
     ((step endp elt setf index copy)
      (sequence &rest args &key from-end start end)
      &body body)
-  #+sb-doc
   "Executes BODY with the names STEP, ENDP, ELT, SETF, INDEX and COPY
   bound to local functions which execute the iteration state query and
   mutation functions returned by MAKE-SEQUENCE-ITERATOR for SEQUENCE
@@ -379,28 +452,29 @@
 
 ;;;; LOOP support.  (DOSEQUENCE support is present in the core SBCL
 ;;;; code).
-(defun loop-elements-iteration-path (variable data-type prep-phrases)
+(defun sb-loop::loop-elements-iteration-path (variable data-type prep-phrases)
   (let (of-phrase)
     (loop for (prep . rest) in prep-phrases do
           (ecase prep
             ((:of :in) (if of-phrase
                            (sb-loop::loop-error "Too many prepositions")
                            (setq of-phrase rest)))))
-    (destructuring-bind (it lim f-e step endp elt seq)
-        (loop repeat 7 collect (gensym))
-      (push `(let ((,seq ,(car of-phrase)))) sb-loop::*loop-wrappers*)
+    (let ((it (gensym "ITER"))
+          (lim (gensym "LIMIT"))
+          (f-e (gensym "FROM-END"))
+          (step (gensym "STEP"))
+          (endp (gensym "ENDP"))
+          (elt (gensym "ELT"))
+          (seq (gensym "SEQ")))
+      (push `(let ((,seq ,(car of-phrase)))) (sb-loop::wrappers sb-loop::*loop*))
       (push `(sequence:with-sequence-iterator (,it ,lim ,f-e ,step ,endp ,elt) (,seq))
-            sb-loop::*loop-wrappers*)
-    `(((,variable nil ,data-type)) () () nil (funcall ,endp ,seq ,it ,lim ,f-e)
-      (,variable (funcall ,elt ,seq ,it) ,it (funcall ,step ,seq ,it ,f-e))))))
-(sb-loop::add-loop-path
- '(element elements) 'loop-elements-iteration-path sb-loop::*loop-ansi-universe*
- :preposition-groups '((:of :in)) :inclusive-permitted nil)
+            (sb-loop::wrappers sb-loop::*loop*))
+      `(((,variable nil ,data-type)) () () nil (funcall ,endp ,seq ,it ,lim ,f-e)
+        (,variable (funcall ,elt ,seq ,it) ,it (funcall ,step ,seq ,it ,f-e))))))
 
 ;;;; generic implementations for sequence functions.
 
 (defgeneric sequence:map (result-prototype function sequence &rest sequences)
-  #+sb-doc
   (:documentation
    "Implements CL:MAP for extended sequences.
 
@@ -750,7 +824,6 @@
     (sequence:nreverse result)))
 
 (defgeneric sequence:concatenate (result-prototype &rest sequences)
-  #+sb-doc
   (:documentation
    "Implements CL:CONCATENATE for extended sequences.
 
@@ -849,16 +922,18 @@
     ;; Create an iteration state for SEQUENCE1 for the interesting
     ;;range within SEQUENCE1. To compare this range against ranges in
     ;;SEQUENCE2, we copy START-STATE1 and then mutate the copy.
-    (sequence:with-sequence-iterator (start-state1 nil from-end1 step1 nil elt1)
+    (sequence:with-sequence-iterator (start-state1 nil from-end1
+                                      step1 nil elt1 nil nil copy1)
         (sequence1 :start start1 :end end1 :from-end from-end)
       ;; Create an iteration state for the interesting range within
       ;; SEQUENCE2.
-      (sequence:with-sequence-iterator (start-state2 nil from-end2 step2 nil elt2 nil index2)
+      (sequence:with-sequence-iterator (start-state2 nil from-end2
+                                        step2 nil elt2 nil index2 copy2)
           (sequence2 :start start2 :end end2 :from-end from-end)
         ;; Copy both iterators at all COUNT possible match positions.
         (dotimes (i count)
-          (let ((state1 (sequence:iterator-copy sequence1 start-state1))
-                (state2 (sequence:iterator-copy sequence2 start-state2)))
+          (let ((state1 (funcall copy1 sequence1 start-state1))
+                (state2 (funcall copy2 sequence2 start-state2)))
             ;; Determine whether there is a match at the current
             ;; position. Return immediately, if there is a match.
             (dotimes
@@ -1114,7 +1189,6 @@
   (apply #'%sort-with-temp-vector #'stable-sort sequence predicate args))
 
 (defgeneric sequence:merge (result-prototype sequence1 sequence2 predicate &key key)
-  #+sb-doc
   (:documentation
    "Implements CL:MERGE for extended sequences.
 

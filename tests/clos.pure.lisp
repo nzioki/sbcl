@@ -77,12 +77,10 @@
       (assert (null result)))))
 
 ;; No compiler-notes for non-constant slot-names in default policy.
-(handler-case
-    (compile nil '(lambda (x y z)
-                   (setf (slot-value x z)
-                         (slot-value y z))))
-  (sb-ext:compiler-note (e)
-    (error e)))
+(with-test (:name (slot-value :no sb-ext:compiler-note))
+  (checked-compile '(lambda (x y z)
+                     (setf (slot-value x z) (slot-value y z)))
+                   :allow-notes nil))
 
 (with-test (:name :slot-table-of-symbol-works)
   (assert (eq :win
@@ -94,3 +92,15 @@
                   (and (search "slot ~S is missing"
                                (simple-condition-format-control c))
                        :win))))))
+
+(with-test (:name :funcallable-instance-sxhash)
+  (assert
+   (/= (sxhash (make-instance 'sb-mop:funcallable-standard-object))
+       (sxhash (make-instance 'sb-mop:funcallable-standard-object))
+       42)))
+
+(with-test (:name (typep :literal-class))
+  (checked-compile-and-assert ()
+      `(lambda (x)
+         (typep x #.(find-class 'symbol)))
+    (('x) t)))

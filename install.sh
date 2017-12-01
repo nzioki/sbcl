@@ -66,6 +66,10 @@ test -f "$BUILD_ROOT$SBCL_HOME"/sbcl.core && \
 
 cp src/runtime/$RUNTIME "$BUILD_ROOT$INSTALL_ROOT"/bin/
 cp output/sbcl.core "$BUILD_ROOT$SBCL_HOME"/sbcl.core
+cp src/runtime/sbcl.mk "$BUILD_ROOT$SBCL_HOME"/sbcl.mk
+for i in $(grep '^LIBSBCL=' src/runtime/sbcl.mk | cut -d= -f2-) ; do
+    cp "src/runtime/$i" "$BUILD_ROOT$SBCL_HOME/$i"
+done
 
 # installing contrib
 
@@ -103,14 +107,15 @@ echo " core and contribs in $BUILD_ROOT$INSTALL_ROOT/lib/sbcl/"
 
 echo
 echo "Documentation:"
+CP="cp -f"
 
 # man
-cp doc/sbcl.1 "$BUILD_ROOT$MAN_DIR"/man1/ && echo " man $BUILD_ROOT$MAN_DIR/man1/sbcl.1"
+$CP doc/sbcl.1 "$BUILD_ROOT$MAN_DIR"/man1/ && echo " man $BUILD_ROOT$MAN_DIR/man1/sbcl.1"
 
 # info
 for info in doc/manual/*.info
 do
-  test -e $info && cp $info "$BUILD_ROOT$INFO_DIR"/ \
+  test -e $info && $CP $info "$BUILD_ROOT$INFO_DIR"/ \
       && BN=`basename $info` \
       && DIRFAIL=`install-info --info-dir="$BUILD_ROOT$INFO_DIR" \
         "$BUILD_ROOT$INFO_DIR"/$BN > /dev/null 2>&1 \
@@ -120,31 +125,31 @@ done
 
 for info in doc/manual/*.info-*
 do
-  test -e $info && cp $info "$BUILD_ROOT$INFO_DIR"/ \
+  test -e $info && $CP $info "$BUILD_ROOT$INFO_DIR"/ \
       && echo " info $BUILD_ROOT$INFO_DIR/`basename $info`"
 done
 
 # pdf
 for pdf in doc/manual/*.pdf
 do
-  test -e $pdf && cp $pdf "$BUILD_ROOT$DOC_DIR"/ \
+  test -e $pdf && $CP $pdf "$BUILD_ROOT$DOC_DIR"/ \
       && echo " pdf $BUILD_ROOT$DOC_DIR/`basename $pdf`"
 done
 
 # html
 for html in doc/manual/sbcl doc/manual/asdf
 do
-  test -d $html && cp -R -L $html "$BUILD_ROOT$DOC_DIR"/html \
+  test -d $html && $CP -R -L $html "$BUILD_ROOT$DOC_DIR"/html \
       && echo " html $BUILD_ROOT$DOC_DIR/html/`basename $html`/index.html"
 done
 
 for html in doc/manual/sbcl.html doc/manual/asdf.html
 do
-  test -e $html && cp $html "$BUILD_ROOT$DOC_DIR"/ \
+  test -e $html && $CP $html "$BUILD_ROOT$DOC_DIR"/ \
       && echo " html $BUILD_ROOT$DOC_DIR/`basename $html`"
 done
 
 for f in BUGS CREDITS COPYING NEWS
 do
-  test -e $f && cp $f "$BUILD_ROOT$DOC_DIR"/
+  test -e $f && $CP $f "$BUILD_ROOT$DOC_DIR"/
 done

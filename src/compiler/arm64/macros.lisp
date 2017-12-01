@@ -177,7 +177,7 @@
 (defun allocation-tramp (alloc-tn size back-label return-in-tmp lip)
   (unless (eq size tmp-tn)
     (inst mov tmp-tn size))
-  (load-inline-constant alloc-tn '(:fixup "alloc_tramp" :foreign) lip)
+  (load-inline-constant alloc-tn '(:fixup alloc-tramp :assembly-routine) lip)
   (inst blr alloc-tn)
   (unless return-in-tmp
     (move alloc-tn tmp-tn))
@@ -223,7 +223,7 @@
                   size)
               #!-sb-thread
               (progn
-                (load-inline-constant ,flag-tn '(:fixup "boxed_region" :foreign) ,lip)
+                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
                 (inst ldp ,result-tn ,flag-tn (@ ,flag-tn)))
               #!+sb-thread
               (inst ldp ,result-tn ,flag-tn (@ thread-tn
@@ -234,7 +234,7 @@
               (inst b :hi ALLOC)
               #!-sb-thread
               (progn
-                (load-inline-constant ,flag-tn '(:fixup "boxed_region" :foreign) ,lip)
+                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
                 (storew ,result-tn ,flag-tn))
               #!+sb-thread
               (storew ,result-tn thread-tn thread-alloc-region-slot)
@@ -294,13 +294,7 @@
       (encode-internal-error-args values)
       (emit-alignment 2))))
 
-(defun error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
@@ -396,19 +390,19 @@
      (:result-types ,el-type)
      (:temporary (:scs (interior-reg)) lip)
      (:generator 5
-       ,@(ecase size (eq size :byte)
-               (:byte
-                `((inst add lip object index)
-                  (inst ,(if signed 'ldrsb 'ldrb)
-                        value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-               (:short
-                `((inst add lip object (lsl index 1))
-                  (inst ,(if signed 'ldrsh 'ldrh)
-                        value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-               (:word
-                `((inst add lip object (lsl index 2))
-                  (inst ,(if signed 'ldrsw 'ldr) (32-bit-reg value)
-                        (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))
+       ,@(ecase size
+           (:byte
+            `((inst add lip object index)
+              (inst ,(if signed 'ldrsb 'ldrb)
+                    value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
+           (:short
+            `((inst add lip object (lsl index 1))
+              (inst ,(if signed 'ldrsh 'ldrh)
+                    value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
+           (:word
+            `((inst add lip object (lsl index 2))
+              (inst ,(if signed 'ldrsw 'ldr) (32-bit-reg value)
+                    (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))
 
 (defmacro define-partial-setter (name type size offset lowtag scs el-type
                                  &optional translate)
@@ -424,32 +418,17 @@
      (:results (result :scs ,scs))
      (:result-types ,el-type)
      (:generator 5
-       ,@(ecase size (eq size :byte)
-                (:byte
-                 `((inst add lip object index)
-                   (inst strb value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-                (:short
-                 `((inst add lip object (lsl index 1))
-                   (inst strh value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-                (:word
-                 `((inst add lip object (lsl index 2))
-                   (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
+       ,@(ecase size
+           (:byte
+            `((inst add lip object index)
+              (inst strb value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
+           (:short
+            `((inst add lip object (lsl index 1))
+              (inst strh value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
+           (:word
+            `((inst add lip object (lsl index 2))
+              (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
        (move result value))))
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  #!-gencgc
-  (declare (ignore objects))            ; should we eval these for side-effect?
-  #!-gencgc
-  `(without-gcing
-    ,@body)
-  #!+gencgc
-  `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
-     (declare (truly-dynamic-extent *pinned-objects*))
-     ,@body))
 
 (defun load-inline-constant (dst value &optional lip)
   (destructuring-bind (size . label) (register-inline-constant value)
@@ -475,7 +454,7 @@ garbage collection.  This is currently implemented by disabling GC"
   #!+sb-thread
   `(let ((reg ,reg))
      (load-symbol tmp-tn ',symbol)
-     (inst ldr tmp-tn (tls-index-of tmp-tn))
+     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
      (inst ldr reg (@ thread-tn tmp-tn)))
   #!-sb-thread
   `(load-symbol-value ,reg ,symbol))
@@ -484,7 +463,7 @@ garbage collection.  This is currently implemented by disabling GC"
   #!+sb-thread
   `(let ((reg ,reg))
      (load-symbol tmp-tn ',symbol)
-     (inst ldr tmp-tn (tls-index-of tmp-tn))
+     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
      (inst str reg (@ thread-tn tmp-tn)))
   #!-sb-thread
   `(store-symbol-value ,reg ,symbol))

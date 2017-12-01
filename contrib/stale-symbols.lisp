@@ -61,22 +61,29 @@
              :external))))
 
 (defun find-stale-objects ()
-  (dolist (space '(:static :dynamic :read-only))
-    (sb-vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
      (lambda (obj type size)
        (declare (optimize (safety 0))
                 (ignore size))
        (block mapper
-         (when (eql type sb-vm:symbol-header-widetag)
+         (when (eql type sb-vm:symbol-widetag)
            (ignore-errors
              (let ((refs (let ((res nil)
                                (count 0))
-                           (dolist (space '(:static :dynamic :read-only))
+                           (dolist (space '(:static :dynamic :read-only
+                                            #+immobile-space :immobile))
                              (sb-vm::map-referencing-objects
                               (lambda (o)
                                 (when (> (incf count) 1)
                                   (return-from mapper nil))
                                 (push (cons space o) res))
+                              ;; FIXME: while we could use :ALL here,
+                              ;; then we have a different problem:
+                              ;; inferring the space for the preceding PUSH.
+                              ;; That's most readily done by calling SB-VM::SPACE-BOUNDS
+                              ;; for each known space, storing those answers somewhere,
+                              ;; and comparing GET-LISP-OBJ-ADDRESS of O to each space.
+                              ;; Would that be the tail wagging the dog?
                               space obj))
                            res)))
                (let ((externalp (external-symbol-p obj)))
@@ -97,4 +104,4 @@
                         (princ "   Reference in dynamic space: ")))
                      (print-stale-reference (cdar refs) t)
                      (terpri))))))))
-     space)))
+     :all))

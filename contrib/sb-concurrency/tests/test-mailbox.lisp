@@ -46,7 +46,8 @@
                                    (lambda (x)
                                      (loop repeat 50
                                            do (send-message mbox x)
-                                              (sleep 0.001)))
+                                              (sleep #-win32 0.001
+                                                     #+win32 0)))
                                    :arguments i)))
            (readers (loop repeat 10
                           collect (make-thread
@@ -62,7 +63,9 @@
 ;;; The issues don't seem to have anything to do with mailboxes
 ;;; per-se, but are rather related to our usage of signal-unsafe
 ;;; pthread functions inside signal handlers.
-#+(and sb-thread (not sunos))
+;;;
+;;; INTERRUPT-THREAD is not reliable on Windows
+#+(and sb-thread (not sunos) (not win32))
 (progn
 
 ;; Dummy struct for ATOMIC-INCF to work.
@@ -82,7 +85,8 @@
     (&key n-senders n-receivers n-messages interruptor)
   (let ((mbox    (make-mailbox))
         (counter (make-counter))
-        (+sleep+ 0.0001)
+        #-win32
+        (+sleep+  0.0001)
         (+fin-token+ :finish) ; end token for receivers to stop
         (+blksize+ 5))        ; "block size" for RECEIVE-PENDING-MESSAGES
     (multiple-value-bind (n-recv-msg
@@ -97,7 +101,8 @@
                            #'(lambda ()
                                (dotimes (i n-messages t)
                                  (send-message mbox i)
-                                 (sleep (random +sleep+))))))
+                                 (sleep #-win32 (random +sleep+)
+                                        #+win32 0)))))
             (receivers
              (flet ((process-msg (msg out)
                       (cond
@@ -110,20 +115,23 @@
                (append
                 (make-threads n-recv-msg "RECV-MSG"
                   #'(lambda ()
-                      (sleep (random +sleep+))
+                      (sleep  #-win32 (random +sleep+)
+                              #+win32 0)
                       (loop (process-msg (receive-message mbox)
                                          #'(lambda (x) (return x))))))
                 (make-threads n-recv-pend-msgs "RECV-PEND-MSGS"
                   #'(lambda ()
                       (loop
-                        (sleep (random +sleep+))
+                        (sleep #-win32 (random +sleep+)
+                              #+win32 0)
                         (mapc #'(lambda (msg)
                                   (process-msg msg #'(lambda (x) (return x))))
                               (receive-pending-messages mbox +blksize+)))))
                 (make-threads n-recv-msg-n-h "RECV-MSG-NO-HANG"
                   #'(lambda ()
                       (loop
-                        (sleep (random +sleep+))
+                        (sleep #-win32 (random +sleep+)
+                               #+win32 0)
                         (multiple-value-bind (msg ok)
                             (receive-message-no-hang mbox)
                           (when ok
@@ -166,7 +174,6 @@
                      `(:errors   . ,errors)
                      `(:timeouts . ,timeouts))))))))
 
-#-win32
 (deftest mailbox.single-producer-single-consumer
     (test-mailbox-producers-consumers :n-senders 1
                                       :n-receivers 1
@@ -176,17 +183,15 @@
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.single-producer-multiple-consumers
     (test-mailbox-producers-consumers :n-senders 1
-                                      :n-receivers 100
+                                      :n-receivers (if (> *cpus* 1) 100 50)
                                       :n-messages 1000)
   (:received . 1000)
   (:garbage  . 0)
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.multiple-producers-single-consumer
     (test-mailbox-producers-consumers :n-senders 10
                                       :n-receivers 1
@@ -196,7 +201,6 @@
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.multiple-producers-multiple-consumers
     (test-mailbox-producers-consumers :n-senders 50
                                       :n-receivers 50
@@ -220,7 +224,8 @@
                           (loop repeat 99
                                 for victim = (nth (random n) threads)
                                 do (kill-thread victim)
-                                   (sleep (random 0.0001)))))
+                                   (sleep  #-win32 (random 0.0001)
+                                           #+win32 0))))
       (values
        ;; We may have killed a receiver before it got to incrementing
        ;; the counter.

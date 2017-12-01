@@ -14,29 +14,19 @@
 ;;;
 ;;; FIXME: These should be listed once and only once, instead of
 ;;; listed here and then listed separately (and by now, 2001-06-06,
-;;; slightly differently) elsewhere.
+;;; slightly differently) elsewhere. (Maybe this is resolved?)
 (declaim (special *posix-argv*
                   *core-string*
                   *stdin*
                   *stdout*
                   *stderr*
                   *tty*
-                  sb!vm:*read-only-space-free-pointer*
-                  sb!vm:*static-space-free-pointer*
                   sb!vm:*current-catch-block*
                   sb!vm::*current-unwind-protect-block*
                   sb!vm::*alien-stack-pointer*
                   sb!vm:*control-stack-start*
                   sb!vm:*control-stack-end*
                   sb!vm:*binding-stack-start*
-                  ;; FIXME: The pseudo-atomic variable stuff should be
-                  ;; conditional on :SB-PSEUDO-ATOMIC-SYMBOLS, which
-                  ;; should be conditional on :X86, instead of the
-                  ;; pseudo-atomic stuff being directly conditional on
-                  ;; :X86. (Note that non-X86 ports mention
-                  ;; pseudo-atomicity too, but they handle it without
-                  ;; messing with special variables.)
-                  #!+(or x86 x86-64) *pseudo-atomic-bits*
                   #!+(or hpux) sb!vm::*c-lra*
                   *allow-with-interrupts*
                   sb!unix::*unblock-deferrables-on-enabling-interrupts-p*
@@ -48,7 +38,15 @@
                   *free-interrupt-context-index*
                   sb!vm::*allocation-pointer*
                   sb!vm::*binding-stack-pointer*
-                  sb!pcl::..slot-unbound..
                   sb!pcl::*cache-miss-values-stack*
                   sb!pcl::*dfun-miss-gfs-on-stack*))
-(!defvar sb!vm:*alloc-signal* nil)
+(defvar sb!vm:*alloc-signal*) ; initialized by create_thread_struct()
+;;; This is a slot of 'struct thread' if multithreaded,
+;;; and the symbol-global-value should never be used.
+;;; (And in any case it is not really a special var)
+#!+(and (or x86 x86-64) (not sb-thread))
+(!defvar *pseudo-atomic-bits* 0)
+
+#!+c-stack-is-control-stack
+(setf (info :variable :always-bound 'sb!c:*alien-stack-pointer*) :always-bound)
+

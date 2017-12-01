@@ -11,93 +11,16 @@
 (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 (load-or-cload-xcompiler #'host-load-stem)
 
-(let ((*features* (cons :sb-xc *features*)))
-  (load "src/cold/muffler.lisp"))
-
-;; Avoid forward-reference to an as-yet unknown type.
-;; NB: This is not how you would write this function, if you required
-;; such a thing. It should be (TYPEP X 'CODE-DELETION-NOTE).
-;; Do as I say, not as I do.
-(defun code-deletion-note-p (x)
-  (eq (type-of x) 'sb!ext:code-deletion-note))
-(setq sb!c::*handled-conditions*
-      `((,(sb!kernel:specifier-type
-           '(or (satisfies unable-to-optimize-note-p)
-                (satisfies code-deletion-note-p)))
-         . muffle-warning)))
-
-(defun proclaim-target-optimization ()
-  (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
-    (sb-xc:proclaim
-     `(optimize
-       (compilation-speed 1) (debug ,debug)
-       ;; CLISP's pretty-printer is fragile and tends to cause stack
-       ;; corruption or fail internal assertions, as of 2003-04-20; we
-       ;; therefore turn off as many notes as possible.
-       (sb!ext:inhibit-warnings #-clisp 2 #+clisp 3)
-       ;; SAFETY = SPEED (and < 3) should provide reasonable safety,
-       ;; but might skip some unreasonably expensive stuff
-       ;; (e.g. %DETECT-STACK-EXHAUSTION in sbcl-0.7.2).
-       (safety 2) (space 1) (speed 2)
-       ;; sbcl-internal optimization declarations:
-       ;;
-       ;; never insert stepper conditions
-       (sb!c:insert-step-conditions 0)
-       ;; save FP and PC for alien calls -- or not
-       (sb!c:alien-funcall-saves-fp-and-pc #!+x86 3 #!-x86 0)))))
-(compile 'proclaim-target-optimization)
-
-(defun in-target-cross-compilation-mode (fun)
-  "Call FUN with everything set up appropriately for cross-compiling
-   a target file."
-  (let (;; In order to increase microefficiency of the target Lisp,
-        ;; enable old CMU CL defined-function-types-never-change
-        ;; optimizations. (ANSI says users aren't supposed to
-        ;; redefine our functions anyway; and developers can
-        ;; fend for themselves.)
-        #!-sb-fluid
-        (sb!ext:*derive-function-types* t)
-        ;; Let the target know that we're the cross-compiler.
-        (*features* (cons :sb-xc *features*))
-        ;; We need to tweak the readtable..
-        (*readtable* (copy-readtable)))
-    ;; ..in order to make backquotes expand into target code
-    ;; instead of host code.
-    ;; FIXME: Isn't this now taken care of automatically by
-    ;; toplevel forms in the xcompiler backq.lisp file?
-    (set-macro-character #\` #'sb!impl::backquote-charmacro)
-    (set-macro-character #\, #'sb!impl::comma-charmacro)
-
-    (set-dispatch-macro-character #\# #\+ #'she-reader)
-    (set-dispatch-macro-character #\# #\- #'she-reader)
-    ;; Control optimization policy.
-    (proclaim-target-optimization)
-    ;; Specify where target machinery lives.
-    (with-additional-nickname ("SB-XC" "SB!XC")
-      (funcall fun))))
-(compile 'in-target-cross-compilation-mode)
-
-
 ;; Supress function/macro redefinition warnings under clisp.
 #+clisp (setf custom:*suppress-check-redefinition* t)
 
-(setf *target-compile-file* #'sb-xc:compile-file)
-(setf *target-assemble-file* #'sb!c:assemble-file)
-(setf *in-target-compilation-mode-fn* #'in-target-cross-compilation-mode)
-
 ;;; Run the cross-compiler to produce cold fasl files.
-;; ... and since the cross-compiler hasn't seen a DEFMACRO for QUASIQUOTE,
-;; make it think it has, otherwise it fails more-or-less immediately.
-(setf (sb-xc:macro-function 'sb!int:quasiquote)
-      (lambda (form env)
-        (the sb!kernel:lexenv-designator env)
-        (sb!impl::expand-quasiquote (second form) t)))
 (setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
 (let (fail
       variables
       functions
       types)
-  (sb-xc:with-compilation-unit ()
+  (sb!xc:with-compilation-unit ()
     (load "src/cold/compile-cold-sbcl.lisp")
     ;; Enforce absence of unexpected forward-references to warm loaded code.
     ;; Looking into a hidden detail of this compiler seems fair game.
@@ -119,7 +42,7 @@
 
 (when sb!c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb!c::call-with-each-globaldb-name
+    (sb!int:call-with-each-globaldb-name
      (lambda (name)
        (let* ((cell (sb!int:info :function :emitted-full-calls name))
               (inlinep (eq (sb!int:info :function :inlinep name) :inline))
@@ -197,16 +120,13 @@ Sample output
 ;;; miscellaneous tidying up and saving results
 (let ((filename "output/object-filenames-for-genesis.lisp-expr"))
   (ensure-directories-exist filename :verbose t)
-  ;; save the initial-symbol-values before writing the object filenames.
-  (save-initial-symbol-values)
   (with-open-file (s filename :direction :output :if-exists :supersede)
     (write *target-object-file-names* :stream s :readably t)))
 
 ;;; Let's check that the type system was reasonably sane. (It's easy
 ;;; to spend a long time wandering around confused trying to debug
 ;;; cold init if it wasn't.)
-(when (position :sb-test *shebang-features*)
-  (load "tests/type.after-xc.lisp"))
+(load "tests/type.after-xc.lisp")
 
 ;;; If you're experimenting with the system under a cross-compilation
 ;;; host which supports CMU-CL-style SAVE-LISP, this can be a good

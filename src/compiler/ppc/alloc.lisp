@@ -104,7 +104,6 @@
       (inst ori ndescr ndescr code-header-widetag)
       (storew ndescr result 0 other-pointer-lowtag)
       (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-entry-points-slot other-pointer-lowtag)
       (storew null-tn result code-debug-info-slot other-pointer-lowtag))))
 
 (define-vop (make-fdefn)
@@ -123,7 +122,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
@@ -137,11 +137,11 @@
               (inst clrrwi. result csp-tn n-lowtag-bits)
               (inst addi csp-tn csp-tn alloc-size)
               (inst ori result result fun-pointer-lowtag)
-              (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-header-widetag)))
+              (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag)))
             (progn
               (allocation result (pad-data-block size)
                           fun-pointer-lowtag :temp-tn temp :flag-tn pa-flag)
-              (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-header-widetag))))
+              (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag))))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -155,7 +155,7 @@
   (:ignore stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
-    (with-fixed-allocation (result pa-flag temp value-cell-header-widetag value-cell-size)
+    (with-fixed-allocation (result pa-flag temp value-cell-widetag value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 

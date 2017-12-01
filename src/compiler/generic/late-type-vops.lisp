@@ -108,15 +108,15 @@
 
 (!define-type-vop code-component-p (code-header-widetag))
 
-(!define-type-vop lra-p (return-pc-header-widetag))
+#!-(or x86 x86-64) (!define-type-vop lra-p (return-pc-widetag))
 
 (!define-type-vop fdefn-p (fdefn-widetag))
 
-(!define-type-vop closurep (closure-header-widetag))
+(!define-type-vop closurep (closure-widetag))
 
-(!define-type-vop simple-fun-p (simple-fun-header-widetag))
+(!define-type-vop simple-fun-p (simple-fun-widetag))
 
-(!define-type-vop funcallable-instance-p (funcallable-instance-header-widetag))
+(!define-type-vop funcallable-instance-p (funcallable-instance-widetag))
 
 (!define-type-vop array-header-p
   (simple-array-widetag
@@ -216,3 +216,5 @@
 
 #!+sb-simd-pack
 (!define-type-vop simd-pack-p (simd-pack-widetag))
+
+(!define-type-vop unbound-marker-p (unbound-marker-widetag))

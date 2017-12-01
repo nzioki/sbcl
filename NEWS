@@ -1,6 +1,274 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
-changes relative to sbcl-1.3.10:
+changes in sbcl-1.4.2 relative to sbcl-1.4.1:
+  * minor incompatible change: SB-EXT:QUIT is no longer marked as deprecated
+    and behaves like SB-EXT:EXIT.
+  * enhancement: ASDF updated to 3.3.1. The ASDF release is dedicated to
+    the late Elias Pipping who put enormous amounts of work into it despite
+    his terminal illness. Thank you and rest in peace.  (lp#1681201)
+  * enhancement: alien routines compiled with '-fsanitize=thread' and/or
+    '-fsanitize=memory' cause fewer false positives in error reporting.
+  * optimization: fewer instances of consing float constants at runtime.
+  * bug fix: a number of compiler bugs detected by Paul F. Dietz' randomized
+    tester.  (lp#1731503, lp#1730699, lp#1723993, lp#1730434, lp#1661911,
+    lp#1729639, lp#1729471, lp#1728692)
+  * bug fix: better errors from NAMESTRING and friends on pathnames with no
+    namestrings.  (lp#792154)
+  * bug fix: EQUAL and EQUALP compiler transforms were too confident in
+    deriving a result.  (lp#1732277, lp#1732225)
+  * bug fix: FILL sometimes returned the underlying data vector rather than
+    the given array.  (lp#1732553)
+  * bug fix: SEARCH returned the wrong answer in some cases.  (lp#1732952)
+  * bug fix: the type (COMPLEX INTEGER) behaves more as specified by Function
+    TYPEP, which has stronger constraints than System Class COMPLEX.
+    (Reported by Eric Marsden, lp#1733400)
+
+changes in sbcl-1.4.1 relative to sbcl-1.4.0:
+  * optimization: faster foreign callbacks.
+  * enhancement: complex arrays can be stack allocated.
+  * enhancement: PROCESS-KILL now exists on win32 and PROCESS-PID actually
+    returns the PID.
+  * optimization: the register allocation method used by the compiler when
+    optimizing for speed is now faster for functions with large bodies.
+  * bug fix: SB-INTROSPECT:ALLOCATION-INFORMATION works on big-endian CPUs
+    (fixes lp#490490 for real rather than by disabling a test)
+  * bug fix: code objects and bignums of large enough size to be placed
+    on GC pages without any other object no longer cause accidental copying
+    during garbage collection. (gencgc only)
+  * bug fix: sb-fasteval failure with 0-argument lambdas (lp#1722715)
+  * bug fix: RUN-PROGRAM doesn't leak handles on win32 and PROCESS-CLOSE
+    doesn't crash. (lp#1724472)
+
+changes in sbcl-1.4.0 relative to sbcl-1.3.21:
+  * minor incompatible change: DESTRUCTURING-BIND treats non-toplevel () as
+    nested empty pattern. This seems to be what the standard mandates, so
+    conforming code should not be affected.
+  * ehancement: (GC :GEN 7) with gencgc will zero-fill dead pseudo-static
+    objects so that they do not spuriously cause reachability of objects that
+    would have been otherwise dead.
+  * enhancement: PROCESS-STATUS now tracks stopped and continued processes
+    properly (also fixes lp#1624941, based on patch by Elias Pipping).
+  * bug fix: INSPECT handles errors signaled while printing slot
+    values. (lp#454682)
+  * bug fix: DESCRIBE works on classes like it used to.
+  * bug fix: *LOAD-PATHNAME* and *LOAD-TRUENAME* are bound to pathnames
+    when processing a sysinit or userinit file
+  * bug fix: save-lisp-and-die is able to collect more garbage on non-x86oid
+    gencgc targets.
+  * bug fix: fixed out-of-bounds array read in optimized POSITION on bit-vectors
+  * bug fix: signal emulation respects the 128-byte stack red zone on x86-64
+    macOS.
+
+changes in sbcl-1.3.21 relative to sbcl-1.3.20:
+  * minor incompatible change: the CLOBBER-IT restart for defstruct redefintion
+    has been removed after a 15 year deprecation cycle. Use the new name,
+    RECKLESSLY-CONTINUE. Note also that this restart is hidden if deemed unsafe
+    due to altered placement of untagged slots in the structure.
+  * enhancement: the assignment of -DSBCL_PREFIX= in src/runtime/GNUmakefile
+    can be removed as a local patch, which results in an sbcl executable
+    that finds its core file relative to itself by looking in "../lib/sbcl".
+  * enhancement: backends using the generational GC are able to relocate
+    dynamic space anywhere the operating system places it.
+    This feature can be disabled by removing :relocatable-heap from the
+    build configuration. Not supported on Windows.
+  * enhancement: DEFMETHOD no longer signals IMPLICIT-GENERIC-FUNCTION-WARNING.
+  * enhancement: better type conflict detection for high order functions, e.g.
+    (find x "123" :test #'=)
+  * enhancement: the tabular output of ROOM is aligned dynamically, preventing
+    misaligned tables for larger sizes or counts.
+  * enhancement: ROOM reports on immobile space if applicable.
+  * optimization: optimized external-format routines.
+  * bug fix: SB-INTROSPECT:ALLOCATION-INFORMATION returns :IMMOBILE
+    instead of :FOREIGN for objects in immobile space.
+  * bug fix: dotted lists in special forms and function call forms signal
+    an appropriate error
+  * bug fix: EQUALP hash tables with pathname keys now ignore internal slots.
+    (lp#1712944, reported by Jason Miller)
+
+changes in sbcl-1.3.20 relative to sbcl-1.3.19:
+  * minor incompatible change: DEF{GENERIC,METHOD} no longer accept some
+    illegal lambda lists such as (defgeneric bar (foo &key foo)) or
+    (defgeneric baz (t)) that were accepted before.
+  * optimization: a valueless &AUX binding in a BOA constructor does not
+    force all slots reads in safe code to perform a full type check.
+  * optimization: ATOMIC-PUSH and ATOMIC-POP generate better code
+  * bug fix: the low-level debugger would erroneously print - or not print
+    as the case may be - "(bad-address)" for some objects depending whether
+    the --dynamic-space-size argument was used at Lisp startup
+  * bug fix: a DEFCONSTANT with a non non-eql-comparable object as the value
+    could cause miscompilation if that constant appeared as the default
+    expression for an &OPTIONAL binding
+  * bug fix: generic function lambda lists are now checked for repeated
+    and otherwise illegal entries. (lp#1704114)
+  * bug fix: setting gencgc_verbose = 1 could cause deadlock in fprintf()
+    depending on the platform's stdio implementation. The relevant code
+    has been changed to use snprintf() and write() instead.
+
+changes in sbcl-1.3.19 relative to sbcl-1.3.18:
+  * enhancement: specialized arrays can be printed readably without using
+    *read-eval*
+  * enhancement: SB-DEBUG:PRINT-BACKTRACE truncates huge string arguments.
+    The full string remains available for inspection via (SB-DEBUG:ARG).
+  * bug fix: backtracing from several threads at once could fail
+  * bug fix: floating-point infinities could not be used as keys
+    in EQUALP hash tables. (lp#1696274)
+  * bug fix: random sb-fasteval failures. (lp#1642708)
+  * bug fix: align the stack in callback wrappers to defend against C
+    compiler over-aggressive use of SIMD.  (lp#1697528)
+  * bug fix: don't try to find the class when reporting that a class does
+    not exist for a primitive type.  (lp#1697226)
+
+changes in sbcl-1.3.18 relative to sbcl-1.3.17:
+  * minor incompatible change: existing values of CFLAGS, ASFLAGS,
+    CPPFLAGS, and LINKFLAGS will be incorporated into C compiler
+    invocations when building from source.
+  * minor incompatible change: the result of WRITE-TO-STRING may be
+    a BASE-STRING if all characters written are of type BASE-CHAR.
+  * minor incompatible change: the broadcast stream with no output
+    streams is a singleton object. That object satisfies OPEN-STREAM-P
+    regardless of how many times CLOSE is invoked on it.
+  * enhancement: x86[-64] backends contain an experimental feature
+    which aids in demonstrating reachability of any object starting
+    from a tenured object or a thread stack by producing a proof
+    as a sequence of pointers to follow.
+    The file "tests/traceroot.test.sh" contains an example usage.
+  * enhancement: if the alien symbol "gc_coalesce_string_literals" is
+    set to 1 prior to SAVE-LISP-AND-DIE, then similar string constants
+    loaded from different fasl files may be collapsed to one object.
+    If the variable is set to 2, then additionally strings which are
+    STRING= in code resulting from COMPILE can be coalesced.
+    For instance, two functions returning the literal string "HI"
+    might return EQ strings after collapsing, which may be undesired
+    in a particular use. The flag pertains to gencgc only.
+  * enhancement: SXHASH values on pathnames are better distributed
+  * bug fix: MAKE-PATHNAME removes empty strings as components of a
+    directory, as is permitted: "Whenever a pathname is constructed
+    the components may be canonicalized if appropriate."
+  * optimization: various printer and FORMAT performance enhancements.
+  * bug fix: GET-FOREGROUND no longer fails in case all other interactive
+    threads exit (lp#1682671, reported by Syll)
+  * bug fix: RELEASE-FOREGROUND always removes the current thread from the
+    list of interactive threads. (lp#1682867, reported by Syll)
+
+changes in sbcl-1.3.17 relative to sbcl-1.3.16:
+  * enhancement: memory overhead from the garbage collector's metadata
+    is reduced on 64-bit architectures; no change for 32-bit.
+  * enhancement: further garbage collector speedups affecting
+    pinned objects on conservative backends, and simple-vectors.
+  * enhancement: on Linux a custom handler for SIGSEGV can be called
+    for page faults outside of dynamic space by changing the C symbol
+    "sbcl_fallback_sigsegv_handler".
+  * bug fix: sb-cover does not lose source positions for AND/OR/COND.
+  * bug fix: random disassembler failures. (lp#1527931)
+  * The bundled sb-md5 contrib has been updated to release 2.0.4
+    which is licensed under Creative Commons CC0 per author's statement
+    https://github.com/pmai/md5/commit/fd134e71b71a10ab78905833a7cb9d4d6817c589
+    (Refer to NEWS and COPYING in the contrib/sb-md5 subdirectory)
+
+changes in sbcl-1.3.16 relative to sbcl-1.3.15:
+  * optimization: various small tweaks give around 5% faster garbage
+    collection
+  * bug fix: better detection of when an impossible code path does
+    not need a warning.  (lp#1668619)
+  * bug fix: stronger attempts to disable position-independent
+    executable building.  (lp#1668986, patch from Mark Wright)
+  * bug fix: OPEN :IF-EXISTS NIL signalled a condition on Windows.
+    (lp#1674437, reported by Jan Idzikowski)
+
+changes in sbcl-1.3.15 relative to sbcl-1.3.14:
+  * minor incompatible change: the reader will when feasible create
+    new symbols using a BASE-STRING for the print name.  Additionally,
+    string literals can favor the base-string type if desired, though
+    the default is to always return UTF-32 strings for compatibility.
+    A preference for base-string does not disable reading Unicode.
+    The choice is controlled via (SETF READTABLE-BASE-CHAR-PREFERENCE).
+    If Unicode was disabled at build time, this setting does nothing.
+  * enhancement: SBCL generates more debug information by default.
+  * enhancement: type errors provide context information, such as which
+    variable is being bound, which slot of which structure is being set.
+  * enhancement: if #+immobile-symbols is in build-time *FEATURES* (not
+    enabled by default), then symbols will never be moved in memory
+    except by SAVE-LISP-AND-DIE. Immobility has helpful implications for
+    code generation as well as interaction with foreign routines.
+    This feature can only be enabled if #+immobile-space is enabled.
+  * enhancement: undefined function errors can be restarted on x86-64, to
+    either retry calling the function again or call a user supplied function.
+  * enhancement: sb-ext:restrict-compiler-policy accepts an upper bound in
+    addition to a lower bound.
+  * enhancement: #+immobile-code improves the speed of function calling.
+    Some delay may be noticed when redefining an existing function
+    from a saved core file however.
+  * defaults change: sb-ext:*disassemble-annotate* default to NIL, due to its
+    poor reliability.
+  * new feature: SB-LINKABLE-RUNTIME, allowing linking with extra object
+    files to help with delivery of executables.  (Thanks to François-René
+    Rideau)
+  * bug fix: data race in GENTEMP fixed - it can no longer return the
+    same interned symbol to multiple threads if called concurrently
+  * bug fix: interrupting LOADing of FASLs does not leave functions without
+    source locations. (lp#540276)
+  * bug fix: DYNAMIC-EXTENT-declared results of NOTINLINE local functions were
+    treated as if they were actually stack allocated (lp#1659964)
+  * bug fix: correctly handle the case of a non-local exit within a function
+    terminating the extent of dynamic-extent, dynamic-bound variables in the
+    presence of multiple-values (lp#1655011)
+  * bug fix: handling of SB-SYS:WITH-PINNED-OBJECTS in the interpreters (both
+    sb-eval and sb-fasteval) now actually pins objects on gencgc.
+  * bug fix: AVX registers are preserved during exceptions on x86-64 macOS.
+  * bug fix: (directory "SOMETHING/*/**/MORE") is no longer equivalent to
+    (directory "SOMETHING/**/MORE")
+  * bug fix: better console IO on Windows (lp#1660906)
+
+changes in sbcl-1.3.14 relative to sbcl-1.3.13:
+  * minor incompatible change: the SB-PCL walker no longer recognizes
+    macros expanding into a DECLARE expression. This is not a language change,
+    since ANSI forbids such usage (X3J13 issue DECLARE-MACROS:FLUSH).
+  * enhancement: for several macros such as MULTIPLE-VALUE-{BIND,SETQ}, COND,
+    DO{,*,LIST}, {RESTART,HANDLER}-{BIND,CASE}, *CASE, conditions signaled
+    during macroexpansion point to the form that caused the problem more
+    accurately.
+  * enhancement: the "--noinform" command-line option inhibits output from
+    save-lisp-and-die in addition to removing the startup banner.
+  * bug fix: PROCESS-KILL failed to return errno if the system call failed
+  * optimization: slightly more comprehensive treatment of the keyword
+    arguments to MAKE-ARRAY in compiler transformations.
+
+changes in sbcl-1.3.13 relative to sbcl-1.3.12:
+  * enhancement: SET triggers package locks on undefined variables.
+    (lp#1645152)
+  * enhancement: new Windows specific option to run-program, :escape-arguments
+    (lp#1503496)
+  * enhancement: recompiling a MAKE-INSTANCE form with an initarg :INITARG
+    CONSTANT where CONSTANT names a constant variable picks up the new value
+    of CONSTANT in case it has been redefined. (lp#1644944)
+  * optimization: faster TYPEP on undefined at compile-time types and upcoming
+    class definitions. (lp#1082967)
+  * optimization: memory consumption of each STANDARD-OBJECT instance is
+    reduced by 2 words if the compact-instance-header feature is enabled.
+  * optimization: CONDITION instances are quicker to allocate.
+  * optimization: unoptimized calls to FILL on specialized vectors are now
+    just as fast as T vectors.
+  * bug fix: get-timezone returns corret DST on 64-bit Windows. (lp#1641058)
+  * bug fix: cross reference information in fasls is no longer incompatible
+    between different cores (lp#1648186)
+
+changes in sbcl-1.3.12 relative to sbcl-1.3.11:
+  * enhancement: on x86-64, compiled functions loaded from fasl files
+    can not be moved, but can be freed, by GC. Additionally, COMPILE will
+    produce immobile code if SB-C::*COMPILE-TO-MEMORY-SPACE* is set to
+    :IMMOBILE. (Caution: the flag is experimental and subject to change.)
+    The benefits are better physical separation of code from data,
+    and potentially easier examination of live images by external tools.
+  * enhancement: the docstring for SAVE-LISP-AND-DIE has been amended to
+    say that the :ROOT-STRUCTURES parameter is not meaningless on gencgc,
+    depending on the platform.
+  * bug fix: calling a named function (e.g. a DEFUN) concurrently with
+    redefining that same function could lead to execution of random bytes.
+  * bug fix: yes-or-no-p accepts formatter functions (lp#1639490)
+  * bug fix: better handling of exceptions on macOS.
+
+changes in sbcl-1.3.11 relative to sbcl-1.3.10:
+  * minor incompatible change: SB-EXT:*INTEXP-MAXIMUM-EXPONENT* is removed.
   * enhancement: TRACE ... :REPORT {TRACE,NIL} now work as advertised in the
     documentation string (based on patch by Patrick Stein)
   * enhancement: support unboxed signed-word structure slots on x86, x86-64
@@ -9,10 +277,20 @@ changes relative to sbcl-1.3.10:
     arrays.
   * optimization: better GC performance in the presence of many threads.
     (patch by Ilya Perminov, lp#1339924)
+  * optimization: multiple-value-call is optimized with multiple argument
+    forms, not just one. (lp#753803)
   * bug fix: MAKE-ALIEN-STRING returns the number of allocated bytes as a
     second value as advertised (reported by Johann 'Myrkraverk' Oskarsson)
   * bug fix: when TO-READTABLE is supplied to COPY-READTABLE, it will
     contain only the macros in FROM-READTABLE and no others. (lp#1631506)
+  * enhancement: gencgc has been modified for x86-64 on Linux and macOS
+    to a support mark-and-sweep as well as the traditional copying strategy.
+    It is conceivable that some applications might be adversely affected.
+    Please see ':immobile-space' in 'base-target-features.lisp-expr'
+    for further details, and possible reasons to disable this feature.
+  * enhancement: x86-64 supports shrinking the fixed overhead in a structure
+    from 2 words to 1 word, reducing memory consumption in applications
+    which create many small structures.
 
 changes in sbcl-1.3.10 relative to sbcl-1.3.9:
   * enhancement: more compact low-level error signaling code

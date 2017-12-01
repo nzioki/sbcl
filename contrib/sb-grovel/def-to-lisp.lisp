@@ -119,7 +119,11 @@ code:
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long long) (long) (x): (x))")
     #+(and (not win32) x86-64)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long) (int) (x): (x))")
-    #-x86-64
+    ;; the C compiler on macOS warns that %ld is the wrong format for an int
+    ;; even though 'long' and 'int' are both 4 bytes.
+    #+x86
+    (as-c "#define CAST_SIGNED(x) ((long) (x))")
+    #-(or x86 x86-64)
     (as-c "#define CAST_SIGNED(x) ((int) (x))")
     (as-c "int main(int argc, char *argv[]) {")
     (as-c "    FILE *out;")
@@ -238,7 +242,7 @@ code:
                       '("-D_LARGEFILE_SOURCE"
                         "-D_LARGEFILE64_SOURCE"
                         "-D_FILE_OFFSET_BITS=64")
-                      #+(and (or x86 ppc) (or linux freebsd)) '("-m32")
+                      #+(and (or x86 ppc sparc) (or linux freebsd)) '("-m32")
                       #+(and x86-64 darwin inode64)
                       `("-arch" "x86_64"
                         ,(format nil "-mmacosx-version-min=~A"

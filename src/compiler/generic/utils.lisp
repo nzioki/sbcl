@@ -32,12 +32,12 @@
 
 (defun static-symbol-p (symbol)
   (or (null symbol)
-      (and (member symbol *static-symbols*) t)))
+      (and (find symbol +static-symbols+) t)))
 
 ;;; the byte offset of the static symbol SYMBOL
 (defun static-symbol-offset (symbol)
   (if symbol
-      (let ((posn (position symbol *static-symbols*)))
+      (let ((posn (position symbol +static-symbols+)))
         (unless posn (error "~S is not a static symbol." symbol))
         (+ (* posn (pad-data-block symbol-size))
            (pad-data-block (1- symbol-size))
@@ -45,30 +45,24 @@
            (- list-pointer-lowtag)))
       0))
 
-;;; Given a byte offset, OFFSET, return the appropriate static symbol.
-(defun offset-static-symbol (offset)
-  (if (zerop offset)
-      nil
-      (multiple-value-bind (n rem)
-          (truncate (+ offset list-pointer-lowtag (- other-pointer-lowtag)
-                       (- (pad-data-block (1- symbol-size))))
-                    (pad-data-block symbol-size))
-        (unless (and (zerop rem) (<= 0 n (1- (length *static-symbols*))))
-          (error "The byte offset ~W is not valid." offset))
-        (elt *static-symbols* n))))
-
 ;;; Return the (byte) offset from NIL to the start of the fdefn object
 ;;; for the static function NAME.
 (defun static-fdefn-offset (name)
-  (let ((static-syms (length *static-symbols*))
-        (static-fun-index (position name *static-funs*)))
-    (unless static-fun-index
-      (error "~S isn't a static function." name))
-    (+ (* static-syms (pad-data-block symbol-size))
-       (pad-data-block (1- symbol-size))
-       (- list-pointer-lowtag)
-       (* static-fun-index (pad-data-block fdefn-size))
-       other-pointer-lowtag)))
+  (let ((static-fun-index
+          (position name #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+))))
+    (and static-fun-index
+         (+ (* (length +static-symbols+) (pad-data-block symbol-size))
+            (pad-data-block (1- symbol-size))
+            (- list-pointer-lowtag)
+            (* static-fun-index (pad-data-block fdefn-size))
+            other-pointer-lowtag))))
+
+;;; Return absolute address of the 'fun' slot in static fdefn NAME.
+(defun static-fdefn-fun-addr (name)
+  (+ nil-value
+     (static-fdefn-offset name)
+     (- other-pointer-lowtag)
+     (ash fdefn-fun-slot word-shift)))
 
 ;;; Return the (byte) offset from NIL to the raw-addr slot of the
 ;;; fdefn object for the static function NAME.
@@ -130,7 +124,9 @@
    (make-representation-tn *fixnum-primitive-type* any-reg-sc-number)
    env))
 
-(defun make-stack-pointer-tn ()
+#!-x86-64
+(defun make-stack-pointer-tn (&optional nargs)
+  (declare (ignore nargs))
   (make-normal-tn *fixnum-primitive-type*))
 
 (defun make-number-stack-pointer-tn ()
@@ -151,19 +147,15 @@
 ;;; additional noise in the code object header.
 (defun select-component-format (component)
   (declare (type component component))
-  ;; The 1+ here is because for the x86 the first constant is a
-  ;; pointer to a list of fixups, or NIL if the code object has none.
-  ;; (The fixups are needed at GC copy time because the X86 code isn't
-  ;; relocatable.)
-  ;;
-  ;; KLUDGE: It'd be cleaner to have the fixups entry be a named
-  ;; element of the CODE (aka component) primitive object. However,
-  ;; it's currently a large, tricky, error-prone chore to change
-  ;; the layout of any primitive object, so for the foreseeable future
-  ;; we'll just live with this ugliness. -- WHN 2002-01-02
-  (dotimes (i (+ code-constants-offset #!+x86 1))
+  (dotimes (i code-constants-offset)
     (vector-push-extend nil
                         (ir2-component-constants (component-info component))))
   (values))
 
+(defun error-call (vop error-code &rest values)
+  "Cause an error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
+(defun cerror-call (vop error-code &rest values)
+  "Cause a continuable error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))

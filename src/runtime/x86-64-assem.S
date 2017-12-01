@@ -13,19 +13,36 @@
  * files for more information.
  */
 
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define LANGUAGE_ASSEMBLY
 #include "genesis/config.h"
 #include "validate.h"
 #include "sbcl.h"
 #include "genesis/closure.h"
+#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
+#ifdef MEMORY_SANITIZER
+#include "genesis/symbol.h"
+#endif
 	
 /* Minimize conditionalization for different OS naming schemes. */
 #if defined __linux__  || defined LISP_FEATURE_FREEBSD || defined __OpenBSD__ || defined __NetBSD__ || defined __sun || defined _WIN64 || defined __DragonFly__
 #define GNAME(var) var
 #else
 #define GNAME(var) _##var
+#endif
+
+#ifdef POSITION_INDEPENDENT_ASM
+#define PIC_CALL(x) x@PLT
+#define PIC_VAR(x) x(%rip)
+#else
+#define PIC_CALL(x) x
+#define PIC_VAR(x) x
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
@@ -68,6 +85,8 @@
  * call sigtrap_handler. */
 #if defined(LISP_FEATURE_UD2_BREAKPOINTS)
 #define TRAP ud2
+#elif defined(LISP_FEATURE_INT4_BREAKPOINTS)
+#define TRAP .byte 0xCE /* due to illegality, assembler won't emit "into" */
 #else
 #define TRAP int3
 #endif
@@ -99,10 +118,14 @@
 GNAME(call_into_lisp_first_time):
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
+#ifdef MEMORY_SANITIZER
+        movq	__msan_param_tls@GOTTPOFF(%rip), %rax
+        movq	%rax, (SYMBOL_VALUE_OFFSET+MSAN_PARAM_TLS)
+#endif
 #if defined(LISP_FEATURE_DARWIN)
 	movq    GSYM(GNAME(all_threads)),%rax
 #else
-        movq    GNAME(all_threads),%rax
+        movq    PIC_VAR(GNAME(all_threads)),%rax
 #endif
 	mov     THREAD_CONTROL_STACK_END_OFFSET(%rax) ,%rsp
 	jmp     Lstack
@@ -162,9 +185,9 @@ Lstack:
 #ifdef LISP_FEATURE_DARWIN
 	mov	GSYM(GNAME(specials)),%rdi
 #else
-	mov	specials,%rdi
+	mov	PIC_VAR(specials),%rdi
 #endif
-	call    GNAME(pthread_getspecific)
+	call    PIC_CALL(GNAME(pthread_getspecific))
 	mov	%rax,%r12
 #endif
 #endif
@@ -187,7 +210,7 @@ Lstack:
 	cmp	$2,%rcx
 	je	Ldone
 	mov	16(%rbx),%rsi	# arg2
-Ldone:	
+Ldone:
 	shl	$(N_FIXNUM_TAG_BITS),%rcx	# (fixnumize num-args)
 	/* Registers rax, rcx, rdx, rdi, and rsi are now live. */
 	xor	%rbx,%rbx	# available
@@ -196,13 +219,12 @@ Ldone:
 	push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
-	sub	$8,%rsp	        # Ensure 3 slots are allocated, two above.
 
 Lcall:
 	call	*CLOSURE_FUN_OFFSET(%rax)
 	
-	/* If the function returned multiple values, it will return to
-	   this point.  Lose them */
+	/* If the function returned multiple values, the carry flag will be set.
+           Lose them */
 	jnc	LsingleValue	
 	mov	%rbx, %rsp
 LsingleValue:	
@@ -230,67 +252,51 @@ LsingleValue:
 	ret
 	SIZE(GNAME(call_into_lisp))
 
-/* Our call-site does not take care of caller-saved xmm registers, so it
- * falls to us spill them beforing hopping into C.
- *
- * We simply save all of them.
- *
- * (But for the sake of completeness, here is my understanding of the specs:)
- *                     System V       Microsoft
- * argument passing    xmm0-7         xmm0-3
- * caller-saved        xmm8-15        xmm4-5
- * callee-saved        -              xmm6-15
- *
- *  --DFL */
-
-#define stkxmmsave(n) movaps %xmm##n, n*16(%rsp)
-#define stkxmmload(n) movaps n*16(%rsp), %xmm##n
-#define map_all_xmm(op) \
-	op(0);op(1);op(2);op(3);op(4);op(5);op(6);op(7); \
-    op(8);op(9);op(10);op(11);op(12);op(13);op(14);op(15);
-
-	.text
+#ifdef LISP_FEATURE_SB_THREAD
+	.text	
+	.globl  GNAME(funcall_alien_callback)
+	TYPE(GNAME(funcall_alien_callback))
 	.align	align_16byte,0x90
-	.globl  GNAME(alloc_tramp)
-	TYPE(GNAME(alloc_tramp))
-GNAME(alloc_tramp):
-	cld
+GNAME(funcall_alien_callback):
+/* Specialized call_into_lisp for callbacks
+   rdi arg1
+   rsi arg2
+   rdx arg0
+   rcx thread
+*/
+        
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
-	and	$-32,%rsp
-	sub	$16*16,%rsp
-	map_all_xmm(stkxmmsave)
-	# Doing rax twice is to maintain 16-byte stack alignment.
-	push    %rax
-	push	%rax
-	push	%rcx
-	push	%rdx
-	push	%rsi
-	push	%rdi
-	push	%r8
-	push	%r9
-	push	%r10
-	push	%r11
-	# r12 through r15 are callee-saved
-	mov	16(%rbp),%rdi
-	call	GNAME(alloc)
-	mov	%rax,16(%rbp)
-	pop	%r11
-	pop	%r10
-	pop	%r9
-	pop	%r8
-	pop	%rdi
-	pop	%rsi
-	pop	%rdx
-	pop	%rcx
-	pop	%rax
-	pop	%rax # corresponds to "extra" push
-	map_all_xmm(stkxmmload)
-	mov	%rbp,%rsp
-	pop	%rbp
-	ret
-	SIZE(GNAME(alloc_tramp))
 
+	push	%rbx  	# these regs are callee-saved according to C
+	push	%r12	# so must be preserved and restored when 
+	push	%r13    # the lisp function returns
+	push	%r14    #
+	push	%r15    #
+
+        mov     %rcx,%r12
+        mov     $(3 << N_FIXNUM_TAG_BITS),%rcx
+
+	/* Alloc new frame. */
+        push	%rbp            # Dummy for return address
+	push	%rbp		# fp in save location S1
+        mov	%rsp,%rbp
+        mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
+	call	*CLOSURE_FUN_OFFSET(%rax)
+
+/* Restore C regs */
+	pop	%r15
+	pop	%r14
+	pop	%r13
+	pop	%r12
+	pop	%rbx
+
+	leave
+
+	ret
+	SIZE(GNAME(funcall_alien_callback))
+#endif
+
 /*
  * fun-end breakpoint magic
  */
@@ -388,7 +394,7 @@ GNAME(arch_scrub_control_stack):
 #ifdef LISP_FEATURE_DARWIN
 	mov	GSYM(GNAME(os_vm_page_size)),%r9
 #else
-	mov	os_vm_page_size,%r9
+	mov	PIC_VAR(os_vm_page_size),%r9
 #endif
 	lea	(%rsi,%r9), %r8
 	lea	(%rdx,%r9), %r9

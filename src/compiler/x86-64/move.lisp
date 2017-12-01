@@ -12,15 +12,11 @@
 (in-package "SB!VM")
 
 (defun zeroize (tn)
-  (let ((offset (tn-offset tn)))
+  (let* ((offset (tn-offset tn))
     ;; Using the 32-bit instruction accomplishes the same thing and is
     ;; one byte shorter.
-    (if (<= offset edi-offset)
-        (let ((tn (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'dword-reg)
-                                  :offset offset)))
-          (inst xor tn tn))
-        (inst xor tn tn))))
+         (tn (if (<= offset edi-offset) (reg-in-size tn :dword) tn)))
+    (inst xor tn tn)))
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((immediate)
@@ -72,8 +68,6 @@
                         (and (sc-is x any-reg descriptor-reg immediate)
                              (sc-is y control-stack))))))
   (:temporary (:sc unsigned-reg) temp)
-  (:effects)
-  (:affected)
   (:generator 0
     (if (and (sc-is x immediate)
              (sc-is y any-reg descriptor-reg control-stack))
@@ -84,16 +78,31 @@
   (any-reg descriptor-reg immediate)
   (any-reg descriptor-reg))
 
-(defun move-immediate (target val &optional tmp-tn)
+(defun move-immediate (target val &optional tmp-tn zeroed)
+  ;; Try to emit the smallest immediate operand if the destination word
+  ;; is already zeroed. Otherwise a :qword.
   (cond
     ;; If target is a register, we can just mov it there directly
     ((and (tn-p target)
           (sc-is target signed-reg unsigned-reg descriptor-reg any-reg))
-     (if (zerop val)
-         (zeroize target)
-         (inst mov target val)))
+     ;; val can be a fixup for an immobile-space symbol, i.e. not a number,
+     ;; hence not acceptable to ZEROP.
+     (cond ((and (numberp val) (zerop val)) (zeroize target))
+           (t (inst mov target val))))
     ;; Likewise if the value is small enough.
-    ((typep val '(signed-byte 32))
+    ((typep val '(or (signed-byte 32) #!+immobile-space fixup))
+     ;; This logic is similar to that of STOREW*.
+     ;; It would be nice to pull it all together in one place.
+     ;; The basic idea is that storing any byte-aligned 8-bit value
+     ;; should be a single byte write, etc.
+     (when (and zeroed (ea-p target))
+       (setq target (sized-ea target
+                              (typecase val
+                                ((unsigned-byte 8) :byte)
+                                ((unsigned-byte 16) :word)
+                                ;; signed-32 is no good, as it needs sign-extension.
+                                ((unsigned-byte 32) :dword)
+                                (t :qword)))))
      (inst mov target val))
     ;; Otherwise go through the temporary register
     (tmp-tn
@@ -119,7 +128,8 @@
     (sc-case y
       ((any-reg descriptor-reg)
        (if (sc-is x immediate)
-           (inst mov y (encode-value-if-immediate x))
+           (let ((val (encode-value-if-immediate x)))
+             (if (eql val 0) (zeroize y) (inst mov y val)))
            (move y x)))
       ((control-stack)
        (if (= (tn-offset fp) esp-offset)
@@ -247,7 +257,7 @@
                     ;; but let's be future-proof and allow for it.
                     (unless (member x '(rsp rbp) :test 'string=)
                       (symbolicate "ALLOC-" signedp "-BIGNUM-IN-" x)))
-                  sb!x86-64-asm::*qword-reg-names*)
+                  +qword-register-names+)
            (ash (tn-offset ,tn) -1))))
 
 ;;; Convert an untagged signed word to a lispobj -- fixnum or bignum
@@ -259,6 +269,7 @@
   (:results (y :scs (any-reg descriptor-reg) . #.(and (> n-fixnum-tag-bits 1)
                                                       '(:from :argument))))
   (:note "signed word to integer coercion")
+  (:vop-var vop)
   ;; Worst case cost to make sure people know they may be number consing.
   (:generator 20
      (cond ((= 1 n-fixnum-tag-bits)
@@ -273,9 +284,7 @@
             (inst imul y x #.(ash 1 n-fixnum-tag-bits))
             (inst jmp :no DONE)
             (inst mov y x)))
-     (inst mov temp-reg-tn
-           (make-fixup #.(bignum-from-reg 'y "SIGNED") :assembly-routine))
-     (inst call temp-reg-tn)
+     (invoke-asm-routine 'call #.(bignum-from-reg 'y "SIGNED") vop temp-reg-tn)
      DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
@@ -287,6 +296,7 @@
   (:args (x :scs (signed-reg unsigned-reg) :to :result))
   (:results (y :scs (any-reg descriptor-reg) :from :argument))
   (:note "unsigned word to integer coercion")
+  (:vop-var vop)
   ;; Worst case cost to make sure people know they may be number consing.
   (:generator 20
      (aver (not (location= x y)))
@@ -306,9 +316,7 @@
                               :scale (ash 1 n-fixnum-tag-bits))))
      (inst jmp :z done)
      (inst mov y x)
-     (inst mov temp-reg-tn
-           (make-fixup #.(bignum-from-reg 'y "UNSIGNED") :assembly-routine))
-     (inst call temp-reg-tn)
+     (invoke-asm-routine 'call #.(bignum-from-reg 'y "UNSIGNED") vop temp-reg-tn)
      DONE))
 (define-move-vop move-from-unsigned :move
   (unsigned-reg) (descriptor-reg))
@@ -322,8 +330,6 @@
                (not (or (location= x y)
                         (and (sc-is x signed-reg unsigned-reg)
                              (sc-is y signed-stack unsigned-stack))))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))

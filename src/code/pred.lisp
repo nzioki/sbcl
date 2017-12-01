@@ -26,7 +26,7 @@
                   collect `(defun ,name (x)
                              (or (typep x '(simple-array ,spec (*)))
                                  (and (complex-vector-p x)
-                                      (do ((data (%array-data-vector x) (%array-data-vector data)))
+                                      (do ((data (%array-data x) (%array-data data)))
                                           ((not (array-header-p data)) (typep data '(simple-array ,spec (*))))))))))))
   (def))
 
@@ -81,7 +81,6 @@
 ;;;; compiler.
 
 (defun not (object)
-  #!+sb-doc
   "Return T if X is NIL, otherwise return NIL."
   (not object))
 
@@ -91,7 +90,6 @@
                     (stem (string-left-trim "%" (string-right-trim "P-" name)))
                     (article (if (position (schar name 0) "AEIOU") "an" "a")))
                `(defun ,pred (object)
-                  #!+sb-doc
                   ,(format nil
                            "Return true if OBJECT is ~A ~A, and NIL otherwise."
                            article
@@ -131,7 +129,7 @@
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  (def-type-predicate-wrapper lra-p)
+  #!-(or x86 x86-64) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
   (def-type-predicate-wrapper rationalp)
@@ -144,6 +142,7 @@
   (def-type-predicate-wrapper symbolp)
   (def-type-predicate-wrapper %other-pointer-p)
   (def-type-predicate-wrapper system-area-pointer-p)
+  (def-type-predicate-wrapper unbound-marker-p)
   (def-type-predicate-wrapper weak-pointer-p)
   #!-64-bit
   (progn
@@ -191,6 +190,10 @@
 #-sb-xc-host
 (defun layout-of (x)
   (declare (optimize (speed 3) (safety 0)))
+  #!+(and compact-instance-header x86-64)
+  (values (%primitive layout-of x
+                      (load-time-value sb!kernel::**built-in-class-codes** t)))
+  #!-(and compact-instance-header x86-64)
   (cond ((%instancep x) (%instance-layout x))
         ((funcallable-instance-p x) (%funcallable-instance-layout x))
         ;; Compiler can dump literal layouts, which handily sidesteps
@@ -205,7 +208,6 @@
 (declaim (inline classoid-of))
 #-sb-xc-host
 (defun classoid-of (object)
-  #!+sb-doc
   "Return the class of the supplied object, which may be any Lisp object, not
    just a CLOS STANDARD-OBJECT."
   (layout-classoid (layout-of object)))
@@ -216,7 +218,6 @@
 ;;; precision here, and it is not permitted to return member types,
 ;;; negation, union, or intersection types.
 (defun type-of (object)
-  #!+sb-doc
   "Return the type of OBJECT."
   (declare (explicit-check))
   ;; We have special logic for everything except arrays.
@@ -269,7 +270,6 @@
 
 ;;; This is real simple, 'cause the compiler takes care of it.
 (defun eq (obj1 obj2)
-  #!+sb-doc
   "Return T if OBJ1 and OBJ2 are the same object, otherwise NIL."
   (eq obj1 obj2))
 ;;; and this too, but it's only needed for backends on which
@@ -281,7 +281,6 @@
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
-  #!+sb-doc
   "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   (or (eq obj1 obj2)
       (if (or (typep obj2 'fixnum)
@@ -347,7 +346,6 @@
                                       (sbit y y-i))))))))))
 
 (defun equal (x y)
-  #!+sb-doc
   "Return T if X and Y are EQL or if they are structured components whose
 elements are EQUAL. Strings and bit-vectors are EQUAL if they are the same
 length and have identical components. Other arrays must be EQ to be EQUAL."
@@ -374,6 +372,18 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
     (declare (maybe-inline equal-aux))
     (equal-aux x y)))
 
+;;; Like EQUAL, but any two gensyms whose names are STRING= are equalish.
+(defun fun-names-equalish (x y)
+  (named-let recurse ((x x) (y y))
+    (cond ((eql x y) t) ; not performance-critical: don't inline %EQL here
+          ((consp x) (and (consp y)
+                          (recurse (car x) (car y))
+                          (recurse (cdr x) (cdr y))))
+          ((and (symbolp x) (not (symbol-package x)))
+           (and (symbolp y) (not (symbol-package y)) (string= x y)))
+          (t
+           (equal x y)))))
+
 ;;; EQUALP comparison of HASH-TABLE values
 (defun hash-table-equalp (x y)
   (declare (type hash-table x y))
@@ -394,9 +404,7 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
   (let ((layout-x (%instance-layout x)))
     (and
      (eq layout-x (%instance-layout y))
-     ;; TODO: store one bit in the layout indicating whether EQUALP
-     ;; should scan slots. (basically a STRUCTURE-CLASSOID-P bit)
-     (structure-classoid-p (layout-classoid layout-x))
+     (logtest +structure-layout-flag+ (layout-%flags layout-x))
      (macrolet ((slot-ref-equalp ()
                   `(let ((x-el (%instance-ref x i))
                          (y-el (%instance-ref y i)))
@@ -499,7 +507,6 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
         (t nil)))
 
 (/show0 "about to do test cases in pred.lisp")
-#!+sb-test
 (let ((test-cases `((0.0 ,(load-time-value (make-unportable-float :single-float-negative-zero)) t)
                     (0.0 1.0 nil)
                     (#c(1 0) #c(1.0 0.0) t)

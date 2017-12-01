@@ -23,6 +23,9 @@
 (defvar *unavailable-argument*
   (sb-debug::make-unprintable-object "unavailable argument"))
 
+(defvar *unavailable-more*
+  (sb-debug::make-unprintable-object "more unavailable arguments"))
+
 (defvar *unavailable-lambda-list*
   (sb-debug::make-unprintable-object "unavailable lambda list"))
 
@@ -93,8 +96,8 @@
                     nil)))
            (fail (datum &rest arguments)
              (return-from check-backtrace
-               (values nil (sb-kernel:coerce-to-condition
-                            datum arguments 'simple-error 'error)))))
+               (values nil (apply #'sb-kernel:coerce-to-condition
+                                  datum 'simple-error 'error arguments)))))
     (mapc (lambda (frame spec)
             (unless (cond
                       ((not spec)
@@ -128,8 +131,8 @@
                      :test #'equal))
            (fail (datum &rest arguments)
              (return-from verify-backtrace
-               (values nil (sb-kernel:coerce-to-condition
-                            datum arguments 'simple-error 'error)))))
+               (values nil (apply #'sb-kernel:coerce-to-condition
+                                  datum 'simple-error 'error arguments)))))
     (call-with-backtrace
      (lambda (backtrace condition)
        (declare (ignore condition))
@@ -171,24 +174,26 @@
 ;;; a stunted stack can result from the tail call variant.)
 (flet ((optimized ()
          (declare (optimize (speed 2) (debug 1))) ; tail call elimination
+         (declare (muffle-conditions style-warning))
          (#:undefined-function 42))
        (not-optimized ()
          (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
+         (declare (muffle-conditions style-warning))
          (#:undefined-function 42))
        (test (fun)
          (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
          (funcall fun)))
 
   (with-test (:name (:backtrace :undefined-function :bug-346)
-                    :skipped-on :interpreter
-                    ;; Failures on SPARC, and probably HPPA are due to
-                    ;; not having a full and valid stack frame for the
-                    ;; undefined function frame.  See PPC
-                    ;; undefined_tramp for details.
-                    :fails-on '(or :sparc))
+              :skipped-on :interpreter
+              ;; Failures on SPARC, and probably HPPA are due to
+              ;; not having a full and valid stack frame for the
+              ;; undefined function frame.  See PPC
+              ;; undefined_tramp for details.
+              :fails-on :sparc)
     (assert-backtrace
      (lambda () (test #'optimized))
-     (list *undefined-function-frame*
+     (list (append *undefined-function-frame* '(42))
            (list `(flet test :in ,*p*) #'optimized))))
 
   ;; bug 353: This test fails at least most of the time for x86/linux
@@ -197,12 +202,12 @@
               :skipped-on :interpreter)
     (assert-backtrace
      (lambda () (test #'not-optimized))
-     (list *undefined-function-frame*
+     (list (append *undefined-function-frame* '(42))
            (list `(flet not-optimized :in ,*p*))
            (list `(flet test :in ,*p*) #'not-optimized)))))
 
 (with-test (:name (:backtrace :interrupted-condition-wait)
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread))
   (let ((m (sb-thread:make-mutex))
         (q (sb-thread:make-waitqueue)))
     (assert-backtrace
@@ -229,9 +234,11 @@
 ;;; Enabling it might catch other problems, so do it anyway.
 (flet ((optimized ()
          (declare (optimize (speed 2) (debug 1))) ; tail call elimination
+         (declare (muffle-conditions style-warning))
          (/ 42 0))
        (not-optimized ()
          (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
+         (declare (muffle-conditions style-warning))
          (/ 42 0))
        (test (fun)
          (declare (optimize (speed 1) (debug 3))) ; no tail call elimination
@@ -240,20 +247,20 @@
   (with-test (:name (:backtrace :divide-by-zero :bug-346)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'optimized))
-                      `((/ 42 &rest)
+                      `((sb-kernel::integer-/-integer 42 &rest)
                         ((flet test :in ,*p*) ,#'optimized))))
 
   (with-test (:name (:backtrace :divide-by-zero :bug-356)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'not-optimized))
-                      `((/ 42 &rest)
+                      `((sb-kernel::integer-/-integer 42 &rest)
                         ((flet not-optimized :in ,*p*))
                         ((flet test :in ,*p*) ,#'not-optimized)))))
 
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on '(and :sparc :linux))
+                  :fails-on (and :sparc :linux))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -290,7 +297,7 @@
                        #+(or x86 x86-64)
                        ,@(and predicate
                               `((,(find-symbol (format nil "GENERIC-~A" fun) "SB-VM"))))
-                       ((flet ,test-name :in ,*p*) 42 t)))))))
+                       ((flet ,(string test-name) :in ,*p*) 42 t)))))))
            (test-predicates (&rest functions)
              `(progn ,@(mapcar (lambda (function)
                                  `(test t ,@(sb-int:ensure-list function)))
@@ -372,21 +379,21 @@
 
 ;;; FIXME: This test really should be broken into smaller pieces
 (with-test (:name (:backtrace :tl-xep))
-  (assert-backtrace #'namestring '(((namestring) (:tl :external))) :details t)
+  (assert-backtrace #'namestring '(((namestring) (:external))) :details t)
   (assert-backtrace #'namestring '((namestring))))
 
 (with-test (:name (:backtrace :more-processor))
   ;; CHECKED-COMPILE avoids STYLE-WARNING noise.
   (assert-backtrace (checked-compile '(lambda () (bt.1.1 :key))
                                      :allow-style-warnings t)
-                    '(((bt.1.1 :key) (:more :optional)))
+                    '(((bt.1.1 :key) (:more)))
                     :details t)
   (assert-backtrace (checked-compile '(lambda () (bt.1.2 :key))
                                      :allow-style-warnings t)
-                    '(((bt.1.2 ?) (:more :optional)))
+                    '(((bt.1.2 ?) (:more)))
                     :details t)
   (assert-backtrace (lambda () (bt.1.3 :key))
-                    `(((bt.1.3 . ,*unavailable-lambda-list*) (:more :optional)))
+                    `(((bt.1.3  ,*unavailable-more*) (:more)))
                     :details t)
   (assert-backtrace (checked-compile '(lambda () (bt.1.1 :key))
                                      :allow-style-warnings t)
@@ -411,10 +418,10 @@
 (with-test (:name (:backtrace :varargs-entry))
   (assert-backtrace #'bt.3.1 '((bt.3.1 :key nil)))
   (assert-backtrace #'bt.3.2 '((bt.3.2 :key ?)))
-  (assert-backtrace #'bt.3.3 `((bt.3.3 . ,*unavailable-lambda-list*)))
+  (assert-backtrace #'bt.3.3 `((bt.3.3 :key ,*unavailable-argument*)))
   (assert-backtrace #'bt.3.1 '((bt.3.1 :key nil)))
   (assert-backtrace #'bt.3.2 '((bt.3.2 :key ?)))
-  (assert-backtrace #'bt.3.3 `((bt.3.3 . ,*unavailable-lambda-list*))))
+  (assert-backtrace #'bt.3.3 `((bt.3.3 :key ,*unavailable-argument*))))
 
 ;;; This test is somewhat deceptively named. Due to confusion in debug naming
 ;;; these functions used to have sb-c::hairy-args-processor debug names for
@@ -422,21 +429,21 @@
 (with-test (:name (:backtrace :hairy-args-processor))
   (assert-backtrace #'bt.4.1 '((bt.4.1 ?)))
   (assert-backtrace #'bt.4.2 '((bt.4.2 ?)))
-  (assert-backtrace #'bt.4.3 `((bt.4.3 . ,*unavailable-lambda-list*)))
+  (assert-backtrace #'bt.4.3 `((bt.4.3 ,*unused-argument*)))
   (assert-backtrace #'bt.4.1 '((bt.4.1 ?)))
   (assert-backtrace #'bt.4.2 '((bt.4.2 ?)))
-  (assert-backtrace #'bt.4.3 `((bt.4.3 . ,*unavailable-lambda-list*))))
+  (assert-backtrace #'bt.4.3 `((bt.4.3 ,*unused-argument*))))
 
 (with-test (:name (:backtrace :optional-processor))
   (assert-backtrace #'bt.5.1 '(((bt.5.1) (:optional))) :details t)
   (assert-backtrace #'bt.5.2 '(((bt.5.2) (:optional))) :details t)
-  (assert-backtrace #'bt.5.3 `(((bt.5.3 . ,*unavailable-lambda-list*) (:optional)))
+  (assert-backtrace #'bt.5.3 `(((bt.5.3) (:optional)))
                     :details t)
   (assert-backtrace #'bt.5.1 '((bt.5.1)))
   (assert-backtrace #'bt.5.2 '((bt.5.2)))
-  (assert-backtrace #'bt.5.3 `((bt.5.3 . ,*unavailable-lambda-list*))))
+  (assert-backtrace #'bt.5.3 `((bt.5.3))))
 
-(with-test (:name (:backtrace :unused-optinoal-with-supplied-p :bug-1498644))
+(with-test (:name (:backtrace :unused-optional-with-supplied-p :bug-1498644))
   (assert-backtrace (lambda () (bt.6.1 :opt))
                     `(((bt.6.1 ,*unused-argument*) ()))
                     :details t)
@@ -444,14 +451,14 @@
                     `(((bt.6.2 ,*unused-argument*) ()))
                     :details t)
   (assert-backtrace (lambda () (bt.6.3 :opt))
-                    `(((bt.6.3 . ,*unavailable-lambda-list*) ()))
+                    `(((bt.6.3 ,*unused-argument*) ()))
                     :details t)
   (assert-backtrace (lambda () (bt.6.1 :opt))
                     `((bt.6.1 ,*unused-argument*)))
   (assert-backtrace (lambda () (bt.6.2 :opt))
                     `((bt.6.2 ,*unused-argument*)))
   (assert-backtrace (lambda () (bt.6.3 :opt))
-                    `((bt.6.3 . ,*unavailable-lambda-list*))))
+                    `((bt.6.3 ,*unused-argument*))))
 
 (with-test (:name (:backtrace :unused-key-with-supplied-p))
   (assert-backtrace (lambda () (bt.7.1 :key :value))
@@ -461,14 +468,14 @@
                     `(((bt.7.2 :key ,*unused-argument*) ()))
                     :details t)
   (assert-backtrace (lambda () (bt.7.3 :key :value))
-                    `(((bt.7.3 . ,*unavailable-lambda-list*) ()))
+                    `(((bt.7.3 :key ,*unused-argument*) ()))
                     :details t)
   (assert-backtrace (lambda () (bt.7.1 :key :value))
                     `((bt.7.1 :key ,*unused-argument*)))
   (assert-backtrace (lambda () (bt.7.2 :key :value))
                     `((bt.7.2 :key ,*unused-argument*)))
   (assert-backtrace (lambda () (bt.7.3 :key :value))
-                    `((bt.7.3 . ,*unavailable-lambda-list*))))
+                    `((bt.7.3 :key ,*unused-argument*))))
 
 (defvar *compile-nil-error*
   (checked-compile '(lambda (x)
@@ -531,6 +538,7 @@
   (:method (x y)
     (+ x y)))
 (defun gf-dispatch-test/f (z)
+  (declare (muffle-conditions style-warning))
   (gf-dispatch-test/gf z))
 (with-test (:name (:backtrace :gf-dispatch))
   ;; Fill the cache
@@ -552,7 +560,7 @@
 
 #+sb-fasteval
 (with-test (:name (:backtrace :interpreted-factorial)
-            :skipped-on '(not :interpreter))
+            :skipped-on (not :interpreter))
   (assert-backtrace
    (lambda () (fact 5))
    '((fact 0)
@@ -566,3 +574,71 @@
      (fact 4)
      (sb-interpreter::2-arg-* &rest)
      (fact 5))))
+
+(with-test (:name :deleted-args)
+  (let ((fun (checked-compile `(lambda (&rest ignore)
+                                 (declare (ignore ignore))
+                                 (error "x")))))
+    (assert (typep (block nil
+                     (handler-bind ((error
+                                      (lambda (c)
+                                        (return (values c
+                                                        (sb-debug:list-backtrace))))))
+                       (funcall fun)))
+                   'simple-error))))
+
+(defun mega-string-replace-fail (x)
+  (let ((string (make-string 10000 :initial-element #\z))
+        (stream (make-string-output-stream)))
+    (block nil
+      (handler-bind
+          ((condition (lambda (c)
+                        (declare (ignore c))
+                        (sb-debug:print-backtrace :stream stream)
+                        (return-from nil))))
+        (replace string x)))
+    (get-output-stream-string stream)))
+
+(with-test (:name :long-string-abbreviation)
+  (let ((backtrace (mega-string-replace-fail '(#\- 1))))
+    (assert (search (concatenate 'string
+                                 "\"-"
+                                 (make-string 49 :initial-element #\z)
+                                 "...\"")
+                    backtrace))))
+
+(defclass cannot-print-this () ())
+(defmethod print-object ((object cannot-print-this) stream)
+  (error "No go!"))
+
+(with-test (:name (sb-debug:print-backtrace :no-error print-object))
+  ;; Errors during printing objects used to be suppressed in a way
+  ;; that required outer condition handlers to behave in a specific
+  ;; way.
+  (handler-bind ((error (lambda (condition)
+                          (error "~@<~S signaled ~A.~@:>"
+                                 'sb-debug:print-backtrace condition))))
+    (with-output-to-string (stream)
+      (labels ((foo (n x)
+                 (when (plusp n)
+                   (foo (1- n) x))
+                 (when (zerop n)
+                   (sb-debug:print-backtrace :count 100 :stream stream
+                                             :emergency-best-effort t))))
+        (foo 100 (make-instance 'cannot-print-this))))))
+
+(with-test (:name (sb-debug:print-backtrace :no-error :circles))
+  ;; Errors during printing objects used to be suppressed in a way
+  ;; that required outer condition handlers to behave in a specific
+  ;; way.
+  (handler-bind ((error (lambda (condition)
+                          (error "~@<~S signaled ~A.~@:>"
+                                 'sb-debug:print-backtrace condition))))
+    (with-output-to-string (stream)
+      (labels ((foo (n x)
+                 (when (plusp n)
+                   (foo (1- n) x))
+                 (when (zerop n)
+                   (sb-debug:print-backtrace :count 100 :stream stream))))
+        (foo 100 (let ((list (list t)))
+                   (nconc list list)))))))

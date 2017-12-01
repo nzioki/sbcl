@@ -90,12 +90,14 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 2 :size-increment 1)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base float-registers :finite :size 32)
+)
 
 (!define-storage-classes
   ;; Non-immediate contstants in the constant pool
@@ -244,24 +246,24 @@
 (defun immediate-constant-sc (value)
   (typecase value
     (null
-     (sc-number-or-lose 'null))
+     null-sc-number)
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
@@ -311,22 +313,20 @@
                                  `(function ,args ,result)))))
     (case (sb!c::combination-fun-source-name node)
       (logtest
-       (if (or (valid-funtype '(fixnum fixnum) '*)
-               (valid-funtype '(signed-word signed-word) '*)
+       (if (or (valid-funtype '(signed-word signed-word) '*)
                (valid-funtype '(word word) '*))
            (values :maybe nil)
            (values :default nil)))
       (logbitp
        (cond
-         ((or (valid-funtype '((constant-arg (integer 0 #.(1- n-fixnum-bits))) fixnum) '*)
-              (valid-funtype '((constant-arg (integer 0 #.(1- n-word-bits))) signed-word) '*)
-              (valid-funtype '((constant-arg (integer 0 #.(1- n-word-bits))) word) '*))
+         ((or (valid-funtype '((constant-arg (mod #.n-word-bits)) signed-word) '*)
+              (valid-funtype '((constant-arg (mod #.n-word-bits)) word) '*))
           (values :transform '(lambda (index integer)
                                (%logbitp integer index))))
          (t (values :default nil))))
       (%ldb
        (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (mod ,width))
+                (and (valid-funtype `((constant-arg (integer 1 ,(1- width)))
                                       (constant-arg (mod ,width))
                                       ,type)
                                     'unsigned-byte)
@@ -337,29 +337,20 @@
                             (<= (+ (sb!c::lvar-value size)
                                    (sb!c::lvar-value posn))
                                 width))))))
-         (if (or (validp 'fixnum n-fixnum-bits)
-                 (validp '(signed-byte 64) 64)
-                 (validp '(unsigned-byte 64) 64))
+         (if (or (validp 'word (1- n-word-bits))
+                 (validp 'signed-word (1- n-word-bits)))
              (values :transform '(lambda (size posn integer)
                                   (%%ldb integer size posn)))
              (values :default nil))))
       (%dpb
-       (flet ((validp (type width)
-                (and (valid-funtype `(,type
-                                      (constant-arg (mod ,width))
-                                      (constant-arg (mod ,width))
-                                      ,type)
-                                    'integer)
-                     (destructuring-bind (newbyte size posn integer)
-                         (sb!c::basic-combination-args node)
-                       (declare (ignore integer newbyte))
-                       (and (plusp (sb!c::lvar-value posn))
-                            (<= (+ (sb!c::lvar-value size)
-                                   (sb!c::lvar-value posn))
-                                width))))))
-         (if (or (validp 'fixnum n-fixnum-bits)
-                 (validp '(signed-byte 64) 64)
-                 (validp '(unsigned-byte 64) 64))
+       (flet ((validp (type result-type)
+                (valid-funtype `(,type
+                                 (constant-arg (integer 1 ,(1- n-word-bits)))
+                                 (constant-arg (mod ,n-word-bits))
+                                 ,type)
+                               result-type)))
+         (if (or (validp 'signed-word 'signed-word)
+                 (validp 'word 'word))
              (values :transform '(lambda (newbyte size posn integer)
                                   (%%dpb newbyte size posn integer)))
              (values :default nil))))
@@ -373,3 +364,11 @@
   (make-random-tn :kind :normal
                   :sc (sc-or-lose '32-bit-reg)
                   :offset (tn-offset tn)))
+
+;;; null-tn will be used for setting it, just check the lowtag
+#!+sb-thread
+(defconstant pseudo-atomic-flag
+    (ash list-pointer-lowtag #!+little-endian 0 #!+big-endian 32))
+#!+sb-thread
+(defconstant pseudo-atomic-interrupted-flag
+    (ash list-pointer-lowtag #!+little-endian 32 #!+big-endian 0))

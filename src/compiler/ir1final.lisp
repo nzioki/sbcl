@@ -87,10 +87,11 @@
                (unless (defined-ftype-matches-declared-ftype-p
                          defined-ftype declared-ftype)
                  (compiler-style-warn
-                  "~@<The previously declared FTYPE~2I ~_~S~I ~_~
-                   conflicts with the definition type ~2I~_~S~:>"
-                  (type-specifier declared-ftype)
-                  (type-specifier defined-ftype)))))
+                  "~@<The previously declared FTYPE~
+                   ~2I ~_~/sb!impl:print-type/~I ~_~
+                   conflicts with the definition type ~
+                   ~2I~_~/sb!impl:print-type/~:>"
+                  declared-ftype defined-ftype))))
             (:defined
              (setf (info :function :type source-name) defined-ftype)))))))
   (values))
@@ -140,6 +141,108 @@
                (aver (basic-combination-p dest))
                (delete-filter node lvar (cast-value node))))))))
 
+(defglobal *two-arg-functions*
+    '((* two-arg-*)
+      (+ two-arg-+)
+      (- two-arg--)
+      (/ two-arg-/)
+      (< two-arg-<)
+      (= two-arg-=)
+      (> two-arg->)
+      (char-equal two-arg-char-equal)
+      (char-greaterp two-arg-char-greaterp)
+      (char-lessp two-arg-char-lessp)
+      (char-not-equal two-arg-char-not-equal)
+      (char-not-greaterp two-arg-char-not-greaterp)
+      (char-not-lessp two-arg-char-not-lessp)
+      (gcd two-arg-gcd)
+      (lcm two-arg-lcm)
+      (logand two-arg-and)
+      (logior two-arg-ior)
+      (logxor two-arg-xor)
+      (logeqv two-arg-eqv)
+      (string= two-arg-string=)
+      (string-equal two-arg-string-equal)
+      (string< two-arg-string<)
+      (string> two-arg-string>)
+      (string<= two-arg-string<=)
+      (string>= two-arg-string>=)
+      (string/= two-arg-string/=)
+      (string-lessp two-arg-string-lessp)
+      (string-greaterp two-arg-string-greaterp)
+      (string-not-lessp two-arg-string-not-lessp)
+      (string-not-greaterp two-arg-string-not-greaterp)
+      (string-not-equal two-arg-string-not-equal)))
+
+(defmacro def-two-arg-fun (function)
+  (let ((name (symbolicate 'two-arg- function)))
+    `(progn
+       (defknown ,name (t t) t ())
+       (defun ,name (a b)
+         (,function a b))
+       (pushnew (list ',function ',name) *two-arg-functions* :key #'car))))
+
+(defmacro def-two-arg-funs (&body functions)
+  `(progn
+     ,@(loop for fun in functions
+             collect `(def-two-arg-fun ,fun))))
+
+(def-two-arg-funs
+  char= char/= char< char> char<= char>=
+  >= <= /=)
+
+;;; Convert function designators to functions in calls to known functions
+;;; Also convert to TWO-ARG- variants
+(defun ir1-optimize-functional-arguments (component)
+  (do-blocks (block component)
+    (do-nodes (node nil block)
+      (when (and (combination-p node)
+                 (eq (combination-kind node) :known))
+        (let ((comination-name (lvar-fun-name (combination-fun node) t)))
+          (map-callable-arguments
+           (lambda (lvar args results &key no-function-conversion &allow-other-keys)
+             (declare (ignore results))
+             ;; TODO: handle CASTS.
+             ;; principal-lvar-use will return the REF but the
+             ;; CAST itself needs to be replaced.
+             (unless no-function-conversion
+               (let ((ref (lvar-uses lvar))
+                     (arg-count (length args)))
+                 (when (ref-p ref)
+                   (flet ((translate-two-args (name)
+                            (and (eql arg-count 2)
+                                 (neq comination-name 'reduce)
+                                 (cadr (assoc name *two-arg-functions*)))))
+                     (let* ((leaf (ref-leaf ref))
+                            (fun-name (and (constant-p leaf)
+                                           (constant-value leaf)))
+                            (replacement
+                              (cond ((and fun-name
+                                          (symbolp fun-name))
+                                     (or (translate-two-args fun-name)
+                                         fun-name))
+                                    ((and (global-var-p leaf)
+                                          (eq (global-var-kind leaf) :global-function))
+                                     (translate-two-args (global-var-%source-name leaf))))))
+                       (when replacement
+                         (change-ref-leaf
+                          ref
+                          (let ((*compiler-error-context* node))
+                            (find-free-fun replacement "ir1-finalize"))))))))))
+           node))))))
+
+(defun rewrite-full-call (combination)
+  (let ((comination-name (lvar-fun-name (combination-fun combination) t))
+        (args (combination-args combination)))
+    (let ((two-arg (cadr (assoc comination-name *two-arg-functions*)))
+          (ref (lvar-uses (combination-fun combination))))
+      (when (and two-arg
+                 (ref-p ref)
+                 (= (length args) 2))
+        (change-ref-leaf
+         ref
+         (find-free-fun two-arg "rewrite-full-call"))))))
+
 ;;; Do miscellaneous things that we want to do once all optimization
 ;;; has been done:
 ;;;  -- Record the derived result type before the back-end trashes the
@@ -163,5 +266,5 @@
            *free-funs*)
 
   (ir1-merge-casts component)
-
+  (ir1-optimize-functional-arguments component)
   (values))

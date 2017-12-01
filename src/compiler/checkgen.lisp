@@ -139,6 +139,10 @@
          ;; weakening, so for integer types we simply collapse all
          ;; ranges into one.
          (weaken-integer-type type))
+        #!+sb-unicode
+        ((csubtypep type (specifier-type 'base-char))
+         ;; Don't want to be putting CHARACTERs into BASE-STRINGs.
+         (specifier-type 'base-char))
         (t
          (let ((min-cost (type-test-cost type))
                (min-type type)
@@ -189,10 +193,17 @@
 ;;; type weakenings, then look for any predicate that is cheaper.
 (defun maybe-weaken-check (type policy)
   (declare (type ctype type))
-  (ecase (policy policy type-check)
-    (0 *wild-type*)
-    (2 (weaken-values-type type))
-    (3 type)))
+  (typecase type
+    ;; Can't do much funcational type checking at run-time
+    (fun-designator-type
+     (specifier-type '(or function symbol)))
+    (fun-type
+     (specifier-type 'function))
+    (t
+     (ecase (policy policy type-check)
+       (0 *wild-type*)
+       (2 (weaken-values-type type))
+       (3 type)))))
 
 ;;; LVAR is an lvar we are doing a type check on and TYPES is a list
 ;;; of types that we are checking its values against. If we have
@@ -249,7 +260,9 @@
                            ((lvar-single-value-p lvar)
                             1)
                            ((and (mv-combination-p dest)
-                                 (eq (mv-combination-kind dest) :local))
+                                 (eq (mv-combination-kind dest) :local)
+                                 (lvar-uses (mv-combination-fun dest))
+                                 (singleton-p (mv-combination-args dest)))
                             (let ((fun-ref (lvar-use (mv-combination-fun dest))))
                               (length (lambda-vars (ref-leaf fun-ref)))))))
          (n-required (length (values-type-required dtype))))
@@ -265,18 +278,13 @@
           ((lvar-single-value-p lvar)
            ;; exactly one value is consumed
            (principal-lvar-single-valuify lvar)
-           (flet ((get-type (type)
-                    (acond ((args-type-required type)
-                            (car it))
-                           ((args-type-optional type)
-                            (car it))
-                           (t (bug "type ~S is too hairy" type)))))
-             (values :simple (maybe-negate-check value
-                                                 (list (get-type ctype))
-                                                 (list (get-type atype))
-                                                 n-required))))
+           (values :simple (maybe-negate-check value
+                                               (list (single-value-type ctype))
+                                               (list (single-value-type atype))
+                                               n-required)))
           ((and (mv-combination-p dest)
-                (eq (mv-combination-kind dest) :local))
+                (eq (mv-combination-kind dest) :local)
+                (singleton-p (mv-combination-args dest)))
            ;; we know the number of consumed values
            (values :simple (maybe-negate-check value
                                                (adjust-list (values-type-types ctype)
@@ -296,29 +304,36 @@
   (let* ((lvar (node-lvar cast))
          (dest (and lvar (lvar-dest lvar))))
     (and (combination-p dest)
-         ;; The theory is that the type assertion is from a declaration on the
-         ;; callee, so the callee should be able to do the check. We want to
-         ;; let the callee do the check, because it is possible that by the
-         ;; time of call that declaration will be changed and we do not want
-         ;; to make people recompile all calls to a function when they were
-         ;; originally compiled with a bad declaration.
-         ;;
-         ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
-         ;; that occur before nodes that can cause observable side effects --
-         ;; most commonly other non-external casts: so the order in which
-         ;; possible type errors are signalled matches with the evaluation
-         ;; order.
-         ;;
-         ;; FIXME: We should let more cases be handled by the callee then we
-         ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
-         ;; This is not fixable quite here, though, because flow-analysis has
-         ;; deleted the LVAR of the cast by the time we get here, so there is
-         ;; no destination. Perhaps we should mark cases inserted by
-         ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
-         ;; deemed unreachable?
-         (almost-immediately-used-p lvar cast)
-         (values (values-subtypep (lvar-externally-checkable-type lvar)
-                                  (cast-type-to-check cast))))))
+         (or
+          ;; Special case, %CHECK-BOUND tests both for fixnum and
+          ;; bound, which is equivalent to testing for INDEX.
+          (and (equal (combination-fun-debug-name dest) '(lambda-inlined check-bound))
+               (values-subtypep (values-specifier-type  '(values index &optional))
+                                (cast-type-to-check cast)))
+          ;; The theory is that the type assertion is from a declaration on the
+          ;; callee, so the callee should be able to do the check. We want to
+          ;; let the callee do the check, because it is possible that by the
+          ;; time of call that declaration will be changed and we do not want
+          ;; to make people recompile all calls to a function when they were
+          ;; originally compiled with a bad declaration.
+          ;;
+          ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
+          ;; that occur before nodes that can cause observable side effects --
+          ;; most commonly other non-external casts: so the order in which
+          ;; possible type errors are signalled matches with the evaluation
+          ;; order.
+          ;;
+          ;; FIXME: We should let more cases be handled by the callee then we
+          ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
+          ;; This is not fixable quite here, though, because flow-analysis has
+          ;; deleted the LVAR of the cast by the time we get here, so there is
+          ;; no destination. Perhaps we should mark cases inserted by
+          ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
+          ;; deemed unreachable?
+          (and
+           (almost-immediately-used-p lvar cast)
+           (values (values-subtypep (lvar-externally-checkable-type lvar)
+                                    (cast-type-to-check cast))))))))
 
 ;; Type specifiers handled by the general-purpose MAKE-TYPE-CHECK-FORM are often
 ;; trivial enough to have an internal error number assigned to them that can be
@@ -362,6 +377,16 @@
           (setf (gethash spec *checkgen-used-types*) (cons 1 answer)))
       answer)))
 
+(defun internal-type-error-call (var type &optional context)
+  (let* ((external-spec (if (ctype-p type)
+                            (type-specifier type)
+                            type))
+         (interr-symbol
+           (%interr-symbol-for-type-spec external-spec)))
+    (if interr-symbol
+        `(%type-check-error/c ,var ',interr-symbol ',context)
+        `(%type-check-error ,var ',external-spec ',context))))
+
 ;;; Return a lambda form that we can convert to do a type check
 ;;; of the specified TYPES. TYPES is a list of the format returned by
 ;;; CAST-CHECK-TYPES.
@@ -370,21 +395,16 @@
 ;;; unsupplied. Such checking is impossible to efficiently do at the
 ;;; source level because our fixed-values conventions are optimized
 ;;; for the common MV-BIND case.
-(defun make-type-check-form (types)
+(defun make-type-check-form (types &optional context)
   (let ((temps (make-gensym-list (length types))))
     `(multiple-value-bind ,temps 'dummy
        ,@(mapcar (lambda (temp type)
                    (let* ((spec
                             (let ((*unparse-fun-type-simplify* t))
                               (type-specifier (second type))))
-                          (test (if (first type) `(not ,spec) spec))
-                          (external-spec (type-specifier (third type)))
-                          (interr-symbol
-                            (%interr-symbol-for-type-spec external-spec)))
+                          (test (if (first type) `(not ,spec) spec)))
                      `(unless (typep ,temp ',test)
-                        ,(if interr-symbol
-                             `(%type-check-error/c ,temp ',interr-symbol)
-                             `(%type-check-error ,temp ',external-spec)))))
+                        ,(internal-type-error-call temp (third type) context))))
                  temps
                  types)
        (values ,@temps))))
@@ -396,7 +416,8 @@
   (declare (type cast cast) (type list types))
   (let ((value (cast-value cast))
         (length (length types)))
-    (filter-lvar value (make-type-check-form types))
+    (filter-lvar value (make-type-check-form types
+                                             (cast-context cast)))
     (reoptimize-lvar (cast-value cast))
     (setf (cast-type-to-check cast) *wild-type*)
     (setf (cast-%type-check cast) nil)
@@ -407,10 +428,10 @@
                          (single-value-type atype))
                         (t
                          (make-values-type
-                          :required (values-type-out atype length)))))
+                          :required (values-type-in atype length)))))
            (dtype (node-derived-type cast))
            (dtype (make-values-type
-                   :required (values-type-out dtype length))))
+                   :required (values-type-in dtype length))))
       (setf (cast-asserted-type cast) atype)
       (setf (node-derived-type cast) dtype)))
 
@@ -507,7 +528,10 @@
                    (casts node)))))
         (setf (block-type-check block) nil)))
     (dolist (cast (casts))
-      (unless (bound-cast-p cast)
+      (unless (or (bound-cast-p cast)
+                  ;; The block could become deleted by IR1-OPTIMIZE-CAST
+                  ;; called by CAST-TYPE-CHECK
+                  (node-to-be-deleted-p cast))
         (multiple-value-bind (check types) (cast-check-types cast)
           (ecase check
             (:simple

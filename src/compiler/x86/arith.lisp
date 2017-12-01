@@ -14,9 +14,7 @@
 ;;;; unary operations
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg) :target res))
@@ -47,6 +45,14 @@
 (define-vop (fast-negate/unsigned signed-unop)
   (:args (x :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
+  (:translate %negate)
+  (:generator 3
+    (move res x)
+    (inst neg res)))
+
+(define-vop (fast-negate/signed-unsigned signed-unop)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
   (:translate %negate)
   (:generator 3
     (move res x)
@@ -200,10 +206,10 @@
   (define-binop logxor 2 xor))
 
 (define-vop (fast-logior-unsigned-signed=>signed fast-safe-arith-op)
-  (:args (x :scs (unsigned-reg))
+  (:args (x :scs (unsigned-reg) :to (:result 1))
          (y :target r :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
-  (:results (r :scs (signed-reg) :from (:argument 1)))
+  (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (unsigned-byte 32) arithmetic")
   (:translate logior)
@@ -336,8 +342,7 @@
   (:translate logand)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant (member #.most-positive-word
-                                   #.(ash most-positive-word -1))))
+  (:arg-types t (:constant word))
   (:results (r :scs (unsigned-reg)))
   (:info mask)
   (:result-types unsigned-num)
@@ -345,15 +350,13 @@
     (move r x)
     (generate-fixnum-test r)
     (inst jmp :nz BIGNUM)
-    (if (= mask most-positive-word)
-        (inst sar r n-fixnum-tag-bits)
-        (inst shr r n-fixnum-tag-bits))
+    (inst sar r n-fixnum-tag-bits)
     (inst jmp DONE)
     BIGNUM
     (loadw r x bignum-digits-offset other-pointer-lowtag)
+    DONE
     (unless (= mask most-positive-word)
-      (inst btr r (1- n-word-bits)))
-    DONE))
+      (inst and r mask))))
 
 
 (define-vop (fast-+-c/signed=>signed fast-safe-arith-op)
@@ -1149,8 +1152,6 @@ constant shift greater than word length")))
 
 (define-vop (fast-conditional)
   (:conditional :e)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1861,18 +1862,6 @@ constant shift greater than word length")))
     (move result digit)
     (move ecx count)
     (inst shl result :cl)))
-
-;;;; static functions
-
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-
 
 ;;; Support for the Mersenne Twister, MT19937, random number generator
 ;;; due to Matsumoto and Nishimura.

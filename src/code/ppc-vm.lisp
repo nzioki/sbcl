@@ -2,23 +2,21 @@
 ;;;
 (in-package "SB!VM")
 
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Returns a string describing the type of the local machine."
   "PowerPC")
 
 ;;;; FIXUP-CODE-OBJECT
 
-(defun fixup-code-object (code offset fixup kind)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset fixup kind &optional flavor)
   (declare (type index offset))
+  (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (without-gcing
-   (let ((sap (%primitive code-instructions code)))
+   (let ((sap (code-instructions code)))
      (ecase kind
        (:absolute
         (setf (sap-ref-32 sap offset) fixup))
@@ -41,39 +39,19 @@
                  (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
        (:l
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) fixup)))))))
+              (ldb (byte 16 0) fixup))))))))
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from x86-vm.lisp then
 ;;;; hacked for types.
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-long)
-  (context (* os-context-t)))
-
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (deref (context-pc-addr context))))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-long)
-  (context (* os-context-t))
-  (index int))
-
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (context-register-addr context index)))
-
+#-sb-xc-host (progn
 (define-alien-routine ("os_context_lr_addr" context-lr-addr) (* unsigned-long)
   (context (* os-context-t)))
 
 (defun context-lr (context)
   (declare (type (alien (* os-context-t)) context))
   (int-sap (deref (context-lr-addr context))))
-
-(defun %set-context-register (context index new)
-(declare (type (alien (* os-context-t)) context))
-(setf (deref (context-register-addr context index))
-      new))
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
@@ -126,19 +104,6 @@
            (let ((error-number (sap-ref-8 pc 4)))
              (values error-number
                      (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
-          #!-precise-arg-count-error
-          ((and (= (ldb (byte 6 10) op) 3)
-                (= (ldb (byte 5 5) op) 24))
-           (let ((prev (sap-ref-32 (int-sap (- (sap-int pc) 4)) 0)))
-             (if (and (= (ldb (byte 6 26) prev) 3)
-                      (= (ldb (byte 5 21) prev) 0))
-                 (values (ldb (byte 16 0) prev)
-                         (list (make-sc-offset any-reg-sc-number
-                                               (ldb (byte 5 16) prev))))
-                 (values #.(error-number-or-lose
-                            'invalid-arg-count-error)
-                         (list (make-sc-offset any-reg-sc-number regnum))))))
-          #!+precise-arg-count-error
           ((and (= (ldb (byte 6 10) op) 3) ;; twi
                 (or (= regnum #.(sc-offset-offset arg-count-sc))
                     (= (ldb (byte 5 5) op) 24))) ;; :ne
@@ -158,4 +123,4 @@
                          '(#.arg-count-sc)))))
           (t
            (values #.(error-number-or-lose 'unknown-error) nil)))))
-
+) ; end PROGN

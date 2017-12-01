@@ -9,17 +9,21 @@
 
 (in-package "SB!VM")
 
+;;; the number of bits per byte, where a byte is the smallest
+;;; addressable object
+(defconstant n-byte-bits 8)
+
 ;;; the number of bits at the low end of a pointer used for type
 ;;; information
-(def!constant n-lowtag-bits
+(defconstant n-lowtag-bits
   (integer-length (1- (/ (* 2 n-word-bits) n-byte-bits))))
 ;;; a mask to extract the low tag bits from a pointer
-(def!constant lowtag-mask (1- (ash 1 n-lowtag-bits)))
+(defconstant lowtag-mask (1- (ash 1 n-lowtag-bits)))
 ;;; the exclusive upper bound on the value of the low tag bits from a
 ;;; pointer
-(def!constant lowtag-limit (ash 1 n-lowtag-bits))
+(defconstant lowtag-limit (ash 1 n-lowtag-bits))
 ;;; the number of tag bits used for a fixnum
-(def!constant n-fixnum-tag-bits
+(defconstant n-fixnum-tag-bits
   ;; On 64-bit targets, this may be as low as 1 (for 63-bit
   ;; fixnums) and as high as 3 (for 61-bit fixnums).  The
   ;; constraint on the low end is that we need at least one bit
@@ -37,53 +41,50 @@
   ;; must not exceed WORD-SHIFT.
   #!-64-bit (1- n-lowtag-bits))
 ;;; the fixnum tag mask
-(def!constant fixnum-tag-mask (1- (ash 1 n-fixnum-tag-bits)))
+(defconstant fixnum-tag-mask (1- (ash 1 n-fixnum-tag-bits)))
 ;;; the bit width of fixnums
-(def!constant n-fixnum-bits (- n-word-bits n-fixnum-tag-bits))
+(defconstant n-fixnum-bits (- n-word-bits n-fixnum-tag-bits))
 ;;; the bit width of positive fixnums
-(def!constant n-positive-fixnum-bits (1- n-fixnum-bits))
+(defconstant n-positive-fixnum-bits (1- n-fixnum-bits))
 
 ;;; the number of bits to shift between word addresses and byte addresses
-(def!constant word-shift (1- (integer-length (/ n-word-bits n-byte-bits))))
+(defconstant word-shift (1- (integer-length (/ n-word-bits n-byte-bits))))
 
 ;;; the number of bytes in a word
-(def!constant n-word-bytes (/ n-word-bits n-byte-bits))
+(defconstant n-word-bytes (/ n-word-bits n-byte-bits))
 
 ;;; the number of bytes in a machine word
-(def!constant n-machine-word-bytes (/ n-machine-word-bits n-byte-bits))
+(defconstant n-machine-word-bytes (/ n-machine-word-bits n-byte-bits))
 
 ;;; the number of bits used in the header word of a data block to store
 ;;; the type
-(def!constant n-widetag-bits 8)
+(defconstant n-widetag-bits 8)
 ;;; a mask to extract the type from a data block header word
-(def!constant widetag-mask (1- (ash 1 n-widetag-bits)))
+(defconstant widetag-mask (1- (ash 1 n-widetag-bits)))
 
-(def!constant sb!xc:most-positive-fixnum
+(defconstant sb!xc:most-positive-fixnum
     (1- (ash 1 n-positive-fixnum-bits))
-  #!+sb-doc
   "the fixnum closest in value to positive infinity")
-(def!constant sb!xc:most-negative-fixnum
+(defconstant sb!xc:most-negative-fixnum
     (ash -1 n-positive-fixnum-bits)
-  #!+sb-doc
   "the fixnum closest in value to negative infinity")
 
-(def!constant most-positive-word (1- (expt 2 n-word-bits))
-  #!+sb-doc
+(defconstant most-positive-word (1- (expt 2 n-word-bits))
   "The most positive integer that is of type SB-EXT:WORD.")
 
-(def!constant most-positive-exactly-single-float-fixnum
+(defconstant most-positive-exactly-single-float-fixnum
   (min (expt 2 single-float-digits) sb!xc:most-positive-fixnum))
-(def!constant most-negative-exactly-single-float-fixnum
+(defconstant most-negative-exactly-single-float-fixnum
   (max (- (expt 2 single-float-digits)) sb!xc:most-negative-fixnum))
-(def!constant most-positive-exactly-double-float-fixnum
+(defconstant most-positive-exactly-double-float-fixnum
   (min (expt 2 double-float-digits) sb!xc:most-positive-fixnum))
-(def!constant most-negative-exactly-double-float-fixnum
+(defconstant most-negative-exactly-double-float-fixnum
   (max (- (expt 2 double-float-digits)) sb!xc:most-negative-fixnum))
 
 ;;;; Point where continuous area starting at dynamic-space-start bumps into
-;;;; next space.
-#!+gencgc
-(def!constant max-dynamic-space-end
+;;;; next space. Computed for genesis/constants.h, not used in Lisp.
+#!+(and gencgc (host-feature sb-xc-host))
+(defconstant max-dynamic-space-end
     (let ((stop (1- (ash 1 n-word-bits)))
           (start dynamic-space-start))
       (dolist (other-start (list read-only-space-start static-space-start
@@ -97,10 +98,44 @@
 ;; The lowest index that you can pass to %INSTANCE-REF accessing
 ;; a slot of data that is not the instance-layout.
 ;; To get a layout, you must call %INSTANCE-LAYOUT - don't assume index 0.
-(def!constant instance-data-start 1)
+(defconstant instance-data-start (+ #!-compact-instance-header 1))
+
+;; The largest number that may appear in the header-data for an instance,
+;; and some other mostly-boxed objects, such as FDEFNs.
+;; This constraint exists because for objects managed by the immobile GC,
+;; their generation number is stored in the header, so we have to know
+;; how much to mask off to obtain the payload size.
+;; Objects whose payload gets capped to this limit are considered
+;; "short_boxed" objects in the sizetab[] array in 'gc-common'.
+;; Additionally there are "tiny_boxed" objects, the payload length of
+;; which can be expressed in 8 bits.
+(defconstant short-header-max-words #x7fff)
 
 ;;; Is X a fixnum in the target Lisp?
 #+sb-xc-host
 (defun fixnump (x)
   (and (integerp x)
        (<= sb!xc:most-negative-fixnum x sb!xc:most-positive-fixnum)))
+
+;;; Helper macro for defining FIXUP-CODE-OBJECT so that its body
+;;; can be the same between the host and target.
+;;; In the target, the byte offset supplied is relative to CODE-INSTRUCTIONS.
+;;; Genesis works differently - it adjusts the offset so that it is relative
+;;; to the containing gspace since that's what bvref requires.
+(defmacro !with-bigvec-or-sap (&body body)
+  `(macrolet #-sb-xc-host ()
+             #+sb-xc-host
+             ((code-instructions (code) `(sb!fasl::descriptor-mem ,code))
+              (sap-int (sap)
+                ;; KLUDGE: SAP is a bigvec; it doesn't know its address.
+                ;; Note that this shadows the uncallable stub function for SAP-INT
+                ;; that placates the host when compiling 'compiler/*/move.lisp'.
+                (declare (ignore sap))
+                `(locally
+                     (declare (notinline sb!fasl::descriptor-gspace)) ; fwd ref
+                   (sb!fasl::gspace-byte-address
+                    (sb!fasl::descriptor-gspace code)))) ; use CODE, not SAP
+              (sap-ref-8 (sap offset) `(sb!fasl::bvref-8 ,sap ,offset))
+              (sap-ref-32 (sap offset) `(sb!fasl::bvref-32 ,sap ,offset))
+              (sap-ref-word (sap offset) `(sb!fasl::bvref-word ,sap ,offset)))
+     ,@body))

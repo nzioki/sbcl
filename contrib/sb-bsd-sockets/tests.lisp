@@ -45,18 +45,28 @@
       nil))
   t)
 
+(when (handler-case (make-instance 'inet-socket
+                                   :type :stream
+                                   :protocol (get-protocol-by-name "tcp"))
+        (error nil)
+        (:no-error (x) x))
+  (push :ipv4-support *features*))
+
+#+ipv4-support
 (deftest make-inet-socket.smoke
   ;; make a socket
   (let ((s (make-instance 'inet-socket :type :stream :protocol (get-protocol-by-name "tcp"))))
     (> (socket-file-descriptor s) 1))
   t)
 
+#+ipv4-support
 (deftest make-inet-socket.keyword
     ;; make a socket
     (let ((s (make-instance 'inet-socket :type :stream :protocol :tcp)))
       (> (socket-file-descriptor s) 1))
   t)
 
+#+ipv4-support
 (deftest* (make-inet-socket-wrong)
     ;; fail to make a socket: check correct error return.  There's no nice
     ;; way to check the condition stuff on its own, which is a shame
@@ -74,6 +84,7 @@
       (:no-error nil))
   t)
 
+#+ipv4-support
 (deftest* (make-inet-socket-keyword-wrong)
     ;; same again with keywords
     (handler-case
@@ -96,7 +107,7 @@
   (handler-case
       (let ((s (make-instance 'inet6-socket :type :stream :protocol (get-protocol-by-name "tcp"))))
         (> (socket-file-descriptor s) 1))
-    (address-family-not-supported () t))
+    ((or address-family-not-supported protocol-not-supported-error) () t))
   t)
 
 #-win32
@@ -104,15 +115,17 @@
   (handler-case
       (let ((s (make-instance 'inet6-socket :type :stream :protocol :tcp)))
         (> (socket-file-descriptor s) 1))
-    (address-family-not-supported () t))
+    ((or address-family-not-supported protocol-not-supported-error) () t))
   t)
 
+#+ipv4-support
 (deftest* (non-block-socket)
   (let ((s (make-instance 'inet-socket :type :stream :protocol :tcp)))
     (setf (non-blocking-mode s) t)
     (non-blocking-mode s))
   t)
 
+#+ipv4-support
 (deftest inet-socket-bind
   (let* ((tcp (get-protocol-by-name "tcp"))
          (address (make-inet-address "127.0.0.1"))
@@ -159,9 +172,10 @@
                    (address-in-use-error () t))))
           (socket-close s1)
           (socket-close s2)))
-    (address-family-not-supported () t))
+    ((or address-family-not-supported protocol-not-supported-error) () t))
   t)
 
+#+ipv4-support
 (deftest* (simple-sockopt-test)
   ;; test we can set SO_REUSEADDR on a socket and retrieve it, and in
   ;; the process that all the weird macros in sockopt happened right.
@@ -259,7 +273,6 @@
       t)
   t)
 
-
 ;;; these require that the internet (or bits of it, at least) is available
 
 #+internet-available
@@ -334,10 +347,11 @@
       (network-unreachable-error () 'network-unreachable))
   t)
 
+#+ipv4-support
 (deftest socket-open-p-true.1
     (socket-open-p (make-instance 'inet-socket :type :stream :protocol :tcp))
   t)
-#+internet-available
+#+(and ipv4-support internet-available)
 (deftest socket-open-p-true.2
     (let ((s (make-instance 'inet-socket :type :stream :protocol :tcp)))
       (unwind-protect
@@ -346,6 +360,7 @@
              (socket-open-p s))
         (socket-close s)))
   t)
+#+ipv4-support
 (deftest socket-open-p-false
     (let ((s (make-instance 'inet-socket :type :stream :protocol :tcp)))
       (socket-close s)
@@ -372,7 +387,7 @@
        (format t "Received ~A bytes from ~A:~A - ~A ~%"
                len address port (subseq buf 0 (min 10 len)))))))
 
-#+sb-thread
+#+(and ipv4-support sb-thread)
 (deftest interrupt-io
     (let (result)
       (labels
@@ -427,48 +442,52 @@
       result)
   :ok)
 
-(defmacro with-client-and-server ((server-socket-var client-socket-var) &body body)
-  (let ((listen-socket (gensym "LISTEN-SOCKET")))
-    `(let ((,listen-socket (make-instance 'inet-socket
-                                          :type :stream
-                                          :protocol :tcp))
-           (,client-socket-var (make-instance 'inet-socket
-                                              :type :stream
-                                              :protocol :tcp))
-           (,server-socket-var))
-      (unwind-protect
-           (progn
-             (setf (sockopt-reuse-address ,listen-socket) t)
-             (socket-bind ,listen-socket (make-inet-address "127.0.0.1") 0)
-             (socket-listen ,listen-socket 5)
-             (socket-connect ,client-socket-var (make-inet-address "127.0.0.1")
-                             (nth-value 1 (socket-name ,listen-socket)))
-             (setf ,server-socket-var (socket-accept ,listen-socket))
-             ,@body)
-        (socket-close ,client-socket-var)
-        (socket-close ,listen-socket)
-        (when ,server-socket-var
-          (socket-close ,server-socket-var))))))
+(defmacro with-client-and-server (((socket-class &rest common-initargs)
+                                   (listen-socket-var &rest listen-address)
+                                   (client-socket-var &rest client-address)
+                                   server-socket-var)
+                                  &body body)
+  `(let ((,listen-socket-var (make-instance ',socket-class ,@common-initargs))
+         (,client-socket-var (make-instance ',socket-class ,@common-initargs))
+         (,server-socket-var))
+     (unwind-protect
+          (progn
+            (setf (sockopt-reuse-address ,listen-socket-var) t)
+            (socket-bind ,listen-socket-var ,@listen-address)
+            (socket-listen ,listen-socket-var 5)
+            (socket-connect ,client-socket-var ,@client-address)
+            (setf ,server-socket-var (socket-accept ,listen-socket-var))
+            ,@body)
+       (socket-close ,client-socket-var)
+       (socket-close ,listen-socket-var)
+       (when ,server-socket-var
+         (socket-close ,server-socket-var)))))
 
 ;; For stream sockets, make sure a shutdown of the output direction
 ;; translates into an END-OF-FILE on the other end, no matter which
 ;; end performs the shutdown and independent of the element-type of
 ;; the stream.
+#+ipv4-support
 (macrolet
     ((define-shutdown-test (name who-shuts-down who-reads element-type direction)
        `(deftest ,name
-          (with-client-and-server (client server)
-            (socket-shutdown ,who-shuts-down :direction ,direction)
-            (handler-case
-                (sb-ext:with-timeout 2
-                  (,(if (eql element-type 'character)
-                        'read-char 'read-byte)
-                   (socket-make-stream
-                    ,who-reads :input t :output t
-                    :element-type ',element-type)))
-              (end-of-file ()
-                :ok)
-              (sb-ext:timeout () :timeout)))
+          (let ((address (make-inet-address "127.0.0.1")))
+            (with-client-and-server
+                ((inet-socket :protocol :tcp :type :stream)
+                 (listener address 0)
+                 (client   address (nth-value 1 (socket-name listener)))
+                 server)
+              (socket-shutdown ,who-shuts-down :direction ,direction)
+              (handler-case
+                  (sb-ext:with-timeout 2
+                    (,(if (eql element-type 'character)
+                          'read-char 'read-byte)
+                      (socket-make-stream
+                       ,who-reads :input t :output t
+                       :element-type ',element-type)))
+                (end-of-file ()
+                  :ok)
+                (sb-ext:timeout () :timeout))))
           :ok))
      (define-shutdown-tests (direction)
        (flet ((make-name (name)
@@ -486,3 +505,26 @@
 
   (define-shutdown-tests :output)
   (define-shutdown-tests :io))
+
+#+linux
+(deftest abstract.smoke
+    (let* ((address "J9dbfDNuVewDs")
+           (message "message")
+           (buffer (make-string (length message))))
+      (with-client-and-server ((local-abstract-socket :type :stream)
+                               (listener address)
+                               (client address)
+                               server)
+        (socket-send client message nil)
+        (string= (socket-receive server buffer nil) message)))
+  t)
+
+#+linux
+(deftest abstract.socket-peername
+    (let ((address "J9dbfDNuVewDs"))
+      (with-client-and-server ((local-abstract-socket :type :stream)
+                               (listener address)
+                               (client address)
+                               server)
+        (string= (sb-ext:octets-to-string (socket-peername client)) address)))
+  t)

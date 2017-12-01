@@ -43,7 +43,7 @@
                          (type-of (unbound-slot-instance condition))))))))
 
 (defmethod wrapper-fetcher ((class standard-class))
-  'std-instance-wrapper)
+  '%instance-layout)
 
 (defmethod slots-fetcher ((class standard-class))
   'std-instance-slots)
@@ -58,20 +58,32 @@
 ;;; structure protocol are promoted to the implementation-specific class
 ;;; std-class. Many of these methods call these four functions.
 
-(defun %swap-wrappers-and-slots (i1 i2)
+(defun %swap-wrappers-and-slots (i1 i2) ; old -> new
   (cond ((std-instance-p i1)
-         (let ((w1 (std-instance-wrapper i1))
+         #+(and compact-instance-header x86-64)
+         (let ((oslots (std-instance-slots i1))
+               (nslots (std-instance-slots i2)))
+           ;; The hash val is in the header of the slots. Copying is race-free
+           ;; because it is immutable once memoized by STD-INSTANCE-HASH.
+           (sb-vm::cas-header-data-high
+            nslots 0 (sb-impl::%std-instance-hash oslots)))
+         ;; FIXME: If a backend supports two-word primitive instances
+         ;; and double-wide CAS, it's probably best to use that.
+         ;; Maybe we're inside a mutex here anyway though?
+         (let ((w1 (%instance-layout i1))
                (s1 (std-instance-slots i1)))
-           (setf (std-instance-wrapper i1) (std-instance-wrapper i2))
+           (setf (%instance-layout i1) (%instance-layout i2))
            (setf (std-instance-slots i1) (std-instance-slots i2))
-           (setf (std-instance-wrapper i2) w1)
+           (setf (%instance-layout i2) w1)
            (setf (std-instance-slots i2) s1)))
         ((fsc-instance-p i1)
-         (let ((w1 (fsc-instance-wrapper i1))
+         (let ((w1 (%funcallable-instance-layout i1))
+               (w2 (%funcallable-instance-layout i2))
                (s1 (fsc-instance-slots i1)))
-           (setf (fsc-instance-wrapper i1) (fsc-instance-wrapper i2))
+           (aver (= (layout-bitmap w1) (layout-bitmap w2)))
+           (setf (%funcallable-instance-layout i1) w2)
            (setf (fsc-instance-slots i1) (fsc-instance-slots i2))
-           (setf (fsc-instance-wrapper i2) w1)
+           (setf (%funcallable-instance-layout i2) w1)
            (setf (fsc-instance-slots i2) s1)))
         (t
          (error "unrecognized instance type"))))
@@ -129,7 +141,7 @@
                  (cdr location))
                 (t
                  (bug "Bogus slot cell in SLOT-VALUE: ~S" cell)))))
-    (if (eq +slot-unbound+ value)
+    (if (unbound-marker-p value)
         (slot-unbound (wrapper-class* wrapper) object slot-name)
         value)))
 
@@ -188,8 +200,7 @@
                       (cas (cdr location) old-value new-value))
                      (t
                       (bug "Bogus slot-cell in (CAS SLOT-VALUE): ~S" cell)))))
-      (if (and (eq +slot-unbound+ old)
-               (neq old old-value))
+      (if (and (unbound-marker-p old) (neq old old-value))
           (slot-unbound (wrapper-class* wrapper) object slot-name)
           old))))
 
@@ -213,7 +224,7 @@
                  (cdr location))
                 (t
                  (bug "Bogus slot cell in SLOT-VALUE: ~S" cell)))))
-    (not (eq +slot-unbound+ value))))
+    (not (unbound-marker-p value))))
 
 (defun slot-makunbound (object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
@@ -271,7 +282,7 @@
             (t
              (instance-structure-protocol-error slotd
                                                 'slot-value-using-class)))))
-    (if (eq value +slot-unbound+)
+    (if (unbound-marker-p value)
         (values (slot-unbound class object (slot-definition-name slotd)))
         value)))
 
@@ -328,7 +339,7 @@
             (t
              (instance-structure-protocol-error slotd
                                                 'slot-boundp-using-class)))))
-    (not (eq value +slot-unbound+))))
+    (not (unbound-marker-p value))))
 
 (defmethod slot-makunbound-using-class
            ((class std-class)
@@ -388,7 +399,7 @@
     (declare (type function function))
     ;; FIXME: Is this really necessary? Structure slots should surely
     ;; never be unbound!
-    (if (eq value +slot-unbound+)
+    (if (unbound-marker-p value)
         (values (slot-unbound class object (slot-definition-name slotd)))
         value)))
 
@@ -448,12 +459,9 @@
        ;; In the vast majority of cases location corresponds to the position
        ;; in list. The only exceptions are when there are non-local slots
        ;; before the one we want.
-       (let* ((slots (layout-slot-list (layout-of instance)))
-              (guess (nth position slots)))
-         (if (eql position (slot-definition-location guess))
-             (slot-definition-name guess)
-             (slot-definition-name
-              (car (member position (class-slots instance) :key #'slot-definition-location))))))
+       (slot-definition-name
+        (find position (layout-slot-list (layout-of instance))
+              :key #'slot-definition-location)))
       (cons
        (car position))))))
 
@@ -487,11 +495,11 @@
     (error 'simple-reference-error
            :format-control "~S called on ~S, which is not yet finalized."
            :format-arguments (list 'class-slots class)
-           :references (list '(:amop :generic-function class-slots)))))
+           :references '((:amop :generic-function class-slots)))))
 
 (defun %set-slots (object names &rest values)
   (mapc (lambda (name value)
-          (if (eq value +slot-unbound+)
+          (if (unbound-marker-p value)
               ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
               (slot-makunbound object name)
               (setf (slot-value object name) value)))

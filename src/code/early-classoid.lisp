@@ -21,6 +21,7 @@
 ;;; is declared to hold a DEFSTRUCT-DESCRIPTION.
 (def!struct (defstruct-description
              (:conc-name dd-)
+             (:copier nil)
              #-sb-xc-host (:pure t)
              (:constructor make-defstruct-description (null-lexenv-p name)))
   ;; name of the structure
@@ -73,9 +74,13 @@
   ;; NIL if the option was given with no argument.
   (printer-fname nil :type (or cons symbol))
 
-  ;; the value of the :PURE option, or :UNSPECIFIED. This is only
-  ;; meaningful if DD-CLASS-P = T.
-  (pure :unspecified :type (member t nil :unspecified)))
+  ;; the value of the :PURE option, used by cheneygc when purifying.
+  ;; This is true if objects of this class are never modified to
+  ;; contain dynamic pointers in their slots or constant-like
+  ;; substructure (and hence can be copied into read-only space by
+  ;; PURIFY).
+  ;; This is only meaningful if DD-CLASS-P = T.
+  (pure nil :type (member t nil)))
 #!-sb-fluid (declaim (freeze-type defstruct-description))
 (!set-load-form-method defstruct-description (:host :xc :target))
 
@@ -85,7 +90,6 @@
 ;;; in order to guarantee that several hash values can be added without
 ;;; overflowing into a bignum.
 (defconstant layout-clos-hash-limit (1+ (ash sb!xc:most-positive-fixnum -3))
-  #!+sb-doc
   "the exclusive upper bound on LAYOUT-CLOS-HASH values")
 ;; This must be DEF!TYPE and not just DEFTYPE because access to slots
 ;; of a layout occur "before" the structure definition is made in the
@@ -94,6 +98,10 @@
 ;; so <type> had best be defined at that point.
 (def!type layout-clos-hash () `(integer 0 ,layout-clos-hash-limit))
 (declaim (ftype (sfunction () layout-clos-hash) random-layout-clos-hash))
+
+(defconstant +structure-layout-flag+  #b001)
+(defconstant +pcl-object-layout-flag+ #b010)
+(defconstant +condition-layout-flag+  #b100)
 
 ;;; The LAYOUT structure is pointed to by the first cell of instance
 ;;; (or structure) objects. It represents what we need to know for
@@ -107,7 +115,10 @@
 ;;; well, since the initialization of layout slots is hardcoded there.
 ;;;
 ;;; FIXME: ...it would be better to automate this, of course...
-(def!struct (layout)
+(def!struct (layout #-sb-xc-host (:constructor #!+immobile-space nil)
+                    (:copier nil))
+  ;; one +something-LAYOUT-FLAG+ bit or none of them
+  (%flags 0 :type fixnum :read-only nil)
   ;; a pseudo-random hash value for use by CLOS.
   (clos-hash (random-layout-clos-hash) :type layout-clos-hash)
   ;; the class that this is a layout for
@@ -140,17 +151,15 @@
   ;;      a depth when it isn't quite.
   (depthoid -1 :type layout-depthoid)
   ;; the number of top level descriptor cells in each instance
-  (length 0 :type index)
+  ;; For [FUNCALLABLE-]STANDARD-OBJECT instances, this is the slot vector
+  ;; length, not the primitive object length.
+  ;; I tried making a structure of this many slots, and the compiler blew up;
+  ;; so it's fair to say this limit is sufficient for practical purposes,
+  ;; Let's be consistent here between the two choices of word size.
+  (length 0 :type (unsigned-byte 28)) ; smaller than SB-INT:INDEX
   ;; If this layout has some kind of compiler meta-info, then this is
   ;; it. If a structure, then we store the DEFSTRUCT-DESCRIPTION here.
   (info nil :type (or null defstruct-description))
-  ;; This is true if objects of this class are never modified to
-  ;; contain dynamic pointers in their slots or constant-like
-  ;; substructure (and hence can be copied into read-only space by
-  ;; PURIFY).
-  ;;
-  ;; This slot is known to the C runtime support code.
-  (pure nil :type (member t nil 0))
   ;; Map of raw slot indices.
   (bitmap +layout-all-tagged+ :type layout-bitmap)
   ;; Per-slot comparator for implementing EQUALP.
@@ -163,18 +172,27 @@
   ;; Information about slots in the class to PCL: this provides fast
   ;; access to slot-definitions and locations by name, etc.
   ;; See MAKE-SLOT-TABLE in pcl/slots-boot.lisp for further details.
-  (slot-table #(1 nil) :type simple-vector)
-  ;; True IFF the layout belongs to a standand-instance or a
-  ;; standard-funcallable-instance.
-  ;; Old comment was:
-  ;;   FIXME: If we unify wrappers and layouts this can go away, since
-  ;;   it is only used in SB-PCL::EMIT-FETCH-WRAPPERS, which can then
-  ;;   use INSTANCE-SLOTS-LAYOUT instead (if there is are no slot
-  ;;   layouts, there are no slots for it to pull.)
-  ;; But while that's conceivable, it still seems advantageous to have
-  ;; a single bit that decides whether something is STANDARD-OBJECT.
-  (%for-std-class-b 0 :type bit :read-only t))
+  (slot-table #(1 nil) :type simple-vector))
 (declaim (freeze-type layout))
+
+#!+(and immobile-space (host-feature sb-xc))
+(macrolet ((def-layout-maker ()
+             (let ((slots (dd-slots (find-defstruct-description 'layout))))
+               `(defun make-layout
+                    (&key ,@(mapcar (lambda (s) `(,(dsd-name s) ,(dsd-default s)))
+                                    slots))
+                  (declare ,@(mapcar (lambda (s) `(type ,(dsd-type s) ,(dsd-name s)))
+                                     slots))
+                  ;; After calling into C, registers are trashed,
+                  ;; so we pass everything as a single vector,
+                  ;; and don't rely on Lisp to write the slots of the layout.
+                  (dx-let ((data (vector ,@(mapcar #'dsd-name slots))))
+                    (truly-the layout
+                     (values (%primitive sb!vm::alloc-immobile-layout data))))))))
+   (assert (<= (* sb!vm:n-word-bytes
+                 (1+ (dd-length (find-defstruct-description 'layout))))
+              sb!vm::layout-align))
+  (def-layout-maker))
 
 ;;; The CLASSOID structure is a supertype of all classoid types.  A
 ;;; CLASSOID is also a CTYPE structure as recognized by the type
@@ -185,6 +203,7 @@
              (:include ctype
                        (class-info (type-class-or-lose 'classoid)))
              (:constructor nil)
+             (:copier nil)
              #-no-ansi-print-object
              (:print-object
               (lambda (class stream)
@@ -228,6 +247,7 @@
 ;;; referenced layouts. Users should never see them.
 (def!struct (undefined-classoid
              (:include classoid)
+             (:copier nil)
              (:constructor make-undefined-classoid (name))))
 
 ;;; BUILT-IN-CLASS is used to represent the standard classes that
@@ -241,6 +261,7 @@
 ;;; system operations (union, subtypep, etc.) should never encounter
 ;;; translated classes, only their translation.
 (def!struct (built-in-classoid (:include classoid)
+                               (:copier nil)
                                (:constructor make-built-in-classoid))
   ;; the type we translate to on parsing. If NIL, then this class
   ;; stands on its own; or it can be set to :INITIALIZING for a period
@@ -248,6 +269,7 @@
   (translation nil :type (or ctype (member nil :initializing))))
 
 (def!struct (condition-classoid (:include classoid)
+                                (:copier nil)
                                 (:constructor make-condition-classoid))
   ;; list of CONDITION-SLOT structures for the direct slots of this
   ;; class
@@ -278,6 +300,7 @@
 ;;; We use an indirection to allow forward referencing of class
 ;;; definitions with load-time resolution.
 (def!struct (classoid-cell
+             (:copier nil)
              (:constructor make-classoid-cell (name &optional classoid))
              #-no-ansi-print-object
              (:print-object (lambda (s stream)
@@ -322,10 +345,12 @@
 ;;; side does not need to distinguish between STANDARD-CLASS and
 ;;; FUNCALLABLE-STANDARD-CLASS.
 (def!struct (standard-classoid (:include classoid)
+                               (:copier nil)
                                (:constructor make-standard-classoid)))
 ;;; a metaclass for classes which aren't standardlike but will never
 ;;; change either.
 (def!struct (static-classoid (:include classoid)
+                             (:copier nil)
                              (:constructor make-static-classoid)))
 
 (declaim (freeze-type built-in-classoid condition-classoid
@@ -337,8 +362,7 @@
 (define-info-type (:type :compiler-layout)
   :type-spec (or layout null)
   :default (lambda (name)
-             (let ((class (find-classoid name nil)))
-               (when class (classoid-layout class)))))
+             (awhen (find-classoid name nil) (classoid-layout it))))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 (defun ftype-from-fdefn (name)

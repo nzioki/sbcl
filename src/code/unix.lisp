@@ -91,7 +91,6 @@
 (defmacro with-restarted-syscall ((&optional (value (gensym))
                                              (errno (gensym)))
                                   syscall-form &rest body)
-  #!+sb-doc
   "Evaluate BODY with VALUE and ERRNO bound to the return values of
 SYSCALL-FORM. Repeat evaluation of SYSCALL-FORM if it is interrupted."
   `(let (,value ,errno)
@@ -112,7 +111,6 @@ SYSCALL-FORM. Repeat evaluation of SYSCALL-FORM if it is interrupted."
 
 #!-win32
 (define-alien-routine ("getenv" posix-getenv) c-string
-  #!+sb-doc
   "Return the \"value\" part of the environment string \"name=value\" which
 corresponds to NAME, or NIL if there is none."
   (name (c-string :not-null t)))
@@ -275,7 +273,6 @@ corresponds to NAME, or NIL if there is none."
   #!+win32 (sb!win32::windows-isatty fd))
 
 (defun unix-lseek (fd offset whence)
-  #!+sb-doc
   "Unix-lseek accepts a file descriptor and moves the file pointer by
    OFFSET octets.  Whence can be any of the following:
 
@@ -315,6 +312,10 @@ corresponds to NAME, or NIL if there is none."
 ;;; associated with fd from the buffer starting at offset. It returns
 ;;; the actual number of bytes written.
 (defun unix-write (fd buf offset len)
+  ;; KLUDGE: change 60fa88b187e438cc made this function unusable in cold-init
+  ;; if compiled with #!+sb-show (which increases DEBUG to 2) because of
+  ;; full calls to SB-ALIEN-INTERNALS:DEPORT-ALLOC and DEPORT.
+  (declare (optimize (debug 1)))
   (declare (type unix-fd fd)
            (type (unsigned-byte 32) offset len))
   (flet ((%write (sap)
@@ -427,7 +428,6 @@ corresponds to NAME, or NIL if there is none."
 (deftype exit-code ()
   `(signed-byte 32))
 (defun os-exit (code &key abort)
-  #!+sb-doc
   "Exit the process with CODE. If ABORT is true, exit is performed using _exit(2),
 avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
   (unless (typep code 'exit-code)
@@ -903,27 +903,20 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 #!-win32
 (defun fd-type (fd)
   (declare (type unix-fd fd))
-  (let ((fmt (logand
-              s-ifmt
-              (or (with-alien ((buf (struct wrapped_stat)))
+  (let ((mode (or (with-alien ((buf (struct wrapped_stat)))
                     (syscall ("fstat_wrapper" int (* (struct wrapped_stat)))
                              (slot buf 'st-mode)
                              fd (addr buf)))
-                  0))))
-    (cond ((logtest s-ififo fmt)
-           :fifo)
-          ((logtest s-ifchr fmt)
-           :character)
-          ((logtest s-ifdir fmt)
-           :directory)
-          ((logtest s-ifblk fmt)
-           :block)
-          ((logtest s-ifreg fmt)
-           :regular)
-          ((logtest s-ifsock fmt)
-           :socket)
-          (t
-           :unknown))))
+                  0)))
+    (case (logand mode s-ifmt)
+      (#.s-ifchr :character)
+      (#.s-ifdir :directory)
+      (#.s-ifblk :block)
+      (#.s-ifreg :regular)
+      (#.s-ifsock :socket)
+      (#.s-iflnk :link)
+      (#.s-ififo :fifo)
+      (t :unknown))))
 
 ;;;; time.h
 
@@ -944,54 +937,26 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 (define-alien-routine get-timezone int
   (when time-t)
-  (daylight-savings-p boolean :out))
-
-#!-(or win32 darwin)
+  ;; KLUDGE: the runtime `boolean' is defined as `int', but the alien
+  ;; type is N-WORD-BITS wide.
+  (daylight-savings-p (boolean 32) :out))
+#!-win32
 (defun nanosleep (secs nsecs)
-  (declare (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
-  (with-alien ((req (struct timespec))
-               (rem (struct timespec)))
-    (setf (slot req 'tv-sec) secs
-          (slot req 'tv-nsec) nsecs)
-    (loop while (and (eql eintr
-                          (nth-value 1
-                                     (int-syscall ("sb_nanosleep" (* (struct timespec))
-                                                                  (* (struct timespec)))
-                                                  (addr req) (addr rem))))
-                     ;; KLUDGE: On Darwin, if an interrupt cases nanosleep to
-                     ;; take longer than the requested time, the call will
-                     ;; return with EINT and (unsigned)-1 seconds in the
-                     ;; remainder timespec, which would cause us to enter
-                     ;; nanosleep again for ~136 years. So, we check that the
-                     ;; remainder time is actually decreasing.
-                     ;;
-                     ;; It would be neat to do this bit of defensive
-                     ;; programming on all platforms, but unfortunately on
-                     ;; Linux, REM can be a little higher than REQ if the
-                     ;; nanosleep() call is interrupted quickly enough,
-                     ;; probably due to the request being rounded up to the
-                     ;; nearest HZ. This would cause the sleep to return way
-                     ;; too early.
-                     #!+darwin
-                     (let ((rem-sec (slot rem 'tv-sec))
-                           (rem-nsec (slot rem 'tv-nsec)))
-                       (when (or (> secs rem-sec)
-                                 (and (= secs rem-sec) (>= nsecs rem-nsec)))
-                         ;; Update for next round.
-                         (setf secs  rem-sec
-                               nsecs rem-nsec)
-                         t)))
-          do (setf (slot req 'tv-sec) (slot rem 'tv-sec)
-                   (slot req 'tv-nsec) (slot rem 'tv-nsec)))))
+  (alien-funcall (extern-alien "sb_nanosleep" (function int time-t int))
+                 secs nsecs)
+  nil)
 
-;;; nanosleep() is not re-entrant on some versions of Darwin,
-;;; this reimplements it using the underlying syscalls.
-;;; It uses a different interface to avoid copying code with a
-;;; different license.
-#!+darwin
-(defun nanosleep (secs nsecs)
-  (declare (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
-  (int-syscall ("sb_nanosleep" time-t int) secs nsecs))
+#!-win32
+(defun nanosleep-double (seconds)
+  (alien-funcall (extern-alien "sb_nanosleep_double" (function (values) double))
+                 seconds)
+  nil)
+
+#!-win32
+(defun nanosleep-float (seconds)
+  (alien-funcall (extern-alien "sb_nanosleep_float" (function (values) float))
+                 seconds)
+  nil)
 
 ;;;; sys/time.h
 
@@ -1016,7 +981,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 #!-win32
 (defun unix-getitimer (which)
-  #!+sb-doc
   "UNIX-GETITIMER returns the INTERVAL and VALUE slots of one of
    three system timers (:real :virtual or :profile). On success,
    unix-getitimer returns 5 values,
@@ -1040,7 +1004,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 #!-win32
 (defun unix-setitimer (which int-secs int-usec val-secs val-usec)
-  #!+sb-doc
   "UNIX-SETITIMER sets the INTERVAL and VALUE slots of one of
    three system timers (:real :virtual or :profile). A SIGALRM signal
    will be delivered VALUE <seconds+microseconds> from now. INTERVAL,
@@ -1091,7 +1054,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
   #!-sb-fluid (declaim (inline get-time-of-day))
   (defun get-time-of-day ()
-    #!+sb-doc
     "Return the number of seconds and microseconds since the beginning of
 the UNIX epoch (January 1st 1970.)"
     #!+(or darwin netbsd)

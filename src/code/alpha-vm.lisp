@@ -11,20 +11,18 @@
 
 (in-package "SB!VM")
 
-;;; See x86-vm.lisp for a description of this.
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Return a string describing the type of the local machine."
   "Alpha")
 
-(defun fixup-code-object (code offset value kind)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset value kind &optional flavor)
+  (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (without-gcing
-   (let ((sap (%primitive code-instructions code)))
+   (let ((sap (code-instructions code)))
      (ecase kind
        (:jmp-hint
         (aver (zerop (ldb (byte 2 0) value)))
@@ -51,7 +49,7 @@
         (setf (sap-ref-8 sap offset) (ldb (byte 8 0) value))
         (setf (sap-ref-8 sap (1+ offset)) (ldb (byte 8 8) value)))
        (:absolute32
-        (setf (sap-ref-32 sap offset) value))))))
+        (setf (sap-ref-32 sap offset) value)))))))
 
 ;;;; "sigcontext" access functions, cut & pasted from x86-vm.lisp then
 ;;;; hacked for types.
@@ -67,31 +65,7 @@
 ;;;;
 ;;;; See also x86-vm for commentary on signed vs unsigned.
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-long)
-  (context (* os-context-t)))
-
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (deref (context-pc-addr context))))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-long)
-  (context (* os-context-t))
-  (index int))
-
-;;; FIXME: Should this and CONTEXT-PC be INLINE to reduce consing?
-;;; (Are they used in anything time-critical, or just the debugger?)
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (the (alien (* unsigned-long))
-           (context-register-addr context index))))
-
-(defun %set-context-register (context index new)
-  (declare (type (alien (* os-context-t)) context))
-  (setf (deref (the (alien (* unsigned-long))
-                 (context-register-addr context index)))
-        new))
-
+#-sb-xc-host (progn
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
@@ -142,4 +116,4 @@
     (declare (type system-area-pointer pc))
     (values error-number
             (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
-
+) ; end PROGN

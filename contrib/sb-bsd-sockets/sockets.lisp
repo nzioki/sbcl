@@ -119,13 +119,17 @@ directly instantiated.")))
 
 (defmethod socket-peername ((socket socket))
   (with-socket-fd-and-addr (fd sockaddr size) socket
-    (socket-error-case ("getpeername" (sockint::getpeername fd sockaddr size))
-        (bits-of-sockaddr socket sockaddr))))
+    (socket-error-case ("getpeername"
+                        (sockint::getpeername fd sockaddr size)
+                        (result actual-size))
+        (bits-of-sockaddr socket sockaddr actual-size))))
 
 (defmethod socket-name ((socket socket))
   (with-socket-fd-and-addr (fd sockaddr size) socket
-    (socket-error-case ("getsockname" (sockint::getsockname fd sockaddr size))
-        (bits-of-sockaddr socket sockaddr))))
+    (socket-error-case ("getsockname"
+                        (sockint::getsockname fd sockaddr size)
+                       (result actual-size))
+        (bits-of-sockaddr socket sockaddr actual-size))))
 
 ;;; There are a whole bunch of interesting things you can do with a
 ;;; socket that don't really map onto "do stream io", especially in
@@ -389,7 +393,11 @@ request an input stream and get an output stream in response\)."
   (or (cdr (assoc err *conditions-for-errno* :test #'eql)) 'socket-error))
 
 (defun socket-error (where &optional (errno (socket-errno)))
-  ;; FIXME: Our Texinfo documentation extractor needs at least this to
-  ;; spit out the signature. Real documentation would be better...
-  ""
+  "Signal an appropriate error for syscall WHERE and ERRNO.
+
+WHERE should be a string naming the failed function.
+
+When supplied, ERRNO should be the UNIX error number associated to the
+failed call. The default behavior is to use the current value of the
+errno variable."
   (error (condition-for-errno errno) :errno errno :syscall where))

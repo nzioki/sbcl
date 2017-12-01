@@ -14,12 +14,12 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(*condition-name-vec* conditional-opcode
+  (import '(conditional-opcode
             add-sub-immediate-p fixnum-add-sub-immediate-p
             negative-add-sub-immediate-p
             encode-logical-immediate fixnum-encode-logical-immediate
             ldr-str-offset-encodable ldp-stp-offset-p
-            bic-mask extend lsl lsr asr ror @) 'sb!vm)
+            bic-mask extend lsl lsr asr ror @) "SB!VM")
   ;; Imports from SB-VM into this package
   (import '(sb!vm::*register-names*
             sb!vm::add-sub-immediate
@@ -30,7 +30,7 @@
 (setf *disassem-inst-alignment-bytes* 4)
 
 
-(defparameter *conditions*
+(defconstant-eqx +conditions+
   '((:eq . 0)
     (:ne . 1)
     (:cs . 2) (:hs . 2)
@@ -45,14 +45,15 @@
     (:lt . 11)
     (:gt . 12)
     (:le . 13)
-    (:al . 14)))
+    (:al . 14))
+  #'equal)
 
-(defparameter *condition-name-vec*
-  (let ((vec (make-array 16 :initial-element nil)))
-    (dolist (cond *conditions*)
-      (when (null (aref vec (cdr cond)))
-        (setf (aref vec (cdr cond)) (car cond))))
-    vec))
+(defconstant-eqx sb!vm::+condition-name-vec+
+  #.(let ((vec (make-array 16 :initial-element nil)))
+      (dolist (cond +conditions+ vec)
+        (when (null (aref vec (cdr cond)))
+          (setf (aref vec (cdr cond)) (car cond)))))
+  #'equalp)
 
 ;;; Set assembler parameters. (In CMU CL, this was done with
 ;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
@@ -60,304 +61,13 @@
   (setf *assem-scheduler-p* nil))
 
 (defun conditional-opcode (condition)
-  (cdr (assoc condition *conditions* :test #'eq)))
+  (cdr (assoc condition +conditions+ :test #'eq)))
 
 (defun invert-condition (condition)
-  (aref *condition-name-vec*
+  (aref sb!vm::+condition-name-vec+
         (logxor 1 (conditional-opcode condition))))
 
 ;;;; disassembler field definitions
-
-(defun current-instruction (dstate &optional (offset 0))
-  (sap-ref-int (dstate-segment-sap dstate)
-               (+ (dstate-cur-offs dstate) offset)
-               n-word-bytes
-               (dstate-byte-order dstate)))
-
-(defun 32-bit-register-p (dstate)
-  (not (logbitp 31 (current-instruction dstate))))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun print-shift (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (kind amount) value
-      (when (plusp amount)
-        (princ ", " stream)
-        (princ (ecase kind
-                 (#b00 "LSL")
-                 (#b01 "LSR")
-                 (#b10 "ASR")
-                 (#b11 "ROR"))
-               stream)
-        (format stream " #~d" amount))))
-
-  (defun print-wide-shift (value stream dstate)
-    (declare (ignore dstate))
-    (when (plusp value)
-      (format stream ", LSL #~d" (* value 16))))
-
-  (defun print-2-bit-shift (value stream dstate)
-    (declare (ignore dstate))
-    (when (= value 1)
-      (princ ", LSL #12" stream)))
-
-  (defun print-extend (value stream dstate)
-    (destructuring-bind (kind amount) value
-      (let* ((inst (current-instruction dstate))
-             (rd (ldb (byte 5 0) inst))
-             (rn (ldb (byte 5 5) inst)))
-        (princ ", " stream)
-        (princ (if (and (= kind #b011)
-                        (or (= rd nsp-offset)
-                            (= rn nsp-offset)))
-                   "LSL"
-                   (ecase kind
-                     (#b000 "UXTB")
-                     (#b001 "UXTH")
-                     (#b010 "UXTW")
-                     (#b011 "UXTX")
-                     (#b100 "SXTB")
-                     (#b101 "SXTH")
-                     (#b110 "SXTW")
-                     (#b111 "SXTX")))
-               stream))
-      (when (plusp amount)
-        (format stream " #~d" amount))))
-
-  (defun print-ldr-str-extend (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (kind amount) value
-      (unless (and (= kind #b011)
-                   (zerop amount))
-        (princ ", " stream)
-        (princ (ecase kind
-                 (#b010 "UXTW")
-                 (#b011 "LSL")
-                 (#b110 "SXTW")
-                 (#b111 "SXTX"))
-               stream))
-      (when (plusp amount)
-        (princ " #3" stream))))
-
-  (defun print-immediate (value stream dstate)
-    (declare (ignore dstate))
-    (format stream "#~D" value))
-
-  (defun print-test-branch-immediate (value stream dstate)
-    (declare (ignore dstate))
-    (format stream "#~D"
-            (dpb (car value) (byte 1 5) (car value))))
-
-  (defun decode-scaled-immediate (value)
-    (destructuring-bind (size opc value simd) value
-      (if (= simd 1)
-          (ash value (logior (ash opc 2) size))
-          (ash value size))))
-
-  (defun print-scaled-immediate (value stream dstate)
-    (declare (ignore dstate))
-    (format stream "#~D" (if (consp value)
-                             (decode-scaled-immediate value)
-                             (ash value 3))))
-
-  (defun print-logical-immediate (value stream dstate)
-    (declare (ignore dstate))
-    (format stream "#~D" (apply #'decode-logical-immediate value)))
-
-  (defun print-imm-writeback (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (imm mode) value
-      (let ((imm (sign-extend imm 9)))
-        (if (zerop imm)
-            (princ "]" stream)
-            (ecase mode
-              (#b00
-               (format stream ", #~D]" imm))
-              (#b01
-               (format stream "], #~D" imm))
-              (#b11
-               (format stream ", #~D]!" imm)))))))
-
-  (defun decode-pair-scaled-immediate (opc value simd)
-    (ash (sign-extend value 7)
-         (+ 2 (ash opc (- (logxor 1 simd))))))
-
-  (defun print-pair-imm-writeback (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (mode &rest imm) value
-      (let ((imm (apply #'decode-pair-scaled-immediate imm)))
-        (if (zerop imm)
-            (princ "]" stream)
-            (ecase mode
-              (#b01
-               (format stream "], #~D" imm))
-              (#b10
-               (format stream ", #~D]" imm))
-              (#b11
-               (format stream ", #~D]!" imm)))))))
-
-  (defun print-w-reg (value stream dstate)
-    (declare (ignore dstate))
-    (princ "W" stream)
-    (princ (aref *register-names* value) stream))
-
-  (defun print-x-reg (value stream dstate)
-    (declare (ignore dstate))
-    (princ (aref *register-names* value) stream))
-
-  (defun print-reg (value stream dstate)
-    (when (32-bit-register-p dstate)
-      (princ "W" stream))
-    (princ (aref *register-names* value) stream))
-
-  (defun print-x-reg-sp (value stream dstate)
-    (declare (ignore dstate))
-    (if (= value nsp-offset)
-        (princ "NSP" stream)
-        (princ (aref *register-names* value) stream)))
-
-  (defun print-reg-sp (value stream dstate)
-    (when (32-bit-register-p dstate)
-      (princ "W" stream))
-    (if (= value nsp-offset)
-        (princ "NSP" stream)
-        (princ (aref *register-names* value) stream)))
-
-  (defun print-reg-float-reg (value stream dstate)
-    (let* ((inst (current-instruction dstate))
-           (v (ldb (byte 1 26) inst)))
-      (if (= (length value) 3)
-          (destructuring-bind (size opc reg) value
-            (cond ((zerop v)
-                   (when (= size #b10)
-                     (princ "W" stream))
-                   (princ (svref *register-names* reg) stream))
-                  (t
-                   (format stream "~a~d"
-                           (cond ((and (= size #b10)
-                                       (= opc #b0))
-                                  "S")
-                                 ((and (= size #b11)
-                                       (= opc #b0))
-                                  "D")
-                                 ((and (= size #b00)
-                                       (= opc #b1))
-                                  "Q"))
-                           reg))))
-          (destructuring-bind (size reg) value
-            (cond ((zerop v)
-                   (when (zerop size)
-                     (princ "W" stream))
-                   (princ (svref *register-names* reg) stream))
-                  (t
-                   (format stream "~a~d"
-                           (case size
-                             (#b00 "S")
-                             (#b01 "D")
-                             (#b10 "Q"))
-                           reg)))))))
-
-  (defun print-float-reg (value stream dstate)
-    (multiple-value-bind (type value)
-        (if (consp value)
-            (values (car value) (cadr value))
-            (values (ldb (byte 1 22) (current-instruction dstate))
-                    value))
-      (format stream "~a~d"
-              (if (= type 1)
-                  "D"
-                  "S")
-              value)))
-
-  (defun print-simd-reg (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (size offset) value
-      (format stream "V~d.~a" offset
-              (if (zerop size)
-                  "8B"
-                  "16B"))))
-
-  (defun lowest-set-bit-index (integer-value)
-    (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
-
-  (defun print-simd-copy-reg (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (offset imm5 &optional imm4) value
-      (let ((index (lowest-set-bit-index imm5)))
-       (format stream "V~d.~a[~a]" offset
-               (char "BHSD" index)
-               (if imm4
-                   (ash imm4 (- index))
-                   (ash imm5 (- (1+ index))))))))
-
-  (defun print-sys-reg (value stream dstate)
-    (declare (ignore dstate))
-    (princ (decode-sys-reg value) stream))
-
-  (defun print-cond (value stream dstate)
-    (declare (ignore dstate))
-    (princ (svref *condition-name-vec* value) stream))
-
-  (defun use-label (value dstate)
-    (let ((value (if (consp value)
-                     (logior (ldb (byte 2 0) (car value))
-                             (ash (cadr value) 2))
-                     (ash value 2))))
-      (+ value (dstate-cur-addr dstate))))
-
-
-  (defun annotate-ldr-str (register offset dstate)
-    (case register
-      (#.sb!vm::code-offset
-       (note-code-constant offset dstate))
-      (#.sb!vm::null-offset
-       (let ((offset (+ sb!vm::nil-value offset)))
-         (maybe-note-assembler-routine offset nil dstate)
-         (maybe-note-static-symbol (logior offset other-pointer-lowtag)
-                                                dstate)))
-      #!+sb-thread
-      (#.sb!vm::thread-offset
-       (let* ((thread-slots
-               (load-time-value
-                (primitive-object-slots
-                 (find 'sb!vm::thread *primitive-objects*
-                       :key #'primitive-object-name)) t))
-              (slot (find (ash offset (- word-shift)) thread-slots
-                          :key #'slot-offset)))
-         (when slot
-           (note (lambda (stream)
-                   (format stream "thread.~(~A~)" (slot-name slot)))
-                 dstate))))))
-
-  (defun find-value-from-previos-inst (register dstate)
-    ;; Needs to be MOVZ REGISTER, imm, LSL #0
-    ;; Should cover most offsets in sane code
-    (let ((inst (current-instruction dstate -4)))
-      (when (and (= (ldb (byte 9 23) inst) #b110100101) ;; MOVZ
-                 (= (ldb (byte 5 0) inst) register)
-                 (= (ldb (byte 2 21) inst) 0)) ;; LSL #0
-        (ldb (byte 16 5) inst))))
-
-  (defun annotate-ldr-str-reg (value stream dstate)
-    (declare (ignore stream))
-    (let* ((inst (current-instruction dstate))
-           (float (ldb-test (byte 1 26) inst)))
-      (unless float
-        (let ((value (find-value-from-previos-inst value dstate)))
-          (when value
-            (annotate-ldr-str (ldb (byte 5 5) inst) value dstate))))))
-
-  (defun annotate-ldr-str-imm (value stream dstate)
-    (declare (ignore stream))
-    (let* ((inst (current-instruction dstate))
-           (float-reg (ldb-test (byte 1 26) inst)))
-      (unless float-reg
-        (annotate-ldr-str (ldb (byte 5 5) inst)
-                          (if (consp value)
-                              (decode-scaled-immediate value)
-                              value)
-                          dstate)))))
-
 
 (progn
 
@@ -412,55 +122,6 @@
   (define-arg-type ldr-str-reg-annotation :printer #'annotate-ldr-str-reg)
 
   (define-arg-type label :sign-extend t :use-label #'use-label))
-
-;;;; special magic to support decoding internal-error and related traps
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((inst (sap-ref-32 sap (- offset 4)))
-         (error-number (ldb (byte 8 13) inst))
-         (length (sb!kernel::error-length error-number))
-         (index offset))
-    (declare (type sb!sys:system-area-pointer sap)
-             (type (unsigned-byte 8) length))
-    (cond (length-only
-           (loop repeat length do (sb!c::sap-read-var-integerf sap index))
-           (values 0 (- index offset) nil nil))
-          (t
-           (collect ((sc-offsets)
-                     (lengths))
-             (loop repeat length do
-                  (let ((old-index index))
-                    (sc-offsets (sb!c::sap-read-var-integerf sap index))
-                    (lengths (- index old-index))))
-             (values error-number
-                     (- index offset)
-                     (sc-offsets)
-                     (lengths)))))))
-
-(defun brk-control (chunk inst stream dstate)
-  (declare (ignore inst chunk))
-  (let ((code (ldb (byte 8 5) (current-instruction dstate))))
-    (flet ((nt (x) (if stream (note x dstate))))
-      (case code
-        (#.halt-trap
-         (nt "Halt trap"))
-        (#.pending-interrupt-trap
-         (nt "Pending interrupt trap"))
-        (#.error-trap
-         (nt "Error trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
-        (#.cerror-trap
-         (nt "Cerror trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
-        (#.breakpoint-trap
-         (nt "Breakpoint trap"))
-        (#.fun-end-breakpoint-trap
-         (nt "Function end breakpoint trap"))
-        (#.single-step-around-trap
-         (nt "Single step around trap"))
-        (#.single-step-before-trap
-         (nt "Single step before trap"))
-        (#.invalid-arg-count-trap
-         (nt "Invalid argument count trap"))))))
 
 ;;;; primitive emitters
 
@@ -526,11 +187,11 @@
 
 (define-instruction simple-fun-header-word (segment)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 ;;;; Addressing mode 1 support
 
@@ -590,7 +251,10 @@
   (operand 0 :type (integer 0 63)))
 
 (define-condition cannot-encode-immediate-operand (error)
-  ((value :initarg :value)))
+  ((value :initarg :value))
+  (:report
+   (lambda (condition stream)
+     (format stream "Cannot encode ~S" (slot-value condition 'value)))))
 
 (defun encode-shifted-register (operand)
   (etypecase operand
@@ -771,7 +435,7 @@
 
 (define-instruction-format
     (add-sub-ext-reg 32
-     :default-printer '(:name :tab rd ", " rn ", " extend)
+     :default-printer '(:name :tab rd ", " rn ", " rm extend)
      :include add-sub)
   (op2 :field (byte 8 21) :value #b01011001)
   (extend :fields (list (byte 3 13) (byte 3 10)) :type 'extend)
@@ -881,7 +545,7 @@
   (:printer add-sub-imm ((op #b11) (rd #b11111))
             '('cmp :tab rn ", " imm shift))
   (:printer add-sub-ext-reg ((op #b11) (rd #b11111))
-            '('cmp :tab rn ", " extend))
+            '('cmp :tab rn ", " rm extend))
   (:printer add-sub-shift-reg ((op #b11) (rd #b11111))
             '('cmp :tab rn ", " rm shift))
   (:printer add-sub-shift-reg ((op #b11) (rn #b11111))
@@ -1201,24 +865,6 @@
   (:emitter
    (emit-bitfield segment +64-bit-size+ 1 +64-bit-size+
                   immr imms (tn-offset rn) (tn-offset rd))))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun print-lsl-alias-name (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (immr imms) value
-      (princ (if (and (/= imms 63)
-                      (= (1+ imms) immr))
-                 'lsl
-                 'ubfm)
-             stream)))
-
-  (defun print-lsl-alias (value stream dstate)
-    (declare (ignore dstate))
-    (destructuring-bind (immr imms) value
-      (if (and (/= imms 63)
-               (= (1+ imms) immr))
-          (format stream "#~d" (- 63 imms))
-          (format stream "#~d, #~d" immr imms)))))
 
 (define-instruction ubfm (segment rd rn immr imms)
   (:printer bitfield ((op #b10) (imms #b111111))
@@ -2246,14 +1892,6 @@
       (:oshst . #b0010)
       (:oshld . #b0001)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun print-mem-bar-kind (value stream dstate)
-    (declare (ignore dstate))
-    (let ((kind (car (rassoc value **mem-bar-kinds**))))
-      (if kind
-          (princ kind stream)
-          (format stream "#~d" value)))))
-
 (defmacro def-mem-bar (name op)
   `(define-instruction ,name (segment &optional (kind :sy))
      (:printer system ((op ,op))
@@ -2640,7 +2278,7 @@
                                  (tn-offset dest))))
            (multi-instruction-maybe-shrink (segment posn magic-value)
              (when (typep (funcall compute-delta posn magic-value)
-                          '(signed-byte 19))
+                          '(signed-byte 21))
                (emit-back-patch segment 4
                                 #'one-instruction-emitter)
                t)))
@@ -2702,7 +2340,7 @@
                                 (tn-offset dest)))
             (multi-instruction-maybe-shrink (segment posn magic-value)
               (let ((delta (compute-delta posn magic-value)))
-                (when (typep delta '(signed-byte 19))
+                (when (typep delta '(signed-byte 21))
                   (emit-back-patch segment 4
                                    #'one-instruction-emitter)
                   t))))

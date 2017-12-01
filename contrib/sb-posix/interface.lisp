@@ -137,15 +137,15 @@
                        (open-with-mode pathname flags mode)
                        (open-without-mode pathname flags))))))
     (def #-win32 "open" #+win32 "_open"))
-(define-call* "read" int minusp
-    (fd file-descriptor) (buf (* t)) (count int))
 (define-call "rename" int minusp (oldpath filename) (newpath filename))
 (define-call* "rmdir" int minusp (pathname filename))
 (define-call* "unlink" int minusp (pathname filename))
 (define-call #-netbsd "opendir" #+netbsd "_opendir"
     (* t) null-alien (pathname filename))
-(define-call* "write" int minusp
-  (fd file-descriptor) (buf (* t)) (count int))
+(define-call* "read" ssize-t minusp
+    (fd file-descriptor) (buf (* t)) (count size-t))
+(define-call* "write" ssize-t minusp
+  (fd file-descriptor) (buf (* t)) (count size-t))
 
 ;;; FIXME: to detect errors in readdir errno needs to be set to 0 and
 ;;; then checked, like it's done in sb-unix:readdir.
@@ -334,8 +334,8 @@
 
   ;; FIXME this is a lie, of course this can fail, but there's no
   ;; error handling here yet!
-  #+mach-exception-handler
-  (define-call "setup_mach_exceptions" void never-fails)
+  #+darwin
+  (define-call "darwin_reinit" void never-fails)
   (define-call ("posix_fork" :c-name "fork") pid-t minusp)
   (defun fork ()
     "Forks the current process, returning 0 in the new process and the PID of
@@ -346,9 +346,9 @@ not supported."
          (when (cdr sb-thread::*all-threads*)
            (go :error))
          (let ((pid (posix-fork)))
-           #+mach-exception-handler
+           #+darwin
            (when (= pid 0)
-             (setup-mach-exceptions))
+             (darwin-reinit))
            (return-from fork pid)))
      :error
        (error "Cannot fork with multiple threads running.")))
@@ -457,7 +457,6 @@ not supported."
  (define-call "wtermsig" int never-fails (status int))
  (define-call "wifstopped" boolean never-fails (status int))
  (define-call "wstopsig" int never-fails (status int))
- #+nil ; see alien/waitpid-macros.c
  (define-call "wifcontinued" boolean never-fails (status int)))
 
 ;;; mmap, msync

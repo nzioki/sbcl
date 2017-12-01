@@ -14,9 +14,7 @@
 ;;;; unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -52,6 +50,13 @@
 (define-vop (fast-negate/unsigned signed-unop)
   (:args (x :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
+  (:translate %negate)
+  (:generator 3
+    (inst neg res x)))
+
+(define-vop (fast-negate/signed-unsigned signed-unop)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
   (:translate %negate)
   (:generator 3
     (inst neg res x)))
@@ -374,8 +379,10 @@
            (if (plusp amount)
                (inst lsl result number amount)
                (inst asr result number (- amount))))
+          ((= amount 64)
+           (inst mov result 0))
           (t
-           (inst mov result 0)))))
+           (inst asr result number 63)))))
 
 (define-vop (fast-ash/signed/unsigned)
   (:note "inline ASH")
@@ -386,13 +393,14 @@
   (:temporary (:sc non-descriptor-reg) temp)
   (:variant-vars variant)
   (:generator 5
-    (move temp amount)
-    (inst cmp temp 0)
+    (inst subs temp amount zr-tn)
     (inst b :ge LEFT)
     (inst neg temp temp)
     (inst cmp temp n-word-bits)
-    (inst b :lt DO)
-    (inst mov temp (1- n-word-bits))
+    ;; Only the first 6 bits count for shifts.
+    ;; This sets all bits to 1 if AMOUNT is larger than 63,
+    ;; cutting the amount to 63.
+    (inst csinv temp temp zr-tn :lt)
     DO
     (ecase variant
       (:signed (inst asr result number temp))
@@ -400,10 +408,8 @@
     (inst b END)
     LEFT
     (inst cmp temp n-word-bits)
-    (inst b :lt DO2)
-    (inst mov temp (1- n-word-bits))
-    DO2
-    (inst lsl result number temp)
+    (inst csel result number zr-tn :lt)
+    (inst lsl result result temp)
     END))
 
 (define-vop (fast-ash/signed=>signed fast-ash/signed/unsigned)
@@ -437,16 +443,16 @@
                 (:result-types ,type)
                 (:policy :fast-safe)
                 (:generator ,cost
-                  (let ((amount (cond (cut
-                                       (inst cmp amount n-word-bits)
-                                       ;; Only the first 6 bits count for shifts.
-                                       ;; This sets all bits to 1 if AMOUNT is larger than 63,
-                                       ;; cutting the amount to 63.
-                                       (inst csinv tmp-tn amount zr-tn :lt)
-                                       tmp-tn)
-                                      (t
-                                       amount))))
-                    (inst lsl result number amount))))))
+                  (cond (cut
+                         (inst cmp amount n-word-bits)
+                         (cond ((location= amount result)
+                                (inst csel tmp-tn number zr-tn :lt)
+                                (inst lsl result tmp-tn amount))
+                               (t
+                                (inst csel result number zr-tn :lt)
+                                (inst lsl result result amount))))
+                        (t
+                         (inst lsl result number amount)))))))
   ;; FIXME: There's the opportunity for a sneaky optimization here, I
   ;; think: a FAST-ASH-LEFT-C/FIXNUM=>SIGNED vop.  -- CSR, 2003-09-03
   (def fast-ash-left/fixnum=>fixnum any-reg tagged-num any-reg 2)
@@ -552,10 +558,23 @@
   (:result-types positive-fixnum)
   (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) temp)
   (:generator 30
-    (move temp arg)
-    (inst cmp temp 0)
-    (inst csinv temp temp temp :ge)
+    (inst cmp arg 0)
+    (inst csinv temp arg arg :ge)
     (inst clz temp temp)
+    (inst mov res (fixnumize 64))
+    (inst sub res res (lsl temp n-fixnum-tag-bits))))
+
+(define-vop (unsigned-byte-64-len)
+  (:translate integer-length)
+  (:note "inline (unsigned-byte 64) integer-length")
+  (:policy :fast-safe)
+  (:args (arg :scs (unsigned-reg) :target temp))
+  (:arg-types unsigned-num)
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) temp)
+  (:generator 29
+    (inst clz temp arg)
     (inst mov res (fixnumize 64))
     (inst sub res res (lsl temp n-fixnum-tag-bits))))
 
@@ -570,11 +589,15 @@
   (:temporary (:scs (non-descriptor-reg) :from (:argument 0) :to (:result 0)
                     :target res) num)
   (:temporary (:scs (non-descriptor-reg)) mask temp)
+  (:variant-vars signed)
   (:generator 30
-    (move num arg)
+    (when signed
+      (inst cmp arg 0)
+      (inst csinv num arg arg :ge)
+      (setf arg num))
     (load-immediate-word mask #x5555555555555555)
-    (inst and temp mask (lsr num 1))
-    (inst and num num mask)
+    (inst and temp mask (lsr arg 1))
+    (inst and num arg mask)
     (inst add num num temp)
     (load-immediate-word mask #x3333333333333333)
     (inst and temp mask (lsr num 2))
@@ -588,6 +611,13 @@
     (inst add num num (lsr num 16))
     (inst add num num (lsr num 32))
     (inst and res num #xff)))
+
+(define-vop (signed-byte-64-count unsigned-byte-64-count)
+  (:note "inline (signed-byte 64) logcount")
+  (:args (arg :scs (signed-reg) :target num))
+  (:arg-types signed-num)
+  (:variant t)
+  (:variant-cost 29))
 
 (defknown %%ldb (integer unsigned-byte unsigned-byte) unsigned-byte
   (movable foldable flushable always-translatable))
@@ -599,7 +629,7 @@
 (defun %%ldb (integer size posn)
   (%ldb size posn integer))
 
-(defun %%dpb (newbyte integer size posn)
+(defun %%dpb (newbyte size posn integer)
   (%dpb newbyte size posn integer))
 
 (define-vop (ldb-c/fixnum)
@@ -654,7 +684,9 @@
   (:policy :fast-safe)
   (:generator 3
     (move res y)
-    (inst bfm res x (- n-word-bits posn) (1- size))))
+    (inst bfm res x (if (= posn 0)
+                        0
+                        (- n-word-bits posn)) (1- size))))
 
 (define-vop (dpb-c/unsigned)
   (:translate %%dpb)
@@ -669,7 +701,9 @@
   (:policy :fast-safe)
   (:generator 3
     (move res y)
-    (inst bfm res x (- n-word-bits posn) (1- size))))
+    (inst bfm res x (if (= posn 0)
+                        0
+                        (- n-word-bits posn)) (1- size))))
 
 ;;; Modular functions
 (define-modular-fun lognot-mod64 (x) lognot :untagged nil 64)
@@ -731,8 +765,6 @@
 
 (define-vop (fast-conditional)
   (:conditional :eq)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -878,21 +910,22 @@
 (define-vop (fast-logbitp-c/fixnum fast-conditional-c/fixnum)
   (:translate %logbitp)
   (:conditional :ne)
-  (:arg-types tagged-num (:constant (integer 0 63)))
+  (:arg-types tagged-num (:constant (mod #.n-word-bits)))
   (:generator 4
-    (inst tst x (ash 1 (+ y n-fixnum-tag-bits)))))
+    (inst tst x (ash 1 (min (+ y n-fixnum-tag-bits)
+                            (1- n-word-bits))))))
 
 (define-vop (fast-logbitp-c/signed fast-conditional-c/signed)
   (:translate %logbitp)
   (:conditional :ne)
-  (:arg-types signed-num (:constant (integer 0 63)))
+  (:arg-types signed-num (:constant (mod #.n-word-bits)))
   (:generator 5
     (inst tst x (ash 1 y))))
 
 (define-vop (fast-logbitp-c/unsigned fast-conditional-c/unsigned)
   (:translate %logbitp)
   (:conditional :ne)
-  (:arg-types unsigned-num (:constant (integer 0 63)))
+  (:arg-types unsigned-num (:constant (mod #.n-word-bits)))
   (:generator 5
     (inst tst x (ash 1 y))))
 
@@ -1154,26 +1187,4 @@
   (:translate sb!bignum:%ashl)
   (:generator 1
     (inst lsl result digit count)))
-
-;;;; Static functions.
 
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg-= (x y) :translate =)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)
-
-(define-static-fun eql (x y) :translate eql)
-
-(define-static-fun %negate (x) :translate %negate)

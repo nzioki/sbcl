@@ -43,8 +43,6 @@
   (:results (y :scs (sap-reg)
                :load-if (not (location= x y))))
   (:note "SAP move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 (define-move-vop sap-move :move
@@ -351,4 +349,22 @@
       (if (location= sap vector)
           (inst add sap disp)
           (inst lea sap (make-ea :qword :base vector :disp disp))))))
+
+;;; Compare and swap
+(define-vop (signed-sap-cas-32)
+  (:policy :fast-safe)
+  (:args (sap :scs (sap-reg) :to (:eval 0))
+         (offset :scs (signed-reg) :to (:eval 0))
+         (oldval :scs (signed-reg) :target eax)
+         (newval :scs (signed-reg) :to (:eval 0)))
+  (:temporary (:sc dword-reg :offset eax-offset
+                   :from (:argument 2) :to (:result 0)) eax)
+  (:arg-types system-area-pointer signed-num signed-num signed-num)
+  (:results (result :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 5
+    (inst mov eax (reg-in-size oldval :dword))
+    (inst cmpxchg (make-ea :dword :base sap :index offset)
+          (reg-in-size newval :dword) :lock)
+    (inst mov (reg-in-size result :dword) eax)))
 

@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB!IMPL")
 
 ;;;; This file implements abstract types which map globaldb Info-Number/Name
 ;;;; pairs to data values. The database itself is defined in 'globaldb'.
@@ -92,11 +92,11 @@
 (defun globaldb-sxhashoid (name)
   (logand (sxhash name) sb!xc:most-positive-fixnum))
 
-(defstruct (info-hashtable (:conc-name info-env-))
+(defstruct (info-hashtable (:conc-name info-env-) (:copier nil))
   (storage (make-info-storage 30) :type simple-vector)
   (comparator #'equal :type function)
   (hash-function #'globaldb-sxhashoid :type function)
-  (mutex (sb!thread:make-mutex))
+  (mutex #-sb-xc-host (sb!thread:make-mutex))
   ;; COUNT is always at *least* as large as the key count.
   ;; If no insertions are in progress, it is exactly right.
   (count 0 :type word))
@@ -226,7 +226,7 @@
         (if (eq (info-env-storage env) storage)
             ;; Grab and release the mutex for no other reason than to
             ;; observe that a rehasher doesn't (for the moment) have it.
-            (sb!thread:with-mutex ((info-env-mutex env))) ; do nothing, retry
+            (sb!thread::with-system-mutex ((info-env-mutex env))) ; do nothing, retry
             (return (info-env-storage env)))))
 
 ;; Look in info-environment ENV for the name KEY. Arguments are like GETHASH.
@@ -310,7 +310,7 @@
         (let ((old-count (info-env-adjust-count env 1)))
           (declare (type info-cell-index old-count))
           (when (>= old-count (info-storage-threshold storage))
-            (sb!thread:with-mutex ((info-env-mutex env))
+            (sb!thread::with-system-mutex ((info-env-mutex env))
               ;; any thread could have beaten us to rehashing
               (when (eq (info-env-storage env) storage)
                 (info-env-rehash env)))
@@ -1188,7 +1188,7 @@ This is interpreted as
   (when (and (consp name)
              (memq (car name) '(sb!pcl::slow-method sb!pcl::fast-method))
              (some #'consp (car (last name))))
-    (let ((i (aref sb!c::*info-types* info-number)))
+    (let ((i (aref *info-types* info-number)))
       (warn "Globaldb storing info for ~S~% ~S ~S~% -> ~S"
             name (meta-info-category i) (meta-info-kind i) new-value)))
 

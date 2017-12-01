@@ -126,7 +126,7 @@
 (defun z-to-bignum (b count)
   "Convert GMP integer in the buffer of a pre-allocated bignum."
   (declare (optimize (speed 3) (space 3) (safety 0))
-           (type bignum-type b)
+           (type bignum b)
            (type bignum-length count))
   (if (zerop count)
       0
@@ -136,7 +136,7 @@
   "Convert to twos complement int the buffer of a pre-allocated
 bignum."
   (declare (optimize (speed 3) (space 3) (safety 0))
-           (type bignum-type b)
+           (type bignum b)
            (type bignum-length count))
   (negate-bignum-in-place b)
   (the (integer * 0) (%normalize-bignum b count)))
@@ -149,7 +149,7 @@ bignum."
 pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
   (declare (optimize (speed 3) (space 3) (safety 0))
            (type (alien (* gmp-limb)) z)
-           (type bignum-type b)
+           (type bignum b)
            (type bignum-length count))
   (dotimes (i count (%normalize-bignum b (1+ count)))
     (%bignum-set b i (deref z i))))
@@ -330,7 +330,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 (defmacro with-mpz-results (pairs &body body)
   (loop for (gres size) in pairs
         for res = (gensym "RESULT")
-        collect `(when (> ,size sb-bignum::maximum-bignum-length)
+        collect `(when (> ,size sb-kernel::maximum-bignum-length)
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,gres (struct gmpint)) into declares
         collect `(,res (%allocate-bignum ,size))
@@ -390,7 +390,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
         collect `(__gmpz_init (addr ,gres)) into inits
         collect `(,size (abs (slot ,gres 'mp_size)))
           into resinits
-        collect `(when (> ,size (1- sb-bignum::maximum-bignum-length))
+        collect `(when (> ,size (1- sb-kernel::maximum-bignum-length))
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,res (%allocate-bignum (1+ ,size)))
           into resallocs
@@ -833,7 +833,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 ;;; integers
 (defun gmp-mul (a b)
   (declare (optimize (speed 3) (space 3))
-           (type bignum-type a b)
+           (type bignum a b)
            (inline mpz-mul))
   (if (or (< (min (%bignum-length a)
                   (%bignum-length b))
@@ -844,7 +844,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 
 (defun gmp-truncate (a b)
   (declare (optimize (speed 3) (space 3))
-           (type bignum-type a b)
+           (type bignum a b)
            (inline mpz-tdiv))
   (if (or (< (min (%bignum-length a)
                   (%bignum-length b))
@@ -926,10 +926,6 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
          *gmp-disabled*)
      (orig-intexp base power))
     (t
-     (when (and sb-kernel::*intexp-maximum-exponent*
-                (> (abs power) sb-kernel::*intexp-maximum-exponent*))
-       (error "The absolute value of ~S exceeds ~S."
-              power 'sb-kernel::*intexp-maximum-exponent*))
      (cond ((minusp power)
             (/ (the integer (gmp-intexp base (- power)))))
            ((eql base 2)

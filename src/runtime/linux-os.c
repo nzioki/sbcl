@@ -49,12 +49,7 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "gc.h"
-#if defined LISP_FEATURE_GENCGC
-#include "gencgc-internal.h"
-#else
-#include "cheneygc-internal.h"
-#endif
+#include "gc-internal.h"
 #include <fcntl.h>
 #ifdef LISP_FEATURE_SB_WTIMER
 # include <sys/timerfd.h>
@@ -127,6 +122,25 @@ futex_init()
     }
 }
 
+/* Try to guess the name of the mutex for this futex, based on knowing
+ * the two pertinent Lisp object types (WAITQUEUE and MUTEX) that use a futex.
+ * Callable from a C debugger */
+#include "genesis/vector.h"
+char* futex_name(int *lock_word)
+{
+    // If there is a Lisp string at lock_word-1 or -2, return that.
+    // Otherwise return NULL.
+    lispobj name = *(lock_word - 1);
+    struct vector* v = (struct vector*)native_pointer(name);
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(v->header) == SIMPLE_BASE_STRING_WIDETAG)
+        return (char*)(v->data);
+    name = *(lock_word - 2);
+    v = (struct vector*)native_pointer(name);
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(v->header) == SIMPLE_BASE_STRING_WIDETAG)
+        return (char*)(v->data);
+    return 0;
+}
+
 int
 futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
 {
@@ -161,21 +175,6 @@ futex_wake(int *lock_word, int n)
 
 
 int linux_sparc_siginfo_bug = 0;
-
-/* This variable was in real use for a few months, basically for
- * storing autodetected information about whether the Linux
- * installation was recent enough to support SBCL threads, and make
- * some run-time decisions based on that. But this turned out to be
- * unstable, so now we just flat-out refuse to start on the old installations
- * when thread support has been compiled in.
- *
- * Unfortunately, in the meanwhile Slime started depending on this
- * variable for deciding which communication style to use. So even
- * though this variable looks unused, it shouldn't be deleted until
- * it's no longer used in the versions of Slime that people are
- * likely to download first. -- JES, 2006-06-07
- */
-int linux_no_threads_p = 0;
 
 #ifdef LISP_FEATURE_SB_THREAD
 int
@@ -327,7 +326,7 @@ static void * under_2gb_free_pointer=DYNAMIC_1_SPACE_END;
 #endif
 
 os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
 {
     int flags =  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     os_vm_address_t actual;
@@ -337,13 +336,17 @@ os_validate(os_vm_address_t addr, os_vm_size_t len)
         addr=under_2gb_free_pointer;
     }
 #endif
+#ifdef MAP_32BIT
+    if (movable & MOVABLE_LOW)
+        flags |= MAP_32BIT;
+#endif
     actual = mmap(addr, len, OS_VM_PROT_ALL, flags, -1, 0);
     if (actual == MAP_FAILED) {
         perror("mmap");
         return 0;               /* caller should check this */
     }
 
-    if (addr && (addr!=actual)) {
+    if (!movable && (addr!=actual)) {
         fprintf(stderr, "mmap: wanted %lu bytes at %p, actually mapped at %p\n",
                 (unsigned long) len, addr, actual);
         return 0;
@@ -366,21 +369,6 @@ os_invalidate(os_vm_address_t addr, os_vm_size_t len)
     }
 }
 
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
-{
-    os_vm_address_t actual;
-
-    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
-                  fd, (off_t) offset);
-    if (actual == MAP_FAILED || (addr && (addr != actual))) {
-        perror("mmap");
-        lose("unexpected mmap(..) failure\n");
-    }
-
-    return actual;
-}
-
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
@@ -397,33 +385,6 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
     }
 }
 
-boolean
-is_valid_lisp_addr(os_vm_address_t addr)
-{
-    struct thread *th;
-    size_t ad = (size_t) addr;
-
-    if ((READ_ONLY_SPACE_START <= ad && ad < READ_ONLY_SPACE_END)
-        || (STATIC_SPACE_START <= ad && ad < STATIC_SPACE_END)
-#if defined LISP_FEATURE_GENCGC
-        || (DYNAMIC_SPACE_START <= ad && ad < DYNAMIC_SPACE_END)
-#else
-        || (DYNAMIC_0_SPACE_START <= ad && ad < DYNAMIC_0_SPACE_END)
-        || (DYNAMIC_1_SPACE_START <= ad && ad < DYNAMIC_1_SPACE_END)
-#endif
-        )
-        return 1;
-    for_each_thread(th) {
-        if((size_t)(th->control_stack_start) <= ad
-           && ad < (size_t)(th->control_stack_end))
-            return 1;
-        if((size_t)(th->binding_stack_start) <= ad
-           && ad < (size_t)(th->binding_stack_start + BINDING_STACK_SIZE))
-            return 1;
-    }
-    return 0;
-}
-
 /*
  * any OS-dependent special low-level handling for signals
  */
@@ -432,6 +393,16 @@ is_valid_lisp_addr(os_vm_address_t addr)
  * The GC needs to be hooked into whatever signal is raised for
  * page fault on this OS.
  */
+static void
+fallback_sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
+{
+    // This calls corruption_warning_and_maybe_lose.
+    lisp_memory_fault_error(context, arch_get_bad_addr(signal, info, context));
+}
+
+void (*sbcl_fallback_sigsegv_handler)  // Settable by user.
+       (int, siginfo_t*, os_context_t*) = fallback_sigsegv_handler;
+
 static void
 sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 {
@@ -463,14 +434,16 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     if (!cheneygc_handle_wp_violation(context, addr))
 #endif
         if (!handle_guard_page_triggered(context, addr))
-            lisp_memory_fault_error(context, addr);
+            sbcl_fallback_sigsegv_handler(signal, info, context);
 }
 
 void
 os_install_interrupt_handlers(void)
 {
+    if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
     undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
                                                  sigsegv_handler);
+    }
 
     /* OAOOM c.f. sunos-os.c.
      * Should we have a reusable function gc_install_interrupt_handlers? */
@@ -489,7 +462,12 @@ os_install_interrupt_handlers(void)
 char *
 os_get_runtime_executable_path(int external)
 {
-    char path[PATH_MAX + 1];
+    /* XXX: If this code is compiled with MSAN, all is well.
+       But if this code is compiled without MSAN, there is a false positive
+       in copied_string() unless we zero-initialize path[].
+       Basically if you want sanitization, the right thing is to compile
+       *all* the source code with the sanitizer, not just some of it. */
+    char path[PATH_MAX + 1] = {0};
     int size;
 
     size = readlink("/proc/self/exe", path, sizeof(path)-1);

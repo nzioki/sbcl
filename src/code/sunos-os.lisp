@@ -16,12 +16,10 @@
 #!-sunos (error "missing :SUNOS feature")
 
 (defun software-type ()
-  #!+sb-doc
   "Return a string describing the supporting software."
   (values "SunOS"))
 
 (defun software-version ()
-  #!+sb-doc
   "Return a string describing version of the supporting software, or NIL
   if not available."
   (or *software-version*
@@ -40,15 +38,6 @@
     (unless err? ; FIXME: nonmnemonic (reversed) name for ERR?
       (error "Unix system call getrusage failed: ~A." (strerror utime)))
     (values utime stime majflt)))
-
-;;; Return the system page size.
-(defun get-page-size ()
-  ;; probably should call getpagesize()
-  ;; FIXME: Or we could just get rid of this, since the uses of it look
-  ;; disposable.
-  ;; FIXME II: this could well be wrong
-  #!+sparc 8192
-  #!+(or x86 x86-64) 4096)
 
 ;;; support for CL:MACHINE-VERSION defined OAOO elsewhere
 (defun get-machine-version ()

@@ -17,48 +17,16 @@
 
 (declaim (maybe-inline get3 %put getf remprop %putf get-properties keywordp))
 
-;;; Used by [GLOBAL-]SYMBOL-VALUE compiler-macros:
-;;;
-;;; When SYMBOL is constant, check whether it names a deprecated
-;;; variable, potentially signaling a {EARLY,LATE}-DEPRECATION-WARNING
-;;; in the process. Furthermore, if the deprecation state is :FINAL,
-;;; replace FORM by SYMBOL, causing the symbol-macro on SYMBOL to
-;;; expand into a call to DEPRECATION-ERROR.
-;;;
-;;; See SB-IMPL:SETUP-VARIABLE-IN-FINAL-DEPRECATION.
-#-sb-xc-host
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun maybe-handle-deprecated-global-variable (symbol env)
-    (when (sb!xc:constantp symbol env)
-      (let ((name (constant-form-value symbol env)))
-        (when (symbolp name)
-          (case (deprecated-thing-p 'variable name)
-            ((:early :late)
-             (check-deprecated-thing 'variable name)
-             nil)
-            ;; In this case, there is a symbol-macro for NAME that
-            ;; will signal the FINAL-DEPRECATION-WARNING when
-            ;; ir1converted and the DEPRECATION-ERROR at runtime.
-            (:final
-             name)))))))
-
 (defun symbol-value (symbol)
-  #!+sb-doc
   "Return SYMBOL's current bound value."
   (declare (optimize (safety 1)))
   (symbol-value symbol))
 
-#-sb-xc-host
-(define-compiler-macro symbol-value (&whole form symbol &environment env)
-  (or (maybe-handle-deprecated-global-variable symbol env) form))
-
 (defun boundp (symbol)
-  #!+sb-doc
   "Return non-NIL if SYMBOL is bound to a value."
   (boundp symbol))
 
 (defun set (symbol new-value)
-  #!+sb-doc
   "Set SYMBOL's value cell to NEW-VALUE."
   (declare (type symbol symbol))
   (about-to-modify-symbol-value symbol 'set new-value)
@@ -68,17 +36,11 @@
   (%set-symbol-value symbol new-value))
 
 (defun symbol-global-value (symbol)
-  #!+sb-doc
   "Return the SYMBOL's current global value. Identical to SYMBOL-VALUE,
 in single-threaded builds: in multithreaded builds bound values are
 distinct from the global value. Can also be SETF."
   (declare (optimize (safety 1)))
   (symbol-global-value symbol))
-
-#-sb-xc-host
-(define-compiler-macro symbol-global-value (&whole form symbol
-                                            &environment env)
-  (or (maybe-handle-deprecated-global-variable symbol env) form))
 
 (defun set-symbol-global-value (symbol new-value)
   (about-to-modify-symbol-value symbol 'set new-value)
@@ -86,10 +48,9 @@ distinct from the global value. Can also be SETF."
 
 (declaim (inline %makunbound))
 (defun %makunbound (symbol)
-  (%set-symbol-value symbol (%primitive sb!c:make-unbound-marker)))
+  (%set-symbol-value symbol (make-unbound-marker)))
 
 (defun makunbound (symbol)
-  #!+sb-doc
   "Make SYMBOL unbound, removing any value it may currently have."
   (with-single-package-locked-error (:symbol symbol "unbinding the symbol ~A")
     ;; :EVENTUALLY is allowed for :always-bound here, as it has no bearing
@@ -140,7 +101,6 @@ distinct from the global value. Can also be SETF."
   (symbol-hash symbol))
 
 (defun symbol-function (symbol)
-  #!+sb-doc
   "Return SYMBOL's current function definition. Settable with SETF."
   (%coerce-name-to-fun symbol symbol-fdefn))
 
@@ -205,11 +165,7 @@ distinct from the global value. Can also be SETF."
     ;; Do not use SYMBOL-INFO-VECTOR - this must not perform a slot read again.
     (setq current-vect (if (listp info-holder) (cdr info-holder) info-holder))
    inner-restart
-    ;; KLUDGE: The "#." on +nil-packed-infos+ is due to slightly crippled
-    ;; fops in genesis's fasload. Anonymizing the constant works around the
-    ;; issue, at the expense of an extra copy of the empty info vector.
-    (let ((new-vect (funcall update-fn
-                             (or current-vect #.+nil-packed-infos+))))
+    (let ((new-vect (funcall update-fn (or current-vect +nil-packed-infos+))))
       (unless (simple-vector-p new-vect)
         (aver (null new-vect))
         (return)) ; nothing to do
@@ -241,7 +197,6 @@ distinct from the global value. Can also be SETF."
                 sb!vm:other-pointer-lowtag))))
 
 (defun symbol-plist (symbol)
-  #!+sb-doc
   "Return SYMBOL's property list."
   #!+symbol-info-vops
   (symbol-plist symbol) ; VOP translates it
@@ -329,12 +284,10 @@ distinct from the global value. Can also be SETF."
 ;;; End of Info/Plist slot manipulation
 
 (defun symbol-name (symbol)
-  #!+sb-doc
   "Return SYMBOL's name as a string."
   (symbol-name symbol))
 
 (defun symbol-package (symbol)
-  #!+sb-doc
   "Return the package SYMBOL was interned in, or NIL if none."
   (symbol-package symbol))
 
@@ -343,15 +296,46 @@ distinct from the global value. Can also be SETF."
   (%set-symbol-package symbol package))
 
 (defun make-symbol (string)
-  #!+sb-doc
   "Make and return a new symbol with the STRING as its print name."
   (declare (type string string))
-  (%make-symbol (if (simple-string-p string)
-                    string
-                    (subseq string 0))))
+  (%make-symbol 0 (if (simple-string-p string) string (subseq string 0))))
+
+;;; All symbols go into immobile space if #!+immobile-symbols is enabled,
+;;; but not if disabled. The win with immobile space that is that all symbols
+;;; can be considered static from an addressing viewpoint, but GC'able.
+;;; (After codegen learns how, provided that defrag becomes smart enough
+;;; to fixup machine code so that defrag remains meaningful)
+;;;
+;;; However, with immobile space being limited in size, you might not want
+;;; symbols in there. In particular, if an application uses symbols as data
+;;; - perhaps symbolic algebra on a Raspberry Pi - then not only is a faster
+;;; purely Lisp allocator better, you probably want not to run out of space.
+;;; The plausible heuristic that interned symbols be immobile, and otherwise not,
+;;; is mostly ok, except for the unfortunate possibility of calling IMPORT
+;;; on a random gensym. And even if a symbol is in immobile space at compile-time,
+;;; it might not be at load-time, if you do nasty things like that, so really
+;;; we can't make any reasonable determination - it's sort of all or nothing.
+
+;;; We can perhaps hardcode addresses of keywords in any case if we think that
+;;; people aren't in the habit of importing gensyms into #<package KEYWORD>.
+;;; It's kinda useless to do that, though not technically forbidden.
+;;; (It can produce a not-necessarily-self-evaluating keyword)
+
+#!+immobile-space
+(defun %make-symbol (kind name)
+  (declare (ignorable kind) (type simple-string name))
+  (set-header-data name sb!vm:+vector-shareable+) ; Set "logically read-only" bit
+  (if #!-immobile-symbols
+      (or (eql kind 1) ; keyword
+          (and (eql kind 2) ; random interned symbol
+               (plusp (length name))
+               (char= (char name 0) #\*)
+               (char= (char name (1- (length name))) #\*)))
+      #!+immobile-symbols t ; always place them there
+      (truly-the (values symbol) (%primitive sb!vm::alloc-immobile-symbol name))
+      (sb!vm::%%make-symbol name)))
 
 (defun get (symbol indicator &optional (default nil))
-  #!+sb-doc
   "Look on the property list of SYMBOL for the specified INDICATOR. If this
   is found, return the associated value, else return DEFAULT."
   (get3 symbol indicator default))
@@ -368,7 +352,6 @@ distinct from the global value. Can also be SETF."
              (return (car cdr-pl)))))))
 
 (defun %put (symbol indicator value)
-  #!+sb-doc
   "The VALUE is added as a property of SYMBOL under the specified INDICATOR.
   Returns VALUE."
   (do ((pl (symbol-plist symbol) (cddr pl)))
@@ -384,7 +367,6 @@ distinct from the global value. Can also be SETF."
            (return value)))))
 
 (defun remprop (symbol indicator)
-  #!+sb-doc
   "Look on property list of SYMBOL for property with specified
   INDICATOR. If found, splice this indicator and its value out of
   the plist, and return the tail of the original list starting with
@@ -405,7 +387,6 @@ distinct from the global value. Can also be SETF."
            (return pl)))))
 
 (defun getf (place indicator &optional (default ()))
-  #!+sb-doc
   "Search the property list stored in PLACE for an indicator EQ to INDICATOR.
   If one is found, return the corresponding value, else return DEFAULT."
   (do ((plist place (cddr plist)))
@@ -429,7 +410,6 @@ distinct from the global value. Can also be SETF."
       (return place))))
 
 (defun get-properties (place indicator-list)
-  #!+sb-doc
   "Like GETF, except that INDICATOR-LIST is a list of indicators which will
   be looked for in the property list stored in PLACE. Three values are
   returned, see manual for details."
@@ -445,7 +425,6 @@ distinct from the global value. Can also be SETF."
            (return (values (car plist) (cadr plist) plist))))))
 
 (defun copy-symbol (symbol &optional (copy-props nil) &aux new-symbol)
-  #!+sb-doc
   "Make and return a new uninterned symbol with the same print name
   as SYMBOL. If COPY-PROPS is false, the new symbol is neither bound
   nor fbound and has no properties, else it has a copy of SYMBOL's
@@ -462,14 +441,16 @@ distinct from the global value. Can also be SETF."
   new-symbol)
 
 (defun keywordp (object)
-  #!+sb-doc
   "Return true if Object is a symbol in the \"KEYWORD\" package."
   (and (symbolp object)
        (eq (symbol-package object) *keyword-package*)))
 
 ;;;; GENSYM and friends
 
-(defun %make-symbol-name (prefix counter)
+(defvar *gentemp-counter* 0)
+(declaim (type unsigned-byte *gentemp-counter*))
+
+(flet ((%symbol-nameify (prefix counter)
   (declare (string prefix))
   (if (typep counter '(and fixnum unsigned-byte))
       (let ((s ""))
@@ -491,15 +472,12 @@ distinct from the global value. Can also be SETF."
           (recurse 1 counter)))
       (with-simple-output-to-string (s)
         (write-string prefix s)
-        (%output-integer-in-base counter 10 s))))
+        (%output-integer-in-base counter 10 s)))))
 
 (defvar *gensym-counter* 0
-  #!+sb-doc
   "counter for generating unique GENSYM symbols")
-(declaim (type unsigned-byte *gensym-counter*))
 
 (defun gensym (&optional (thing "G"))
-  #!+sb-doc
   "Creates a new uninterned symbol whose name is a prefix string (defaults
    to \"G\"), followed by a decimal number. Thing, when supplied, will
    alter the prefix if it is a string, or be used for the decimal number
@@ -512,18 +490,13 @@ distinct from the global value. Can also be SETF."
           (values thing (let ((old *gensym-counter*))
                           (setq *gensym-counter* (1+ old))
                           old)))
-    (make-symbol (%make-symbol-name prefix int))))
-
-(defvar *gentemp-counter* 0)
-(declaim (type unsigned-byte *gentemp-counter*))
+    (make-symbol (%symbol-nameify prefix int))))
 
 (defun gentemp (&optional (prefix "T") (package (sane-package)))
-  #!+sb-doc
   "Creates a new symbol interned in package PACKAGE with the given PREFIX."
-  (declare (type string prefix))
-  (loop for name = (%make-symbol-name prefix (incf *gentemp-counter*))
-        while (nth-value 1 (find-symbol name package))
-        finally (return (values (intern name package)))))
+  (loop (multiple-value-bind (sym accessibility)
+            (intern (%symbol-nameify prefix (incf *gentemp-counter*)) package)
+          (unless accessibility (return sym))))))
 
 ;;; This function is to be called just before a change which would affect the
 ;;; symbol value. We don't absolutely have to call this function before such
@@ -549,7 +522,7 @@ distinct from the global value. Can also be SETF."
              (makunbound "make ~S unbound"))))
     (let ((kind (info :variable :kind symbol)))
       (multiple-value-bind (what continue)
-          (cond ((eq :constant kind)
+          (cond ((eq kind :constant)
                  (cond ((eq symbol t)
                         (values "Veritas aeterna. (can't ~@?)" nil))
                        ((eq symbol nil)
@@ -558,8 +531,13 @@ distinct from the global value. Can also be SETF."
                         (values "Can't ~@?." nil))
                        (t
                         (values "Constant modification: attempt to ~@?." t))))
-                ((and bind (eq :global kind))
-                 (values "Can't ~@? (global variable)." nil)))
+                ((and bind (eq kind :global))
+                 (values "Can't ~@? (global variable)." nil))
+                ((and (eq action 'set)
+                      (eq kind :unknown))
+                 (with-single-package-locked-error
+                     (:symbol symbol "setting the value of ~S"))
+                 nil))
         (when what
           (if continue
               (cerror "Modify the constant." what (describe-action) symbol)

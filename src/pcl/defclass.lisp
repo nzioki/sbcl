@@ -117,10 +117,11 @@
                  ;; full-blown class, so the "a class of this name is
                  ;; coming" note we write here would be irrelevant.
                  (eval-when (:compile-toplevel)
-                   (%compiler-defclass ',name
-                                       ',*readers-for-this-defclass*
-                                       ',*writers-for-this-defclass*
-                                       ',*slot-names-for-this-defclass*))
+                   (sb-kernel::%compiler-defclass
+                    ',name
+                    ',*readers-for-this-defclass*
+                    ',*writers-for-this-defclass*
+                    ',*slot-names-for-this-defclass*))
                  ,defclass-form)))))))
 
 (defun canonize-defclass-options (class-name options)
@@ -256,10 +257,9 @@
 (defun check-slot-name-for-defclass (name class-name env)
   (flet ((slot-name-illegal (reason)
            (error 'simple-program-error
-                  :format-control
-                  (format nil "~~@<In DEFCLASS ~~S, the slot name ~~S ~
-                               is ~A.~~@:>" reason)
-                  :format-arguments (list class-name name))))
+                  :format-control "~@<In DEFCLASS ~S, the slot name ~S ~
+                                   is ~A.~@:>"
+                  :format-arguments (list class-name name reason))))
     (cond ((not (symbolp name))
            (slot-name-illegal "not a symbol"))
           ((keywordp name)
@@ -294,57 +294,19 @@
              (push entry *initfunctions-for-this-defclass*))
            (cadr entry)))))
 
-(defun %compiler-defclass (name readers writers slots)
-  ;; ANSI says (Macro DEFCLASS, section 7.7) that DEFCLASS, if it
-  ;; "appears as a top level form, the compiler must make the class
-  ;; name be recognized as a valid type name in subsequent
-  ;; declarations (as for deftype) and be recognized as a valid class
-  ;; name for defmethod parameter specializers and for use as the
-  ;; :metaclass option of a subsequent defclass."
-  (preinform-compiler-about-class-type name)
-  (preinform-compiler-about-accessors readers writers slots))
-
-(defun preinform-compiler-about-class-type (name)
-  ;; Unless the type system already has an actual type attached to
-  ;; NAME (in which case (1) writing a placeholder value over that
-  ;; actual type as a compile-time side-effect would probably be a bad
-  ;; idea and (2) anyway we don't need to modify it in order to make
-  ;; NAME be recognized as a valid type name)
-  (with-single-package-locked-error (:symbol name "proclaiming ~S as a class"))
-  (unless (info :type :kind name)
-    ;; Tell the compiler to expect a class with the given NAME, by
-    ;; writing a kind of minimal placeholder type information. This
-    ;; placeholder will be overwritten later when the class is defined.
-    (setf (info :type :kind name) :forthcoming-defclass-type))
-  (values))
-
-(defun preinform-compiler-about-accessors (readers writers slots)
-  (flet ((inform (names type &key key)
-           (mapc (lambda (name)
-                   (let ((name (if key (funcall key name) name)))
-                     (when (eq (info :function :where-from name) :assumed)
-                       (sb-c:proclaim-ftype name type nil :defined))))
-                 names)))
-    (let ((rtype (specifier-type '(function (t) t)))
-          (wtype (specifier-type '(function (t t) t))))
-      (inform readers rtype)
-      (inform writers wtype)
-      (inform slots rtype :key #'slot-reader-name)
-      (inform slots rtype :key #'slot-boundp-name)
-      (inform slots wtype :key #'slot-writer-name))))
 
 ;;; This is the early definition of LOAD-DEFCLASS. It just collects up
 ;;; all the class definitions in a list. Later, in braid1.lisp, these
 ;;; are actually defined.
 
 ;;; Each entry in *EARLY-CLASS-DEFINITIONS* is an EARLY-CLASS-DEFINITION.
-(defparameter *early-class-definitions* ())
+(defparameter *!early-class-definitions* ())
 
-(defun early-class-definition (class-name)
-  (or (find class-name *early-class-definitions* :key #'ecd-class-name)
+(defun !early-class-definition (class-name)
+  (or (find class-name *!early-class-definitions* :key #'ecd-class-name)
       (error "~S is not a class in *early-class-definitions*." class-name)))
 
-(defun make-early-class-definition
+(defun !make-early-class-definition
        (name source-location metaclass
         superclass-names canonical-slots other-initargs)
   (list 'early-class-definition
@@ -358,36 +320,36 @@
 (defun ecd-canonical-slots   (ecd) (nth 5 ecd))
 (defun ecd-other-initargs    (ecd) (nth 6 ecd))
 
-(defvar *early-class-slots* nil)
+(defvar *!early-class-slots* nil)
 
 (defun canonical-slot-name (canonical-slot)
   (getf canonical-slot :name))
 
-(defun early-class-slots (class-name)
-  (cdr (or (assoc class-name *early-class-slots*)
+(defun !early-class-slots (class-name)
+  (cdr (or (assoc class-name *!early-class-slots*)
            (let ((a (cons class-name
                           (mapcar #'canonical-slot-name
-                                  (early-collect-inheritance class-name)))))
-             (push a *early-class-slots*)
+                                  (!early-collect-inheritance class-name)))))
+             (push a *!early-class-slots*)
              a))))
 
-(defun early-class-size (class-name)
-  (length (early-class-slots class-name)))
+(defun !early-class-size (class-name)
+  (length (!early-class-slots class-name)))
 
-(defun early-collect-inheritance (class-name)
+(defun !early-collect-inheritance (class-name)
   ;;(declare (values slots cpl default-initargs direct-subclasses))
-  (let ((cpl (early-collect-cpl class-name)))
-    (values (early-collect-slots cpl)
+  (let ((cpl (!early-collect-cpl class-name)))
+    (values (!early-collect-slots cpl)
             cpl
-            (early-collect-default-initargs cpl)
+            (!early-collect-default-initargs cpl)
             (let (collect)
-              (dolist (definition *early-class-definitions*)
+              (dolist (definition *!early-class-definitions*)
                 (when (memq class-name (ecd-superclass-names definition))
                   (push (ecd-class-name definition) collect)))
               (nreverse collect)))))
 
-(defun early-collect-slots (cpl)
-  (let* ((definitions (mapcar #'early-class-definition cpl))
+(defun !early-collect-slots (cpl)
+  (let* ((definitions (mapcar #'!early-class-definition cpl))
          (super-slots (mapcar #'ecd-canonical-slots definitions))
          (slots (apply #'append (reverse super-slots))))
     (dolist (s1 slots)
@@ -401,18 +363,18 @@
                    name1)))))
     slots))
 
-(defun early-collect-cpl (class-name)
+(defun !early-collect-cpl (class-name)
   (labels ((walk (c)
-             (let* ((definition (early-class-definition c))
+             (let* ((definition (!early-class-definition c))
                     (supers (ecd-superclass-names definition)))
                (cons c
-                     (apply #'append (mapcar #'early-collect-cpl supers))))))
+                     (apply #'append (mapcar #'!early-collect-cpl supers))))))
     (remove-duplicates (walk class-name) :from-end nil :test #'eq)))
 
-(defun early-collect-default-initargs (cpl)
+(defun !early-collect-default-initargs (cpl)
   (let ((default-initargs ()))
     (dolist (class-name cpl)
-      (let* ((definition (early-class-definition class-name))
+      (let* ((definition (!early-class-definition class-name))
              (others (ecd-other-initargs definition)))
         (loop (when (null others) (return nil))
               (let ((initarg (pop others)))
@@ -425,7 +387,7 @@
     (reverse default-initargs)))
 
 (defun !bootstrap-slot-index (class-name slot-name)
-  (or (position slot-name (early-class-slots class-name))
+  (or (position slot-name (!early-class-slots class-name))
       (error "~S not found" slot-name)))
 
 ;;; !BOOTSTRAP-GET-SLOT and !BOOTSTRAP-SET-SLOT are used to access and
@@ -487,19 +449,15 @@
   ;; SAFE-P is used by REAL-LOAD-DEFCLASS, but can be ignored here, since
   ;; during the bootstrap we won't have (SAFETY 3).
   (declare (ignore safe-p))
-  (%compiler-defclass name readers writers slot-names)
-  (setq supers  (copy-tree supers)
-        canonical-slots   (copy-tree canonical-slots)
-        canonical-options (copy-tree canonical-options))
-  (let ((ecd
-          (make-early-class-definition name
-                                       source-location
-                                       metaclass
-                                       supers
-                                       canonical-slots
-                                       canonical-options))
+  (sb-kernel::%%compiler-defclass name readers writers slot-names)
+  (let ((ecd (!make-early-class-definition name
+                                          source-location
+                                          metaclass
+                                          (copy-tree supers)
+                                          (copy-tree canonical-slots)
+                                          (copy-tree canonical-options)))
         (existing
-          (find name *early-class-definitions* :key #'ecd-class-name)))
-    (setq *early-class-definitions*
-          (cons ecd (remove existing *early-class-definitions*)))
+         (find name *!early-class-definitions* :key #'ecd-class-name)))
+    (setq *!early-class-definitions*
+          (cons ecd (remove existing *!early-class-definitions*)))
     ecd))

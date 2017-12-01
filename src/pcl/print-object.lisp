@@ -33,50 +33,32 @@
 ;;; by the printer doing bootstrapping, and immediately replace it
 ;;; with some new printing logic, so that the Lisp printer stays
 ;;; crippled only for the shortest necessary time.
-(/show0 "about to replace placeholder PRINT-OBJECT with DEFGENERIC")
-(let (;; (If we don't suppress /SHOW printing while the printer is
-      ;; crippled here, it becomes really easy to crash the bootstrap
-      ;; sequence by adding /SHOW statements e.g. to the compiler,
-      ;; which kinda defeats the purpose of /SHOW being a harmless
-      ;; tracing-style statement.)
-      #+sb-show (*/show* nil)
-      ;; (another workaround for the problem of debugging while the
-      ;; printer is disabled here)
-      ;; FIXME: the way to do this is bind print-pprint-dispatch
-      ;; to an "emergency fallback" table. Give it sane entries for
-      ;; CONDITION, STRUCTURE-OBJECT, INSTANCE, and T.
-      ;; Bind *print-pretty* to T for the duration of these forms,
-      ;; and then we no longer need this extra state variable.
-      (sb-impl::*print-object-is-disabled-p* t))
+(unless (sb-impl::!c-runtime-noinform-p)
+  (write-string "; Removing placeholder PRINT-OBJECT ...")
+  (force-output))
+(let ((*print-pretty* t)) ; use pretty printer dispatch table, not PRINT-OBJECT
   (fmakunbound 'print-object)
   (defgeneric print-object (object stream))
-  (defmethod print-object ((x t) stream)
-    (if *print-pretty*
-        (pprint-logical-block (stream nil)
-          (print-unreadable-object (x stream :type t :identity t)))
-        (print-unreadable-object (x stream :type t :identity t)))))
-(/show0 "done replacing placeholder PRINT-OBJECT with DEFGENERIC")
-
-;;;; a hook called by the printer to take care of dispatching to PRINT-OBJECT
-;;;; for appropriate FUNCALLABLE-INSTANCE objects
-
-;;; Now that CLOS is working, we can replace our old temporary placeholder code
-;;; for writing funcallable instances with permanent code:
-(fmakunbound 'sb-impl::printed-as-funcallable-standard-class)
-(defun sb-impl::printed-as-funcallable-standard-class (object stream)
-  (when (funcallable-standard-class-p (class-of object))
-    (print-object object stream)
-    t))
+  (!incorporate-cross-compiled-methods 'print-object))
+(unless (sb-impl::!c-runtime-noinform-p)
+  (write-string " done
+"))
 
 ;;;; PRINT-OBJECT methods for objects from PCL classes
 ;;;;
+
+(defmethod print-object ((object standard-object) stream)
+  (print-unreadable-object (object stream :type t :identity t)))
+
+(defmethod print-object ((object funcallable-standard-object) stream)
+  (print-unreadable-object (object stream :type t :identity t)))
 
 (defmethod print-object ((method standard-method) stream)
   (if (slot-boundp method '%generic-function)
       (print-unreadable-object (method stream :type t :identity t)
         (let ((generic-function (method-generic-function method))
               (*print-length* 50))
-          (format stream "~:[~*~;~/sb-impl::print-symbol-with-prefix/ ~]~{~S ~}~:S"
+          (format stream "~:[~*~;~/sb-ext:print-symbol-with-prefix/ ~]~{~S ~}~:S"
                   generic-function
                   (and generic-function
                        (generic-function-name generic-function))
@@ -90,7 +72,7 @@
   (if (slot-boundp method '%generic-function)
       (print-unreadable-object (method stream :type t :identity t)
         (let ((generic-function (method-generic-function method)))
-          (format stream "~/sb-impl::print-symbol-with-prefix/, slot:~S, ~:S"
+          (format stream "~/sb-ext:print-symbol-with-prefix/, slot:~S, ~:S"
                   (and generic-function
                        (generic-function-name generic-function))
                   (accessor-method-slot-name method)
@@ -101,7 +83,7 @@
 
 (defmethod print-object ((mc standard-method-combination) stream)
   (print-unreadable-object (mc stream :type t :identity t)
-    (format stream "~S ~S"
+    (format stream "~S ~:S"
             (slot-value-for-printing mc 'type-name)
             (slot-value-for-printing mc 'options))))
 
@@ -112,7 +94,7 @@
          (let ((name (slot-value instance 'name)))
            (print-unreadable-object
                (instance stream :type t :identity (not properly-named-p))
-             (format stream "~/sb-impl::print-symbol-with-prefix/~:[~:; ~:S~]"
+             (format stream "~/sb-ext:print-symbol-with-prefix/~:[~:; ~:S~]"
                      name extra-p extra))))
         ((not extra-p) ; case (2): empty body to avoid an extra space
          (print-unreadable-object (instance stream :type t :identity t)))
@@ -173,11 +155,11 @@
   (print-unreadable-object (obj stream :type t)
     (format stream "~D" (cpd-count obj))))
 
-(defmethod print-object ((self eql-specializer) stream)
-  (let ((have-obj (slot-boundp self 'object)))
-    (print-unreadable-object (self stream :type t :identity (not have-obj))
-      (when have-obj
-        (write (slot-value self 'object) :stream stream)))))
+(defmethod print-object ((self specializer-with-object) stream)
+  (if (and (slot-exists-p self 'object) (slot-boundp self 'object))
+      (print-unreadable-object (self stream :type t)
+        (write (slot-value self 'object) :stream stream))
+      (print-unreadable-object (self stream :type t :identity t))))
 
 sb-c::
 (defmethod print-object ((self policy) stream)
@@ -186,15 +168,42 @@ sb-c::
       (print-unreadable-object (self stream :type t)
         (write (policy-to-decl-spec self) :stream stream))))
 
-(!incorporate-cross-compiled-methods 'print-object :except '(t condition))
+sb-kernel::(progn
+(defmethod print-object ((condition type-error) stream)
+  (if (and *print-escape*
+           (slot-boundp condition 'expected-type)
+           (slot-boundp condition 'datum))
+      (flet ((maybe-string (thing)
+               (ignore-errors
+                 (write-to-string thing :lines 1 :readably nil :array nil :pretty t))))
+        (let ((type (maybe-string (type-error-expected-type condition)))
+              (datum (maybe-string (type-error-datum condition))))
+          (if (and type datum)
+              (print-unreadable-object (condition stream :type t)
+                (format stream "~@<expected-type: ~A ~_datum: ~A~:@>"
+                        type datum))
+              (call-next-method))))
+      (call-next-method)))
 
-;;; Print-object methods on subtypes of CONDITION can't be cross-compiled
-;;; until CLOS is fully working. Compile them now.
-#.`(progn
-     ,@(mapcar (lambda (args)
-                 `(setf (slot-value (defmethod ,@(cdr args)) 'source)
-                        ,(car args)))
-               *!delayed-defmethod-args*))
+(defmethod print-object ((condition cell-error) stream)
+  (if (and *print-escape* (slot-boundp condition 'name))
+      (print-unreadable-object (condition stream :type t :identity t)
+        (princ (cell-error-name condition) stream))
+      (call-next-method)))
+
+(defmethod print-object :around ((o reference-condition) s)
+  (call-next-method)
+  (unless (or *print-escape* *print-readably*)
+    (when (and *print-condition-references*
+               (reference-condition-references o))
+      (format s "~&See also:~%")
+      (pprint-logical-block (s nil :per-line-prefix "  ")
+        (do* ((rs (reference-condition-references o) (cdr rs))
+              (r (car rs) (car rs)))
+             ((null rs))
+          (print-reference r s)
+          (unless (null (cdr rs))
+            (terpri s)))))))) ; end PROGN
 
 ;;; Ordinary DEFMETHOD should be used from here on out.
 ;;; This variable actually has some semantics to being unbound.

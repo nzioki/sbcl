@@ -47,7 +47,7 @@
     (error-p (&rest foo &rest bar))
     (error-p (&rest foo &optional bar))))
 
-(with-test (:name :supplied-p-order)
+(with-test (:name (:lambda-list :supplied-p-order 1))
   (let ((* 10))
     (assert (eql ((lambda (&key (x * *)) () x)) 10))
     (assert (eql ((lambda (&key (y * *) (x *)) () x) :y 1) t))
@@ -65,13 +65,11 @@
     (assert (eql (destructuring-bind (&optional (y * *) (x *)) '(1) x) t))
     (assert (eql (destructuring-bind (&optional (x *) (y * *)) () x) 10))))
 
-(with-test (:name :supplied-p-order)
-  (assert-no-signal
-   (compile nil '(lambda ()
-                  (destructuring-bind (&optional (x nil xp)) '()
-                    (declare (ignore x xp))
-                    nil)))
-   warning))
+(with-test (:name (:lambda-list :supplied-p-order 2))
+  (checked-compile '(lambda ()
+                     (destructuring-bind (&optional (x nil xp)) '()
+                       (declare (ignore x xp))
+                       nil))))
 
 (with-test (:name :aux-not-destructured)
   (assert-error (sb-c::parse-lambda-list
@@ -185,11 +183,11 @@
          '((&body foo) (&whole (a . d) x y)))
 
     (try '(&optional a ((bb1 bb2) (f)) (c 'c) (d 'd dsp) &aux foo (baz))
-         '(&optional a ((bb1 bb2)) (c 'c) (d 'd)))
+         '(&optional a ((bb1 bb2)) (c) (d)))
 
     (try '(&key ((:bork (zook mook)) def bsp) (e 'e esp)
                 ((:name fred)) (color x csp))
-         '(&key ((:bork (zook mook))) (e 'e) ((:name fred)) (color)))
+         '(&key ((:bork (zook mook))) (e) ((:name fred)) (color)))
 
     (try '(x &optional (y) (((&whole (&whole w z . r) &body b) (c)) (def)))
          ;;                           ^ this &WHOLE variable is irrelevant
@@ -211,8 +209,8 @@
     ;; This asserts that sharing works during re-construction.
     (let ((parse (sb-c::parse-ds-lambda-list '(((a)))))
           (cache (list nil)))
-      (assert (eq (sb-c::unparse-ds-lambda-list parse cache)
-                  (sb-c::unparse-ds-lambda-list parse cache))))))
+      (assert (eq (sb-c::unparse-ds-lambda-list parse :cache cache)
+                  (sb-c::unparse-ds-lambda-list parse :cache cache))))))
 
 (with-test (:name :macro-lambda-list)
   ;; This only parses the surface level, which suffices to check for
@@ -264,7 +262,7 @@
   (assert-signal (sb-c::parse-ds-lambda-list '(a &optional (b c &key)))
                  style-warning))
 
-(with-test (:name :ds-bind-list-checkers)
+(with-test (:name (destructuring-bind :list-checkers))
   (labels ((gen-check (lambda-list macro-context)
              (sb-c::emit-ds-bind-check (sb-c::parse-ds-lambda-list lambda-list)
                                        :ignore macro-context nil))
@@ -291,7 +289,7 @@
 
 ;; The same lambda lists and test inputs are each run two different ways.
 (macrolet ((with-test-ll ((name lambda-list) &body body)
-             `(with-test (:name (:ds-bind-shape ,name))
+             `(with-test (:name (destructuring-bind :shape ,name))
                 (let ((fun
                        (lambda (args)
                          (sb-int:binding*
@@ -429,7 +427,13 @@
     (lose '((1 ((2)) 3)))
     (lose '((1 ((2))) wat))
     (lose '((1 ((2))) (wat))))
-  )
+
+  ;; () as nested destructuring lambda list.
+  (with-test-ll (:nil-as-nested-ds-lambda-list (a () b))
+    (win '(1 () 3) '(1 3))
+    (lose '(1 2))
+    (lose '(1 2 3))
+    (lose '(1 (2) 3))))
 
 (with-test (:name :arg-count-error-tail-calls-error)
  (assert

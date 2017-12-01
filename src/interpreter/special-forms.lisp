@@ -9,6 +9,9 @@
 
 (in-package "SB-INTERPRETER")
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (shadow "SYMEVAL"))
+
 ;;; Return a THE form that wraps EXPRESSION, but if CTYPE is NIL,
 ;;; just return EXPRESSION.
 (defun cast-to (ctype expression)
@@ -681,8 +684,9 @@
       (labels ((recurse (list forms)
                  (if (not list)
                      (dispatch forms env)
-                     (sb-sys:with-pinned-objects ((car list))
-                       (recurse (cdr list) forms)))))
+                     (let ((obj (dispatch (car list) env)))
+                       (sb-sys:with-pinned-objects (obj)
+                         (recurse (cdr list) forms))))))
         (recurse objects forms)))))
 
 ;;; Now for the complicated stuff, starting with the simplest

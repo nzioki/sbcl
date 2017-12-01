@@ -101,7 +101,6 @@
       (inst or ndescr code-header-widetag)
       (storew ndescr result 0 other-pointer-lowtag)
       (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-entry-points-slot other-pointer-lowtag)
       (storew null-tn result code-debug-info-slot other-pointer-lowtag))))
 
 (define-vop (make-fdefn)
@@ -120,7 +119,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
@@ -130,7 +130,7 @@
         (allocation result alloc-size fun-pointer-lowtag
                     :stack-p stack-allocate-p
                     :temp-tn temp)
-        (inst li temp (logior (ash (1- size) n-widetag-bits) closure-header-widetag))
+        (inst li temp (logior (ash (1- size) n-widetag-bits) closure-widetag))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -143,7 +143,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation
-        (result temp value-cell-header-widetag value-cell-size)
+        (result temp value-cell-widetag value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; Automatic allocators for primitive objects.

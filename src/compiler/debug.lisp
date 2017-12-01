@@ -13,7 +13,6 @@
 (in-package "SB!C")
 
 (defvar *args* ()
-  #!+sb-doc
   "This variable is bound to the format arguments when an error is signalled
 by BARF or BURP.")
 
@@ -34,7 +33,6 @@ by BARF or BURP.")
   (values))
 
 (defvar *burp-action* :warn
-  #!+sb-doc
   "Action taken by the BURP function when a possible compiler bug is detected.
 One of :WARN, :ERROR or :NONE.")
 (declaim (type (member :warn :error :none) *burp-action*))
@@ -43,6 +41,7 @@ One of :WARN, :ERROR or :NONE.")
 ;;; Otherwise similar to BARF.
 (declaim (ftype (function (string &rest t) (values)) burp))
 (defun burp (string &rest *args*)
+  (declare (notinline warn)) ; See COMPILER-WARN for rationale
   (ecase *burp-action*
     (:warn (apply #'warn string *args*))
     (:error (apply #'cerror "press on anyway." string *args*))
@@ -120,13 +119,15 @@ One of :WARN, :ERROR or :NONE.")
 
            (maphash (lambda (k v)
                       (declare (ignore k))
-                      (unless (or (constant-p v)
+                      (unless (or (eq v :deprecated)
+                                  (constant-p v)
                                   (and (global-var-p v)
                                        (member (global-var-kind v)
                                                '(:global :special :unknown))))
                         (barf "strange *FREE-VARS* entry: ~S" v))
-                      (dolist (n (leaf-refs v))
-                        (check-node-reached n))
+                      (when (leaf-p v)
+                        (dolist (n (leaf-refs v))
+                          (check-node-reached n)))
                       (when (basic-var-p v)
                         (dolist (n (basic-var-sets v))
                           (check-node-reached n))))
@@ -572,10 +573,11 @@ One of :WARN, :ERROR or :NONE.")
         (barf "The WRITE-P in ~S isn't ~S." vop write-p))
       (unless (find-in #'tn-ref-next-ref ref vop-refs)
         (barf "~S not found in REFS for ~S" ref vop))
-      (unless (find-in #'tn-ref-next ref
-                       (if (tn-ref-write-p ref)
-                           (tn-writes (tn-ref-tn ref))
-                           (tn-reads (tn-ref-tn ref))))
+      (unless (or (eq (tn-kind (tn-ref-tn ref)) :unused)
+                  (find-in #'tn-ref-next ref
+                           (if (tn-ref-write-p ref)
+                               (tn-writes (tn-ref-tn ref))
+                               (tn-reads (tn-ref-tn ref)))))
         (barf "~S not found in reads/writes for its TN" ref))
 
       (let ((target (tn-ref-target ref)))
@@ -905,7 +907,13 @@ One of :WARN, :ERROR or :NONE.")
     (global-var
      (format stream "~S {~A}" (leaf-debug-name leaf) (global-var-kind leaf)))
     (functional
-     (format stream "~S ~S" (type-of leaf) (functional-debug-name leaf)))))
+     (format stream "~S ~S ~S" (type-of leaf) (functional-debug-name leaf)
+             (mapcar #'leaf-debug-name
+                     (typecase leaf
+                       (clambda
+                        (lambda-vars leaf))
+                       (optional-dispatch
+                        (optional-dispatch-arglist leaf))))))))
 
 ;;; Attempt to find a block given some thing that has to do with it.
 (declaim (ftype (sfunction (t) cblock) block-or-lose))
@@ -950,6 +958,8 @@ One of :WARN, :ERROR or :NONE.")
       (format t " <deleted>"))
 
     (pprint-newline :mandatory)
+    (when (block-start-cleanup block)
+      (format t "cleanup ~s~%" (cleanup-kind (block-start-cleanup block))))
     (awhen (block-info block)
       (format t "start stack: ")
       (print-lvar-stack (ir2-block-start-stack it))
@@ -973,7 +983,8 @@ One of :WARN, :ERROR or :NONE.")
              (dolist (arg (basic-combination-args node))
                (if arg
                    (print-lvar arg)
-                   (format t "<none> ")))))
+                   (format t "<none> "))))
+           (format t "{derived ~a}" (type-specifier (basic-combination-derived-type node))))
           (cset
            (write-string "set ")
            (print-leaf (set-var node))
@@ -1029,7 +1040,9 @@ One of :WARN, :ERROR or :NONE.")
       (pprint-newline :mandatory))
     (let ((succ (block-succ block)))
       (format t "successors~{ c~D~}~%"
-              (mapcar (lambda (x) (cont-num (block-start x))) succ))))
+              (mapcar (lambda (x) (cont-num (block-start x))) succ)))
+    (when (block-end-cleanup block)
+      (format t "cleanup ~s~%" (cleanup-kind (block-end-cleanup block)))))
   (values))
 
 ;;; Print the guts of a TN. (logic shared between PRINT-OBJECT (TN T)
@@ -1043,7 +1056,8 @@ One of :WARN, :ERROR or :NONE.")
           (t
            (format stream "t~D" (tn-id tn))))
     (when (and (tn-sc tn) (tn-offset tn))
-      (format stream "[~A]" (location-print-name tn)))))
+      (format stream "[~A]" (location-print-name tn)))
+    (format stream " ~s" (tn-kind tn))))
 
 ;;; Print the TN-REFs representing some operands to a VOP, linked by
 ;;; TN-REF-ACROSS.
@@ -1161,7 +1175,7 @@ One of :WARN, :ERROR or :NONE.")
         (format t "~&~A...~%" condition))))
   (values))
 
-(defvar *list-conflicts-table* (make-hash-table :test 'eq))
+(defvar *list-conflicts-table*)
 
 ;;; Add all ALWAYS-LIVE TNs in BLOCK to the conflicts. TN is ignored
 ;;; when it appears in the global conflicts.
@@ -1240,7 +1254,6 @@ One of :WARN, :ERROR or :NONE.")
                (res)))))))
 
 (defun nth-vop (thing n)
-  #!+sb-doc
   "Return the Nth VOP in the IR2-BLOCK pointed to by THING."
   (let ((block (block-info (block-or-lose thing))))
     (do ((i 0 (1+ i))

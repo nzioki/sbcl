@@ -33,10 +33,10 @@
                 (remove-keywords (cddr options) keywords)))))
 
 (def!struct (prim-object-slot
-             (:constructor make-slot (name docs rest-p offset special options))
+             (:constructor make-slot (name rest-p offset special options))
+             (:copier nil)
              (:conc-name slot-))
   (name nil :type symbol :read-only t)
-  (docs nil :type (or null simple-string) :read-only t)
   (rest-p nil :type (member t nil) :read-only t)
   (offset 0 :type fixnum :read-only t)
   (options nil :type list :read-only t)
@@ -44,7 +44,7 @@
   ;; referenced as special variables, this slot holds the name of that variable.
   (special nil :type symbol :read-only t))
 
-(def!struct (primitive-object)
+(def!struct (primitive-object (:copier nil))
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
@@ -80,7 +80,7 @@
           (error "No more slots can follow a :rest-p slot."))
         (destructuring-bind
             (slot-name &rest options
-                       &key docs rest-p (length (if rest-p 0 1))
+                       &key rest-p (length (if rest-p 0 1))
                        ((:type slot-type) t) init
                        (ref-known nil ref-known-p) ref-trans
                        (set-known nil set-known-p) set-trans
@@ -103,19 +103,19 @@
               (setf length 2))
             (when (oddp offset)
               (incf offset)))
-          (slots (make-slot slot-name docs rest-p offset special
-                            (remove-keywords options
-                                             '(:docs :rest-p :length))))
+          (slots (make-slot slot-name rest-p offset special
+                            (remove-keywords options '(:rest-p :length))))
           (let ((offset-sym (symbolicate name "-" slot-name
                                          (if rest-p "-OFFSET" "-SLOT"))))
-            (constants `(def!constant ,offset-sym ,offset
-                          ,@(when docs (list docs))))
+            (constants `(def!constant ,offset-sym ,offset))
             (when special
               (specials `(defvar ,special))))
+          #-c-headers-only
           (when ref-trans
             (when ref-known-p
               (forms `(defknown ,ref-trans (,type) ,slot-type ,ref-known)))
             (forms `(def-reffer ,ref-trans ,offset ,lowtag)))
+          #-c-headers-only
           (when set-trans
             (when set-known-p
               (forms `(defknown ,set-trans
@@ -125,6 +125,7 @@
                                 ,slot-type
                         ,set-known)))
             (forms `(def-setter ,set-trans ,offset ,lowtag)))
+          #-c-headers-only
           (when cas-trans
             (when rest-p
               (error ":REST-P and :CAS-TRANS incompatible."))
@@ -141,6 +142,7 @@
           (incf offset length)))
       (unless variable-length-p
         (constants `(def!constant ,(symbolicate name "-SIZE") ,offset)))
+      #-c-headers-only
       (when alloc-trans
         (forms `(def-alloc ,alloc-trans ,offset
                   ,(if variable-length-p :var-alloc :fixed-alloc)
@@ -179,7 +181,7 @@
                       (constant-name (symbolicate sc-name "-SC-NUMBER")))
                  `((define-storage-class ,sc-name ,sc-number
                      ,sb-name ,@args)
-                   (def!constant ,constant-name ,sc-number))))))
+                   (defconstant ,constant-name ,sc-number))))))
       `(progn ,@(mapcan #'process-class classes)))))
 
 ;;;; stuff for defining reffers and setters
@@ -215,7 +217,7 @@
 
 ;;; For a documentation, see CUT-TO-WIDTH.
 
-(defstruct modular-class
+(defstruct (modular-class (:copier nil))
   ;; hash: name -> { :GOOD | optimizer | ({modular-fun-info}*)}
   (funs (make-hash-table :test 'eq))
   ;; hash: modular-variant -> (prototype width)
@@ -238,7 +240,7 @@
      (aver signedp)
      *tagged-modular-class*)))
 
-(defstruct modular-fun-info
+(defstruct (modular-fun-info (:copier nil))
   (name (missing-arg) :type symbol)
   (width (missing-arg) :type (integer 0))
   (signedp (missing-arg) :type boolean)

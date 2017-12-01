@@ -52,7 +52,6 @@
 ;;; Any of these special characters can be preceded by an escape
 ;;; character to cause it to be treated as a regular character.
 (defun remove-escape-characters (namestr start end escape-char)
-  #!+sb-doc
   "Remove any occurrences of escape characters from the string
    because we've already checked for whatever they may have
    protected."
@@ -421,13 +420,11 @@
 
 
 (defun probe-file (pathspec)
-  #!+sb-doc
   "Return the truename of PATHSPEC if the truename can be found,
 or NIL otherwise.  See TRUENAME for more information."
   (query-file-system pathspec :truename nil))
 
 (defun truename (pathspec)
-  #!+sb-doc
   "If PATHSPEC is a pathname that names an existing file, return
 a pathname that denotes a canonicalized name for the file.  If
 pathspec is a stream associated with a file, return a pathname
@@ -448,14 +445,12 @@ broken symlink itself."
       (query-file-system pathspec :truename)))
 
 (defun file-author (pathspec)
-  #!+sb-doc
   "Return the author of the file specified by PATHSPEC. Signal an
 error of type FILE-ERROR if no such file exists, or if PATHSPEC
 is a wild pathname."
   (query-file-system pathspec :author))
 
 (defun file-write-date (pathspec)
-  #!+sb-doc
   "Return the write date of the file specified by PATHSPEC.
 An error of type FILE-ERROR is signaled if no such file exists,
 or if PATHSPEC is a wild pathname."
@@ -466,7 +461,6 @@ or if PATHSPEC is a wild pathname."
 (/show0 "filesys.lisp 700")
 
 (defun rename-file (file new-name)
-  #!+sb-doc
   "Rename FILE to have the specified NEW-NAME. If FILE is a stream open to a
 file, then the associated file is renamed."
   (let* ((original (merge-pathnames file (sane-default-pathname-defaults)))
@@ -494,7 +488,6 @@ file, then the associated file is renamed."
       (values new-name old-truename (truename new-name)))))
 
 (defun delete-file (file)
-  #!+sb-doc
   "Delete the specified FILE.
 
 If FILE is a stream, on Windows the stream is closed immediately. On Unix
@@ -525,7 +518,6 @@ per standard Unix unlink() behaviour."
       pathname))
 
 (defun delete-directory (pathspec &key recursive)
-  #!+sb-doc
   "Deletes the directory designated by PATHSPEC (a pathname designator).
 Returns the truename of the directory deleted.
 
@@ -588,35 +580,46 @@ exist or if is a file or a symbolic link."
           (delete-dir physical)))))
 
 
-(defun sbcl-homedir-pathname ()
-  (let ((sbcl-home (posix-getenv "SBCL_HOME")))
-    ;; SBCL_HOME isn't set for :EXECUTABLE T embedded cores
-    (when (and sbcl-home (not (string= sbcl-home "")))
-      (parse-native-namestring sbcl-home
-                               *physical-host*
-                               *default-pathname-defaults*
-                               :as-directory t))))
+(sb!alien:define-alien-variable ("sbcl_home" *sbcl-home*) c-string)
 
-(defun user-homedir-namestring (&optional username)
-  (flet ((not-empty (x)
-           (and (not (equal x "")) x)))
+(defun sbcl-homedir-pathname ()
+  (let ((env (posix-getenv "SBCL_HOME")))
+    ;; Should we absoluteize this if it was obtained automatically?
+    ;; Depends whether people are in the habit of using chdir within Lisp.
+    (parse-native-namestring (if (and env (not (string= env "")))
+                                 env
+                                 *sbcl-home*)
+                             *physical-host*
+                             *default-pathname-defaults*
+                             :as-directory t)))
+
+(flet ((not-empty (x)
+         (and (not (equal x "")) x))
+       (lose (&optional username)
+         (error "Couldn't find home directory~@[ for ~S~]." username)))
+
+  #!-win32
+  (defun user-homedir-namestring (&optional username)
     (if username
         (sb!unix:user-homedir username)
         (or (not-empty (posix-getenv "HOME"))
-            #!+win32
+            (not-empty (sb!unix:uid-homedir (sb!unix:unix-getuid)))
+            (lose))))
+
+  #!+win32
+  (defun user-homedir-namestring (&optional username)
+    (if username
+        (lose username)
+        (or (not-empty (posix-getenv "HOME"))
             (not-empty (posix-getenv "USERPROFILE"))
-            #!+win32
             (let ((drive (not-empty (posix-getenv "HOMEDRIVE")))
                   (path (not-empty (posix-getenv "HOMEPATH"))))
               (and drive path
                    (concatenate 'string drive path)))
-            #!-win32
-            (not-empty (sb!unix:uid-homedir (sb!unix:unix-getuid)))
-            (error "Couldn't find home directory.")))))
+            (lose)))))
 
 ;;; (This is an ANSI Common Lisp function.)
 (defun user-homedir-pathname (&optional host)
-  #!+sb-doc
   "Return the home directory of the user as a pathname. If the HOME
 environment variable has been specified, the directory it designates
 is returned; otherwise obtains the home directory from the operating
@@ -635,7 +638,6 @@ system. HOST argument is ignored by SBCL."
 ;;;; DIRECTORY
 
 (defun directory (pathspec &key (resolve-symlinks t))
-  #!+sb-doc
   "Return a list of PATHNAMEs, each the TRUENAME of a file that matched the
 given pathname. Note that the interaction between this ANSI-specified
 TRUENAMEing and the semantics of the Unix filesystem (symbolic links..) means
@@ -800,7 +802,6 @@ matching filenames."
 ;;; DIRECTORY.
 (defun map-directory (function directory &key (files t) (directories t)
                       (classify-symlinks t) (errorp t))
-  #!+sb-doc
   "Map over entries in DIRECTORY. Keyword arguments specify which entries to
 map over, and how:
 
@@ -883,30 +884,33 @@ Experimental: interface subject to change."
 ;;; Part of DIRECTORY: implements matching the directory spec. Calls FUNCTION
 ;;; with all DIRECTORIES that match the directory portion of PATHSPEC.
 (defun map-matching-directories (function pathspec)
-  (let* ((dir (pathname-directory pathspec))
-         (length (length dir))
-         (wild (position-if (lambda (elt)
-                              (or (eq :wild elt) (typep elt 'pattern)))
-                            dir))
-         (wild-inferiors (position :wild-inferiors dir))
-         (end (cond ((and wild wild-inferiors)
-                     (min wild wild-inferiors))
-                    (t
-                     (or wild wild-inferiors length))))
-         (rest (subseq dir end))
-         (starting-point (make-pathname :directory (subseq dir 0 end)
-                                        :device (pathname-device pathspec)
-                                        :host (pathname-host pathspec)
-                                        :name nil
-                                        :type nil
-                                        :version nil)))
-    (cond (wild-inferiors
-           (map-wild-inferiors function rest starting-point))
-          (wild
-           (map-wild function rest starting-point))
-          (t
-           ;; Nothing wild -- the directory matches itself.
-           (funcall function starting-point))))
+  (binding* ((directory (pathname-directory pathspec))
+             ((mode end) (loop for component in directory
+                            for i :of-type index from 0
+                            do (typecase component
+                                 ((or (eql :wild) pattern)
+                                  (return (values :wild i)))
+                                 ((eql :wild-inferiors)
+                                  (return (values :wild-inferiors i))))))
+             ((directory-start directory-rest)
+              (if end
+                  (values (subseq directory 0 end) (subseq directory end))
+                  (values directory directory)))
+             (starting-point (make-pathname :directory directory-start
+                                            :device (pathname-device pathspec)
+                                            :host (pathname-host pathspec)
+                                            :name nil
+                                            :type nil
+                                            :version nil))
+             (starting-point (or (probe-file starting-point)
+                                 starting-point)))
+    (case mode
+      (:wild-inferiors
+       (map-wild-inferiors function directory-rest starting-point))
+      (:wild
+       (map-wild function directory-rest starting-point))
+      (t ; Nothing wild -- the directory matches itself.
+       (funcall function starting-point))))
   nil)
 
 (defun last-directory-piece (pathname)
@@ -1167,7 +1171,6 @@ Experimental: interface subject to change."
        (null (pathname-type pathname))))
 
 (defun ensure-directories-exist (pathspec &key verbose (mode #o777))
-  #!+sb-doc
   "Test whether the directories containing the specified file
   actually exist, and attempt to create them if they do not.
   The MODE argument is a CMUCL/SBCL-specific extension to control

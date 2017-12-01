@@ -137,7 +137,7 @@ extern int dynamic_values_bytes;
 #  define per_thread_value(sym, thread) sym->value
 #else
 #ifdef LISP_FEATURE_64_BIT
-static inline int
+static inline unsigned int
 tls_index_of(struct symbol *symbol) // untagged pointer
 {
   return symbol->header >> 32;
@@ -148,17 +148,6 @@ tls_index_of(struct symbol *symbol) // untagged pointer
 #define per_thread_value(sym,th) \
   ((union per_thread_data *)th)->dynamic_values[tls_index_of(sym)>>WORD_SHIFT]
 #endif
-
-static inline lispobj *
-SymbolValueAddress(u64 tagged_symbol_pointer, void *thread)
-{
-    struct symbol *sym= SYMBOL(tagged_symbol_pointer);
-    if(thread && tls_index_of(sym)) {
-        lispobj *r = &per_thread_value(sym, thread);
-        if((*r)!=NO_TLS_VALUE_MARKER_WIDETAG) return r;
-    }
-    return &sym->value;
-}
 
 static inline lispobj
 SymbolValue(u64 tagged_symbol_pointer, void *thread)
@@ -184,26 +173,25 @@ SetSymbolValue(u64 tagged_symbol_pointer,lispobj val, void *thread)
     sym->value = val;
 }
 
-static inline lispobj
-SymbolTlValue(u64 tagged_symbol_pointer, void *thread)
-{
-    struct symbol *sym= SYMBOL(tagged_symbol_pointer);
-    return per_thread_value(sym, thread);
-}
+#ifdef LISP_FEATURE_SB_THREAD
+/* write_TLS assigns directly into TLS causing the symbol to
+ * be thread-local without saving a prior value on the binding stack. */
+# define write_TLS(sym, val, thread) write_TLS_index(sym##_tlsindex, val, thread, _ignored_)
+# define write_TLS_index(index, val, thread, sym) \
+   *(lispobj*)(index + (char*)((union per_thread_data*)thread)->dynamic_values) = val
+# define read_TLS(sym, thread) \
+   *(lispobj*)(sym##_tlsindex + (char*)((union per_thread_data*)thread)->dynamic_values)
+#else
+# define write_TLS(sym, val, thread) SYMBOL(sym)->value = val
+# define write_TLS_index(index, val, thread, sym) sym->value = val
+# define read_TLS(sym, thread) SYMBOL(sym)->value
+#endif
 
-static inline void
-SetTlSymbolValue(u64 tagged_symbol_pointer,lispobj val, void *thread)
+#define StaticSymbolFunction(x) FdefnFun(x##_FDEFN)
+/* Return 'fun' given a tagged pointer to an fdefn. */
+static inline lispobj FdefnFun(lispobj fdefn)
 {
-    struct symbol *sym= SYMBOL(tagged_symbol_pointer);
-    // dynbind asserts that there is a tls_index in multithread runtime
-    per_thread_value(sym, thread) = val;
-}
-
-/* This only works for static symbols. */
-static inline lispobj
-StaticSymbolFunction(lispobj sym)
-{
-    return ((struct fdefn *)native_pointer(SymbolValue(sym, 0)))->fun;
+    return FDEFN(fdefn)->fun;
 }
 
 /* These are for use during GC, on the current thread, or on prenatal
@@ -322,6 +310,20 @@ static inline struct thread *arch_os_get_current_thread(void)
 #endif
 }
 
+inline static int lisp_thread_p(os_context_t *context) {
+#ifdef LISP_FEATURE_SB_THREAD
+    return pthread_getspecific(lisp_thread) != NULL;
+#elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
+    char *csp = (char *)*os_context_sp_addr(context);
+    return (char *)all_threads->control_stack_start < csp &&
+        (char *)all_threads->control_stack_end > (char *) csp;
+#else
+    /* Can't really tell since pthreads are required to get the
+       dimensions of the C stack. */
+    return 1;
+#endif
+}
+
 #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
 extern kern_return_t mach_lisp_thread_init(struct thread *thread);
 extern void mach_lisp_thread_destroy(struct thread *thread);
@@ -385,12 +387,6 @@ void pop_gcing_safety(struct gcing_safety *from)
 #endif
     }
 }
-
-/* Even with just -O1, gcc optimizes the jumps in this "loop" away
- * entirely, giving the ability to define WITH-FOO-style macros. */
-#define RUN_BODY_ONCE(prefix, finally_do)               \
-    int prefix##done = 0;                               \
-    for (; !prefix##done; finally_do, prefix##done = 1)
 
 #define WITH_GC_AT_SAFEPOINTS_ONLY_hygenic(var)        \
     struct gcing_safety var;                    \

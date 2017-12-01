@@ -17,9 +17,9 @@
 
 (deftype text-width () '(integer 0 1000))
 (deftype alignment () '(integer 0 64))
-(deftype offset () '(signed-byte 24))
-(deftype address () '(unsigned-byte #.sb!vm:n-word-bits))
-(deftype disassem-length () '(unsigned-byte 24))
+(deftype offset () 'fixnum)
+(deftype address () 'word)
+(deftype disassem-length () '(and unsigned-byte fixnum))
 (deftype column () '(integer 0 1000))
 
 (defconstant max-filtered-value-index 32)
@@ -58,12 +58,10 @@
 ;;; the width of the column in which instruction-bytes are printed. A
 ;;; value of zero disables the printing of instruction bytes.
 (defvar *disassem-inst-column-width* 16
-  #!+sb-doc
   "The width of instruction bytes.")
 (declaim (type text-width *disassem-inst-column-width*))
 
 (defvar *disassem-note-column* (+ 45 *disassem-inst-column-width*)
-  #!+sb-doc
   "The column in which end-of-line comments for notes are started.")
 
 ;;;; A DCHUNK contains the bits we look at to decode an
@@ -297,7 +295,6 @@
                                       &key default-printer include)
                                      &rest arg-specs)
   #+sb-xc-host (declare (ignore default-printer))
-  #!+sb-doc
   "DEFINE-INSTRUCTION-FORMAT (Name Length {Format-Key Value}*) Arg-Def*
   Define an instruction format NAME for the disassembler's use. LENGTH is
   the length of the format in bits.
@@ -615,7 +612,8 @@
          (sub-table (assq :printer cache)))
     (or (cdr (assoc guts (cdr sub-table) :test #'equal))
         (let ((template
-     '(lambda (chunk inst stream dstate
+     `(named-lambda (inst-printer ,@*current-instruction-flavor*)
+        (chunk inst stream dstate
                &aux (chunk (truly-the dchunk chunk))
                     (inst (truly-the instruction inst))
                     (stream (truly-the stream stream))
@@ -684,10 +682,10 @@
              ;; Otherwise, defer to run-time.
              form))
         ((:or :and :not)
-         (sharing-cons
+         (recons
           form
           subj
-          (sharing-cons
+          (recons
            test
            key
            (sharing-mapcar
@@ -712,7 +710,7 @@
                   (t ,(nth 3 printer)))
           args))
         (:cond
-         (sharing-cons
+         (recons
           printer
           :cond
           (sharing-mapcar
@@ -722,7 +720,7 @@
                      (lambda (sub-printer)
                        (preprocess-conditionals sub-printer args))
                      (cdr clause))))
-               (sharing-cons
+               (recons
                 clause
                 (preprocess-test (find-first-field-name filtered-body)
                                  (car clause)
@@ -771,8 +769,7 @@
 ;;;; some simple functions that help avoid consing when we're just
 ;;;; recursively filtering things that usually don't change
 
-(defun sharing-cons (old-cons car cdr)
-  #!+sb-doc
+(defun recons (old-cons car cdr)
   "If CAR is eq to the car of OLD-CONS and CDR is eq to the CDR, return
   OLD-CONS, otherwise return (cons CAR CDR)."
   (if (and (eq car (car old-cons)) (eq cdr (cdr old-cons)))
@@ -781,12 +778,11 @@
 
 (defun sharing-mapcar (fun list)
   (declare (type function fun))
-  #!+sb-doc
   "A simple (one list arg) mapcar that avoids consing up a new list
   as long as the results of calling FUN on the elements of LIST are
   eq to the original."
   (and list
-       (sharing-cons list
+       (recons list
                      (funcall fun (car list))
                      (sharing-mapcar fun (cdr list)))))
 
@@ -1013,7 +1009,7 @@
                     (:constructor %make-segment)
                     (:copier nil))
   (sap-maker (missing-arg)
-             :type (function () system-area-pointer))
+             :type (function () #-sb-xc-host system-area-pointer))
   ;; Length in bytes of the range of memory covered by this segment.
   (length 0 :type disassem-length)
   (virtual-location 0 :type address)
@@ -1034,7 +1030,7 @@
   ;; offset of next position
   (next-offs 0 :type offset)
   ;; a sap pointing to our segment
-  (segment-sap nil :type (or null system-area-pointer))
+  (segment-sap nil :type (or null #-sb-xc-host system-area-pointer))
   ;; the current segment
   (segment nil :type (or null segment))
   ;; to avoid buffer overrun at segment end, we might need to copy bytes
@@ -1044,11 +1040,9 @@
   (alignment sb!vm:n-word-bytes :type alignment)
   (byte-order :little-endian
               :type (member :big-endian :little-endian))
-  ;; for user code to hang stuff off of
-  (properties nil :type list)
-  ;; for user code to hang stuff off of, cleared each time after a
+  ;; for user code to track decoded bits, cleared each time after a
   ;; non-prefix instruction is processed
-  (inst-properties nil :type (or fixnum list))
+  (inst-properties 0 :type fixnum)
   (filtered-values (make-array max-filtered-value-index)
                    :type filtered-value-vector)
   ;; to avoid consing decoded values, a prefilter can keep a chain
@@ -1082,6 +1076,7 @@
 
   ;; currently active source variables
   (current-valid-locations nil :type (or null (vector bit))))
+(declaim (freeze-type disassem-state))
 (defmethod print-object ((dstate disassem-state) stream)
   (print-unreadable-object (dstate stream :type t)
     (format stream
@@ -1098,30 +1093,6 @@
 (defun dstate-next-addr (dstate)
   (the address (+ (seg-virtual-location (dstate-segment dstate))
                   (dstate-next-offs dstate))))
-
-;;; Get the value of the property called NAME in DSTATE. Also SETF'able.
-;;;
-;;; KLUDGE: The associated run-time machinery for this is in
-;;; target-disassem.lisp (much later). This is here just to make sure
-;;; it's defined before it's used. -- WHN ca. 19990701
-(defmacro dstate-get-prop (dstate name)
-  `(getf (dstate-properties ,dstate) ,name))
-
-;;; Put PROPERTY into the set of instruction properties in DSTATE.
-;;; PROPERTY can be a fixnum or symbol, but any given backend
-;;; must exclusively use one or the other property representation.
-(defun dstate-put-inst-prop (dstate property)
-  (if (fixnump property)
-      (setf (dstate-inst-properties dstate)
-            (logior (or (dstate-inst-properties dstate) 0) property))
-      (push property (dstate-inst-properties dstate))))
-
-;;; Return non-NIL if PROPERTY is in the set of instruction properties in
-;;; DSTATE. As with -PUT-INST-PROP, we can have a bitmask or a plist.
-(defun dstate-get-inst-prop (dstate property)
-  (if (fixnump property)
-      (logtest (or (dstate-inst-properties dstate) 0) property)
-      (memq property (dstate-inst-properties dstate))))
 
 (declaim (ftype function read-suffix))
 (defun read-signed-suffix (length dstate)

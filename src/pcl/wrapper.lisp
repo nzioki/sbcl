@@ -28,13 +28,22 @@
 
 (defmacro wrapper-class (wrapper)
   `(classoid-pcl-class (layout-classoid ,wrapper)))
-(defmacro wrapper-no-of-instance-slots (wrapper)
-  `(layout-length ,wrapper))
 
 (declaim (inline make-wrapper-internal))
-(defun make-wrapper-internal (&key length classoid)
+(defun make-wrapper-internal (&key (bitmap -1) length classoid)
   (make-layout :length length :classoid classoid :invalid nil
-               :%for-std-class-b 1))
+               :%flags +pcl-object-layout-flag+ :bitmap bitmap))
+
+;;; With compact-instance-header and immobile-code, the primitive object has
+;;; 2 descriptor slots (fin-fun and CLOS slot vector) and 2 non-desriptor slots
+;;; containing machine instructions, after the self-pointer (trampoline) slot.
+;;; Scavenging the self-pointer is unnecessary though harmless.
+;;; This intricate calculation of #b110 makes it insensitive to the
+;;; index of the trampoline slot.
+#+(and immobile-code compact-instance-header)
+(defconstant +fsc-layout-bitmap+
+  (logxor (1- (ash 1 sb-vm:funcallable-instance-info-offset))
+          (ash 1 (1- sb-vm:funcallable-instance-trampoline-slot))))
 
 ;;; This is called in BRAID when we are making wrappers for classes
 ;;; whose slots are not initialized yet, and which may be built-in
@@ -51,26 +60,31 @@
         layout))
      (t
       (make-wrapper-internal
+       :bitmap (cond #+(and immobile-code compact-instance-header)
+                     ((member name '(generic-function
+                                     standard-generic-function))
+                      +fsc-layout-bitmap+)
+                     (t -1))
        :length length
        :classoid (make-standard-classoid
                   :name name :pcl-class class))))))
-
-;;; The following variable may be set to a STANDARD-CLASS that has
-;;; already been created by the lisp code and which is to be redefined
-;;; by PCL. This allows STANDARD-CLASSes to be defined and used for
-;;; type testing and dispatch before PCL is loaded.
-(defvar *pcl-class-boot* nil)
 
 ;;; In SBCL, as in CMU CL, the layouts (a.k.a wrappers) for built-in
 ;;; and structure classes already exist when PCL is initialized, so we
 ;;; don't necessarily always make a wrapper. Also, we help maintain
 ;;; the mapping between CL:CLASS and SB-KERNEL:CLASSOID objects.
 (defun make-wrapper (length class)
+  ;; SLOT-VALUE can't be inlined because we don't have the machinery
+  ;; to perform ENSURE-ACCESSOR as yet.
   (declare (notinline slot-value))
   (cond
     ((or (typep class 'std-class)
          (typep class 'forward-referenced-class))
      (make-wrapper-internal
+      :bitmap (cond #+(and immobile-code compact-instance-header)
+                    ((eq (class-of class) *the-class-funcallable-standard-class*)
+                     +fsc-layout-bitmap+)
+                    (t -1))
       :length length
       :classoid
       (let ((owrap (class-wrapper class)))
@@ -79,18 +93,9 @@
               ((or (*subtypep (class-of class) *the-class-standard-class*)
                    (*subtypep (class-of class) *the-class-funcallable-standard-class*)
                    (typep class 'forward-referenced-class))
-               (cond ((and *pcl-class-boot*
-                           (eq (slot-value class 'name) *pcl-class-boot*))
-                      (let ((found (find-classoid
-                                    (slot-value class 'name))))
-                        (unless (classoid-pcl-class found)
-                          (setf (classoid-pcl-class found) class))
-                        (aver (eq (classoid-pcl-class found) class))
-                        found))
-                     (t
-                      (let ((name (slot-value class 'name)))
-                        (make-standard-classoid :pcl-class class
-                                                :name (and (symbolp name) name))))))
+               (let ((name (slot-value class 'name)))
+                 (make-standard-classoid :pcl-class class
+                                         :name (and (symbolp name) name))))
               (t
                (bug "Got to T branch in ~S" 'make-wrapper))))))
     (t
@@ -137,7 +142,7 @@
   (not (null (layout-invalid wrapper))))
 
 ;;; We only use this inside INVALIDATE-WRAPPER.
-(defvar *previous-nwrappers* (make-hash-table))
+(defvar *previous-nwrappers* (make-hash-table :test #'eq))
 
 (defun %invalidate-wrapper (owrapper state nwrapper)
   (aver (member state '(:flush :obsolete) :test #'eq))
@@ -220,9 +225,9 @@
                (:flush
                 (let ((new (cadr state)))
                   (cond ((std-instance-p instance)
-                         (setf (std-instance-wrapper instance) new))
+                         (setf (%instance-layout instance) new))
                         ((fsc-instance-p instance)
-                         (setf (fsc-instance-wrapper instance) new))
+                         (setf (%funcallable-instance-layout instance) new))
                         (t
                          (bug "unrecognized instance type")))))
                (:obsolete

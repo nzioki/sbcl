@@ -13,6 +13,10 @@
 
 ;;;; various constants and essentially-constants
 
+(defun fasl-target-features ()
+  #+sb-xc-host sb-cold:*shebang-features*
+  #-sb-xc-host *features*)
+
 ;;; a string which appears at the start of a fasl file header
 ;;;
 ;;; This value is used to identify fasl files. Even though this is not
@@ -31,41 +35,44 @@
 ;;;   because they're hard to express portably and because the LOAD
 ;;;   code might reasonably use READ-LINE to get the value to compare
 ;;;   against.
-(defparameter *fasl-header-string-start-string* "# FASL")
+(defglobal *fasl-header-string-start-string* "# FASL")
 
-(macrolet ((define-fasl-format-features ()
-             (let (;; master value for *F-P-A-F-F*
-                   (fpaff '(:sb-thread :sb-package-locks :sb-unicode :gencgc :ud2-breakpoints)))
-               `(progn
-                  ;; a list of *(SHEBANG-)FEATURES* flags which affect
-                  ;; binary compatibility, i.e. which must be the same
-                  ;; between the SBCL which compiles the code and the
-                  ;; SBCL which executes the code
-                  ;;
-                  ;; This is a property of SBCL executables in the
-                  ;; abstract, not of this particular SBCL executable,
-                  ;; so any flag in this list may or may not be present
-                  ;; in the *FEATURES* list of this particular build.
-                  (defparameter *features-potentially-affecting-fasl-format*
-                    ',fpaff)
-                  ;; a string representing flags of *F-P-A-F-F* which
-                  ;; are in this particular build
-                  ;;
-                  ;; (A list is the natural logical representation for
-                  ;; this, but we represent it as a string because
-                  ;; that's physically convenient for writing to and
-                  ;; reading from fasl files, and because we don't
-                  ;; need to do anything sophisticated with its
-                  ;; logical structure, just test it for equality.)
-                  (defparameter *features-affecting-fasl-format*
-                    ,(let ((*print-pretty* nil))
-                       (prin1-to-string
-                        (sort
-                         (copy-seq
-                          (intersection sb-cold:*shebang-features* fpaff))
-                         #'string<
-                         :key #'symbol-name))))))))
-  (define-fasl-format-features))
+;;; a list of *(SHEBANG-)FEATURES* flags which affect binary compatibility,
+;;; i.e. which must be the same between the SBCL which compiled the code
+;;; and the SBCL which executes the code. This is a property of SBCL executables
+;;; in the abstract, not of this particular SBCL executable,
+;;; so any flag in this list may or may not be present
+;;; in the *FEATURES* list of this particular build.
+(defglobal *features-potentially-affecting-fasl-format*
+    (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc :gencgc :msan)
+            #!+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
+
+;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
+;;; which are present in a particular compilation.
+(defun compute-features-affecting-fasl-format ()
+  (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
+                                             (fasl-target-features)))
+                    #'string< :key #'symbol-name)))
+    ;; Stringify the subset of *FEATURES* that affect fasl format.
+    ;; A list would be the natural representation choice for this, but a string
+    ;; is convenient for and a requirement for writing to and reading from fasls
+    ;; at this stage of the loading. WITH-STANDARD-IO-SYNTAX and WRITE-TO-STRING
+    ;; would work, but this is simple enough to do by hand.
+    (with-simple-output-to-string (stream)
+      (let ((delimiter #\())
+        (dolist (symbol list)
+          (write-char delimiter stream)
+          (write-string (string symbol) stream)
+          (setq delimiter #\Space)))
+      (write-char #\) stream))))
+
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (let ((string (compute-features-affecting-fasl-format)))
+    (assert (and (> (length string) 2)
+                 (not (find #\newline string))
+                 (not (find #\# string))
+                 (not (search ".." string))))))
 
 ;;; the code for a character which terminates a fasl file header
 (defconstant +fasl-header-string-stop-char-code+ 255)
@@ -125,37 +132,30 @@
 ;;;   Assembler routines are named by full Lisp symbols: they
 ;;;     have packages and that sort of native Lisp stuff associated
 ;;;     with them. We can compare them with EQ.
-(declaim (type hash-table *assembler-routines*))
-(defglobal *assembler-routines* (make-hash-table :test 'eq))
+(defglobal *assembler-routines* nil)
 
 
 ;;;; the FOP database
-
-(declaim (simple-vector **fop-names** **fop-funs**))
-
-;;; a vector indexed by a FaslOP that yields the FOP's name
-(defglobal **fop-names** (make-array 256 :initial-element nil))
 
 ;;; a vector indexed by a FaslOP that yields a function which performs
 ;;; the operation. Most functions take 0 arguments - they only manipulate
 ;;; the fop stack. But if the fop is defined to receive an argument (or two)
 ;;; then loader's main loop is responsible for supplying it.
 (defglobal **fop-funs** (make-array 256 :initial-element 0))
+(declaim (simple-vector **fop-funs**))
 
-;; Two bitmaps indicate function signature. One tells whether the fop takes
-;; operands (other than from the stack). Each consecutive block of 4 opcodes
-;; either does or doesn't, so the array is 1/4th the size of the opcode space.
-;; The other tells whether the fop wants its result pushed on the stack.
-(declaim (type (cons (simple-bit-vector 64) (simple-bit-vector 256))
+;;; Two arrays indicate fop function signature.
+;;; The first array indicates how many integer operands follow the opcode.
+;;; The second tells whether the fop wants its result pushed on the stack.
+(declaim (type (cons (simple-array (mod 4) (256)) (simple-bit-vector 256))
                **fop-signatures**))
 (defglobal **fop-signatures**
-    (cons (make-array 64 :element-type 'bit :initial-element 0)
+    (cons (make-array 256 :element-type '(mod 4) :initial-element 0)
           (make-array 256 :element-type 'bit :initial-element 0)))
 
 ;;;; variables
 
 (defvar *load-depth* 0
-  #!+sb-doc
   "the current number of recursive LOADs")
 (declaim (type index *load-depth*))
 

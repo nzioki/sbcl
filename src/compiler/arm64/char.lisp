@@ -42,8 +42,6 @@
   (:results (y :scs (character-reg)
                :load-if (not (location= x y))))
   (:note "character move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 (define-move-vop character-move :move
@@ -112,3 +110,62 @@
 (define-vop (fast-char</character character-compare)
   (:translate char<)
   (:conditional :lt))
+
+(defun char-immediate-p (char)
+  (add-sub-immediate-p (sb!xc:char-code char)))
+
+(define-vop (character-compare/c)
+  (:args (x :scs (character-reg)))
+  (:arg-types character (:constant (satisfies char-immediate-p)))
+  (:info y)
+  (:policy :fast-safe)
+  (:note "inline constant comparison")
+  (:generator 2
+    (inst cmp x (sb!xc:char-code y))))
+
+(define-vop (fast-char=/character/c character-compare/c)
+  (:translate char=)
+  (:conditional :eq))
+
+(define-vop (fast-char>/character/c character-compare/c)
+  (:translate char>)
+  (:conditional :gt))
+
+(define-vop (fast-char</character/c character-compare/c)
+  (:translate char<)
+  (:conditional :lt))
+
+#!+sb-unicode
+(define-vop (base-char-p)
+  (:args (value :scs (any-reg descriptor-reg)))
+  (:arg-types *)
+  (:translate base-char-p)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
+  (:conditional :eq)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 4
+    (inst and temp value (lognot #x7F00))
+    (inst cmp temp character-widetag)))
+
+#!+sb-unicode
+(define-vop (base-char-p-character)
+  (:args (value :scs (any-reg)))
+  (:arg-types character)
+  (:translate base-char-p)
+  (:conditional :eq)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 3
+    (inst tst value (lognot #x7FFF))))
+
+#!+sb-unicode
+(define-vop (base-char-p-character-reg)
+  (:args (value :scs (character-reg)))
+  (:arg-types character)
+  (:translate base-char-p)
+  (:conditional :lt)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 2
+    (inst cmp value base-char-code-limit)))

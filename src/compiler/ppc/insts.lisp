@@ -13,7 +13,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) 'sb!vm)
+  (import '(reg-tn-encoding) "SB!VM")
   ;; Imports from SB-VM into this package
   (import '(;; SBs and SCs
             sb!vm::zero sb!vm::immediate-constant
@@ -125,7 +125,7 @@
 (define-compiler-macro valid-bo-encoding (&whole form enc)
   (declare (notinline valid-bo-encoding))
   (if (keywordp enc) (valid-bo-encoding enc) form))
-(eval-when (:compile-toplevel :load-toplevel :execute)
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 (defun valid-bo-encoding (enc)
   (or (if (integerp enc)
         (and (= enc (logand #x1f enc))
@@ -1999,13 +1999,13 @@
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 
 ;;;; Instructions for converting between code objects, functions, and lras.

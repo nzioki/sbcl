@@ -470,16 +470,17 @@
                                      (slow-result (handler-case
                                                       (apply slow call-args)
                                                     (division-by-zero () :div0))))
-                                (if (eql fast-result slow-result)
-                                    (print (list :ok `(,op ,@args) :=> fast-result))
-                                    (error "oops: ~S, ~S" args call-args)))))))))))
+                                (if (not (eql fast-result slow-result))
+                                    (error "oops: ~S, ~S" args call-args)
+                                    #+nil (print (list :ok `(,op ,@args) :=> fast-result))
+                                    ))))))))))
 
 ;;; (TRUNCATE <unsigned-word> <constant unsigned-word>) is optimized
 ;;; to use multiplication instead of division. This propagates to FLOOR,
 ;;; MOD and REM. Test that the transform is indeed triggered and test
 ;;; several cases for correct results.
 (with-test (:name (:integer-division-using-multiplication :used)
-                  :skipped-on '(not (or :x86-64 :x86)))
+                  :skipped-on (not (or :x86-64 :x86)))
   (dolist (fun '(truncate floor ceiling mod rem))
     (let* ((foo (checked-compile
                  `(lambda (x)
@@ -560,9 +561,9 @@
         results)
     (dolist (base (cons bignum numbers))
       (dolist (power numbers)
-        (format t "(expt ~s ~s) => " base power)
+        #+nil (format t "(expt ~s ~s) => " base power)
         (let ((result (expt base power)))
-          (format t "~s~%" result)
+          #+nil (format t "~s~%" result)
           (push result results))))
     (assert (every #'numberp results))))
 
@@ -583,6 +584,8 @@
              (and (nearly-equal-p (realpart x) (realpart y))
                   (nearly-equal-p (imagpart x) (imagpart y))))
            (print-result (msg base power got expected)
+             (declare (ignorable msg base power got expected))
+             #+nil
              (format t "~a (expt ~s ~s)~%got      ~s~%expected ~s~%"
                      msg base power got expected)))
     (let ((n-broken 0))
@@ -745,3 +748,62 @@
 (with-test (:name :bignum-ashift-left-fixnum)
   (assert (= (eval '(ash most-negative-fixnum (1- sb-vm:n-word-bits)))
              (eval '(* most-negative-fixnum (expt 2 (1- sb-vm:n-word-bits)))))))
+
+(with-test (:name :fixnum-ldb-sign-bits)
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (fixnum x))
+                                 (ldb (byte (/ sb-vm:n-word-bits 2)
+                                            (/ sb-vm:n-word-bits 2)) x)))))
+    (assert (= (funcall fun
+                        most-positive-fixnum)
+               (ash most-positive-fixnum (- (/ sb-vm:n-word-bits 2)))))
+    (assert (= (funcall fun -1)
+               (1- (expt 2 (/ sb-vm:n-word-bits 2)))))))
+
+(with-test (:name :dpb-sign-bits)
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (fixnum x))
+                                 (dpb 1 (byte (/ sb-vm:n-word-bits 2)
+                                              (/ sb-vm:n-word-bits 2)) x)))))
+    (assert (= (funcall fun -1)
+               (logior (ash 1 (/ sb-vm:n-word-bits 2))
+                       (logandc2 -1
+                                 (mask-field (byte (/ sb-vm:n-word-bits 2)
+                                                   (/ sb-vm:n-word-bits 2))
+                                             -1)))))
+    (assert (= (funcall fun most-positive-fixnum)
+               (logior (ash 1 (/ sb-vm:n-word-bits 2))
+                       (logandc2 most-positive-fixnum
+                                 (mask-field (byte (/ sb-vm:n-word-bits 2)
+                                                   (/ sb-vm:n-word-bits 2))
+                                             -1)))))))
+
+(with-test (:name :dpb-position-zero)
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (sb-vm:word x))
+                                 (dpb 0 (byte (/ sb-vm:n-word-bits 2) 0) x)))))
+    (assert (= (funcall fun 1) 0))
+    (assert (= (funcall fun sb-ext:most-positive-word)
+               (logxor sb-ext:most-positive-word
+                       (1- (expt 2 (/ sb-vm:n-word-bits 2))))))))
+
+(with-test (:name :logand-mask-word)
+  (let ((fun (checked-compile `(lambda (x)
+                                 (logand x (ash sb-ext:most-positive-word -1))))))
+    (assert (= (funcall fun -1)
+               (ash most-positive-word -1)))))
+
+(with-test (:name ://complex-real-single-float)
+  (assert (= (funcall (checked-compile `(lambda (b)
+                                          (declare (type single-float b))
+                                          (/ #c(1.0 2.0) b)))
+                      1.0)
+             #c(1.0 2.0))))
+
+(with-test (:name :unsigned-ash)
+  (let ((fun (checked-compile
+              `(lambda (x)
+                 (declare (sb-vm:signed-word x))
+                 (ash x -64)))))
+    (assert (zerop (funcall fun 123)))
+    (assert (= (funcall fun -321) -1))))

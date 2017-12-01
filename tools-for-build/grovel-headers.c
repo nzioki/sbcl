@@ -65,7 +65,7 @@
   #include <sys/sysctl.h>
 #endif
 
-#ifdef _WIN32
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
   #include "pthreads_win32.h"
 #endif
 
@@ -73,17 +73,18 @@
 #include "gc.h"
 
 #define DEFTYPE(lispname,cname) { cname foo; \
-    printf("(define-alien-type " lispname " (%s %d))\n", (((foo=-1)<0) ? "signed" : "unsigned"), (8 * (sizeof foo))); }
+    printf("(define-alien-type " lispname " (%s %lu))\n", \
+           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * (sizeof foo))); }
 
 #define DEFSTRUCT(lispname,cname,body) { cname bar; \
     printf("(define-alien-type nil\n  (struct %s", #lispname); \
     body; \
     printf("))\n"); }
 #define DEFSLOT(lispname,cname) \
-    printf("\n          (%s (%s %d))", \
+    printf("\n          (%s (%s %lu))", \
            #lispname, \
            (((bar.cname=-1)<0) ? "signed" : "unsigned"), \
-           (8 * (sizeof bar.cname)))
+           (8LU * (sizeof bar.cname)))
 
 void
 defconstant(char* lisp_name, unsigned long unix_number)
@@ -154,6 +155,7 @@ main(int argc, char *argv[])
     DEFTYPE("nlink-t", nlink_t);
     DEFTYPE("off-t",   off_t);
     DEFTYPE("size-t",  size_t);
+    DEFTYPE("ssize-t", ssize_t);
     DEFTYPE("time-t",  time_t);
 #if !defined(LISP_FEATURE_OS_PROVIDES_SUSECONDS_T)
     /* Similar kludge in sb-posix. */
@@ -220,7 +222,15 @@ main(int argc, char *argv[])
     deferrno("ewouldblock", EWOULDBLOCK);
     printf("\n");
 
+    deferrno("sc-nprocessors-onln", _SC_NPROCESSORS_ONLN);
+
     printf(";;; for wait3(2) in run-program.lisp\n");
+#ifdef WCONTINUED
+    defconstant("wcontinued", WCONTINUED);
+#else
+    defconstant("wcontinued", 0);
+#endif
+
     defconstant("wnohang", WNOHANG);
     defconstant("wuntraced", WUNTRACED);
     printf("\n");

@@ -575,7 +575,7 @@ an item in an itemization."
                (when sub-lines-consumed
                  (incf line-number (1- sub-lines-consumed)) ; +1 on next loop
                  (incf lines-consumed sub-lines-consumed)
-                 (setf result (nconc (nreverse sub-itemization) result)))))
+                 (setf result (append (reverse sub-itemization) result)))))
             ((and offset (= indentation this-offset))
              ;; start of new item
              (push (format nil "@item ~A"
@@ -869,7 +869,7 @@ package, as well as for the package itself."
   (format *texinfo-output* "~
 @iftex
 @macro ~A{name}
-{\\\\smallertt\\\\phantom{concurrency:}~@[\\\\llap{~(~A~):}~]}\\name\\
+{@smallertt@phantom{concurrency:}~@[@llap{~(~A~):}~]}\\name\\
 @end macro
 @end iftex
 @ifinfo

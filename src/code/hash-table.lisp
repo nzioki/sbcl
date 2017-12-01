@@ -12,6 +12,12 @@
 
 (in-package "SB!IMPL")
 
+;;; ** weak_hash_entry_alivep_fun[] in gc-common must
+;;;    coincide with this ordering of table kinds
+(defconstant-eqx weak-hash-table-kinds
+    #(nil :key :value :key-and-value :key-or-value)
+  #'equalp)
+
 ;;; HASH-TABLE is implemented as a STRUCTURE-OBJECT.
 (sb!xc:defstruct (hash-table (:copier nil)
                              (:constructor %make-hash-table
@@ -22,7 +28,7 @@
                                 rehash-threshold
                                 rehash-trigger
                                 table
-                                weakness
+                                %weakness
                                 index-vector
                                 next-vector
                                 hash-vector
@@ -57,8 +63,7 @@
   (next-weak-hash-table nil :type null)
   ;; Non-NIL if this is some kind of weak hash table. For details see
   ;; the docstring of MAKE-HASH-TABLE.
-  (weakness nil :type (member nil :key :value :key-or-value :key-and-value)
-            :read-only t)
+  (%weakness nil :type (integer 0 4) :read-only t)
   ;; Index into the Next vector chaining together free slots in the KV
   ;; vector.
   (next-free-kv 0 :type index)
@@ -82,11 +87,6 @@
   ;; Used for locking GETHASH/(SETF GETHASH)/REMHASH
   (lock (sb!thread:make-mutex :name "hash-table lock")
         :type sb!thread:mutex :read-only t)
-  ;; The GC will set this to T if it moves an EQ-based key. This used
-  ;; to be signaled by a bit in the header of the kv vector, but that
-  ;; implementation caused some concurrency issues when we stopped
-  ;; inhibiting GC during hash-table lookup.
-  (needs-rehash-p nil :type (member nil t))
   ;; Has user requested synchronization?
   (synchronized-p nil :type (member nil t) :read-only t)
   ;; For detecting concurrent accesses.
@@ -106,7 +106,6 @@
 (defconstant +magic-hash-vector-value+ (ash 1 (1- sb!vm:n-word-bits)))
 
 (sb!xc:defmacro with-locked-hash-table ((hash-table) &body body)
-  #!+sb-doc
   "Limits concurrent accesses to HASH-TABLE for the duration of BODY.
 If HASH-TABLE is synchronized, BODY will execute with exclusive
 ownership of the table. If HASH-TABLE is not synchronized, BODY will

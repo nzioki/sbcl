@@ -105,7 +105,12 @@
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
-  (:temporary (:scs (non-descriptor-reg)) temp)
+  ;; KLUDGE: Specify an explicit offset for TEMP because NARGS is a
+  ;; non-descriptor-reg, but is also live, yet the register allocator
+  ;; does not know that it is, and if TEMP collides NARGS and
+  ;; COMPUTE-CODE-FROM-LIP needs TEMP then we run into trouble very
+  ;; quickly.
+  (:temporary (:scs (non-descriptor-reg) :offset nl4-offset) temp)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
     ;; function header.
@@ -598,10 +603,13 @@ default-value-8
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
+      ,@(case named
+          ((nil)
+           '((arg-fun :target lexenv)))
+          (:direct)
+          (t
+           '((name :target name-pass))))
 
-      ,(if named
-           '(name :target name-pass)
-           '(arg-fun :target lexenv))
 
       ,@(when (eq return :tail)
           '((ocfp :target ocfp-pass)
@@ -620,6 +628,7 @@ default-value-8
      (:vop-var vop)
      (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
             ,@(unless variable '(nargs))
+            ,@(when (eq named :direct) '(fun))
             ,@(when (eq return :fixed) '(nvals))
             step-instrumenting)
 
@@ -639,18 +648,19 @@ default-value-8
                   :to :eval)
                  return-pc-pass)
 
-     ,@(if named
-         `((:temporary (:sc descriptor-reg :offset fdefn-offset
-                        :from (:argument ,(if (eq return :tail) 0 1))
-                        :to :eval)
-                       name-pass))
-
-         `((:temporary (:sc descriptor-reg :offset lexenv-offset
-                        :from (:argument ,(if (eq return :tail) 0 1))
-                        :to :eval)
-                       lexenv)
-           (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
-                       function)))
+     ,@(case named
+         ((t)
+          `((:temporary (:sc descriptor-reg :offset fdefn-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        name-pass)))
+         ((nil)
+          `((:temporary (:sc descriptor-reg :offset lexenv-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        lexenv)
+            (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
+                        function))))
 
      (:temporary (:sc any-reg :offset nargs-offset :to :eval)
                  nargs-pass)
@@ -764,49 +774,53 @@ default-value-8
                                           (ash (reg-tn-encoding callable-tn)
                                                5)))
                     (emit-label step-done-label))))
-
-           ,@(if named
-                 `((sc-case name
-                     (descriptor-reg (move name-pass name))
-                     (control-stack
-                      (inst lw name-pass cfp-tn
-                            (ash (tn-offset name) word-shift))
-                      (do-next-filler))
-                     (constant
-                      (inst lw name-pass code-tn
-                            (- (ash (tn-offset name) word-shift)
-                               other-pointer-lowtag))
-                      (do-next-filler)))
-                   ;; The step instrumenting must be done after
-                   ;; FUNCTION is loaded, but before ENTRY-POINT is
-                   ;; calculated.
-                   (insert-step-instrumenting name-pass)
-                   (inst lw entry-point name-pass
-                         (- (ash fdefn-raw-addr-slot word-shift)
-                            other-pointer-lowtag))
-                   (do-next-filler))
-                 `((sc-case arg-fun
-                     (descriptor-reg (move lexenv arg-fun))
-                     (control-stack
-                      (inst lw lexenv cfp-tn
-                            (ash (tn-offset arg-fun) word-shift))
-                      (do-next-filler))
-                     (constant
-                      (inst lw lexenv code-tn
-                            (- (ash (tn-offset arg-fun) word-shift)
-                               other-pointer-lowtag))
-                      (do-next-filler)))
-                   (inst lw function lexenv
-                         (- (ash closure-fun-slot word-shift)
-                            fun-pointer-lowtag))
-                   (do-next-filler)
-                   ;; The step instrumenting must be done before
-                   ;; after FUNCTION is loaded, but before ENTRY-POINT
-                   ;; is calculated.
-                   (insert-step-instrumenting function)
-                   (inst addu entry-point function
-                         (- (ash simple-fun-code-offset word-shift)
-                            fun-pointer-lowtag))))
+           (declare (ignorable #'insert-step-instrumenting))
+           ,@(case named
+               ((t)
+                `((sc-case name
+                    (descriptor-reg (move name-pass name))
+                    (control-stack
+                     (inst lw name-pass cfp-tn
+                           (ash (tn-offset name) word-shift))
+                     (do-next-filler))
+                    (constant
+                     (inst lw name-pass code-tn
+                           (- (ash (tn-offset name) word-shift)
+                              other-pointer-lowtag))
+                     (do-next-filler)))
+                  ;; The step instrumenting must be done after
+                  ;; FUNCTION is loaded, but before ENTRY-POINT is
+                  ;; calculated.
+                  (insert-step-instrumenting name-pass)
+                  (inst lw entry-point name-pass
+                        (- (ash fdefn-raw-addr-slot word-shift)
+                           other-pointer-lowtag))
+                  (do-next-filler)))
+               ((nil)
+                `((sc-case arg-fun
+                    (descriptor-reg (move lexenv arg-fun))
+                    (control-stack
+                     (inst lw lexenv cfp-tn
+                           (ash (tn-offset arg-fun) word-shift))
+                     (do-next-filler))
+                    (constant
+                     (inst lw lexenv code-tn
+                           (- (ash (tn-offset arg-fun) word-shift)
+                              other-pointer-lowtag))
+                     (do-next-filler)))
+                  (inst lw function lexenv
+                        (- (ash closure-fun-slot word-shift)
+                           fun-pointer-lowtag))
+                  (do-next-filler)
+                  ;; The step instrumenting must be done before
+                  ;; after FUNCTION is loaded, but before ENTRY-POINT
+                  ;; is calculated.
+                  (insert-step-instrumenting function)
+                  (inst addu entry-point function
+                        (- (ash simple-fun-code-offset word-shift)
+                           fun-pointer-lowtag))))
+               (:direct
+                `((inst lw entry-point null-tn (static-fun-offset fun)))))
            (loop
              (if (cdr filler)
                  (do-next-filler)
@@ -836,10 +850,13 @@ default-value-8
 
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)
@@ -1174,64 +1191,39 @@ default-value-8
     (inst addu count supplied (fixnumize (- fixed)))
     (inst subu context csp-tn count)))
 
-
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-;;;
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (cond ((zerop count)
-             (inst bne nargs err-lab)
-             (inst nop))
-            (t
-             (inst li temp (fixnumize count))
-             (inst bne nargs temp err-lab)
-             (inst nop))))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
+  (:temporary (:scs (unsigned-reg)) temp)
   (:arg-types positive-fixnum (:constant t) (:constant t))
   (:info min max)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
-              (let ((err-lab
-                      (generate-error-code vop 'invalid-arg-count-error nargs)))
-                (cond ((not min)
-                       (cond ((zerop max)
-                              (inst bne nargs err-lab))
-                             (t
-                              (inst li temp (fixnumize max))
-                              (inst bne nargs temp err-lab)))
-                       (inst nop))
-                      (max
-                       (when (plusp min)
-                         (inst li temp (fixnumize min))
-                         (inst sltu temp nargs temp)
-                         (inst bne temp err-lab)
-                         (inst nop))
-                       (inst li temp (fixnumize max))
-                       (inst sltu temp temp nargs)
-                       (inst bne temp err-lab)
-                       (inst nop))
-                      ((plusp min)
-                       (inst li temp (fixnumize min))
-                       (inst sltu temp nargs temp)
-                       (inst bne temp err-lab)
-                       (inst nop))))))
+    (let ((err-lab
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
+      (cond ((not min)
+             (cond ((zerop max)
+                    (inst bne nargs err-lab))
+                   (t
+                    (inst li temp (fixnumize max))
+                    (inst bne nargs temp err-lab)))
+             (inst nop))
+            (max
+             (when (plusp min)
+               (inst li temp (fixnumize min))
+               (inst sltu temp nargs temp)
+               (inst bne temp err-lab)
+               (inst nop))
+             (inst li temp (fixnumize max))
+             (inst sltu temp temp nargs)
+             (inst bne temp err-lab)
+             (inst nop))
+            ((plusp min)
+             (inst li temp (fixnumize min))
+             (inst sltu temp nargs temp)
+             (inst bne temp err-lab)
+             (inst nop))))))
 
 ;;; Single-stepping
 

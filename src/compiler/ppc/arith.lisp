@@ -14,9 +14,7 @@
 ;;;; Unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -187,8 +185,6 @@
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (signed-byte 32) logical op"))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
 
 (defmacro !define-var-binop (translate untagged-penalty op
                              &optional arg-swap restore-fixnum-mask)
@@ -395,8 +391,6 @@
                   (inst ,shifted-op temp x high-half)
                   (inst ,op r temp low-half))))
              `(inst ,op r x y))))))
-
-); eval-when
 
 (!define-var-binop + 4 add)
 (!define-var-binop - 4 sub)
@@ -654,7 +648,7 @@
          ;; present in the input X physically.  RLWINM as used below would
          ;; mask these out with 0 even for negative inputs.
          (inst srawi res x phantom-bits)
-         (inst rlwinm res x
+         (inst rlwinm res res
                (mod (- 32 posn (- phantom-bits)) 32)
                (- 32 size n-fixnum-tag-bits)
                (- 31 n-fixnum-tag-bits)))
@@ -746,8 +740,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1264,31 +1256,6 @@
   (:translate sb!bignum:%ashl)
   (:generator 1
     (inst slw result digit count)))
-
-
-;;;; Static funs.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)
 
 (in-package "SB!C")
 

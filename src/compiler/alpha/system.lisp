@@ -13,15 +13,6 @@
 
 ;;;; type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and object lowtag-mask result)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -75,23 +66,6 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
-  (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst ldl temp (- fun-pointer-lowtag) function)
-    (inst and temp #xff temp)
-    (inst bis type temp temp)
-    (inst stl temp (- fun-pointer-lowtag) function)
-    (move type result)))
-
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -108,9 +82,12 @@
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
+  (:temporary (:sc non-descriptor-reg) temp)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res n-widetag-bits res)))
+    (inst srl res n-widetag-bits res)
+    (inst li short-header-max-words temp)
+    (inst and res temp res)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)

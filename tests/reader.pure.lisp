@@ -211,9 +211,10 @@
     (let ((*readtable* (copy-readtable nil)))
       (assert (null (loop for c across standard-chars append (frob c)))))))
 
-(with-test (:name :copy-readtable-with-unicode-macro)
+(with-test (:name :copy-readtable-with-unicode-macro
+                  :skipped-on (not :sb-unicode))
   (let ((rt (copy-readtable)))
-    (set-macro-character #\u100fa #'error nil rt)
+    (set-macro-character (code-char #x100fa) #'error nil rt)
     (assert (plusp (hash-table-count (sb-impl::character-macro-hash-table rt))))
     (copy-readtable nil rt)
     (assert (null (get-macro-character #\UFC rt)))))
@@ -293,12 +294,14 @@
   (set-syntax-from-char #\7 #\Space)
   (assert (string= (format nil "~7D" 1) "      1")))
 
-(let ((symbol (find-symbol "DOES-NOT-EXIST" "CL-USER")))
-  (assert (null symbol))
-  (handler-case
-      (read-from-string "CL-USER:DOES-NOT-EXIST")
-    (reader-error (c)
-      (princ c))))
+(with-test (:name :report-reader-error)
+  ;; Apparently this wants to test the printing of the error string
+  ;; otherwise we'd just use ASSERT-SIGNAL.
+  (let ((symbol (find-symbol "DOES-NOT-EXIST" "CL-USER")))
+    (declare (optimize safety)) ; don't flush PRINC-TO-STRING
+    (assert (null symbol))
+    (handler-case (read-from-string "CL-USER:DOES-NOT-EXIST")
+     (reader-error (c) (princ-to-string c)))))
 
 ;;; The GET-MACRO-CHARACTER in SBCL <= "1.0.34.2" bogusly computed its
 ;;; second return value relative to *READTABLE* rather than the passed
@@ -362,7 +365,7 @@
 ;;  - multiple-value-call in WITH-CHAR-MACRO-RESULT
 ;;  - the initial cons cell in READ-LIST
 (with-test (:name :read-does-not-cons-per-se
-                  :skipped-on '(:or :interpreter (:not :x86-64)))
+                  :skipped-on (:or :interpreter (:not :x86-64)))
   (flet ((test-reading (string)
            (let ((s (make-string-input-stream string)))
              (read s) ; once outside the loop, to make A-SYMBOL
@@ -406,7 +409,7 @@
 ;;; The WITH-FAST-READ-BYTE macro accidentally left the package lock
 ;;; of FAST-READ-BYTE disabled during its body.
 (with-test (:name :fast-read-byte-package-lock
-            :skipped-on '(not :sb-package-locks))
+            :skipped-on (not :sb-package-locks))
   (let ((fun
          ;; Suppress the compiler output to avoid noise when running the
          ;; test. (There are a warning and an error about the package
@@ -425,8 +428,11 @@
   (assert-error (read-from-string "(let ((foo 3) #+sbcl) wat)"))
   (assert-error (read-from-string "(let ((foo 3) #-brand-x) wat)")))
 
+;; Another test asserting that a signaled condition is printable
 (with-test (:name :impossible-number-error)
-  (princ (nth-value 1 (ignore-errors (READ-FROM-STRING "1/0")))))
+  (locally
+   (declare (optimize safety)) ; don't flush PRINC-TO-STRING
+   (princ-to-string (nth-value 1 (ignore-errors (READ-FROM-STRING "1/0"))))))
 
 (with-test (:name :read-from-string-compiler-macro)
   ;; evaluation order should be the customary one. In particular,
@@ -437,3 +443,113 @@
 
 (with-test (:name :sharp-star-reader-error)
   (assert-error (read-from-string (format nil "#~D*" (1+ most-positive-fixnum))) reader-error))
+
+(defun test1 (print &optional expect)
+  (let ((*readtable* (copy-readtable nil)))
+    (when print
+      (format t "READTABLE-CASE  Input   Symbol-name~@
+                 ----------------------------------~%"))
+    (dolist (readtable-case '(:upcase :downcase :preserve :invert))
+      (setf (readtable-case *readtable*) readtable-case)
+      (dolist (input '("ZEBRA" "Zebra" "zebra"))
+        (if print
+            (format t "~&:~A~16T~A~24T~A"
+                    (string-upcase readtable-case)
+                    input
+                    (symbol-name (read-from-string input)))
+            (assert (string= (symbol-name (read-from-string input))
+                             (pop expect))))))))
+
+(defun test2 (print &optional expect)
+  (let ((*readtable* (copy-readtable nil)))
+    (when print
+      (format t "READTABLE-CASE *PRINT-CASE*  Symbol-name  Output  Princ~@
+                 --------------------------------------------------------~%"))
+    (dolist (readtable-case '(:upcase :downcase :preserve :invert))
+      (setf (readtable-case *readtable*) readtable-case)
+      (dolist (*print-case* '(:upcase :downcase :capitalize))
+        (dolist (symbol '(|ZEBRA| |Zebra| |zebra|))
+          (if print
+              (format t "~&:~A~15T:~A~29T~A~42T~A~50T~A"
+                      (string-upcase readtable-case)
+                      (string-upcase *print-case*)
+                      (symbol-name symbol)
+                      (prin1-to-string symbol)
+                      (princ-to-string symbol))
+              (progn
+                (assert (string= (prin1-to-string symbol) (pop expect)))
+                (assert (string= (princ-to-string symbol) (pop expect))))))))))
+
+(with-test (:name :readtable-cases)
+  (test1 nil '("ZEBRA" "ZEBRA" "ZEBRA"
+               "zebra" "zebra" "zebra"
+               "ZEBRA" "Zebra" "zebra"
+               "zebra" "Zebra" "ZEBRA"))
+  (test2 nil '("ZEBRA"   "ZEBRA"
+               "|Zebra|" "Zebra"
+               "|zebra|" "zebra"
+               "zebra"   "zebra"
+               "|Zebra|" "zebra"
+               "|zebra|" "zebra"
+               "Zebra"   "Zebra"
+               "|Zebra|" "Zebra"
+               "|zebra|" "zebra"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "ZEBRA"
+               "ZEBRA"   "ZEBRA"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "Zebra"
+               "zebra"   "zebra"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "Zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA")))
+
+#+sb-unicode
+(with-test (:name :base-char-preference)
+  (let* ((rt (copy-readtable))
+         (*readtable* rt)
+         (callcount 0))
+    (flet ((expect (setting symbol-name-type string-type)
+             (unless (eq setting :default)
+               (setf (readtable-base-char-preference rt) setting))
+             ;; Each test has to intern a new symbol of course.
+             (let ((input (format nil "MAMALOOK~D" (incf callcount))))
+               (assert (equal (type-of (symbol-name (read-from-string input)))
+                              symbol-name-type))
+               (assert (equal (type-of (read-from-string "\"Foobarbaz\""))
+                              string-type)))
+             ;; Also verify that COPY-READTABLE works
+             (assert (eq (readtable-base-char-preference (copy-readtable rt))
+                         (readtable-base-char-preference rt)))))
+      ;; Verify correctness of the stated default as per the docstring
+      (assert (eq (readtable-base-char-preference rt) :symbols))
+      ;; Default: prefer base symbols, but CHARACTER strings.
+      (expect :default '(simple-base-string 9) '(simple-array character (9)))
+      ;; Prefer base strings, but CHARACTER strings for symbol names
+      (expect :strings
+              '(simple-array character (9))
+              '(simple-base-string 9))
+      ;; Prefer base-string for everything
+      (expect :both '(simple-base-string 9) '(simple-base-string 9))
+      ;; Prefer base-string for neither
+      (expect nil
+              '(simple-array character (9))
+              '(simple-array character (9))))))

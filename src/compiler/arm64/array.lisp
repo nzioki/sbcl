@@ -93,14 +93,21 @@
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
          (index :scs (any-reg descriptor-reg)))
+  (:variant-vars %test-fixnum)
+  (:variant t)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error array bound index)))
-      (%test-fixnum index error t)
+      (when %test-fixnum
+        (%test-fixnum index error t))
       (inst cmp index bound)
       (inst b :hs error))))
 
+(define-vop (check-bound/fast check-bound)
+  (:policy :fast)
+  (:variant nil)
+  (:variant-cost 4))
 ;;;; Accessors/Setters
 
 ;;; Variants built on top of word-index-ref, etc.  I.e. those vectors whos

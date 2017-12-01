@@ -81,7 +81,7 @@
   ;; dynamic-space-free-pointer increments only when a page is full.
   ;; Using boxed_region directly is finer-grained.
   #!+(and (not sb-thread) gencgc)
-  (ash (extern-alien "boxed_region" unsigned-long)
+  (ash (extern-alien "gc_alloc_region" unsigned-long)
        (- (1+ sb!vm:word-shift)))
   ;; threads imply gencgc. use the per-thread alloc region pointer
   #!+sb-thread
@@ -189,8 +189,29 @@
        ;; Make sure we never return 0 (almost no chance of that anyway).
        (return answer)))))
 
-(declaim (inline std-instance-hash))
+
+#!+(and compact-instance-header x86-64)
+(progn
+  (declaim (inline %std-instance-hash))
+  (defun %std-instance-hash (slots) ; return or compute the 32-bit hash
+    (let ((stored-hash (sb!vm::get-header-data-high slots)))
+      (if (eql stored-hash 0)
+          (let ((new (logand (new-instance-hash-code) #xFFFFFFFF)))
+            (let ((old (sb!vm::cas-header-data-high slots 0 new)))
+              (if (eql old 0) new old)))
+          stored-hash))))
+
 (defun std-instance-hash (instance)
+  #!+(and compact-instance-header x86-64)
+  ;; The one logical slot (excluding layout) in the primitive object is index 0.
+  ;; That holds a vector of the clos slots, and its header holds the hash.
+  (let* ((slots (%instance-ref instance 0))
+         (hash (%std-instance-hash slots)))
+    ;; Simulate N-POSITIVE-FIXNUM-BITS of output for backward-compatibility,
+    ;; in case people use the high order bits.
+    ;; (There are only 32 bits of actual randomness, if even that)
+    (logxor (ash hash (- sb!vm:n-positive-fixnum-bits 32)) hash))
+  #!-(and compact-instance-header x86-64)
   (let ((hash (%instance-ref instance sb!pcl::std-instance-hash-slot-index)))
     (if (not (eql hash 0))
         hash
@@ -204,6 +225,9 @@
 ;; These are also random numbers, but not lazily computed.
 (declaim (inline fsc-instance-hash))
 (defun fsc-instance-hash (fin)
+  #!+compact-instance-header
+  (sb!vm::get-header-data-high (%funcallable-instance-info fin 0))
+  #!-compact-instance-header
   (%funcallable-instance-info fin sb!pcl::fsc-instance-hash-slot-index))
 
 (defun sxhash (x)
@@ -270,9 +294,8 @@
                    ;; we hash all of the components of a pathname together.
                    (let ((hash (sxhash-recurse (pathname-host x) depthoid)))
                      (mixf hash (sxhash-recurse (pathname-device x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-directory x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-name x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-type x) depthoid))
+                     (mixf hash (%pathname-dir-hash x))
+                     (mixf hash (%pathname-stem-hash x))
                      ;; Hash :NEWEST the same as NIL because EQUAL for
                      ;; pathnames assumes that :newest and nil are equal.
                      (let ((version (%pathname-version x)))
@@ -288,12 +311,13 @@
                    ;; simply returning the same value for all LAYOUT
                    ;; objects, as the next branch would do.
                    (layout-clos-hash x))
-                  ((or structure-object condition)
+                  (structure-object
                    (logxor 422371266
                            ;; FIXME: why not (LAYOUT-CLOS-HASH ...) ?
                            (sxhash      ; through DEFTRANSFORM
                             (classoid-name
                              (layout-classoid (%instance-layout x))))))
+                  (condition (sb!kernel::condition-hash x))
                   (t (std-instance-hash x))))
                (symbol (sxhash x))      ; through DEFTRANSFORM
                (array
@@ -315,7 +339,7 @@
                         (sxhash (char-code x)))) ; through DEFTRANSFORM
                ;; general, inefficient case of NUMBER
                (number (sxhash-number x))
-               (generic-function (fsc-instance-hash x))
+               (funcallable-instance (fsc-instance-hash x))
                (t 42))))
     (sxhash-recurse x +max-hash-depthoid+)))
 
@@ -339,6 +363,7 @@
   (typecase key
     (array (array-psxhash key depthoid))
     (hash-table (hash-table-psxhash key))
+    (pathname (sxhash key))
     (structure-object (structure-object-psxhash key depthoid))
     (cons (list-psxhash key depthoid))
     (number (number-psxhash key))
@@ -396,13 +421,8 @@
   (declare (optimize speed))
   (declare (type structure-object key))
   (declare (type (integer 0 #.+max-hash-depthoid+) depthoid))
-  (let* ((layout (%instance-layout key)) ; i.e. slot #0
-         ;; Is there some reason the name of the layout's classoid
-         ;; should be preferred as the seed, instead of using the CLOS-HASH
-         ;; just like SXHASH does?
-         (classoid (layout-classoid layout))
-         (name (classoid-name classoid))
-         (result (mix (sxhash name) (the fixnum 79867))))
+  (let* ((layout (%instance-layout key))
+         (result (layout-clos-hash layout)))
     (declare (type fixnum result))
     (when (plusp depthoid)
       (let ((max-iterations depthoid)
@@ -467,6 +487,15 @@
                                    (sxhash q)
                                    (sxhash-double-float
                                     (coerce key 'double-float)))))
+                            ((float-infinity-p key)
+                             ;; {single,double}-float infinities are EQUALP
+                             (if (minusp key)
+                                 (load-time-value
+                                  (sxhash (symbol-value 'sb!ext:single-float-negative-infinity))
+                                  t)
+                                 (load-time-value
+                                  (sxhash (symbol-value 'sb!ext:single-float-positive-infinity))
+                                  t)))
                             (t
                              (multiple-value-bind (q r) (floor key)
                                (if (zerop (the ,type r))
@@ -507,7 +536,7 @@
 ;;; More work here equates to less work in the global hashtable.
 ;;; To wit: (eq (sxhash '(foo a b c bar)) (sxhash '(foo a b c d))) => T
 ;;; but the corresponding globaldb-sxhashoids differ.
-(defun sb!c::globaldb-sxhashoid (name)
+(defun globaldb-sxhashoid (name)
   (locally
       (declare (optimize (safety 0))) ; after the argc check
     ;; TRAVERSE will walk across more cons cells than RECURSE will descend.

@@ -19,18 +19,6 @@
 (defvar *undefined-warnings*)
 (declaim (list *undefined-warnings*))
 
-;;; Look up some symbols in *FREE-VARS*, returning the var
-;;; structures for any which exist. If any of the names aren't
-;;; symbols, we complain.
-(declaim (ftype (function (list) list) get-old-vars))
-(defun get-old-vars (names)
-  (collect ((vars))
-    (dolist (name names (vars))
-      (unless (symbolp name)
-        (compiler-error "The name ~S is not a symbol." name))
-      (let ((old (gethash name *free-vars*)))
-        (when old (vars old))))))
-
 (declaim (ftype (function (list list) list)
                 process-handle-conditions-decl))
 (defun process-handle-conditions-decl (spec list)
@@ -222,7 +210,8 @@
             software version name replacement))
          (setf (info :function :deprecated name) info))
         (variable
-         ;; TODO (check-variable-name name "deprecated variable declaration")
+         (check-variable-name
+          name :context "deprecated variable declaration" :signal-via #'error)
          (when (eq state :final)
            (sb!impl::setup-variable-in-final-deprecation
             software version name replacement))
@@ -276,7 +265,11 @@
                (if location
                    (setf (getf (info :source-location :declaration name) key)
                          location)
-                   (remf (info :source-location :declaration name) key)))
+                   ;; Without this WHEN, globaldb would accumulate
+                   ;; a bunch of explicitly stored empty lists because
+                   ;; it does not know that there's no need to store NIL.
+                   (when (info :source-location :declaration name)
+                     (remf (info :source-location :declaration name) key))))
              (map-names (names function &rest extra-args)
                (mapc (lambda (name)
                        (store-location name)
@@ -324,11 +317,11 @@
            (multiple-value-bind (state software version)
                (check-deprecation-declaration state since form)
              (mapc (lambda (thing)
+                     (process-deprecation-declaration thing state software version)
                      (destructuring-bind (namespace name &rest rest) thing
                        (declare (ignore rest))
                        (store-location
-                        name :key (deprecation-location-key namespace)))
-                     (process-deprecation-declaration thing state software version))
+                        name :key (deprecation-location-key namespace))))
                    things))))
         (declaration
          (map-args #'process-declaration-declaration form))
@@ -337,10 +330,9 @@
            (compiler-warn "unrecognized declaration ~S" raw-form)))))))
 
 (defun sb!xc:proclaim (raw-form)
-  #+sb-xc (/show0 "entering PROCLAIM, RAW-FORM=..")
-  #+sb-xc (/hexstr raw-form)
+  #!+(and sb-show (host-feature sb-xc))
+  (progn (write-string "* ") (write `(declaim ,raw-form) :level nil) (terpri))
   (%proclaim raw-form nil)
-  #+sb-xc (/show0 "returning from PROCLAIM")
   (values))
 
 ;; Issue a style warning if there are any repeated OPTIMIZE declarations

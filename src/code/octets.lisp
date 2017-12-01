@@ -17,11 +17,6 @@
 
 (in-package "SB!IMPL")
 
-;;; FIXME: don't we have this somewhere else?
-(deftype array-range ()
-  "A number that can represent an index into a vector, including
-one-past-the-end"
-  '(integer 0 #.sb!xc:array-dimension-limit))
 
 ;;;; conditions
 
@@ -38,6 +33,8 @@ one-past-the-end"
                                       (octets-encoding-error-position c)))
                      (octets-encoding-error-external-format c)))))
 
+(declaim (ftype (sfunction (t t t) (simple-array (unsigned-byte 8) 1))
+                encoding-error))
 (defun encoding-error (external-format string pos)
   (restart-case
       (error 'octets-encoding-error
@@ -371,10 +368,6 @@ one-past-the-end"
                                                   "LATIN-1")
                                               "KEYWORD")
                              #!+win32 (sb!win32::ansi-codepage)))
-        (/show0 "cold-printing defaulted external-format:")
-        #!+sb-show
-        (cold-print external-format)
-        (/show0 "matching to known aliases")
         (let ((entry (get-external-format external-format)))
           (cond
             (entry
@@ -484,17 +477,17 @@ one-past-the-end"
              (replacement-handlerify entry replacement)
              entry))))))
 
-(defun unintern-init-only-stuff ()
-  (let ((this-package (find-package "SB-IMPL")))
-    (dolist (s '(char-class char-class2 char-class3))
-      (unintern s this-package))
-    (flet ((ends-with-p (s1 s2)
-             (let ((diff (- (length s1) (length s2))))
-               (and (>= diff 0) (string= s1 s2 :start1 diff)))))
-      (do-symbols (s this-package)
-        (let ((name (symbol-name s)))
-          (if (and (macro-function s)
-                   (eql (mismatch name "DEFINE-") 7)
-                   (or (ends-with-p name "->STRING")
-                       (ends-with-p name "->STRING*")))
-              (unintern s this-package)))))))
+(defun !unintern-symbols ()
+  `("SB-IMPL"
+    char-class char-class2 char-class3
+    ,@(let (macros)
+        (flet ((ends-with-p (s1 s2)
+                 (let ((diff (- (length s1) (length s2))))
+                   (and (>= diff 0) (string= s1 s2 :start1 diff)))))
+          (do-symbols (s "SB-IMPL" macros)
+            (let ((name (symbol-name s)))
+              (when (and (macro-function s)
+                         (eql (mismatch name "DEFINE-") 7)
+                         (or (ends-with-p name "->STRING")
+                             (ends-with-p name "->STRING*")))
+                (push s macros))))))))

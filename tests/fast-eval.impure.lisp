@@ -246,3 +246,46 @@
 
 (test-util:with-test (:name :inline-lexenv-not-too-hairy)
   (assert (sb-c::fun-name-inline-expansion 'foo-compare)))
+
+(defmacro use-hairy-env (x &environment e)
+  (list 'list
+        (eql (sb-interpreter::env-from-lexenv e) :compile)
+        (sb-int:eval-in-lexenv x e)))
+
+;;; Assert that USE-HAIRY-ENV can be invoked such that when it calls
+;;; EVAL-IN-LEXENV on an environment object that is too complex,
+;;; it works anyway. Of course don't actually do this :-)
+;;; Arguably the interpreter could be modified such that it only chokes
+;;; if you _actually_ try to reference parts of the complex lexenv
+;;; that you're not allowed to, but that's a whole other ball of wax.
+(test-util:with-test (:name :eval-in-complex-lexenv)
+  (let ((answer
+         (funcall (compile nil '(lambda (a) (cons a (use-hairy-env (+ 1 2)))))
+                  45)))
+    (assert (eql (first answer) 45))
+    ;; ensure that the lambda environment could not be handled by the interpreter
+    (assert (eql (second answer) t))
+    (assert (eql (third answer) 3))))
+
+(test-util:with-test (:name :exited-block)
+  (handler-case (funcall (let ((x 1)) (block b (lambda () (return-from b)))))
+    (condition (c)
+      (assert (and (typep c 'sb-int:simple-control-error)
+                   (search "exited block" (simple-condition-format-control c)))))
+    (:no-error (&rest whatever) (error "Expected an error"))))
+
+(test-util:with-test (:name :exited-tagbody)
+  (handler-case (funcall
+                 (block zot
+                   (tagbody
+                    (return-from zot (let ((x 1)) (lambda () (go foo))))
+                    foo)))
+     (condition (c)
+       (assert (and (typep c 'sb-int:simple-control-error)
+                    (search "exited tagbody"
+                            (simple-condition-format-control c)))))
+     (:no-error (&rest whatever) (error "Expected an error"))))
+
+(test-util:with-test (:name :argless-lambda)
+  (assert (eq ((lambda () (declare (special *some-var*)) (setq *some-var* t)))
+              t)))

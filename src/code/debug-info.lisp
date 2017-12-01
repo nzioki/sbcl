@@ -36,7 +36,7 @@
 (defconstant compiled-debug-var-more-count-p           #b00000010)
 (defconstant compiled-debug-var-environment-live       #b00000100)
 (defconstant compiled-debug-var-save-loc-p             #b00001000)
-(defconstant compiled-debug-var-id-p                   #b00010000)
+(defconstant compiled-debug-var-same-name-p            #b00010000)
 (defconstant compiled-debug-var-minimal-p              #b00100000)
 (defconstant compiled-debug-var-deleted-p              #b01000000)
 (defconstant compiled-debug-var-indirect-p             #b10000000)
@@ -54,16 +54,35 @@
 ;;;;    ...more <kind, delta, top level form offset, form-number, live-set>
 ;;;;       tuples...
 
-(defparameter *compiled-code-location-kinds*
-  #(:unknown-return :known-return :internal-error :non-local-exit
-    :block-start :call-site :single-value-return :non-local-entry
-    :step-before-vop))
+(defconstant-eqx +compiled-code-location-kinds+
+    #(:unknown-return :known-return :internal-error :non-local-exit
+      :block-start :call-site :single-value-return :non-local-entry
+      :step-before-vop)
+  #'equalp)
+
+(eval-when (:compile-toplevel)
+  (assert (<= (integer-length (1- (length +compiled-code-location-kinds+))) 4)))
+
+;;; Location flags, encoded in the low 4 bits of loction kind byte
+(defconstant compiled-code-location-stepping         (ash #b0001 4))
+(defconstant compiled-code-location-context          (ash #b0010 4))
+(defconstant compiled-code-location-live             (ash #b0100 4))
+(defconstant compiled-code-location-zero-form-number (ash #b1000 4))
+
+(defconstant debug-info-var-deleted -1)
+(defconstant debug-info-var-rest -2)
+(defconstant debug-info-var-more -3)
+(defconstant debug-info-var-optional -4)
+(defconstant debug-info-var-supplied-p -5)
+
 
 ;;;; DEBUG-FUN objects
 
-(def!struct (debug-fun (:constructor nil)))
+(def!struct (debug-fun (:constructor nil)
+                       (:copier nil)))
 
 (def!struct (compiled-debug-fun (:include debug-fun)
+                                (:copier nil)
                                 #-sb-xc-host (:pure t))
   ;; KLUDGE: Courtesy of more than a decade of, ah, organic growth in
   ;; CMU CL, there are two distinct -- but coupled -- mechanisms to
@@ -77,11 +96,10 @@
   ;; A list of DEBUG-FUN objects is maintained for each COMPONENT. To
   ;; figure out which DEBUG-FUN object corresponds to your FUNCTION
   ;; object, you compare the name values of each. -- WHN 2001-12-20
-  (name (missing-arg) :type (or simple-string cons symbol))
-  ;; The kind of function (same as FUNCTIONAL-KIND):
-  (kind nil :type (member nil :optional :external :toplevel :cleanup))
+  (name (missing-arg) :type (or simple-string cons symbol) :read-only t)
   ;; a description of variable locations for this function, in alphabetical
   ;; order by name; or NIL if no information is available
+  ;; If only one variable is encoded then it's stored as is without a vector.
   ;;
   ;; The variable entries are alphabetically ordered. This ordering is
   ;; used in lifetime info to refer to variables: the first entry is
@@ -96,7 +114,8 @@
   ;;   * the variable ID, when it has one
   ;;   * SC-offset of primary location, if it has one
   ;;   * SC-offset of save location, if it has one
-  (vars nil :type (or simple-vector null))
+  ;; Can either be a single value or a vector for multiple values.
+  (vars nil)
   ;; a vector of the packed binary representation of the
   ;; COMPILED-DEBUG-BLOCKs in this function, in the order that the
   ;; blocks were emitted. The first block is the start of the
@@ -109,37 +128,32 @@
   ;; Check whether this slot's data might have the same problem that
   ;; that slot's data did.
   (blocks nil :type (or (simple-array (unsigned-byte 8) (*)) null))
-  ;; If all code locations in this function are in the same top level
-  ;; form, then this is the number of that form, otherwise NIL. If
-  ;; NIL, then each code location represented in the BLOCKS specifies
-  ;; the TLF number.
-  (tlf-number nil :type (or index null))
   (form-number nil :type (or index null))
   ;; a vector describing the variables that the argument values are
   ;; stored in within this function. The locations are represented by
   ;; the ordinal number of the entry in the VARIABLES slot value. The
   ;; locations are in the order that the arguments are actually passed
-  ;; in, but special marker symbols can be interspersed to indicate
+  ;; in, but special negative numbers can be interspersed to indicate
   ;; the original call syntax:
   ;;
-  ;; DELETED
+  ;;  DEBUG-INFO-VAR-DELETED
   ;;    There was an argument to the function in this position, but it was
   ;;    deleted due to lack of references. The value cannot be recovered.
   ;;
-  ;; SUPPLIED-P
+  ;; DEBUG-INFO-VAR-SUPPLIED-P
   ;;    The following location is the supplied-p value for the preceding
   ;;    keyword or optional.
   ;;
-  ;; OPTIONAL-ARGS
+  ;; DEBUG-INFO-VAR-OPTIONAL
   ;;    Indicates that following unqualified args are optionals, not required.
   ;;
-  ;; REST-ARG
+  ;; DEBUG-INFO-VAR-REST
   ;;    The following location holds the list of rest args.
   ;;
-  ;; MORE-ARG
+  ;; DEBUG-INFO-VAR-MORE
   ;;    The following two locations are the more arg context and count.
   ;;
-  ;; <any other symbol>
+  ;; <symbol>
   ;;    The following location is the value of the &KEY argument with the
   ;;    specified name.
   ;;
@@ -149,7 +163,9 @@
   ;; VARIABLES are all required arguments, and are in the order they
   ;; appear in the VARIABLES vector. In other words, :MINIMAL stands
   ;; in for a vector where every element holds its index.
-  (arguments nil :type (or (simple-array * (*)) (member :minimal nil)))
+  ;;
+  ;; Can either be a single value or a vector for multiple values.
+  (arguments nil)
   ;; There are three alternatives for this slot:
   ;;
   ;; a VECTOR
@@ -168,14 +184,98 @@
   (return-pc (missing-arg) :type sc-offset)
   #!-fp-and-pc-standard-save
   (old-fp (missing-arg) :type sc-offset)
+  ;; An integer which contains between 2 and 4 varint-encoded fields:
+  ;; START-PC -
   ;; The earliest PC in this function at which the environment is properly
   ;; initialized (arguments moved from passing locations, etc.)
-  (start-pc (missing-arg) :type index)
+  ;; ELSEWHERE-PC -
   ;; The start of elsewhere code for this function (if any.)
-  (elsewhere-pc (missing-arg) :type index)
-  (closure-save nil :type (or sc-offset null))
-  #!+unwind-to-frame-and-call-vop
-  (bsp-save nil :type (or sc-offset null)))
+  ;; CLOSURE-SAVE, and BSP-SAVE.
+  (encoded-locs (missing-arg) :type unsigned-byte :read-only t))
+
+(defun cdf-encode-locs (start-pc elsewhere-pc closure-save
+                        #!+unwind-to-frame-and-call-vop bsp-save)
+  (dx-let ((bytes (make-array (* 5 4) :fill-pointer 0
+                                      :element-type '(unsigned-byte 8))))
+    ;; ELSEWHERE is encoded first to simplify the C backtrace logic,
+    ;; which does not need access to any of the subsequent fields.
+    (write-var-integer elsewhere-pc bytes)
+    (write-var-integer start-pc bytes)
+    #!+unwind-to-frame-and-call-vop
+    (write-var-integer (if bsp-save (1+ bsp-save) 0) bytes)
+    ;; More often the BSP-SAVE is non-null than CLOSURE-SAVE is non-null,
+    ;; so the encoding is potentially smaller with CLOSURE-SAVE being last.
+    (when closure-save
+      (write-var-integer (1+ closure-save) bytes))
+    (integer-from-octets bytes)))
+
+(defun cdf-decode-locs (cdf)
+  (let ((encoding (compiled-debug-fun-encoded-locs cdf))
+        (input-pointer 0))
+    (flet ((decode-varint (&aux (accumulator 0) (shift 0))
+             (loop
+              (let ((byte (ldb (byte 8 input-pointer) encoding)))
+                (incf input-pointer 8)
+                (setf accumulator (logior accumulator (ash (logand byte #x7f) shift)))
+                (incf shift 7)
+                (unless (logtest byte #x80) (return accumulator))))))
+      (let ((elsewhere-pc (decode-varint))
+            (start-pc (decode-varint))
+            #!+unwind-to-frame-and-call-vop
+            ;; 0 -> NULL, 1 -> 0, ...
+            (bsp-save (let ((i (decode-varint))) (unless (zerop i) (1- i))))
+            (closure-save (let ((i (decode-varint))) (unless (zerop i) (1- i)))))
+        (values start-pc elsewhere-pc closure-save
+                #!+unwind-to-frame-and-call-vop bsp-save)))))
+
+(macrolet ((def (index name)
+             `(defun ,name (cdf)
+                (nth-value ,index (cdf-decode-locs cdf)))))
+  (def 0 compiled-debug-fun-start-pc)
+  (def 1 compiled-debug-fun-elsewhere-pc)
+  ;; Most compiled-debug-funs don't need these
+  (def 2 compiled-debug-fun-closure-save)
+  #!+unwind-to-frame-and-call-vop (def 3 compiled-debug-fun-bsp-save))
+
+(def!struct (compiled-debug-fun-optional (:include compiled-debug-fun)
+                                         #-sb-xc-host (:pure t)
+                                         (:copier nil)
+                                         (:predicate nil)))
+(def!struct (compiled-debug-fun-more (:include compiled-debug-fun)
+                                     #-sb-xc-host (:pure t)
+                                     (:copier nil)
+                                     (:predicate nil)))
+(def!struct (compiled-debug-fun-external (:include compiled-debug-fun)
+                                         #-sb-xc-host (:pure t)
+                                         (:copier nil)
+                                         (:predicate nil)))
+(def!struct (compiled-debug-fun-toplevel (:include compiled-debug-fun)
+                                         #-sb-xc-host (:pure t)
+                                         (:copier nil)
+                                         (:predicate nil)))
+(def!struct (compiled-debug-fun-cleanup (:include compiled-debug-fun)
+                                        #-sb-xc-host (:pure t)
+                                        (:copier nil)
+                                        (:predicate nil)))
+
+(defun compiled-debug-fun-ctor (kind)
+  (ecase kind
+    (:optional #'make-compiled-debug-fun-optional)
+    (:more #'make-compiled-debug-fun-more)
+    (:external #'make-compiled-debug-fun-external)
+    (:toplevel #'make-compiled-debug-fun-toplevel)
+    (:cleanup #'make-compiled-debug-fun-cleanup)
+    ((nil) #'make-compiled-debug-fun)))
+
+(defun compiled-debug-fun-kind (debug-fun)
+  (etypecase debug-fun
+    (compiled-debug-fun-optional :optional)
+    (compiled-debug-fun-more :more)
+    (compiled-debug-fun-external :external)
+    (compiled-debug-fun-toplevel :toplevel)
+    (compiled-debug-fun-cleanup :cleanup)
+    (compiled-debug-fun nil)))
+
 
 ;;;; minimal debug function
 
@@ -233,7 +333,8 @@
 
 ;;; There is one per compiled file and one per function compiled at
 ;;; toplevel or loaded from source.
-(def!struct (debug-source #-sb-xc-host (:pure t))
+(def!struct (debug-source #-sb-xc-host (:pure t)
+                          (:copier nil))
   ;; (This is one of those structures where IWBNI we had multiple
   ;; inheritance.  The first four slots describe compilation of a
   ;; file, the fifth and sixth compilation of a form processed by
@@ -242,37 +343,35 @@
 
   ;; When the DEBUG-SOURCE describes a file, the file's namestring.
   ;; Otherwise, NIL.
-  (namestring nil :type (or null string))
+  (namestring nil :type (or null string) :read-only t)
   ;; the universal time that the source was written, or NIL if
   ;; unavailable
   (created nil :type (or unsigned-byte null))
-  ;; The FILE-POSITIONs of the truly top level forms read from this
-  ;; file (if applicable). The vector element type will be chosen to
-  ;; hold the largest element.
-  (start-positions nil :type (or (simple-array * (*)) null))
 
   ;; For functions processed by EVAL (including EVAL-WHEN and LOAD on
   ;; a source file), the source form.
-  (form nil :type list)
+  (form nil :type list :read-only nil)
   ;; This is the function whose source is the form.
-  (function nil)
+  (function nil :read-only t)
 
   ;; the universal time that the source was compiled
   (compiled (missing-arg) :type unsigned-byte)
   ;; Additional information from (WITH-COMPILATION-UNIT (:SOURCE-PLIST ...))
-  (plist *source-plist*))
+  (plist *source-plist* :read-only t))
 
 ;;;; DEBUG-INFO structures
 
-(def!struct debug-info
+(def!struct (debug-info
+             (:copier nil))
   ;; Some string describing something about the code in this component.
-  (name (missing-arg) :type t)
+  (name (missing-arg) :type t :read-only t)
   ;; A DEBUG-SOURCE structure describing where the code for this
   ;; component came from, in the order that forms were read.
   (source nil))
 
 (def!struct (compiled-debug-info
              (:include debug-info)
+             (:copier nil)
              #-sb-xc-host (:pure t))
   ;; a SIMPLE-VECTOR of alternating DEBUG-FUN objects and fixnum
   ;; PCs, used to map PCs to functions, so that we can figure out what
@@ -286,17 +385,12 @@
   ;; always careful to put our code in low memory. Is that how it
   ;; works? Would this break if we used a more general memory map? --
   ;; WHN 20000120
-  (fun-map (missing-arg) :type simple-vector :read-only t))
-
-(defvar *!initial-debug-sources*)
-
-(defun !debug-info-cold-init ()
-  (let ((now (get-universal-time)))
-    (dolist (debug-source *!initial-debug-sources*)
-      (let* ((namestring (debug-source-namestring debug-source))
-             (timestamp (file-write-date namestring)))
-        (setf (debug-source-created debug-source) timestamp
-              (debug-source-compiled debug-source) now)))))
+  (fun-map (missing-arg) :type simple-vector :read-only t)
+  ;; Location contexts
+  ;; Either a simple-vector or a context if there's only one context.
+  (contexts nil :type t :read-only t)
+  (tlf-number nil :type (or index null))
+  (char-offset nil :type (or index null)))
 
 ;;;; file reading
 ;;;;
@@ -318,24 +412,26 @@
                                 (princ (file-info-name s) stream)))))
   ;; If a file, the truename of the corresponding source file. If from
   ;; a Lisp form, :LISP. If from a stream, :STREAM.
-  (name (missing-arg) :type (or pathname (eql :lisp)))
+  (name (missing-arg) :type (or pathname (eql :lisp)) :read-only t)
   ;; the external format that we'll call OPEN with, if NAME is a file.
-  (external-format nil)
+  (external-format nil  :read-only t)
   ;; the defaulted, but not necessarily absolute file name (i.e. prior
   ;; to TRUENAME call.) Null if not a file. This is used to set
-  ;; *COMPILE-FILE-PATHNAME*, and if absolute, is dumped in the
-  ;; debug-info.
-  (untruename nil :type (or pathname null))
+  ;; *COMPILE-FILE-PATHNAME*, and if absolute (a harmful constraint to be sure),
+  ;; is dumped in the debug-info.
+  (untruename nil :type (or pathname null) :read-only t)
   ;; the file's write date (if relevant)
-  (write-date nil :type (or unsigned-byte null))
+  (write-date nil :type (or unsigned-byte null)  :read-only t)
   ;; parallel vectors containing the forms read out of the file and
   ;; the file positions that reading of each form started at (i.e. the
   ;; end of the previous form)
-  (forms (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
-  (positions (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
+  (forms (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t)
+                                                       :read-only t)
+  (positions (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t)
+                                                           :read-only t)
   ;; A vector of character ranges than span each subform in the TLF,
   ;; reset to empty for each one, updated by form-tracking-stream-observer.
-  (subforms nil :type (or null (vector t)) :read-only t)
+  (subforms nil :type (or null (vector t)) :read-only t :read-only t)
   ;; A list of objects about which the compile may/would/should have signaled
   ;; a style-warning in the :compile-toplevel situation, so we don't do it
   ;; again in the :load-toplevel situation.
@@ -354,11 +450,11 @@
                                   (s stream :type t :identity t))))
              (:copier nil))
   ;; the UT that compilation started at
-  (start-time (get-universal-time) :type unsigned-byte)
+  (start-time (get-universal-time) :type unsigned-byte :read-only t)
   ;; the IRT that compilation started at
-  (start-real-time (get-internal-real-time) :type unsigned-byte)
+  (start-real-time (get-internal-real-time) :type unsigned-byte :read-only t)
   ;; the FILE-INFO structure for this compilation
-  (file-info nil :type (or file-info null))
+  (file-info nil :type (or file-info null) :read-only t)
   ;; the stream that we are using to read the FILE-INFO, or NIL if
   ;; no stream has been opened yet
   (stream nil :type (or stream null))
@@ -368,4 +464,4 @@
   ;; if the current compilation is recursive (e.g., due to EVAL-WHEN
   ;; processing at compile-time), the invoking compilation's
   ;; source-info.
-  (parent nil :type (or source-info null)))
+  (parent nil :type (or source-info null) :read-only t))

@@ -1,20 +1,18 @@
 (in-package "SB!VM")
 
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Returns a string describing the type of the local machine."
   "HPPA")
 
 ;;;; FIXUP-CODE-OBJECT
-;FIX-lav: unify code with genesis.lisp fixup
-(defun fixup-code-object (code offset value kind)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset value kind &optional flavor)
+  (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (without-gcing
-   (let* ((sap (%primitive code-instructions code))
+   (let* ((sap (code-instructions code))
           (inst (sap-ref-32 sap offset)))
      (setf (sap-ref-32 sap offset)
            (ecase kind
@@ -50,32 +48,10 @@
                 (logior (ash bits 3)
                         (mask-field (byte 1 1) inst)
                         (mask-field (byte 3 13) inst)
-                        (mask-field (byte 11 21) inst)))))))))
+                        (mask-field (byte 11 21) inst))))))))))
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-int)
-  (context (* os-context-t)))
+#-sb-xc-host (progn
 
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (logandc2 (deref (context-pc-addr context)) 3)))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-int)
-  (context (* os-context-t))
-  (index int))
-
-;;; FIXME: Should this and CONTEXT-PC be INLINE to reduce consing?
-;;; (Are they used in anything time-critical, or just the debugger?)
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (context-register-addr context index)))
-
-(defun %set-context-register (context index new)
-(declare (type (alien (* os-context-t)) context))
-(setf (deref (context-register-addr context index))
-      new))
-
-#!+linux
 ;;; For now.
 (defun context-floating-point-modes (context)
   (declare (ignore context))
@@ -96,3 +72,4 @@
     (declare (type system-area-pointer pc))
     (values error-number
             (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
+) ; end PROGN

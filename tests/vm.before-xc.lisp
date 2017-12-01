@@ -18,16 +18,16 @@
 
 (flet ((yes (x)
          (assert
-          (eql (sc-number-or-lose 'immediate)
+          (eql immediate-sc-number
                (immediate-constant-sc x))))
        (no (x)
          (assert
           (not (immediate-constant-sc x)))))
   ;; target fixnums can be dealt with as immediates; target bignums
   ;; can not.
-  (yes #.sb-xc:most-positive-fixnum)
-  (yes #.sb-xc:most-negative-fixnum)
-  (no #.(1+ sb-xc:most-positive-fixnum))
-  (no #.(1- sb-xc:most-negative-fixnum)))
+  (yes #.sb!xc:most-positive-fixnum)
+  (yes #.sb!xc:most-negative-fixnum)
+  (no #.(1+ sb!xc:most-positive-fixnum))
+  (no #.(1- sb!xc:most-negative-fixnum)))
 
 (/show "done with tests/vm.before-xc.lisp")

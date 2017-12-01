@@ -91,7 +91,8 @@
   ;; constant, then the arguments will be swapped.
   commutative)
 
-(defstruct (fun-info #-sb-xc-host (:pure t))
+(defstruct (fun-info #-sb-xc-host (:pure t)
+                     (:copier nil))
   ;; boolean attributes of this function.
   (attributes (missing-arg) :type attributes)
   ;; TRANSFORM structures describing transforms for this function
@@ -122,6 +123,10 @@
   ;; can't be handled using the template mechanism. The COMBINATION
   ;; node and the IR2-BLOCK are passed as arguments.
   (ir2-convert nil :type (or function null))
+  ;; Called before IR2 conversion, just like IR2-CONVERT above
+  ;; Currently used for issuing warnings so that it doesn't intefere
+  ;; with things like CALL-FULL-LIKE-P due to IR2-CONVERT.
+  (ir2-hook nil :type (or function null))
   ;; If true, the function can stack-allocate the result. The
   ;; COMBINATION node is passed as an argument.
   (stack-allocate-result nil :type (or function null))
@@ -155,12 +160,9 @@
   ;; If non-null, the index of the argument which becomes the result
   ;; of the function.
   (result-arg nil :type (or index null))
-  ;; For functions with attributes FOLDABLE & CALL check that the
-  ;; arguments declared as CALLABLE or FUNCTION are foldable as well.
-  (foldable-call-check nil :type (or function null))
-  ;; A function that is called with lvars to check that the functions
-  ;; passed to CALLABLE arguments have the right argument counts.
-  (callable-check nil :type (or function null))
+  ;; A function that maps over callable arguments,
+  ;; Used by MAP-CALLABLE-ARGUMENTS
+  (callable-map nil :type (or function null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
   (call-type-deriver nil :type (or function null)))
 

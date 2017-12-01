@@ -24,9 +24,7 @@
 #define DEFAULT_CONTROL_STACK_SIZE (2*1024*1024)
 
 /* constants derived from the fundamental constants in passed by GENESIS */
-#ifdef LISP_FEATURE_GENCGC
-#define DEFAULT_DYNAMIC_SPACE_SIZE (DYNAMIC_SPACE_END - DYNAMIC_SPACE_START)
-#else
+#ifdef LISP_FEATURE_CHENEYGC
 #define DEFAULT_DYNAMIC_SPACE_SIZE (DYNAMIC_0_SPACE_END - DYNAMIC_0_SPACE_START)
 #endif
 #define READ_ONLY_SPACE_SIZE (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START)
@@ -89,7 +87,7 @@
 #define BINDING_STACK_RETURN_GUARD_PAGE(th) \
     (BINDING_STACK_GUARD_PAGE(th) - os_vm_page_size)
 
-extern void validate(void);
+extern void allocate_spaces(void);
 
 extern void
 protect_control_stack_hard_guard_page(int protect_p, struct thread *thread);

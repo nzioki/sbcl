@@ -198,7 +198,7 @@
 ;;; This needs to be used recursively, in case a non-trivial user
 ;;; defined ADD/REMOVE-DIRECT-METHOD method ends up calling another
 ;;; function using the same lock.
-(defvar *specializer-lock* (sb-thread:make-mutex :name "Specializer lock"))
+(define-load-time-global *specializer-lock* (sb-thread:make-mutex :name "Specializer lock"))
 
 (defmethod add-direct-method :around ((specializer specializer) method)
   ;; All the actions done under this lock are done in an order
@@ -280,7 +280,8 @@
 ;;; This table is shared between threads, so needs to be synchronized.
 ;;; (though insertions are only performed when holding the specializer-lock,
 ;;; so the preceding claim is probably overly paranoid.)
-(defvar *class-eq-specializer-methods* (make-hash-table :test 'eq :synchronized t))
+(define-load-time-global *class-eq-specializer-methods*
+    (make-hash-table :test 'eq :synchronized t))
 
 (defmethod specializer-method-table ((specializer class-eq-specializer))
   *class-eq-specializer-methods*)
@@ -326,15 +327,16 @@
 
 (defun real-load-defclass (name metaclass-name supers slots other
                            readers writers slot-names source-location &optional safe-p)
-  (with-single-package-locked-error (:symbol name "defining ~S as a class")
-    (%compiler-defclass name readers writers slot-names)
-    (let ((res (apply #'ensure-class name :metaclass metaclass-name
-                      :direct-superclasses supers
-                      :direct-slots slots
-                      :definition-source source-location
-                      'safe-p safe-p
-                      other)))
-      res)))
+  (sb-kernel::call-with-defining-class
+   'class name
+   (lambda ()
+     (sb-kernel::%%compiler-defclass name readers writers slot-names)
+     (apply #'ensure-class name :metaclass metaclass-name
+            :direct-superclasses supers
+            :direct-slots slots
+            :definition-source source-location
+            'safe-p safe-p
+            other))))
 
 (setf (gdefinition 'load-defclass) #'real-load-defclass)
 
@@ -365,7 +367,7 @@
                   (cond
                     ((eq class-or-name name)
                      (error "~@<Class named ~
-                             ~/sb-impl::print-symbol-with-prefix/ ~
+                             ~/sb-ext:print-symbol-with-prefix/ ~
                              specified as its own ~(~A~)class.~@:>"
                             class-or-name which))
                     ((find-class class-or-name (eq which :meta)))
@@ -499,10 +501,10 @@
 
 (defmethod invalid-superclass ((class class) (superclass class))
   (error 'invalid-superclass :class class :superclass superclass
-         :references (list* '(:amop :generic-function validate-superclass)
-                            (and (typep superclass 'built-in-class)
-                                 (list '(:ansi-cl :system-class built-in-class)
-                                       '(:ansi-cl :section (4 3 7)))))))
+         :references `((:amop :generic-function validate-superclass)
+                       ,@(when (typep superclass 'built-in-class)
+                           '((:ansi-cl :system-class built-in-class)
+                             (:ansi-cl :section (4 3 7)))))))
 
 (defmethod shared-initialize :after ((class forward-referenced-class)
                                      slot-names &key &allow-other-keys)
@@ -638,18 +640,18 @@
          (info (slot-definition-info slotd)))
     (setf (slot-info-reader info)
           (lambda (x)
-            (handler-case (condition-reader-function x slot-name)
+            (handler-case (condition-slot-value x slot-name)
               ;; FIXME: FIND-SLOT-DEFAULT throws an error if the slot
               ;; is unbound; maybe it should be a CELL-ERROR of some
               ;; sort?
               (error () (values (slot-unbound class x slot-name))))))
     (setf (slot-info-writer info)
           (lambda (v x)
-            (condition-writer-function x v slot-name)))
+            (set-condition-slot-value x v slot-name)))
     (setf (slot-info-boundp info)
           (lambda (x)
             (multiple-value-bind (v c)
-                (ignore-errors (condition-reader-function x slot-name))
+                (ignore-errors (condition-slot-value x slot-name))
               (declare (ignore v))
               (null c))))
     slotd))
@@ -920,7 +922,7 @@
 (define-condition cpl-protocol-violation (reference-condition error)
   ((class :initarg :class :reader cpl-protocol-violation-class)
    (cpl :initarg :cpl :reader cpl-protocol-violation-cpl))
-  (:default-initargs :references (list '(:sbcl :node "Metaobject Protocol")))
+  (:default-initargs :references '((:sbcl :node "Metaobject Protocol")))
   (:report
    (lambda (c s)
      (format s "~@<Protocol violation: the ~S class ~S ~
@@ -1029,7 +1031,7 @@
           (style-warn
            "~@<slot names with the same SYMBOL-NAME but ~
                   different SYMBOL-PACKAGE (possible package problem) ~
-                  for class ~S:~4I~@:_~<~@{~/sb-impl::print-symbol-with-prefix/~^~:@_~}~:>~@:>"
+                  for class ~S:~4I~@:_~<~@{~/sb-ext:print-symbol-with-prefix/~^~:@_~}~:>~@:>"
            class dupes)))
     (let* ((slot-name (slot-definition-name (car slots)))
            (oslots (and (not (eq (symbol-package slot-name)
@@ -1184,7 +1186,7 @@
                                   (push c (class-slot-cells from-class))
                                   c))))
                  (aver (consp cell))
-                 (if (eq +slot-unbound+ (cdr cell))
+                 (if (unbound-marker-p (cdr cell))
                      ;; We may have inherited an initfunction FIXME: Is this
                      ;; really right? Is the initialization in
                      ;; SHARED-INITIALIZE (STD-CLASS) not enough?
@@ -1487,7 +1489,7 @@
     (restart-case
         (bad-type value slot-type
                   "~@<Error during ~A. Current value in slot ~
-                   ~/sb-impl::print-symbol-with-prefix/ of an instance ~
+                   ~/sb-ext:print-symbol-with-prefix/ of an instance ~
                    of ~S is ~S, which does not match the new slot type ~
                    ~S in class ~S.~:@>"
                   context slot-name old-class value slot-type new-class)
@@ -1496,7 +1498,7 @@
         :report (lambda (stream)
                   (format stream "~@<Specify a new value to by used ~
                                   for slot ~
-                                  ~/sb-impl::print-symbol-with-prefix/ ~
+                                  ~/sb-ext:print-symbol-with-prefix/ ~
                                   instead of ~S.~@:>"
                           slot-name value))
         (setf value new-value))))
@@ -1505,7 +1507,7 @@
 (defun %set-slot-value-checking-type (context slots slot value
                                       safe old-class new-class)
   (setf (clos-slots-ref slots (slot-definition-location slot))
-        (if (and safe (neq value +slot-unbound+))
+        (if (and safe (not (unbound-marker-p value)))
             (let ((name (slot-definition-name slot))
                   (type (slot-definition-type slot)))
               (%ensure-slot-value-type context name type value
@@ -1513,8 +1515,6 @@
             value)))
 
 (defvar *in-obsolete-instance-trap* nil)
-(defvar *the-wrapper-of-structure-object*
-  (class-wrapper (find-class 'structure-object)))
 
 (define-condition obsolete-structure (error)
   ((datum :reader obsolete-structure-datum :initarg :datum))
@@ -1568,7 +1568,7 @@
          (dolist (old old-instance-slots)
            (let* ((name (slot-definition-name old))
                   (value (clos-slots-ref oslots (slot-definition-location old))))
-             (unless (eq value +slot-unbound+)
+             (unless (unbound-marker-p value)
                (let ((new (assq name layout)))
                  (cond (new
                         (set-value value new))
@@ -1605,8 +1605,7 @@
         instance added discarded plist)
 
        nwrapper))
-    (*in-obsolete-instance-trap*
-     *the-wrapper-of-structure-object*)
+    (*in-obsolete-instance-trap* #.(find-layout 'structure-object))
     (t
      (let ((*in-obsolete-instance-trap* t))
        (error 'obsolete-structure :datum instance)))))
@@ -1630,9 +1629,8 @@
                      return slot))
              (initarg-for-slot-p (slot)
                (dolist (slot-initarg (slot-definition-initargs slot))
-                 ;; Abuse +slot-unbound+
-                 (unless (eq +slot-unbound+
-                             (getf initargs slot-initarg +slot-unbound+))
+                 (unless (unbound-marker-p
+                          (getf initargs slot-initarg +slot-unbound+))
                    (return t))))
              (set-value (value slotd)
                (%set-slot-value-checking-type
@@ -1720,7 +1718,7 @@
   (declare (ignore initargs))
   (error "You can't change the class of ~S to ~S~@
           because it isn't already an instance with metaclass ~S."
-         instance new-class 'standard-class))
+         instance new-class 'funcallable-standard-class))
 
 (defmethod change-class ((instance funcallable-standard-object)
                          (new-class standard-class)
@@ -1728,7 +1726,7 @@
   (declare (ignore initargs))
   (error "You can't change the class of ~S to ~S~@
           because it isn't already an instance with metaclass ~S."
-         instance new-class 'funcallable-standard-class))
+         instance new-class 'standard-class))
 
 (defmethod change-class ((instance t) (new-class-name symbol) &rest initargs)
   (apply #'change-class instance (find-class new-class-name) initargs))
@@ -1753,7 +1751,7 @@
                        :format-control ,(coerce (format nil "~@<~A~@:>" control)
                                                 'base-string)
                        :format-arguments (list (class-name class))
-                       :references (list '(:amop :initialization "Class"))))))
+                       :references '((:amop :initialization "Class"))))))
   (def initialize-instance ((class system-class) &rest initargs)
     "Cannot initialize an instance of ~S.")
   (def reinitialize-instance ((class system-class) &rest initargs)

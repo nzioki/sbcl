@@ -78,10 +78,12 @@
   ((sb-kernel::name :type (satisfies legal-class-name-p)))
   (:report (lambda (condition stream)
              (format stream "~@<There is no class named ~
-                             ~/sb-impl:print-symbol-with-prefix/.~@:>"
+                             ~/sb-ext:print-symbol-with-prefix/.~@:>"
                      (sb-kernel::cell-error-name condition)))))
 
-(defvar *create-classes-from-internal-structure-definitions-p* t)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *create-classes-from-internal-structure-definitions-p* t))
+(declaim (always-bound *create-classes-from-internal-structure-definitions-p*))
 
 (declaim (ftype function ensure-non-standard-class))
 (defun find-class-from-cell (symbol cell &optional (errorp t))
@@ -113,10 +115,10 @@
            (member **boot-state** '(braid complete)))
       (let ((errorp (not (null (constant-form-value errorp))))
             (cell (make-symbol "CLASSOID-CELL")))
-        `(let ((,cell (load-time-value (find-classoid-cell ',symbol :create t))))
+        `(let ((,cell ,(find-classoid-cell symbol :create t)))
            (or (classoid-cell-pcl-class ,cell)
                ,(if errorp
-                    `(find-class-from-cell ',symbol ,cell t)
+                    `(find-class-from-cell ',symbol ,cell)
                     `(when (classoid-cell-classoid ,cell)
                        (find-class-from-cell ',symbol ,cell nil))))))
       form))
@@ -142,20 +144,16 @@
         (update-ctors 'setf-find-class :class new-value :name name))
       new-value)))
 
-(flet ((call-gf (gf-nameize action object slot-name env &optional newval)
+(flet ((call-gf (gf-nameize object slot-name env &optional newval)
          (aver (constantp slot-name env))
-         (let* ((slot-name (constant-form-value slot-name env))
-                (gf-name (funcall gf-nameize slot-name)))
-           `(funcall (load-time-value
-                      (progn (ensure-accessor ',action ',gf-name ',slot-name)
-                             (fdefinition ',gf-name)) t)
-                     ,@newval ,object))))
+         `(funcall #',(funcall gf-nameize (constant-form-value slot-name env))
+                   ,@newval ,object)))
   (defmacro accessor-slot-boundp (object slot-name &environment env)
-    (call-gf 'slot-boundp-name 'boundp object slot-name env))
+    (call-gf 'slot-boundp-name object slot-name env))
 
   (defmacro accessor-slot-value (object slot-name &environment env)
     `(truly-the (values t &optional)
-                ,(call-gf 'slot-reader-name 'reader object slot-name env)))
+                ,(call-gf 'slot-reader-name object slot-name env)))
 
   (defmacro accessor-set-slot-value (object slot-name new-value &environment env)
     ;; Expand NEW-VALUE before deciding not to bind a temp var for OBJECT,
@@ -174,8 +172,7 @@
           ;; into (funcall #'(setf F) ...), it does not insert any code to
           ;; enforce V as the overall value. So we do we do that here???
           (form `(let ((.new-value. ,new-value))
-                   ,(call-gf 'slot-writer-name 'writer object slot-name env
-                             '(.new-value.))
+                   ,(call-gf 'slot-writer-name object slot-name env '(.new-value.))
                    .new-value.)))
       (if bind-object
           `(let ,bind-object ,form)

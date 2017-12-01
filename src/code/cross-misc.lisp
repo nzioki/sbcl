@@ -23,20 +23,6 @@
   (declare (ignore name))
   `#'(lambda ,args ,@body))
 
-;;; Interrupt control isn't an issue in the cross-compiler: we don't
-;;; use address-dependent (and thus GC-dependent) hashes, and we only
-;;; have a single thread of control.
-(defmacro without-interrupts (&rest forms)
-  `(macrolet ((allow-with-interrupts (&body body)
-                `(progn ,@body))
-              (with-local-interrupts (&body body)
-                `(progn ,@body)))
-     ,@forms))
-
-(defmacro with-locked-hash-table ((table) &body body)
-  (declare (ignore table))
-  `(progn ,@body))
-
 (defmacro with-locked-system-table ((table) &body body)
   (declare (ignore table))
   `(progn ,@body))
@@ -48,6 +34,8 @@
            (symbol-value ',name)
            ,value)
        ,@doc)))
+
+(defmacro define-load-time-global (&rest args) `(defvar ,@args))
 
 ;;; The GENESIS function works with fasl code which would, in the
 ;;; target SBCL, work on ANSI-STREAMs (streams which aren't extended
@@ -198,3 +186,46 @@
 
 ;;; Avoid an unknown type reference from globaldb.
 (deftype fdefn () '(satisfies fdefn-p))
+
+;;; Avoid an unknown function reference from globaldb on some build
+;;; hosts.  It doesn't really matter what this function does: we don't
+;;; have FDEFN objects on the host anyway.
+(defun fdefn-p (x) (declare (ignore x)) nil)
+
+;;; Needed for constant-folding
+(defun system-area-pointer-p (x) x nil) ; nothing is a SAP
+;;; Needed for DEFINE-MOVE-FUN LOAD-SYSTEM-AREA-POINTER
+(defun sap-int (x) (error "can't take SAP-INT ~S" x))
+;;; Needed for FIXUP-CODE-OBJECT
+(defmacro without-gcing (&body body) `(progn ,@body))
+
+(defun logically-readonlyize (x) x)
+
+;;; Mainly for the fasl loader
+(defun %fun-name (f) (nth-value 2 (function-lambda-expression f)))
+
+;;;; Variables which have meaning only to the cross-compiler, defined here
+;;;; in lieu of #+sb-xc-host elsewere which messes up toplevel form numbers.
+(in-package "SB!C")
+
+;;; Set of function names whose definition will never be seen in make-host-2,
+;;; as they are deferred until warm load.
+;;; The table is populated by compile-cold-sbcl, and not present in the target.
+(defparameter *undefined-fun-whitelist* (make-hash-table :test 'equal))
+
+;;; The opposite of the whitelist - if certain full calls are seen, it is probably
+;;; the result of a missed transform and/or misconfiguration.
+(defparameter *full-calls-to-warn-about*
+  '(;mask-signed-field ;; Too many to fix
+    ))
+
+;;; Used by OPEN-FASL-OUTPUT
+(defun string-to-octets (string &key external-format)
+  (assert (eq external-format :utf-8))
+  (let* ((n (length string))
+         (a (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n a)
+      (let ((code (sb!xc:char-code (char string i))))
+        (unless (<= 0 code 127)
+          (setf code (sb!xc:char-code #\?)))
+        (setf (aref a i) code)))))

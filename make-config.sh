@@ -435,7 +435,10 @@ else
     case $sbcl_arch in
         x86|x86-64|arm64)
             case $sbcl_os in
-                linux)
+    # Be aware that if you use multiple threads on Darwin,
+    # it works well enough when threads don't interact much, but
+    # you might encounter https://bugs.launchpad.net/sbcl/+bug/901441
+                linux|darwin)
                     WITH_FEATURES="$WITH_FEATURES :sb-thread"
             esac
     esac
@@ -463,6 +466,7 @@ fi
 original_dir=`pwd`
 cd ./src/runtime/
 rm -f Config target-arch-os.h target-arch.h target-os.h target-lispregs.h
+rm -f sbcl.mk sbcl.o libsbcl.a
 # KLUDGE: these two logically belong in the previous section
 # ("architecture-dependent"); it seems silly to enforce this in terms
 # of the shell script, though. -- CSR, 2002-02-03
@@ -650,6 +654,8 @@ if [ "$sbcl_arch" = "x86" ]; then
         # of course it doesn't provide dlopen, but there is
         # roughly-equivalent magic nevertheless.
         printf ' :os-provides-dlopen' >> $ltf
+    else
+        printf ' :relocatable-heap' >> $ltf
     fi
     if [ "$sbcl_os" = "openbsd" ]; then
         rm -f src/runtime/openbsd-sigcontext.h
@@ -664,7 +670,12 @@ elif [ "$sbcl_arch" = "x86-64" ]; then
     printf ' :alien-callbacks :cycle-counter :complex-float-vops :raw-signed-word' >> $ltf
     printf ' :float-eql-vops :integer-eql-vop :inline-constants :memory-barrier-vops' >> $ltf
     printf ' :multiply-high-vops :sb-simd-pack :ash-right-vops :symbol-info-vops' >> $ltf
-
+    printf ' :undefined-fun-restarts' >> $ltf
+    case "$sbcl_os" in
+    linux | darwin | *bsd)
+        printf ' :immobile-space :immobile-code :compact-instance-header' >> $ltf
+        printf ' :relocatable-heap' >> $ltf
+    esac
 elif [ "$sbcl_arch" = "mips" ]; then
     printf ' :cheneygc :linkage-table' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
@@ -675,6 +686,7 @@ elif [ "$sbcl_arch" = "ppc" ]; then
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :linkage-table :raw-instance-init-vops :memory-barrier-vops' >> $ltf
     printf ' :compare-and-swap-vops :multiply-high-vops :alien-callbacks' >> $ltf
+    printf ' :relocatable-heap' >> $ltf
     if [ "$sbcl_os" = "linux" ]; then
         # Use a C program to detect which kind of glibc we're building on,
         # to bandage across the break in source compatibility between
@@ -701,7 +713,7 @@ elif [ "$sbcl_arch" = "sparc" ]; then
     # as well.
     sh tools-for-build/sparc-funcdef.sh > src/runtime/sparc-funcdef.h
     if [ "$sbcl_os" = "sunos" ] || [ "$sbcl_os" = "linux" ]; then
-        printf ' :gencgc' >> $ltf
+        printf ' :gencgc :relocatable-heap' >> $ltf
     else
         echo '***'
         echo '*** You are running SPARC on non-SunOS, non-Linux.  Since'
@@ -734,7 +746,7 @@ elif [ "$sbcl_arch" = "arm" ]; then
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
     printf ' :precise-arg-count-error :unwind-to-frame-and-call-vop' >> $ltf
-    printf ' :fp-and-pc-standard-save' >> $ltf
+    printf ' :fp-and-pc-standard-save :relocatable-heap' >> $ltf
 elif [ "$sbcl_arch" = "arm64" ]; then
     printf ' :64-bit :64-bit-registers :gencgc :linkage-table :fp-and-pc-standard-save' >> $ltf
     printf ' :alien-callbacks :precise-arg-count-error :inline-constants' >> $ltf
@@ -742,7 +754,8 @@ elif [ "$sbcl_arch" = "arm64" ]; then
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
     printf ' :unbind-n-vop :unwind-to-frame-and-call-vop :raw-signed-word' >> $ltf
-    printf ' :compare-and-swap-vops :memory-barrier-vops' >> $ltf
+    printf ' :compare-and-swap-vops :memory-barrier-vops :undefined-fun-restarts' >> $ltf
+    printf ' :relocatable-heap' >> $ltf
 else
     # Nothing need be done in this case, but sh syntax wants a placeholder.
     echo > /dev/null
@@ -775,7 +788,7 @@ if [ `uname` = "SunOS" ] ; then
   # use /usr/xpg4/bin/id instead of /usr/bin/id
   PATH=/usr/xpg4/bin:$PATH
 fi
-echo '"'`hostname`-`id -un`-`date +%Y-%m-%d-%H-%M-%S`'"' > output/build-id.tmp
+echo '"'`hostname`-`id -un`-`date +%Y-%m-%d-%H-%M-%S`'"' > output/build-id.inc
 
 if [ -n "$SBCL_HOST_LOCATION" ]; then
     echo //setting up host configuration

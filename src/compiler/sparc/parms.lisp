@@ -19,9 +19,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-;;; number of bits per byte where a byte is the smallest addressable object
-(defconstant n-byte-bits 8)
-
 ;;; flags for the generational garbage collector
 (defconstant pseudo-atomic-interrupted-flag 1)
 (defconstant pseudo-atomic-flag
@@ -95,6 +92,9 @@
 
 ;;;; Description of the target address space.
 
+#!+gencgc ; sensibly small read-only and static spaces
+(!gencgc-space-setup #x0f800000 :dynamic-space-start #x30000000)
+
 ;;; Where to put the different spaces.  Must match the C code!
 #!+(and linux cheneygc)
 (progn
@@ -113,20 +113,6 @@
   (defconstant dynamic-1-space-start #x40000000)
   (defconstant dynamic-1-space-end   #x48000000))
 
-#!+(and linux gencgc) ; sensibly small read-only and static spaces
-(progn
-  (defconstant linkage-table-space-start #x0f800000)
-  (defconstant linkage-table-space-end   #x10000000)
-
-  (defconstant read-only-space-start     #x11000000)
-  (defconstant read-only-space-end       #x110ff000)
-
-  (defconstant static-space-start        #x11100000)
-  (defconstant static-space-end          #x111ff000)
-
-  (defconstant dynamic-space-start       #x30000000)
-  (defconstant dynamic-space-end         (!configure-dynamic-space-end)))
-
 #!+(and sunos cheneygc) ; might as well start by trying the same numbers
 (progn
   (defconstant linkage-table-space-start #x0f800000)
@@ -144,21 +130,7 @@
   (defconstant dynamic-1-space-start     #x40000000)
   (defconstant dynamic-1-space-end       #x48000000))
 
-#!+(and sunos gencgc) ; sensibly small read-only and static spaces
-(progn
-  (defconstant linkage-table-space-start #x0f800000)
-  (defconstant linkage-table-space-end   #x10000000)
-
-  (defconstant read-only-space-start     #x11000000)
-  (defconstant read-only-space-end       #x110ff000)
-
-  (defconstant static-space-start        #x11100000)
-  (defconstant static-space-end          #x111ff000)
-
-  (defconstant dynamic-space-start       #x30000000)
-  (defconstant dynamic-space-end         (!configure-dynamic-space-end)))
-
-#!+netbsd ; Need a gap at 0x4000000 for shared libraries
+#!+(and netbsd cheneygc) ; Need a gap at 0x4000000 for shared libraries
 (progn
   (defconstant linkage-table-space-start #x0f800000)
   (defconstant linkage-table-space-end   #x10000000)
@@ -204,18 +176,17 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(#!+gencgc *restart-lisp-function*)))
+(defconstant-eqx +static-symbols+
+  `#(,@+common-static-symbols+)
+  #'equalp)
 
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+ two-arg-- two-arg-* two-arg-/ two-arg-< two-arg-> two-arg-=
     two-arg-<= two-arg->= two-arg-/= eql %negate
     two-arg-and two-arg-ior two-arg-xor two-arg-eqv
-    two-arg-gcd two-arg-lcm))
+    two-arg-gcd two-arg-lcm)
+  #'equalp)
 
 ;;;; Pseudo-atomic trap number
 

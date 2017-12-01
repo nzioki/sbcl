@@ -22,7 +22,6 @@
       (move rax-tn value)))
 
 (defun generate-fixnum-test (value)
-  #!+sb-doc
   "Set the Z flag if VALUE is fixnum"
   (inst test
         (cond ((sc-is value any-reg descriptor-reg)
@@ -381,7 +380,7 @@
     (let ((is-symbol-label (if not-p DROP-THRU target)))
       (inst cmp value nil-value)
       (inst jmp :e is-symbol-label)
-      (test-type value target not-p (symbol-header-widetag)))
+      (test-type value target not-p (symbol-widetag)))
     DROP-THRU))
 
 (define-vop (consp type-predicate)

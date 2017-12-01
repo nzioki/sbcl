@@ -18,7 +18,6 @@
 ;;; that expand into so large an expression that the resulting code
 ;;; bloat is not justifiable.
 (defun move (dst src)
-  #!+sb-doc
   "Move SRC into DST unless they are location=."
   (unless (location= dst src)
     (sc-case dst
@@ -129,7 +128,6 @@
   #!-sb-thread `(store-symbol-value ,reg *binding-stack-pointer*))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
    byte-ordering issues."
   (once-only ((n-target target)
@@ -155,6 +153,7 @@
 ;;; decision.
 
 (defun allocation-dynamic-extent (alloc-tn size lowtag)
+  (aver (not (location= alloc-tn rsp-tn)))
   (inst sub rsp-tn size)
   ;; see comment in x86/macros.lisp implementation of this
   ;; However that comment seems inapplicable here because:
@@ -164,24 +163,34 @@
   ;; - The real issue is that it's not obvious that the stack is
   ;;   16-byte-aligned at *all* times. Maybe it is, maybe it isn't.
   (inst and rsp-tn #.(lognot lowtag-mask))
-  (aver (not (location= alloc-tn rsp-tn)))
   (inst lea alloc-tn (make-ea :byte :base rsp-tn :disp lowtag))
   (values))
 
 ;;; This macro should only be used inside a pseudo-atomic section,
 ;;; which should also cover subsequent initialization of the
 ;;; object.
-(defun allocation-tramp (alloc-tn size lowtag
-                         &optional (result-tn alloc-tn))
+(defun allocation-tramp (result-tn size lowtag)
   (cond ((typep size '(and integer (not (signed-byte 32))))
          ;; MOV accepts large immediate operands, PUSH does not
-         (inst mov alloc-tn size)
-         (inst push alloc-tn))
+         (inst mov result-tn size)
+         (inst push result-tn))
         (t
          (inst push size)))
-  (inst mov alloc-tn (make-fixup "alloc_tramp" :foreign))
-  (inst call alloc-tn)
-  (inst pop result-tn)
+  ;; This really would be better if it recognized TEMP-REG-TN as the "good" case
+  ;; rather than specializing on R11, which just happens to be the temp reg.
+  ;; But the assembly routine is hand-written, not generated, and it has to match,
+  ;; so there's not much that can be done to generalize it.
+  (let* ((to-r11 (location= result-tn r11-tn))
+         (fixup (make-fixup (if to-r11
+                                'alloc-tramp-r11
+                                'alloc-tramp) :assembly-routine)))
+    (inst call (cond #!+immobile-code
+                     (sb!c::*code-is-immobile* fixup)
+                     (t (inst mov result-tn fixup)
+                        result-tn)))
+    (unless to-r11
+      (inst pop result-tn)))
+
   (when lowtag
     (inst or (reg-in-size result-tn :byte) lowtag))
   (values))
@@ -191,6 +200,20 @@
   (when dynamic-extent
     (allocation-dynamic-extent alloc-tn size lowtag)
     (return-from allocation (values)))
+  (aver (and (not (location= alloc-tn temp-reg-tn))
+             (or (integerp size) (not (location= size temp-reg-tn)))))
+
+  #!+(and (not sb-thread) sb-dynamic-core)
+  ;; We'd need a spare reg in which to load boxed_region from the linkage table.
+  ;; Probably could use r12 since it's reserved for the thread base,
+  ;; but that seems like the wrong answer, because r12 should be available
+  ;; to the register allocator when not using it as the thread base.
+  ;; Could push/pop any random register on the stack and own it temporarily,
+  ;; but seeing as nobody cared about this, just punt.
+  (allocation-tramp alloc-tn size lowtag)
+
+  #!-(and (not sb-thread) sb-dynamic-core)
+  ;; Otherwise do the normal inline allocation thing
   (let ((NOT-INLINE (gen-label))
         (DONE (gen-label))
         ;; Yuck.
@@ -198,42 +221,30 @@
         ;; thread->alloc_region.free_pointer
         (free-pointer
          #!+sb-thread
-         (make-ea :qword
-                  :base thread-base-tn :scale 1
+         (make-ea :qword :base thread-base-tn
                   :disp (* n-word-bytes thread-alloc-region-slot))
          #!-sb-thread
-         (make-ea :qword
-                  :scale 1 :disp
-                  (make-fixup "boxed_region" :foreign)))
+         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign)))
         ;; thread->alloc_region.end_addr
         (end-addr
          #!+sb-thread
-         (make-ea :qword
-                  :base thread-base-tn :scale 1
+         (make-ea :qword :base thread-base-tn
                   :disp (* n-word-bytes (1+ thread-alloc-region-slot)))
          #!-sb-thread
-         (make-ea :qword
-                  :scale 1 :disp
-                  (make-fixup "boxed_region" :foreign 8))))
+         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign 8))))
     (cond ((or in-elsewhere
-               #!+gencgc
                ;; large objects will never be made in a per-thread region
                (and (integerp size)
                     (>= size large-object-size)))
            (allocation-tramp alloc-tn size lowtag))
           (t
            (inst mov temp-reg-tn free-pointer)
-           (cond ((tn-p size)
-                  (if (location= alloc-tn size)
-                      (inst add alloc-tn temp-reg-tn)
-                      (inst lea alloc-tn
-                            (make-ea :qword :base temp-reg-tn :index size))))
-                 ((typep size '(signed-byte 31))
-                  (inst lea alloc-tn
-                        (make-ea :qword :base temp-reg-tn :disp size)))
-                 (t ; a doozy - 'disp' in an EA is too small for this size
-                  (inst mov alloc-tn temp-reg-tn)
-                  (inst add alloc-tn (constantize size))))
+           (cond ((integerp size)
+                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :disp size)))
+                 ((location= alloc-tn size)
+                  (inst add alloc-tn temp-reg-tn))
+                 (t
+                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :index size))))
            (inst cmp alloc-tn end-addr)
            (inst jmp :a NOT-INLINE)
            (inst mov free-pointer alloc-tn)
@@ -244,10 +255,10 @@
            (assemble (*elsewhere*)
              (emit-label NOT-INLINE)
              (cond ((numberp size)
-                    (allocation-tramp alloc-tn size nil temp-reg-tn))
+                    (allocation-tramp temp-reg-tn size nil))
                    (t
                     (inst sub alloc-tn free-pointer)
-                    (allocation-tramp alloc-tn alloc-tn nil temp-reg-tn)))
+                    (allocation-tramp temp-reg-tn alloc-tn nil)))
              (inst jmp DONE))))
     (values)))
 
@@ -271,7 +282,7 @@
 (defun emit-error-break (vop kind code values)
   (assemble ()
     #!-ud2-breakpoints
-    (inst int 3)                  ; i386 breakpoint instruction
+    (inst int #!+int4-breakpoints 4 #!-int4-breakpoints 3)
     ;; On Darwin, we need to use #x0b0f instead of int3 in order
     ;; to generate a SIGILL instead of a SIGTRAP as darwin/x86
     ;; doesn't seem to be reliably firing SIGTRAP
@@ -288,20 +299,26 @@
       (#.invalid-arg-count-trap) ; there is no "payload" in this trap kind
       (t
        (inst byte code)
-       (encode-internal-error-args values)))))
-
-(defun error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error. ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
+       (encode-internal-error-args
+        (mapcar (lambda (tn)
+                  (cond ((and (tn-p tn) (sc-is tn immediate))
+                         (aver (typep (tn-value tn) '(or symbol layout)))
+                         (make-sc-offset constant-sc-number (tn-offset tn)))
+                        (t
+                         tn)))
+                values))))))
 
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
+  (apply #'generate-error-code+ nil vop error-code values))
+
+(defun generate-error-code+ (preamble-emitter vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
+      (when preamble-emitter
+        (funcall preamble-emitter))
       (emit-error-break vop
                         (case error-code ; should be named ERROR-SYMBOL really
                           (invalid-arg-count-error invalid-arg-count-trap)
@@ -399,7 +416,9 @@
          ,@(when translate `((:translate ,translate)))
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg) :to :eval)
-              (index :scs (any-reg) :to :result)
+              (index :scs (,@(when (member translate '(%instance-cas %raw-instance-cas/word))
+                               '(immediate))
+                           any-reg) :to :eval)
               (old-value :scs ,scs :target rax)
               (new-value :scs ,scs))
        (:arg-types ,type tagged-num ,el-type ,el-type)
@@ -409,9 +428,12 @@
        (:result-types ,el-type)
        (:generator 5
          (move rax old-value)
-         (inst cmpxchg (make-ea :qword :base object :index index
-                                :scale (ash 1 (- word-shift n-fixnum-tag-bits))
-                                :disp (- (* ,offset n-word-bytes) ,lowtag))
+         (inst cmpxchg
+               (make-ea :qword :base object
+                        :index  (unless (sc-is index immediate) index)
+                        :scale (ash 1 (- word-shift n-fixnum-tag-bits))
+                        :disp (- (* (+ (if (sc-is index immediate) (tn-value index) 0)
+                                       ,offset) n-word-bytes) ,lowtag))
                new-value :lock)
          (move value rax)))))
 
@@ -568,61 +590,34 @@
                value)
          (move result value)))))
 
-;;; helper for alien stuff.
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  #!+sb-doc
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-collection."
-  (if objects
-      (let ((pins (make-gensym-list (length objects)))
-            (wpo (sb!xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
-        ;; BODY is stuffed in a function to preserve the lexical
-        ;; environment.
-        `(flet ((,wpo () (progn ,@body)))
-           ;; The cross-compiler prints either "unknown type: COMPILER-NOTE" at
-           ;; each use of W-P-O prior to 'ir1report' being compiled, or else
-           ;; "could not stack allocate". Kill it with fire :-(
-           (declare (muffle-conditions #+sb-xc compiler-note #-sb-xc t))
-           ;; PINS are dx-allocated in case the compiler for some
-           ;; unfathomable reason decides to allocate value-cells
-           ;; for them -- since we have DX value-cells on x86oid
-           ;; platforms this still forces them on the stack.
-           (dx-let ,(mapcar #'list pins objects)
-             (multiple-value-prog1 (,wpo)
-               ;; TOUCH-OBJECT has a VOP with an empty body: compiler
-               ;; thinks we're using the argument and doesn't flush
-               ;; the variable, but we don't have to pay any extra
-               ;; beyond that -- and MULTIPLE-VALUE-PROG1 keeps them
-               ;; live till the body has finished. *whew*
-               ,@(mapcar (lambda (pin)
-                           `(touch-object ,pin))
-                         pins)))))
-      `(progn ,@body)))
-
-;;; Emit the most compact form of the test immediate instruction,
-;;; using an 8 bit test when the immediate is only 8 bits and the
-;;; value is one of the four low registers (rax, rbx, rcx, rdx) or the
-;;; control stack.
-(defun emit-optimized-test-inst (x y)
-  (typecase y
-    ((unsigned-byte 7)
-     ;; If we knew that the sign bit would not be tested, this could
-     ;; handle (unsigned-byte 8) constants. But since we don't know,
-     ;; we assume that it's not ok to change the test such that the S flag
-     ;; comes out possibly differently.
-     (let ((offset (tn-offset x)))
-       (cond ((and (sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
-                   (or (= offset rax-offset) (= offset rbx-offset)
-                       (= offset rcx-offset) (= offset rdx-offset)))
-              (inst test (reg-in-size x :byte) y))
-             ((sc-is x control-stack)
-              (inst test (make-ea :byte :base rbp-tn
-                                  :disp (frame-byte-offset offset))
-                    y))
-             (t
-              (inst test x y)))))
-    (t
-     (inst test x y))))
+;;; Emit the most compact form of the test immediate instruction
+;;; by using the smallest operand size that is the large enough to hold
+;;; the immediate value Y. The operand size makes no difference since the result
+;;; of the implied AND is not written back to a register. However, if the msb
+;;; (the sign bit) of the immediate at a smaller size is 1 but at its true size
+;;; (always a :QWORD) is 0, the S flag value could come out 1 instead of 0.
+;;; SIGN-BIT-MATTERS specifies that a shorter operand size must not be selected
+;;; if doing so could affect whether the sign flag comes out the same.
+;;; e.g. if EDX is #xff, "TEST EDX, #x80" indicates a non-negative result
+;;; whereas "TEST DL, #x80" indicates a negative result.
+(defun emit-optimized-test-inst (x y sign-bit-matters)
+  (let* ((size-override
+          (cond ((or (typep y '(unsigned-byte 7))
+                     (and (typep y '(unsigned-byte 8)) (not sign-bit-matters)))
+                 :byte)
+                ((or (typep y '(unsigned-byte 15))
+                     (and (typep y '(unsigned-byte 16)) (not sign-bit-matters)))
+                 :word)
+                ((or (typep y '(unsigned-byte 31))
+                     (and (typep y '(unsigned-byte 32)) (not sign-bit-matters)))
+                 :dword)))
+         (offset (tn-offset x))
+         (modified-x
+          (when size-override
+            (cond ((sc-is x control-stack)
+                   ;; TODO: a 7- or 8-bit pattern that does not span bytes
+                   ;; should be testable as a :BYTE by suitably altering :DISP.
+                   (make-ea size-override :base rbp-tn :disp (frame-byte-offset offset)))
+                  ((sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
+                   (reg-in-size x size-override))))))
+    (inst test (or modified-x x) y)))

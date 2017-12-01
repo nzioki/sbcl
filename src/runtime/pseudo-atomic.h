@@ -18,10 +18,14 @@
 
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
 
-#define set_alloc_pointer(value)                \
-    SetSymbolValue(ALLOCATION_POINTER, value, 0)
-#define get_alloc_pointer()                     \
-    SymbolValue(ALLOCATION_POINTER, 0)
+#define set_alloc_pointer(value) dynamic_space_free_pointer = (lispobj*)(value)
+#define get_alloc_pointer() (dynamic_space_free_pointer)
+
+#ifdef LISP_FEATURE_SB_THREAD
+# define THREAD_PA_BITS(thread) thread->pseudo_atomic_bits
+#else
+# define THREAD_PA_BITS(thread) SYMBOL(PSEUDO_ATOMIC_BITS)->value
+#endif
 
 #if defined(LISP_FEATURE_X86)
 #define LISPOBJ_ASM_SUFFIX "l"
@@ -32,13 +36,13 @@
 static inline int
 get_pseudo_atomic_atomic(struct thread *thread)
 {
-    return SymbolValue(PSEUDO_ATOMIC_BITS, thread) & (~1);
+    return (THREAD_PA_BITS(thread) & (~1)) != 0;
 }
 
 static inline void
 set_pseudo_atomic_atomic(struct thread *thread)
 {
-    lispobj *p = SymbolValueAddress(PSEUDO_ATOMIC_BITS, thread);
+    lispobj *p = &THREAD_PA_BITS(thread);
     if (*p)
         lose("set_pseudo_atomic_atomic: pseudo atomic bits is %d.", *p);
     __asm__ __volatile__
@@ -51,7 +55,7 @@ set_pseudo_atomic_atomic(struct thread *thread)
 static inline void
 clear_pseudo_atomic_atomic(struct thread *thread)
 {
-    lispobj *p = SymbolValueAddress(PSEUDO_ATOMIC_BITS, thread);
+    lispobj *p = &THREAD_PA_BITS(thread);
     __asm__ __volatile__
         ("and" LISPOBJ_ASM_SUFFIX " %0,%1"
          :
@@ -62,7 +66,7 @@ clear_pseudo_atomic_atomic(struct thread *thread)
 static inline int
 get_pseudo_atomic_interrupted(struct thread *thread)
 {
-    return SymbolValue(PSEUDO_ATOMIC_BITS, thread) & 1;
+    return THREAD_PA_BITS(thread) & 1;
 }
 
 static inline void
@@ -70,7 +74,7 @@ set_pseudo_atomic_interrupted(struct thread *thread)
 {
     if (!get_pseudo_atomic_atomic(thread))
         lose("set_pseudo_atomic_interrupted not in pseudo atomic");
-    lispobj *p = SymbolValueAddress(PSEUDO_ATOMIC_BITS, thread);
+    lispobj *p = &THREAD_PA_BITS(thread);
     __asm__ __volatile__
         ("or" LISPOBJ_ASM_SUFFIX " %0,%1"
          :
@@ -83,7 +87,7 @@ clear_pseudo_atomic_interrupted(struct thread *thread)
 {
     if (get_pseudo_atomic_atomic(thread))
         lose("clear_pseudo_atomic_interrupted in pseudo atomic");
-    lispobj *p = SymbolValueAddress(PSEUDO_ATOMIC_BITS, thread);
+    lispobj *p = &THREAD_PA_BITS(thread);
     __asm__ __volatile__
         ("and" LISPOBJ_ASM_SUFFIX " %0,%1"
          :
@@ -121,7 +125,7 @@ get_pseudo_atomic_interrupted(struct thread *thread)
 static inline void
 set_pseudo_atomic_interrupted(struct thread *thread)
 {
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, do_pending_interrupt, thread);
+    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, (lispobj)do_pending_interrupt, thread);
 }
 
 static inline void
@@ -176,7 +180,12 @@ clear_pseudo_atomic_interrupted(struct thread *thread)
      = (lispobj*) ((uword_t) dynamic_space_free_pointer | flag_PseudoAtomicInterrupted))
 #endif
 
-#endif
+#else /* CHENEYGC */
+
+#define set_alloc_pointer(value) dynamic_space_free_pointer = (lispobj*)(value)
+#define get_alloc_pointer() (dynamic_space_free_pointer)
+
+#endif /* defined(LISP_FEATURE_GENCGC) */
 
 #if defined LISP_FEATURE_ARM || defined LISP_FEATURE_ARM64
 #define set_alloc_pointer(value)                \

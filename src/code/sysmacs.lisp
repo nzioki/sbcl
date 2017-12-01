@@ -11,19 +11,19 @@
 
 (in-package "SB!IMPL")
 
-;;;; these are initialized in cold init
+;;;; these are initialized by create_thread_struct()
 
-(!defvar *in-without-gcing* nil)
-(!defvar *gc-inhibit* t)
+(defvar *in-without-gcing*)
+(defvar *gc-inhibit*)
 
 ;;; When the dynamic usage increases beyond this amount, the system
 ;;; notes that a garbage collection needs to occur by setting
 ;;; *GC-PENDING* to T. It starts out as NIL meaning nobody has figured
 ;;; out what it should be yet.
-(!defvar *gc-pending* nil)
+(defvar *gc-pending*)
 
 #!+sb-thread
-(!defvar *stop-for-gc-pending* nil)
+(defvar *stop-for-gc-pending*)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (dolist (symbol '(*gc-inhibit* *in-without-gcing*
@@ -38,7 +38,6 @@
 (defvar sb!vm::*pinned-objects*)
 
 (defmacro without-gcing (&body body)
-  #!+sb-doc
   "Executes the forms in the body without doing a garbage collection. It
 inhibits both automatically and explicitly triggered collections. Finally,
 upon leaving the BODY if gc is not inhibited it runs the pending gc.
@@ -85,14 +84,12 @@ maintained."
 
 ;;; These macros handle the special cases of T and NIL for input and
 ;;; output streams.
-;;; It is unfortunate that the names connote synonym-streams being involved.
-;;; Perhaps {IN,OUT}-STREAM-FROM-DESIGNATOR would have been better.
-;;; And shouldn't the high-security feature check that if either NIL or T
-;;; is given, the designated stream has the right directionality?
-;;; Nothing prevents *TERMINAL-IO* from being bound to an output-only stream.
+;;; FIXME: should we kill the high-security feature? Or, if enabled,
+;;; ensure that the designated stream has the right directionality?
+;;; (Nothing prevents *TERMINAL-IO* from being bound to an output-only stream, e.g.)
 ;;;
 ;;; FIXME: Shouldn't these be functions instead of macros?
-(defmacro in-synonym-of (stream)
+(defmacro in-stream-from-designator (stream)
   (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-input*)
@@ -117,7 +114,7 @@ maintained."
               ((t) '*terminal-io*)
               (t (return x))))))
 |#
-(defmacro out-synonym-of (stream)
+(defmacro out-stream-from-designator (stream)
   (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-output*)
@@ -136,7 +133,7 @@ maintained."
 ;;; STREAM with the ARGS for ANSI-STREAMs, or the FUNCTION with the
 ;;; ARGS for FUNDAMENTAL-STREAMs.
 (defmacro with-in-stream (stream (slot &rest args) &optional stream-dispatch)
-  `(let ((stream (in-synonym-of ,stream)))
+  `(let ((stream (in-stream-from-designator ,stream)))
     ,(if stream-dispatch
          `(if (ansi-stream-p stream)
               (funcall (,slot stream) stream ,@args)
@@ -145,7 +142,7 @@ maintained."
                        `(,function stream ,@args)))))
          `(funcall (,slot stream) stream ,@args))))
 
-(defmacro with-out-stream/no-synonym (stream (slot &rest args) &optional stream-dispatch)
+(defmacro %with-out-stream (stream (slot &rest args) &optional stream-dispatch)
   `(let ((stream ,stream))
     ,(if stream-dispatch
          `(if (ansi-stream-p stream)
@@ -156,8 +153,9 @@ maintained."
          `(funcall (,slot stream) stream ,@args))))
 
 (defmacro with-out-stream (stream (slot &rest args) &optional stream-dispatch)
-  `(with-out-stream/no-synonym (out-synonym-of ,stream)
-    (,slot ,@args) ,stream-dispatch))
+  `(%with-out-stream (out-stream-from-designator ,stream)
+                     (,slot ,@args)
+                     ,stream-dispatch))
 
 
 ;;;; These are hacks to make the reader win.

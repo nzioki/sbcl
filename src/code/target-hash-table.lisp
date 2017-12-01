@@ -14,6 +14,15 @@
 
 ;;;; utilities
 
+(defun hash-table-weakness (ht)
+  "Return the WEAKNESS of HASH-TABLE which is one of NIL, :KEY,
+:VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE."
+  (aref weak-hash-table-kinds (hash-table-%weakness ht)))
+
+(declaim (inline hash-table-weak-p))
+(defun hash-table-weak-p (ht)
+  (not (zerop (hash-table-%weakness ht))))
+
 ;;; Code for detecting concurrent accesses to the same table from
 ;;; multiple threads. Only compiled in when the :SB-HASH-TABLE-DEBUG
 ;;; feature is enabled. The main reason for the existence of this code
@@ -126,8 +135,6 @@
 
 ;;;; user-defined hash table tests
 
-(defvar *user-hash-table-tests* nil)
-
 (defun register-hash-table-test (name hash-fun)
   (declare (symbol name) (function hash-fun))
   (unless (fboundp name)
@@ -148,7 +155,6 @@
   name)
 
 (defmacro define-hash-table-test (name hash-function)
-  #!+sb-doc
   "Defines NAME as a new kind of hash table test for use with the :TEST
 argument to MAKE-HASH-TABLE, and associates a default HASH-FUNCTION with it.
 
@@ -218,6 +224,22 @@ Examples:
 (defconstant +min-hash-table-size+ 16)
 (defconstant +min-hash-table-rehash-threshold+ (float 1/16 1.0))
 
+;; The GC will set this to 1 if it moves an EQ-based key. This used
+;; to be signaled by a bit in the header of the kv vector, but that
+;; implementation caused some concurrency issues when we stopped
+;; inhibiting GC during hash-table lookup.
+;;
+;; This indicator properly belongs to the k/v vector for at least 2 reasons:
+;; - if the vector is on an already-written page but the table is not,
+;;   it avoids a write fault when setting to true. This a boon to gencgc
+;; - if there were lock-free tables - which presumably operate by atomically
+;;   changing out the vector for a new one - whether the vector is bucketized
+;;   correctly after GC is an aspect of the vector, not the table
+;;
+;; We could do it with a single bit by implementing vops for atomic
+;; read/modify/write on the header. In C there's sync_or_and_fetch, etc.
+(defmacro kv-vector-needs-rehash (vector) `(svref ,vector 1))
+
 (defun make-hash-table (&key
                         (test 'eql)
                         (size +min-hash-table-size+)
@@ -226,7 +248,6 @@ Examples:
                         (hash-function nil)
                         (weakness nil)
                         (synchronized))
-  #!+sb-doc
   "Create and return a new hash table. The keywords are as follows:
 
   :TEST
@@ -363,6 +384,10 @@ Examples:
            (scaled-size (truncate (/ (float size+1) rehash-threshold)))
            (length (power-of-two-ceiling (max scaled-size
                                               (1+ +min-hash-table-size+))))
+           ;; FIXME: this is completely insane for 64-bit.
+           ;; We can not possibly support hash-tables that need
+           ;; such large indices. It doesn't work.
+           ;; Reducing this to (unsigned-byte 32) would save memory.
            (index-vector (make-array length
                                      :element-type
                                      '(unsigned-byte #.sb!vm:n-word-bits)
@@ -383,16 +408,18 @@ Examples:
                    rehash-threshold
                    size
                    kv-vector
-                   weakness
+                   (position weakness weak-hash-table-kinds :test #'eq)
                    index-vector
                    next-vector
                    (unless (eq test 'eq)
+                     ;; See FIXME at INDEX-VECTOR. Same concern.
                      (make-array size+1
                                  :element-type '(unsigned-byte
                                                  #.sb!vm:n-word-bits)
                                  :initial-element +magic-hash-vector-value+))
                    synchronized)))
       (declare (type index size+1 scaled-size length))
+      (setf (kv-vector-needs-rehash kv-vector) 0)
       ;; Set up the free list, all free. These lists are 0 terminated.
       (do ((i 1 (1+ i)))
           ((>= i size))
@@ -403,39 +430,28 @@ Examples:
       table)))
 
 (defun hash-table-count (hash-table)
-  #!+sb-doc
   "Return the number of entries in the given HASH-TABLE."
   (declare (type hash-table hash-table)
            (values index))
   (hash-table-number-entries hash-table))
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-rehash-size 'function)
       "Return the rehash-size HASH-TABLE was created with.")
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-rehash-threshold 'function)
       "Return the rehash-threshold HASH-TABLE was created with.")
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-synchronized-p 'function)
       "Returns T if HASH-TABLE is synchronized.")
 
 (defun hash-table-size (hash-table)
-  #!+sb-doc
   "Return a size that can be used with MAKE-HASH-TABLE to create a hash
    table that can hold however many entries HASH-TABLE can hold without
    having to be grown."
   (hash-table-rehash-trigger hash-table))
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-test 'function)
       "Return the test HASH-TABLE was created with.")
-
-#!+sb-doc
-(setf (fdocumentation 'hash-table-weakness 'function)
-      "Return the WEAKNESS of HASH-TABLE which is one of NIL, :KEY,
-:VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE.")
 
 ;;; Called when we detect circular chains in a hash-table.
 (defun signal-corrupt-hash-table (hash-table)
@@ -484,8 +500,14 @@ multiple threads accessing the same hash-table without locking."
     ;; Disable GC tricks on the OLD-KV-VECTOR.
     (set-header-data old-kv-vector sb!vm:vector-normal-subtype)
 
+    ;; GC must never observe a value other than 0 or 1 in the 1st element
+    ;; of a vector marked as valid-hashing. The vector is initially filled
+    ;; with the unbound-marker, so rectify that. GC is inhibited (asserted
+    ;; on entry), so the store order here isn't terribly important.
+    (setf (kv-vector-needs-rehash new-kv-vector) 0)
+
     ;; Non-empty weak hash tables always need GC support.
-    (when (and (hash-table-weakness table) (plusp (hash-table-count table)))
+    (when (and (hash-table-weak-p table) (plusp (hash-table-count table)))
       (set-header-data new-kv-vector sb!vm:vector-valid-hashing-subtype))
 
     ;; FIXME: here and in several other places in the hash table code,
@@ -512,8 +534,7 @@ multiple threads accessing the same hash-table without locking."
       (declare (type index/2 i))
       (let ((key (aref new-kv-vector (* 2 i)))
             (value (aref new-kv-vector (1+ (* 2 i)))))
-        (cond ((and (eq key +empty-ht-slot+)
-                    (eq value +empty-ht-slot+))
+        (cond ((and (empty-ht-slot-p key) (empty-ht-slot-p value))
                ;; Slot is empty, push it onto the free list.
                (setf (aref new-next-vector i)
                      (hash-table-next-free-kv table))
@@ -549,10 +570,9 @@ multiple threads accessing the same hash-table without locking."
     (setf (hash-table-hash-vector table) new-hash-vector)
     ;; Fill the old kv-vector with 0 to help the conservative GC. Even
     ;; if nothing else were zeroed, it's important to clear the
-    ;; special first cells in old-kv-vector.
+    ;; special first cell in old-kv-vector.
     (fill old-kv-vector 0)
-    (setf (hash-table-rehash-trigger table) new-size)
-    (setf (hash-table-needs-rehash-p table) nil))
+    (setf (hash-table-rehash-trigger table) new-size))
   (values))
 
 ;;; Use the same size as before, re-using the vectors.
@@ -568,7 +588,7 @@ multiple threads accessing the same hash-table without locking."
     (declare (type index size length))
 
     ;; Non-empty weak hash tables always need GC support.
-    (unless (and (hash-table-weakness table) (plusp (hash-table-count table)))
+    (unless (and (hash-table-weak-p table) (plusp (hash-table-count table)))
       ;; Disable GC tricks, they will be re-enabled during the re-hash
       ;; if necessary.
       (set-header-data kv-vector sb!vm:vector-normal-subtype))
@@ -584,8 +604,7 @@ multiple threads accessing the same hash-table without locking."
       (declare (type index/2 i))
       (let ((key (aref kv-vector (* 2 i)))
             (value (aref kv-vector (1+ (* 2 i)))))
-        (cond ((and (eq key +empty-ht-slot+)
-                    (eq value +empty-ht-slot+))
+        (cond ((and (empty-ht-slot-p key) (empty-ht-slot-p value))
                ;; Slot is empty, push it onto free list.
                (setf (aref next-vector i) (hash-table-next-free-kv table))
                (setf (hash-table-next-free-kv table) i))
@@ -610,21 +629,21 @@ multiple threads accessing the same hash-table without locking."
                           (type hash hashing))
                  ;; Push this slot into the next chain.
                  (setf (aref next-vector i) next)
-                 (setf (aref index-vector index) i)))))))
+                 (setf (aref index-vector index) i))))))
   ;; Clear the rehash bit only at the very end, otherwise another thread
   ;; might see a partially rehashed table as a normal one.
-  (setf (hash-table-needs-rehash-p table) nil)
+    (setf (kv-vector-needs-rehash kv-vector) 0))
   (values))
 
 (declaim (inline maybe-rehash))
 (defun maybe-rehash (hash-table ensure-free-slot-p)
-  (when (hash-table-weakness hash-table)
+  (when (hash-table-weak-p hash-table)
     (aver *gc-inhibit*))
   (flet ((rehash-p ()
            (and ensure-free-slot-p
                 (zerop (hash-table-next-free-kv hash-table))))
          (rehash-without-growing-p ()
-           (hash-table-needs-rehash-p hash-table)))
+           (not (eql 0 (kv-vector-needs-rehash (hash-table-table hash-table))))))
     (declare (inline rehash-p rehash-without-growing-p))
     (cond ((rehash-p)
            ;; Use recursive locks since for weak tables the lock has
@@ -645,7 +664,7 @@ multiple threads accessing the same hash-table without locking."
 
 (declaim (inline update-hash-table-cache))
 (defun update-hash-table-cache (hash-table index)
-  (unless (hash-table-weakness hash-table)
+  (unless (hash-table-weak-p hash-table)
     (setf (hash-table-cache hash-table) index)))
 
 (defmacro with-hash-table-locks ((hash-table
@@ -658,7 +677,7 @@ multiple threads accessing the same hash-table without locking."
               (with-concurrent-access-check ,hash-table ,operation
                 (locally (declare (inline ,@inline))
                   ,@body))))
-       (if (hash-table-weakness ,hash-table)
+       (if (hash-table-weak-p ,hash-table)
            (sb!thread::with-recursive-system-lock
                ((hash-table-lock ,hash-table) :without-gcing t)
              (,body-fun))
@@ -673,7 +692,6 @@ multiple threads accessing the same hash-table without locking."
                  (,body-fun)))))))
 
 (defun gethash (key hash-table &optional default)
-  #!+sb-doc
   "Finds the entry in HASH-TABLE whose key is KEY and returns the
 associated value and T as multiple values, or returns DEFAULT and NIL
 if there is no such entry. Entries can be added using SETF."
@@ -789,7 +807,7 @@ if there is no such entry. Entries can be added using SETF."
            (hash-vector (hash-table-hash-vector hash-table))
            (test-fun (hash-table-test-fun hash-table)))
       (declare (type index index next))
-      (when (hash-table-weakness hash-table)
+      (when (hash-table-weak-p hash-table)
         (set-header-data kv-vector sb!vm:vector-valid-hashing-subtype))
       (cond ((or eq-based (not hash-vector))
              (when eq-based
@@ -946,7 +964,6 @@ if there is no such entry. Entries can be added using SETF."
                      (clear-slot next-vector prior next))))))))))
 
 (defun remhash (key hash-table)
-  #!+sb-doc
   "Remove the entry in HASH-TABLE associated with KEY. Return T if
 there was such an entry, or NIL if not."
   (declare (type hash-table hash-table)
@@ -957,7 +974,6 @@ there was such an entry, or NIL if not."
     (%remhash key hash-table)))
 
 (defun clrhash (hash-table)
-  #!+sb-doc
   "This removes all the entries from HASH-TABLE and returns the hash
 table itself."
   (when (plusp (hash-table-number-entries hash-table))
@@ -972,6 +988,7 @@ table itself."
         ;; Mark all slots as empty by setting all keys and values to magic
         ;; tag.
         (aver (eq (aref kv-vector 0) hash-table))
+        (setf (kv-vector-needs-rehash kv-vector) 0)
         (fill kv-vector +empty-ht-slot+ :start 2)
         ;; Set up the free list, all free.
         (do ((i 1 (1+ i)))

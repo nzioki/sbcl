@@ -58,7 +58,6 @@
   (frob function))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
   byte-ordering issues."
   (once-only ((n-target target)
@@ -206,7 +205,7 @@
      ;; it.
      #!+gencgc
      (t
-      (inst li ,temp-tn (make-fixup "boxed_region" :foreign))
+      (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
       (loadw ,result-tn ,temp-tn 0)     ;boxed_region.free_pointer
       (loadw ,temp-tn ,temp-tn 1)       ;boxed_region.end_addr
 
@@ -234,7 +233,7 @@
           ;; Kludge: We ought to have two distinct FLAG-TN and TEMP-TN
           ;; here, to avoid the SUB and the TEMP-TN reload which is
           ;; causing it.  PPC gets it right.
-          (inst li ,temp-tn (make-fixup "boxed_region" :foreign))
+          (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
           (storew ,result-tn ,temp-tn 0)
 
           (inst b done)
@@ -294,11 +293,6 @@
     (encode-internal-error-args values)
     (emit-alignment word-shift)))
 
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
-
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
@@ -324,19 +318,3 @@
         (inst andcc zero-tn alloc-tn 3)
         ;; The C code needs to process this correctly and fixup alloc-tn.
         (inst t :ne pseudo-atomic-trap)))))
-
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  #!-gencgc
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  #!-gencgc
-  `(without-gcing
-    ,@body)
-  #!+gencgc
-  `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
-     (declare (truly-dynamic-extent *pinned-objects*))
-     ,@body))

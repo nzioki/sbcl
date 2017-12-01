@@ -37,14 +37,17 @@ os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *contex
 
 void arch_skip_instruction(os_context_t *context)
 {
-    /* KLUDGE: Other platforms check for trap codes and skip inlined
-     * trap/error parameters.  We should too. */
-
-    /* Note that we're doing integer arithmetic here, not pointer. So
-     * the value that the return value of os_context_pc_addr() points
-     * to will be incremented by 4, not 32.
-     */
+    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    unsigned code = trap_instruction >> 5 & 0xFF;
     *os_context_pc_addr(context) += 4;
+    switch (code)
+    {
+    case trap_Error:
+    case trap_Cerror:
+        skip_internal_error(context);
+    default:
+        break;
+    }
 }
 
 unsigned char *arch_internal_error_arguments(os_context_t *context)
@@ -114,13 +117,7 @@ arch_handle_fun_end_breakpoint(os_context_t *context)
 void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
-    unsigned char register_offset =
-        *((unsigned char *)(*os_context_pc_addr(context))+5);
-    handle_single_step_trap(context, trap, register_offset);
-    /* KLUDGE: arch_skip_instruction() only skips one instruction, and
-     * there is a following word to deal with as well, so skip
-     * twice. */
-    arch_skip_instruction(context);
+    handle_single_step_trap(context, trap, reg_LEXENV);
     arch_skip_instruction(context);
 }
 
@@ -173,7 +170,7 @@ void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
   *inst_ptr++ = inst;
 
   // address
-  *(unsigned long *)inst_ptr++ = target_addr;
+  *(unsigned long *)inst_ptr++ = (unsigned long)target_addr;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }

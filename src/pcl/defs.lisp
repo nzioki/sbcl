@@ -100,7 +100,6 @@
          (error "~S is neither a type nor a specializer." specl))))
 
 (defun type-class (type)
-  (declare (special *the-class-t*))
   (setq type (type-from-specializer type))
   (if (atom type)
       (if (eq type t)
@@ -180,8 +179,7 @@
                (subtypep (convert-to-system-type type1)
                          (convert-to-system-type type2))))))))
 
-(defvar *built-in-class-symbols* ())
-(defvar *built-in-wrapper-symbols* ())
+(define-load-time-global *built-in-class-symbols* ())
 
 (defun get-built-in-class-symbol (class-name)
   (or (cadr (assq class-name *built-in-class-symbols*))
@@ -207,7 +205,7 @@
 ;;; Grovel over SB-KERNEL::*!BUILT-IN-CLASSES* in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
-(defvar *built-in-classes*
+(define-load-time-global *built-in-classes*
   (labels ((direct-supers (class)
              (/noshow "entering DIRECT-SUPERS" (classoid-name class))
              (if (typep class 'built-in-classoid)
@@ -293,10 +291,6 @@
 
 (defclass structure-object (slot-object) ()
   (:metaclass structure-class))
-
-(defstruct (dead-beef-structure-object
-            (:constructor |STRUCTURE-OBJECT class constructor|)
-            (:copier nil)))
 
 (defclass standard-object (slot-object) ())
 
@@ -509,6 +503,7 @@
 ;;; these functions can access the SLOT-INFO directly, avoiding the overhead
 ;;; of accessing a standard-instance.
 (defstruct (slot-info
+            (:copier nil)
             (:constructor make-slot-info
                 (&key slotd typecheck
                  (reader (uninitialized-accessor-function :reader slotd))
@@ -561,6 +556,8 @@
 ;;; and vestiges of PROTOTYPE specializers
 (defclass standard-specializer (specializer) ())
 
+;;; Note that this class cannot define the OBJECT slot and
+;;; SPECIALIZER-OBJECT reader because of bootstrapping limitations.
 (defclass specializer-with-object (specializer) ())
 
 (defclass exact-class-specializer (specializer) ())
@@ -572,12 +569,15 @@
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass class-prototype-specializer (standard-specializer specializer-with-object)
+(defclass class-prototype-specializer (standard-specializer
+                                       specializer-with-object)
   ((object :initarg :class
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass eql-specializer (standard-specializer exact-class-specializer specializer-with-object)
+(defclass eql-specializer (standard-specializer
+                           exact-class-specializer
+                           specializer-with-object)
   ((object :initarg :object :reader specializer-object
            :reader eql-specializer-object)
    ;; Because EQL specializers are interned, any two putative instances
@@ -607,9 +607,8 @@
   ;; Need to lock, so that two threads don't get non-EQ specializers
   ;; for an EQL object.
   (with-locked-system-table (*eql-specializer-table*)
-    (or (gethash object *eql-specializer-table*)
-        (setf (gethash object *eql-specializer-table*)
-              (make-instance 'eql-specializer :object object)))))
+    (ensure-gethash object *eql-specializer-table*
+                    (make-instance 'eql-specializer :object object))))
 
 (defclass class (dependent-update-mixin
                  definition-source-mixin

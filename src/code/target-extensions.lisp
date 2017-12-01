@@ -19,33 +19,39 @@
 
 ;;;; variables initialization and shutdown sequences
 
-;; (Most of the save-a-core functionality is defined later, in its
-;; own file, but we'd like to have these symbols declared special
-;; and initialized ASAP.)
+;;; (Most of the save-a-core functionality is defined later, in its
+;;; own file, but we'd like to have these symbols declared special and
+;;; initialized ASAP.)
+
+(declaim (type list *save-hooks* *init-hooks* *exit-hooks*))
+
 (defvar *save-hooks* nil
-  #!+sb-doc
-  "This is a list of functions which are called in an unspecified
-order before creating a saved core image. Unused by SBCL itself:
-reserved for user and applications.")
+  "A list of function designators which are called in an unspecified
+order before creating a saved core image.
+
+Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *init-hooks* nil
-  #!+sb-doc
-  "This is a list of functions which are called in an unspecified
+  "A list of function designators which are called in an unspecified
 order when a saved core image starts up, after the system itself has
-been initialized. Unused by SBCL itself: reserved for user and
-applications.")
+been initialized.
+
+Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *exit-hooks* nil
-  #!+sb-doc
-  "This is a list of functions which are called in an unspecified
-order when SBCL process exits. Unused by SBCL itself: reserved for
-user and applications. Using (SB-EXT:EXIT :ABORT T), or calling
-exit(3) directly will circumvent these hooks.")
+  "A list of function designators which are called in an unspecified
+order when SBCL process exits.
+
+Unused by SBCL itself: reserved for user and applications.
+
+Using (SB-EXT:EXIT :ABORT T), or calling exit(3) directly circumvents
+these hooks.")
 
 
 ;;; Binary search for simple vectors
-(defun binary-search (value seq &key (key #'identity))
+(defun binary-search* (value seq key)
   (declare (simple-vector seq))
+  (declare (function key))
   (labels ((recurse (start end)
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
@@ -56,8 +62,13 @@ exit(3) directly will circumvent these hooks.")
                        ((> value key-value)
                         (recurse (1+ i) end))
                        (t
-                        elt))))))
+                        i))))))
     (recurse 0 (length seq))))
+
+(defun binary-search (value seq &key (key #'identity))
+  (let ((index (binary-search* value seq key)))
+    (if index
+        (svref seq index))))
 
 (defun double-vector-binary-search (value vector)
   (declare (simple-vector vector)
@@ -129,8 +140,3 @@ exit(3) directly will circumvent these hooks.")
                   (%shrink-vector string size)
                   string)))
          ,@body))))
-
-;;; The smallest power of two that is equal to or greater than X.
-(defun power-of-two-ceiling (x)
-  (declare (index x))
-  (ash 1 (integer-length (1- x))))

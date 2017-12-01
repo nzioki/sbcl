@@ -54,10 +54,13 @@
          (eval-when (:compile-toplevel :load-toplevel :execute)
            (create-alien-type-class-if-necessary ',name ',defstruct-name
                                                  ',(or include 'root)))
+         (setf (info :source-location :alien-type ',name)
+               (sb!c:source-location))
          (def!struct (,defstruct-name
                         (:include ,include-defstruct
                                   (class ',name)
                                   ,@overrides)
+                        (:copier nil)
                         (:constructor
                          ,(symbolicate "MAKE-" defstruct-name)
                          (&key class bits alignment
@@ -150,7 +153,6 @@
         (error "attempt to shadow definition of ~A ~S" kind name)))))
 
 (defun unparse-alien-type (type)
-  #!+sb-doc
   "Convert the alien-type structure TYPE back into a list specification of
    the type."
   (declare (type alien-type type))
@@ -192,7 +194,7 @@
         (setf (info :alien-type kind name) defn
               (info :source-location :alien-type name) source-location))))
 
-  (defun %define-alien-type (name new)
+  (defun %define-alien-type (name new source-location)
     (ecase (info :alien-type :kind name)
       (:primitive
        (error "~/sb!impl:print-type-specifier/ is a built-in alien type."
@@ -209,6 +211,7 @@
       (:unknown))
     (setf (info :alien-type :definition name) new)
     (setf (info :alien-type :kind name) :defined)
+    (setf (info :source-location :alien-type name) source-location)
     name))
 
 ;;;; the root alien type
@@ -273,11 +276,10 @@
 ;;;
 (defmethod print-object ((info heap-alien-info) stream)
   (print-unreadable-object (info stream :type t)
-    (funcall (formatter "~S ~S~@[ (data)~]")
-             stream
-             (heap-alien-info-alien-name info)
-             (unparse-alien-type (heap-alien-info-type info))
-             (heap-alien-info-datap info))))
+    (format stream "~S ~S~@[ (data)~]"
+            (heap-alien-info-alien-name info)
+            (unparse-alien-type (heap-alien-info-type info))
+            (heap-alien-info-datap info))))
 
 ;;; The form to evaluate to produce the SAP pointing to where in the heap
 ;;; it is.
@@ -293,7 +295,6 @@
 ;;;; Interfaces to the different methods
 
 (defun alien-type-= (type1 type2)
-  #!+sb-doc
   "Return T iff TYPE1 and TYPE2 describe equivalent alien types."
   (or (eq type1 type2)
       (and (eq (alien-type-class type1)
@@ -301,7 +302,6 @@
            (invoke-alien-type-method :type= type1 type2))))
 
 (defun alien-subtype-p (type1 type2)
-  #!+sb-doc
   "Return T iff the alien type TYPE1 is a subtype of TYPE2. Currently, the
    only supported subtype relationships are is that any pointer type is a
    subtype of (* t), and any array type first dimension will match
@@ -830,7 +830,7 @@
 
 ;;;; the RECORD type
 
-(def!struct (alien-record-field)
+(def!struct (alien-record-field (:copier nil))
   (name (missing-arg) :type symbol)
   (type (missing-arg) :type alien-type)
   (bits nil :type (or unsigned-byte null))
@@ -968,7 +968,6 @@
                      (alien-record-field-type field2))))
 
 (defvar *alien-type-matches* nil
-  #!+sb-doc
   "A hashtable used to detect cycles while comparing record types.")
 
 (define-alien-type-method (record :type=) (type1 type2)
@@ -1090,6 +1089,7 @@
 ;;; these structures and LOCAL-ALIEN and friends communicate
 ;;; information about how that local alien is represented.
 (def!struct (local-alien-info
+             (:copier nil)
              (:constructor make-local-alien-info
                            (&key type force-to-memory-p
                             &aux (force-to-memory-p (or force-to-memory-p
@@ -1111,7 +1111,6 @@
 ;;;; the ADDR macro
 
 (sb!xc:defmacro addr (expr &environment env)
-  #!+sb-doc
   "Return an Alien pointer to the data addressed by Expr, which must be a call
    to SLOT or DEREF, or a reference to an Alien variable."
   (let ((form (%macroexpand expr env)))

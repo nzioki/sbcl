@@ -16,14 +16,12 @@
 #!-linux (error "missing :LINUX feature")
 
 (defun software-type ()
-  #!+sb-doc
   "Return a string describing the supporting software."
   "Linux")
 
 ;;; FIXME: More duplicated logic here vrt. other oses. Abstract into
 ;;; uname-software-version?
 (defun software-version ()
-  #!+sb-doc
   "Return a string describing version of the supporting software, or NIL
   if not available."
   (or *software-version*
@@ -42,10 +40,6 @@
     (unless err? ; FIXME: nonmnemonic (reversed) name for ERR?
       (error "Unix system call getrusage failed: ~A." (strerror utime)))
     (values utime stime majflt)))
-
-;;; Return the system page size.
-(defun get-page-size ()
-  sb!c:*backend-page-bytes*)
 
 ;;; support for CL:MACHINE-VERSION defined OAOO elsewhere
 (defun get-machine-version ()

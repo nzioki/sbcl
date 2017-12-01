@@ -13,23 +13,23 @@
 
 ;;;; register specs
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *byte-register-names* (make-array 8 :initial-element nil))
-  (defvar *word-register-names* (make-array 16 :initial-element nil))
-  (defvar *dword-register-names* (make-array 16 :initial-element nil))
-  (defvar *float-register-names* (make-array 8 :initial-element nil)))
+(defconstant-eqx +byte-register-names+
+    #("AL" "AH" "CL" "CH" "DL" "DH" "BL" "BH")
+  #'equalp)
+(defconstant-eqx +word-register-names+
+    #("AX" NIL "CX" NIL "DX" NIL "BX" NIL "SP" NIL "BP" NIL "SI" NIL "DI" NIL)
+  #'equalp)
+(defconstant-eqx +dword-register-names+
+    #("EAX" NIL "ECX" NIL "EDX" NIL "EBX" NIL "ESP" NIL "EBP" NIL "ESI" NIL "EDI" NIL)
+  #'equalp)
 
 (macrolet ((defreg (name offset size)
-             (let ((offset-sym (symbolicate name "-OFFSET"))
-                   (names-vector (symbolicate "*" size "-REGISTER-NAMES*")))
-               `(progn
-                  (eval-when (:compile-toplevel :load-toplevel :execute)
+             (declare (ignore size))
+             `(eval-when (:compile-toplevel :load-toplevel :execute)
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                    (defconstant ,offset-sym ,offset))
-                  (setf (svref ,names-vector ,offset-sym)
-                        ,(symbol-name name)))))
+                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
            ;; FIXME: It looks to me as though DEFREGSET should also
            ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
@@ -98,6 +98,7 @@
 
 ;;;; SB definitions
 
+(!define-storage-bases
 ;;; Despite the fact that there are only 8 different registers, we consider
 ;;; them 16 in order to describe the overlap of byte registers. The only
 ;;; thing we need to represent is what registers overlap. Therefore, we
@@ -118,6 +119,7 @@
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base noise :unbounded :size 2)
+)
 
 ;;;; SC definitions
 
@@ -344,18 +346,18 @@
   (typecase value
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (when (static-symbol-p value)
-       (sc-number-or-lose 'immediate)))
+       immediate-sc-number))
     (single-float
        (case value
-         ((0f0 1f0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-single-immediate))))
+         ((0f0 1f0) fp-constant-sc-number)
+         (t fp-single-immediate-sc-number)))
     (double-float
        (case value
-         ((0d0 1d0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-double-immediate))))
+         ((0d0 1d0) fp-constant-sc-number)
+         (t fp-double-immediate-sc-number)))
     #!+long-float
     (long-float
        (when (or (eql value 0l0) (eql value 1l0)
@@ -364,10 +366,10 @@
                  (eql value (log 2.718281828459045235360287471352662L0 2l0))
                  (eql value (log 2l0 10l0))
                  (eql value (log 2l0 2.718281828459045235360287471352662L0)))
-         (sc-number-or-lose 'fp-constant)))))
+         fp-constant-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
-  (eql sc (sc-number-or-lose 'immediate)))
+  (eql sc immediate-sc-number))
 
 ;; For an immediate TN, return its value encoded for use as a literal.
 ;; For any other TN, return the TN.  Only works for FIXNUMs,
@@ -430,11 +432,11 @@
       (registers
        (let* ((sc-name (sc-name sc))
               (name-vec (cond ((member sc-name *byte-sc-names*)
-                               *byte-register-names*)
+                               +byte-register-names+)
                               ((member sc-name *word-sc-names*)
-                               *word-register-names*)
+                               +word-register-names+)
                               ((member sc-name *dword-sc-names*)
-                               *dword-register-names*))))
+                               +dword-register-names+))))
          (or (and name-vec
                   (< -1 offset (length name-vec))
                   (svref name-vec offset))
@@ -445,7 +447,6 @@
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
       (noise (symbol-name (sc-name sc))))))
-;;; FIXME: Could this, and everything that uses it, be made #!+SB-SHOW?
 
 (defun combination-implementation-style (node)
   (declare (type sb!c::combination node))

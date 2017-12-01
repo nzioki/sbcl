@@ -339,6 +339,48 @@
       (values (logior seen (if (oddp rest-bits) (bits &body) 0))
               required optional (or rest more) keys aux env whole))))
 
+;;; Check the variable names and keywords in the sections of the
+;;; lambda list for illegal and repeated ones.
+;;;
+;;; Can be wrapped around PARSE-LAMBDA-LIST like this:
+;;;
+;;;   (multiple-value-call #'check-lambda-list-names
+;;;     (parse-lambda-list ...)
+;;;     :context ...)
+(defun check-lambda-list-names (llks required optional rest keys aux env whole
+                                &key
+                                  (context "an ordinary lambda list")
+                                  (signal-via #'compiler-error)
+                                  (allow-symbol-macro t))
+  (let ((names (make-repeated-name-check :signal-via signal-via))
+        (keywords (make-repeated-name-check
+                   :kind "keyword" :signal-via signal-via)))
+    (flet ((check-name (name)
+             (check-variable-name-for-binding
+              name :context context :signal-via signal-via
+              :allow-symbol-macro allow-symbol-macro)
+             (funcall names name)))
+      (mapc #'check-name required)
+      (mapc (lambda (spec)
+              (multiple-value-bind (name default suppliedp-var)
+                  (parse-optional-arg-spec spec)
+                (declare (ignore default))
+                (check-name name)
+                (when suppliedp-var
+                  (check-name (first suppliedp-var)))))
+            optional)
+      (mapc #'check-name rest)
+      (mapc (lambda (spec)
+              (multiple-value-bind (keyword name default suppliedp-var)
+                  (parse-key-arg-spec spec)
+                (declare (ignore default))
+                (check-name name)
+                (when suppliedp-var
+                  (check-name (first suppliedp-var)))
+                (funcall keywords keyword)))
+            keys)))
+  (values llks required optional rest keys aux env whole))
+
 ;;; Construct an abstract representation of a destructuring lambda list
 ;;; from its source form, recursing as necessary.
 ;;; Warn if it looks like a default expression will cause pattern mismatch.
@@ -356,7 +398,9 @@
                          :silent silent :condition-class condition-class)
    (declare (ignore env) (notinline mapcar))
    (labels ((parse (list)
-              (if (atom list) list (parse-ds-lambda-list list :silent silent)))
+              (if (listp list)
+                  (parse-ds-lambda-list list :silent silent)
+                  list))
             (parse* (list arg-specifier)
               (let ((parse (parse list)))
                 (when (and (not silent) (vectorp parse)) ; is destructuring
@@ -400,10 +444,11 @@
 ;;; DEFAULT should be specified as '* when parsing a DEFTYPE lambda-list.
 (defun parse-optional-arg-spec (spec &optional default)
   (etypecase spec
-    (symbol (values spec default nil))
+    (symbol (values spec default nil nil))
     (cons (values (car spec)
                   (if (cdr spec) (cadr spec) default)
-                  (cddr spec)))))
+                  (cddr spec)
+                  (when (cdr spec) t)))))
 
 ;;; Split a keyword argument specifier into the keyword, the bound variable
 ;;; or destructuring pattern, the default, and supplied-p var.
@@ -411,11 +456,12 @@
 ;;; DEFAULT should be specified as '* when parsing a DEFTYPE lambda-list.
 (defun parse-key-arg-spec (spec &optional default)
   (etypecase spec
-    (symbol (values (keywordicate spec) spec default nil))
-    (cons (destructuring-bind (var &optional (def default) . sup-p-var) spec
-              (if (symbolp var)
-                  (values (keywordicate var) var def sup-p-var)
-                  (values (car var) (cadr var) def sup-p-var))))))
+    (symbol (values (keywordicate spec) spec default nil nil))
+    (cons (destructuring-bind (var &optional (def default defaultp) . sup-p-var)
+              spec
+            (if (symbolp var)
+                (values (keywordicate var) var def sup-p-var defaultp)
+                (values (car var) (cadr var) def sup-p-var defaultp))))))
 
 ;;; Return a "twice abstracted" representation of DS-LAMBDA-LIST that removes
 ;;; all variable names, &AUX parameters, supplied-p variables, and defaults.
@@ -480,18 +526,7 @@
 ;;; Produce a destructuring lambda list from its internalized representation,
 ;;; excluding any parts that don't constrain the shape of the expected input.
 ;;; &AUX, supplied-p vars, and defaults do not impose shape constraints.
-;;;
-;;; However as a special case, some constant defaults are retained mainly for
-;;; backward-compatibility.
-;;; The reason for it is that a test in SB-INTROSPECT checks the lambda list
-;;; of type ARRAY, which has explicit '* defaults. They're explicit
-;;; because of a bug or deficiency in !DEF-TYPE-TRANSLATOR which does not
-;;; adhere to the convention that DEFTYPE-like lambda lists use '* as implicit
-;;; defaults for everything unless stated otherwise.
-;;; So really the '* should have been superfluous in the lambda list,
-;;; but I'm also not convinced that changing the test case is the right thing.
-;;;
-(defun unparse-ds-lambda-list (parsed-lambda-list &optional cache)
+(defun unparse-ds-lambda-list (parsed-lambda-list &key cache (remove-defaults t))
   (cond ((symbolp parsed-lambda-list) parsed-lambda-list)
         ((cdr (assq parsed-lambda-list (cdr cache))))
         (t
@@ -503,12 +538,9 @@
                           (cons (recurse (car spec)) (maybe-default spec))))
                     (maybe-default (spec)
                       (let ((def (cdr spec)))
-                        (when (and def (typep (car def)
-                                              '(or (cons (eql quote))
-                                                   (member t)
-                                                   keyword number)))
+                        (when (and def (not remove-defaults))
                           (list (car def))))) ; Remove any supplied-p var.
-                    (recurse (x) (unparse-ds-lambda-list x cache))
+                    (recurse (x) (unparse-ds-lambda-list x :cache cache))
                     (memoize (input output)
                       (when cache (push (cons input output) (cdr cache)))
                       output))
@@ -676,13 +708,14 @@
 ;;;
 (defun emit-ds-bind-check (parsed-lambda-list input macro-context memo-table)
   (with-ds-lambda-list-parts (llks nil req opt rest keys) parsed-lambda-list
-    (let* ((display (unparse-ds-lambda-list parsed-lambda-list memo-table))
+    (let* ((display (unparse-ds-lambda-list parsed-lambda-list :cache memo-table))
            (pattern `',(if macro-context (cons macro-context display) display))
            (min (length req))
            (max (+ min (length opt)))
            (bounds (list min max)))
       (cond ((ll-kwds-keyp llks)
-             `(,(if (eq (cddr macro-context) 'define-compiler-macro)
+             `(,(if (typep macro-context
+                           '(cons t (cons t (eql define-compiler-macro))))
                     'cmacro-check-ds-list/&key
                     'check-ds-list/&key)
                 ,input ,@bounds ,pattern
@@ -1086,7 +1119,24 @@
                       (when whole `((,(car whole) ,ll-whole)))))
              ;; Drop &WHOLE and &ENVIRONMENT
              (new-ll (make-lambda-list llks nil req opt rest keys aux))
-             (parse (parse-ds-lambda-list new-ll)))
+             (parse (parse-ds-lambda-list new-ll))
+             ((declared-lambda-list decls)
+              (let ((ll
+                      (loop for (nil . declarations) in decls
+                            thereis
+                            (loop for x in declarations
+                                  when (and (consp x)
+                                            (eql (car x) 'lambda-list))
+                                  return x))))
+                (values
+                 (or ll
+                     ;; Normalize the lambda list by unparsing.
+                     `(lambda-list ,(unparse-ds-lambda-list parse :remove-defaults nil)))
+                 (if ll
+                     (loop for (declare . declarations) in decls
+                           collect (list* declare
+                                          (remove 'lambda-list declarations :key #'car)))
+                     decls)))))
     ;; Signal a style warning for duplicate names, but disregard &AUX variables
     ;; because most folks agree that (LET* ((X (F)) (X (G X))) ..) makes sense
     ;; - some would even say that it is idiomatic - and &AUX bindings are just
@@ -1099,6 +1149,8 @@
               (style-warn-once lambda-list "variable ~S occurs more than once"
                                (car tail))))
           (append whole env (ds-lambda-list-variables parse nil)))
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq docstring nil)
     (values `(,@(if lambda-name `(named-lambda ,lambda-name) '(lambda))
                   (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
               ,@(when (and docstring (eq doc-string-allowed :internal))
@@ -1106,8 +1158,8 @@
               ;; MACROLET doesn't produce an object capable of reflection,
               ;; so don't bother inserting a different lambda-list.
               ,@(unless (eq kind 'macrolet)
-                  ;; Normalize the lambda list by unparsing.
-                  `((declare (lambda-list ,(unparse-ds-lambda-list parse)))))
+
+                  `((declare ,declared-lambda-list)))
               ,@(if outer-decls (list outer-decls))
               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
               ,@(sb!c:macro-policy-decls)

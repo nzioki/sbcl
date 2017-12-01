@@ -30,7 +30,9 @@
   (:generator 1
      (storew (encode-value-if-immediate value) object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg) :to :eval)
@@ -93,11 +95,11 @@
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
-  (:translate symbol-global-value)
+  (:translate sym-global-val)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -130,7 +132,7 @@
   ;; With Symbol-Value, we check that the value isn't the trap object. So
   ;; Symbol-Value of NIL is NIL.
   (define-vop (symbol-value)
-    (:translate symbol-value)
+    (:translate symeval)
     (:policy :fast-safe)
     (:args (object :scs (descriptor-reg) :to (:result 1)))
     (:results (value :scs (descriptor-reg any-reg)))
@@ -158,7 +160,7 @@
     ;; unbound", which is used in the implementation of COPY-SYMBOL.  --
     ;; CSR, 2003-04-22
     (:policy :fast)
-    (:translate symbol-value)
+    (:translate symeval)
     (:generator 8
       (let ((ret-lab (gen-label)))
         (loadw value object symbol-tls-index-slot other-pointer-lowtag)
@@ -172,9 +174,9 @@
 #!-sb-thread
 (progn
   (define-vop (symbol-value symbol-global-value)
-    (:translate symbol-value))
+    (:translate symeval))
   (define-vop (fast-symbol-value fast-symbol-global-value)
-    (:translate symbol-value))
+    (:translate symeval))
   (define-vop (set %set-symbol-global-value)))
 
 #!+sb-thread
@@ -245,17 +247,14 @@
   (:args (function :scs (descriptor-reg) :target result)
          (fdefn :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) raw)
-  (:temporary (:sc byte-reg) type)
   (:results (result :scs (descriptor-reg)))
   (:generator 38
-    (load-type type function (- fun-pointer-lowtag))
-    (inst lea raw
-          (make-ea-for-object-slot function simple-fun-code-offset
-                                   fun-pointer-lowtag))
-    (inst cmp type simple-fun-header-widetag)
-    (inst jmp :e normal-fn)
     (inst lea raw (make-fixup 'closure-tramp :assembly-routine))
-    NORMAL-FN
+    (inst cmp (make-ea :byte :base function :disp (- fun-pointer-lowtag))
+          simple-fun-widetag)
+    (inst cmov :e raw
+          (make-ea :dword :base function
+                   :disp (- (* simple-fun-self-slot n-word-bytes) fun-pointer-lowtag)))
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
     (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result function)))
@@ -402,11 +401,20 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg immediate)))
+  (:info offset)
+  (:generator 4
+     (storew (encode-value-if-immediate value) object (+ closure-info-offset offset)
+             fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))

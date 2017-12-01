@@ -10,107 +10,35 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; OS-CONTEXT-T
-
-;;; a POSIX signal context, i.e. the type passed as the third
-;;; argument to an SA_SIGACTION-style signal handler
-;;;
-;;; The real type does have slots, but at Lisp level, we never
-;;; access them, or care about the size of the object. Instead, we
-;;; always refer to these objects by pointers handed to us by the C
-;;; runtime library, and ask the runtime library any time we need
-;;; information about the contents of one of these objects. Thus, it
-;;; works to represent this as an object with no slots.
-;;;
-;;; KLUDGE: It would be nice to have a type definition analogous to
-;;; C's "struct os_context_t;", for an incompletely specified object
-;;; which can only be referred to by reference, but I don't know how
-;;; to do that in the FFI, so instead we just this bogus no-slots
-;;; representation. -- WHN 20000730
-;;;
-;;; FIXME: Since SBCL, unlike CMU CL, uses this as an opaque type,
-;;; it's no longer architecture-dependent, and probably belongs in
-;;; some other package, perhaps SB-KERNEL.
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-;;;; MACHINE-TYPE
 
 (defun machine-type ()
-  #!+sb-doc
   "Return a string describing the type of the local machine."
   "X86")
 
 ;;;; :CODE-OBJECT fixups
-
-;;; a counter to measure the storage overhead of these fixups
-(defvar *num-fixups* 0)
-;;; FIXME: When the system runs, it'd be interesting to see what this is.
-
-(declaim (inline adjust-fixup-array))
-(defun adjust-fixup-array (array size)
-  (let ((new (make-array size :element-type '(unsigned-byte 32))))
-    (replace new array)
-    new))
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
 ;;;
 ;;; Add a fixup offset to the vector of fixup offsets for the given
 ;;; code object.
-(defun fixup-code-object (code offset fixup kind)
+(defun fixup-code-object (code offset fixup kind &optional flavor)
   (declare (type index offset))
-  (flet ((add-fixup (code offset)
-           ;; (We check for and ignore fixups for code objects in the
-           ;; read-only and static spaces. (In the old CMU CL code
-           ;; this check was conditional on *ENABLE-DYNAMIC-SPACE-CODE*,
-           ;; but in SBCL relocatable dynamic space code is always in
-           ;; use, so we always do the check.)
-           (incf *num-fixups*)
-           (let ((fixups (code-header-ref code code-constants-offset)))
-             (cond ((typep fixups '(simple-array (unsigned-byte 32) (*)))
-                    (let ((new-fixups
-                            (adjust-fixup-array fixups (1+ (length fixups)))))
-                      (setf (aref new-fixups (length fixups)) offset)
-                      (setf (code-header-ref code code-constants-offset)
-                            new-fixups)))
-                   (t
-                    (unless (or (eq (widetag-of fixups)
-                                    unbound-marker-widetag)
-                                (zerop fixups))
-                      (format t "** Init. code FU = ~S~%" fixups)) ; FIXME
-                    (setf (code-header-ref code code-constants-offset)
-                          (make-array
-                           1
-                           :element-type '(unsigned-byte 32)
-                           :initial-element offset)))))))
-    (without-gcing
-      (let* ((sap (truly-the system-area-pointer
-                             (code-instructions code)))
-             (obj-start-addr (logand (get-lisp-obj-address code)
-                                     #xfffffff8))
-             ;; FIXME: what is this 5?
-             #+nil (const-start-addr (+ obj-start-addr (* 5 n-word-bytes)))
-             (code-start-addr (sap-int (code-instructions code)))
-             (ncode-words (code-header-ref code 1))
-             (code-end-addr (+ code-start-addr (* ncode-words n-word-bytes))))
-        (unless (member kind '(:absolute :relative))
-          (error "Unknown code-object-fixup kind ~S." kind))
+  (declare (ignore flavor))
+  (without-gcing
+   (when
+     (let* ((obj-start-addr (logandc2 (get-lisp-obj-address code) sb!vm:lowtag-mask))
+            (sap (code-instructions code))
+            (code-end-addr (+ (sap-int sap) (%code-code-size code))))
         (ecase kind
           (:absolute
            ;; Word at sap + offset contains a value to be replaced by
            ;; adding that value to fixup.
            (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset)))
            ;; Record absolute fixups that point within the code object.
-           (when (> code-end-addr (sap-ref-32 sap offset) obj-start-addr)
-             (add-fixup code offset)))
+           (< obj-start-addr (sap-ref-32 sap offset) code-end-addr))
           (:relative
            ;; Fixup is the actual address wanted.
-           ;;
-           ;; Record relative fixups that point outside the code
-           ;; object.
-           (when (or (< fixup obj-start-addr) (> fixup code-end-addr))
-             (add-fixup code offset))
            ;; Replace word with value to add to that loc to get there.
            (let* ((loc-sap (+ (sap-int sap) offset))
                   ;; Use modular arithmetic so that if the offset
@@ -119,8 +47,19 @@
                   (rel-val (ldb (byte 32 0)
                                 (- fixup loc-sap n-word-bytes))))
              (declare (type (unsigned-byte 32) loc-sap rel-val))
-             (setf (sap-ref-32 sap offset) rel-val))))))
-    nil))
+             (setf (sap-ref-32 sap offset) rel-val))
+           ;; Record relative fixups that point outside the code object.
+           (or (< fixup obj-start-addr) (> fixup code-end-addr)))))
+    ;; The preceding logic returns T if and only if the fixup
+    ;; should be preserved for re-fix-up when code is transported.
+    (setf (sb!vm::%code-fixups code)
+          (let ((fixups (sb!vm::%code-fixups code)))
+            (let* ((len (length (the (simple-array sb!vm:word 1) fixups)))
+                   (new (replace (make-array (1+ len) :element-type 'sb!vm:word)
+                                 fixups)))
+              (setf (aref new len) offset)
+              new)))))
+  nil)
 
 ;;;; low-level signal context access functions
 ;;;;
@@ -139,48 +78,9 @@
 ;;;;      and internal error handling) the extra runtime cost should be
 ;;;;      negligible.
 
-(declaim (inline context-pc-addr))
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-int)
-  ;; (Note: Just as in CONTEXT-REGISTER-ADDR, we intentionally use an
-  ;; 'unsigned *' interpretation for the 32-bit word passed to us by
-  ;; the C code, even though the C code may think it's an 'int *'.)
-  (context (* os-context-t)))
-
-(declaim (inline context-pc))
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-pc-addr context)))
-    (declare (type (alien (* unsigned-int)) addr))
-    (int-sap (deref addr))))
-
-(declaim (inline context-register-addr))
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-int)
-  ;; (Note the mismatch here between the 'int *' value that the C code
-  ;; may think it's giving us and the 'unsigned *' value that we
-  ;; receive. It's intentional: the C header files may think of
-  ;; register values as signed, but the CMU CL code tends to think of
-  ;; register values as unsigned, and might get bewildered if we ask
-  ;; it to work with signed values.)
-  (context (* os-context-t))
-  (index int))
-
 #!+(or linux win32)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
-
-(declaim (inline context-register))
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* unsigned-int)) addr))
-    (deref addr)))
-
-(defun %set-context-register (context index new)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* unsigned-int)) addr))
-    (setf (deref addr) new)))
 
 (defun context-float-register (context index format)
   (declare (ignorable context index))
@@ -262,9 +162,6 @@
 (defvar *fp-constant-l2e*)
 (defvar *fp-constant-lg2*)
 (defvar *fp-constant-ln2*)
-
-;;; the current alien stack pointer; saved/restored for non-local exits
-(defvar *alien-stack-pointer*)
 
 ;;; Support for the MT19937 random number generator. The update
 ;;; function is implemented as an assembly routine. This definition is

@@ -31,10 +31,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-;;; the number of bits per byte, where a byte is the smallest
-;;; addressable object
-(defconstant n-byte-bits 8)
-
 ;;; The minimum immediate offset in a memory-referencing instruction.
 (defconstant minimum-immediate-offset (- (expt 2 31)))
 
@@ -187,7 +183,7 @@
 ;;; NetBSD configuration used to have this comment regarding the linkage
 ;;; table: "In CMUCL: 0xB0000000->0xB1000000"
 
-#!+win32     (!gencgc-space-setup #x22000000 :alignment #x10000)
+#!+win32     (!gencgc-space-setup #x22000000)
 #!+linux     (!gencgc-space-setup #x01000000 :dynamic-space-start #x09000000)
 #!+sunos     (!gencgc-space-setup #x20000000 :dynamic-space-start #x48000000)
 #!+freebsd   (!gencgc-space-setup #x01000000 :dynamic-space-start #x58000000)
@@ -229,19 +225,15 @@
 ;;;
 ;;; pfw X86 doesn't have enough registers to keep these things there.
 ;;;     Note these spaces grow from low to high addresses.
-(defvar *allocation-pointer*)
 (defvar *binding-stack-pointer*)
 
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(*alien-stack-pointer*
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    *alien-stack-pointer*
 
      ;; interrupt handling
      *pseudo-atomic-bits*
 
-     *allocation-pointer*
      *binding-stack-pointer*
 
      ;; the floating point constants
@@ -256,21 +248,11 @@
      *fp-constant-l2t*
      *fp-constant-l2e*
      *fp-constant-lg2*
-     *fp-constant-ln2*
+     *fp-constant-ln2*)
+  #'equalp)
 
-     ;; For GC-AND-SAVE
-     *restart-lisp-function*
-
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-
-     ;; see comments in ../x86-64/parms.lisp
-     sb!pcl::..slot-unbound..)))
-
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -285,7 +267,8 @@
     two-arg-xor
     two-arg-gcd
     two-arg-lcm
-    %coerce-callable-to-fun))
+    %coerce-callable-to-fun)
+  #'equalp)
 
 #!+win32
 (defconstant +win32-tib-arbitrary-field-offset+ #.(+ #xE10 (* 4 63)))

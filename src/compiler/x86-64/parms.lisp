@@ -31,10 +31,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 64)
 
-;;; the number of bits per byte, where a byte is the smallest
-;;; addressable object
-(defconstant n-byte-bits 8)
-
 ;;; The minimum immediate offset in a memory-referencing instruction.
 (defconstant minimum-immediate-offset (- (expt 2 31)))
 
@@ -108,10 +104,7 @@
 
 (!gencgc-space-setup #x20000000
                      :dynamic-space-start #x1000000000
-
-                     #!+openbsd :default-dynamic-space-size #!+openbsd #x1bcf0000
-
-                     #!+win32 :alignment #!+win32 #x10000)
+                     #!+openbsd :dynamic-space-size #!+openbsd #x1bcf0000)
 
 (defconstant linkage-table-entry-size 16)
 
@@ -144,44 +137,21 @@
 ;;; we could profitably keep these in registers on x86-64 now we have
 ;;; r8-r15 as well
 ;;;     Note these spaces grow from low to high addresses.
-(defvar *allocation-pointer*)
 (defvar *binding-stack-pointer*)
 
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(*alien-stack-pointer*
-
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    #!+immobile-space function-layout
+    #!-sb-thread *alien-stack-pointer*    ; a thread slot if #!+sb-thread
      ;; interrupt handling
-     *pseudo-atomic-bits*
+    #!-sb-thread *pseudo-atomic-bits*     ; ditto
+    #!-sb-thread *binding-stack-pointer*) ; ditto
+  #'equalp)
 
-     *allocation-pointer*
-     *binding-stack-pointer*
-
-     ;; For GC-AND-SAVE
-     *restart-lisp-function*
-
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-
-     ;; hash table empty cell marker
-     sb!impl::%empty-ht-slot%
-
-     ;; The ..SLOT-UNBOUND.. symbol is static in order to optimise the
-     ;; common slot unbound check.
-     ;;
-     ;; FIXME: In SBCL, the CLOS code has become sufficiently tightly
-     ;; integrated into the system that it'd probably make sense to
-     ;; use the ordinary unbound marker for this.
-     ;;
-     ;; FIXME II: if it doesn't make sense, why is this X86-ish only?
-     sb!pcl::..slot-unbound..)))
-
-(defparameter *static-funs*
-  '(length
+;;; FIXME: with #!+immobile-space, this should be the empty list,
+;;; because *all* fdefns are permanently placed.
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -196,7 +166,8 @@
     two-arg-xor
     two-arg-gcd
     two-arg-lcm
-    %coerce-callable-to-fun))
+    %coerce-callable-to-fun)
+  #'equalp)
 
 #!+sb-simd-pack
 (defvar *simd-pack-element-types* '(integer single-float double-float))

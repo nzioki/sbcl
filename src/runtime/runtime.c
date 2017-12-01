@@ -70,8 +70,11 @@
 #include "interr.h"
 #endif
 
-#ifndef SBCL_HOME
-#define SBCL_HOME SBCL_PREFIX"/lib/sbcl/"
+#ifdef SBCL_PREFIX
+char *sbcl_home = SBCL_PREFIX"/lib/sbcl/";
+#else
+static char libpath[] = "../lib/sbcl";
+char *sbcl_home;
 #endif
 
 #ifdef LISP_FEATURE_HPUX
@@ -235,17 +238,18 @@ and resources this platform demands.\n\
 char *
 search_for_core ()
 {
-    char *sbcl_home = getenv("SBCL_HOME");
+    char *env_sbcl_home = getenv("SBCL_HOME");
     char *lookhere;
     char *stem = "/sbcl.core";
     char *core;
 
-    if (!(sbcl_home && *sbcl_home)) sbcl_home = SBCL_HOME;
-    lookhere = (char *) calloc(strlen(sbcl_home) +
+    if (!(env_sbcl_home && *env_sbcl_home))
+      env_sbcl_home = sbcl_home;
+    lookhere = (char *) calloc(strlen(env_sbcl_home) +
                                strlen(stem) +
                                1,
                                sizeof(char));
-    sprintf(lookhere, "%s%s", sbcl_home, stem);
+    sprintf(lookhere, "%s%s", env_sbcl_home, stem);
     core = copied_existing_filename_or_null(lookhere);
 
     if (!core) {
@@ -427,6 +431,7 @@ void print_environment(int argc, char *argv[])
     }
 }
 
+struct lisp_startup_options lisp_startup_options;
 int
 main(int argc, char *argv[], char *envp[])
 {
@@ -443,13 +448,17 @@ main(int argc, char *argv[], char *envp[])
     char *runtime_path = 0;
 
     /* other command line options */
-    boolean noinform = 0;
     boolean end_runtime_options = 0;
-    boolean disable_lossage_handler_p = 0;
+    boolean disable_lossage_handler_p
+#if defined(LISP_FEATURE_SB_LDB)
+        = 0;
+#else
+        = 1;
+#endif
+
     boolean debug_environment_p = 0;
 
     lispobj initial_function;
-    const char *sbcl_home = getenv("SBCL_HOME");
 
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
     os_preinit();
@@ -502,13 +511,13 @@ main(int argc, char *argv[], char *envp[])
                  * runtime option, it is equivalent to --noinform.
                  * This exits, and does not increment argi, so that
                  * TOPLEVEL-INIT sees the option. */
-                noinform = 1;
+                lisp_startup_options.noinform = 1;
                 end_runtime_options = 1;
                 disable_lossage_handler_p = 1;
                 lose_on_corruption_p = 1;
                 break;
             } else if (0 == strcmp(arg, "--noinform")) {
-                noinform = 1;
+                lisp_startup_options.noinform = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--core")) {
                 if (core) {
@@ -617,7 +626,7 @@ main(int argc, char *argv[], char *envp[])
 
     /* Align down to multiple of page_table page size, and to the appropriate
      * stack alignment. */
-    dynamic_space_size &= ~(sword_t)(PAGE_BYTES-1);
+    dynamic_space_size &= ~(sword_t)(BACKEND_PAGE_BYTES-1);
 #ifdef LISP_FEATURE_GENCGC
     dynamic_space_size &= ~(sword_t)(GENCGC_CARD_BYTES-1);
 #endif
@@ -638,33 +647,45 @@ main(int argc, char *argv[], char *envp[])
     }
     dyndebug_init();
     arch_init();
-    validate();
+    allocate_spaces();
     gc_init();
 
     setup_locale();
+
+    #ifndef SBCL_PREFIX
+    /* If built without SBCL_PREFIX defined, then set 'sbcl_home' to
+     * "<here>/../lib/sbcl/" based on how this executable was invoked. */
+    {
+        char *exename = argv[0]; // Use as-it, not truenameified
+        char *slash = strrchr(exename, '/');
+        if (!slash) {
+            sbcl_home = libpath;
+        } else {
+            int prefixlen = slash - exename + 1; // keep the slash in the prefix
+            char *tail = exename + prefixlen - 4;
+            char *suffix = libpath;
+            sbcl_home = successful_malloc(prefixlen + sizeof libpath); // sizeof incl. nul
+            // Translate "{path/}bin/sbcl" => "{path/}lib/sbcl", otherwise
+            // "{path}/sbcl" => "{path}/../lib/sbcl" so that running "./sbcl" works
+            // if sitting in "bin".
+            if (prefixlen >= 4 && !strncmp(tail, "bin/", 4)
+                // chop "bin" only if a complete word: '/' or nothing to its left.
+                && (tail-1 < exename || tail[-1] == '/')) {
+                prefixlen -= 4; // remove "bin/"
+                suffix += 3; // don't append "../"
+            }
+            memcpy(sbcl_home, exename, prefixlen);
+            strcpy(sbcl_home+prefixlen, suffix);
+        }
+    }
+    #endif
 
     /* If no core file was specified, look for one. */
     if (!core) {
         core = search_for_core();
     }
 
-    /* Make sure that SBCL_HOME is set and not the empty string,
-       unless loading an embedded core. */
-    if (!(sbcl_home && *sbcl_home) && embedded_core_offset == 0) {
-        char *envstring, *copied_core, *dir;
-        char *stem = "SBCL_HOME=";
-        copied_core = copied_string(core);
-        dir = dirname(copied_core);
-        envstring = (char *) calloc(strlen(stem) +
-                                    strlen(dir) +
-                                    1,
-                                    sizeof(char));
-        sprintf(envstring, "%s%s", stem, dir);
-        putenv(envstring);
-        free(copied_core);
-    }
-
-    if (!noinform && embedded_core_offset == 0) {
+    if (!lisp_startup_options.noinform && embedded_core_offset == 0) {
         print_banner();
         fflush(stdout);
     }
@@ -682,6 +703,17 @@ main(int argc, char *argv[], char *envp[])
             embedded_core_offset = offset;
     }
 
+    globals_init();
+
+    /* Doing this immediately after the core has been located
+     * and before any random malloc() calls occur improves the chance
+     * of mapping dynamic space at our preferred addres (if movable).
+     * If not movable, it was already mapped in allocate_spaces(). */
+    initial_function = load_core_file(core, embedded_core_offset);
+    if (initial_function == NIL) {
+        lose("couldn't find initial function\n");
+    }
+
 #if defined(SVR4) || defined(__linux__) || defined(__NetBSD__)
     tzset();
 #endif
@@ -692,23 +724,12 @@ main(int argc, char *argv[], char *envp[])
     if (!disable_lossage_handler_p)
         enable_lossage_handler();
 
-    globals_init();
-
-    initial_function = load_core_file(core, embedded_core_offset);
-    if (initial_function == NIL) {
-        lose("couldn't find initial function\n");
-    }
-#ifdef LISP_FEATURE_SB_DYNAMIC_CORE
     os_link_runtime();
-#endif
 #ifdef LISP_FEATURE_HPUX
     /* -1 = CLOSURE_FUN_OFFSET, 23 = SIMPLE_FUN_CODE_OFFSET, we are
      * not in LANGUAGE_ASSEMBLY so we cant reach them. */
     return_from_lisp_stub = (void *) ((char *)*((unsigned long *)
                  ((char *)initial_function + -1)) + 23);
-#endif
-#ifdef LISP_FEATURE_X86_64
-    tune_asm_routines_for_microarch();
 #endif
 
     gc_initialize_pointers();

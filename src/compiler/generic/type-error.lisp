@@ -72,12 +72,10 @@
 (define-vop (type-check-error/c)
   (:policy :fast-safe)
   (:translate sb!c::%type-check-error/c)
-  (:args (object :scs (descriptor-reg any-reg unsigned-reg signed-reg)
-                 :load-if (not (sc-is object
-                                      descriptor-reg any-reg
-                                      unsigned-reg signed-reg constant))))
-  (:arg-types * (:constant symbol))
-  (:info errcode)
+  (:args (object :scs (descriptor-reg any-reg unsigned-reg signed-reg
+                       character-reg constant)))
+  (:arg-types * (:constant symbol) (:constant t))
+  (:info errcode *location-context*)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 900
@@ -87,39 +85,61 @@
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
 
-(macrolet ((def (name error translate &rest args)
+#!+immobile-space
+(defun type-err-type-tn-loadp (thing)
+  (cond ((sc-is thing immediate)
+         (let ((obj (tn-value thing)))
+           (typecase obj
+             (layout nil)
+             ;; non-static symbols can be referenced as error-break args
+             ;; because they appear in the code constants.
+             ;; static symbols can't be referenced as error-break args
+             ;; because there is no way to refer to an immediate value.
+             (symbol (static-symbol-p obj))
+             (t t))))
+        (t t)))
+
+(macrolet ((def (name error translate context &rest args)
              `(define-vop (,name)
                 ,@(when translate
                     `((:policy :fast-safe)
                       (:translate ,translate)))
                 (:args ,@(mapcar (lambda (arg)
-                                   `(,arg :scs (descriptor-reg any-reg
-                                                unsigned-reg signed-reg)
-                                          :load-if (not (sc-is ,arg descriptor-reg any-reg
-                                                               unsigned-reg signed-reg constant))))
+                                   `(,arg :scs (descriptor-reg any-reg character-reg
+                                                unsigned-reg signed-reg constant)
+                                          #!+immobile-space
+                                          ,@(if (eq name 'type-check-error)
+                                                `(:load-if (type-err-type-tn-loadp ,arg)))))
                                  args))
+                ,@(and context
+                       `((:info *location-context*)
+                         (:arg-types ,@(make-list (length args) :initial-element '*)
+                                     (:constant t))))
                 (:vop-var vop)
                 (:save-p :compute-only)
                 (:generator 1000
                   (error-call vop ',error ,@args)))))
   (def arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs)
+    sb!c::%arg-count-error nil nargs)
   (def local-arg-count-error local-invalid-arg-count-error
-    sb!c::%local-arg-count-error nargs fname)
-  (def type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (def layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
+    sb!c::%local-arg-count-error nil nargs fname)
+  (def type-check-error object-not-type-error sb!c::%type-check-error t
+    object ptype)
+  (def layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error nil
     object layout)
   (def odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error)
+    sb!c::%odd-key-args-error nil)
   (def unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error key)
-  (def nil-fun-returned-error nil-fun-returned-error nil fun))
+    sb!c::%unknown-key-arg-error t key)
+  (def nil-fun-returned-error nil-fun-returned-error nil nil fun))
 
 (defun encode-internal-error-args (values)
   (with-adjustable-vector (vector)
-    (dolist (tn values)
+    (dolist (where values)
       (write-var-integer
-       (make-sc-offset (sc-number (tn-sc tn)) (or (tn-offset tn) 0))
+       ;; WHERE can be either a TN or a packed SC number + offset
+       (if (tn-p where)
+           (make-sc-offset (sc-number (tn-sc where)) (or (tn-offset where) 0))
+           where)
        vector))
     (loop for octet across vector do (inst byte octet))))

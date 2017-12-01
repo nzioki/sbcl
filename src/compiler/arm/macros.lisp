@@ -274,7 +274,7 @@
                 (emit-label ALLOC)
                 (allocation-tramp ,result-tn ,size BACK-FROM-ALLOC)
                 (emit-label FIXUP)
-                (inst word (make-fixup "boxed_region" :foreign))))))))
+                (inst word (make-fixup "gc_alloc_region" :foreign))))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -311,13 +311,7 @@
     (encode-internal-error-args values)
     (emit-alignment word-shift)))
 
-(defun error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
@@ -428,18 +422,3 @@
        (inst ,(ecase size (:byte 'strb) (:short 'strh))
              value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))
        (move result value))))
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  #!-gencgc
-  (declare (ignore objects))            ; should we eval these for side-effect?
-  #!-gencgc
-  `(without-gcing
-    ,@body)
-  #!+gencgc
-  `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
-     (declare (truly-dynamic-extent *pinned-objects*))
-     ,@body))

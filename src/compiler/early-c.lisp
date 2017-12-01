@@ -16,17 +16,14 @@
 (in-package "SB!C")
 
 ;;; ANSI limits on compilation
-(def!constant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(def!constant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(def!constant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
@@ -46,7 +43,10 @@
 
 ;;; the type of LAYOUT-DEPTHOID slot values
 (def!type layout-depthoid () '(or index (integer -1 -1)))
-(def!type layout-bitmap () '(and integer (not (eql 0))))
+(def!type layout-bitmap ()
+  ;; FIXME: Probably should exclude negative bignum
+  #!+compact-instance-header 'integer
+  #!-compact-instance-header '(and integer (not (eql 0))))
 
 ;;; An INLINEP value describes how a function is called. The values
 ;;; have these meanings:
@@ -63,10 +63,11 @@
 ;;;             references (even under #'without FUNCALL)."
 (deftype inlinep ()
   '(member :inline :maybe-inline :notinline nil))
-(defparameter *inlinep-translations*
+(defconstant-eqx +inlinep-translations+
   '((inline . :inline)
     (notinline . :notinline)
-    (maybe-inline . :maybe-inline)))
+    (maybe-inline . :maybe-inline))
+  #'equal)
 
 ;;; *FREE-VARS* translates from the names of variables referenced
 ;;; globally to the LEAF structures for them. *FREE-FUNS* is like
@@ -89,6 +90,10 @@
 
 ;;; miscellaneous forward declarations
 (defvar *code-segment*)
+;; FIXME: this is a kludge due to the absence of a 'vop' argument
+;; to ALLOCATION-TRAMP in the x86-64 backend.
+#!+immobile-code
+(defvar *code-is-immobile*)
 #!+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
 (defvar *compiler-error-context*)
@@ -101,9 +106,9 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
-(defvar *eval-tlf-index*)
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere*)
+(defvar *elsewhere-label*)
 (defvar *event-info*)
 (defvar *event-note-threshold*)
 (defvar *failure-p*)
@@ -127,9 +132,10 @@
 (defvar *undefined-warnings*)
 (defvar *warnings-p*)
 (defvar *lambda-conversions*)
+(defvar *compile-object* nil)
+(defvar *msan-compatible-stack-unpoison* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
-  #!+sb-doc
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
 and stack allocates otherwise inaccessible parts of the object whenever
 possible. Potentially long (over one page in size) vectors are, however, not
@@ -140,6 +146,7 @@ the stack without triggering overflow protection.")
 ;;; This lock is seized in the compiler, and related areas -- like the
 ;;; classoid/layout/class system.
 (defglobal **world-lock** nil)
+#-sb-xc-host
 (!cold-init-forms
  (setf **world-lock** (sb!thread:make-mutex :name "World Lock")))
 (!defun-from-collected-cold-init-forms !world-lock-cold-init)
@@ -225,12 +232,13 @@ the stack without triggering overflow protection.")
     (style-warn 'asterisks-around-lexical-variable-name
                 :format-control
                 "using the lexical binding of the symbol ~
-                 ~/sb-impl::print-symbol-with-prefix/, not the~@
+                 ~/sb-ext:print-symbol-with-prefix/, not the~@
                  dynamic binding"
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)))
+(def!struct (debug-name-marker (:print-function print-debug-name-marker)
+                               (:copier nil)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -305,7 +313,7 @@ the stack without triggering overflow protection.")
 (in-package "SB!ALIEN")
 
 ;;; Information describing a heap-allocated alien.
-(def!struct (heap-alien-info)
+(def!struct (heap-alien-info (:copier nil))
   ;; The type of this alien.
   (type (missing-arg) :type alien-type)
   ;; Its name.

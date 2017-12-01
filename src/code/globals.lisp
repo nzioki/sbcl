@@ -1,8 +1,5 @@
 ;;;; This file contains special proclamations for variables that are
-;;;; referenced in the code sources before they are defined. There are
-;;;; also function proclamations to make some common functions be
-;;;; known, avoiding work in recording the calls that are done before
-;;;; the definition.
+;;;; referenced in the code sources before they are defined.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -19,8 +16,12 @@
                   sb!debug:*stack-top-hint*
                   *handler-clusters*
                   *restart-clusters*
-                  *in-without-gcing* *gc-inhibit* *gc-pending*
+                  *gc-inhibit* *gc-pending*
                   #!+sb-thread *stop-for-gc-pending*
-                  #!+sb-dynamic-core sb!vm::*required-runtime-c-symbols*
-                  *load-verbose*
                   *posix-argv*))
+;;; This constant is assigned by Genesis and never read by Lisp code.
+;;; (To prove that it isn't used, it's not a toplevel form)
+#!+(and sb-dynamic-core (host-feature sb-xc))
+(let ()
+  (defconstant sb!vm::+required-foreign-symbols+
+    (symbol-value 'sb!vm::+required-foreign-symbols+)))

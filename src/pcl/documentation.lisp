@@ -317,7 +317,6 @@
 
 ;;; Now that we have created the machinery for setting documentation, we can
 ;;; set the documentation for the machinery for setting documentation.
-#+sb-doc
 (setf (documentation 'documentation 'function)
       "Return the documentation string of Doc-Type for X, or NIL if none
 exists. System doc-types are VARIABLE, FUNCTION, STRUCTURE, TYPE, SETF, and T.
@@ -338,3 +337,13 @@ sets the documentation string stored in the function object.
 
 returns the documentation stored under the function name if any, and
 falls back on the documentation in the function object if necessary.")
+
+(setf (documentation '+slot-unbound+ 'variable)
+  "SBCL specific extensions to MOP: if this value is read from an
+instance using STANDARD-INSTANCE-ACCESS, the slot is unbound.
+Similarly, an :INSTANCE allocated slot can be made unbound by
+assigning this to it using (SETF STANDARD-INSTANCE-ACCESS).
+
+Value of +SLOT-UNBOUND+ is unspecified, and should not be relied to be
+of any particular type, but it is guaranteed to be suitable for EQ
+comparison.")

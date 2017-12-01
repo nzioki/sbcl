@@ -40,7 +40,8 @@
 ;;;;  (incf (buffer-tail buffer) n))
 ;;;;
 
-(defstruct (buffer (:constructor %make-buffer (sap length)))
+(defstruct (buffer (:constructor %make-buffer (sap length))
+                   (:copier nil))
   (sap (missing-arg) :type system-area-pointer :read-only t)
   (length (missing-arg) :type index :read-only t)
   (head 0 :type index)
@@ -48,23 +49,9 @@
 (declaim (freeze-type buffer))
 
 (defglobal *available-buffers* ()
-  #!+sb-doc
   "List of available buffers.")
 
-(defglobal *available-buffers-lock*
-  (sb!thread:make-mutex :name "lock for *AVAILABLE-BUFFERS*")
-  #!+sb-doc
-  "Mutex for access to *AVAILABLE-BUFFERS*.")
-
-(defmacro with-available-buffers-lock ((&optional) &body body)
-  ;; CALL-WITH-SYSTEM-MUTEX because streams are low-level enough to be
-  ;; async signal safe, and in particular a C-c that brings up the
-  ;; debugger while holding the mutex would lose badly.
-  `(sb!thread::with-system-mutex (*available-buffers-lock*)
-     ,@body))
-
 (defconstant +bytes-per-buffer+ (* 4 1024)
-  #!+sb-doc
   "Default number of bytes per buffer.")
 
 (defun alloc-buffer (&optional (size +bytes-per-buffer+))
@@ -80,14 +67,7 @@
       buffer)))
 
 (defun get-buffer ()
-  ;; Don't go for the lock if there is nothing to be had -- sure,
-  ;; another thread might just release one before we get it, but that
-  ;; is not worth the cost of locking. Also release the lock before
-  ;; allocation, since it's going to take a while.
-  (if *available-buffers*
-      (or (with-available-buffers-lock ()
-            (pop *available-buffers*))
-          (alloc-buffer))
+  (or (and *available-buffers* (atomic-pop *available-buffers*))
       (alloc-buffer)))
 
 (declaim (inline reset-buffer))
@@ -98,8 +78,7 @@
 
 (defun release-buffer (buffer)
   (reset-buffer buffer)
-  (with-available-buffers-lock ()
-    (push buffer *available-buffers*)))
+  (atomic-push buffer *available-buffers*))
 
 
 ;;;; the FD-STREAM structure
@@ -148,7 +127,9 @@
   (dual-channel-p nil)
   ;; character position if known -- this may run into bignums, but
   ;; we probably should flip it into null then for efficiency's sake...
-  (output-column nil :type (or unsigned-byte null))
+  (output-column nil :type (or (and unsigned-byte
+                                    #!+64-bit index)
+                               null))
   ;; T if input is waiting on FD. :EOF if we hit EOF.
   (listen nil :type (member nil t :eof))
   ;; T if serve-event is allowed when this stream blocks
@@ -183,27 +164,19 @@
   (print-unreadable-object (fd-stream stream :type t :identity t)
     (format stream "for ~S" (fd-stream-name fd-stream))))
 
-;;; This is a separate buffer management function, as it wants to be
-;;; clever about locking -- grabbing the lock just once.
+;;; Release all of FD-STREAM's buffers. Originally the intent of this
+;;; was to grab a mutex once only, but the buffer pool is lock-free now.
 (defun release-fd-stream-buffers (fd-stream)
-  (let ((ibuf (fd-stream-ibuf fd-stream))
-        (obuf (fd-stream-obuf fd-stream))
-        (queue (loop for item in (fd-stream-output-queue fd-stream)
-                       when (buffer-p item)
-                       collect (reset-buffer item))))
-    (when ibuf
-      (push (reset-buffer ibuf) queue))
-    (when obuf
-      (push (reset-buffer obuf) queue))
-    ;; ...so, anything found?
-    (when queue
-      ;; detach from stream
-      (setf (fd-stream-ibuf fd-stream) nil
-            (fd-stream-obuf fd-stream) nil
-            (fd-stream-output-queue fd-stream) nil)
-      ;; splice to *available-buffers*
-      (with-available-buffers-lock ()
-        (setf *available-buffers* (nconc queue *available-buffers*))))))
+  (awhen (fd-stream-ibuf fd-stream)
+    (setf (fd-stream-ibuf fd-stream) nil)
+    (release-buffer it))
+  (awhen (fd-stream-obuf fd-stream)
+    (setf (fd-stream-obuf fd-stream) nil)
+    (release-buffer it))
+  (dolist (buf (fd-stream-output-queue fd-stream))
+    (when (buffer-p buf)
+      (release-buffer buf)))
+  (setf (fd-stream-output-queue fd-stream) nil))
 
 ;;;; FORM-TRACKING-STREAM
 
@@ -292,6 +265,8 @@
          (when (> end start)
            (go :flush-and-fill))))))
 
+(define-symbol-macro +write-failed+ "Couldn't write to ~S")
+
 ;;; Flush the current output buffer of the stream, ensuring that the
 ;;; new buffer is empty. Returns (for convenience) the new output
 ;;; buffer -- which may or may not be EQ to the old one. If the is no
@@ -347,7 +322,7 @@
                               ;; if interrupted on win32, just try again
                               #!+win32 ((eql errno sb!unix:eintr))
                               (t
-                               (simple-stream-perror "Couldn't write to ~s"
+                               (simple-stream-perror +write-failed+
                                                      stream errno)))))))))))))
 
 ;;; Helper for FLUSH-OUTPUT-BUFFER -- returns the new buffer.
@@ -415,11 +390,11 @@
                  (t
                   ;; Could not write on the first try at all!
                   #!+win32
-                  (simple-stream-perror "Couldn't write to ~S." stream errno)
+                  (simple-stream-perror +write-failed+ stream errno)
                   #!-win32
                   (if (= errno sb!unix:ewouldblock)
                       (bug "Unexpected blocking in WRITE-OUTPUT-FROM-QUEUE.")
-                      (simple-stream-perror "Couldn't write to ~S"
+                      (simple-stream-perror +write-failed+
                                             stream errno))))))))
   nil)
 
@@ -446,11 +421,11 @@
                    (t
                     ;; Could not write -- buffer or error.
                     #!+win32
-                    (simple-stream-perror "couldn't write to ~s" stream errno)
+                    (simple-stream-perror +write-failed+ stream errno)
                     #!-win32
                     (if (= errno sb!unix:ewouldblock)
                         (buffer-output stream thing start end)
-                        (simple-stream-perror "couldn't write to ~s" stream errno)))))))))
+                        (simple-stream-perror +write-failed+ stream errno)))))))))
 
 ;;; Deprecated -- can go away after 1.1 or so. Deprecated because
 ;;; this is not something we want to export. Nikodemus thinks the
@@ -464,7 +439,6 @@
 ;;;; output routines and related noise
 
 (defvar *output-routines* ()
-  #!+sb-doc
   "List of all available output routines. Each element is a list of the
   element-type output, the kind of buffering, the function name, and the number
   of bytes per element.")
@@ -543,8 +517,7 @@
              :code code)
     (output-nothing ()
       :report (lambda (stream)
-                (format stream "~@<Skip output of this character.~@:>"))
-      (throw 'output-nothing nil))
+                (format stream "~@<Skip output of this character.~@:>")))
     (output-replacement (string)
       :report (lambda (stream)
                 (format stream "~@<Output replacement string.~@:>"))
@@ -553,18 +526,23 @@
                      (finish-output *query-io*)
                      (list (read *query-io*)))
       (let ((string (string string)))
-        (fd-sout stream (string string) 0 (length string)))
-      (throw 'output-nothing nil))))
+        (fd-sout stream (string string) 0 (length string))))))
 
-(defun external-format-encoding-error (stream code)
+(defun %external-format-encoding-error (stream code)
   (if (streamp stream)
       (stream-encoding-error-and-handle stream code)
       (c-string-encoding-error stream code)))
 
+(defmacro external-format-encoding-error (stream code)
+  `(return-from output-nothing (%external-format-encoding-error ,stream ,code)))
+
 (defun synchronize-stream-output (stream)
   ;; If we're reading and writing on the same file, flush buffered
   ;; input and rewind file position accordingly.
-  (unless (fd-stream-dual-channel-p stream)
+  (unless (or (fd-stream-dual-channel-p stream)
+              (and
+               (eq (fd-stream-in stream) #'ill-in)
+               (eq (fd-stream-bin stream) #'ill-bin)))
     (let ((adjust (nth-value 1 (flush-input-buffer stream))))
       (unless (eql 0 adjust)
         (sb!unix:unix-lseek (fd-stream-fd stream) (- adjust) sb!unix:l_incr)))))
@@ -590,7 +568,7 @@
          ;; FIXME: Why this here? Doesn't seem necessary.
          `(synchronize-stream-output ,stream-var))
       ,(if restart
-           `(catch 'output-nothing
+           `(block output-nothing
               ,@body
               (setf (buffer-tail obuf) (+ tail size)))
            `(progn
@@ -618,7 +596,7 @@
        ,(unless (eq (car buffering) :none)
           `(synchronize-stream-output ,stream-var))
        ,(if restart
-            `(catch 'output-nothing
+            `(block output-nothing
                ,@body
                (setf (buffer-tail obuf) (+ tail ,size)))
             `(progn
@@ -868,8 +846,7 @@
       (frob ef-string-to-octets-fun))
     result))
 
-(defvar *external-formats* (make-hash-table)
-  #!+sb-doc
+(define-load-time-global *external-formats* (make-hash-table)
   "Hashtable of all available external formats. The table maps from
   external-format names to EXTERNAL-FORMAT structures.")
 
@@ -979,7 +956,7 @@
 (defun sysread-may-block-p (stream)
   #!+win32
   ;; This answers T at EOF on win32, I think.
-  (not (sb!win32:fd-listen (fd-stream-fd stream)))
+  (not (sb!win32:handle-listen (fd-stream-fd stream)))
   #!-win32
   (not (sb!unix:unix-simple-poll (fd-stream-fd stream) :input 0)))
 
@@ -1459,7 +1436,8 @@
 (defmacro define-external-format/variable-width
     (external-format output-restart replacement-character
      out-size-expr out-expr in-size-expr in-expr
-     octets-to-string-sym string-to-octets-sym)
+     octets-to-string-sym string-to-octets-sym
+     &key base-string-direct-mapping)
   (let* ((name (first external-format))
          (out-function (symbolicate "OUTPUT-BYTES/" name))
          (format (format nil "OUTPUT-CHAR-~A-~~A-BUFFERED" (string name)))
@@ -1496,7 +1474,7 @@
                            ;; STRING bounds have already been checked.
                            (optimize (safety 0)))
                   (,@(if output-restart
-                         `(catch 'output-nothing)
+                         `(block output-nothing)
                          `(progn))
                      (do* ()
                           ((or (= start end) (< (- len tail) 4)))
@@ -1508,7 +1486,7 @@
                          (setf (buffer-tail obuf) tail)
                          (incf start)))
                      (go flush))
-                  ;; Exited via CATCH: skip the current character.
+                  ;; Exited via RETURN-FROM OUTPUT-NOTHING: skip the current character.
                   (incf start))))
            flush
             (when (< start end)
@@ -1524,7 +1502,8 @@
                                            (:full character))
           (if (eql byte #\Newline)
               (setf (fd-stream-output-column stream) 0)
-              (incf (fd-stream-output-column stream)))
+              (setf (fd-stream-output-column stream)
+                    (+ (truly-the unsigned-byte (fd-stream-output-column stream)) 1)))
         (let ((bits (char-code byte))
               (sap (buffer-sap obuf))
               (tail (buffer-tail obuf)))
@@ -1655,7 +1634,13 @@
                               ,name sap head decode-break-reason))
                            (when (zerop (char-code char))
                              (return count))))
-                 (string (make-string length :element-type element-type)))
+                 (string (case element-type
+                           (base-char
+                            (make-string length :element-type 'base-char))
+                           (character
+                            (make-string length :element-type 'character))
+                           (t
+                            (make-string length :element-type element-type)))))
             (declare (ignorable stream)
                      (type index head length) ;; size
                      (type (unsigned-byte 8) byte)
@@ -1679,44 +1664,47 @@
 
       (defun ,output-c-string-function (string)
         (declare (type simple-string string))
-        (locally
-            (declare (optimize (speed 3) (safety 0)))
-          (let* ((length (length string))
-                 (char-length (make-array (1+ length) :element-type 'index))
-                 (buffer-length
-                  (+ (loop for i of-type index below length
-                        for byte of-type character = (aref string i)
-                        for bits = (char-code byte)
-                        sum (setf (aref char-length i)
-                                  (the index ,out-size-expr)) of-type index)
-                     (let* ((byte (code-char 0))
-                            (bits (char-code byte)))
-                       (declare (ignorable byte bits))
-                       (setf (aref char-length length)
-                             (the index ,out-size-expr)))))
-                 (tail 0)
-                 (,n-buffer (make-array buffer-length
-                                        :element-type '(unsigned-byte 8)))
-                 stream)
-            (declare (type index length buffer-length tail)
-                     (type null stream)
-                     (ignorable stream))
-            (with-pinned-objects (,n-buffer)
-              (let ((sap (vector-sap ,n-buffer)))
-                (declare (system-area-pointer sap))
-                (loop for i of-type index below length
-                      for byte of-type character = (aref string i)
-                      for bits = (char-code byte)
-                      for size of-type index = (aref char-length i)
-                      do (prog1
-                             ,out-expr
-                           (incf tail size)))
-                (let* ((bits 0)
-                       (byte (code-char bits))
-                       (size (aref char-length length)))
-                  (declare (ignorable bits byte size))
-                  ,out-expr)))
-            ,n-buffer)))
+        (cond ,@(and base-string-direct-mapping
+                     `(((simple-base-string-p string)
+                        string)))
+              (t
+               (locally
+                   (declare (optimize (speed 3) (safety 0)))
+                 (block output-nothing
+                   (let* ((length (length string))
+                          (null-size (let* ((byte (code-char 0))
+                                            (bits (char-code byte)))
+                                       (declare (ignorable byte bits))
+                                       (the index ,out-size-expr)))
+                          (buffer-length
+                            (+ (loop for i of-type index below length
+                                     for byte of-type character = (aref string i)
+                                     for bits = (char-code byte)
+                                     sum (the index ,out-size-expr) of-type index)
+                               null-size))
+                          (tail 0)
+                          (,n-buffer (make-array buffer-length
+                                                 :element-type '(unsigned-byte 8)))
+                          stream)
+                     (declare (type index length buffer-length tail)
+                              (type null stream)
+                              (ignorable stream))
+                     (with-pinned-objects (,n-buffer)
+                       (let ((sap (vector-sap ,n-buffer)))
+                         (declare (system-area-pointer sap))
+                         (loop for i of-type index below length
+                               for byte of-type character = (aref string i)
+                               for bits = (char-code byte)
+                               for size of-type index = ,out-size-expr
+                               do (prog1
+                                      ,out-expr
+                                    (incf tail size)))
+                         (let* ((bits 0)
+                                (byte (code-char bits))
+                                (size null-size))
+                           (declare (ignorable bits byte size))
+                           ,out-expr)))
+                     ,n-buffer))))))
 
       (let ((entry (%make-external-format
                     :names ',external-format
@@ -1940,11 +1928,13 @@
   (release-fd-stream-buffers fd-stream))
 
 ;;; Flushes the current input buffer and any supplied replacements,
-;;; and returns the input buffer, and the amount of of flushed input
-;;; in bytes.
+;;; and returns the input buffer, and the amount of flushed input in
+;;; bytes.
 (defun flush-input-buffer (stream)
-  (let ((unread (length (fd-stream-instead stream))))
-    (setf (fill-pointer (fd-stream-instead stream)) 0)
+  (let* ((instead (fd-stream-instead stream))
+         (unread (length instead)))
+    ;; (setf fill-pointer) performs some checks and is slower
+    (setf (%array-fill-pointer instead) 0)
     (let ((ibuf (fd-stream-ibuf stream)))
       (if ibuf
           (let ((head (buffer-head ibuf))
@@ -1956,7 +1946,7 @@
   (flush-input-buffer stream)
   #!+win32
   (progn
-    (sb!win32:fd-clear-input (fd-stream-fd stream))
+    (sb!win32:handle-clear-input (fd-stream-fd stream))
     (setf (fd-stream-listen stream) nil))
   #!-win32
   (catch 'eof-input-catcher
@@ -1976,7 +1966,7 @@
                   (or (not (eql (buffer-head ibuf) (buffer-tail ibuf)))
                       (fd-stream-listen fd-stream)
                       #!+win32
-                      (sb!win32:fd-listen (fd-stream-fd fd-stream))
+                      (sb!win32:handle-listen (fd-stream-fd fd-stream))
                       #!-win32
                       ;; If the read can block, LISTEN will certainly return NIL.
                       (if (sysread-may-block-p fd-stream)
@@ -2361,7 +2351,6 @@
              (direction direction)
              (if-does-not-exist if-does-not-exist)
              (if-exists if-exists))
-  #!+sb-doc
   "Return a stream which reads from or writes to FILENAME.
   Defined keywords:
    :DIRECTION - one of :INPUT, :OUTPUT, :IO, or :PROBE
@@ -2548,7 +2537,7 @@
                                     pathname))
                        (t nil)))
                     ((and (eql errno #!-win32 sb!unix:eexist
-                                     #!+win32 sb!win32::error_already_exists)
+                                     #!+win32 sb!win32::error_file_exists)
                           (null if-exists))
                      nil)
                     (t
@@ -2571,9 +2560,6 @@
 ;;; This is called when the cold load is first started up, and may also
 ;;; be called in an attempt to recover from nested errors.
 (defun stream-cold-init-or-reset ()
-  ;; FIXME: on gencgc the 4 standard fd-streams {stdin,stdout,stderr,tty}
-  ;; and these synonym streams are baked into +pseudo-static-generation+.
-  ;; Is that inadvertent?
   (stream-reinit)
   (setf *terminal-io* (make-synonym-stream '*tty*))
   (setf *standard-output* (make-synonym-stream '*stdout*))
@@ -2585,20 +2571,18 @@
   (values))
 
 (defun stream-deinit ()
+  (setq *tty* nil *stdin* nil *stdout* nil *stderr* nil)
   ;; Unbind to make sure we're not accidently dealing with it
   ;; before we're ready (or after we think it's been deinitialized).
-  (with-available-buffers-lock () (%makunbound '*available-buffers*)))
+  (%makunbound '*available-buffers*))
 
-(defun stdstream-external-format (fd outputp)
-  #!-win32 (declare (ignore fd outputp))
-  (let* ((keyword #!+win32 (if (and (/= fd -1)
-                                    (logbitp 0 fd)
-                                    (logbitp 1 fd))
-                               :ucs-2
-                               (if outputp
-                                   (sb!win32::console-output-codepage)
-                                   (sb!win32::console-input-codepage)))
-                  #!-win32 (default-external-format))
+(defun stdstream-external-format (fd)
+  #!-win32 (declare (ignore fd))
+  (let* ((keyword (cond #!+(and win32 sb-unicode)
+                        ((sb!win32::console-handle-p fd)
+                         :ucs-2)
+                        (t
+                         (default-external-format))))
          (ef (get-external-format keyword))
          (replacement (ef-default-replacement-character ef)))
     `(,keyword :replacement ,replacement)))
@@ -2606,9 +2590,8 @@
 ;;; This is called whenever a saved core is restarted.
 (defun stream-reinit (&optional init-buffers-p)
   (when init-buffers-p
-    (with-available-buffers-lock ()
-      (aver (not (boundp '*available-buffers*)))
-      (setf *available-buffers* nil)))
+    (aver (not (boundp '*available-buffers*)))
+    (setf *available-buffers* nil))
   (with-simple-output-to-string (*error-output*)
     (multiple-value-bind (in out err)
         #!-win32 (values 0 1 2)
@@ -2636,7 +2619,7 @@
                     :element-type :default
                     :serve-events inputp
                     :auto-close t
-                    :external-format (stdstream-external-format nul-handle outputp))))
+                    :external-format (stdstream-external-format nul-handle))))
                (stdio-stream (handle name inputp outputp)
                  (cond
                    #!+win32
@@ -2652,7 +2635,7 @@
                      :buffering :line
                      :element-type :default
                      :serve-events inputp
-                     :external-format (stdstream-external-format handle outputp))))))
+                     :external-format (stdstream-external-format handle))))))
         (setf *stdin*  (stdio-stream in  "standard input"  t   nil)
               *stdout* (stdio-stream out "standard output" nil t)
               *stderr* (stdio-stream err "standard error"  nil t))))
@@ -2666,8 +2649,7 @@
             (if tty
                 (make-fd-stream tty :name "the terminal"
                                     :input t :output t :buffering :line
-                                    :external-format (stdstream-external-format
-                                                      tty t)
+                                    :external-format (stdstream-external-format tty)
                                     :serve-events t
                                     :auto-close t)
                 (make-two-way-stream *stdin* *stdout*))))
@@ -2727,26 +2709,26 @@
     (t ; call next method
      (fd-stream-misc-routine stream operation arg1 arg2))))
 
-;; Using (get-std-handle-or-null +std-error-handle+) instead of the file
-;; descriptor might make this work on win32, but I don't know.
-#!-win32
-(macrolet ((stderr () 2))
- (!defglobal *!cold-stderr-buf* " ")
- (defun !make-cold-stderr-stream ()
-   (%make-fd-stream
-    :out (lambda (stream ch)
-           (declare (ignore stream))
-           (let ((b (truly-the (simple-base-string 1) *!cold-stderr-buf*)))
-             (setf (char b 0) ch)
-             (sb!unix:unix-write (stderr) b 0 1)))
-    :sout (lambda (stream string start end)
+(!defglobal *!cold-stderr-buf* " ")
+
+(defun !make-cold-stderr-stream ()
+  (let ((stderr
+          #!-win32 2
+          #!+win32 (sb!win32::get-std-handle-or-null sb!win32::+std-error-handle+)))
+    (%make-fd-stream
+     :out (lambda (stream ch)
             (declare (ignore stream))
-            (flet ((out (s start len)
-                     (sb!unix:unix-write (stderr) s start len)))
-              (if (typep string 'simple-base-string)
-                  (out string start (- end start))
-                  (let ((n (- end start)))
-                    ;; will croak if there is any non-BASE-CHAR in the string
-                    (out (replace (make-array n :element-type 'base-char)
-                                  string :start2 start) 0 n)))))
-    :misc (constantly nil))))
+            (let ((b (truly-the (simple-base-string 1) *!cold-stderr-buf*)))
+              (setf (char b 0) ch)
+              (sb!unix:unix-write stderr b 0 1)))
+     :sout (lambda (stream string start end)
+             (declare (ignore stream))
+             (flet ((out (s start len)
+                      (sb!unix:unix-write stderr s start len)))
+               (if (typep string 'simple-base-string)
+                   (out string start (- end start))
+                   (let ((n (- end start)))
+                     ;; will croak if there is any non-BASE-CHAR in the string
+                     (out (replace (make-array n :element-type 'base-char)
+                                   string :start2 start) 0 n)))))
+     :misc (constantly nil))))

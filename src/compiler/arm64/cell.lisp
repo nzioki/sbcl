@@ -31,7 +31,9 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg))
@@ -92,7 +94,7 @@
       DONE))
 
   (define-vop (symbol-value checked-cell-ref)
-    (:translate symbol-value)
+    (:translate symeval)
     (:temporary (:sc any-reg) tls-index)
     (:variant-vars check-boundp)
     (:variant t)
@@ -131,7 +133,7 @@
   (define-vop (set cell-set)
     (:variant symbol-value-slot other-pointer-lowtag))
   (define-vop (symbol-value checked-cell-ref)
-    (:translate symbol-value)
+    (:translate symeval)
     (:generator 9
                 (loadw value object symbol-value-slot other-pointer-lowtag)
                 (let ((err-lab (generate-error-code vop 'unbound-symbol-error object)))
@@ -140,7 +142,7 @@
   (define-vop (fast-symbol-value cell-ref)
     (:variant symbol-value-slot other-pointer-lowtag)
     (:policy :fast)
-    (:translate symbol-value))
+    (:translate symeval))
 
   (define-vop (boundp boundp-frob)
     (:translate boundp)
@@ -155,11 +157,11 @@
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
-  (:translate symbol-global-value)
+  (:translate sym-global-val)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -242,7 +244,10 @@
   (:generator 10
     (loadw value object fdefn-fun-slot other-pointer-lowtag)
     (inst cmp value null-tn)
-    (inst b :eq (generate-error-code vop 'undefined-fun-error object))))
+    (inst b :eq
+          (let ((*location-context* (make-restart-location RETRY value)))
+            (generate-error-code vop 'undefined-fun-error object)))
+    RETRY))
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
@@ -256,7 +261,7 @@
     (inst add-sub lip function (- (* simple-fun-code-offset n-word-bytes)
                                   fun-pointer-lowtag))
     (load-type type function (- fun-pointer-lowtag))
-    (inst cmp type simple-fun-header-widetag)
+    (inst cmp type simple-fun-widetag)
     (inst b :eq SIMPLE-FUN)
     (load-inline-constant lip '(:fixup closure-tramp :assembly-routine) lip)
     SIMPLE-FUN
@@ -313,12 +318,12 @@
       (inst str value (@ thread-tn tls-index))))
 
   (define-vop (unbind)
-    (:info n)
+    (:info symbols)
     (:temporary (:sc descriptor-reg) value)
     (:temporary (:sc any-reg) tls-index bsp)
     (:generator 0
       (load-binding-stack-pointer bsp)
-      (loop repeat n
+      (loop for symbol in symbols
             do
             (inst ldp value tls-index (@ bsp (* (- binding-value-slot binding-size)
                                                 n-word-bytes)))
@@ -405,11 +410,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))

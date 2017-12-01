@@ -58,7 +58,7 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "cpputil.h"
+#include "align.h"
 
 #ifndef LISP_FEATURE_SB_THREAD
 /* dummy definition to reduce ifdef clutter */
@@ -69,7 +69,6 @@ os_vm_size_t os_vm_page_size;
 
 #include "gc.h"
 #include "gencgc-internal.h"
-#include <winsock2.h>
 #include <wincrypt.h>
 
 #if 0
@@ -90,6 +89,17 @@ int linux_supports_futex=0;
 
 /* Tired of writing arch_os_get_current_thread each time. */
 #define this_thread (arch_os_get_current_thread())
+
+/* Documented limit for ReadConsole/WriteConsole is 64K bytes.
+   Real limit observed on W2K-SP3 is somewhere in between 32KiB and 64Kib...
+*/
+#define MAX_CONSOLE_TCHARS 16384
+
+#ifdef LISP_FEATURE_SB_UNICODE
+typedef WCHAR console_char;
+#else
+typedef CHAR console_char;
+#endif
 
 /* wrappers for winapi calls that must be successful (like SBCL's
  * (aver ...) form). */
@@ -522,7 +532,7 @@ u32 os_get_build_time_shared_libraries(u32 excl_maximum,
             &image_optional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         IMAGE_IMPORT_DESCRIPTOR* image_import_descriptor =
             base + image_import_direntry->VirtualAddress;
-        u32 nlibrary, i,j;
+        u32 nlibrary, j;
 
         for (nlibrary=0u; nlibrary < excl_maximum
                           && image_import_descriptor->FirstThunk;
@@ -695,7 +705,7 @@ void os_preinit()
 static int translating_vfprintf(FILE*stream, const char *fmt, va_list args)
 {
     char translated[1024];
-    int i=0, delta = 0;
+    unsigned i=0, delta = 0;
 
     while (fmt[i-delta] && i<sizeof(translated)-1) {
         if((fmt[i-delta]=='%')&&
@@ -767,7 +777,8 @@ intptr_t win32_get_module_handle_by_address(os_vm_address_t addr)
                       ? result : 0);
 }
 
-void os_init(char *argv[], char *envp[])
+void os_init(char __attribute__((__unused__)) *argv[],
+             char __attribute__((__unused__)) *envp[])
 {
     SYSTEM_INFO system_info;
     GetSystemInfo(&system_info);
@@ -816,7 +827,7 @@ static inline boolean local_thread_stack_address_p(os_vm_address_t address)
  */
 
 os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
 {
     MEMORY_BASIC_INFORMATION mem_info;
 
@@ -902,13 +913,15 @@ os_invalidate(os_vm_address_t addr, os_vm_size_t len)
 }
 
 void
-os_invalidate_free(os_vm_address_t addr, os_vm_size_t len)
+os_invalidate_free(os_vm_address_t addr,
+                   os_vm_size_t __attribute__((__unused__)) len)
 {
     AVERLAX(VirtualFree(addr, 0, MEM_RELEASE));
 }
 
 void
-os_invalidate_free_by_any_address(os_vm_address_t addr, os_vm_size_t len)
+os_invalidate_free_by_any_address(os_vm_address_t addr,
+                                  os_vm_size_t __attribute__((__unused__)) len)
 {
     MEMORY_BASIC_INFORMATION minfo;
     AVERLAX(VirtualQuery(addr, &minfo, sizeof minfo));
@@ -940,8 +953,7 @@ os_validate_recommit(os_vm_address_t addr, os_vm_size_t len)
  * thing to maintain).
  */
 
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+void os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 {
     os_vm_size_t count;
 
@@ -953,10 +965,7 @@ os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 
     count = read(fd, addr, len);
     CRT_AVER( count == len );
-
-    return addr;
 }
-
 static DWORD os_protect_modes[8] = {
     PAGE_NOACCESS,
     PAGE_READONLY,
@@ -986,7 +995,7 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
  * description of a space, we could probably punt this and just do
  * (FOO_START <= x && x < FOO_END) everywhere it's called. */
 static boolean
-in_range_p(os_vm_address_t a, lispobj sbeg, size_t slen)
+in_range_p(lispobj a, lispobj sbeg, size_t slen)
 {
     char* beg = (char*)((uword_t)sbeg);
     char* end = (char*)((uword_t)sbeg) + slen;
@@ -997,18 +1006,18 @@ in_range_p(os_vm_address_t a, lispobj sbeg, size_t slen)
 boolean
 is_linkage_table_addr(os_vm_address_t addr)
 {
-    return in_range_p(addr, LINKAGE_TABLE_SPACE_START, LINKAGE_TABLE_SPACE_SIZE);
+    return in_range_p((lispobj)addr, LINKAGE_TABLE_SPACE_START, LINKAGE_TABLE_SPACE_SIZE);
 }
 
 static boolean is_some_thread_local_addr(os_vm_address_t addr);
 
 boolean
-is_valid_lisp_addr(os_vm_address_t addr)
+gc_managed_addr_p(lispobj addr)
 {
     if(in_range_p(addr, READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE) ||
        in_range_p(addr, STATIC_SPACE_START   , STATIC_SPACE_SIZE) ||
        in_range_p(addr, DYNAMIC_SPACE_START  , dynamic_space_size) ||
-       is_some_thread_local_addr(addr))
+       is_some_thread_local_addr((os_vm_address_t)addr))
         return 1;
     return 0;
 }
@@ -1230,7 +1239,7 @@ handle_access_violation(os_context_t *ctx,
 
     /* linkage table or a "valid_lisp_addr" outside of dynamic space (?) */
     if (is_linkage_table_addr(fault_address)
-        || is_valid_lisp_addr(fault_address))
+        || gc_managed_addr_p((lispobj)fault_address))
         goto try_recommit;
 
     return -1;
@@ -1346,7 +1355,7 @@ EXCEPTION_DISPOSITION
 handle_exception(EXCEPTION_RECORD *exception_record,
                  struct lisp_exception_frame *exception_frame,
                  CONTEXT *win32_context,
-                 void *dispatcher_context)
+                 void __attribute__((__unused__)) *dispatcher_context)
 {
     if (!win32_context)
         /* Not certain why this should be possible, but let's be safe... */
@@ -1469,7 +1478,8 @@ carry_frame_pointer(os_context_register_t default_value)
 }
 
 void
-wos_install_interrupt_handlers(struct lisp_exception_frame *handler)
+wos_install_interrupt_handlers
+(struct lisp_exception_frame __attribute__((__unused__)) *handler)
 {
 #ifdef LISP_FEATURE_X86
     handler->next_frame = get_seh_frame();
@@ -1492,7 +1502,7 @@ wos_install_interrupt_handlers(struct lisp_exception_frame *handler)
 void *memmove(void *dest, const void *src, size_t n)
 {
     if (dest < src) {
-        int i;
+        size_t i;
         for (i = 0; i < n; i++) *(((char *)dest)+i) = *(((char *)src)+i);
     } else {
         while (n--) *(((char *)dest)+n) = *(((char *)src)+n);
@@ -1547,24 +1557,7 @@ socket_input_available(HANDLE socket)
     return ret;
 }
 
-/* Unofficial but widely used property of console handles: they have
-   #b11 in two minor bits, opposed to other handles, that are
-   machine-word-aligned. Properly emulated even on wine.
-
-   Console handles are special in many aspects, e.g. they aren't NTDLL
-   system handles: kernel32 redirects console operations to CSRSS
-   requests. Using the hack below to distinguish console handles is
-   justified, as it's the only method that won't hang during
-   outstanding reads, won't try to lock NT kernel object (if there is
-   one; console isn't), etc. */
-int
-console_handle_p(HANDLE handle)
-{
-    return (handle != NULL)&&
-        (handle != INVALID_HANDLE_VALUE)&&
-        ((((int)(intptr_t)handle)&3)==3);
-}
-
+#ifdef LISP_FEATURE_SB_THREAD
 /* Atomically mark current thread as (probably) doing synchronous I/O
  * on handle, if no cancellation is requested yet (and return TRUE),
  * otherwise clear thread's I/O cancellation flag and return false.
@@ -1601,43 +1594,23 @@ io_end_interruptible(HANDLE handle)
                                  handle, 0);
     pthread_mutex_unlock(&interrupt_io_lock);
 }
+#define WITH_INTERRUPTIBLE_IO(handle)      \
+    if (!io_begin_interruptible(handle)) { \
+      errno = EINTR;                       \
+      return -1;                           \
+    }                                      \
+    RUN_BODY_ONCE(xx, io_end_interruptible(handle))
+#else
+#define WITH_INTERRUPTIBLE_IO(handle)
+#endif
 
-/* Documented limit for ReadConsole/WriteConsole is 64K bytes.
-   Real limit observed on W2K-SP3 is somewhere in between 32KiB and 64Kib...
-*/
-#define MAX_CONSOLE_TCHARS 16384
-
-int
-win32_write_unicode_console(HANDLE handle, void * buf, int count)
+int console_handle_p(HANDLE handle)
 {
-    DWORD written = 0;
-    DWORD nchars;
-    BOOL result;
-    nchars = count>>1;
-    if (nchars>MAX_CONSOLE_TCHARS) nchars = MAX_CONSOLE_TCHARS;
-
-    if (!io_begin_interruptible(handle)) {
-        errno = EINTR;
-        return -1;
-    }
-    result = WriteConsoleW(handle,buf,nchars,&written,NULL);
-    io_end_interruptible(handle);
-
-    if (result) {
-        if (!written) {
-            errno = EINTR;
-            return -1;
-        } else {
-            return 2*written;
-        }
-    } else {
-        DWORD err = GetLastError();
-        odxprint(io,"WriteConsole fails => %u\n", err);
-        errno = (err==ERROR_OPERATION_ABORTED ? EINTR : EIO);
-        return -1;
-    }
+    DWORD mode;
+    return GetFileType(handle) == FILE_TYPE_CHAR &&
+        GetConsoleMode(handle, &mode);
 }
-
+#ifdef LISP_FEATURE_SB_THREAD
 /*
  * (AK writes:)
  *
@@ -1698,7 +1671,7 @@ win32_write_unicode_console(HANDLE handle, void * buf, int count)
  */
 
 struct {
-    WCHAR buffer[MAX_CONSOLE_TCHARS];
+    console_char buffer[MAX_CONSOLE_TCHARS];
     DWORD head, tail;
     pthread_mutex_t lock;
     pthread_cond_t cond_has_data;
@@ -1721,11 +1694,17 @@ tty_read_line_server()
             pthread_cond_wait(&ttyinput.cond_has_client,&ttyinput.lock);
 
         pthread_mutex_unlock(&ttyinput.lock);
-
+#ifdef LISP_FEATURE_SB_UNICODE
         ok = ReadConsoleW(ttyinput.handle,
                           &ttyinput.buffer[ttyinput.tail],
                           MAX_CONSOLE_TCHARS-ttyinput.tail,
                           &nchars,NULL);
+#else
+        ok = ReadConsole(ttyinput.handle,
+                         &ttyinput.buffer[ttyinput.tail],
+                         MAX_CONSOLE_TCHARS-ttyinput.tail,
+                         &nchars,NULL);
+#endif
 
         pthread_mutex_lock(&ttyinput.lock);
 
@@ -1782,19 +1761,17 @@ win32_tty_listen(HANDLE handle)
     return result;
 }
 
-static int
-tty_read_line_client(HANDLE handle, void* buf, int count)
+static int win32_read_console(HANDLE handle, void* buf, int count)
 {
     int result = 0;
-    int nchars = count / sizeof(WCHAR);
-    sigset_t pendset;
+    int nchars = count / sizeof(console_char);
 
     if (!nchars)
         return 0;
     if (nchars>MAX_CONSOLE_TCHARS)
         nchars=MAX_CONSOLE_TCHARS;
 
-    count = nchars*sizeof(WCHAR);
+    count = nchars*sizeof(console_char);
 
     pthread_mutex_lock(&ttyinput.lock);
 
@@ -1822,7 +1799,7 @@ tty_read_line_client(HANDLE handle, void* buf, int count)
                 io_end_interruptible(ttyinput.handle);
             }
         }
-        result = sizeof(WCHAR)*(ttyinput.tail-ttyinput.head);
+        result = sizeof(console_char)*(ttyinput.tail-ttyinput.head);
         if (result > count) {
             result = count;
         }
@@ -1832,18 +1809,18 @@ tty_read_line_client(HANDLE handle, void* buf, int count)
                 LPWSTR ubuf = buf;
 
                 memcpy(buf,&ttyinput.buffer[ttyinput.head],count);
-                ttyinput.head += (result / sizeof(WCHAR));
+                ttyinput.head += (result / sizeof(console_char));
                 if (ttyinput.head == ttyinput.tail)
                     ttyinput.head = ttyinput.tail = 0;
 
-                for (nch=0;nch<result/sizeof(WCHAR);++nch) {
+                for (nch=0;nch<result/sizeof(console_char);++nch) {
                     if (ubuf[nch]==13) {
                         ++offset;
                     } else {
                         ubuf[nch-offset]=ubuf[nch];
                     }
                 }
-                result-=offset*sizeof(WCHAR);
+                result-=offset*sizeof(console_char);
 
             }
         } else {
@@ -1857,31 +1834,26 @@ unlock:
     return result;
 }
 
-int
-win32_read_unicode_console(HANDLE handle, void* buf, int count)
-{
-
-    int result;
-    result = tty_read_line_client(handle,buf,count);
-    return result;
-}
-
 boolean
 win32_maybe_interrupt_io(void* thread)
 {
     struct thread *th = thread;
     boolean done = 0;
+
     if (ptr_CancelIoEx) {
         pthread_mutex_lock(&interrupt_io_lock);
         HANDLE h = (HANDLE)
             InterlockedExchangePointer((volatile LPVOID *)
                                        &th->synchronous_io_handle_and_flag,
                                        (LPVOID)INVALID_HANDLE_VALUE);
+
         if (h && (h!=INVALID_HANDLE_VALUE)) {
             if (console_handle_p(h)) {
                 pthread_mutex_lock(&ttyinput.lock);
                 pthread_cond_broadcast(&ttyinput.cond_has_data);
                 pthread_mutex_unlock(&ttyinput.lock);
+                done = 1;
+                goto unlock;
             }
             if (ptr_CancelSynchronousIo) {
                 pthread_mutex_lock(&th->os_thread->fiber_lock);
@@ -1890,12 +1862,47 @@ win32_maybe_interrupt_io(void* thread)
             }
             done |= !!ptr_CancelIoEx(h,NULL);
         }
+    unlock:
         pthread_mutex_unlock(&interrupt_io_lock);
     }
     return done;
 }
+#endif
 
 static const LARGE_INTEGER zero_large_offset = {.QuadPart = 0LL};
+
+int
+win32_write_console(HANDLE handle, void * buf, int count)
+{
+    DWORD written = 0;
+    DWORD nchars = count / sizeof(console_char);
+    BOOL result;
+
+    if (nchars>MAX_CONSOLE_TCHARS) nchars = MAX_CONSOLE_TCHARS;
+
+    WITH_INTERRUPTIBLE_IO(handle) {
+#ifdef LISP_FEATURE_SB_UNICODE
+        result = WriteConsoleW(handle, buf, nchars, &written, NULL);
+#else
+        result = WriteConsole(handle, buf, nchars, &written, NULL);
+#endif
+    }
+
+    if (result) {
+        if (!written) {
+            errno = EINTR;
+            return -1;
+        } else {
+            return written * sizeof(console_char);
+
+        }
+    } else {
+        DWORD err = GetLastError();
+        odxprint(io,"WriteConsole fails => %u\n", err);
+        errno = (err==ERROR_OPERATION_ABORTED ? EINTR : EIO);
+        return -1;
+    }
+}
 
 int
 win32_unix_write(HANDLE handle, void * buf, int count)
@@ -1908,8 +1915,9 @@ win32_unix_write(HANDLE handle, void * buf, int count)
     BOOL seekable;
     BOOL ok;
 
-    if (console_handle_p(handle))
-        return win32_write_unicode_console(handle,buf,count);
+    if (console_handle_p(handle)) {
+        return win32_write_console(handle,buf,count);
+    }
 
     overlapped.hEvent = self->private_events.events[0];
     seekable = SetFilePointerEx(handle,
@@ -1923,12 +1931,10 @@ win32_unix_write(HANDLE handle, void * buf, int count)
         overlapped.Offset = 0;
         overlapped.OffsetHigh = 0;
     }
-    if (!io_begin_interruptible(handle)) {
-        errno = EINTR;
-        return -1;
+
+    WITH_INTERRUPTIBLE_IO(handle) {
+        ok = WriteFile(handle, buf, count, &written_bytes, &overlapped);
     }
-    ok = WriteFile(handle, buf, count, &written_bytes, &overlapped);
-    io_end_interruptible(handle);
 
     if (ok) {
         goto done_something;
@@ -1970,6 +1976,7 @@ win32_unix_write(HANDLE handle, void * buf, int count)
     return written_bytes;
 }
 
+
 int
 win32_unix_read(HANDLE handle, void * buf, int count)
 {
@@ -1982,8 +1989,9 @@ win32_unix_read(HANDLE handle, void * buf, int count)
     LARGE_INTEGER file_position;
     BOOL seekable;
 
-    if (console_handle_p(handle))
-        return win32_read_unicode_console(handle,buf,count);
+    if (console_handle_p(handle)) {
+        return win32_read_console(handle, buf, count);
+    }
 
     overlapped.hEvent = self->private_events.events[0];
     /* If it has a position, we won't try overlapped */
@@ -1998,12 +2006,11 @@ win32_unix_read(HANDLE handle, void * buf, int count)
         overlapped.Offset = 0;
         overlapped.OffsetHigh = 0;
     }
-    if (!io_begin_interruptible(handle)) {
-        errno = EINTR;
-        return -1;
+
+    WITH_INTERRUPTIBLE_IO(handle) {
+        ok = ReadFile(handle,buf,count,&read_bytes, &overlapped);
     }
-    ok = ReadFile(handle,buf,count,&read_bytes, &overlapped);
-    io_end_interruptible(handle);
+
     if (ok) {
         /* immediately */
         goto done_something;
@@ -2012,6 +2019,7 @@ win32_unix_read(HANDLE handle, void * buf, int count)
         if (errorCode == ERROR_HANDLE_EOF ||
             errorCode == ERROR_BROKEN_PIPE ||
             errorCode == ERROR_NETNAME_DELETED) {
+
             read_bytes = 0;
             goto done_something;
         }
@@ -2085,7 +2093,7 @@ void scratch(void)
 }
 
 char *
-os_get_runtime_executable_path(int external)
+os_get_runtime_executable_path(int __attribute__((__unused__)) external)
 {
     char path[MAX_PATH + 1];
     DWORD bufsize = sizeof(path);
@@ -2099,27 +2107,35 @@ os_get_runtime_executable_path(int external)
     return copied_string(path);
 }
 
-#ifdef LISP_FEATURE_SB_THREAD
 
 DWORD
 win32_wait_object_or_signal(HANDLE waitFor)
 {
+#ifdef LISP_FEATURE_SB_THREAD
     struct thread *self = arch_os_get_current_thread();
     HANDLE handles[] = {waitFor, self->private_events.events[1]};
     return
-        WaitForMultipleObjects(2,handles, FALSE,INFINITE);
+        WaitForMultipleObjects(2,handles, FALSE, INFINITE);
+#else
+    return WaitForSingleObject(waitFor, INFINITE);
+#endif
 }
 
 DWORD
 win32_wait_for_multiple_objects_or_signal(HANDLE *handles, DWORD count)
 {
+#ifdef LISP_FEATURE_SB_THREAD
     struct thread *self = arch_os_get_current_thread();
     handles[count] = self->private_events.events[1];
-
     return
         WaitForMultipleObjects(count + 1, handles, FALSE, INFINITE);
+#else
+    return
+        WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+#endif
 }
 
+#ifdef LISP_FEATURE_SB_THREAD
 /*
  * Portability glue for win32 waitable timers.
  *

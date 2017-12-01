@@ -10,10 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-;;; Given the presence of docstrings and source locations,
-;;; this logic arguably belongs to the runtime kernel, not the compiler,
-;;; but such nuance isn't hugely important.
-(in-package "SB!C")
+(in-package "SB!IMPL")
 
 ;;; Similar to FUNCTION, but the result type is "exactly" specified:
 ;;; if it is an object type, then the function returns exactly one
@@ -50,7 +47,8 @@
 ;;; The reverse mapping is obtained by reading the META-INFO.
 (declaim (type (simple-vector #.(ash 1 info-number-bits)) *info-types*))
 (!defglobal *info-types*
-            (make-array (ash 1 info-number-bits) :initial-element nil))
+            ;; Must be dumped as a literal for cold-load.
+            #.(make-array (ash 1 info-number-bits) :initial-element nil))
 
 (defstruct (meta-info
             (:constructor
@@ -254,6 +252,7 @@
 ;;;; functions and VOPs. To save space and allow for quick set
 ;;;; operations, we represent the attributes as bits in a fixnum.
 
+(in-package "SB!C")
 (deftype attributes () 'fixnum)
 
 ;;; Given a list of attribute names and an alist that translates them
@@ -286,21 +285,18 @@
         (test-name (symbolicate name "-ATTRIBUTEP")))
     `(progn
        (defmacro ,constructor (&rest attribute-names)
-         #!+sb-doc
          "Automagically generated boolean attribute creation function.
   See !DEF-BOOLEAN-ATTRIBUTE."
          (encode-attribute-mask attribute-names ,vector))
        (defun ,(symbolicate "DECODE-" name "-ATTRIBUTES") (attributes)
          (decode-attribute-mask attributes ,vector))
        (defmacro ,test-name (attributes &rest attribute-names)
-         #!+sb-doc
          "Automagically generated boolean attribute test function.
   See !DEF-BOOLEAN-ATTRIBUTE."
          `(logtest (the attributes ,attributes)
                    (,',constructor ,@attribute-names)))
        (define-setf-expander ,test-name (place &rest attributes
                                                &environment env)
-         #!+sb-doc
          "Automagically generated boolean attribute setter. See
  !DEF-BOOLEAN-ATTRIBUTE."
          (multiple-value-bind (temps values stores setter getter)

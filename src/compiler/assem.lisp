@@ -16,8 +16,6 @@
 (defvar *assem-scheduler-p* nil)
 (declaim (type boolean *assem-scheduler-p*))
 
-(defvar *assem-instructions* (make-hash-table))
-
 (defvar *assem-max-locations* 0)
 (declaim (type index *assem-max-locations*))
 
@@ -34,7 +32,7 @@
   ;; performance reasons (as of 2006-05-13 hairy array operations
   ;; are rather slow compared to simple ones).
   (buffer (make-array 0 :element-type 'assembly-unit)
-          :type (or null (simple-array assembly-unit)))
+          :type (or null (simple-array assembly-unit 1)))
   ;; whether or not to run the scheduler. Note: if the instruction
   ;; definitions were not compiled with the scheduler turned on, this
   ;; has no effect.
@@ -229,9 +227,7 @@
 (defmethod print-object ((inst instruction) stream)
   (print-unreadable-object (inst stream :type t :identity t)
     #!+sb-show-assem
-    (princ (or (gethash inst *inst-ids*)
-               (setf (gethash inst *inst-ids*)
-                     (incf *next-inst-id*)))
+    (princ (ensure-gethash inst *inst-ids* (incf *next-inst-id*))
            stream)
     (format stream
             #!+sb-show-assem " emitter=~S" #!-sb-show-assem "emitter=~S"
@@ -249,12 +245,57 @@
 (defun reset-inst-ids ()
   (clrhash *inst-ids*)
   (setf *next-inst-id* 0))
+;;;
+
+;;; This holds the current segment while assembling. Use ASSEMBLE to
+;;; change it.
+(defvar **current-segment**)
+;;; Just like **CURRENT-SEGMENT** except this holds the current vop.
+;;; This is used only to keep track of which vops emit which insts.
+(defvar **current-vop** nil)
+
+(defmacro assemble ((&optional segment vop &key labels) &body body
+                    &environment env)
+  "Execute BODY (as a progn) with SEGMENT as the current segment."
+  (flet ((label-name-p (thing)
+           (and thing (symbolp thing))))
+    (let* ((visible-labels (remove-if-not #'label-name-p body))
+           (inherited-labels
+             (multiple-value-bind (expansion expanded)
+                 (#+sb-xc-host cl:macroexpand
+                  #-sb-xc-host %macroexpand '..inherited-labels.. env)
+               (if expanded (copy-list expansion) nil)))
+           (new-labels
+             (sort (append labels
+                           (set-difference visible-labels
+                                           inherited-labels))
+                   #'string<))
+           (nested-labels
+             (sort (set-difference (append inherited-labels new-labels)
+                                   visible-labels)
+                   #'string<)))
+      (when (intersection labels inherited-labels)
+        (error "duplicate nested labels: ~S"
+               (intersection labels inherited-labels)))
+      `(let* (,@(when segment
+                  `((**current-segment** ,segment)))
+              ,@(when vop
+                  `((**current-vop** ,vop)))
+              ,@(mapcar (lambda (name)
+                          `(,name (gen-label)))
+                        new-labels))
+         (symbol-macrolet (,@(when (or inherited-labels nested-labels)
+                               `((..inherited-labels.. ,nested-labels))))
+           ,@(mapcar (lambda (form)
+                       (if (label-name-p form)
+                           `(emit-label ,form)
+                           form))
+                     body))))))
 
 ;;;; the scheduler itself
 
-(defmacro without-scheduling ((&optional (segment '(%%current-segment%%)))
+(defmacro without-scheduling ((&optional (segment '**current-segment**))
                               &body body)
-  #!+sb-doc
   "Execute BODY (as a PROGN) without scheduling any of the instructions
    generated inside it. This is not protected by UNWIND-PROTECT, so
    DO NOT use THROW or RETURN-FROM to escape from it."
@@ -546,10 +587,11 @@
 
     ;; Now call the emitters, but turn the scheduler off for the duration.
     (setf (segment-run-scheduler segment) nil)
-    (dolist (inst results)
-      (if (eq inst :nop)
-          (sb!c:emit-nop segment)
-          (funcall (inst-emitter inst) segment)))
+    (assemble (segment)
+     (dolist (inst results)
+       (if (eq inst :nop)
+           (sb!c:emit-nop segment)
+           (funcall (inst-emitter inst) segment))))
     (setf (segment-run-scheduler segment) t))
 
   ;; Clear out any residue left over.
@@ -1135,106 +1177,28 @@
 
 
 ;;;; interface to the rest of the compiler
-
-;;; This holds the current segment while assembling. Use ASSEMBLE to
-;;; change it.
-;;;
-;;; The double asterisks in the name are intended to suggest that this
-;;; isn't just any old special variable, it's an extra-special
-;;; variable, because sometimes MACROLET is used to bind it. So be
-;;; careful out there..
-;;;
-;;; (This used to be called **CURRENT-SEGMENT** in SBCL until 0.7.3,
-;;; and just *CURRENT-SEGMENT* in CMU CL. In both cases, the rebinding
-;;; now done with MACROLET was done with SYMBOL-MACROLET instead. The
-;;; rename-with-double-asterisks was because the SYMBOL-MACROLET made
-;;; it an extra-special variable. The change over to
-;;; %%CURRENT-SEGMENT%% was because ANSI forbids the use of
-;;; SYMBOL-MACROLET on special variable names, and CLISP correctly
-;;; complains about this when being used as a bootstrap host.)
-(defmacro %%current-segment%% () '**current-segment**)
-(defvar **current-segment**)
-
-;;; Just like %%CURRENT-SEGMENT%%, except this holds the current vop.
-;;; This is used only to keep track of which vops emit which insts.
-;;;
-;;; The double asterisks in the name are intended to suggest that this
-;;; isn't just any old special variable, it's an extra-special
-;;; variable, because sometimes MACROLET is used to bind it. So be
-;;; careful out there..
-(defmacro %%current-vop%% () '**current-vop**)
-(defvar **current-vop** nil)
-
-;;; We also MACROLET %%CURRENT-SEGMENT%% to a local holding the
-;;; segment so uses of %%CURRENT-SEGMENT%% inside the body don't have
-;;; to keep dereferencing the symbol. Given that ASSEMBLE is the only
-;;; interface to **CURRENT-SEGMENT**, we don't have to worry about the
-;;; special value becoming out of sync with the lexical value. Unless
-;;; some bozo closes over it, but nobody does anything like that...
-(defmacro assemble ((&optional segment vop &key labels) &body body
-                    &environment env)
-  #!+sb-doc
-  "Execute BODY (as a progn) with SEGMENT as the current segment."
-  (flet ((label-name-p (thing)
-           (and thing (symbolp thing))))
-    (let* ((seg-var (gensym "SEGMENT-"))
-           (vop-var (gensym "VOP-"))
-           (visible-labels (remove-if-not #'label-name-p body))
-           (inherited-labels
-            (multiple-value-bind (expansion expanded)
-                (#+sb-xc-host cl:macroexpand
-                 #-sb-xc-host %macroexpand '..inherited-labels.. env)
-              (if expanded (copy-list expansion) nil)))
-           (new-labels
-            (sort (append labels
-                          (set-difference visible-labels
-                                          inherited-labels))
-                  #'string<))
-           (nested-labels
-            (sort (set-difference (append inherited-labels new-labels)
-                                  visible-labels)
-                  #'string<)))
-      (when (intersection labels inherited-labels)
-        (error "duplicate nested labels: ~S"
-               (intersection labels inherited-labels)))
-      `(let* ((,seg-var ,(or segment '(%%current-segment%%)))
-              (,vop-var ,(or vop '(%%current-vop%%)))
-              ,@(when segment
-                      `((**current-segment** ,seg-var)))
-              ,@(when vop
-                      `((**current-vop** ,vop-var)))
-              ,@(mapcar (lambda (name)
-                          `(,name (gen-label)))
-                        new-labels))
-         (declare (ignorable ,vop-var ,seg-var)
-                  ;; Must be done so that contribs and user code doing
-                  ;; low-level stuff don't need to worry about this.
-                  (disable-package-locks %%current-segment%% %%current-vop%%))
-         (macrolet ((%%current-segment%% () ',seg-var)
-                    (%%current-vop%% () ',vop-var))
-           ;; KLUDGE: Some host lisps (CMUCL 18e Sparc at least)
-           ;; can't deal with this declaration, so disable it on host.
-           ;; Ditto for later ENABLE-PACKAGE-LOCKS %%C-S%% declaration.
-           #-sb-xc-host
-           (declare (enable-package-locks %%current-segment%% %%current-vop%%))
-           (symbol-macrolet (,@(when (or inherited-labels nested-labels)
-                                     `((..inherited-labels.. ,nested-labels))))
-             ,@(mapcar (lambda (form)
-                         (if (label-name-p form)
-                             `(emit-label ,form)
-                             form))
-                       body)))))))
-
-(defun inst-emitter-symbol (symbol &optional create)
-  (values (funcall (if create 'intern 'find-symbol)
-                   (string-downcase symbol)
-                   *backend-instruction-set-package*)))
+(defun op-encoder-name (string-designator &optional create)
+  (let ((conflictp
+         ;; This kludge avoids interning instruction encoder names in lowercase
+         ;; most of the time, which was a hack to avoid overlap with Lisp macros
+         ;; of the same name.
+         (member string-designator
+                 '("ASR" "LSR" "LSL" "ROR"                     ; ARM
+                   "T"                                         ; Sparc "trap"
+                   "AND" "OR" "NOT" "PUSH" "POP" "SET" "LOOP"  ; x86
+                   "LDB"                                       ; HPPA
+                   "BREAK" "BYTE" "CALL" "WORD" "MOVE")        ; generic
+                 :test #'string=)))
+    (values (funcall (if create 'intern 'find-symbol)
+                     (if conflictp
+                         (string-downcase string-designator)
+                         (string string-designator))
+                     *backend-instruction-set-package*))))
 
 (defmacro inst (&whole whole instruction &rest args &environment env)
-  #!+sb-doc
   "Emit the specified instruction to the current segment."
   (let* ((stringablep (typep instruction '(or symbol string character)))
-         (sym (and stringablep (inst-emitter-symbol instruction))))
+         (sym (and stringablep (op-encoder-name instruction))))
     (cond ((and stringablep
                 (null sym))
            (warn "Undefined instruction: ~s in~% ~s" instruction whole)
@@ -1242,31 +1206,23 @@
           ((#-sb-xc macro-function #+sb-xc sb!xc:macro-function sym env)
            `(,sym ,@args))
           (t
-           `(,@(if stringablep `(,sym) `(funcall (inst-emitter-symbol ,instruction)))
-             (%%current-segment%%) (%%current-vop%%) ,@args)))))
+           `(,@(if stringablep `(,sym) `(funcall (op-encoder-name ,instruction)))
+             ,@args)))))
 
-;;; Note: The need to capture MACROLET bindings of %%CURRENT-SEGMENT%%
-;;; and %%CURRENT-VOP%% prevents this from being an ordinary function.
-(defmacro emit-label (label)
-  #!+sb-doc
+(defun emit-label (label)
   "Emit LABEL at this location in the current segment."
-  `(%emit-label (%%current-segment%%) (%%current-vop%%) ,label))
+  (%emit-label **current-segment** **current-vop** label))
 
-;;; Note: The need to capture MACROLET bindings of
-;;; %%CURRENT-SEGMENT%% prevents this from being an ordinary function.
-(defmacro emit-postit (function)
-  `(%emit-postit (%%current-segment%%) ,function))
+(defun emit-postit (function)
+  (%emit-postit **current-segment** function))
 
-;;; Note: The need to capture SYMBOL-MACROLET bindings of
-;;; **CURRENT-SEGMENT* and (%%CURRENT-VOP%%) prevents this from being an
-;;; ordinary function.
-(defmacro emit-alignment (bits &optional (pattern 0))
-  #!+sb-doc
+(defun emit-alignment (bits &optional (pattern 0))
   "Emit an alignment restriction to the current segment."
-  `(%emit-alignment (%%current-segment%%) (%%current-vop%%) ,bits ,pattern))
+  (%emit-alignment **current-segment** **current-vop** bits pattern))
 
+(declaim (ftype (sfunction (label &optional t index) (or null index))
+                label-position))
 (defun label-position (label &optional if-after delta)
-  #!+sb-doc
   "Return the current position for LABEL. Chooser maybe-shrink functions
    should supply IF-AFTER and DELTA in order to ensure correct results."
   (let ((posn (label-posn label)))
@@ -1275,7 +1231,6 @@
         posn)))
 
 (defun append-segment (segment other-segment)
-  #!+sb-doc
   "Append OTHER-SEGMENT to the end of SEGMENT. Don't use OTHER-SEGMENT
    for anything after this."
   (when (segment-run-scheduler segment)
@@ -1315,7 +1270,6 @@
   (values))
 
 (defun finalize-segment (segment)
-  #!+sb-doc
   "Do any final processing of SEGMENT and return the total number of bytes
    covered by this segment."
   (when (segment-run-scheduler segment)
@@ -1476,10 +1430,9 @@
 
 (defmacro define-instruction (name lambda-list &rest options)
   (binding* ((sym-name (symbol-name name))
-             (defun-name (inst-emitter-symbol sym-name t))
+             (defun-name (op-encoder-name sym-name t))
              (segment-name (car lambda-list))
              (vop-name nil)
-             (postits (gensym "POSTITS-"))
              (emitter nil)
              (decls nil)
              (attributes nil)
@@ -1529,16 +1482,8 @@
                               ,,@options) pdefs)))
           (t
            (error "unknown option: ~S" option)))))
-    (unless vop-name
-      (setq vop-name (make-symbol "VOP")))
     (when emitter
-      (push `(let ((hook (segment-inst-hook ,segment-name)))
-               (when hook
-                 (multiple-value-call hook ,segment-name ,vop-name ,sym-name
-                                      ,@arg-reconstructor)))
-            emitter)
-      (push `(dolist (postit ,postits)
-               (emit-back-patch ,segment-name 0 postit))
+      (push `(multiple-value-call #'instruction-hooks ,sym-name ,@arg-reconstructor)
             emitter)
       (unless cost (setf cost 1))
       #!+sb-dyncount
@@ -1559,19 +1504,19 @@
                       (schedule-pending-instructions ,segment-name))
                     ,@emitter))
             (let ((flet-name
-                   (gensym (concatenate 'string "EMIT-" sym-name "-INST-")))
+                    (gensym (concatenate 'string "EMIT-" sym-name "-INST-")))
                   (inst-name (gensym "INST-")))
               (setf emitter `((flet ((,flet-name (,segment-name)
                                        ,@emitter))
                                 (if (segment-run-scheduler ,segment-name)
                                     (let ((,inst-name
-                                           (make-instruction
-                                            (incf (segment-inst-number
-                                                   ,segment-name))
-                                            #',flet-name
-                                            (instruction-attributes
-                                             ,@attributes)
-                                            (progn ,@delay))))
+                                            (make-instruction
+                                             (incf (segment-inst-number
+                                                    ,segment-name))
+                                             #',flet-name
+                                             (instruction-attributes
+                                              ,@attributes)
+                                             (progn ,@delay))))
                                       ,@(when dependencies
                                           `((note-dependencies
                                                 (,segment-name ,inst-name)
@@ -1583,25 +1528,25 @@
        (setf (get ',defun-name 'sb!disassem::instruction-flavors)
              (list ,@pdefs))
        ,(when emitter
-         `(defun ,defun-name (,segment-name ,vop-name ,@new-lambda-list)
-           ,@(when decls
-               `((declare ,@decls)))
-           (let ((,postits (segment-postits ,segment-name)))
-             ;; Must be done so that contribs and user code doing
-             ;; low-level stuff don't need to worry about this.
-             (declare (disable-package-locks %%current-segment%%))
-             (setf (segment-postits ,segment-name) nil)
-             (macrolet ((%%current-segment%% ()
-                          (error "You can't use INST without an ~
-                                  ASSEMBLE inside emitters.")))
-               ;; KLUDGE: Some host lisps (CMUCL 18e Sparc at least)
-               ;; can't deal with this declaration, so disable it on host
-               ;; Ditto for earlier ENABLE-PACKAGE-LOCKS %%C-S%% %%C-V%%
-               ;; declaration.
-               #-sb-xc-host
-               (declare (enable-package-locks %%current-segment%%))
-               ,@emitter))
-           (values))))))
+          `(defun ,defun-name ,new-lambda-list
+             ,@(when decls
+                 `((declare ,@decls)))
+             (let* ((,segment-name **current-segment**)
+                    ,@(and vop-name
+                           `((,vop-name **current-vop**))))
+               ,@emitter)
+             (values))))))
+
+(defun instruction-hooks (&rest args)
+  (let* ((segment **current-segment**)
+         (vop **current-vop**)
+         (postits (segment-postits segment)))
+    (setf (segment-postits segment) nil)
+    (dolist (postit postits)
+      (emit-back-patch segment 0 postit))
+    (let ((hook (segment-inst-hook segment)))
+      (when hook
+        (apply hook segment vop args)))))
 
 (defmacro define-instruction-macro (name lambda-list &body body)
-  `(defmacro ,(inst-emitter-symbol (symbol-name name) t) ,lambda-list ,@body))
+  `(defmacro ,(op-encoder-name name t) ,lambda-list ,@body))

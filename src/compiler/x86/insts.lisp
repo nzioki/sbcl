@@ -14,9 +14,9 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(*condition-name-vec* conditional-opcode
+  (import '(conditional-opcode
             register-p ; FIXME: rename to GPR-P
-            make-ea ea-disp width-bits) 'sb!vm)
+            make-ea ea-disp width-bits) "SB!VM")
   ;; Imports from SB-VM into this package
   (import '(sb!vm::*byte-sc-names* sb!vm::*word-sc-names* sb!vm::*dword-sc-names*
             sb!vm::frame-byte-offset
@@ -32,13 +32,6 @@
   ;; Actually, :DWORD is the only one really supported.
   :dword)
 
-(defparameter *byte-reg-names*
-  #(al cl dl bl ah ch dh bh))
-(defparameter *word-reg-names*
-  #(ax cx dx bx sp bp si di))
-(defparameter *dword-reg-names*
-  #(eax ecx edx ebx esp ebp esi edi))
-
 ;;; Disassembling x86 code needs to take into account little things
 ;;; like instructions that have a byte/word length bit in their
 ;;; encoding, prefixes to change the default word length for a single
@@ -52,20 +45,6 @@
 ;;; The inst-props are cleared automatically after each non-prefix
 ;;; instruction, must be set by prefilters, and contain a single bit of
 ;;; data each (presence/absence).
-
-;;; Return the operand size based on the prefixes and width bit from
-;;; the dstate.
-(defun inst-operand-size (dstate)
-  (declare (type disassem-state dstate))
-  (cond ((dstate-get-inst-prop dstate 'operand-size-8) :byte)
-        ((dstate-get-inst-prop dstate 'operand-size-16) :word)
-        (t +default-operand-size+)))
-
-;;; Return the operand size for a "word-sized" operand based on the
-;;; prefixes from the dstate.
-(defun inst-word-operand-size (dstate)
-  (declare (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'operand-size-16) :word :dword))
 
 ;;; Returns either an integer, meaning a register, or a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component
@@ -109,16 +88,6 @@
            (list r/m (read-signed-suffix 8 dstate)))
         (t                            ; (= mod #b10)
            (list r/m (read-signed-suffix 32 dstate)))))
-
-
-;;; This is a sort of bogus prefilter that just stores the info globally for
-;;; other people to use; it probably never gets printed.
-(defun prefilter-width (dstate value)
-  (declare (type bit value)
-           (type disassem-state dstate))
-  (when (zerop value)
-    (dstate-put-inst-prop dstate 'operand-size-8))
-  value)
 
 (defun width-bits (width)
   (ecase width
@@ -226,21 +195,24 @@
              (princ (schar (symbol-name (inst-operand-size dstate)) 0)
                     stream)))
 
+(defconstant +fs-segment-prefix+ #b0001)
+(defconstant +gs-segment-prefix+ #b0010)
+(defconstant +operand-size-8+    #b0100)
+(defconstant +operand-size-16+   #b1000)
+
 ;;; Used to capture the effect of the #x66 operand size override prefix.
 (define-arg-type x66
   :prefilter (lambda (dstate junk)
                (declare (ignore junk))
-               (dstate-put-inst-prop dstate 'operand-size-16)))
+               (dstate-setprop dstate +operand-size-16+)))
 
 ;;; Used to capture the effect of the #x64 and #x65 segment override
 ;;; prefixes.
 (define-arg-type seg
   :prefilter (lambda (dstate value)
-               (declare (type bit value))
-               (dstate-put-inst-prop
-                dstate (elt '(fs-segment-prefix gs-segment-prefix) value))))
+               (dstate-setprop dstate (ash 1 (the bit value)))))
 
-(defparameter *conditions*
+(defconstant-eqx +conditions+
   '((:o . 0)
     (:no . 1)
     (:b . 2) (:nae . 2) (:c . 2)
@@ -256,23 +228,24 @@
     (:l . 12) (:nge . 12)
     (:nl . 13) (:ge . 13)
     (:le . 14) (:ng . 14)
-    (:nle . 15) (:g . 15)))
-(defparameter *condition-name-vec*
-  (let ((vec (make-array 16 :initial-element nil)))
-    (dolist (cond *conditions*)
-      (when (null (aref vec (cdr cond)))
-        (setf (aref vec (cdr cond)) (car cond))))
-    vec))
+    (:nle . 15) (:g . 15))
+  #'equal)
+(defconstant-eqx sb!vm::+condition-name-vec+
+  #.(let ((vec (make-array 16 :initial-element nil)))
+      (dolist (cond +conditions+ vec)
+        (when (null (aref vec (cdr cond)))
+          (setf (aref vec (cdr cond)) (car cond)))))
+  #'equalp)
 
 ;;; Set assembler parameters. (In CMU CL, this was done with
 ;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf sb!assem:*assem-scheduler-p* nil))
 
-(define-arg-type condition-code :printer *condition-name-vec*)
+(define-arg-type condition-code :printer sb!vm::+condition-name-vec+)
 
 (defun conditional-opcode (condition)
-  (cdr (assoc condition *conditions* :test #'eq)))
+  (cdr (assoc condition +conditions+ :test #'eq)))
 
 ;;;; disassembler instruction formats
 
@@ -591,9 +564,6 @@
 (define-bitfield-emitter emit-dword 32
   (byte 32 0))
 
-(define-bitfield-emitter emit-byte-with-reg 8
-  (byte 5 3) (byte 3 0))
-
 (define-bitfield-emitter emit-mod-reg-r/m-byte 8
   (byte 2 6) (byte 3 3) (byte 3 0))
 
@@ -623,12 +593,16 @@
 
 ;;;; the effective-address (ea) structure
 
+(declaim (ftype (sfunction (tn) (mod 8)) reg-tn-encoding))
 (defun reg-tn-encoding (tn)
   (declare (type tn tn))
   (aver (eq (sb-name (sc-sb (tn-sc tn))) 'registers))
   (let ((offset (tn-offset tn)))
     (logior (ash (logand offset 1) 2)
             (ash offset -1))))
+
+(defun emit-byte+reg (seg byte reg)
+  (emit-byte seg (+ byte (reg-tn-encoding reg))))
 
 (defstruct (ea (:constructor make-ea (size &key base index scale disp))
                (:copier nil))
@@ -909,11 +883,7 @@
             (cond ((or (integerp src)
                        (and (fixup-p src)
                             (eq (fixup-flavor src) :symbol-tls-index)))
-                   (emit-byte-with-reg segment
-                                       (if (eq size :byte)
-                                           #b10110
-                                           #b10111)
-                                       (reg-tn-encoding dst))
+                   (emit-byte+reg segment (if (eq size :byte) #xB0 #xB8) dst)
                    (if (fixup-p src)
                        (emit-absolute-fixup segment src)
                        (emit-sized-immediate segment size src)))
@@ -1012,7 +982,7 @@
             (aver (not (eq size :byte)))
             (maybe-emit-operand-size-prefix segment size)
             (cond ((register-p src)
-                   (emit-byte-with-reg segment #b01010 (reg-tn-encoding src)))
+                   (emit-byte+reg segment #x50 src))
                   (t
                    (emit-byte segment #b11111111)
                    (emit-ea segment src #b110 t))))))))
@@ -1030,7 +1000,7 @@
      (aver (not (eq size :byte)))
      (maybe-emit-operand-size-prefix segment size)
      (cond ((register-p dst)
-            (emit-byte-with-reg segment #b01011 (reg-tn-encoding dst)))
+            (emit-byte+reg segment #x58 dst))
            (t
             (emit-byte segment #b10001111)
             (emit-ea segment dst #b000))))))
@@ -1050,9 +1020,7 @@
      (maybe-emit-operand-size-prefix segment size)
      (labels ((xchg-acc-with-something (acc something)
                 (if (and (not (eq size :byte)) (register-p something))
-                    (emit-byte-with-reg segment
-                                        #b10010
-                                        (reg-tn-encoding something))
+                    (emit-byte+reg segment #x90 something)
                     (xchg-reg-with-something acc something)))
               (xchg-reg-with-something (reg something)
                 (emit-byte segment (if (eq size :byte) #b10000110 #b10000111))
@@ -1248,7 +1216,7 @@
    (let ((size (operand-size dst)))
      (maybe-emit-operand-size-prefix segment size)
      (cond ((and (not (eq size :byte)) (register-p dst))
-            (emit-byte-with-reg segment #b01000 (reg-tn-encoding dst)))
+            (emit-byte+reg segment #x40 dst))
            (t
             (emit-byte segment (if (eq size :byte) #b11111110 #b11111111))
             (emit-ea segment dst #b000))))))
@@ -1262,7 +1230,7 @@
    (let ((size (operand-size dst)))
      (maybe-emit-operand-size-prefix segment size)
      (cond ((and (not (eq size :byte)) (register-p dst))
-            (emit-byte-with-reg segment #b01001 (reg-tn-encoding dst)))
+            (emit-byte+reg segment #x48 dst))
            (t
             (emit-byte segment (if (eq size :byte) #b11111110 #b11111111))
             (emit-ea segment dst #b001))))))
@@ -1373,7 +1341,7 @@
   (:printer ext-reg-no-width ((op #b11001)))
   (:emitter
    (emit-byte segment #x0f)
-   (emit-byte-with-reg segment #b11001 (reg-tn-encoding dst))))
+   (emit-byte+reg segment #xC8 dst)))
 
 ;;; CBW -- Convert Byte to Word. AX <- sign_xtnd(AL)
 (define-instruction cbw (segment)
@@ -1888,6 +1856,7 @@
 
 (define-instruction nop (segment)
   (:printer byte ((op #b10010000)))
+  (:printer ext-reg/mem-no-width ((op '(#x1F 0))))
   (:emitter
    (emit-byte segment #b10010000)))
 
@@ -1923,11 +1892,7 @@
 
 (define-instruction simple-fun-header-word (segment)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
-
-(define-instruction lra-header-word (segment)
-  (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 ;;;; fp instructions
 ;;;;

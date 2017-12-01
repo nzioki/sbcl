@@ -33,9 +33,7 @@
     (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
 
     LOSE
-    (cerror-call vop done 'object-not-list-error ptr)
+    (cerror-call vop 'object-not-list-error ptr)
 
     DONE
     (move count result)))
-
-(define-static-fun length (object) :translate length)

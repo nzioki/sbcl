@@ -13,6 +13,20 @@
 
 ;;;; DYNAMIC-USAGE and friends
 
+#!+(and relocatable-heap gencgc)
+(define-alien-variable ("DYNAMIC_SPACE_START" sb!vm:dynamic-space-start) unsigned-long)
+#!-sb-fluid
+(declaim (inline current-dynamic-space-start))
+(defun current-dynamic-space-start ()
+  #!+gencgc sb!vm:dynamic-space-start
+  #!-gencgc (extern-alien "current_dynamic_space" unsigned-long))
+
+#!+(or x86 x86-64)
+(progn
+  (declaim (inline dynamic-space-free-pointer))
+  (defun dynamic-space-free-pointer ()
+    (extern-alien "dynamic_space_free_pointer" system-area-pointer)))
+
 #!-sb-fluid
 (declaim (inline dynamic-usage))
 #!+gencgc
@@ -24,74 +38,45 @@
              (- (sap-int (sb!c::dynamic-space-free-pointer))
                 (current-dynamic-space-start))))
 
+#!+immobile-space
+(progn
+  (define-alien-variable sb!vm:varyobj-space-size (unsigned 32))
+  #!+relocatable-heap
+  (progn
+    (define-alien-variable ("FIXEDOBJ_SPACE_START" sb!vm:fixedobj-space-start) unsigned-long)
+    (define-alien-variable ("VARYOBJ_SPACE_START" sb!vm:varyobj-space-start) unsigned-long))
+  (define-alien-variable ("varyobj_free_pointer" sb!vm:*varyobj-space-free-pointer*)
+    system-area-pointer)
+  (define-alien-variable ("fixedobj_free_pointer" sb!vm:*fixedobj-space-free-pointer*)
+    system-area-pointer)
+  (defun immobile-space-addr-p (addr)
+    (declare (type word addr))
+    (or (let ((start sb!vm:fixedobj-space-start))
+          (<= start addr (truly-the word (+ start (1- sb!vm:fixedobj-space-size)))))
+        (let ((start sb!vm:varyobj-space-start))
+          (<= start addr (truly-the word (+ start (1- sb!vm:varyobj-space-size)))))))
+  (defun immobile-space-obj-p (obj)
+    (immobile-space-addr-p (get-lisp-obj-address obj))))
+
 (defun static-space-usage ()
-  (- (ash sb!vm:*static-space-free-pointer* sb!vm:n-fixnum-tag-bits)
-     sb!vm:static-space-start))
+  (- (sap-int sb!vm:*static-space-free-pointer*) sb!vm:static-space-start))
 
 (defun read-only-space-usage ()
-  (- (ash sb!vm::*read-only-space-free-pointer* sb!vm:n-fixnum-tag-bits)
-     sb!vm:read-only-space-start))
+  (- (sap-int sb!vm:*read-only-space-free-pointer*) sb!vm:read-only-space-start))
+
+;;; Convert the descriptor into a SAP. The bits all stay the same, we just
+;;; change our notion of what we think they are.
+(declaim (inline descriptor-sap))
+(defun descriptor-sap (x) (int-sap (get-lisp-obj-address x)))
 
 (defun control-stack-usage ()
   #!-stack-grows-downward-not-upward
-  (- (sap-int (sb!c::control-stack-pointer-sap))
-     (sap-int (sb!di::descriptor-sap sb!vm:*control-stack-start*)))
+  (sap- (control-stack-pointer-sap) (descriptor-sap sb!vm:*control-stack-start*))
   #!+stack-grows-downward-not-upward
-  (- (sap-int (sb!di::descriptor-sap sb!vm:*control-stack-end*))
-     (sap-int (sb!c::control-stack-pointer-sap))))
+  (sap- (descriptor-sap sb!vm:*control-stack-end*) (control-stack-pointer-sap)))
 
 (defun binding-stack-usage ()
-  (- (sap-int (sb!c::binding-stack-pointer-sap))
-     (sap-int (sb!di::descriptor-sap sb!vm:*binding-stack-start*))))
-
-;;;; ROOM
-
-(defun room-minimal-info ()
-  (format t "Dynamic space usage is:   ~10:D bytes.~%" (dynamic-usage))
-  (format t "Read-only space usage is: ~10:D bytes.~%" (read-only-space-usage))
-  (format t "Static space usage is:    ~10:D bytes.~%" (static-space-usage))
-  (format t "Control stack usage is:   ~10:D bytes.~%" (control-stack-usage))
-  (format t "Binding stack usage is:   ~10:D bytes.~%" (binding-stack-usage))
-  #!+sb-thread
-  (format t
-          "Control and binding stack usage is for the current thread only.~%")
-  (format t "Garbage collection is currently ~:[enabled~;DISABLED~].~%"
-          *gc-inhibit*))
-
-(defun room-intermediate-info ()
-  (room-minimal-info)
-  (sb!vm:memory-usage :count-spaces '(:dynamic)
-                      :print-spaces t
-                      :cutoff 0.05f0
-                      :print-summary nil))
-
-(defun room-maximal-info ()
-  ;; FIXME: SB!VM:INSTANCE-USAGE calls suppressed until bug 344 is fixed
-  (room-intermediate-info)
-  ;; old way, could be restored when bug 344 fixed:
-  ;;x (room-minimal-info)
-  ;;x (sb!vm:memory-usage :count-spaces '(:static :dynamic))
-  ;;x (sb!vm:instance-usage :dynamic :top-n 10)
-  ;;x (sb!vm:instance-usage :static :top-n 10)
-  )
-
-(defun room (&optional (verbosity :default))
-  #!+sb-doc
-  "Print to *STANDARD-OUTPUT* information about the state of internal
-  storage and its management. The optional argument controls the
-  verbosity of output. If it is T, ROOM prints out a maximal amount of
-  information. If it is NIL, ROOM prints out a minimal amount of
-  information. If it is :DEFAULT or it is not supplied, ROOM prints out
-  an intermediate amount of information."
-  (fresh-line)
-  (ecase verbosity
-    ((t)
-     (room-maximal-info))
-    ((nil)
-     (room-minimal-info))
-    (:default
-     (room-intermediate-info)))
-  (values))
+  (sap- (binding-stack-pointer-sap) (descriptor-sap sb!vm:*binding-stack-start*)))
 
 ;;;; GET-BYTES-CONSED
 
@@ -102,18 +87,15 @@
 ;;; ever allocated by adding this to the number of bytes currently
 ;;; allocated and never freed.)
 (declaim (type unsigned-byte *n-bytes-freed-or-purified*))
-(defvar *n-bytes-freed-or-purified* 0)
+(defglobal *n-bytes-freed-or-purified* 0)
 (defun gc-reinit ()
   (setq *gc-inhibit* nil)
   (gc)
   (setf *n-bytes-freed-or-purified* 0
-        *gc-run-time* 0
-        ;; See comment in interr.lisp
-        *heap-exhausted-error-condition* (make-condition 'heap-exhausted-error)))
+        *gc-run-time* 0))
 
 (declaim (ftype (sfunction () unsigned-byte) get-bytes-consed))
 (defun get-bytes-consed ()
-  #!+sb-doc
   "Return the number of bytes consed since the program began. Typically
 this result will be a consed bignum, so if you have an application (e.g.
 profiling) which can't tolerate the overhead of consing bignums, you'll
@@ -126,7 +108,6 @@ and submit it as a patch."
 ;;;; GC hooks
 
 (!defvar *after-gc-hooks* nil
-  #!+sb-doc
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
 run in any thread.")
@@ -160,7 +141,6 @@ run in any thread.")
         (free-alien old))
       pathname))
   (defun gc-logfile ()
-    #!+sb-doc
     "Return the pathname used to log garbage collections. Can be SETF.
 Default is NIL, meaning collections are not logged. If non-null, the
 designated file is opened before and after each collection, and generation
@@ -171,9 +151,11 @@ statistics are appended to it."
 
 (declaim (inline dynamic-space-size))
 (defun dynamic-space-size ()
-  #!+sb-doc
   "Size of the dynamic space in bytes."
   (extern-alien "dynamic_space_size" os-vm-size-t))
+#!+gencgc
+(define-symbol-macro sb!vm:dynamic-space-end
+  (+ (dynamic-space-size) sb!vm:dynamic-space-start))
 
 ;;;; SUB-GC
 
@@ -192,9 +174,9 @@ statistics are appended to it."
 
 ;;; For GENCGC all generations < GEN will be GC'ed.
 
-(defvar *already-in-gc* (sb!thread:make-mutex :name "GC lock"))
+(define-load-time-global *already-in-gc* (sb!thread:make-mutex :name "GC lock"))
 
-(defun sub-gc (&key (gen 0))
+(defun sub-gc (gen)
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
@@ -207,7 +189,7 @@ statistics are appended to it."
                         (new-usage 0)
                         (start-time (get-internal-run-time)))
                     (collect-garbage gen)
-                    (setf *gc-epoch* (cons nil nil))
+                    (setf *gc-epoch* (cons 0 0))
                     (let ((run-time (- (get-internal-run-time) start-time)))
                       ;; KLUDGE: Sometimes we see the second getrusage() call
                       ;; return a smaller value than the first, which can
@@ -314,7 +296,7 @@ statistics are appended to it."
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
-  #!+(and sb-doc gencgc)
+  #!+gencgc
   "Initiate a garbage collection.
 
 The default is to initiate a nursery collection, which may in turn
@@ -324,7 +306,7 @@ used to specify the oldest generation guaranteed to be collected.
 
 On CheneyGC platforms arguments FULL and GEN take no effect: a full
 collection is always performed."
-  #!+(and sb-doc (not gencgc))
+  #!-gencgc
   "Initiate a garbage collection.
 
 The collection is always a full collection.
@@ -337,7 +319,7 @@ If GEN is provided, it can be used to specify the oldest generation
 guaranteed to be collected."
   #!-gencgc (declare (ignore full))
   (let (#!+gencgc (gen (if full sb!vm:+pseudo-static-generation+ gen)))
-    (when (eq t (sub-gc :gen gen))
+    (when (eq t (sub-gc gen))
       (post-gc))))
 
 (define-alien-routine scrub-control-stack void)
@@ -368,7 +350,6 @@ guaranteed to be collected."
 ;;;; auxiliary functions
 
 (defun bytes-consed-between-gcs ()
-  #!+sb-doc
   "The amount of memory that will be allocated before the next garbage
 collection is initiated. This can be set with SETF.
 
@@ -404,10 +385,10 @@ Note: currently changes to this value are lost when saving core."
 #!+gencgc
 (define-alien-type generation
     (struct generation
+            (alloc-large-start-page page-index-t)
             (alloc-start-page page-index-t)
             (alloc-unboxed-start-page page-index-t)
-            (alloc-large-start-page page-index-t)
-            (alloc-large-unboxed-start-page page-index-t)
+            (alloc-code-start-page page-index-t)
             (bytes-allocated os-vm-size-t)
             (gc-trigger os-vm-size-t)
             (bytes-consed-between-gcs os-vm-size-t)
@@ -421,10 +402,8 @@ Note: currently changes to this value are lost when saving core."
     (array generation #.(1+ sb!vm:+pseudo-static-generation+)))
 
 (macrolet ((def (slot doc &optional setfp)
-             (declare (ignorable doc))
              `(progn
                 (defun ,(symbolicate "GENERATION-" slot) (generation)
-                  #!+sb-doc
                   ,doc
                   #!+gencgc
                   (declare (generation-index generation))
@@ -481,7 +460,6 @@ promotion. Available on GENCGC platforms only.
 
 Experimental: interface subject to change."))
   (defun generation-average-age (generation)
-    #!+sb-doc
     "Average age of memory allocated to GENERATION: average number of times
 objects allocated to the generation have seen younger objects promoted to it.
 Available on GENCGC platforms only.

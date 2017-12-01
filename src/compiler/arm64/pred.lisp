@@ -27,16 +27,12 @@
 
 ;;; The generic conditional branch, emitted immediately after test
 ;;; VOPs that only set flags.
-
-;;; FIXME: Unlike the PPC (from whence this was cribbed), ARM actually
-;;; has flags.  We should take advantage of them here.
-
 (define-vop (branch-if)
   (:info dest flags not-p)
   (:generator 0
     (flet ((negate-condition (name)
              (let ((code (logxor 1 (conditional-opcode name))))
-               (aref *condition-name-vec* code))))
+               (aref +condition-name-vec+ code))))
       (aver (null (rest flags)))
       (inst b
             (if not-p
@@ -63,7 +59,7 @@
   (:info target not-p)
   (:policy :fast-safe)
   (:translate eq)
-  (:generator 3
+  (:generator 6
     (cond ((not (and (sc-is y immediate)
                      (eql 0 (tn-value y))))
            (inst cmp
@@ -80,3 +76,16 @@
            (inst cbnz x target))
           (t
            (inst cbz x target)))))
+
+(macrolet ((def (eq-name eql-name cost)
+             `(define-vop (,eq-name ,eql-name)
+                (:translate eq)
+                (:variant-cost ,cost))))
+  (def fast-if-eq-character fast-char=/character 3)
+  (def fast-if-eq-character/c fast-char=/character/c 2)
+  (def fast-if-eq-fixnum fast-eql/fixnum 3)
+  (def fast-if-eq-fixnum/c fast-eql-c/fixnum 2)
+  (def fast-if-eq-signed fast-if-eql/signed 5)
+  (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
+  (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
+  (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))

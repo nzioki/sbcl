@@ -31,7 +31,7 @@
 
 ;;;; basic LAYOUT stuff
 
-;;; a list of conses, initialized by genesis
+;;; a vector of conses, initialized by genesis
 ;;;
 ;;; In each cons, the car is the symbol naming the layout, and the
 ;;; cdr is the layout itself.
@@ -47,7 +47,7 @@
   (setq *forward-referenced-layouts* (make-hash-table :test 'equal))
   #-sb-xc-host (progn
                  (/show0 "processing *!INITIAL-LAYOUTS*")
-                 (dolist (x *!initial-layouts*)
+                 (dovector (x *!initial-layouts*)
                    (setf (layout-clos-hash (cdr x)) (random-layout-clos-hash))
                    (setf (gethash (car x) *forward-referenced-layouts*)
                          (cdr x)))
@@ -56,7 +56,8 @@
 ;;; The LAYOUT structure itself is defined in 'early-classoid.lisp'
 
 (declaim (inline layout-for-std-class-p))
-(defun layout-for-std-class-p (x) (not (zerop (layout-%for-std-class-b x))))
+(defun layout-for-std-class-p (x)
+  (logtest (layout-%flags x) +pcl-object-layout-flag+))
 
 (defmethod print-object ((layout layout) stream)
   (print-unreadable-object (layout stream :type t :identity t)
@@ -112,9 +113,11 @@
     (with-world-lock ()
       (let ((classoid (find-classoid name nil)))
         (or (and classoid (classoid-layout classoid))
-            (gethash name table)
-            (setf (gethash name table)
-                  (make-layout :classoid (or classoid (make-undefined-classoid name)))))))))
+            (values (ensure-gethash name table
+                                    (make-layout
+                                     :classoid
+                                     (or classoid
+                                         (make-undefined-classoid name))))))))))
 
 ;;; If LAYOUT is uninitialized, initialize it with CLASSOID, LENGTH,
 ;;; INHERITS, DEPTHOID, and BITMAP.
@@ -125,14 +128,15 @@
 ;;; preexisting class slot value is OK, and if it's not initialized,
 ;;; its class slot value is set to an UNDEFINED-CLASS. -- FIXME: This
 ;;; is no longer true, :UNINITIALIZED used instead.
-(declaim (ftype (function (layout classoid index simple-vector layout-depthoid layout-bitmap)
-                          layout)
-                %init-or-check-layout))
-(defun %init-or-check-layout (layout classoid length inherits depthoid bitmap)
+(declaim (ftype (function (layout classoid index fixnum simple-vector
+                           layout-depthoid layout-bitmap)
+                          layout) %init-or-check-layout))
+(defun %init-or-check-layout (layout classoid length flags inherits depthoid bitmap)
   (cond ((eq (layout-invalid layout) :uninitialized)
          ;; There was no layout before, we just created one which
          ;; we'll now initialize with our information.
          (setf (layout-length layout) length
+               (layout-%flags layout) flags
                (layout-inherits layout) inherits
                (layout-depthoid layout) depthoid
                (layout-bitmap layout) bitmap
@@ -163,7 +167,15 @@
   (when (layout-invalid layout)
     (sb!c::compiler-error "can't dump reference to obsolete class: ~S"
                           (layout-classoid layout)))
-  (let ((name (classoid-name (layout-classoid layout))))
+  (let* ((classoid (layout-classoid layout))
+         (name (classoid-name classoid)))
+    (aver (= (layout-%flags layout)
+             (typecase classoid
+               (structure-classoid +structure-layout-flag+)
+               (condition-classoid +condition-layout-flag+)
+               (undefined-classoid
+                (bug "xc MAKE-LOAD-FORM on undefined layout"))
+               (t 0))))
     (unless name
       (sb!c::compiler-error "can't dump anonymous LAYOUT: ~S" layout))
     ;; Since LAYOUT refers to a class which refers back to the LAYOUT,
@@ -178,6 +190,7 @@
      `(%init-or-check-layout ',layout
                              ',(layout-classoid layout)
                              ',(layout-length layout)
+                             ',(layout-%flags layout)
                              ',(layout-inherits layout)
                              ',(layout-depthoid layout)
                              ',(layout-bitmap layout)))))
@@ -270,10 +283,10 @@ between the ~A definition and the ~A definition"
 ;;; Used by the loader to forward-reference layouts for classes whose
 ;;; definitions may not have been loaded yet. This allows type tests
 ;;; to be loaded when the type definition hasn't been loaded yet.
-(declaim (ftype (function (symbol index simple-vector layout-depthoid layout-bitmap)
+(declaim (ftype (function (symbol index fixnum simple-vector layout-depthoid layout-bitmap)
                           layout)
                 find-and-init-or-check-layout))
-(defun find-and-init-or-check-layout (name length inherits depthoid bitmap)
+(defun find-and-init-or-check-layout (name length flags inherits depthoid bitmap)
   (truly-the ; avoid an "assertion too complex to check" optimizer note
    (values layout &optional)
    (with-world-lock ()
@@ -282,6 +295,7 @@ between the ~A definition and the ~A definition"
                              (or (find-classoid name nil)
                                  (layout-classoid layout))
                              length
+                             flags
                              inherits
                              depthoid
                              bitmap)))))
@@ -418,17 +432,9 @@ between the ~A definition and the ~A definition"
   (let ((obj-info (make-hash-table :size (length objects)))
         (free-objs nil)
         (result nil))
-    (dolist (constraint constraints)
-      (let ((obj1 (car constraint))
-            (obj2 (cdr constraint)))
-        (let ((info2 (gethash obj2 obj-info)))
-          (if info2
-              (incf (first info2))
-              (setf (gethash obj2 obj-info) (list 1))))
-        (let ((info1 (gethash obj1 obj-info)))
-          (if info1
-              (push obj2 (rest info1))
-              (setf (gethash obj1 obj-info) (list 0 obj2))))))
+    (loop for (obj1 . obj2) in constraints do
+       (incf (first (ensure-gethash obj2 obj-info (list 0))))
+       (push obj2 (rest (ensure-gethash obj1 obj-info (list 0)))))
     (dolist (obj objects)
       (let ((info (gethash obj obj-info)))
         (when (or (not info) (zerop (first info)))
@@ -493,6 +499,7 @@ between the ~A definition and the ~A definition"
 ;;; classes. Non-structure "typed" defstructs are a special case, and
 ;;; don't have a corresponding class.
 (def!struct (structure-classoid (:include classoid)
+                                (:copier nil)
                                 (:constructor %make-structure-classoid)))
 (defun make-structure-classoid (&key name)
   (mark-ctype-interned (%make-structure-classoid :name name)))
@@ -600,7 +607,8 @@ between the ~A definition and the ~A definition"
                (classoid-cell-pcl-class cell) nil))
        (clear-info :type :kind name)
        (clear-info :type :documentation name)
-       (clear-info :type :compiler-layout name)))))
+       (clear-info :type :compiler-layout name)
+       (values-specifier-type-cache-clear)))))
 
 ;;; Called when we are about to define NAME as a class meeting some
 ;;; predicate (such as a meta-class type test.) The first result is
@@ -799,7 +807,8 @@ between the ~A definition and the ~A definition"
 (declaim (type cons **non-instance-classoid-types**))
 (defglobal **non-instance-classoid-types**
   '(symbol system-area-pointer weak-pointer code-component
-    lra fdefn random-class))
+    #!-(or x86 x86-64) lra
+    fdefn random-class))
 
 (defun classoid-non-instance-p (classoid)
   (declare (type classoid classoid))
@@ -866,7 +875,7 @@ between the ~A definition and the ~A definition"
      (character :codes (#.sb!vm:character-widetag)
                 :translation (character-set)
                 :prototype-form (code-char 42))
-     (symbol :codes (#.sb!vm:symbol-header-widetag)
+     (symbol :codes (#.sb!vm:symbol-widetag)
              :prototype-form '#:mu)
 
      (system-area-pointer :codes (#.sb!vm:sap-widetag)
@@ -874,15 +883,14 @@ between the ~A definition and the ~A definition"
      (weak-pointer :codes (#.sb!vm:weak-pointer-widetag)
       :prototype-form (make-weak-pointer (find-package "CL")))
      (code-component :codes (#.sb!vm:code-header-widetag))
-     ;; should this be #!-(or x86 x86-64) ?
-     (lra :codes (#.sb!vm:return-pc-header-widetag))
+     #!-(or x86 x86-64) (lra :codes (#.sb!vm:return-pc-widetag))
      (fdefn :codes (#.sb!vm:fdefn-widetag)
             :prototype-form (make-fdefn "42"))
      (random-class) ; used for unknown type codes
 
      (function
-      :codes (#.sb!vm:closure-header-widetag
-              #.sb!vm:simple-fun-header-widetag)
+      :codes (#.sb!vm:closure-widetag
+              #.sb!vm:simple-fun-widetag)
       :state :read-only
       :prototype-form (function (lambda () 42)))
 
@@ -966,7 +974,7 @@ between the ~A definition and the ~A definition"
      (sequence
       :translation (or cons (member nil) vector extended-sequence)
       :state :read-only
-      :depth 2)
+      :depth 1)
      (vector
       :translation vector :codes (#.sb!vm:complex-vector-widetag)
       :direct-superclasses (array sequence)
@@ -986,151 +994,6 @@ between the ~A definition and the ~A definition"
       :inherits (bit-vector vector simple-array
                  array sequence)
       :prototype-form (make-array 0 :element-type 'bit))
-     (simple-array-unsigned-byte-2
-      :translation (simple-array (unsigned-byte 2) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-2-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 2)))
-     (simple-array-unsigned-byte-4
-      :translation (simple-array (unsigned-byte 4) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-4-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 4)))
-     (simple-array-unsigned-byte-7
-      :translation (simple-array (unsigned-byte 7) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-7-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 7)))
-     (simple-array-unsigned-byte-8
-      :translation (simple-array (unsigned-byte 8) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-8-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 8)))
-     (simple-array-unsigned-byte-15
-      :translation (simple-array (unsigned-byte 15) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-15-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 15)))
-     (simple-array-unsigned-byte-16
-      :translation (simple-array (unsigned-byte 16) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-16-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 16)))
-
-     (simple-array-unsigned-fixnum
-      :translation (simple-array (unsigned-byte #.sb!vm:n-positive-fixnum-bits) (*))
-      :codes (#.sb!vm:simple-array-unsigned-fixnum-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0
-                       :element-type '(unsigned-byte #.sb!vm:n-positive-fixnum-bits)))
-
-     (simple-array-unsigned-byte-31
-      :translation (simple-array (unsigned-byte 31) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-31-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 31)))
-     (simple-array-unsigned-byte-32
-      :translation (simple-array (unsigned-byte 32) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-32-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 32)))
-     #!+64-bit
-     (simple-array-unsigned-byte-63
-      :translation (simple-array (unsigned-byte 63) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-63-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 63)))
-     #!+64-bit
-     (simple-array-unsigned-byte-64
-      :translation (simple-array (unsigned-byte 64) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-64-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 64)))
-     (simple-array-signed-byte-8
-      :translation (simple-array (signed-byte 8) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-8-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 8)))
-     (simple-array-signed-byte-16
-      :translation (simple-array (signed-byte 16) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-16-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 16)))
-
-     (simple-array-fixnum
-      :translation (simple-array (signed-byte #.sb!vm:n-fixnum-bits)
-                    (*))
-      :codes (#.sb!vm:simple-array-fixnum-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0
-                       :element-type
-                       '(signed-byte #.sb!vm:n-fixnum-bits)))
-
-     (simple-array-signed-byte-32
-      :translation (simple-array (signed-byte 32) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-32-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 32)))
-     #!+64-bit
-     (simple-array-signed-byte-64
-      :translation (simple-array (signed-byte 64) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-64-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 64)))
-     (simple-array-single-float
-      :translation (simple-array single-float (*))
-      :codes (#.sb!vm:simple-array-single-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type 'single-float))
-     (simple-array-double-float
-      :translation (simple-array double-float (*))
-      :codes (#.sb!vm:simple-array-double-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type 'double-float))
-     #!+long-float
-     (simple-array-long-float
-      :translation (simple-array long-float (*))
-      :codes (#.sb!vm:simple-array-long-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type 'long-float))
-     (simple-array-complex-single-float
-      :translation (simple-array (complex single-float) (*))
-      :codes (#.sb!vm:simple-array-complex-single-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(complex single-float)))
-     (simple-array-complex-double-float
-      :translation (simple-array (complex double-float) (*))
-      :codes (#.sb!vm:simple-array-complex-double-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(complex double-float)))
-     #!+long-float
-     (simple-array-complex-long-float
-      :translation (simple-array (complex long-float) (*))
-      :codes (#.sb!vm:simple-array-complex-long-float-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(complex long-float)))
      (string
       :translation string
       :direct-superclasses (vector)
@@ -1193,6 +1056,11 @@ between the ~A definition and the ~A definition"
       :inherits (symbol list sequence)
       :direct-superclasses (symbol list)
       :prototype-form 'nil)
+     ;; These last few are strange. STREAM has only T as an ancestor,
+     ;; so you'd think it would be at depth 1. FILE- and STRING-STREAM
+     ;; each have STREAM and T as ancestors, so you'd think they'd be at depth
+     ;; 1 greater than STREAM, instead of 2 greater. But changing any of
+     ;; these to the "obvious" value makes various type checks go wrong.
      (stream
       :state :read-only
       :depth 2)
@@ -1203,7 +1071,21 @@ between the ~A definition and the ~A definition"
      (string-stream
       :state :read-only
       :depth 4
-      :inherits (stream))))
+      :inherits (stream))
+     .
+     #.(loop for x across sb!vm:*specialized-array-element-type-properties*
+             unless (member (sb!vm::saetp-specifier x) '(t character base-char nil bit))
+             collect
+             ;; I'm not sure if it's an accident that there are distinct SB!KERNEL
+             ;; versus SB!VM symbols for the specialized arrays. The former are types
+             ;; in the language, and the latter are primitive object types,
+             ;; but istm they should be designated by the same symbols.
+             `(,(intern (string (sb!vm::saetp-primitive-type-name x)) *package*)
+               :translation (simple-array ,(sb!vm::saetp-specifier x) (*))
+               :codes (,(sb!vm::saetp-typecode x))
+               :direct-superclasses (vector simple-array)
+               :inherits (vector simple-array array sequence)
+               :prototype-form (make-array 0 :element-type ',(sb!vm::saetp-specifier x))))))
 
 ;;; See also src/code/class-init.lisp where we finish setting up the
 ;;; translations for built-in types.
@@ -1263,58 +1145,12 @@ between the ~A definition and the ~A definition"
           (register-layout
            (find-and-init-or-check-layout name
                                           0
+                                          0
                                           inherits-vector
                                           depthoid
                                           +layout-all-tagged+)
            :invalidate nil)))))
   (/show0 "done with loop over *!BUILT-IN-CLASSES*"))
-
-;;; Define temporary PCL STANDARD-CLASSes. These will be set up
-;;; correctly and the Lisp layout replaced by a PCL wrapper after PCL
-;;; is loaded and the class defined.
-(!cold-init-forms
-  (/show0 "about to define temporary STANDARD-CLASSes")
-  ;; You'd think with all the pedantic explanation in here it would at least
-  ;; be right, but it isn't: layout-inherits for FUNDAMENTAL-STREAM
-  ;; ends up as (T SLOT-OBJECT STREAM STANDARD-OBJECT)
-  (dolist (x '(;; Why is STREAM duplicated in this list? Because, when
-               ;; the inherits-vector of FUNDAMENTAL-STREAM is set up,
-               ;; a vector containing the elements of the list below,
-               ;; i.e. '(T STREAM STREAM), is created, and
-               ;; this is what the function ORDER-LAYOUT-INHERITS
-               ;; would do, too.
-               ;;
-               ;; So, the purpose is to guarantee a valid layout for
-               ;; the FUNDAMENTAL-STREAM class, matching what
-               ;; ORDER-LAYOUT-INHERITS would do.
-               ;; ORDER-LAYOUT-INHERITS would place STREAM at index 2
-               ;; in the INHERITS(-VECTOR). Index 1 would not be
-               ;; filled, so STREAM is duplicated there (as
-               ;; ORDER-LAYOUTS-INHERITS would do). Maybe the
-               ;; duplicate definition could be removed (removing a
-               ;; STREAM element), because FUNDAMENTAL-STREAM is
-               ;; redefined after PCL is set up, anyway. But to play
-               ;; it safely, we define the class with a valid INHERITS
-               ;; vector.
-               (fundamental-stream (t stream stream))))
-    (/show0 "defining temporary STANDARD-CLASS")
-    (let* ((name (first x))
-           (inherits-list (second x))
-           (classoid (make-standard-classoid :name name))
-           (classoid-cell (find-classoid-cell name :create t)))
-      ;; Needed to open-code the MAP, below
-      (declare (type list inherits-list))
-      (setf (classoid-cell-classoid classoid-cell) classoid
-            (info :type :kind name) :instance)
-      (let ((inherits (map 'simple-vector
-                           (lambda (x)
-                             (classoid-layout (find-classoid x)))
-                           inherits-list)))
-        #-sb-xc-host (/show0 "INHERITS=..") #-sb-xc-host (/hexstr inherits)
-        (register-layout (find-and-init-or-check-layout name 0 inherits
-                                                        -1 +layout-all-tagged+)
-                         :invalidate nil))))
-  (/show0 "done defining temporary STANDARD-CLASSes"))
 
 ;;; Now that we have set up the class heterarchy, seal the sealed
 ;;; classes. This must be done after the subclasses have been set up.
@@ -1385,6 +1221,14 @@ between the ~A definition and the ~A definition"
               (let ((layout (classoid-layout (find-classoid name))))
                 (dolist (code codes)
                   (setf (svref res code) layout)))))))
+  #!+immobile-space
+  (let ((table **built-in-class-codes**))
+    (loop with layout = (aref table sb!vm:list-pointer-lowtag)
+          for i from sb!vm:list-pointer-lowtag by 16 below 256
+          do (setf (aref table i) layout))
+    (loop with layout = (aref table sb!vm:even-fixnum-lowtag)
+          for i from sb!vm:even-fixnum-lowtag by (ash 1 sb!vm:n-fixnum-tag-bits) below 256
+          do (setf (aref table i) layout)))
   #-sb-xc-host (/show0 "done setting *BUILT-IN-CLASS-CODES*"))
 
 (!defun-from-collected-cold-init-forms !classes-cold-init)

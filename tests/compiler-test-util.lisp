@@ -18,7 +18,6 @@
            #:assert-no-consing
            #:compiler-derived-type
            #:count-full-calls
-           #:find-value-cell-values
            #:find-code-constants
            #:find-named-callees
            #:find-anonymous-callees
@@ -34,13 +33,6 @@
   (defun compiler-derived-type (x)
     (declare (ignore x))
     (values t nil)))
-
-(defun find-value-cell-values (fun)
-  (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
-          for c = (code-header-ref code i)
-          when (= sb-vm:value-cell-header-widetag (widetag-of c))
-          collect (sb-vm::value-cell-ref c))))
 
 (defun find-named-callees (fun &key (type t) (name nil namep))
   (let ((code (fun-code-header (%fun-fun fun))))
@@ -64,8 +56,11 @@
   (let ((code (fun-code-header (%fun-fun fun))))
     (loop for i from sb-vm:code-constants-offset below (code-header-words code)
           for c = (code-header-ref code i)
-          when (typep c type)
-          collect c)))
+          for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
+                          (value-cell-ref c)
+                          c)
+          when (typep value type)
+          collect value)))
 
 (defun collect-consing-stats (thunk times)
   (declare (type function thunk))
@@ -105,7 +100,8 @@
 
 (defun file-compile (toplevel-forms &key load)
   (let* ((lisp (merge-pathnames "file-compile-tmp.lisp"))
-         (fasl (compile-file-pathname lisp)))
+         (fasl (compile-file-pathname lisp))
+         (error-stream (make-string-output-stream)))
     (unwind-protect
          (progn
            (with-open-file (f lisp :direction :output)
@@ -113,10 +109,13 @@
                  (write-line toplevel-forms f)
                  (dolist (form toplevel-forms)
                    (prin1 form f))))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
+           (multiple-value-bind (fasl warn fail)
+               (let ((*error-output* error-stream))
+                 (compile-file lisp :print nil :verbose nil))
              (when load
-               (load fasl))
-             (values warn fail)))
+               (let ((*error-output* error-stream))
+                 (load fasl :print nil :verbose nil)))
+             (values warn fail error-stream)))
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 

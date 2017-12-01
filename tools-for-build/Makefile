@@ -10,16 +10,12 @@
 -include genesis/Makefile.features
 -include Config
 
-CPPFLAGS:=-I../src/runtime
+CPPFLAGS+=-I../src/runtime
 LDFLAGS:=$(LDFLAGS)
 LDLIBS:=$(OS_LIBS)
 
-all: grovel-headers determine-endianness where-is-mcontext \
-        modify-ldt-struct-name sigaction-sa-nodefer-works-test
-
-grovel-headers: CPPFLAGS+=-Wno-format
+all: grovel-headers determine-endianness where-is-mcontext
 
 clean:
-	rm -f *.o grovel-headers determine-endianness where-is-mcontext \
-                modify-ldt-structure-name sigaction-sa-nodefer-works-test
+	rm -f *.o grovel-headers determine-endianness where-is-mcontext
 	rm -f *.exe

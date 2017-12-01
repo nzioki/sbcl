@@ -20,7 +20,7 @@
 ;; structure is used instead. (See EMIT-SINGLE-STEP-TEST in
 ;; src/compiler/x86/call.lisp).
 #!-sb-thread
-(defvar *stepping* nil)
+(defvar *stepping* 0)
 
 ;; Used for implementing the STEP-OUT restart. The step-wrapper will
 ;; bind this to :MAYBE, before calling the wrapped code. When
@@ -28,7 +28,7 @@
 ;; so, it'll re-enable the stepper. This is a tri-state variable (NIL,
 ;; :MAYBE, T) so that the debugger can detect in advance whether the
 ;; OUT debugger command will actually have a wrapper to step out to.
-(defvar *step-out* nil)
+(!define-thread-local *step-out* nil)
 
 ;; These functions make no sense on the host, but putting them in
 ;; 'step.lisp' is too late, because 'step' is compiled in warm load,

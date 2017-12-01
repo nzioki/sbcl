@@ -209,17 +209,49 @@
 (fmakunbound 'eval-in-environment)
 (defun eval-in-environment (form env)
   (incf *eval-calls*)
-  ;; Should we pre-test that ENV is one that can be converted both to
-  ;; and from an interpreter environment? If it isn't, we might want to
-  ;; call the compiler now rather than performing an un-invertable step.
-  ;; Can that happen?
-  (%eval form (typecase env (sb-kernel:lexenv (env-from-lexenv env)) (t env))))
+  (let ((interpreter-env
+         (typecase env
+          (sb-kernel:lexenv (if (sb-c::null-lexenv-p env) nil (env-from-lexenv env)))
+          (t env))))
+    (if (eq interpreter-env :compile)
+        (funcall (handler-case
+                     ;; Final arg of T means signal errors immediately rather
+                     ;; than returning a function that signals when called.
+                     (sb-c::actually-compile nil `(lambda () ,form) env nil nil t)
+                  (error ()
+                     ;; Whatever went wrong, just say "too complex"
+                   (error 'compiler-environment-too-complex-error
+                          :format-control
+                          "~@<Lexical environment is too complex to evaluate in: ~S~:@>"
+                          :format-arguments (list env)))))
+        ;; FIXME: should this be (OR INTERPTER-ENV (CAPTURE-TOPLEVEL-ENV)) ?
+        ;; Whether we decide to capture the policy here or not, there will always
+        ;; be some use-case that comes out wrong. Capturing it is necessary for
+        ;; the following to work in the interpreter:
+        #|
+        (defmacro some-macro (x &environment e)
+          (if (policy e (= safety 3)) (expand-to-safe-code) (expand-normally)))
+        (with-compilation-unit (:policy '(optimize (safety 3)))
+           (some-macro (whatever)))
+        |#
+        ;; because WITH-COMPILATION-UNIT rebinds *POLICY* and so we need
+        ;; to look at that policy regardless of whether interpreting or compiling.
+        ;; But %COERCE-TO-POLICY as used in the (POLICY) macro would return
+        ;; **BASELINE-POLICY** instead of *POLICY* when given NIL as the env,
+        ;; because the compiler wants that.
+        ;; But if we do capture the policy up front, then we _fail_ to see
+        ;; any changes that are made by PROCLAIM because those _don't_
+        ;; affect the policy in an interpreter environment.
+        (%eval form interpreter-env))))
 
-(defun unintern-init-only-stuff ()
+(defun !unintern-symbols ()
   (let ((this-pkg (find-package "SB-INTERPRETER")))
-    (do-symbols (s this-pkg)
-      (when (or (and (eq (symbol-package s) this-pkg)
-                     (macro-function s)
-                     (not (member s '(defspecial do-decl-spec)))) ; for SB-CLTL2
-                (eq s '%%eval)) ; got inlined
-        (unintern s this-pkg)))))
+    `("SB-INTERPRETER"
+      %%eval ; got inlined
+      ,@(let (macros)
+          (do-symbols (s "SB-INTERPRETER" macros)
+            (when (and (eq (symbol-package s) this-pkg)
+                       (macro-function s)
+                       (not (member s '(defspecial with-subforms do-decl-spec)))) ; for SB-CLTL2
+              (push s macros)))
+          macros))))

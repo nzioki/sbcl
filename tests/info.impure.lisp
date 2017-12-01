@@ -54,7 +54,7 @@
   (assert-error (funcall (compile nil `(lambda (x) (fdefinition x))) 0)
                  type-error))
 
-(in-package "SB-C")
+(in-package "SB-IMPL")
 
 (test-util:with-test (:name :globaldb-sxhashoid-discrimination)
   (assert (not (eql (globaldb-sxhashoid '(a b c d e))
@@ -62,14 +62,14 @@
 
 (test-util:with-test (:name :bug-458015)
   ;; Make sure layouts have sane source-locations
-  (sb-c::call-with-each-globaldb-name
+  (sb-int:call-with-each-globaldb-name
    (lambda (info-name)
      (when (and (symbolp info-name) (info :type :kind info-name))
         (let* ((classoid (find-classoid info-name nil))
                (layout (and classoid (classoid-layout classoid)))
                (srcloc (and layout (sb-kernel::layout-source-location layout))))
           (when (and layout)
-            (assert (or (definition-source-location-p srcloc)
+            (assert (or (sb-c::definition-source-location-p srcloc)
                         (null srcloc)))))))))
 
 (test-util:with-test (:name :find-classoid-signal-error)
@@ -167,13 +167,6 @@
       (try `(setf ,s))
       (try `(cas ,s)))))
 
-(defun shuffle (vector) ; destructive
-  (loop for lim from (1- (length vector)) downto 0
-        for chosen = (random (1+ lim))
-        unless (= chosen lim)
-        do (rotatef (aref vector chosen) (aref vector lim)))
-  vector)
-
 (test-util:with-test (:name :quick-packed-info-insert)
   ;; Exercise some bit patterns that touch the sign bit on 32-bit machines.
   (loop repeat 10
@@ -187,7 +180,7 @@
       ;; Randomize because maybe there's an ordering constraint more
       ;; complicated than fdefn always getting to be first.
       ;; (there isn't, but could be)
-      (dolist (num (coerce (shuffle (coerce type-nums 'vector)) 'list))
+      (dolist (num (coerce (test-util:shuffle (coerce type-nums 'vector)) 'list))
         (let ((val (format nil "value for ~D" num)))
           (setq iv1 (quick-packed-info-insert iv1 num val)
                 iv2 (%packed-info-insert ; not PACKED-INFO-INSERT
@@ -219,7 +212,7 @@
         (a (make-array 1 :element-type 'sb-ext:word)))
     (let* ((aux-keys '(0 a b c d e f g h nil i j k l m n o p setf q r s))
            (info-types (loop for i from 1 below 64 collect i))
-           (work (shuffle (coerce (crossprod aux-keys info-types) 'vector)))
+           (work (test-util:shuffle (coerce (crossprod aux-keys info-types) 'vector)))
            (n (floor (length work) 4))
            (threads))
       (dotimes (i 4)
@@ -283,7 +276,7 @@
     (dotimes (i n-threads)
       ;; Insert the integers [-n .. -2]. Keys 0 and -1 are illegal.
       (setf (aref worklists i)
-            (shuffle (integer-range (- (1+ n-inserts)) -2))))
+            (test-util:shuffle (integer-range (- (1+ n-inserts)) -2))))
     (dotimes (i n-threads)
       (push (sb-thread:make-thread
              (lambda (worklist me)
@@ -488,7 +481,7 @@
         (random-result (make-array (length names) :initial-element nil))
         (n-created 0)
         (highest-type-num
-         (position-if #'identity sb-c::*info-types*
+         (position-if #'identity *info-types*
                       :end sb-int:+fdefn-info-num+ :from-end t)))
     (loop for name across names
           for i from 0
@@ -506,12 +499,12 @@
                      (random-value (random most-positive-fixnum)))
                  (push (cons random-type random-value)
                        (aref random-result random-name-index))
-                 (sb-c::set-info-value (aref names random-name-index)
-                                       random-type random-value))))
+                 (sb-int:set-info-value (aref names random-name-index)
+                                        random-type random-value))))
     (values n-created fdefn-result random-result)))
 
 (test-util:with-test (:name :get-info-value-initializing
-                      :skipped-on '(not :sb-thread))
+                      :skipped-on (not :sb-thread))
   ;; Precompute random generalized function names for testing, some of which
   ;; are "simple" (per the taxonomy of globaldb) and some hairy.
   (let ((work (coerce (loop repeat 10000
@@ -558,8 +551,7 @@
         (when (some (lambda (output)
                       (assoc type-num (aref output name-index)))
                     random-results)
-          (let ((actual (sb-c::get-info-value (aref work name-index)
-                                              type-num)))
+          (let ((actual (get-info-value (aref work name-index) type-num)))
             (unless (some (lambda (output)
                             (some (lambda (cell)
                                     (and (eq (car cell) type-num)
@@ -579,7 +571,7 @@
 ;; This test conses ~5 Megabytes on 64-bit almost entirely due
 ;; to allocation of each immutable info storage vector.
 (test-util:with-test (:name :get-info-value-updating
-                      :skipped-on '(not :sb-thread))
+                      :skipped-on (not :sb-thread))
   (flet ((run (names)
            (declare (simple-vector names))
            (let* ((n (length names))
@@ -595,8 +587,7 @@
                           (let* ((index (random n))
                                  (name (aref names index)))
                             (atomic-incf (aref counts index))
-                            ;; should probably be SB-INT:
-                            (sb-c::atomic-set-info-value
+                            (sb-int:atomic-set-info-value
                              :variable :macro-expansion name
                              (lambda (old old-p)
                                (if old-p (1+ old) 1))))

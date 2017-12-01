@@ -34,7 +34,7 @@
 ;;; that works only for compiling the compiler.
 
 ;;; "Lead-in" Control TRANsfer [to some node]
-(def!struct (ctran (:constructor make-ctran))
+(def!struct (ctran (:constructor make-ctran) (:copier nil))
   ;; an indication of the way that this continuation is currently used
   ;;
   ;; :UNUSED
@@ -64,11 +64,13 @@
 
 (defmethod print-object ((x ctran) stream)
   (print-unreadable-object (x stream :type t :identity t)
-    (format stream "~D" (cont-num x))))
+    (when (boundp '*compiler-ir-obj-map*)
+      (format stream "~D" (cont-num x)))))
 
 ;;; Linear VARiable. Multiple-value (possibly of unknown number)
 ;;; temporal storage.
-(def!struct (lvar (:constructor make-lvar (&optional dest)))
+(def!struct (lvar (:constructor make-lvar (&optional dest))
+                  (:copier nil))
   ;; The node which receives this value. NIL only temporarily.
   (dest nil :type (or node null))
   ;; cached type of this lvar's value. If NIL, then this must be
@@ -88,12 +90,14 @@
   ;; if the LVAR value is DYNAMIC-EXTENT, CLEANUP protecting it.
   (dynamic-extent nil :type (or null cleanup))
   ;; something or other that the back end annotates this lvar with
-  (info nil))
+  (info nil)
+  (dependent-casts nil))
 (!set-load-form-method lvar (:xc :target) :ignore-it)
 
 (defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
-    (format stream "~D" (cont-num x))))
+    (when (boundp '*compiler-ir-obj-map*)
+      (format stream "~D" (cont-num x)))))
 
 #!-sb-fluid (declaim (inline lvar-has-single-use-p))
 (defun lvar-has-single-use-p (lvar)
@@ -211,14 +215,8 @@
 ;;;    set, since they may:
 ;;;     - be in the process of being deleted, or
 ;;;     - have no successors.
-;;; -- TYPE-ASSERTED, TEST-MODIFIED
-;;;    These flags are used to indicate that something in this block
-;;;    might be of interest to constraint propagation. TYPE-ASSERTED
-;;;    is set when an lvar type assertion is strengthened.
-;;;    TEST-MODIFIED is set whenever the test for the ending IF has
-;;;    changed (may be true when there is no IF.)
 (!def-boolean-attribute block
-  reoptimize flush-p type-check delete-p type-asserted test-modified)
+  reoptimize flush-p type-check delete-p)
 
 (macrolet ((defattr (block-slot)
              `(defmacro ,block-slot (block)
@@ -228,14 +226,12 @@
   (defattr block-reoptimize)
   (defattr block-flush-p)
   (defattr block-type-check)
-  (defattr block-delete-p)
-  (defattr block-type-asserted)
-  (defattr block-test-modified))
+  (defattr block-delete-p))
 
 (def!struct (cloop (:conc-name loop-)
                    (:predicate loop-p)
                    (:constructor make-loop)
-                   (:copier copy-loop))
+                   (:copier nil))
   ;; The kind of loop that this is.  These values are legal:
   ;;
   ;;    :OUTER
@@ -284,6 +280,7 @@
 (def!struct (cblock (:include sset-element)
                     (:constructor make-block (start))
                     (:constructor make-block-key)
+                    (:copier nil)
                     (:conc-name block-)
                     (:predicate block-p))
   ;; a list of all the blocks that are predecessors/successors of this
@@ -307,8 +304,7 @@
   (next nil :type (or null cblock))
   (prev nil :type (or null cblock))
   ;; This block's attributes: see above.
-  (flags (block-attributes reoptimize flush-p type-check type-asserted
-                           test-modified)
+  (flags (block-attributes reoptimize flush-p type-check)
          :type attributes)
   ;; in constraint propagation: list of LAMBDA-VARs killed in this block
   ;; in copy propagation: list of killed TNs
@@ -343,10 +339,12 @@
   ;; no cached value has been stored yet.
   (physenv-cache :none :type (or null physenv (member :none))))
 (defmethod print-object ((cblock cblock) stream)
-  (print-unreadable-object (cblock stream :type t :identity t)
-    (format stream "~W :START c~W"
+  (if (boundp '*compiler-ir-obj-map*)
+      (print-unreadable-object (cblock stream :type t :identity t)
+        (format stream "~W :START c~W"
             (block-number cblock)
-            (cont-num (block-start cblock)))))
+            (cont-num (block-start cblock))))
+      (print-unreadable-object (cblock stream :type t :identity t))))
 
 ;;; The BLOCK-ANNOTATION class is inherited (via :INCLUDE) by
 ;;; different BLOCK-INFO annotation structures so that code
@@ -532,7 +530,8 @@
   ;; the kind of thing that has to be cleaned up
   (kind (missing-arg)
         :type (member :special-bind :catch :unwind-protect
-                      :block :tagbody :dynamic-extent))
+                      :block :tagbody :dynamic-extent
+                      #!-c-stack-is-control-stack :restore-nsp))
   ;; the node that messes things up. This is the last node in the
   ;; non-messed-up environment. Null only temporarily. This could be
   ;; deleted due to unreachability.
@@ -628,6 +627,7 @@
 ;;; continuation, although it is accessed by searching in the
 ;;; PHYSENV-NLX-INFO.
 (def!struct (nlx-info
+             (:copier nil)
              (:constructor make-nlx-info (cleanup
                                           exit
                                           &aux
@@ -674,6 +674,7 @@
 ;;; allows us to easily substitute one for the other without actually
 ;;; hacking the flow graph.
 (def!struct (leaf (:include sset-element (number (incf *compiler-sset-counter*)))
+                  (:copier nil)
                   (:constructor nil))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
@@ -744,13 +745,14 @@
 ;;; The BASIC-VAR structure represents information common to all
 ;;; variables which don't correspond to known local functions.
 (def!struct (basic-var (:include leaf)
+                       (:copier nil)
                        (:constructor nil))
   ;; Lists of the set nodes for this variable.
   (sets () :type list))
 
 ;;; The GLOBAL-VAR structure represents a value hung off of the symbol
 ;;; NAME.
-(def!struct (global-var (:include basic-var))
+(def!struct (global-var (:include basic-var) (:copier nil))
   ;; kind of variable described
   (kind (missing-arg)
         :type (member :special :global-function :global :unknown)))
@@ -779,7 +781,8 @@
 ;;; INLINEP values are preserved.
 (def!struct (defined-fun (:include global-var
                                    (where-from :defined)
-                                   (kind :global-function)))
+                                   (kind :global-function))
+                         (:copier nil))
   ;; The values of INLINEP and INLINE-EXPANSION initialized from the
   ;; global environment.
   (inlinep nil :type inlinep)
@@ -803,7 +806,8 @@
 (def!struct (functional (:include leaf
                                   (%source-name '.anonymous.)
                                   (where-from :defined)
-                                  (type (specifier-type 'function))))
+                                  (type (specifier-type 'function)))
+                        (:copier nil))
   ;; (For public access to this slot, use LEAF-DEBUG-NAME.)
   ;;
   ;; the name of FUNCTIONAL for debugging purposes, or NIL if we
@@ -1007,7 +1011,7 @@
                      (:conc-name lambda-)
                      (:predicate lambda-p)
                      (:constructor make-lambda)
-                     (:copier copy-lambda))
+                     (:copier nil))
   ;; list of LAMBDA-VAR descriptors for arguments
   (vars nil :type list :read-only t)
   ;; If this function was ever a :OPTIONAL function (an entry-point
@@ -1120,7 +1124,7 @@
 ;;; arguments into a direct call to the appropriate entry-point
 ;;; function, so functions that are compiled together can avoid doing
 ;;; the dispatch.
-(def!struct (optional-dispatch (:include functional))
+(def!struct (optional-dispatch (:include functional) (:copier nil))
   ;; the original parsed argument list, for anyone who cares
   (arglist nil :type list)
   ;; true if &ALLOW-OTHER-KEYS was supplied
@@ -1169,7 +1173,7 @@
 ;;; LAMBDA-VARs during IR1 conversion. If we use one of these things,
 ;;; then the var will have to be massaged a bit before it is simple
 ;;; and lexical.
-(def!struct arg-info
+(def!struct (arg-info (:copier nil))
   ;; true if this arg is to be specially bound
   (specialp nil :type boolean)
   ;; the kind of argument being described. Required args only have arg
@@ -1228,7 +1232,7 @@
   explicit-value-cell
   )
 
-(def!struct (lambda-var (:include basic-var))
+(def!struct (lambda-var (:include basic-var) (:copier nil))
   (flags (lambda-var-attributes)
          :type attributes)
   ;; the CLAMBDA that this var belongs to. This may be null when we are
@@ -1309,7 +1313,7 @@
                  (:conc-name if-)
                  (:predicate if-p)
                  (:constructor make-if)
-                 (:copier copy-if))
+                 (:copier nil))
   ;; LVAR for the predicate
   (test (missing-arg) :type lvar)
   ;; the blocks that we execute next in true and false case,
@@ -1329,7 +1333,7 @@
                   (:conc-name set-)
                   (:predicate set-p)
                   (:constructor make-set)
-                  (:copier copy-set))
+                  (:copier nil))
   ;; descriptor for the variable set
   (var (missing-arg) :type basic-var)
   ;; LVAR for the value form
@@ -1412,7 +1416,7 @@
                      (:conc-name return-)
                      (:predicate return-p)
                      (:constructor make-return)
-                     (:copier copy-return))
+                     (:copier nil))
   ;; the lambda we are returning from. Null temporarily during
   ;; ir1tran.
   (lambda nil :type (or clambda null))
@@ -1431,6 +1435,7 @@
 ;;; TYPE-TO-CHECK is performed and then the VALUE is declared to be of
 ;;; type ASSERTED-TYPE.
 (def!struct (cast (:include valued-node)
+                  (:copier nil)
                   (:constructor %make-cast))
   (asserted-type (missing-arg) :type ctype)
   (type-to-check (missing-arg) :type ctype)
@@ -1446,22 +1451,24 @@
   ;; T
   ;;    A type check is needed.
   (%type-check t :type (member t :external nil))
-  ;; the LEXENV for the deleted EXIT node for which this is the
-  ;; remaining value semantics. If NULL, we do not have exit value
-  ;; semantics and may be deleted based on type information.
-  (vestigial-exit-lexenv nil :type (or lexenv null))
-  ;; the LEXENV for the ENTRY node for the deleted EXIT node mentioned
-  ;; above. NULL if we do not have exit value semantics.
-  (vestigial-exit-entry-lexenv nil :type (or lexenv null))
   ;; the lvar which is checked
-  (value (missing-arg) :type lvar))
+  (value (missing-arg) :type lvar)
+  (context nil)
+  ;; Avoid compile time type conflict warnings.
+  ;; Used by things that expand into ETYPECASE.
+  (silent-conflict nil :type boolean))
 (defprinter (cast :identity t)
   %type-check
   value
   asserted-type
-  type-to-check
-  vestigial-exit-lexenv
-  vestigial-exit-entry-lexenv)
+  type-to-check)
+
+;;; A filter to help order the value semantics of MULTIPLE-VALUE-PROG1
+(def!struct (vestigial-exit-cast (:include cast
+                                           (%type-check nil)
+                                           (asserted-type *wild-type*)
+                                           (type-to-check *wild-type*))
+                                 (:copier nil)))
 
 ;;; A cast that always follows %check-bound and they are deleted together.
 ;;; Created via BOUND-CAST ir1-translator by chaining it together with %check-bound.
@@ -1469,7 +1476,8 @@
 ;;; DELETE-CAST deletes BOUND-CAST-CHECK
 ;;; GENERATE-TYPE-CHECKS ignores it, it never translates to a type check,
 ;;; %CHECK-BOUND does all the checking.
-(def!struct (bound-cast (:include cast (%type-check nil)))
+(def!struct (bound-cast (:include cast (%type-check nil))
+                        (:copier nil))
   ;; %check-bound combination before the cast
   (check (missing-arg) :type (or null combination))
   ;; Tells whether the type information is in a state where it can be
@@ -1478,6 +1486,23 @@
   (array (missing-arg) :type lvar)
   (bound (missing-arg) :type lvar))
 
+(def!struct (dependent-cast (:include cast) (:copier nil))
+  ;; Either LVARs or LEAFs
+  (deps nil :type list))
+
+(def!struct (function-designator-cast (:include dependent-cast)
+                                      (:copier nil))
+  (caller nil :type symbol)
+  (arg-specs nil :type list)
+  (result-specs nil :type list))
+(defprinter (function-designator-cast :identity t)
+  %type-check
+  value
+  asserted-type
+  (deps :test deps)
+  (caller :test caller)
+  (arg-specs :test arg-specs)
+  (result-specs :test result-specs))
 
 ;;;; non-local exit support
 ;;;;

@@ -780,15 +780,6 @@
 
 ;;; Array type unions have some tricky semantics.
 
-;; borrowed from 'info.impure.lisp' - FIXME: put in test-util
-;; and make it accept with either lists or vectors.
-(defun shuffle (list)
-  (let ((vector (coerce list 'vector)))
-    (loop for lim from (1- (length vector)) downto 0
-          for chosen = (random (1+ lim))
-          do (rotatef (aref vector chosen) (aref vector lim)))
-    (coerce vector 'list)))
-
 (macrolet
     ((disunity-test (name type-specifier-1 type-specifier-2)
        `(with-test (:name ,name)
@@ -1010,4 +1001,14 @@
 (with-test (:name :redefine-deftype-to-defstruct)
   (defstruct foofa (a nil :type foofa)))
 
-;;; success
+(with-test (:name :undefine-class)
+  (let ((class (gensym "CLASS")))
+    (eval `(progn (defclass ,class () ())
+                  (lambda (x) (typep x ',class))
+                  (setf (find-class ',class) nil)))
+    (let ((fun (checked-compile `(lambda (x) (typep x ',class))
+                                :allow-style-warnings t)))
+      (assert-error (funcall fun 10))
+      (assert (handler-case (not (sb-kernel:specifier-type class))
+                (sb-kernel:parse-unknown-type ()
+                  t))))))

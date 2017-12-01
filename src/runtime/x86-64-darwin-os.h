@@ -3,12 +3,18 @@
 
 #include "darwin-os.h"
 
+#define X86_64_SIGFPE_FIXUP    /* Darwin doesn't handle accrued bits correctly. */
+
+static inline unsigned int *
+arch_os_context_mxcsr_addr(os_context_t *context)
+{
+  return &context->uc_mcontext->__fs.__fpu_mxcsr;
+
+}
+
 typedef register_t os_context_register_t;
 
-static inline os_context_t *arch_os_get_context(void **void_context)
-{
-    return (os_context_t *) *void_context;
-}
+#include "arch-os-generic.inc"
 
 #if __DARWIN_UNIX03
 #define CONTEXT_ADDR_FROM_STEM(stem) (os_context_register_t*)&context->uc_mcontext->__ss.__##stem

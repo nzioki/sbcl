@@ -47,10 +47,16 @@
   (or #+sbcl
       (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
         (when envvar
+          (require :sb-posix)
           (parse-make-host-parallelism envvar)))))
 
 (defun make-host-1-parallelism () (car *make-host-parallelism*))
 (defun make-host-2-parallelism () (cdr *make-host-parallelism*))
+
+#+sbcl
+(let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
+           (if (eq access :external) sym 'sb-unix:unix-exit))))
+  (defun exit-process (arg) (funcall f arg)))
 
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
@@ -126,13 +132,51 @@
     (rename-file x path)))
 (compile 'rename-file-a-la-unix)
 
-;;; other miscellaneous tools
-(load "src/cold/read-from-file.lisp")
-(load "src/cold/rename-package-carefully.lisp")
-(load "src/cold/with-stuff.lisp")
+(export '(prepend-genfile-path read-from-file *generated-sources-root*))
+(defvar *generated-sources-root* "")
+
+;;; See remark in COMPILE-STEM about strings vs. The Common Lisp Way
+(defun prepend-genfile-path (namestring)
+  (concatenate 'string
+               ;; if exact match to "output/", or mismatch at the next character
+               (if (member (mismatch "output/" namestring) '(nil 7))
+                   *generated-sources-root*
+                   "")
+               namestring))
+(compile 'prepend-genfile-path) ; seems in vogue to compile everything in this file
+
+;;; Return an expression read from the file named NAMESTRING.
+;;; For user-supplied inputs, protect against more than one expression
+;;; appearing in the file. With trusted inputs we needn't bother.
+(defun read-from-file (namestring)
+  (with-open-file (s (prepend-genfile-path namestring))
+    (let* ((result (read s))
+           (eof-result (cons nil nil)))
+      (when (string= (pathname-name namestring) "build-order")
+        ;; build-order uses both host and target conditionals.
+        ;; Our sanity checks during make-host-1 would complain
+        ;; about #+feature when reading the second expression in the file
+        ;; whenever such feature is also a possible target feature.
+        (return-from read-from-file result))
+      (unless (eq (read s nil eof-result) eof-result)
+        (error "more than one expression in file ~S" namestring))
+      result)))
+(compile 'read-from-file)
 
 ;;; Try to minimize/conceal any non-standardness of the host Common Lisp.
-(load "src/cold/ansify.lisp")
+#-sbcl (load "src/cold/ansify.lisp")
+
+;;;; Do not put SBCL-specific things in 'ansify'. Put them here.
+;;;; And there had better not be a reason that SBCL needs ansification.
+#+sbcl
+(progn
+  (setq *compile-print* nil)
+  (load "src/cold/muffler.lisp")
+  ;; Let's just say we never care to see these.
+  (declaim (sb-ext:muffle-conditions
+            (satisfies unable-to-optimize-note-p)
+            (satisfies optional+key-style-warning-p)
+            sb-ext:code-deletion-note)))
 
 ;;;; special read-macros for building the cold system (and even for
 ;;;; building some of our tools for building the cold system)
@@ -156,11 +200,6 @@
                                       (read-from-file customizer-file-name))
                              #'identity)))
         (funcall customizer default-features)))
-(let ((*print-length* nil)
-      (*print-level* nil))
-  (format t
-          "target features *SHEBANG-FEATURES*=~%~@<~S~:>~%"
-          *shebang-features*))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -170,11 +209,6 @@
                                   (read-from-file customizer-file-name))
                          #'identity)))
     (funcall customizer default-subfeatures)))
-(let ((*print-length* nil)
-      (*print-level* nil))
-  (format t
-          "target backend-subfeatures *SHEBANG-BACKEND-FEATURES*=~@<~S~:>~%"
-          *shebang-backend-subfeatures*))
 
 ;;; Call for effect of signaling an error if no target picked.
 (target-platform-name)
@@ -201,20 +235,28 @@
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
-         ("(and win32 (not (and sb-thread
-                                sb-safepoint sb-thruption sb-wtimer
-                                sb-dynamic-core)))"
-          ":SB-WIN32 requires :SB-THREAD and related features")
-         ("(and sb-dynamic-core (not (and linkage-table sb-thread)))"
-          ;; Subtle memory corruption follows when sb-dynamic-core is
-          ;; active, and non-threaded allocation routines have not been
-          ;; updated to take the additional indirection into account.
-          ;; Let's avoid this unusual combination.
-          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE and :SB-THREAD")
+         ("(and sb-dynamic-core (not linkage-table))"
+          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
+         ("(and relocatable-heap (or cheneygc win32))"
+          "Relocatable heap requires gencgc + not win32")
+         ("(and sb-linkable-runtime (not sb-dynamic-core))"
+          ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
+         ("(and sb-linkable-runtime (not (or x86 x86-64)))"
+          ":SB-LINKABLE-RUNTIME not supported on selected architecture")
+         ("(and sb-linkable-runtime (not (or darwin linux win32)))"
+          ":SB-LINKABLE-RUNTIME not supported on selected operating system")
          ("(and sb-eval sb-fasteval)"
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
           "At most one interpreter can be selected")
+         ("(and immobile-space (not x86-64))"
+          ":IMMOBILE-SPACE is supported only on x86-64")
+        ("(and compact-instance-header (not immobile-space))"
+          ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
+        ("(and immobile-code (not immobile-space))"
+          ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
+        ("(and immobile-symbols (not immobile-space))"
+          ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
@@ -245,7 +287,10 @@
 ;;; flags which can be used to describe properties of source files
 (defparameter
   *expected-stem-flags*
-  '(;; meaning: This file is not to be compiled when building the
+  '(;; meaning: This file is needed to generate C headers if doing so
+    ;; independently of make-host-1
+    :c-headers
+    ;; meaning: This file is not to be compiled when building the
     ;; cross-compiler which runs on the host ANSI Lisp. ("not host
     ;; code", i.e. does not execute on host -- but may still be
     ;; cross-compiled by the host, so that it executes on the target)
@@ -282,13 +327,11 @@
     ;; genesis to include in the cold core.
     :not-genesis))
 
-(defparameter *stems-and-flags* (read-from-file "build-order.lisp-expr"))
-
 (defvar *array-to-specialization* (make-hash-table :test #'eq))
 
 (defmacro do-stems-and-flags ((stem flags) &body body)
   (let ((stem-and-flags (gensym "STEM-AND-FLAGS")))
-    `(dolist (,stem-and-flags *stems-and-flags*)
+    `(dolist (,stem-and-flags (get-stems-and-flags))
        (let ((,stem (first ,stem-and-flags))
              (,flags (rest ,stem-and-flags)))
          ,@body
@@ -306,9 +349,15 @@
       stem)))
 (compile 'stem-remap-target)
 
-;;; Determine the source path for a stem.
+;;; Determine the source path for a stem by remapping from the abstract name
+;;; if it contains "/target/" and appending a ".lisp" suffix.
+;;; Assume that STEM is source-tree-relative unless it starts with "output/"
+;;; in which case it could be elsewhere, if you prefer to keep the sources
+;;; devoid of compilation artifacts. (The production of out-of-tree artifacts
+;;; is not actually implemented in the generic build, however if your build
+;;; system does that by itself, then hooray for you)
 (defun stem-source-path (stem)
-  (concatenate 'string "" (stem-remap-target stem) ".lisp"))
+  (concatenate 'string (prepend-genfile-path (stem-remap-target stem)) ".lisp"))
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.
@@ -331,8 +380,13 @@
     (concatenate 'string obj-prefix (stem-remap-target stem) obj-suffix)))
 (compile 'stem-object-path)
 
+(defvar *stems-and-flags* nil)
 ;;; Check for stupid typos in FLAGS list keywords.
-(let ((stems (make-hash-table :test 'equal)))
+(defun get-stems-and-flags ()
+ (when *stems-and-flags*
+   (return-from get-stems-and-flags *stems-and-flags*))
+ (setf *stems-and-flags* (read-from-file "build-order.lisp-expr"))
+ (let ((stems (make-hash-table :test 'equal)))
   (do-stems-and-flags (stem flags)
     ;; We do duplicate stem comparison based on the object path in
     ;; order to cover the case of stems with an :assem flag, which
@@ -352,6 +406,7 @@
       (when set-difference
         (error "found unexpected flag(s) in *STEMS-AND-FLAGS*: ~S"
                set-difference)))))
+  *stems-and-flags*)
 
 ;;;; tools to compile SBCL sources to create the cross-compiler
 
@@ -392,7 +447,7 @@
          (ignore-failure-p (find :ignore-failure-p flags)))
     (declare (type function compile-file))
 
-    (ensure-directories-exist obj :verbose t)
+    (ensure-directories-exist obj :verbose *compile-print*) ; host's value
 
     ;; We're about to set about building a new object file. First, we
     ;; delete any preexisting object file in order to avoid confusing
@@ -439,10 +494,14 @@
       (tagbody
        retry-compile-file
          (multiple-value-bind (output-truename warnings-p failure-p)
-            (if trace-file
-                (funcall compile-file src :output-file tmp-obj
-                         :trace-file t :allow-other-keys t)
-                (funcall compile-file src :output-file tmp-obj))
+             (restart-case
+                 (if trace-file
+                     (funcall compile-file src :output-file tmp-obj
+                                               :trace-file t :allow-other-keys t)
+                     (funcall compile-file src :output-file tmp-obj))
+               (recompile ()
+                 :report report-recompile-restart
+                 (go retry-compile-file)))
            (declare (ignore warnings-p))
            (cond ((not output-truename)
                   (error "couldn't compile ~S" src))
@@ -482,14 +541,8 @@
 ;;; cross-compiler's source code in the cross-compilation host.
 (defun in-host-compilation-mode (fn)
   (declare (type function fn))
-  (let ((*features* (cons :sb-xc-host *features*))
-        ;; the CROSS-FLOAT-INFINITY-KLUDGE, as documented in
-        ;; base-target-features.lisp-expr:
-        (*shebang-features* (set-difference *shebang-features*
-                                            '(:sb-propagate-float-type
-                                              :sb-propagate-fun-type))))
-    (with-additional-nickname ("SB-XC" "SB!XC")
-      (funcall fn))))
+  (let ((*features* (cons :sb-xc-host *features*)))
+    (funcall fn)))
 (compile 'in-host-compilation-mode)
 
 ;;; Process a file as source code for the cross-compiler, compiling it
@@ -515,12 +568,22 @@
 ;;;; tools to compile SBCL sources to create object files which will
 ;;;; be used to create the target SBCL .core file
 
+(defun lpnify-stem (stem)
+  ;; Don't want genfiles path to sneak in - avoid (STEM-SOURCE-PATH ...) here.
+  (let ((string (stem-remap-target stem)))
+    ;; Distrust that random hosts don't bork up the translation.
+    ;; Simply replace '/' with ';' and be done.
+    (format nil "SYS:~:@(~A~).LISP" (substitute #\; #\/ string))))
+(compile 'lpnify-stem)
+
 ;;; Run the cross-compiler on a file in the source directory tree to
 ;;; produce a corresponding file in the target object directory tree.
 (defun target-compile-stem (stem flags)
   (funcall *in-target-compilation-mode-fn*
            (lambda ()
-             (compile-stem stem flags :target-compile))))
+             (progv (list (intern "*SOURCE-NAMESTRING*" "SB!C"))
+                    (list (lpnify-stem stem))
+               (compile-stem stem flags :target-compile)))))
 (compile 'target-compile-stem)
 
 ;;; (This function is not used by the build process, but is intended
@@ -533,20 +596,3 @@
              (funcall *target-compile-file* filename))))
 (compile 'target-compile-file)
 
-(defun make-assembler-package (pkg-name)
-  (when (find-package pkg-name)
-    (delete-package pkg-name))
-  (let ((pkg (make-package pkg-name
-                           :use '("CL" "SB!INT" "SB!EXT" "SB!KERNEL" "SB!VM"
-                                  "SB!SYS" ; for SAP accessors
-                                  ;; Dependence of the assembler on the compiler
-                                  ;; feels a bit backwards, but assembly needs
-                                  ;; TN-SC, TN-OFFSET, etc. because the compiler
-                                  ;; doesn't speak the assembler's language.
-                                  ;; Rather vice-versa.
-                                  "SB!C"))))
-    ;; Both SB-ASSEM and SB-DISASSEM export these two symbols.
-    ;; Neither is shadowing-imported. If you need one, package-qualify it.
-    (shadow '("SEGMENT" "MAKE-SEGMENT") pkg)
-    (use-package '("SB!ASSEM" "SB!DISASSEM") pkg)
-    pkg))

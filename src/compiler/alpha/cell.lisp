@@ -36,7 +36,9 @@
     #!-gengc
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 ;;;; symbol hacking VOPs
 
@@ -57,7 +59,7 @@
 ;;; With SYMBOL-VALUE, we check that the value isn't the trap object.
 ;;; So SYMBOL-VALUE of NIL is NIL.
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symbol-value)
+  (:translate symeval)
   (:generator 9
     (move object obj-temp)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -87,7 +89,7 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-value))
+  (:translate symeval))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
@@ -106,9 +108,9 @@
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 (define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 ;;;; fdefinition (FDEFN) objects
 
@@ -142,7 +144,7 @@
   (:generator 38
     (let ((normal-fn (gen-label)))
       (load-type type function (- fun-pointer-lowtag))
-      (inst xor type simple-fun-header-widetag type)
+      (inst xor type simple-fun-widetag type)
       (inst addq function
             (- (ash simple-fun-code-offset word-shift) fun-pointer-lowtag)
             lip)
@@ -241,11 +243,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg null zero)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))

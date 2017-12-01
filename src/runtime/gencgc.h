@@ -12,4 +12,6 @@
 #ifndef __GENCGC_H__
 #define __GENCGC_H__
 
+page_index_t find_last_free_page(void);
+
 #endif /* __GENCGC_H__ */

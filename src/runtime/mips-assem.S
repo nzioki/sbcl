@@ -13,6 +13,11 @@
  * files for more information.
  */
 
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #include "sbcl.h"
 #include "lispregs.h"
 #include "globals.h"
@@ -180,7 +185,7 @@ symbol:
 
 	.align	3
 	.set	noreorder
-lra:	.word	RETURN_PC_HEADER_WIDETAG
+lra:	.word	RETURN_PC_WIDETAG
 
 	/* Multiple value return spot, clear stack. */
 	move	reg_CSP, reg_OCFP
@@ -376,7 +381,7 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	.align  3 /* minimum alignment for a lisp object */
 	LEAF(fun_end_breakpoint_guts)
 	.set    noreorder
-	.word   RETURN_PC_HEADER_WIDETAG + 0x600
+	.word   RETURN_PC_WIDETAG + 0x600
 	b       multiple_value_return
 	 nop
 	.set    reorder

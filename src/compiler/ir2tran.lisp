@@ -17,6 +17,8 @@
 ;;; Move X to Y unless they are EQ.
 (defun emit-move (node block x y)
   (declare (type node node) (type ir2-block block) (type tn x y))
+  (aver (neq (tn-kind x) :unused))
+  (aver (neq (tn-kind y) :unused))
   (unless (eq x y)
     (vop move node block x y))
   (values))
@@ -66,51 +68,23 @@
          (entry-info-closure-tn (lambda-info thing))))
       (bug "~@<~2I~_~S ~_not found in ~_~S~:>" thing physenv)))
 
-;;; If LEAF already has a constant TN, return that, otherwise make a
-;;; TN for it.
-(defun constant-tn (leaf boxedp)
-  (declare (type constant leaf))
-  ;; When convenient we can have both a boxed and unboxed TN for
-  ;; constant.
-  (if boxedp
-      (or (constant-boxed-tn leaf)
-          (setf (constant-boxed-tn leaf) (make-constant-tn leaf t)))
-      (or (leaf-info leaf)
-          (setf (leaf-info leaf) (make-constant-tn leaf nil)))))
-
 ;;; Return a TN that represents the value of LEAF, or NIL if LEAF
 ;;; isn't directly represented by a TN. ENV is the environment that
 ;;; the reference is done in.
-(defun leaf-tn (leaf env boxedp)
+(defun leaf-tn (leaf env)
   (declare (type leaf leaf) (type physenv env))
   (typecase leaf
     (lambda-var
      (unless (lambda-var-indirect leaf)
        (find-in-physenv leaf env)))
-    (constant (constant-tn leaf boxedp))
+    (constant (make-constant-tn leaf))
     (t nil)))
 
 ;;; This is used to conveniently get a handle on a constant TN during
 ;;; IR2 conversion. It returns a constant TN representing the Lisp
 ;;; object VALUE.
 (defun emit-constant (value)
-  (constant-tn (find-constant value) t))
-
-(defun %return-is-boxed (node)
-  (declare (type creturn node))
-  (let* ((fun (return-lambda node))
-         (returns (tail-set-info (lambda-tail-set fun))))
-    (or (xep-p fun)
-        (eq (return-info-kind returns) :unknown))))
-
-(defun boxed-ref-p (ref)
-  (let ((dest (lvar-dest (ref-lvar ref))))
-    (cond ((and (basic-combination-p dest)
-                (call-full-like-p dest))
-           t)
-          ((and (return-p dest) (%return-is-boxed dest)))
-          (t
-           nil))))
+  (make-constant-tn (find-constant value)))
 
 ;;; Convert a REF node. The reference must not be delayed.
 (defun ir2-convert-ref (node block)
@@ -138,7 +112,7 @@
                  (vop ancestor-frame-ref node block tn (leaf-info leaf) res))))
           (t (emit-move node block tn res)))))
       (constant
-       (emit-move node block (constant-tn leaf (boxed-ref-p node)) res))
+       (emit-move node block (make-constant-tn leaf) res))
       (functional
        (ir2-convert-closure node block leaf res))
       (global-var
@@ -317,10 +291,13 @@
                    (entry-info (lambda-info xep) :exit-if-null)
                    (tn (entry-info-closure-tn entry-info) :exit-if-null)
                    (closure (physenv-closure (get-lambda-physenv xep)))
+                   #!-x86-64
                    (entry (make-load-time-constant-tn :entry xep)))
           (let ((this-env (node-physenv call))
                 (leaf-dx-p (and dx-p (leaf-dynamic-extent leaf))))
-            (vop make-closure call 2block entry (length closure)
+            (aver (entry-info-offset entry-info))
+            (vop make-closure call 2block #!-x86-64 entry
+                 (entry-info-offset entry-info) (length closure)
                  leaf-dx-p tn)
             (loop for what in closure and n from 0 do
                   (unless (and (lambda-var-p what)
@@ -412,7 +389,7 @@
           (ecase (ir2-lvar-kind 2lvar)
             (:delayed
              (let ((ref (lvar-uses lvar)))
-               (leaf-tn (ref-leaf ref) (node-physenv ref) (boxed-ref-p ref))))
+               (leaf-tn (ref-leaf ref) (node-physenv ref))))
             (:fixed
              (aver (= (length (ir2-lvar-locs 2lvar)) 1))
              (first (ir2-lvar-locs 2lvar)))))
@@ -440,7 +417,8 @@
     (aver (= nlocs (length ptypes)))
 
     (mapcar (lambda (from to-type)
-              (if (eq (tn-primitive-type from) to-type)
+              (if (or (eq (tn-kind from) :unused)
+                      (eq (tn-primitive-type from) to-type))
                   from
                   (let ((temp (make-normal-tn to-type)))
                     (emit-move node block from temp)
@@ -530,7 +508,8 @@
   (let ((nsrc (length src))
         (ndest (length dest)))
     (mapc (lambda (from to)
-            (unless (eq from to)
+            (unless (or (eq from to)
+                        (eq (tn-kind to) :unused))
               (emit-move node block from to)))
           (if (> ndest nsrc)
               (append src (make-list (- ndest nsrc)
@@ -554,19 +533,22 @@
            (list results) (type (or lvar null) lvar))
   (when lvar
     (let ((2lvar (lvar-info lvar)))
-      (ecase (ir2-lvar-kind 2lvar)
-        (:fixed
-         (let ((locs (ir2-lvar-locs 2lvar)))
-           (unless (eq locs results)
-             (move-results-coerced node block results locs))))
-        (:unknown
-         (let* ((nvals (length results))
-                (locs (make-standard-value-tns nvals)))
-           (move-results-coerced node block results locs)
-           (vop* push-values node block
-                 ((reference-tn-list locs nil))
-                 ((reference-tn-list (ir2-lvar-locs 2lvar) t))
-                 nvals))))))
+      ;; If LVAR flows through a CAST which is unused it won't get
+      ;; deleted and won't be annotated
+      (when 2lvar
+        (ecase (ir2-lvar-kind 2lvar)
+          (:fixed
+           (let ((locs (ir2-lvar-locs 2lvar)))
+             (unless (eq locs results)
+               (move-results-coerced node block results locs))))
+          (:unknown
+           (let* ((nvals (length results))
+                  (locs (make-standard-value-tns nvals)))
+             (move-results-coerced node block results locs)
+             (vop* push-values node block
+                   ((reference-tn-list locs nil))
+                   ((reference-tn-list (ir2-lvar-locs 2lvar) t))
+                   nvals)))))))
   (values))
 
 ;;; CAST
@@ -577,16 +559,18 @@
              (2lvar (lvar-info lvar))
              (value (cast-value node))
              (2value (lvar-info value)))
-    (ecase (ir2-lvar-kind 2lvar)
-      (:unused)
-      ((:unknown :fixed)
-       (aver (not (cast-type-check node)))
-       (move-results-coerced node block
-                             (ir2-lvar-locs 2value)
-                             (ir2-lvar-locs 2lvar))))))
+    (check-functional-cast node)
+    (when 2lvar ;; the cast can be unused but not deleted to due vestigial exits
+      (ecase (ir2-lvar-kind 2lvar)
+        (:unused)
+        ((:unknown :fixed)
+         (aver (not (cast-type-check node)))
+         (move-results-coerced node block
+                               (ir2-lvar-locs 2value)
+                               (ir2-lvar-locs 2lvar)))))))
 
-(defoptimizer (%check-bound ir2-convert)
-    ((array bound index) node block)
+(defoptimizer (%check-bound ir2-hook) ((array bound index) node block)
+  (declare (ignore block))
   (when (constant-lvar-p bound)
     (let* ((bound-type (specifier-type `(integer 0 (,(lvar-value bound)))))
            (index-type (lvar-type index)))
@@ -595,8 +579,7 @@
         (let ((*compiler-error-context* node))
           (compiler-warn "Derived type ~s is not a suitable index for ~s."
                          (type-specifier index-type)
-                         (type-specifier (lvar-type array)))))))
-  (ir2-convert-template node block))
+                         (type-specifier (lvar-type array))))))))
 
 ;;;; template conversion
 
@@ -702,10 +685,11 @@
                    (do ((loc locs (cdr loc))
                         (rtypes rtypes (cdr rtypes)))
                        ((null loc) t)
-                     (unless (operand-restriction-ok
-                              (car rtypes)
-                              (tn-primitive-type (car loc))
-                              :t-ok nil)
+                     (unless (and (neq (tn-kind (car loc)) :unused)
+                                  (operand-restriction-ok
+                                   (car rtypes)
+                                   (tn-primitive-type (car loc))
+                                   :t-ok nil))
                        (return nil))))
               locs
               (lvar-result-tns
@@ -1001,7 +985,14 @@
     (if (eq (ir2-lvar-kind 2lvar) :delayed)
         (let ((name (lvar-fun-name lvar t)))
           (aver name)
-          (values (make-load-time-constant-tn :fdefinition name) name))
+          (values (cond ((sb!vm::static-fdefn-offset name)
+                         name)
+                        (t
+                         ;; Named call to an immobile fdefn from an immobile component
+                         ;; uses the FUN-TN only to preserve liveness of the fdefn.
+                         ;; The name becomes an info arg.
+                         (make-load-time-constant-tn :fdefinition name)))
+                   name))
         (let* ((locs (ir2-lvar-locs 2lvar))
                (loc (first locs))
                (function-ptype (primitive-type-or-lose 'function)))
@@ -1040,26 +1031,30 @@
 
     (multiple-value-bind (fun-tn named)
         (fun-lvar-tn node block (basic-combination-fun node))
-      (if named
-          (vop* tail-call-named node block
-                (fun-tn old-fp return-pc pass-refs)
-                (nil)
-                nargs
-                (emit-step-p node))
-          (vop* tail-call node block
-                (fun-tn old-fp return-pc pass-refs)
-                (nil)
-                nargs
-                (emit-step-p node)))))
-
+      (cond ((not named)
+             (vop* tail-call node block
+                  (fun-tn old-fp return-pc pass-refs)
+                  (nil)
+                  nargs (emit-step-p node)))
+            #!-immobile-code
+            ((eq fun-tn named)
+             (vop* static-tail-call-named node block
+                   (old-fp return-pc pass-refs) ; args
+                   (nil)                        ; results
+                   nargs named (emit-step-p node)))
+            (t
+             (vop* tail-call-named node block
+                   (#!-immobile-code fun-tn old-fp return-pc pass-refs) ; args
+                   (nil)                ; results
+                   nargs #!+immobile-code named (emit-step-p node))))))  ; info
   (values))
 
 ;;; like IR2-CONVERT-LOCAL-CALL-ARGS, only different
 (defun ir2-convert-full-call-args (node block)
   (declare (type combination node) (type ir2-block block))
   (let* ((args (basic-combination-args node))
-         (fp (make-stack-pointer-tn))
-         (nargs (length args)))
+         (nargs (length args))
+         (fp (make-stack-pointer-tn nargs)))
     (vop allocate-full-call-frame node block nargs fp)
     (collect ((locs))
       (let ((last nil)
@@ -1083,16 +1078,36 @@
   (multiple-value-bind (fp args arg-locs nargs)
       (ir2-convert-full-call-args node block)
     (let* ((lvar (node-lvar node))
-           (locs (standard-result-tns lvar))
+           (locs (and lvar
+                      (loop for loc in (ir2-lvar-locs (lvar-info lvar))
+                            for i from 0
+                            collect (cond ((eql (tn-kind loc) :unused)
+                                           loc)
+                                          #!+(or x86-64 arm64) ;; needs default-unknown-values support
+                                          ((>= i sb!vm::register-arg-count)
+                                           (make-normal-tn *backend-t-primitive-type*))
+                                          (t
+                                           (standard-arg-location i))))))
            (loc-refs (reference-tn-list locs t))
            (nvals (length locs)))
       (multiple-value-bind (fun-tn named)
           (fun-lvar-tn node block (basic-combination-fun node))
-        (if named
-            (vop* call-named node block (fp fun-tn args) (loc-refs)
-                  arg-locs nargs nvals (emit-step-p node))
-            (vop* call node block (fp fun-tn args) (loc-refs)
-                  arg-locs nargs nvals (emit-step-p node)))
+        (cond ((not named)
+               (vop* call node block (fp fun-tn args) (loc-refs)
+                     arg-locs nargs nvals (emit-step-p node)))
+              #!-immobile-code
+              ((eq fun-tn named)
+               (vop* static-call-named node block
+                     (fp args)
+                     (loc-refs)
+                     arg-locs nargs named nvals
+                     (emit-step-p node)))
+              (t
+               (vop* call-named node block
+                     (fp #!-immobile-code fun-tn args) ; args
+                     (loc-refs)                        ; results
+                     arg-locs nargs #!+immobile-code named nvals ; info
+                     (emit-step-p node))))
         (move-lvar-result node block locs lvar))))
   (values))
 
@@ -1106,11 +1121,22 @@
            (loc-refs (reference-tn-list locs t)))
       (multiple-value-bind (fun-tn named)
           (fun-lvar-tn node block (basic-combination-fun node))
-        (if named
-            (vop* multiple-call-named node block (fp fun-tn args) (loc-refs)
-                  arg-locs nargs (emit-step-p node))
-            (vop* multiple-call node block (fp fun-tn args) (loc-refs)
-                  arg-locs nargs (emit-step-p node))))))
+        (cond ((not named)
+               (vop* multiple-call node block (fp fun-tn args) (loc-refs)
+                  arg-locs nargs (emit-step-p node)))
+              #!-immobile-code
+              ((eq fun-tn named)
+               (vop* static-multiple-call-named node block
+                  (fp args)
+                  (loc-refs)
+                  arg-locs nargs named
+                  (emit-step-p node)))
+              (t
+               (vop* multiple-call-named node block
+                  (fp #!-immobile-code fun-tn args)     ; args
+                  (loc-refs)                            ; results
+                  arg-locs nargs #!+immobile-code named ; info
+                  (emit-step-p node)))))))
   (values))
 
 ;;; stuff to check in PONDER-FULL-CALL
@@ -1137,6 +1163,11 @@
          (fname (lvar-fun-name lvar t)))
     (declare (type (or symbol cons) fname))
 
+    (when (and (symbolp fname)
+               (eq (symbol-package fname) *cl-package*))
+      ;; Never produce a warning from (DECLARE (INLINE LENGTH)) etc
+      (return-from ponder-full-call))
+
     ;; Warn about cross-compiling certain full-calls,
     ;; as it is indicative of dependency order problems.
     #+sb-xc-host
@@ -1145,9 +1176,7 @@
       (unless (and (stringp compname) (string/= compname "DEFMACRO"))
         ;; Catch FOO and (SETF FOO) both.
         (let ((stem (if (atom fname) fname (second fname))))
-          (when (member stem
-                        sb-cold::*full-calls-to-warn-about*
-                        :test #'string=)
+          (when (member stem *full-calls-to-warn-about* :test #'string=)
             (warn "Full call to ~S" fname)))))
 
     (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
@@ -1225,8 +1254,6 @@
   (values))
 
 ;;;; entering functions
-
-#!+precise-arg-count-error
 (defun xep-verify-arg-count (node block fun arg-count-location)
   (when (policy fun (plusp verify-arg-count))
     (let* ((ef (functional-entry-fun fun))
@@ -1260,28 +1287,29 @@
       (vop xep-allocate-frame node block start-label)
       ;; Arg verification needs to be done before the stack pointer is adjusted
       ;; so that the extra arguments are still present when the error is signalled
+      #!-precise-arg-count-error
+      (vop xep-setup-sp node block)
       (let ((verified (unless (eq (functional-kind fun) :toplevel)
                         (setf arg-count-tn (make-arg-count-location))
-                        #!+precise-arg-count-error
                         (xep-verify-arg-count node block fun arg-count-tn))))
         #!-x86-64
         (declare (ignore verified))
-       (cond ((and (optional-dispatch-p ef) (optional-dispatch-more-entry ef))
-              ;; COPY-MORE-ARG should handle SP adjustemnt, but it
-              ;; isn't done on all targets.
-              #!-precise-arg-count-error
-              (vop xep-setup-sp node block)
+       (cond ((and (optional-dispatch-p ef)
+                   (optional-dispatch-more-entry ef)
+                   (neq (functional-kind (optional-dispatch-more-entry ef)) :deleted))
+              ;; COPY-MORE-ARG does the job of XEP-SETUP-SP on +precise-arg-count-error
               (vop copy-more-arg node block (optional-dispatch-max-args ef)
                    #!+x86-64 verified))
+             #!+precise-arg-count-error
              (t
               (vop xep-setup-sp node block))))
       (when (ir2-physenv-closure env)
         (let ((closure (make-normal-tn *backend-t-primitive-type*)))
           (when (policy fun (> store-closure-debug-pointer 1))
             ;; Save the closure pointer on the stack.
-            (let ((closure-save (make-representation-tn
-                                 *backend-t-primitive-type*
-                                 (sc-number-or-lose 'sb!vm::control-stack))))
+            (let ((closure-save
+                   (make-representation-tn *backend-t-primitive-type*
+                                           sb!vm:control-stack-sc-number)))
               (vop setup-closure-environment node block start-label
                    closure-save)
               (setf (ir2-physenv-closure-save-tn env) closure-save)
@@ -1333,9 +1361,8 @@
   ;; It could be saved from the XEP, but some functions have both
   ;; external and internal entry points, so it will be saved twice.
   (let ((temp (make-normal-tn *backend-t-primitive-type*))
-        (bsp-save-tn (make-representation-tn
-                      *backend-t-primitive-type*
-                      (sc-number-or-lose 'sb!vm::control-stack))))
+        (bsp-save-tn (make-representation-tn *backend-t-primitive-type*
+                                             sb!vm:control-stack-sc-number)))
     (vop current-binding-pointer node block temp)
     (emit-move node block temp bsp-save-tn)
     (setf (ir2-physenv-bsp-save-tn env) bsp-save-tn)
@@ -1462,8 +1489,8 @@
 ;;; lvar.
 (defun ir2-convert-mv-bind (node block)
   (declare (type mv-combination node) (type ir2-block block))
-  (let* ((lvar (first (basic-combination-args node)))
-         (fun (ref-leaf (lvar-uses (basic-combination-fun node))))
+  (let* ((fun (ref-leaf (lvar-uses (basic-combination-fun node))))
+         (args (basic-combination-args node))
          (vars (lambda-vars fun)))
     (aver (eq (functional-kind fun) :mv-let))
     (mapc (lambda (src var)
@@ -1473,10 +1500,21 @@
                          (lambda-var-explicit-value-cell var))
                     (emit-make-value-cell node block src dest)
                     (emit-move node block src dest)))))
-          (lvar-tns node block lvar
-                            (mapcar (lambda (x)
-                                      (primitive-type (leaf-type x)))
-                                    vars))
+          (if (singleton-p args)
+              (lvar-tns node block (first args)
+                        (mapcar (lambda (x)
+                                  (primitive-type (leaf-type x)))
+                                vars))
+              (let ((vars vars))
+                (loop for lvar in args
+                      for values = (nth-value 1 (values-types
+                                                 (lvar-derived-type lvar)))
+                      while vars
+                      nconc
+                      (lvar-tns node block lvar (loop repeat values
+                                                      collect (if vars
+                                                                  (primitive-type (leaf-type (pop vars)))
+                                                                  *backend-t-primitive-type*))))))
           vars))
   (values))
 
@@ -1592,6 +1630,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let ((tns (mapcar (lambda (x)
                        (lvar-tn node block x))
                      values)))
+
     (move-lvar-result node block tns (node-lvar node))))
 
 ;;; In the normal case where unknown values are desired, we use the
@@ -1656,17 +1695,18 @@ not stack-allocated LVAR ~S." source-lvar)))))
          ;; FIXME: setting INFO is inefficient when not actually
          ;; changing anything
          (unless (info :variable :wired-tls name)
-           (setf (info :variable :wired-tls name) :always-has-tls))
+           (setf (info :variable :wired-tls name) t))
          ;; We force the symbol into the code constants in case BIND
-         ;; does not actually reference it, as with x86.
+         ;; does not actually reference it, as with immobile symbols.
          (emit-constant name)
          (vop bind node block (lvar-tn node block value) name))
        (vop dynbind node block (lvar-tn node block value)
             (emit-constant name))))))
 
-(defoptimizer (%special-unbind ir2-convert) ((n) node block)
-  (declare (ignorable n))
-  (vop unbind node block #!+(and sb-thread unbind-n-vop) (lvar-value n)))
+(defoptimizer (%special-unbind ir2-convert) ((&rest symbols) node block)
+  (declare (ignorable symbols))
+  (vop unbind node block #!+(and sb-thread unbind-n-vop)
+                         (mapcar #'lvar-value symbols)))
 
 ;;; ### It's not clear that this really belongs in this file, or
 ;;; should really be done this way, but this is the least violation of
@@ -1738,7 +1778,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 ;;; %CLEANUP-POINT doesn't do anything except prevent the body from
 ;;; being entirely deleted.
-(defoptimizer (%cleanup-point ir2-convert) (() node block) node block)
+(defoptimizer (%cleanup-point ir2-convert) ((&rest args) node block) args node block)
 
 ;;; This function invalidates a lexical exit on exiting from the
 ;;; dynamic extent. This is done by storing 0 into the indirect value
@@ -1978,6 +2018,29 @@ not stack-allocated LVAR ~S." source-lvar)))))
          (results (lvar-result-tns lvar (list (primitive-type-or-lose t)))))
     (emit-move node block (lvar-tn node block value) (first results))
     (move-lvar-result node block results lvar)))
+
+;;; An identity to avoid complaints about constant modification
+(defoptimizer (ltv-wrapper ir2-convert) ((x) node block)
+  (let* ((lvar (node-lvar node))
+         (results (lvar-result-tns lvar (list (primitive-type-or-lose t)))))
+    (emit-move node block (lvar-tn node block x) (first results))
+    (move-lvar-result node block results lvar)))
+
+#-sb-xc-host ;; package-lock-violation-p is not present yet
+(defoptimizer (set ir2-hook) ((symbol value) node block)
+  (declare (ignore value block))
+  (when (constant-lvar-p symbol)
+    (let* ((symbol (lvar-value symbol))
+           (kind (info :variable :kind symbol)))
+      (when (and (eq kind :unknown)
+                 (sb!impl::package-lock-violation-p (symbol-package symbol) symbol))
+        (let ((*compiler-error-context* node))
+          (compiler-warn "violating package lock on ~/sb-ext:print-symbol-with-prefix/"
+                         symbol))))))
+
+(defoptimizer (restart-point ir2-convert) ((location) node block)
+  (setf (restart-location-label (lvar-value location))
+        (block-label (ir2-block-block block))))
 
 ;;; Convert the code in a component into VOPs.
 (defun ir2-convert (component)
@@ -2109,7 +2172,10 @@ not stack-allocated LVAR ~S." source-lvar)))))
               (ir2-convert-full-call node 2block))
              (:known
               (let* ((info (basic-combination-fun-info node))
-                     (fun (fun-info-ir2-convert info)))
+                     (fun (fun-info-ir2-convert info))
+                     (hook (fun-info-ir2-hook info)))
+                (when hook
+                  (funcall hook node 2block))
                 (cond (fun
                        (funcall fun node 2block))
                       ((eq (basic-combination-info node) :full)

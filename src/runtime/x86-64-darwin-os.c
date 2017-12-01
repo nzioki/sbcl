@@ -7,6 +7,7 @@
 #include "runtime.h"
 #include "interrupt.h"
 #include "x86-64-darwin-os.h"
+#include "x86-64-arch.h"
 #include "genesis/fdefn.h"
 
 #include <mach/mach.h>
@@ -46,6 +47,7 @@ typedef struct __darwin_mcontext64 darwin_mcontext;
 #define ss __ss
 #define es __es
 #define fs __fs
+#define rflags __rflags
 
 #define fpu_fcw __fpu_fcw
 #define fpu_mxcsr __fpu_mxcsr
@@ -283,9 +285,10 @@ catch_exception_raise(mach_port_t exception_port,
                       exception_data_t code_vector,
                       mach_msg_type_number_t code_count)
 {
-    kern_return_t ret, dealloc_ret;
-    int signal;
+    kern_return_t ret = KERN_SUCCESS, dealloc_ret;
+    int signal, rip_offset = 0;
     siginfo_t* siginfo;
+    void (*handler)(int, siginfo_t *, os_context_t *);
 
 #ifdef LISP_FEATURE_SB_THREAD
     thread_mutex_lock(&mach_exception_lock);
@@ -294,43 +297,62 @@ catch_exception_raise(mach_port_t exception_port,
     x86_thread_state64_t thread_state;
     mach_msg_type_number_t thread_state_count = x86_THREAD_STATE64_COUNT;
 
+#ifdef x86_AVX_STATE64_COUNT
+    x86_avx_state64_t float_state;
+    mach_msg_type_number_t float_state_count = avx_supported? x86_AVX_STATE64_COUNT : x86_FLOAT_STATE64_COUNT;
+    x86_avx_state64_t *target_float_state;
+    int float_state_flavor = avx_supported? x86_AVX_STATE64 : x86_FLOAT_STATE64;
+#else
     x86_float_state64_t float_state;
     mach_msg_type_number_t float_state_count = x86_FLOAT_STATE64_COUNT;
+    x86_float_state64_t *target_float_state;
+    int float_state_flavor = x86_FLOAT_STATE64;
+#endif
 
     x86_exception_state64_t exception_state;
     mach_msg_type_number_t exception_state_count = x86_EXCEPTION_STATE64_COUNT;
 
     x86_thread_state64_t backup_thread_state;
     x86_thread_state64_t *target_thread_state;
-    x86_float_state64_t *target_float_state;
 
     os_vm_address_t addr;
 
     struct thread *th;
 
     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
-    if (mach_port_get_context(mach_task_self(), exception_port, (mach_port_context_t *)&th)
+    if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
         != KERN_SUCCESS) {
         lose("Can't find the thread for an exception %p", exception_port);
     }
+    thread_get_state(thread, x86_THREAD_STATE64,
+                     (thread_state_t)&thread_state, &thread_state_count);
+    thread_get_state(thread, float_state_flavor,
+                     (thread_state_t)&float_state, &float_state_count);
+    thread_get_state(thread, x86_EXCEPTION_STATE64,
+                     (thread_state_t)&exception_state, &exception_state_count);
 
+    if (code_count && exception == EXC_BAD_ACCESS && code_vector[0] == EXC_I386_GPFLT) {
+        /* This can happen for addresses larger than 48 bits,
+           resulting in bogus faultvaddr. */
+        addr = NULL;
+    } else {
+        addr = (void*)exception_state.faultvaddr;
+    }
     switch (exception) {
 
     case EXC_BAD_ACCESS:
         signal = SIGBUS;
-        ret = thread_get_state(thread,
-                               x86_THREAD_STATE64,
-                               (thread_state_t)&thread_state,
-                               &thread_state_count);
-        ret = thread_get_state(thread,
-                               x86_FLOAT_STATE64,
-                               (thread_state_t)&float_state,
-                               &float_state_count);
-        ret = thread_get_state(thread,
-                               x86_EXCEPTION_STATE64,
-                               (thread_state_t)&exception_state,
-                               &exception_state_count);
-        addr = (void*)exception_state.faultvaddr;
+
+        if(addr >= CONTROL_STACK_RETURN_GUARD_PAGE(th) &&
+           addr < CONTROL_STACK_RETURN_GUARD_PAGE(th) + os_vm_page_size) {
+            /* We're returning from the guard page: reprotect it, and
+             * unprotect this one. This works even if we somehow missed
+             * the return-guard-page, and hit it on our way to new
+             * exhaustion instead. */
+            reset_thread_control_stack_guard_page(th);
+            goto do_not_handle;
+        }
+
         /* note the os_context hackery here.  When the signal handler returns,
          * it won't go back to what it was doing ... */
         if(addr >= CONTROL_STACK_GUARD_PAGE(th) &&
@@ -340,223 +362,95 @@ catch_exception_raise(mach_port_t exception_port,
              * previous page so that we can catch returns from the guard page
              * and restore it. */
             lower_thread_control_stack_guard_page(th);
-
-            backup_thread_state = thread_state;
-            open_stack_allocation(&thread_state);
-            /* Reserve a 256 byte zone for signal handlers
-             * to use on the interrupted thread stack.
-             */
-            stack_allocate(&thread_state, 256);
-
-            /* Save thread state */
-            target_thread_state =
-                stack_allocate(&thread_state, sizeof(*target_thread_state));
-            (*target_thread_state) = backup_thread_state;
-
-            /* Save float state */
-            target_float_state =
-                stack_allocate(&thread_state, sizeof(*target_float_state));
-            (*target_float_state) = float_state;
-
-            /* Set up siginfo */
-            siginfo = stack_allocate(&thread_state, sizeof(*siginfo));
-            /* what do we need to put in our fake siginfo?  It looks like
-             * the x86 code only uses si_signo and si_adrr. */
-            siginfo->si_signo = signal;
-            siginfo->si_addr = (void*)exception_state.faultvaddr;
-
-            call_c_function_in_context(&thread_state,
-                                       signal_emulation_wrapper,
-                                       5,
-                                       target_thread_state,
-                                       target_float_state,
-                                       signal,
-                                       siginfo,
-                                       control_stack_exhausted_handler);
-        }
-        else if(addr >= CONTROL_STACK_RETURN_GUARD_PAGE(th) &&
-                addr < CONTROL_STACK_RETURN_GUARD_PAGE(th) + os_vm_page_size) {
-            /* We're returning from the guard page: reprotect it, and
-             * unprotect this one. This works even if we somehow missed
-             * the return-guard-page, and hit it on our way to new
-             * exhaustion instead. */
-            reset_thread_control_stack_guard_page(th);
+            handler = control_stack_exhausted_handler;
         }
         else if (addr >= undefined_alien_address &&
                  addr < undefined_alien_address + os_vm_page_size) {
-            backup_thread_state = thread_state;
-            open_stack_allocation(&thread_state);
-            stack_allocate(&thread_state, 256);
-
-            /* Save thread state */
-            target_thread_state =
-                stack_allocate(&thread_state, sizeof(*target_thread_state));
-            (*target_thread_state) = backup_thread_state;
-
-            target_float_state =
-                stack_allocate(&thread_state, sizeof(*target_float_state));
-            (*target_float_state) = float_state;
-
-            /* Set up siginfo */
-            siginfo = stack_allocate(&thread_state, sizeof(*siginfo));
-            /* what do we need to put in our fake siginfo?  It looks like
-             * the x86 code only uses si_signo and si_adrr. */
-            siginfo->si_signo = signal;
-            siginfo->si_addr = (void*)exception_state.faultvaddr;
-
-            call_c_function_in_context(&thread_state,
-                                       signal_emulation_wrapper,
-                                       5,
-                                       target_thread_state,
-                                       target_float_state,
-                                       signal,
-                                       siginfo,
-                                       undefined_alien_handler);
+            handler = undefined_alien_handler;
         } else {
-
-            backup_thread_state = thread_state;
-            open_stack_allocation(&thread_state);
-            stack_allocate(&thread_state, 256);
-
-            /* Save thread state */
-            target_thread_state =
-                stack_allocate(&thread_state, sizeof(*target_thread_state));
-            (*target_thread_state) = backup_thread_state;
-
-            target_float_state =
-                stack_allocate(&thread_state, sizeof(*target_float_state));
-            (*target_float_state) = float_state;
-
-            /* Set up siginfo */
-            siginfo = stack_allocate(&thread_state, sizeof(*siginfo));
-            /* what do we need to put in our fake siginfo?  It looks like
-             * the x86 code only uses si_signo and si_adrr. */
-            siginfo->si_signo = signal;
-            siginfo->si_addr = (void*)exception_state.faultvaddr;
-
-            call_c_function_in_context(&thread_state,
-                                       signal_emulation_wrapper,
-                                       5,
-                                       target_thread_state,
-                                       target_float_state,
-                                       signal,
-                                       siginfo,
-                                       memory_fault_handler);
+            handler = memory_fault_handler;
         }
-        ret = thread_set_state(thread,
-                               x86_THREAD_STATE64,
-                               (thread_state_t)&thread_state,
-                               thread_state_count);
-
-        ret = thread_set_state(thread,
-                               x86_FLOAT_STATE64,
-                               (thread_state_t)&float_state,
-                               float_state_count);
-#ifdef LISP_FEATURE_SB_THREAD
-        thread_mutex_unlock(&mach_exception_lock);
-#endif
-        ret = KERN_SUCCESS;
         break;
-
     case EXC_BAD_INSTRUCTION:
 
-        ret = thread_get_state(thread,
-                               x86_THREAD_STATE64,
-                               (thread_state_t)&thread_state,
-                               &thread_state_count);
-        ret = thread_get_state(thread,
-                               x86_FLOAT_STATE64,
-                               (thread_state_t)&float_state,
-                               &float_state_count);
-        ret = thread_get_state(thread,
-                               x86_EXCEPTION_STATE64,
-                               (thread_state_t)&exception_state,
-                               &exception_state_count);
-        if (0xffffffffffff0b0f == *((u64 *)thread_state.rip)) {
+        if (*((u64 *)thread_state.rip) == 0xffffffffffff0b0f) {
             /* fake sigreturn. */
 
             /* When we get here, thread_state.rax is a pointer to a
              * thread_state to restore. */
             /* thread_state = *((thread_state_t *)thread_state.rax); */
 
-            ret = thread_set_state(thread,
-                                   x86_THREAD_STATE64,
-                                   (thread_state_t) thread_state.rax,
-                                   /* &thread_state, */
-                                   thread_state_count);
-
-            ret = thread_set_state(thread,
-                                   x86_FLOAT_STATE64,
-                                   (thread_state_t) thread_state.rbx,
-                                   /* &thread_state, */
-                                   float_state_count);
+            thread_set_state(thread, x86_THREAD_STATE64,
+                             (thread_state_t) thread_state.rax, thread_state_count);
+            thread_set_state(thread, float_state_flavor,
+                             (thread_state_t) thread_state.rbx, float_state_count);
+            goto do_not_handle;
+        } else if (*((unsigned short *)thread_state.rip) == 0x0b0f) {
+            signal = SIGTRAP;
+            rip_offset = 2;
+            handler = sigtrap_handler;
         } else {
-
-            backup_thread_state = thread_state;
-            open_stack_allocation(&thread_state);
-            stack_allocate(&thread_state, 256);
-
-            /* Save thread state */
-            target_thread_state =
-                stack_allocate(&thread_state, sizeof(*target_thread_state));
-            (*target_thread_state) = backup_thread_state;
-
-            target_float_state =
-                stack_allocate(&thread_state, sizeof(*target_float_state));
-            (*target_float_state) = float_state;
-
-            /* Set up siginfo */
-            siginfo = stack_allocate(&thread_state, sizeof(*siginfo));
-            /* what do we need to put in our fake siginfo?  It looks like
-             * the x86 code only uses si_signo and si_adrr. */
-            if (*((unsigned short *)target_thread_state->rip) == 0x0b0f) {
-                signal = SIGTRAP;
-                siginfo->si_signo = signal;
-                siginfo->si_addr = (void*)exception_state.faultvaddr;
-                target_thread_state->rip += 2;
-                call_c_function_in_context(&thread_state,
-                                           signal_emulation_wrapper,
-                                           5,
-                                           target_thread_state,
-                                           target_float_state,
-                                           signal,
-                                           siginfo,
-                                           sigtrap_handler);
-            } else {
-                signal = SIGILL;
-                siginfo->si_signo = signal;
-                siginfo->si_addr = (void*)exception_state.faultvaddr;
-
-                call_c_function_in_context(&thread_state,
-                                           signal_emulation_wrapper,
-                                           5,
-                                           target_thread_state,
-                                           target_float_state,
-                                           signal,
-                                           siginfo,
-                                           sigill_handler);
-            }
-            ret = thread_set_state(thread,
-                                   x86_THREAD_STATE64,
-                                   (thread_state_t)&thread_state,
-                                   thread_state_count);
-            ret = thread_set_state(thread,
-                                   x86_FLOAT_STATE64,
-                                   (thread_state_t)&float_state,
-                                   float_state_count);
+            signal = SIGILL;
+            handler = sigill_handler;
         }
-#ifdef LISP_FEATURE_SB_THREAD
-        thread_mutex_unlock(&mach_exception_lock);
-#endif
-        ret = KERN_SUCCESS;
-        break;
 
+        break;
+    case EXC_BREAKPOINT:
+        if (single_stepping) {
+            signal = SIGTRAP;
+            /* Clear TF or the signal emulation wrapper won't proceed
+               with single stepping enabled. */
+            thread_state.rflags &= ~0x100;
+            handler = sigtrap_handler;
+            break;
+        }
     default:
-#ifdef LISP_FEATURE_SB_THREAD
-        thread_mutex_unlock(&mach_exception_lock);
-#endif
         ret = KERN_INVALID_RIGHT;
+        goto do_not_handle;
     }
+
+    backup_thread_state = thread_state;
+
+    /* The ABI has a 128-byte red zone. */
+    stack_allocate(&thread_state, 128);
+
+    open_stack_allocation(&thread_state);
+    /* Reserve a 256 byte zone for signal handlers
+     * to use on the interrupted thread stack.
+     */
+    stack_allocate(&thread_state, 256);
+
+    /* Save thread state */
+    target_thread_state = stack_allocate(&thread_state, sizeof(*target_thread_state));
+    (*target_thread_state) = backup_thread_state;
+
+    target_thread_state->rip += rip_offset;
+    /* Save float state */
+    target_float_state = stack_allocate(&thread_state, sizeof(*target_float_state));
+    (*target_float_state) = float_state;
+
+    /* Set up siginfo */
+    siginfo = stack_allocate(&thread_state, sizeof(*siginfo));
+
+    siginfo->si_signo = signal;
+    siginfo->si_addr = addr;
+
+    call_c_function_in_context(&thread_state,
+                               signal_emulation_wrapper,
+                               5,
+                               target_thread_state,
+                               target_float_state,
+                               signal,
+                               siginfo,
+                               handler);
+    thread_set_state(thread, x86_THREAD_STATE64,
+                     (thread_state_t)&thread_state, thread_state_count);
+    thread_set_state(thread, float_state_flavor,
+                     (thread_state_t)&float_state, float_state_count);
+  do_not_handle:
+#ifdef LISP_FEATURE_SB_THREAD
+    thread_mutex_unlock(&mach_exception_lock);
+#endif
 
     dealloc_ret = mach_port_deallocate (mach_task_self(), thread);
     if (dealloc_ret) {
@@ -570,6 +464,7 @@ catch_exception_raise(mach_port_t exception_port,
 
     return ret;
 }
+#endif
 
 void
 os_restore_fp_control(os_context_t *context)
@@ -586,4 +481,10 @@ os_restore_fp_control(os_context_t *context)
     asm ("fldcw %0" : : "m" (fpu_control_word));
 }
 
-#endif
+
+
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+  return (os_context_register_t *)((&context->uc_mcontext->__fs.__fpu_xmm0) + offset);
+}

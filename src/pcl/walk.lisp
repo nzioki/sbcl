@@ -459,6 +459,7 @@
 
 ;;; SBCL-only special forms
 (define-walker-template truly-the (nil quote eval))
+(define-walker-template sb!kernel:the* (nil quote eval))
 ;;; FIXME: maybe we don't need this one any more, given that
 ;;; NAMED-LAMBDA now expands into (FUNCTION (NAMED-LAMBDA ...))?
 (define-walker-template named-lambda walk-named-lambda)
@@ -496,63 +497,64 @@
   ;; the user wants to this form. If the second value returned
   ;; by walk-function is T then we don't recurse...
   (catch form
-    (multiple-value-bind (newform walk-no-more-p)
-        (funcall (env-walk-function env) form context env)
-      (catch newform
-        (cond
-         (walk-no-more-p newform)
-         ((not (eq form newform))
-          (walk-form-internal newform context env))
-         ((and (not (consp newform))
-               (or (eql context :eval)
-                   (eql context :set)))
-          (let ((symmac (car (variable-symbol-macro-p newform env))))
-            (if symmac
-                (let* ((newnewform (walk-form-internal (cddr symmac)
-                                                       context
-                                                       env))
-                       (resultform
-                        (if (eq newnewform (cddr symmac))
-                            (if *walk-form-expand-macros-p* newnewform newform)
-                            newnewform))
-                       (type (env-var-type newform env)))
-                  (if (eq t type)
-                      resultform
-                      `(the ,type ,resultform)))
-                newform)))
-         ((eql context :set) newform)
-         (t
-          (let* ((fn (car newform))
-                 (template (get-walker-template fn newform)))
-            (if template
-                (if (symbolp template)
-                    (funcall template newform context env)
-                    (walk-template newform template context env))
-                (multiple-value-bind (newnewform macrop)
-                    (walker-environment-bind
-                        (new-env env :walk-form newform)
-                      (%macroexpand-1 newform new-env))
-                  (cond
-                   (macrop
-                    (let ((newnewnewform (walk-form-internal newnewform
-                                                             context
-                                                             env)))
-                      (if (eq newnewnewform newnewform)
-                          (if *walk-form-expand-macros-p* newnewform newform)
-                          newnewnewform)))
-                   ((and (symbolp fn)
-                         (special-operator-p fn))
-                    ;; This shouldn't happen, since this walker is now
-                    ;; maintained as part of SBCL, so it should know
-                    ;; about all the special forms that SBCL knows
-                    ;; about.
-                    (bug "unexpected special form ~S" fn))
-                   (t
-                    ;; Otherwise, walk the form as if it's just a
-                    ;; standard function call using a template for
-                    ;; standard function call.
-                    (walk-template
-                     newnewform '(call repeat (eval)) context env))))))))))))
+    (with-current-source-form (form)
+      (multiple-value-bind (newform walk-no-more-p)
+          (funcall (env-walk-function env) form context env)
+        (catch newform
+          (cond
+            (walk-no-more-p newform)
+            ((not (eq form newform))
+             (walk-form-internal newform context env))
+            ((and (not (consp newform))
+                  (or (eql context :eval)
+                      (eql context :set)))
+             (let ((symmac (car (variable-symbol-macro-p newform env))))
+               (if symmac
+                   (let* ((newnewform (walk-form-internal (cddr symmac)
+                                                          context
+                                                          env))
+                          (resultform
+                           (if (eq newnewform (cddr symmac))
+                               (if *walk-form-expand-macros-p* newnewform newform)
+                               newnewform))
+                          (type (env-var-type newform env)))
+                     (if (eq t type)
+                         resultform
+                         `(the ,type ,resultform)))
+                   newform)))
+            ((eql context :set) newform)
+            (t
+             (let* ((fn (car newform))
+                    (template (get-walker-template fn newform)))
+               (if template
+                   (if (symbolp template)
+                       (funcall template newform context env)
+                       (walk-template newform template context env))
+                   (multiple-value-bind (newnewform macrop)
+                       (walker-environment-bind
+                           (new-env env :walk-form newform)
+                         (%macroexpand-1 newform new-env))
+                     (cond
+                       (macrop
+                        (let ((newnewnewform (walk-form-internal newnewform
+                                                                 context
+                                                                 env)))
+                          (if (eq newnewnewform newnewform)
+                              (if *walk-form-expand-macros-p* newnewform newform)
+                              newnewnewform)))
+                       ((and (symbolp fn)
+                             (special-operator-p fn))
+                        ;; This shouldn't happen, since this walker is now
+                        ;; maintained as part of SBCL, so it should know
+                        ;; about all the special forms that SBCL knows
+                        ;; about.
+                        (bug "unexpected special form ~S" fn))
+                       (t
+                        ;; Otherwise, walk the form as if it's just a
+                        ;; standard function call using a template for
+                        ;; standard function call.
+                        (walk-template
+                         newnewform '(call repeat (eval)) context env)))))))))))))
 
 (defun walk-template (form template context env)
   (if (atom template)
@@ -634,12 +636,6 @@
                (walk-form-internal (car form) :eval env)
                (walk-repeat-eval (cdr form) env))))
 
-(defun recons (x car cdr)
-  (if (or (not (eq (car x) car))
-          (not (eq (cdr x) cdr)))
-      (cons car cdr)
-      x))
-
 (defun relist (x &rest args)
   (if (null args)
       nil
@@ -661,10 +657,11 @@
 
 (defun walk-declarations (body fn env
                                &optional doc-string-p declarations old-body
-                               &aux (form (car body)) macrop new-form)
+                               &aux (form (car body)))
   (cond ((and (stringp form)                    ;might be a doc string
               (cdr body)                        ;isn't the returned value
               (null doc-string-p)               ;no doc string yet
+              ;; FIXME: {decl}+ doc {decl}+ is supposed to be valid.
               (null declarations))              ;no declarations yet
          (recons body
                  form
@@ -687,18 +684,6 @@
                  form
                  (walk-declarations
                    (cdr body) fn env doc-string-p declarations)))
-        ((and form
-              (listp form)
-              (null (get-walker-template (car form) form))
-              (progn
-                (multiple-value-setq (new-form macrop)
-                                     (%macroexpand-1 form env))
-                macrop))
-         ;; This form was a call to a macro. Maybe it expanded
-         ;; into a declare?  Recurse to find out.
-         (walk-declarations (recons body new-form (cdr body))
-                            fn env doc-string-p declarations
-                            (or old-body body)))
         (t
          ;; Now that we have walked and recorded the declarations,
          ;; call the function our caller provided to expand the body.
@@ -770,7 +755,7 @@
       'no-init
       (cadr binding)))
 
-(defun let*-bindings (bindings &aux names inits (seen (make-hash-table)))
+(defun let*-bindings (bindings &aux names inits (seen (make-hash-table :test #'eq)))
   (dolist (binding (reverse bindings) (values names inits))
     (let ((name (let*-binding-name binding)))
       (push (cons name (gethash name seen)) names)

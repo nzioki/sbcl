@@ -94,16 +94,8 @@ include the pathname of the file and the position of the definition."
 
 (declaim (ftype (sb-int:sfunction (t debug-info) debug-function) debug-info-debug-function))
 (defun debug-info-debug-function (function debug-info)
-  (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
-        (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
-    (or
-     (find-if
-      (lambda (x)
-        (and
-         (sb-c::compiled-debug-fun-p x)
-         (eq (sb-c::compiled-debug-fun-name x) name)))
-      map)
-     (elt map 0))))
+  (sb-di::compiled-debug-fun-from-pc debug-info
+                                     (sb-di::function-start-pc-offset function)))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
@@ -125,12 +117,11 @@ FBOUNDP."
   "Call FN for each allocated code component in one of SPACES.  FN
 receives the object and its size as arguments.  SPACES should be a
 list of the symbols :dynamic, :static, or :read-only."
-  (dolist (space spaces)
-    (sb-vm::map-allocated-objects
+  (apply #'sb-vm::map-allocated-objects
      (lambda (obj header size)
        (when (= sb-vm:code-header-widetag header)
          (funcall fn obj size)))
-     space)))
+     spaces))
 
 (declaim (inline map-caller-code-components))
 (defun map-caller-code-components (function spaces fn)
@@ -368,7 +359,13 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
                             (sb-c::fun-info-stack-allocate-result
-                             . sb-c::stack-allocate-result))))
+                             . sb-c::stack-allocate-result)
+                            (sb-c::fun-info-constraint-propagate
+                             . sb-c::constraint-propagate)
+                            (sb-c::fun-info-constraint-propagate-if
+                             . sb-c::constraint-propagate-if)
+                            (sb-c::fun-info-call-type-deriver
+                             . sb-c::call-type-deriver))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
                     when fn collect
@@ -377,10 +374,12 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (list name))
                       source))))))
        (:vop
-        (let ((loc (sb-int:info :source-location type name)))
+        (let ((loc (sb-int:info :source-location type name))
+              (translated (find-vop-source name)))
           (if loc
-              (translate-source-location loc)
-              (find-vop-source name))))
+              (cons (translate-source-location loc)
+                    translated)
+              translated)))
        (:alien-type
         (let ((loc (sb-int:info :source-location type name)))
           (and loc
@@ -473,14 +472,13 @@ If an unsupported TYPE is requested, the function will return NIL.
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
          (debug-fun (debug-info-debug-function function debug-info))
-         (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
+         (tlf (sb-c::compiled-debug-info-tlf-number debug-info)))
     (make-definition-source
      :pathname
      (when (stringp (sb-c::debug-source-namestring debug-source))
        (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
-     (if tlf
-         (elt (sb-c::debug-source-start-positions debug-source) tlf))
+     (sb-c::compiled-debug-info-char-offset debug-info)
      :form-path (if tlf (list tlf))
      :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
      :file-write-date (sb-c::debug-source-created debug-source)
@@ -597,23 +595,18 @@ value."
      function
      spaces
      (lambda (code)
-       (let ((entry (sb-kernel:%code-entry-points  code)))
-         (cond ((not entry)
-                (push (princ-to-string code) referrers))
-               (t
-                (loop for e = entry then (sb-kernel::%simple-fun-next e)
-                      while e
-                      do (pushnew e referrers)))))))
+       (dotimes (i (sb-kernel:code-n-entries code))
+         (pushnew (sb-kernel:%code-entry-point code i) referrers))))
     referrers))
 
 ;;; XREF facility
 
 (defun collect-xref (wanted-kind wanted-name)
   (let ((result '()))
-    (sb-c::map-simple-funs
+    (sb-c:map-simple-funs
      (lambda (name fun)
        (sb-int:binding* ((xrefs (sb-kernel:%simple-fun-xrefs fun) :exit-if-null))
-         (sb-c::map-packed-xref-data
+         (sb-c:map-packed-xref-data
           (lambda (xref-kind xref-name xref-form-number)
             (when (and (eq xref-kind wanted-kind)
                        (equal xref-name wanted-name))
@@ -806,35 +799,56 @@ Experimental: interface subject to change."
                       #.(if (= sb-vm:n-word-bits 64) 'single-float (values))))
       (values :immediate nil)
       (let ((plist
-             (sb-sys:without-gcing
-               ;; Disable GC so the object cannot move to another page while
-               ;; we have the address.
+             (sb-sys:with-pinned-objects (object)
                (let* ((addr (sb-kernel:get-lisp-obj-address object))
                       (space
-                       (cond ((< sb-vm:read-only-space-start addr
-                                 (ash sb-vm:*read-only-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
+                       (cond ((< (sb-kernel:current-dynamic-space-start) addr
+                                 (sb-sys:sap-int (sb-kernel:dynamic-space-free-pointer)))
+                              :dynamic)
+                             #+immobile-space
+                             ((sb-kernel:immobile-space-addr-p addr)
+                              :immobile)
+                             ((< sb-vm:read-only-space-start addr
+                                 (sb-sys:sap-int sb-vm:*read-only-space-free-pointer*))
                               :read-only)
                              ((< sb-vm:static-space-start addr
-                                 (ash sb-vm:*static-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
-                              :static)
-                             ((< (sb-kernel:current-dynamic-space-start) addr
-                                 (sb-sys:sap-int (sb-kernel:dynamic-space-free-pointer)))
-                              :dynamic))))
+                                 (sb-sys:sap-int sb-vm:*static-space-free-pointer*))
+                              :static))))
                  (when space
                    #+gencgc
                    (if (eq :dynamic space)
-                       (let ((index (sb-vm::find-page-index addr)))
-                         (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
-                           (let ((flags (sb-alien:slot page 'sb-vm::flags)))
-                             (list :space space
-                                   :generation (sb-alien:slot page 'sb-vm::gen)
-                                   :write-protected (logbitp 0 flags)
-                                   :boxed (logbitp 2 flags)
-                                   :pinned (logbitp 5 flags)
-                                   :large (logbitp 6 flags)
-                                   :page index))))
+                       (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
+                         ;; No wonder #+big-endian failed introspection tests-
+                         ;; bits are packed in the opposite order. And thankfully,
+                         ;; this fix seems not to depend on whether the numbering
+                         ;; scheme is MSB 0 or LSB 0, afaict.
+                         (let* ((index (sb-vm::find-page-index addr))
+                                (flags (sb-alien:slot page 'sb-vm::flags))
+                                .
+                                ;; The unused fields WP-CLR and PINS are
+                                ;; to make it easier for the human to count.
+                                #+big-endian
+                                ((allocated (ldb (byte 3 5) flags))
+                                 (wp        (logbitp 4 flags))
+                                 (wp-clr    (logbitp 3 flags))
+                                 (dontmove  (logbitp 2 flags))
+                                 (pins      (logbitp 1 flags))
+                                 (large     (logbitp 0 flags)))
+                                #+little-endian
+                                ((allocated (ldb (byte 3 0) flags))
+                                 (wp        (logbitp 3 flags))
+                                 (wp-clr    (logbitp 4 flags))
+                                 (dontmove  (logbitp 5 flags))
+                                 (pins      (logbitp 6 flags))
+                                 (large     (logbitp 7 flags))))
+                           (declare (ignore wp-clr pins))
+                           (list :space space
+                                 :generation (sb-alien:slot page 'sb-vm::gen)
+                                 :write-protected wp
+                                 :boxed (logbitp 0 allocated)
+                                 :pinned dontmove
+                                 :large large
+                                 :page index)))
                        (list :space space))
                    #-gencgc
                    (list :space space))))))
@@ -845,11 +859,11 @@ Experimental: interface subject to change."
                  ;; FIXME: Check other stacks as well.
                  #+sb-thread
                  (dolist (thread (sb-thread:list-all-threads))
-                   (let ((c-start (sb-di::descriptor-sap
+                   (let ((c-start (sb-int:descriptor-sap
                                    (sb-thread::%symbol-value-in-thread
                                     'sb-vm:*control-stack-start*
                                     thread)))
-                         (c-end (sb-di::descriptor-sap
+                         (c-end (sb-int:descriptor-sap
                                  (sb-thread::%symbol-value-in-thread
                                   'sb-vm:*control-stack-end*
                                   thread))))
@@ -884,15 +898,14 @@ conservative roots from the thread registers and interrupt contexts.
 Experimental: interface subject to change."
   (let ((fun (coerce function 'function))
         (seen (sb-int:alloc-xset)))
-    (flet ((call (part)
-             (when (and (member (sb-kernel:lowtag-of part)
-                                `(,sb-vm:instance-pointer-lowtag
-                                  ,sb-vm:list-pointer-lowtag
-                                  ,sb-vm:fun-pointer-lowtag
-                                  ,sb-vm:other-pointer-lowtag))
-                        (not (sb-int:xset-member-p part seen)))
-               (sb-int:add-to-xset part seen)
-               (funcall fun part))))
+    (labels ((call (part)
+               (when (and (is-lisp-pointer part)
+                          (not (sb-int:xset-member-p part seen)))
+                 (sb-int:add-to-xset part seen)
+                 (funcall fun part)))
+             (is-lisp-pointer (obj)
+               #+64-bit (= (logand (sb-kernel:get-lisp-obj-address obj) 3) 3)
+               #-64-bit (oddp (sb-kernel:get-lisp-obj-address obj))))
       (when ext
         (let ((table sb-pcl::*eql-specializer-table*))
           (call (sb-int:with-locked-system-table (table)
@@ -944,22 +957,21 @@ Experimental: interface subject to change."
              (dotimes (i (length object))
                (call (aref object i)))
              (when (sb-kernel:array-header-p object)
-               (call (sb-kernel::%array-data-vector object))
+               (call (sb-kernel:%array-data object))
                (call (sb-kernel::%array-displaced-p object))
                (unless simple
                  (call (sb-kernel::%array-displaced-from object))))))
         (sb-kernel:code-component
-         (call (sb-kernel:%code-entry-points object))
          (call (sb-kernel:%code-debug-info object))
          (loop for i from sb-vm:code-constants-offset
                below (sb-kernel:code-header-words object)
-               do (call (sb-kernel:code-header-ref object i))))
+               do (call (sb-kernel:code-header-ref object i)))
+         (loop for i below (sb-kernel:code-n-entries object)
+               do (call (sb-kernel:%code-entry-point object i))))
         (sb-kernel:fdefn
          (call (sb-kernel:fdefn-name object))
          (call (sb-kernel:fdefn-fun object)))
         (sb-kernel:simple-fun
-         (unless simple
-           (call (sb-kernel:%simple-fun-next object)))
          (call (sb-kernel:fun-code-header object))
          (call (sb-kernel:%simple-fun-name object))
          (call (sb-kernel:%simple-fun-arglist object))
@@ -971,8 +983,9 @@ Experimental: interface subject to change."
            (call x)))
         (sb-kernel:funcallable-instance
          (call (sb-kernel:%funcallable-instance-function object))
-         (loop for i from 1 below (- (1+ (sb-kernel:get-closure-length object))
-                                     sb-vm::funcallable-instance-info-offset)
+         (loop for i from sb-vm:instance-data-start
+               below (- (1+ (sb-kernel:get-closure-length object))
+                        sb-vm:funcallable-instance-info-offset)
                do (call (sb-kernel:%funcallable-instance-info object i))))
         (symbol
          (when ext
@@ -998,8 +1011,8 @@ Experimental: interface subject to change."
            (call (symbol-package object))))
         (sb-kernel::random-class
          (case (sb-kernel:widetag-of object)
-           (#.sb-vm::value-cell-header-widetag
-            (call (sb-kernel::value-cell-ref object)))
+           (#.sb-vm:value-cell-widetag
+            (call (sb-kernel:value-cell-ref object)))
            (t
             (warn "~&MAP-ROOT: Unknown widetag ~S: ~S~%"
                   (sb-kernel:widetag-of object) object)))))))

@@ -16,16 +16,13 @@
 ;;; prefixes..
 
 (defvar *trace-indentation-step* 2
-  #+sb-doc
   "the increase in trace indentation at each call level")
 
 (defvar *max-trace-indentation* 40
-  #+sb-doc
   "If the trace indentation exceeds this value, then indentation restarts at
    0.")
 
 (defvar *trace-encapsulate-default* t
-  #+sb-doc
   "the default value for the :ENCAPSULATE option to TRACE")
 
 ;;;; internal state
@@ -39,7 +36,7 @@
 
 ;;; A TRACE-INFO object represents all the information we need to
 ;;; trace a given function.
-(def!struct (trace-info
+(defstruct (trace-info
              (:print-object (lambda (x stream)
                               (print-unreadable-object (x stream :type t)
                                 (prin1 (trace-info-what x) stream)))))
@@ -121,7 +118,7 @@
            (if (valid-function-name-p x)
                (if (fboundp x)
                    (fdefinition x)
-                   (warn "~/sb-impl::print-symbol-with-prefix/ is ~
+                   (warn "~/sb-ext:print-symbol-with-prefix/ is ~
                           undefined, not tracing." x))
                (warn "~S is not a valid function name, not tracing." x))))
     (multiple-value-bind (res named-p)
@@ -138,9 +135,7 @@
           (values (get-def) t)))
      (typecase res
        (closure
-        (values (sb-kernel:%closure-fun res)
-                named-p
-                :compiled-closure))
+        (values (%closure-fun res) named-p :compiled-closure))
        (funcallable-instance
         (values res named-p :funcallable-instance))
        ;; FIXME: What about SB!EVAL:INTERPRETED-FUNCTION -- it gets picked off
@@ -268,7 +263,7 @@
                     (or (not wherein)
                         (trace-wherein-p frame wherein)))))
        (when conditionp
-         (let ((sb-kernel:*current-level-in-print* 0)
+         (let ((*current-level-in-print* 0)
                (*standard-output* (make-string-output-stream))
                (*in-trace* t))
            (ecase (trace-info-report info)
@@ -311,7 +306,7 @@
                  (or (cdr entry)
                      (let ((cond (trace-info-condition-after info)))
                        (and cond (apply #'funcall (cdr cond) frame values)))))
-        (let ((sb-kernel:*current-level-in-print* 0)
+        (let ((*current-level-in-print* 0)
               (*standard-output* (make-string-output-stream))
               (*in-trace* t))
           (ecase (trace-info-report info)
@@ -562,7 +557,6 @@
         collect (trace-info-what x)))
 
 (defmacro trace (&rest specs)
-  #+sb-doc
   "TRACE {Option Global-Value}* {Name {Option Value}*}*
 
 TRACE is a debugging tool that provides information when specified
@@ -693,7 +687,6 @@ The -AFTER and -ALL forms can use SB-DEBUG:ARG."
                (untrace-1 fun)))))))
 
 (defmacro untrace (&rest specs)
-  #+sb-doc
   "Remove tracing from the specified functions. Untraces all
 functions when called with no arguments."
   (if specs

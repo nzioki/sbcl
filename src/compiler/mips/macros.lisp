@@ -24,7 +24,6 @@
 ;;; Instruction-like macros.
 
 (defmacro move (dst src &optional (always-emit-code-p nil))
-  #!+sb-doc
   "Move SRC into DST (unless they are location= and ALWAYS-EMIT-CODE-P
 is nil)."
   (once-only ((n-dst dst)
@@ -62,7 +61,6 @@ is nil)."
             (- other-pointer-lowtag))))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
 byte-ordering issues."
   (once-only ((n-target target)
@@ -79,7 +77,6 @@ byte-ordering issues."
 ;;; return instructions.
 
 (defmacro lisp-jump (function lip)
-  #!+sb-doc
   "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
   `(progn
      (inst addu ,lip ,function (- (ash simple-fun-code-offset word-shift)
@@ -88,7 +85,6 @@ byte-ordering issues."
      (move code-tn ,function t)))
 
 (defmacro lisp-return (return-pc lip &key (offset 0) (frob-code t))
-  #!+sb-doc
   "Return to RETURN-PC.  LIP is an interior-reg temporary."
   `(progn
      (inst addu ,lip ,return-pc
@@ -100,7 +96,6 @@ byte-ordering issues."
 
 
 (defmacro emit-return-pc (label)
-  #!+sb-doc
   "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
   `(progn
      (emit-alignment n-lowtag-bits)
@@ -129,7 +124,6 @@ byte-ordering issues."
           (storew reg cfp-tn offset))))))
 
 (defmacro maybe-load-stack-tn (reg reg-or-stack)
-  #!+sb-doc
   "Move the TN Reg-Or-Stack into Reg if it isn't already there."
   (once-only ((n-reg reg)
               (n-stack reg-or-stack))
@@ -147,7 +141,6 @@ byte-ordering issues."
                                   size dynamic-extent-p
                                   &key (lowtag other-pointer-lowtag))
                                  &body body)
-  #!+sb-doc
   "Do stuff to allocate an other-pointer object of fixed Size with a single
 word header having the specified Type-Code.  The result is placed in
 Result-TN, Flag-Tn must be wired to NL4-OFFSET, and Temp-TN is a non-
@@ -227,23 +220,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
     (encode-internal-error-args values)
     (emit-alignment word-shift)))
 
-(defun error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
-
-(defun cerror-call (vop label error-code &rest values)
-  #!+sb-doc
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  (assemble ()
-    (without-scheduling ()
-      (inst b label)
-      (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))))
-
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
@@ -252,20 +229,6 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
       (apply #'error-call vop error-code values)
       start-lab)))
 
-(defun generate-cerror-code (vop error-code &rest values)
-  #!+sb-doc
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (assemble ()
-    (let ((continue (gen-label)))
-      (emit-label continue)
-      (assemble (*elsewhere*)
-        (let ((error (gen-label)))
-          (emit-label error)
-          (apply #'cerror-call vop continue error-code values)
-          error)))))
 
 ;;;; PSEUDO-ATOMIC
 
@@ -447,13 +410,3 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
                  value object
                  (- (+ (* ,offset n-word-bytes) (* index ,scale)) ,lowtag))
            (move result value))))))
-
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  `(without-gcing
-    ,@body))

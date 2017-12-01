@@ -16,13 +16,20 @@
 ;;; a utility for SIGNAL, ERROR, CERROR, WARN, COMPILER-NOTIFY and
 ;;; INVOKE-DEBUGGER: Parse the hairy argument conventions into a
 ;;; single argument that's directly usable by all the other routines.
-(defun coerce-to-condition (datum arguments default-type fun-name)
-  (declare (explicit-check))
-  (cond ((typep datum 'condition)
+(defun coerce-to-condition (datum default-type fun-name &rest arguments)
+  (declare (explicit-check)
+           (dynamic-extent arguments))
+  (cond ((and (%instancep datum)
+              (let ((layout (%instance-layout datum)))
+                (logtest +condition-layout-flag+ (layout-%flags layout))
+                ;; An invalid layout will drop into the (MAKE-CONDITION) branch
+                ;; which rightly fails because ALLOCATE-CONDITION asserts that
+                ;; the first argument is a condition-designator, which it won't be.
+                (not (layout-invalid layout))))
          (when (and arguments (not (eq fun-name 'cerror)))
            (cerror "Ignore the additional arguments."
                    'simple-type-error
-                   :datum arguments
+                   :datum (copy-list arguments)
                    :expected-type 'null
                    :format-control "You may not supply additional arguments ~
                                     when giving ~S to ~S."
@@ -31,7 +38,7 @@
         ((or (stringp datum) (functionp datum))
          (make-condition default-type
                          :format-control datum
-                         :format-arguments arguments))
+                         :format-arguments (copy-list arguments)))
         (t
          (apply #'make-condition datum arguments))))
 

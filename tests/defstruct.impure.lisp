@@ -31,11 +31,22 @@
 (declaim (notinline opaque-identity))
 (defun opaque-identity (x) x)
 
+(defstruct (boa-saux (:constructor make-boa-saux (&aux a (b 3) (c))))
+  (a #\! :type (integer 1 2))
+  (b #\? :type (integer 3 4))
+  (c #\# :type (integer 5 6)))
+(defstruct (boa-kid (:include boa-saux)))
+(defstruct (boa-grandkid (:include boa-kid)))
 (with-test (:name :defstruct-boa-typecheck)
-  (defstruct (boa-saux (:constructor make-boa-saux (&aux a (b 3) (c))))
-    (a #\! :type (integer 1 2))
-    (b #\? :type (integer 3 4))
-    (c #\# :type (integer 5 6)))
+  (dolist (dsd (sb-kernel:dd-slots
+                (sb-kernel:find-defstruct-description 'boa-saux)))
+    (let ((name (sb-kernel:dsd-name dsd))
+          (always-boundp (sb-kernel::dsd-always-boundp dsd)))
+      (ecase name
+        ((a c) (assert (not always-boundp)))
+        (b (assert always-boundp)))))
+  (let ((dd (sb-kernel:find-defstruct-description 'boa-grandkid)))
+    (assert (not (sb-kernel::dsd-always-boundp (car (sb-kernel:dd-slots dd))))))
   (let ((s (make-boa-saux)))
     (locally (declare (optimize (safety 3))
                       (inline boa-saux-a))
@@ -45,6 +56,13 @@
     (assert (eql (boa-saux-a s) 1))
     (assert (eql (boa-saux-b s) 3))
     (assert (eql (boa-saux-c s) 5))))
+
+(with-test (:name :defstruct-boa-nice-error :skipped-on :interpreter)
+  (let ((err (nth-value 1 (ignore-errors (boa-saux-a (make-boa-saux))))))
+    (assert (and (typep err 'simple-type-error)
+                 (search "Accessed uninitialized slot"
+                         (simple-condition-format-control err))))))
+
                                         ; these two checks should be
                                         ; kept separated
 
@@ -52,7 +70,7 @@
  (let ((s (make-boa-saux)))
    (locally (declare (optimize (safety 0))
                      (inline boa-saux-a))
-     (assert (eql (opaque-identity (boa-saux-a s)) 0)))
+     (assert (sb-int:unbound-marker-p (opaque-identity (boa-saux-a s)))))
    (setf (boa-saux-a s) 1)
    (setf (boa-saux-c s) 5)
    (assert (eql (boa-saux-a s) 1))
@@ -1152,7 +1170,7 @@ redefinition."
         (error "fail"))
     (type-error (e)
       (assert (eq 'string (type-error-expected-type e)))
-      (assert (zerop (type-error-datum e))))))
+      (assert (sb-int:unbound-marker-p (type-error-datum e))))))
 
 (with-test (:name :defstruct-copier-typechecks-argument)
   (copy-person (make-astronaut :name "Neil"))
@@ -1355,8 +1373,8 @@ redefinition."
 ;; should match the platform's native order.
 (defun compare-memory (obj1 obj1-word-ofs obj2 obj2-word-ofs n-words)
   (with-pinned-objects (obj1 obj2)
-    (let ((sap1 (int-sap (- (get-lisp-obj-address obj1) (lowtag-of obj1))))
-          (sap2 (int-sap (- (get-lisp-obj-address obj2) (lowtag-of obj2)))))
+    (let ((sap1 (int-sap (logandc2 (get-lisp-obj-address obj1) sb-vm:lowtag-mask)))
+          (sap2 (int-sap (logandc2 (get-lisp-obj-address obj2) sb-vm:lowtag-mask))))
       (dotimes (i n-words)
         (let ((w1 (sap-ref-32 sap1 (ash (+ obj1-word-ofs i) sb-vm:word-shift)))
               (w2 (sap-ref-32 sap2 (ash (+ obj2-word-ofs i) sb-vm:word-shift))))
@@ -1372,9 +1390,31 @@ redefinition."
                              :initial-element *c*))
 
 (test-util:with-test (:name :dfloat-endianness
-                      :skipped-on '(not (or :mips :x86))) ; only tested on these
+                      :skipped-on (not (or :mips :x86))) ; only tested on these
   (compare-memory pi 2 *adf* 2 2) ; Array
   (compare-memory pi 2 (make-struct-df) 2 2) ; Structure
 
   (compare-memory *c* 2 *acdf* 2 4) ; Array
   (compare-memory *c* 2 (make-struct-cdf) 2 4)) ; Structure
+
+(test-util:with-test (:name :recklessly-continuable-defstruct)
+  (flet ((redefine-defstruct (from to)
+           (eval from)
+           (handler-bind
+               ((error (lambda (c)
+                         (declare (ignore c))
+                         (return-from redefine-defstruct
+                           ;; RESTARTs are DX, don't return it.
+                           (not (null (find 'sb-kernel::recklessly-continue
+                                            (compute-restarts)
+                                            :key 'restart-name))))))
+                (warning #'muffle-warning))
+               (eval to))))
+    (assert (not (redefine-defstruct
+                  '(defstruct not-redefinable (a 0 :type sb-ext:word))
+                  '(defstruct not-redefinable (a)))))
+    (assert (redefine-defstruct
+             ;; Incompatible types has nothing to do with whether
+             ;; RECKLESSLY-CONTINUE is offered.
+             '(defstruct redefinable (a nil :type symbol))
+             '(defstruct redefinable (a nil :type cons))))))

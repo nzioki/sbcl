@@ -25,7 +25,7 @@
                        (simplify-namestring #'simplify-win32-namestring)
                        (customary-case :lower))))
 
-(defvar *physical-host* (make-win32-host))
+(setq *physical-host* (make-win32-host))
 
 ;;;
 (define-symbol-macro +long-file-name-prefix+ (quote "\\\\?\\"))
@@ -192,12 +192,13 @@
                      (list end nil)))))))
         (values nil
                 device
-                (cons (if absolute :absolute :relative) directory)
+                (cond (absolute
+                       (cons :absolute directory))
+                      (directory
+                       (cons :relative directory)))
                 (first name-and-type)
                 (second name-and-type)
                 nil)))))
-
-
 
 (defun unparse-win32-host (pathname)
   (declare (type pathname pathname)
@@ -216,7 +217,9 @@
           ((and (= 1 (length device)) (alpha-char-p (char device 0)))
            (concatenate 'simple-string device ":"))
           ((and (consp directory) (eq :relative (car directory)))
-           (error "No printed representation for a relative UNC pathname."))
+           (no-native-namestring-error
+            pathname
+            "there is no printed representation for a relative UNC pathname"))
           (t
            (if native
                (concatenate 'simple-string "\\\\" device)
@@ -227,53 +230,24 @@
 
 (defun unparse-win32-file (pathname)
   (declare (type pathname pathname))
-  (collect ((strings))
-    (let* ((name (%pathname-name pathname))
-           (type (%pathname-type pathname))
-           (type-supplied (not (or (null type) (eq type :unspecific)))))
-      ;; Note: by ANSI 19.3.1.1.5, we ignore the version slot when
-      ;; translating logical pathnames to a filesystem without
-      ;; versions (like Win32).
-      (when name
-        (when (and (null type)
-                   (typep name 'string)
-                   (> (length name) 0)
-                   (position #\. name :start 1))
-          (error "too many dots in the name: ~S" pathname))
-        (when (and (typep name 'string)
-                   (string= name ""))
-          (error "name is of length 0: ~S" pathname))
-        (strings (unparse-physical-piece name #\^)))
-      (when type-supplied
-        (unless name
-          (error "cannot specify the type without a file: ~S" pathname))
-        (when (typep type 'simple-string)
-          (when (position #\. type)
-            (error "type component can't have a #\. inside: ~S" pathname)))
-        (strings ".")
-        (strings (unparse-physical-piece type #\^))))
-    (apply #'concatenate 'simple-string (strings))))
+  (unparse-physical-file pathname #\^))
 
 (defun unparse-win32-namestring (pathname)
   (declare (type pathname pathname))
   (concatenate 'simple-string
                (unparse-win32-device pathname)
                (unparse-physical-directory pathname #\^)
-               (unparse-win32-file pathname)))
+               (unparse-physical-file pathname #\^)))
 
 (defun unparse-native-win32-namestring (pathname as-file)
   (declare (type pathname pathname))
   (let* ((device (pathname-device pathname))
+         (devicep (not (member device '(:unc nil))))
          (directory (pathname-directory pathname))
-         (name (pathname-name pathname))
-         (name-present-p (typep name '(not (member nil :unspecific))))
-         (name-string (if name-present-p name ""))
-         (type (pathname-type pathname))
-         (type-present-p (typep type '(not (member nil :unspecific))))
-         (type-string (if type-present-p type ""))
-         (absolutep (and device (eql :absolute (car directory)))))
-    (when name-present-p
-      (setf as-file nil))
+         (absolutep (and device (eql :absolute (car directory))))
+         (seperator-after-directory-p
+          (or (pathname-component-present-p (pathname-name pathname))
+              (not as-file))))
     (when (and absolutep (member :up directory))
       ;; employ merge-pathnames to parse :BACKs into which we turn :UPs
       (setf directory
@@ -287,59 +261,52 @@
        (when absolutep
          (write-string (case device
                          (:unc +unc-file-name-prefix+)
-                         (otherwise +long-file-name-prefix+)) s))
-       (when (or (not absolutep) (not (member device '(:unc nil))))
+                         (otherwise +long-file-name-prefix+))
+                       s))
+       (when (or (not absolutep) devicep)
          (write-string (unparse-win32-device pathname t) s))
        (when directory
          (ecase (pop directory)
            (:absolute
             (let ((next (pop directory)))
-              ;; Don't use USER-HOMEDIR-NAMESTRING, since
-              ;; it can be specified as C:/User/user
-              ;; and (native-namestring (user-homedir-pathname))
-              ;; will be not equal to it, because it's parsed first.
-              (cond ((eq :home next)
-                     (write-string (native-namestring (user-homedir-pathname))
-                                   s))
-                    ((and (consp next) (eq :home (car next)))
-                     (let ((where (user-homedir-pathname (second next))))
-                       (if where
-                           (write-string (native-namestring where) s)
-                           (error "User homedir unknown for: ~S."
-                                  (second next)))))
-                    ;; namestring of user-homedir-pathname already has
-                    ;; // at the end
-                    (next
-                     (write-char #\\ s)
-                     (push next directory))
-                    (t
-                     (write-char #\\ s)))))
+              (cond
+                ((typep next '(or (eql :home) (cons (eql :home))))
+                 (let* ((username (when (consp next) (second next)))
+                        (home (handler-case
+                                  (if username
+                                      (parse-native-namestring
+                                       (user-homedir-namestring username))
+                                      (user-homedir-pathname))
+                                (error (condition)
+                                  (no-native-namestring-error
+                                   pathname
+                                   "user homedir not known~@[ for ~S~]: ~A"
+                                   username condition)))))
+                   (when (and (or absolutep devicep)
+                              (not (string-equal device (pathname-device home))))
+                     (no-native-namestring-error
+                      pathname
+                      "Device in homedir ~S conflicts which device ~S"
+                      home device))
+                   (write-string (native-namestring home) s)))
+                ;; namestring of user-homedir-pathname already has
+                ;; // at the end
+                (next
+                 (write-char #\\ s)
+                 (push next directory))
+                (t
+                 (write-char #\\ s)))))
            (:relative)))
        (loop for (piece . subdirs) on directory
              do (typecase piece
                   ((member :up :back) (write-string ".." s))
                   (string (write-string piece s))
-                  (t (error "Bad directory segment in NATIVE-NAMESTRING: ~S."
-                            piece)))
-             if (or subdirs (stringp name))
-             do (write-char #\\ s)
-             else
-             do (unless as-file
-                  (write-char #\\ s)))
-       (if name-present-p
-           (progn
-             (unless (stringp name-string) ;some kind of wild field
-               (error "Bad name component in NATIVE-NAMESTRING: ~S." name))
-             (write-string name-string s)
-             (when type-present-p
-               (unless (stringp type-string) ;some kind of wild field
-                 (error "Bad type component in NATIVE-NAMESTRING: ~S." type))
-               (write-char #\. s)
-               (write-string type-string s)))
-           (when type-present-p
-             (error
-              "Type component without a name component in NATIVE-NAMESTRING: ~S."
-              type)))
+                  (t (no-native-namestring-error pathname
+                                                 "Bad directory segment in NATIVE-NAMESTRING: ~S."
+                                                 piece)))
+             when (or subdirs seperator-after-directory-p)
+             do (write-char #\\ s))
+       (write-string (unparse-native-physical-file pathname) s)
        (when absolutep
          (let ((string (get-output-stream-string s)))
            (return-from unparse-native-win32-namestring
@@ -355,6 +322,7 @@
      'simple-string)))
 
 ;;; FIXME.
+;;; ... fix what?
 (defun unparse-win32-enough (pathname defaults)
   (declare (type pathname pathname defaults))
   (flet ((lose ()

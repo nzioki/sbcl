@@ -10,7 +10,7 @@
 (in-package "SB!C")
 
 (def-alloc %make-structure-instance 1 :structure-alloc
-           sb!vm:instance-header-widetag sb!vm:instance-pointer-lowtag
+           sb!vm:instance-widetag sb!vm:instance-pointer-lowtag
            nil)
 
 #!+stack-allocatable-fixed-objects
@@ -71,17 +71,11 @@
 (defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
-        (lvar (node-lvar node)))
+        (dx-p (node-stack-allocate-p node)))
     (flet ((zero-init-p (x)
              ;; dynamic-space is already zeroed
-             (and (or (not lvar)
-                      (not (lvar-dynamic-extent lvar)))
-                  ;; KLUDGE: can't ignore type-derived
-                  ;; constants since they can be closed over
-                  ;; and not using them confuses the register
-                  ;; allocator.
-                  ;; See compiler.pure/cons-zero-initialization
-                  (strictly-constant-lvar-p x)
+             (and (not dx-p)
+                  (constant-lvar-p x)
                   (eql (lvar-value x) 0))))
      (dolist (init inits)
        (let ((kind (car init))
@@ -105,7 +99,7 @@
                          `(ecase raw-type
                             ((t)
                              (vop init-slot node block object arg-tn
-                                  name (+ sb!vm:instance-slots-offset slot) lowtag))
+                                  name dx-p (+ sb!vm:instance-slots-offset slot) lowtag))
                             ,@(map 'list
                                (lambda (rsd)
                                  `(,(sb!kernel::raw-slot-data-raw-type rsd)
@@ -117,7 +111,10 @@
            (:dd
             (vop init-slot node block object
                  (emit-constant (sb!kernel::dd-layout-or-lose slot))
-                 name sb!vm:instance-slots-offset lowtag))
+                 name dx-p
+                 ;; Layout has no index if compact headers.
+                 (or #!+compact-instance-header :layout sb!vm:instance-slots-offset)
+                 lowtag))
            (otherwise
             (if (and (eq kind :arg)
                      (zero-init-p (car args)))
@@ -128,11 +125,16 @@
                         (aver args)
                         (lvar-tn node block (pop args)))
                        (:unbound
+                        ;; SLOT should be the word index to alter, but with structure
+                        ;; instances, SLOT is a cons whose car is the raw-slot-type
+                        ;; since BOXED-COMBINATION-REF-P expects that #'cddr is the
+                        ;; slot index.
+                        (when (listp slot)
+                          (setq slot (+ (cdr slot) sb!vm:instance-slots-offset)))
                         (or unbound-marker-tn
                             (setf unbound-marker-tn
                                   (let ((tn (make-restricted-tn
-                                             nil
-                                             (sc-number-or-lose 'sb!vm::any-reg))))
+                                             nil sb!vm:any-reg-sc-number)))
                                     (vop make-unbound-marker node block tn)
                                     tn))))
                        (:null
@@ -141,11 +143,10 @@
                         (or funcallable-instance-tramp-tn
                             (setf funcallable-instance-tramp-tn
                                   (let ((tn (make-restricted-tn
-                                             nil
-                                             (sc-number-or-lose 'sb!vm::any-reg))))
+                                             nil sb!vm:any-reg-sc-number)))
                                     (vop make-funcallable-instance-tramp node block tn)
                                     tn)))))
-                     name slot lowtag))))))))
+                     name dx-p slot lowtag))))))))
   (unless (null args)
     (bug "Leftover args: ~S" args)))
 
@@ -188,8 +189,12 @@
     (let* ((c-dd (lvar-value dd))
            (c-slot-specs (lvar-value slot-specs))
            (words (+ (dd-length c-dd) words)))
+      #!+compact-instance-header
+      (progn (aver (= type sb!vm:instance-widetag))
+             (emit-constant (setq type (sb!kernel::dd-layout-or-lose c-dd))))
       (emit-fixed-alloc node block name words type lowtag result lvar)
-      (emit-inits node block name result lowtag `((:dd . ,c-dd) ,@c-slot-specs) args)
+      (emit-inits node block name result lowtag
+                  `(#!-compact-instance-header (:dd . ,c-dd) ,@c-slot-specs) args)
       (move-lvar-result node block locs lvar))))
 
 (defoptimizer (initialize-vector ir2-convert)
@@ -249,12 +254,7 @@
           (let ((value (pop initial-contents)))
             ;; dynamic-space is already zeroed
             (unless (and (not dx-p)
-                         ;; KLUDGE: can't ignore type-derived
-                         ;; constants since they can be closed over
-                         ;; and not using them confuses the register
-                         ;; allocator.
-                         ;; See compiler.pure/vector-zero-initialization
-                         (strictly-constant-lvar-p value)
+                         (constant-lvar-p value)
                          (if character
                              (eql (char-code (lvar-value value)) 0)
                              (eql (lvar-value value) 0)))
@@ -265,15 +265,16 @@
 ;;; An array header for simple non-unidimensional arrays is a fixed alloc,
 ;;; because the rank has to be known.
 ;;; (There are no compile-time optimizations for unknown rank arrays)
-(defoptimizer (make-array-header* ir2-convert) ((&rest args) node block)
+(defoptimizer (make-array-header* ir2-convert) ((widetag &rest args) node block)
   (let ((n-args (length args)))
+    ;; Remove the widetag lvar
+    (pop (basic-combination-args node))
     (ir2-convert-fixed-allocation
      node block 'make-array
      ;; Each argument fills in one slot of the array header.
      ;; Add one word for the primitive object's header word.
      (1+ n-args)
-     ;; MAKE-ARRAY optimizations will not kick in for complex arrays.
-     sb!vm:simple-array-widetag
+     (lvar-value widetag)
      sb!vm:other-pointer-lowtag
      (loop for i from 1 to n-args collect `(:arg . ,i)))))
 
@@ -316,10 +317,9 @@
          ;; a vector object should fit in one page -- otherwise it might go past
          ;; stack guard pages.
          (values-subtypep (lvar-derived-type words)
-                          (load-time-value
-                           (specifier-type `(integer 0 ,(- (/ sb!vm::*backend-page-bytes*
-                                                              sb!vm:n-word-bytes)
-                                                           sb!vm:vector-data-offset))))))))
+                          (specifier-type
+                           `(integer 0 ,(- (/ +backend-page-bytes+ sb!vm:n-word-bytes)
+                                           sb!vm:vector-data-offset)))))))
 
   (defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
     (declare (ignore type length words))
@@ -329,8 +329,7 @@
 
   (defun vectorish-ltn-annotate-helper (call ltn-policy dx-template &optional not-dx-template)
     (let* ((args (basic-combination-args call))
-           (template-name (if (awhen (node-lvar call)
-                                (lvar-dynamic-extent it))
+           (template-name (if (node-stack-allocate-p call)
                               dx-template
                               not-dx-template))
            (template (and template-name
@@ -384,9 +383,8 @@
         ;; could be removed, because allocation would never miss the guard page
         ;; if it tries to consume too much stack space.
         (values-subtypep (lvar-derived-type length)
-                         (load-time-value
-                          (specifier-type `(integer 0 ,(/ sb!vm::*backend-page-bytes*
-                                                          sb!vm:n-word-bytes 2)))))))
+                         (specifier-type
+                          `(integer 0 ,(/ +backend-page-bytes+ sb!vm:n-word-bytes 2))))))
   (defoptimizer (%make-list ltn-annotate) ((length element) call ltn-policy)
     (declare (ignore length element))
     (vectorish-ltn-annotate-helper call ltn-policy
@@ -398,7 +396,8 @@
 ;;; given the mandatory slots for a simple array of rank 0 or > 1.
 (defun make-array-header-inits (storage n-elements dimensions)
   (macrolet ((expand ()
-               `(list* ,@(mapcar (lambda (slot)
+               `(list* sb!vm:simple-array-widetag
+                       ,@(mapcar (lambda (slot)
                                    (ecase (slot-name slot)
                                      (data           'storage)
                                      (fill-pointer   'n-elements)
@@ -412,3 +411,11 @@
                                                  :key 'primitive-object-name))))
                        dimensions)))
     (expand)))
+
+;;; This order is used by SB-C::TRANSFORM-MAKE-ARRAY-VECTOR
+(assert (equal (mapcar #'slot-name
+                       (primitive-object-slots
+                        (find 'array *primitive-objects*
+                              :key 'primitive-object-name)))
+               '(fill-pointer fill-pointer-p elements data
+                 displacement displaced-p displaced-from dimensions)))

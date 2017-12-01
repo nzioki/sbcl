@@ -15,8 +15,8 @@
 ;;; Unbound outside package lock context, inside either list of
 ;;; packages for which locks are ignored, T when locks for
 ;;; all packages are ignored, and :invalid outside package-lock
-;;; context. FIXME: This needs to be rebound for each thread.
-(!defvar *ignored-package-locks* :invalid)
+;;; context.
+(!define-thread-local *ignored-package-locks* :invalid)
 
 ;; This proclamation avoids a ton of style warnings due to so many calls
 ;; that get cross-compiled prior to compiling "target-package.lisp"
@@ -31,11 +31,6 @@
   #!+sb-package-locks
   (with-unique-names (topmost)
     `(progn
-       ;; /show was fairly useless here because it printed "/foo-ing ~A"
-       ;; without any clue as to what the interesting THING was.
-       ;; It could be handy for debugging package locks in bootstrap code,
-       ;; but if package locks work fine, it's just way too much noise.
-       (/noshow0 ,(first format))
        (let ((,topmost nil))
          ;; We use assignment and conditional restoration instead of
          ;; dynamic binding because we want the ignored locks
@@ -58,7 +53,6 @@
              (setf *ignored-package-locks* :invalid)))))))
 
 (defmacro without-package-locks (&body body)
-  #!+sb-doc
   "Ignores all runtime package lock violations during the execution of
 body. Body can begin with declarations."
   `(let (#!+sb-package-locks (*ignored-package-locks* t))

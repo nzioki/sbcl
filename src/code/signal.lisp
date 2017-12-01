@@ -48,10 +48,12 @@
 ;;;    (foo))
 ;;; provided that the first branch is true "often enough".
 
-(!defvar *interrupts-enabled* t)
-(!defvar *interrupt-pending* nil)
-#!+sb-thruption (!defvar *thruption-pending* nil)
-(!defvar *allow-with-interrupts* t)
+;;; These 4 symbols are initialized by create_thread_struct()
+(defvar *interrupts-enabled*)
+(defvar *interrupt-pending*)
+#!+sb-thruption (defvar *thruption-pending*)
+(defvar *allow-with-interrupts*)
+
 ;;; This is to support signal handlers that want to return to the
 ;;; interrupted context without leaving anything extra on the stack. A
 ;;; simple
@@ -65,8 +67,19 @@
 ;;; still on the stack.
 (!defvar *unblock-deferrables-on-enabling-interrupts-p* nil)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (dolist (symbol '(*unblock-deferrables-on-enabling-interrupts-p*
+                    *interrupts-enabled*
+                    *interrupt-pending*
+                    *thruption-pending*
+                    *allow-with-interrupts*))
+    ;; Force these to be always bound despite absence of a compile-time binding.
+    ;; (Avoid accidentally installing a value into symbol->value in cold-load)
+    ;; Not only are they always bound, 4 of them always have a thread-local value.
+    ;; We don't as yet have a way to elide the check for no-tls-value though.
+    (setf  (info :variable :always-bound symbol) :always-bound)))
+
 (defmacro without-interrupts (&body body)
-  #!+sb-doc
   "Executes BODY with all deferrable interrupts disabled. Deferrable
 interrupts arriving during execution of the BODY take effect after BODY has
 been executed.
@@ -152,7 +165,6 @@ WITHOUT-INTERRUPTS in:
            (,without-interrupts-body)))))
 
 (defmacro with-interrupts (&body body)
-  #!+sb-doc
   "Executes BODY with deferrable interrupts conditionally enabled. If there
 are pending interrupts they take effect prior to executing BODY.
 

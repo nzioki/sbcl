@@ -13,20 +13,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; SAVE-LISP-AND-DIE itself
 
+#-gencgc
 (define-alien-routine "save" (boolean)
   (file c-string)
-  (initial-fun (unsigned #.sb!vm:n-word-bits))
+  (initial-fun (unsigned #.sb-vm:n-word-bits))
   (prepend-runtime int)
   (save-runtime-options int)
   (compressed int)
   (compression-level int)
   (application-type int))
 
-#!+gencgc
+#+gencgc
 (define-alien-routine "gc_and_save" void
   (file c-string)
   (prepend-runtime int)
@@ -35,13 +36,13 @@
   (compression-level int)
   (application-type int))
 
-#!+gencgc
-(defvar sb!vm::*restart-lisp-function*)
+#+gencgc
+(define-alien-variable "lisp_init_function" (unsigned #.sb-vm:n-machine-word-bits))
 
 (define-condition save-condition (reference-condition)
   ()
   (:default-initargs
-   :references (list '(:sbcl :node "Saving a Core Image"))))
+   :references '((:sbcl :node "Saving a Core Image"))))
 
 (define-condition save-error (error save-condition)
   ()
@@ -71,9 +72,8 @@
                                          (root-structures ())
                                          (environment-name "auxiliary")
                                          (compression nil)
-                                         #!+win32
+                                         #+win32
                                          (application-type :console))
-  #!+sb-doc
   "Save a \"core image\", i.e. enough information to restart a Lisp
 process later in the same state, in the file of the specified name.
 Only global state is preserved: the stack is unwound in the process.
@@ -115,12 +115,17 @@ The following &KEY arguments are defined:
   :ROOT-STRUCTURES
      This should be a list of the main entry points in any newly loaded
      systems. This need not be supplied, but locality and/or GC performance
-     may be better if they are. Meaningless if :PURIFY is NIL. See the
-     PURIFY function.
+     may be better if they are. This has two different but related meanings:
+     If :PURIFY is true - and only for cheneygc - the root structures
+     are those which anchor the set of objects moved into static space.
+     On gencgc - and only on platforms supporting immobile code - these are
+     the functions and/or function-names which commence a depth-first scan
+     of code when reordering based on the statically observable call chain.
+     The complete set of reachable objects is not affected per se.
+     This argument is meaningless if neither enabling precondition holds.
 
   :ENVIRONMENT-NAME
-     This is also passed to the PURIFY function when :PURIFY is T.
-     (rarely used)
+     This has no purpose; it is accepted only for legacy compatibility.
 
   :COMPRESSION
      This is only meaningful if the runtime was built with the :SB-CORE-COMPRESSION
@@ -164,11 +169,12 @@ This implementation is not as polished and painless as you might like:
 This isn't because we like it this way, but just because there don't
 seem to be good quick fixes for either limitation and no one has been
 sufficiently motivated to do lengthy fixes."
-  #!+gencgc
-  (declare (ignore purify root-structures environment-name))
-  #!+sb-core-compression
+  (declare (ignore environment-name))
+  #+gencgc
+  (declare (ignore purify) (ignorable root-structures))
+  #+sb-core-compression
   (check-type compression (or boolean (integer -1 9)))
-  #!-sb-core-compression
+  #-sb-core-compression
   (when compression
     (error "Unable to save compressed core: this runtime was not built with zlib support"))
   (when *dribble-stream*
@@ -181,83 +187,107 @@ sufficiently motivated to do lengthy fixes."
         (return-from save-lisp-and-die))))
   (when (eql t compression)
     (setf compression -1))
-  (tune-image-for-dump)
-  (deinit)
+
+  ;; Share EQUALP FUN-INFOs
+  (let ((ht (make-hash-table :test 'equalp)))
+    (sb-int:call-with-each-globaldb-name
+     (lambda (name)
+       (binding* ((info (info :function :info name) :exit-if-null)
+                  (shared-info (gethash info ht)))
+         (if shared-info
+             (setf (info :function :info name) shared-info)
+             (setf (gethash info ht) info))))))
+  ;; Share similar simple-fun arglists and types
+  ;; EQUALISH considers any two identically-spelled gensyms as EQ
+  (let ((arglist-hash (make-hash-table :hash-function 'equal-hash
+                                       :test 'fun-names-equalish))
+        (type-hash (make-hash-table :test 'equal)))
+    (sb-vm::map-allocated-objects
+     (lambda (object widetag size)
+       (declare (ignore size))
+       (when (= widetag sb-vm:code-header-widetag)
+         (dotimes (i (sb-kernel:code-n-entries object))
+           (let* ((fun (sb-kernel:%code-entry-point object i))
+                  (arglist (%simple-fun-arglist fun))
+                  (type (sb-vm::%%simple-fun-type fun)))
+             (setf (%simple-fun-arglist fun)
+                   (ensure-gethash arglist arglist-hash arglist))
+             (setf (sb-kernel:%simple-fun-type fun)
+                   (ensure-gethash type type-hash type))))))
+     :all))
+  ;;
+  (labels ((restart-lisp ()
+             (handling-end-of-the-world
+              (reinit)
+              #+hpux (%primitive sb-vm::setup-return-from-lisp-stub)
+              (funcall toplevel)))
+           (foreign-bool (value)
+             (if value 1 0)))
+    (let ((name (native-namestring (physicalize-pathname core-file-name)
+                                   :as-file t)))
+      (tune-image-for-dump)
+      (deinit)
   ;; FIXME: Would it be possible to unmix the PURIFY logic from this
   ;; function, and just do a GC :FULL T here? (Then if the user wanted
   ;; a PURIFYed image, he'd just run PURIFY immediately before calling
   ;; SAVE-LISP-AND-DIE.)
-  (labels ((restart-lisp ()
-             (handling-end-of-the-world
-               (reinit)
-               #!+hpux (%primitive sb!vm::setup-return-from-lisp-stub)
-               (funcall toplevel)))
-           (foreign-bool (value)
-             (if value 1 0))
-           (save-core (gc)
-             (let ((name (native-namestring
-                          (physicalize-pathname core-file-name)
-                          :as-file t)))
-               (when gc
-                 #!-gencgc (gc)
-                 ;; Do a destructive non-conservative GC, and then save a core.
-                 ;; A normal GC will leave huge amounts of storage unreclaimed
-                 ;; (over 50% on x86). This needs to be done by a single function
-                 ;; since the GC will invalidate the stack.
-                 #!+gencgc (gc-and-save name
-                                        (foreign-bool executable)
-                                        (foreign-bool save-runtime-options)
-                                        (foreign-bool compression)
-                                        (or compression 0)
-                                        #!+win32
-                                        (ecase application-type
-                                          (:console 0)
-                                          (:gui 1))
-                                        #!-win32 0))
-               (without-gcing
-                 (save name
-                       (get-lisp-obj-address #'restart-lisp)
-                       (foreign-bool executable)
-                       (foreign-bool save-runtime-options)
-                       (foreign-bool compression)
-                       (or compression 0)
-                       #!+win32
-                       (ecase application-type
-                         (:console 0)
-                         (:gui 1))
-                       #!-win32 0)))))
-    ;; Save the restart function into a static symbol, to allow GC-AND-SAVE
-    ;; access to it even after the GC has moved it.
-    #!+gencgc
-    (setf sb!vm::*restart-lisp-function* #'restart-lisp)
-    (cond #!-gencgc
-          (purify
-           (purify :root-structures root-structures
-                   :environment-name environment-name)
-           (save-core nil))
-          (t
-           (save-core t)))
+    #+gencgc
+    (progn
+      #+immobile-code
+      (progn
+        ;; Perform static linkage. There seems to be no reason to have users
+        ;; decide whether they want this. Functions become un-statically-linked
+        ;; on demand, for TRACE, redefinition, etc.
+        (sb-vm::statically-link-core)
+        ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
+        ;; prior causes compilation to occur into immobile space.
+        ;; Failing to see all immobile code would miss some relocs.
+        (sb-kernel::choose-code-component-order root-structures))
+      ;; Save the restart function. Logically a passed argument, but can't be,
+      ;; as it would require pinning around the whole save operation.
+      (with-pinned-objects (#'restart-lisp)
+        (setf lisp-init-function (get-lisp-obj-address #'restart-lisp)))
+      ;; Do a destructive non-conservative GC, and then save a core.
+      ;; A normal GC will leave huge amounts of storage unreclaimed
+      ;; (over 50% on x86). This needs to be done by a single function
+      ;; since the GC will invalidate the stack.
+      (gc-and-save name
+                   (foreign-bool executable)
+                   (foreign-bool save-runtime-options)
+                   (foreign-bool compression)
+                   (or compression 0)
+                   #+win32 (ecase application-type (:console 0) (:gui 1))
+                   #-win32 0)
+      (setf lisp-init-function 0)) ; only reach here on save error
+    #-gencgc
+    (progn
+      (if purify (purify :root-structures root-structures) (gc))
+      (without-gcing
+       (save name
+             (get-lisp-obj-address #'restart-lisp)
+             (foreign-bool executable)
+             (foreign-bool save-runtime-options)
+             (foreign-bool compression)
+             (or compression 0)
+             #+win32 (ecase application-type (:console 0) (:gui 1))
+             #-win32 0)))))
+
     ;; Something went very wrong -- reinitialize to have a prayer
     ;; of being able to report the error.
-    (reinit)
-    (error 'save-error)))
+  (reinit)
+  (error 'save-error))
 
-;;; REPACK-XREF is defined during warm load of
-;;; src/code/repack-xref.lisp.
-(declaim (ftype (sfunction (&key (:verbose t) (:compact-name-count (integer 0))) null)
-                sb!c::repack-xref))
 (defun tune-image-for-dump ()
-  #!+sb-fasteval (sb!interpreter::flush-everything)
-  (tune-hashtable-sizes-of-all-packages)
-  (sb!c::repack-xref :verbose nil))
+  #+sb-fasteval (sb-interpreter::flush-everything)
+  (tune-hashtable-sizes-of-all-packages))
 
 (defun deinit ()
   (call-hooks "save" *save-hooks*)
-  #!+sb-wtimer
+  #+sb-wtimer
   (itimer-emulation-deinit)
-  (let ((threads (sb!thread:list-all-threads)))
+  (let ((threads (sb-thread:list-all-threads)))
     (unless (= 1 (length threads))
-      (let* ((interactive (sb!thread::interactive-threads))
+      (let* ((interactive (sb-thread::interactive-threads))
              (other (set-difference threads interactive)))
         (error 'save-with-multiple-threads-error
                :interactive-threads interactive
@@ -265,10 +295,14 @@ sufficiently motivated to do lengthy fixes."
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
-  (stream-deinit)
   (deinit-finalizers)
+  (fill *pathnames* nil)
   (drop-all-hash-caches)
+  ;; Must clear this cache if asm routines are movable.
+  (setq sb-disassem::*assembler-routines-by-addr* nil)
   (os-deinit)
+  ;; Do this last, to have some hope of printing if we need to.
+  (stream-deinit)
   (setf * nil ** nil *** nil
         - nil + nil ++ nil +++ nil
         /// nil // nil / nil))

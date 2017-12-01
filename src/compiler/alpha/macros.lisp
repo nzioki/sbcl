@@ -24,7 +24,6 @@
 
 ;;; c.f. x86 backend:
 ;;(defmacro move (dst src)
-;;  #!+sb-doc
 ;;  "Move SRC into DST unless they are location=."
 ;;  (once-only ((n-dst dst)
 ;;              (n-src src))
@@ -202,18 +201,6 @@
         (inst byte (aref vector i))))
     (emit-alignment word-shift)))
 
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
-
-(defun cerror-call (vop label error-code &rest values)
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  (assemble ()
-     (emit-error-break vop cerror-trap (error-number-or-lose error-code) values)
-     (inst br zero-tn label)))
-
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
@@ -222,21 +209,6 @@
       (emit-label start-lab)
       (apply #'error-call vop error-code values)
       start-lab)))
-
-(defmacro generate-cerror-code (vop error-code &rest values)
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (assemble ()
-    (let ((continue (gen-label)))
-      (emit-label continue)
-      (assemble (*elsewhere*)
-        (let ((error (gen-label)))
-          (emit-label error)
-          (apply #'cerror-call vop continue error-code values)
-          error)))))
-
 
 ;;; a handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((&key (extra 0)) &rest forms)
@@ -509,12 +481,3 @@
                                          (* index ,scale))
                                       ,lowtag) object))))
            (move value result))))))
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  `(without-gcing
-    ,@body))

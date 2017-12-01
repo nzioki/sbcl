@@ -20,7 +20,6 @@
 ;;; worth the (large) cost in space.
 (declaim (maybe-inline sort stable-sort))
 (defun sort (sequence predicate &rest args &key key)
-  #!+sb-doc
   "Destructively sort SEQUENCE. PREDICATE should return non-NIL if
    ARG1 is to precede ARG2."
   (declare (truly-dynamic-extent args))
@@ -40,7 +39,6 @@
 
 ;;;; stable sorting
 (defun stable-sort (sequence predicate &rest args &key key)
-  #!+sb-doc
   "Destructively sort SEQUENCE. PREDICATE should return non-NIL if
    ARG1 is to precede ARG2."
   (declare (truly-dynamic-extent args))
@@ -374,7 +372,6 @@
 ) ; EVAL-WHEN
 
 (defun merge (result-type sequence1 sequence2 predicate &key key)
-  #!+sb-doc
   "Merge the sequences SEQUENCE1 and SEQUENCE2 destructively into a
    sequence of type RESULT-TYPE using PREDICATE to order the elements."
   ;; FIXME: This implementation is remarkably inefficient in various
@@ -430,8 +427,6 @@
               (length-1 (length vector-1))
               (length-2 (length vector-2))
               (result (make-sequence result-type (+ length-1 length-2))))
-         (declare (vector vector-1 vector-2) ; FIXME: this looks redundant,
-                  (fixnum length-1 length-2)) ; as does this.
          (if (and (simple-vector-p result)
                   (simple-vector-p vector-1)
                   (simple-vector-p vector-2))

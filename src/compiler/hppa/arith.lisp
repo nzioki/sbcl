@@ -14,9 +14,7 @@
 ;;;; Unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -537,8 +535,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -854,8 +850,6 @@
   (:results (hi-res :scs (unsigned-reg) :from (:result 1))
             (lo-res :scs (unsigned-reg) :from (:result 0)))
   (:result-types unsigned-num unsigned-num)
-  (:affected)
-  (:effects)
   (:generator 3
     (inst add lo extra lo-res)
     (inst addc hi zero-tn hi-res)))
@@ -936,28 +930,3 @@
     (inst subi 31 count temp)
     (inst mtctl temp :sar)
     (inst zdep digit :variable 32 result)))
-
-
-;;;; Static functions.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-

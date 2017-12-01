@@ -13,17 +13,6 @@
 
 ;;;; type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg control-stack)
-                 :target result))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (move result object)
-    (inst and result lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -82,22 +71,6 @@
     (inst movzx result (make-ea :byte :base function
                                       :disp (- fun-pointer-lowtag)))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
-  (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target eax)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0)
-                   :to (:result 0) :target result)
-              eax)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (move eax type)
-    (storeb al-tn function 0 fun-pointer-lowtag)
-    (move result eax)))
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -116,7 +89,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
+    (inst shr res n-widetag-bits)
+    (inst and res short-header-max-words)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -147,14 +121,6 @@
     (inst shr res 1)))
 
 ;;;; allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -213,36 +179,22 @@
                    :disp (- fun-pointer-lowtag other-pointer-lowtag)))
     (inst add func code)))
 
-(define-vop (%simple-fun-self)
+;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
+;;; as soon as it's loaded into a register, it prevents the underlying fun from
+;;; being transported by GC. It's even subtler in that sense than COMPUTE-FUN,
+;;; which doesn't pin a *different* object produced from thin air.
+;;; (It's output operand is embedded in the object pointed to by its input)
+(define-vop (%closure-fun)
   (:policy :fast-safe)
-  (:translate %simple-fun-self)
+  (:translate %closure-fun)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (descriptor-reg)))
   (:generator 3
-    (loadw result function simple-fun-self-slot fun-pointer-lowtag)
+    (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst lea result
           (make-ea :byte :base result
                    :disp (- fun-pointer-lowtag
                             (* simple-fun-code-offset n-word-bytes))))))
-
-;;; The closure function slot is a pointer to raw code on X86 instead
-;;; of a pointer to the code function object itself. This VOP is used
-;;; to reference the function object given the closure object.
-(define-source-transform %closure-fun (closure)
-  `(%simple-fun-self ,closure))
-
-(define-vop (%set-fun-self)
-  (:policy :fast-safe)
-  (:translate (setf %simple-fun-self))
-  (:args (new-self :scs (descriptor-reg) :target result :to :result)
-         (function :scs (descriptor-reg) :to :result))
-  (:temporary (:sc any-reg :from (:argument 0) :to :result) temp)
-  (:results (result :scs (descriptor-reg)))
-  (:generator 3
-    (inst lea temp (make-ea-for-object-slot new-self simple-fun-code-offset
-                                            fun-pointer-lowtag))
-    (storew temp function simple-fun-self-slot fun-pointer-lowtag)
-    (move result new-self)))
 
 ;;;; symbol frobbing
 

@@ -2,48 +2,31 @@
 ;;;
 (in-package "SB!VM")
 
-;;; See x86-vm.lisp for a description of this.
-;;; FIXME: Why is this present in every ARCH-vm.lisp with the the same definition. Is there something like common-vm?
-(define-alien-type os-context-t (struct os-context-t-struct))
-
+#-sb-xc-host
 (defun machine-type ()
-  #!+sb-doc
   "Return a string describing the type of the local machine."
   "ARM")
 
 ;;;; FIXUP-CODE-OBJECT
 
-(defun fixup-code-object (code offset fixup kind)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset fixup kind &optional flavor)
   (declare (type index offset))
+  (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (sb!sys:without-gcing
-   (let ((sap (%primitive sb!kernel::code-instructions code)))
+  (without-gcing
+   (let ((sap (code-instructions code)))
      (ecase kind
        (:absolute
-        (setf (sap-ref-32 sap offset) fixup))))))
+        (setf (sap-ref-32 sap offset) fixup)))))))
 
 ;;;; "Sigcontext" access functions, cut & pasted from sparc-vm.lisp,
 ;;;; then modified for ARM.
 ;;;;
 ;;;; See also x86-vm for commentary on signed vs unsigned.
 
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-int)
-  (context (* os-context-t))
-  (index int))
-
-;;; FIXME: Should this and CONTEXT-PC be INLINE to reduce consing?
-;;; (Are they used in anything time-critical, or just the debugger?)
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (context-register-addr context index)))
-
-(defun %set-context-register (context index new)
-  (declare (type (alien (* os-context-t)) context))
-  (setf (deref (context-register-addr context index))
-        new))
-
+#-sb-xc-host (progn
 (defun context-float-register (context index format)
   (declare (ignorable context index))
   (warn "stub CONTEXT-FLOAT-REGISTER")
@@ -53,9 +36,6 @@
   (declare (ignore context index))
   (warn "stub %SET-CONTEXT-FLOAT-REGISTER")
   (coerce new-value format))
-
-(defun context-pc (context)
-  (int-sap (context-register context pc-offset)))
 
 ;;;; INTERNAL-ERROR-ARGS.
 
@@ -68,3 +48,4 @@
     (declare (type system-area-pointer pc))
     (values error-number
             (sb!kernel::decode-internal-error-args (sap+ pc 6) error-number))))
+) ; end PROGN

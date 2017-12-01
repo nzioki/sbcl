@@ -37,13 +37,17 @@ endif
 ifndef LISP_FEATURE_SB_DYNAMIC_CORE
   LINKFLAGS +=-Wl,-no_pie
 endif
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = libsbcl.a
+  USE_LIBSBCL = -Wl,-force_load libsbcl.a
+endif
 
 ASSEM_SRC = x86-assem.S ldso-stubs.S
 ARCH_SRC = x86-arch.c
 
 CPPFLAGS += -no-cpp-precomp
 
-GC_SRC = gencgc.c
+GC_SRC = fullcgc.c gencgc.c traceroot.c
 
 .PHONY: after-grovel-headers
 

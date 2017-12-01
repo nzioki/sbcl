@@ -29,7 +29,6 @@
 ;;; So it might be desirable to have the compiler not rely on this
 ;;; function, eventually.
 (defun function-lambda-expression (fun)
-  #+sb-doc
   "Return (VALUES DEFINING-LAMBDA-EXPRESSION CLOSURE-P NAME), where
   DEFINING-LAMBDA-EXPRESSION is NIL if unknown, or a suitable argument
   to COMPILE otherwise, CLOSURE-P is non-NIL if the function's definition
@@ -52,7 +51,7 @@
      (sb-interpreter:fun-lambda-expression fun))
     (function
      (let* ((name (%fun-name fun))
-            (fun (%simple-fun-self (%fun-fun fun)))
+            (fun (%fun-fun fun))
             (code (sb-di::fun-code-header fun))
             (info (sb-kernel:%code-debug-info code))
             (source (if info (sb-c::debug-info-source info))))
@@ -85,16 +84,35 @@
             (t
              line)))))
 
+(defun call-as-describe-block (thunk stream format-control format-arguments)
+  (pprint-logical-block (stream nil)
+    (pprint-newline :mandatory stream)
+    (when format-control
+      (apply #'format stream format-control format-arguments)
+      (pprint-indent :block 2 stream))
+    (when thunk
+      (funcall thunk stream)))
+  (terpri stream))
+
+(defmacro describe-block ((stream-symbol
+                           &optional format-control &rest format-arguments)
+                          &body body)
+  `(call-as-describe-block
+    ,(if body
+         `(lambda (,stream-symbol) ,@body)
+         nil)
+    ,stream-symbol ,format-control (list ,@format-arguments)))
+
 (defun describe (object &optional (stream-designator *standard-output*))
-  #+sb-doc
   "Print a description of OBJECT to STREAM-DESIGNATOR."
-  (let ((stream (out-synonym-of stream-designator))
+  (let ((stream (out-stream-from-designator stream-designator))
         (*print-right-margin* (or *print-right-margin* 72))
         (*print-circle* t)
+        (*print-pretty* t)
         (*suppress-print-errors*
-          (if (subtypep 'serious-condition *suppress-print-errors*)
-              *suppress-print-errors*
-              'serious-condition)))
+         (if (subtypep 'serious-condition *suppress-print-errors*)
+             *suppress-print-errors*
+             'serious-condition)))
     ;; Until sbcl-0.8.0.x, we did
     ;;   (FRESH-LINE STREAM)
     ;;   (PPRINT-LOGICAL-BLOCK (STREAM NIL)
@@ -117,7 +135,7 @@
     ;; ANSI's example of DESCRIBE-OBJECT does its own final TERPRI.
     (values)))
 
-;;;; DESCRIBE-OBJECT
+;;;; DESCRIBE-OBJECT Protocol
 ;;;;
 ;;;; Style guide:
 ;;;;
@@ -138,40 +156,32 @@
 ;;;; * The newline policy that gets the whitespace right is for
 ;;;;   each block to both start and end with a newline.
 
-(defgeneric object-self-string (x))
+(defgeneric describe-object (object stream))
 
-(defmethod object-self-string (x)
-  (prin1-to-line x))
+(defgeneric object-self-string (object))
 
-(defmethod object-self-string ((x symbol))
+(defgeneric object-type-string (object))
+
+;;; Methods for builtin objects
+
+(defmethod object-self-string ((object t))
+  (prin1-to-line object))
+
+(defmethod object-self-string ((object symbol))
   (let ((*package* (find-package :keyword)))
-    (prin1-to-string x)))
+    (prin1-to-string object)))
 
-(defgeneric object-type-string (x))
-
-(defmethod object-type-string (x)
-  (let ((type (class-name-or-class (class-of x))))
+(defmethod object-type-string ((object t))
+  (let ((type (class-name-or-class (class-of object))))
     (if (symbolp type)
         (string-downcase type)
         (prin1-to-string type))))
 
-(defmethod object-type-string ((x cons))
-  (if (listp (cdr x)) "list" "cons"))
+(defmethod object-type-string ((object cons))
+  (if (listp (cdr object)) "list" "cons"))
 
-(defmethod object-type-string ((x hash-table))
-  "hash-table")
-
-(defmethod object-type-string ((x condition))
-  "condition")
-
-(defmethod object-type-string ((x structure-object))
-  "structure-object")
-
-(defmethod object-type-string ((x standard-object))
-  "standard-object")
-
-(defmethod object-type-string ((x function))
-  (typecase x
+(defmethod object-type-string ((object function))
+  (typecase object
     (simple-fun "compiled function")
     (closure "compiled closure")
     ((or #+sb-fasteval sb-interpreter:interpreted-function
@@ -179,106 +189,112 @@
     (generic-function "generic-function")
     (t "funcallable-instance")))
 
-(defmethod object-type-string ((x stream))
-  "stream")
+(defmethod object-type-string ((object array))
+  (cond
+    ((or (stringp object) (bit-vector-p object))
+     (format nil "~@[simple-~*~]~A"
+             (typep object 'simple-array)
+             (typecase object
+               (base-string "base-string")
+               (string "string")
+               (t "bit-vector"))))
+    ((simple-vector-p object)
+     "simple-vector")
+    (t
+     (format nil "~@[simple ~*~]~@[specialized ~*~]~:[array~;vector~]"
+             (typep object 'simple-array)
+             (neq t (array-element-type object))
+             (vectorp object)))))
 
-(defmethod object-type-string ((x sb-gray:fundamental-stream))
-  "gray stream")
-
-(defmethod object-type-string ((x package))
-  "package")
-
-(defmethod object-type-string ((x array))
-  (cond ((or (stringp x) (bit-vector-p x))
-         (format nil "~@[simple-~*~]~A"
-                 (typep x 'simple-array)
-                 (typecase x
-                   (base-string "base-string")
-                   (string "string")
-                   (t "bit-vector"))))
-        (t
-         (if (simple-vector-p x)
-             "simple-vector"
-             (format nil "~@[simple ~*~]~@[specialized ~*~]~:[array~;vector~]"
-                     (typep x 'simple-array)
-                     (neq t (array-element-type x))
-                     (vectorp x))))))
-
-(defmethod object-type-string ((x character))
-  (typecase x
+(defmethod object-type-string ((object character))
+  (typecase object
     (standard-char "standard-char")
     (base-char "base-char")
-    (t "character")))
+    #+sb-unicode (t "character"))) ; unreachable if no unicode
 
-(defun print-standard-describe-header (x stream)
+(macrolet ((def (class &optional (string (string-downcase (class-name (find-class class)))))
+             `(defmethod object-type-string ((object ,class))
+                ,string)))
+
+  (def hash-table)
+  (def condition)
+  (def structure-object)
+  (def standard-object)
+  (def stream)
+  (def sb-gray:fundamental-stream "gray stream")
+  (def package))
+
+(defun print-standard-describe-header (object stream)
   (format stream "~&~A~%  [~A]~%"
-          (object-self-string x)
-          (object-type-string x)))
-
-(defgeneric describe-object (x stream))
+          (object-self-string object)
+          (object-type-string object)))
 
 ;;; Catch-all.
 
-(defmethod describe-object ((x t) s)
-  (print-standard-describe-header x s))
+(defmethod describe-object ((object t) stream)
+  (print-standard-describe-header object stream))
 
-(defmethod describe-object ((x cons) s)
-  (print-standard-describe-header x s)
-  (describe-function x nil s))
+(defmethod describe-object ((object cons) stream)
+  (print-standard-describe-header object stream)
+  (describe-function object nil stream))
 
-(defmethod describe-object ((x function) s)
-  (print-standard-describe-header x s)
-  (describe-function nil x s))
+(defmethod describe-object ((object function) stream)
+  (print-standard-describe-header object stream)
+  (describe-function nil object stream)
+  (when (funcallable-instance-p object)
+    (describe-instance object stream)))
 
-(defmethod describe-object ((x class) s)
-  (print-standard-describe-header x s)
-  (describe-class nil x s)
-  (describe-instance x s))
+(defmethod describe-object ((object class) stream)
+  (print-standard-describe-header object stream)
+  (describe-class nil object stream)
+  (describe-instance object stream))
 
-(defmethod describe-object ((x sb-pcl::slot-object) s)
-  (print-standard-describe-header x s)
-  (describe-instance x s))
+(defmethod describe-object ((object sb-pcl::slot-object) stream)
+  (print-standard-describe-header object stream)
+  (describe-instance object stream))
 
-(defmethod describe-object ((x character) s)
-  (print-standard-describe-header x s)
-  (format s "~%Char-code: ~S" (char-code x))
-  (format s "~%Char-name: ~A" (char-name x)))
+(defmethod describe-object ((object character) stream)
+  (print-standard-describe-header object stream)
+  (format stream "~%Char-code: ~S~%Char-name: ~A"
+          (char-code object) (char-name object)))
 
-(defmethod describe-object ((x array) s)
-  (print-standard-describe-header x s)
-  (format s "~%Element-type: ~/sb-impl:print-type-specifier/"
-          (array-element-type x))
-  (if (vectorp x)
-      (if (array-has-fill-pointer-p x)
-          (format s "~%Fill-pointer: ~S~%Size: ~S"
-                  (fill-pointer x)
-                  (array-total-size x))
-          (format s "~%Length: ~S" (length x)))
-      (format s "~%Dimensions: ~S" (array-dimensions x)))
+(defmethod describe-object ((object array) stream)
+  (print-standard-describe-header object stream)
+  (format stream "~%Element-type: ~/sb-impl:print-type-specifier/"
+          (array-element-type object))
+  (cond
+    ((not (vectorp object))
+     (format stream "~%Dimensions: ~S" (array-dimensions object)))
+    ((array-has-fill-pointer-p object)
+     (format stream "~%Fill-pointer: ~S~%Size: ~S"
+             (fill-pointer object)
+             (array-total-size object)))
+    (t
+     (format stream "~%Length: ~S" (length object))))
   (let ((*print-array* nil))
-    (unless (typep x 'simple-array)
-      (format s "~%Adjustable: ~A" (if (adjustable-array-p x) "yes" "no"))
-      (multiple-value-bind (to offset) (array-displacement x)
-        (if (format s "~%Displaced-to: ~A~%Displaced-offset: ~S"
-                    (prin1-to-line to)
-                    offset)
-            (format s "~%Displaced: no"))))
-    (when (and (not (array-displacement x)) (array-header-p x))
-      (format s "~%Storage vector: ~A"
-              (prin1-to-line (array-storage-vector x))))
-    (terpri s)))
+    (unless (typep object 'simple-array)
+      (format stream "~%Adjustable: ~:[no~;yes~]" (adjustable-array-p object))
+      (multiple-value-bind (to offset) (array-displacement object)
+        (if to
+            (format stream "~%Displaced-to: ~A~%Displaced-offset: ~S"
+                    (prin1-to-line to) offset)
+            (format stream "~%Displaced: no"))))
+    (when (and (not (array-displacement object)) (array-header-p object))
+      (format stream "~%Storage vector: ~A"
+              (prin1-to-line (array-storage-vector object))))
+    (terpri stream)))
 
-(defmethod describe-object ((x hash-table) s)
-  (print-standard-describe-header x s)
+(defmethod describe-object ((object hash-table) stream)
+  (print-standard-describe-header object stream)
   ;; Don't print things which are already apparent from the printed
   ;; representation -- COUNT, TEST, and WEAKNESS
-  (format s "~%Occupancy: ~,1F" (float (/ (hash-table-count x)
-                                          (hash-table-size x))))
-  (format s "~%Rehash-threshold: ~S" (hash-table-rehash-threshold x))
-  (format s "~%Rehash-size: ~S" (hash-table-rehash-size x))
-  (format s "~%Size: ~S" (hash-table-size x))
-  (format s "~%Synchronized: ~A" (if (hash-table-synchronized-p x) "yes" "no"))
-  (terpri s))
+  (format stream "~%Occupancy: ~,1F" (float (/ (hash-table-count object)
+                                               (hash-table-size object))))
+  (format stream "~%Rehash-threshold: ~S" (hash-table-rehash-threshold object))
+  (format stream "~%Rehash-size: ~S" (hash-table-rehash-size object))
+  (format stream "~%Size: ~S" (hash-table-size object))
+  (format stream "~%Synchronized: ~:[no~;yes~]" (hash-table-synchronized-p object))
+  (terpri stream))
 
 (defmethod describe-object ((symbol symbol) stream)
   (print-standard-describe-header symbol stream)
@@ -300,31 +316,27 @@
   ;; Type specifier
   (describe-type symbol stream)
 
+  ;; Declaration specifier
+  (describe-declaration symbol stream)
+
   (awhen (sb-c::policy-quality-name-p symbol)
-    (pprint-logical-block (stream nil)
-      (pprint-newline :mandatory stream)
-      (pprint-indent :block 2 stream)
-      (format stream "~A names a~:[ dependent~;n~] optimization policy quality:"
-              symbol (minusp it))
-      (describe-documentation symbol 'optimize stream t))
-    (terpri stream))
+    (describe-block (stream "~A names a~:[ dependent~;n~] optimization policy quality:"
+                            symbol (minusp it))
+      (describe-documentation symbol 'optimize stream t)))
 
   ;; Print out properties.
   (let ((plist (symbol-plist symbol)))
     (when plist
-      (pprint-logical-block (stream nil)
-        (format stream "~%Symbol-plist:")
-        (pprint-indent :block 2 stream)
-        (sb-pcl::doplist (key value) plist
+      (describe-block (stream "Symbol-plist:")
+        (doplist (key value) plist
           (format stream "~@:_~A -> ~A"
                   (prin1-to-line key :columns 2 :reserve 5)
-                  (prin1-to-line value :columns 2 :reserve 5))))
-      (terpri stream))))
+                  (prin1-to-line value :columns 2 :reserve 5)))))))
 
-(defmethod describe-object ((package package) stream)
-  (print-standard-describe-header package stream)
-  (pprint-logical-block (stream nil)
-    (describe-documentation package t stream)
+(defmethod describe-object ((object package) stream)
+  (print-standard-describe-header object stream)
+  (describe-block (stream)
+    (describe-documentation object t stream)
     (flet ((humanize (list)
              (sort (mapcar (lambda (x)
                              (if (packagep x)
@@ -335,26 +347,25 @@
            (out (label list)
              (describe-stuff label list stream :escape nil)))
       (let ((exports nil))
-        (do-external-symbols (ext package)
+        (do-external-symbols (ext object)
           (push ext exports))
         #+sb-package-locks
-        (let ((implemented (humanize (package-implemented-by-list package)))
-              (implements (humanize (package-implements-list package)))
-              (this (list (package-name package))))
-          (when (package-locked-p package)
+        (let ((implemented (humanize (package-implemented-by-list object)))
+              (implements (humanize (package-implements-list object)))
+              (this (list (package-name object))))
+          (when (package-locked-p object)
             (format stream "~@:_Locked."))
           (when (set-difference implemented this :test #'string=)
             (out "Implemented-by-list" implemented))
           (when (set-difference implements this :test #'string=)
             (out "Implements-list" implements)))
-        (out "Nicknames" (humanize (package-nicknames package)))
-        (out "Use-list" (humanize (package-use-list package)))
-        (out "Used-by-list" (humanize (package-used-by-list package)))
-        (out "Shadows" (humanize (package-shadowing-symbols package)))
+        (out "Nicknames" (humanize (package-nicknames object)))
+        (out "Use-list" (humanize (package-use-list object)))
+        (out "Used-by-list" (humanize (package-used-by-list object)))
+        (out "Shadows" (humanize (package-shadowing-symbols object)))
         (out "Exports" (humanize exports))
         (format stream "~@:_~S internal symbols."
-                (package-internal-symbol-count package))))
-    (terpri stream)))
+                (package-internal-symbol-count object))))))
 
 ;;;; Helpers to deal with shared functionality
 
@@ -370,15 +381,12 @@
 (defun describe-class (name class stream)
   (binding* ((by-name (not class))
              ((name class) (if class
-                               (values (class-name class) name)
+                               (values (class-name class) class)
                                (values name (find-class name nil)))))
     (when class
       (let ((metaclass-name (class-name (class-of class))))
-        (pprint-logical-block (stream nil)
-          (when by-name
-            (format stream "~@:_~A names the ~(~A~) ~S:"
-                    name metaclass-name class)
-            (pprint-indent :block 2 stream))
+        (describe-block (stream (when by-name "~A names the ~(~A~) ~S:")
+                                name metaclass-name class)
           (describe-deprecation 'type name stream)
           (describe-documentation class t stream)
           (when (sb-mop:class-finalized-p class)
@@ -433,14 +441,12 @@
                                             ;; FIXME: does this get the prefix right?
                                             (quiet-doc slotd t)))
                                     slots))
-                    (format stream "~@:_No direct slots."))))
-          (pprint-indent :block 0 stream)
-          (pprint-newline :mandatory stream))))))
+                    (format stream "~@:_No direct slots.")))))))))
 
 (defun describe-instance (object stream)
   (let* ((class (class-of object))
          (slotds (sb-mop:class-slots class))
-         (max-slot-name-length 0)
+         (max-slot-name-length 30)
          (plist nil))
 
     ;; Figure out a good width for the slot-name column.
@@ -449,14 +455,13 @@
                    (max max-slot-name-length (length (symbol-name name))))))
       (dolist (slotd slotds)
         (adjust-slot-name-length (sb-mop:slot-definition-name slotd))
-        (push slotd (getf plist (sb-mop:slot-definition-allocation slotd))))
-      (setf max-slot-name-length  (min (+ max-slot-name-length 3) 30)))
+        (push slotd (getf plist (sb-mop:slot-definition-allocation slotd)))))
 
     ;; Now that we know the width, we can print.
     (flet ((describe-slot (name value)
-             (format stream "~%  ~A~VT = ~A" name max-slot-name-length
-                     (prin1-to-line value))))
-      (sb-pcl::doplist (allocation slots) plist
+             (format stream "~%  ~VA = ~A"
+                     max-slot-name-length name (prin1-to-line value))))
+      (doplist (allocation slots) plist
         (format stream "~%Slots with ~S allocation:" allocation)
         (dolist (slotd (nreverse slots))
           (describe-slot
@@ -498,9 +503,7 @@
                 (:alien "an alien variable"))))
     (when (and (eq kind :unknown) (not (boundp name)))
       (return-from describe-variable))
-    (pprint-logical-block (stream nil)
-      (format stream "~@:_~A names ~A:" name wot)
-      (pprint-indent :block 2 stream)
+    (describe-block (stream "~A names ~A:" name wot)
       (describe-deprecation 'variable name stream)
       (when (eq (info :variable :where-from name) :declared)
         (format stream "~@:_Declared type: ~/sb-impl:print-type/"
@@ -523,8 +526,7 @@
          (format stream "~:@_Value: ~S" (symbol-value name)))
         ((not (eq kind :unknown))
          (format stream "~:@_Currently unbound.")))
-      (describe-documentation name 'variable stream)
-      (terpri stream))))
+      (describe-documentation name 'variable stream))))
 
 (defun describe-lambda-list (lambda-list stream)
   (let ((*print-circle* nil)
@@ -576,9 +578,7 @@
         (when (legal-fun-name-p name)
           (multiple-value-bind (from sure) (info :function :where-from name)
             (when (or (eq :declared from) (and sure (eq :assumed from)))
-              (pprint-logical-block (stream nil)
-                (format stream "~%~A names an undefined function" name)
-                (pprint-indent :block 2 stream)
+              (describe-block (stream "~A names an undefined function" name)
                 (format stream "~@:_~:(~A~) type: ~/sb-impl:print-type/"
                         from (proclaimed-ftype name))))))
         ;; Defined.
@@ -639,10 +639,7 @@
                                   (info :function :inlinep name)
                                   (info :function :inline-expansion-designator
                                         name)))))))
-          (pprint-logical-block (stream nil)
-            (unless function
-              (format stream "~%~A names ~A:" name what)
-              (pprint-indent :block 2 stream))
+          (describe-block (stream (unless function "~A names ~A:") name what)
             (describe-deprecation 'function name stream)
             (describe-lambda-list lambda-list stream)
             (when argument-precedence-order
@@ -684,37 +681,27 @@
                                   fun (sb-mop:method-specializers method)))
                          (pprint-indent :block 4 stream)
                          (describe-documentation method t stream nil))))))
-            (describe-function-source fun stream)
-            (terpri stream)))))
+            (describe-function-source fun stream)))))
   (unless function
     (awhen (and (legal-fun-name-p name) (compiler-macro-function name))
-      (pprint-logical-block (stream nil)
-        (format stream "~@:_~A has a compiler-macro:" name)
-        (pprint-indent :block 2 stream)
+      (describe-block (stream "~A has a compiler-macro:" name)
         (describe-documentation it t stream)
-        (describe-function-source it stream))
-      (terpri stream))
+        (describe-function-source it stream)))
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
              (expander (info :setf :expander name2)))
         (cond ((typep expander '(and symbol (not null)))
-               (pprint-logical-block (stream nil)
-                 (format stream "~&~A has setf-expansion: ~S"
-                         name expander)
-                 (pprint-indent :block 2 stream)
-                 (describe-documentation name2 'setf stream))
-               (terpri stream))
+               (describe-block (stream "~A has setf-expansion: ~S"
+                                       name expander)
+                 (describe-documentation name2 'setf stream)))
               (expander
                (when (listp expander)
                  (setq expander (cdr expander)))
-               (pprint-logical-block (stream nil)
-                 (format stream "~&~A has a complex setf-expansion:"
-                         name)
-                 (pprint-indent :block 2 stream)
+               (describe-block (stream "~A has a complex setf-expansion:"
+                                       name)
                  (describe-lambda-list (%fun-lambda-list expander) stream)
                  (describe-documentation name2 'setf stream t)
-                 (describe-function-source expander stream))
-               (terpri stream)))))
+                 (describe-function-source expander stream))))))
     (when (symbolp name)
       (describe-function `(setf ,name) nil stream))))
 
@@ -723,11 +710,8 @@
          (fun (and kind (info :type :expander name)))
          (fun (if (listp fun) (car fun) fun)))
     (when fun
-      (pprint-newline :mandatory stream)
-      (pprint-logical-block (stream nil)
-        (format stream "~@:_~A names a ~@[primitive~* ~]type-specifier:"
-                name (eq kind :primitive))
-        (pprint-indent :block 2 stream)
+      (describe-block (stream "~A names a ~@[primitive~* ~]type-specifier:"
+                              name (eq kind :primitive))
         (describe-deprecation 'type name stream)
         (describe-documentation name 'type stream (eq t fun))
         (when (functionp fun)
@@ -736,5 +720,26 @@
               (handler-case (typexpand-1 name)
                 (error () (values nil nil)))
             (when ok
-              (format stream "~@:_Expansion: ~S" expansion)))))
-      (terpri stream))))
+              (format stream "~@:_Expansion: ~S" expansion))))))))
+
+(defun describe-declaration (name stream)
+  (let ((kind (cond
+                ((member name '(ignore ignorable
+                                dynamic-extent
+                                special
+                                type ftype
+                                optimize
+                                inline notineline
+                                declaration))
+                 "a standard")
+                ((member name '(global always-bound
+                                freeze-type
+                                muffle-conditions unmuffle-conditions
+                                disable-package-locks enable-package-locks
+                                maybe-inline
+                                deprecated))
+                 "an SBCL-specific")
+                ((info :declaration :recognized name)
+                 "a user-defined"))))
+    (when kind
+      (describe-block (stream "~A names ~A declaration." name kind)))))

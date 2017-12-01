@@ -573,10 +573,12 @@ default-value-8
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
-
-      ,(if named
-           '(name :target name-pass)
-           '(arg-fun :target lexenv))
+      ,@(case named
+          ((nil)
+           '((arg-fun :target lexenv)))
+          (:direct)
+          (t
+           '((name :target name-pass))))
 
       ,@(when (eq return :tail)
           '((old-fp :target old-fp-pass)
@@ -595,6 +597,7 @@ default-value-8
      (:vop-var vop)
      (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
             ,@(unless variable '(nargs))
+            ,@(when (eq named :direct) '(fun))
             ,@(when (eq return :fixed) '(nvals))
             step-instrumenting)
 
@@ -614,16 +617,17 @@ default-value-8
                   :from (:argument ,(if (eq return :tail) 2 1))
                   :to :eval)
                  return-pc-pass)
-
-     ,(if named
-          `(:temporary (:sc descriptor-reg :offset cname-offset
-                            :from (:argument ,(if (eq return :tail) 0 1))
-                            :to :eval)
-                       name-pass)
-          `(:temporary (:sc descriptor-reg :offset lexenv-offset
-                            :from (:argument ,(if (eq return :tail) 0 1))
-                            :to :eval)
-                       lexenv))
+     ,@(case named
+         ((t)
+          `((:temporary (:sc descriptor-reg :offset cname-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        name-pass)))
+         ((nil)
+          `((:temporary (:sc descriptor-reg :offset lexenv-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        lexenv))))
 
      (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
                  function)
@@ -735,35 +739,38 @@ default-value-8
                                         (ash (reg-tn-encoding callable-tn)
                                              5)))
                     (emit-label step-done-label))))
-
-
-           ,@(if named
-                 `((sc-case name
-                     (descriptor-reg (move name-pass name))
-                     (control-stack
-                      (loadw name-pass cfp-tn (tn-offset name))
-                      (do-next-filler))
-                     (constant
-                      (loadw name-pass code-tn (tn-offset name)
-                             other-pointer-lowtag)
-                      (do-next-filler)))
-                   (insert-step-instrumenting name-pass)
-                   (loadw function name-pass fdefn-raw-addr-slot
-                          other-pointer-lowtag)
-                   (do-next-filler))
-                 `((sc-case arg-fun
-                     (descriptor-reg (move lexenv arg-fun))
-                     (control-stack
-                      (loadw lexenv cfp-tn (tn-offset arg-fun))
-                      (do-next-filler))
-                     (constant
-                      (loadw lexenv code-tn (tn-offset arg-fun)
-                             other-pointer-lowtag)
-                      (do-next-filler)))
-                   (loadw function lexenv closure-fun-slot
-                          fun-pointer-lowtag)
-                   (do-next-filler)
-                   (insert-step-instrumenting function)))
+           (declare (ignorable #'insert-step-instrumenting))
+           ,@(case named
+               ((t)
+                `((sc-case name
+                    (descriptor-reg (move name-pass name))
+                    (control-stack
+                     (loadw name-pass cfp-tn (tn-offset name))
+                     (do-next-filler))
+                    (constant
+                     (loadw name-pass code-tn (tn-offset name)
+                         other-pointer-lowtag)
+                     (do-next-filler)))
+                  (insert-step-instrumenting name-pass)
+                  (loadw function name-pass fdefn-raw-addr-slot
+                      other-pointer-lowtag)
+                  (do-next-filler)))
+               ((nil)
+                `((sc-case arg-fun
+                    (descriptor-reg (move lexenv arg-fun))
+                    (control-stack
+                     (loadw lexenv cfp-tn (tn-offset arg-fun))
+                     (do-next-filler))
+                    (constant
+                     (loadw lexenv code-tn (tn-offset arg-fun)
+                         other-pointer-lowtag)
+                     (do-next-filler)))
+                  (loadw function lexenv closure-fun-slot
+                      fun-pointer-lowtag)
+                  (do-next-filler)
+                  (insert-step-instrumenting function)))
+               (:direct
+                `((inst ld function null-tn (static-fun-offset fun)))))
            (loop
              (if filler
                  (do-next-filler)
@@ -791,13 +798,15 @@ default-value-8
                   (load-stack-tn cur-nfp nfp-save))))
              (:tail))))))
 
-
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)
@@ -1133,28 +1142,6 @@ default-value-8
     (inst sub count supplied (fixnumize fixed))
     (inst sub context csp-tn count)))
 
-
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (inst cmp nargs (fixnumize count))
-      (if (member :sparc-v9 *backend-subfeatures*)
-          ;; Assume we don't take the branch
-          (inst b :ne err-lab :pn)
-          (inst b :ne err-lab))
-      (inst nop))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
@@ -1178,12 +1165,12 @@ default-value-8
              (max
               (when (plusp min)
                 (inst cmp nargs (fixnumize min))
-                (b :leu))
+                (b :ltu))
               (inst cmp nargs (fixnumize max))
-              (b :geu))
+              (b :gtu))
              ((plusp min)
               (inst cmp nargs (fixnumize min))
-              (b :leu)))))))
+              (b :ltu)))))))
 
 ;;; Single-stepping
 (define-vop (step-instrument-before-vop)

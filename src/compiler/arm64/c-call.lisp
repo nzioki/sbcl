@@ -15,11 +15,6 @@
 
 (defconstant +max-register-args+ 8)
 
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
-
 (defstruct arg-state
   (num-register-args 0)
   (fp-registers 0)
@@ -42,38 +37,38 @@
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-num-register-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc (register-args-offset reg-args)))
+           (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (defun float-arg (state prim-type reg-sc stack-sc)
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-fp-registers state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc reg-args))
+           (make-wired-tn* prim-type reg-sc reg-args))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-64 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-64 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'single-float 'single-reg 'single-stack))
+  (float-arg state 'single-float single-reg-sc-number single-stack-sc-number))
 
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'double-float 'double-reg 'double-stack))
+  (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
 ;;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
@@ -117,23 +112,23 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-64 'signed-reg)
-            (values 'unsigned-byte-64 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc
+            (values 'signed-byte-64 signed-reg-sc-number)
+            (values 'unsigned-byte-64 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc
                         (result-reg-offset num-results)))))
 
 (define-alien-type-method (system-area-pointer :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'system-area-pointer 'sap-reg (result-reg-offset 0)))
+  (make-wired-tn* 'system-area-pointer sap-reg-sc-number (result-reg-offset 0)))
 
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'single-float 'single-reg 0))
+  (make-wired-tn* 'single-float single-reg-sc-number 0))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'double-float 'double-reg 0))
+  (make-wired-tn* 'double-float double-reg-sc-number 0))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -376,15 +371,8 @@
                   (t
                    (bug "Unknown alien type: ~S" type)))))
         ;; arg0 to FUNCALL3 (function)
-        ;;
-        ;; Indirect the access to ENTER-ALIEN-CALLBACK through
-        ;; the symbol-value slot of SB-ALIEN::*ENTER-ALIEN-CALLBACK*
-        ;; to ensure it'll work even if the GC moves ENTER-ALIEN-CALLBACK.
-        ;; Skip any SB-THREAD TLS magic, since we don't expect anyone
-        ;; to rebind the variable. -- JES, 2006-01-01
-        (load-immediate-word r0-tn (+ nil-value (static-symbol-offset
-                                                 'sb!alien::*enter-alien-callback*)))
-        (loadw r0-tn r0-tn symbol-value-slot other-pointer-lowtag)
+        (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
+        (loadw r0-tn r0-tn)
         ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
         (inst mov r1-tn (fixnumize index))
         ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
@@ -395,7 +383,9 @@
         (inst mov-sp r3-tn nsp-tn)
 
         ;; Call
-        (load-immediate-word r4-tn (foreign-symbol-address "funcall3"))
+        (load-immediate-word r4-tn (foreign-symbol-address
+                                    #!-sb-thread "funcall3"
+                                    #!+sb-thread "callback_wrapper_trampoline"))
         (inst blr r4-tn)
 
         ;; Result now on top of stack, put it in the right register

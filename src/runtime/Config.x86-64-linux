@@ -42,15 +42,17 @@ ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
 
-CFLAGS += -fno-omit-frame-pointer
+CFLAGS += -fno-omit-frame-pointer -momit-leaf-frame-pointer
 
-GC_SRC = gencgc.c
+ifdef LISP_FEATURE_IMMOBILE_SPACE
+  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
+else
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
+endif
 
-# Hardened GCC enables PIE by default
-ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e nopie),)
-CFLAGS += -fno-pie
-LINKFLAGS += -nopie
-LDFLAGS += -nopie
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = sbcl.o
+  USE_LIBSBCL = sbcl.o
 endif
 
 # Nothing to do for after-grovel-headers.

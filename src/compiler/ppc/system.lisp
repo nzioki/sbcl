@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst andi. result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -75,18 +66,6 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
-  (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst stb type function (- 3 fun-pointer-lowtag))
-    (move result type)))
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -105,7 +84,9 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst srwi res res n-widetag-bits)))
+    ;; Shift right by 8 bits (i.e. rotate left 24)
+    ;; and take the 15 rightmost bits.
+    (inst rlwinm res res 24 17 31)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -123,7 +104,12 @@
        (inst slwi t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t1 t2))
       (immediate
-       (inst ori t1 t1 (ash (tn-value data) n-widetag-bits)))
+       (let ((val (ash (tn-value data) n-widetag-bits)))
+         (cond ((typep val '(unsigned-byte 16))
+                (inst ori t1 t1 val))
+               (t
+                (inst lr t2 val)
+                (inst or t1 t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))

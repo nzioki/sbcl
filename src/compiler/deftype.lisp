@@ -12,7 +12,7 @@
 (defun constant-type-expander (name expansion)
   (declare (optimize safety))
   ;; Dummy implementation of SET-CLOSURE-NAME for the host.
-  (flet (#+sb-xc-host (set-closure-name (f name) (declare (ignore name)) f))
+  (flet (#+sb-xc-host (set-closure-name (f junk name) (declare (ignore junk name)) f))
     (set-closure-name
      (lambda (whole)
        ;; NB: It does not in general work to set the lambda-list of a closure,
@@ -24,6 +24,7 @@
                   :kind 'deftype :name (car whole) :args (cdr whole)
                   :lambda-list '() :minimum 0 :maximum 0)
            expansion))
+     t
      `(type-expander ,name))))
 
 ;; Can't have a function called SIMPLE-TYPE-ERROR or TYPE-ERROR...
@@ -41,7 +42,6 @@
 
 (defmacro sb!xc:deftype (&whole form name lambda-list &body body
                          &environment env)
-  #!+sb-doc
   "Define a new type, with syntax like DEFMACRO."
   (declare (ignore env))
   (unless (symbolp name)
@@ -67,6 +67,8 @@
                                    lambda-list body 'deftype name
                                    :doc-string-allowed :external
                                    :environment :ignore))))
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
     `(progn
        (eval-when (:compile-toplevel :load-toplevel :execute)
          (%compiler-deftype ',name ,expander-form ,source-location-form

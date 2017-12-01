@@ -140,7 +140,8 @@
   (let* ((tn-ptype (primitive-type (lvar-type lvar)))
          (info (make-ir2-lvar tn-ptype)))
     (setf (lvar-info lvar) info)
-    (let ((name (lvar-fun-name lvar t)))
+    (let ((name (and (ref-p (lvar-uses lvar)) ;; lvar-fun-name sees through casts
+                     (lvar-fun-name lvar t))))
       (if (and delay name)
           (setf (ir2-lvar-kind info) :delayed)
           (setf (ir2-lvar-locs info)
@@ -182,7 +183,6 @@
   (declare (type combination call))
   (let ((kind (basic-combination-kind call))
         (info (basic-combination-fun-info call)))
-    (annotate-fun-lvar (basic-combination-fun call))
 
     (dolist (arg (basic-combination-args call))
       (unless (lvar-info arg)
@@ -200,8 +200,9 @@
        (when (eq kind :error)
          (setf (basic-combination-kind call) :full))
        (setf (basic-combination-info call) :full)
+       (rewrite-full-call call)
        (flush-full-call-tail-transfer call))))
-
+  (annotate-fun-lvar (basic-combination-fun call))
   (values))
 
 ;;; Annotate an lvar for unknown multiple values:
@@ -242,7 +243,11 @@
 (defun annotate-fixed-values-lvar (lvar types)
   (declare (type lvar lvar) (list types))
   (let ((info (make-ir2-lvar nil)))
-    (setf (ir2-lvar-locs info) (mapcar #'make-normal-tn types))
+    (setf (ir2-lvar-locs info)
+          (loop for type in types
+                collect (if type
+                            (make-normal-tn type)
+                            (make-unused-tn))))
     (setf (lvar-info lvar) info)
     (when (lvar-dynamic-extent lvar)
       (aver (proper-list-of-length-p types 1))
@@ -307,12 +312,32 @@
   (declare (type mv-combination call))
   (setf (basic-combination-kind call) :local)
   (setf (node-tail-p call) nil)
-  (annotate-fixed-values-lvar
-   (first (basic-combination-args call))
-   (mapcar (lambda (var)
-             (primitive-type (basic-var-type var)))
-           (lambda-vars
-            (ref-leaf (lvar-use (basic-combination-fun call))))))
+  (let ((args (basic-combination-args call)))
+    (if (singleton-p args)
+        (annotate-fixed-values-lvar
+         (first args)
+         (mapcar (lambda (var)
+                   (cond
+                     ;; Needs support from the CALL VOPs, default-unknown-values specifically
+                     #!+(or x86-64 arm64)
+                     ((not (lambda-var-refs var))
+                      nil)
+                     (t
+                      (primitive-type (basic-var-type var)))))
+                 (lambda-vars
+                  (ref-leaf (lvar-use (basic-combination-fun call))))))
+        (let ((types (mapcar (lambda (var)
+                               (primitive-type (basic-var-type var)))
+                             (lambda-vars
+                              (ref-leaf (lvar-use (basic-combination-fun call)))))))
+          (dolist (arg args)
+            (annotate-fixed-values-lvar
+             arg
+             (loop repeat (nth-value 1 (values-types
+                                        (lvar-derived-type arg)))
+                   collect (if types
+                               (pop types)
+                               *backend-t-primitive-type*)))))))
   (values))
 
 ;;; We force all the argument lvars to use the unknown values
@@ -460,24 +485,18 @@
                      (eq mem type))
              (return t))))
         (:constant
-         (cond (lvar
-                ;; Can't use constant-lvar-p, because it returns T for
-                ;; things for which the derived type is an EQL type,
-                ;; but there may be already a variable allocated for
-                ;; it, which can cause problems when there's a closure
-                ;; over it.
-                ;; See  :vop-on-eql-type test in compiler.pure for an example.
-                ;;
-                ;; And the value is already loaded into a register,
-                ;; which is usually cheaper/more compactly encoded
-                ;; than a constant.
-                (and (strictly-constant-lvar-p lvar)
-                     (funcall (second restr) (lvar-value lvar))))
-               (tn
-                (and (eq (tn-kind tn) :constant)
-                     (funcall (second restr) (tn-value tn))))
-               (t
-                (error "Neither LVAR nor TN supplied.")))))))
+         (flet ((type-p (value type)
+                  (if (typep type '(cons (eql satisfies)))
+                      (funcall (second type) value)
+                      (sb!xc:typep value type))))
+          (cond (lvar
+                 (and (constant-lvar-p lvar)
+                      (type-p (lvar-value lvar) (cdr restr))))
+                (tn
+                 (and (eq (tn-kind tn) :constant)
+                      (type-p (tn-value tn) (cdr restr))))
+                (t
+                 (error "Neither LVAR nor TN supplied."))))))))
 
 ;;; Check that the argument type restriction for TEMPLATE are
 ;;; satisfied in call. If an argument's TYPE-CHECK is :NO-CHECK and
@@ -641,13 +660,11 @@
                   (setq fallback template)))))))))
 
 (defvar *efficiency-note-limit* 2
-  #!+sb-doc
   "This is the maximum number of possible optimization alternatives will be
   mentioned in a particular efficiency note. NIL means no limit.")
 (declaim (type (or index null) *efficiency-note-limit*))
 
 (defvar *efficiency-note-cost-threshold* 5
-  #!+sb-doc
   "This is the minimum cost difference between the chosen implementation and
   the next alternative that justifies an efficiency note.")
 (declaim (type index *efficiency-note-cost-threshold*))
@@ -682,7 +699,7 @@
                               (ecase (car x)
                                 (:or `(:or .,(mapcar #'primitive-type-name
                                                      (cdr x))))
-                                (:constant `(:constant ,(third x))))))
+                                (:constant `(:constant . ,(cdr x))))))
                         (template-arg-types template))))
       (:conditional
        (funcall frob "conditional in a non-conditional context"))
@@ -818,10 +835,12 @@
       ;; to implement an out-of-line version in terms of inline
       ;; transforms or VOPs or whatever.
       (unless template
-        (when (let ((funleaf (physenv-lambda (node-physenv call))))
+        (ltn-default-call call)
+        (when (let ((funleaf (physenv-lambda (node-physenv call)))
+                    (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
-                     (eq (lvar-fun-name (combination-fun call))
-                         (leaf-source-name funleaf))
+                     (eq name (leaf-source-name funleaf))
+                     (not (sb!vm::static-fdefn-offset name))
                      (let ((info (basic-combination-fun-info call)))
                        (not (or (fun-info-ir2-convert info)
                                 (ir1-attributep (fun-info-attributes info)
@@ -833,7 +852,7 @@
                            (mapcar (lambda (arg)
                                      (type-specifier (lvar-type arg)))
                                    args))))
-        (ltn-default-call call)
+
         (return-from ltn-analyze-known-call (values)))
       (setf (basic-combination-info call) template)
       (setf (node-tail-p call) nil)

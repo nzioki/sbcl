@@ -20,10 +20,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
-
 ;;; Floating-point related constants, both format descriptions and FPU
 ;;; control register descriptions.  These don't exactly match up with
 ;;; what the machine manuals say because the Common Lisp standard
@@ -95,18 +91,7 @@
   (defconstant linkage-table-space-end   #x0b000000))
 
 #!+gencgc
-(progn
-  (defconstant linkage-table-space-start #x0a000000)
-  (defconstant linkage-table-space-end   #x0b000000)
-
-  (defconstant read-only-space-start     #x04000000)
-  (defconstant read-only-space-end       #x07ff8000)
-
-  (defconstant static-space-start        #x08000000)
-  (defconstant static-space-end          #x097fff00)
-
-  (defconstant dynamic-space-start       #x4f000000)
-  (defconstant dynamic-space-end         (!configure-dynamic-space-end)))
+(!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
 (defconstant linkage-table-entry-size 16)
 
@@ -141,11 +126,9 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(*allocation-pointer*
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    *allocation-pointer*
 
      *control-stack-pointer*
      *binding-stack-pointer*
@@ -153,22 +136,18 @@
 
      ;; interrupt handling
      *pseudo-atomic-atomic*
-     *pseudo-atomic-interrupted*
+     *pseudo-atomic-interrupted*)
+  #'equalp)
 
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-     #!+gencgc *restart-lisp-function*)))
-
-(defparameter *static-funs*
-  '(two-arg-gcd two-arg-lcm
+(defconstant-eqx +static-fdefns+
+  #(two-arg-gcd two-arg-lcm
     two-arg-+ two-arg-- two-arg-* two-arg-/
     two-arg-< two-arg-> two-arg-=
     two-arg-and two-arg-ior two-arg-xor two-arg-eqv
 
     eql
-    sb!kernel:%negate))
+    sb!kernel:%negate)
+  #'equalp)
 
 
 ;;;; Assembler parameters:

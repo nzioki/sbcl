@@ -5,8 +5,17 @@
 ;;; things.)
 (setf *print-level* 5 *print-length* 5)
 
-(progn (load "src/cold/shared.lisp")
-       (load "tools-for-build/ldso-stubs.lisp"))
+(progn
+  (load "src/cold/shared.lisp")
+  (load "tools-for-build/ldso-stubs.lisp")
+  (let ((*print-pretty* nil)
+        (*print-length* nil))
+    (dolist (thing '("*SHEBANG-FEATURES*" "*SHEBANG-BACKEND-SUBFEATURES*"))
+      (let ((val (symbol-value (intern thing "SB-COLD"))))
+        (when val
+          (format t "~&target *~A* = ~S~%"
+                  (subseq thing (length "*SHEBANG-") (1- (length thing)))
+                  val))))))
 (in-package "SB-COLD")
 (progn
   (setf *host-obj-prefix* "obj/from-host/")
@@ -39,7 +48,7 @@
                            (setq fail 'warning))))
                       ;; Prevent regressions on a couple platforms
                       ;; that are known to build cleanly.
-                      #!+(or x86 x86-64)
+                      #!+(or x86 x86-64 arm64)
                       (sb-int:simple-style-warning
                        (lambda (c)
                          (when (and in-summary
@@ -66,10 +75,9 @@
 ;;; Let's check that the type system, and various other things, are
 ;;; reasonably sane. (It's easy to spend a long time wandering around
 ;;; confused trying to debug cross-compilation if it isn't.)
- (when (find :sb-test *shebang-features*)
-   (load "tests/type.before-xc.lisp")
-   (load "tests/info.before-xc.lisp")
-   (load "tests/vm.before-xc.lisp"))
+ (load "tests/type.before-xc.lisp")
+ (load "tests/info.before-xc.lisp")
+ (load "tests/vm.before-xc.lisp")
 ;; When building on a slow host using a slow Lisp,
 ;; the wait time in slurp-ucd seems interminable - over a minute.
 ;; Compiling seems to help a bit, but maybe it's my imagination.
@@ -86,4 +94,4 @@
  (host-cload-stem "src/compiler/generic/genesis" nil)
 ) ; END with-compilation-unit
 
-(sb!vm:genesis :c-header-dir-name "src/runtime/genesis")
+(sb-cold:genesis :c-header-dir-name "src/runtime/genesis")

@@ -223,7 +223,9 @@
   e)
 (with-test (:name :macroexpand-of-setf-structure-access)
   (assert (equal (macroexpand-1 '(setf (foo-a x) 3))
-                 '(sb-kernel:%instance-set (the foo x) 1 (the fixnum 3))))
+                 `(sb-kernel:%instance-set (the foo x)
+                                           ,sb-vm:instance-data-start
+                                           (sb-kernel:the* (fixnum :context (:struct foo . a)) 3))))
 
   ;; Lexical definition of (SETF FOO-A) inhibits source-transform.
   ;; This is not required behavior - SETF of structure slots
@@ -238,3 +240,26 @@
   (assert (equal-mod-gensyms
            (macroexpand-1 '(setf (bar-a x) 3))
            '(let* ((#2=#:x x) (new 3)) (funcall #'(setf bar-a) new #2#)))))
+
+;;; WITH-CURRENT-SOURCE-FORM tests
+
+(defmacro warnings-in-subforms (a b)
+  (with-current-source-form (a)
+    (warn "a warning"))
+  (with-current-source-form (b)
+    (warn "a warning"))
+  `(progn ,a ,b))
+
+(with-test (:name (with-current-source-form :smoke))
+  (assert (equal (checked-compile-condition-source-paths
+                  '(lambda () (warnings-in-subforms 1 2)))
+                 '((2 0) (2 0))))
+  (assert (equal (checked-compile-condition-source-paths
+                  '(lambda () (warnings-in-subforms (progn 1) (progn 2))))
+                 '((1 2 0) (2 2 0))))
+  (assert (equal (checked-compile-condition-source-paths
+                  '(lambda ()
+                    (warnings-in-subforms
+                     (warnings-in-subforms (progn 1) (progn 2))
+                     (progn 3))))
+                 '((1 2 0) (2 2 0) (1 1 2 0) (2 1 2 0)))))

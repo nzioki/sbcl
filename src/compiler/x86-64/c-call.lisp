@@ -17,11 +17,6 @@
 ;; used for things going down the stack but C wants to have args
 ;; indexed in the positive direction.
 
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
-
 (defstruct (arg-state (:copier nil))
   (register-args 0)
   (xmm-args 0)
@@ -35,41 +30,41 @@
                        #!+win32 (arg-state-xmm-args state))))
     (cond ((< reg-args max-int-args)
            (setf (arg-state-register-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc
+           (make-wired-tn* prim-type reg-sc
                              (nth reg-args *c-call-register-arg-offsets*)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-64 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-64 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 (defun float-arg (state prim-type reg-sc stack-sc)
   (let ((xmm-args (max (arg-state-xmm-args state)
                         #!+win32 (arg-state-register-args state))))
     (cond ((< xmm-args max-xmm-args)
            (setf (arg-state-xmm-args state) (1+ xmm-args))
-           (my-make-wired-tn prim-type reg-sc
+           (make-wired-tn* prim-type reg-sc
                              (nth xmm-args *float-regs*)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'double-float 'double-reg 'double-stack))
+  (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'single-float 'single-reg 'single-stack))
+  (float-arg state 'single-float single-reg-sc-number single-stack-sc-number))
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
@@ -84,9 +79,9 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-64 'signed-reg)
-            (values 'unsigned-byte-64 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc (result-reg-offset num-results)))))
+            (values 'signed-byte-64 signed-reg-sc-number)
+            (values 'unsigned-byte-64 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc (result-reg-offset num-results)))))
 
 (define-alien-type-method (integer :naturalize-gen) (type alien)
   (if (<= (alien-type-bits type) 32)
@@ -99,20 +94,20 @@
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'system-area-pointer 'sap-reg
+    (make-wired-tn* 'system-area-pointer sap-reg-sc-number
                       (result-reg-offset num-results))))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'double-float 'double-reg num-results)))
+    (make-wired-tn* 'double-float double-reg-sc-number num-results)))
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'single-float 'single-reg num-results)))
+    (make-wired-tn* 'single-float single-reg-sc-number num-results)))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -127,7 +122,7 @@
     (collect ((arg-tns))
       (dolist (arg-type (alien-fun-type-arg-types type))
         (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
-      (values (my-make-wired-tn 'positive-fixnum 'any-reg esp-offset)
+      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number esp-offset)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
               (invoke-alien-type-method :result-tn
@@ -257,6 +252,10 @@
   (:generator 2
    (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
 
+#!+sb-safepoint
+(defconstant thread-saved-csp-offset
+  (- (/ +backend-page-bytes+ n-word-bytes)))
+
 (define-vop (call-out)
   (:args (function :scs (sap-reg)
                    :target rbx)
@@ -283,15 +282,11 @@
   (:ignore results
            #!+(and sb-safepoint win32) rdi
            #!+(and sb-safepoint win32) rsi
-           #!+win32 args
-           #!+win32 rax
            #!+sb-safepoint r15
            #!+sb-safepoint r13)
   (:vop-var vop)
   (:save-p t)
   (:generator 0
-    ;; ABI: Direction flag must be clear on function entry. -- JES, 2006-01-20
-    (inst cld)
     #!+sb-safepoint
     (progn
       ;; Current PC - don't rely on function to keep it in a form that
@@ -299,6 +294,15 @@
       (let ((label (gen-label)))
         (inst lea r14 (make-fixup nil :code-object label))
         (emit-label label)))
+    (when sb!c::*msan-compatible-stack-unpoison*
+      (inst mov rax (static-symbol-value-ea 'msan-param-tls))
+      ;; Unpoison parameters
+      (do ((n 0 (+ n n-word-bytes))
+           (arg args (tn-ref-across arg)))
+          ((null arg))
+        ;; KLUDGE: assume all parameters are 8 bytes or less
+        (inst fs)
+        (inst mov (make-ea :qword :base rax :disp n) 0)))
     #!-win32
     ;; ABI: AL contains amount of arguments passed in XMM registers
     ;; for vararg calls.
@@ -338,13 +342,6 @@
     ;; C stack must be 16 byte aligned
     (inst and rsp-tn -16)
     (move result rsp-tn)))
-
-(define-vop (dealloc-number-stack-space)
-  (:info amount)
-  (:generator 0
-    (unless (zerop amount)
-      (let ((delta (logandc2 (+ amount 7) 7)))
-        (inst add rsp-tn delta)))))
 
 (macrolet ((alien-stack-ptr ()
              #!+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
@@ -387,12 +384,12 @@
     (let* ((segment (make-segment))
            (rax rax-tn)
            #!+(or win32 (not sb-thread)) (rcx rcx-tn)
-           #!-win32 (rdi rdi-tn)
-           #!-win32 (rsi rsi-tn)
+           #!-(and win32 sb-thread) (rdi rdi-tn)
+           #!-(and win32 sb-thread) (rsi rsi-tn)
            (rdx rdx-tn)
            (rbp rbp-tn)
            (rsp rsp-tn)
-           #!+win32 (r8 r8-tn)
+           #!+(and win32 sb-thread) (r8 r8-tn)
            (xmm0 float0-tn)
            ([rsp] (make-ea :qword :base rsp :disp 0))
            ;; How many arguments have been copied
@@ -406,7 +403,8 @@
                          (subseq *float-regs* 0 #!-win32 8 #!+win32 4))))
       (assemble (segment)
         ;; Make room on the stack for arguments.
-        (inst sub rsp (* n-word-bytes (length argument-types)))
+        (when argument-types
+          (inst sub rsp (* n-word-bytes (length argument-types))))
         ;; Copy arguments from registers to stack
         (dolist (type argument-types)
           (let ((integerp (not (alien-float-type-p type)))
@@ -456,21 +454,15 @@
         #!-sb-thread
         (progn
           ;; arg0 to FUNCALL3 (function)
-          ;;
-          ;; Indirect the access to ENTER-ALIEN-CALLBACK through
-          ;; the symbol-value slot of SB-ALIEN::*ENTER-ALIEN-CALLBACK*
-          ;; to ensure it'll work even if the GC moves ENTER-ALIEN-CALLBACK.
-          ;; Skip any SB-THREAD TLS magic, since we don't expect anyone
-          ;; to rebind the variable. -- JES, 2006-01-01
-          (inst mov rdi (+ nil-value (static-symbol-offset
-                                      'sb!alien::*enter-alien-callback*)))
-          (loadw rdi rdi symbol-value-slot other-pointer-lowtag)
+          (inst mov rdi (make-ea :qword :disp (static-fdefn-fun-addr 'enter-alien-callback)))
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
           (inst mov rsi (fixnumize index))
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
           (inst mov rdx rsp)
           ;; add room on stack for return value
-          (inst sub rsp 8)
+          (inst sub rsp (if (evenp arg-count)
+                            (* n-word-bytes 2)
+                            n-word-bytes))
           ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
           (inst mov rcx rsp)
 
@@ -493,7 +485,9 @@
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
           (inst mov #!-win32 rsi #!+win32 rdx rsp)
           ;; add room on stack for return value
-          (inst sub rsp 8)
+          (inst sub rsp (if (evenp arg-count)
+                            (* n-word-bytes 2)
+                            n-word-bytes))
           ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
           (inst mov #!-win32 rdx #!+win32 r8 rsp)
           ;; Make new frame
@@ -524,7 +518,13 @@
 
         ;; Pop the arguments and the return value from the stack to get
         ;; the return address at top of stack.
-        (inst add rsp (* (1+ (length argument-types)) n-word-bytes))
+
+        (inst add rsp (* (+ arg-count
+                            ;; Plus the return value and make sure it's aligned
+                            (if (evenp arg-count)
+                                2
+                                1))
+                         n-word-bytes))
         ;; Return
         (inst ret))
       (finalize-segment segment)

@@ -30,7 +30,8 @@
   ;; T if this descriptor is bogus.
   bogus)
 
-(defstruct (pollfds (:constructor make-pollfds (list)))
+(defstruct (pollfds (:constructor make-pollfds (list))
+                    (:copier nil))
   (list)
   ;; If using poll() we maintain, in addition to a list of HANDLER,
   ;; an (ALIEN (* STRUCT POLLFD)) to avoid creating it repeatedly.
@@ -53,8 +54,7 @@
             (handler-descriptor handler)
             (handler-function handler))))
 
-(defvar *descriptor-handlers* nil
-  #!+sb-doc
+(!define-thread-local *descriptor-handlers* nil
   "List of all the currently active handlers for file descriptors")
 
 (sb!xc:defmacro with-descriptor-handlers (&body forms)
@@ -100,7 +100,6 @@
 
 ;;; Add a new handler to *descriptor-handlers*.
 (defun add-fd-handler (fd direction function)
-  #!+sb-doc
   "Arrange to call FUNCTION whenever FD is usable. DIRECTION should be
   either :INPUT or :OUTPUT. The value returned should be passed to
   SYSTEM:REMOVE-FD-HANDLER when it is no longer needed."
@@ -137,13 +136,11 @@
 
 ;;; Remove an old handler from *descriptor-handlers*.
 (defun remove-fd-handler (handler)
-  #!+sb-doc
   "Removes HANDLER from the list of active handlers."
   (filter-handlers (delete handler handlers)))
 
 ;;; Search *descriptor-handlers* for any reference to fd, and nuke 'em.
 (defun invalidate-descriptor (fd)
-  #!+sb-doc
   "Remove any handlers referring to FD. This should only be used when attempting
   to recover from a detected inconsistency."
   (filter-handlers (delete fd handlers :key #'handler-descriptor)))
@@ -153,7 +150,6 @@
 ;;; it discards the cached C array of (struct pollfd), as it must do
 ;;; each time the list of Lisp HANDLER structs is touched.
 (defmacro with-fd-handler ((fd direction function) &rest body)
-  #!+sb-doc
   "Establish a handler with SYSTEM:ADD-FD-HANDLER for the duration of BODY.
    DIRECTION should be either :INPUT or :OUTPUT, FD is the file descriptor to
    use, and FUNCTION is the function to call whenever FD is usable."
@@ -202,14 +198,12 @@
 ;;; polling function if it does time out.
 (declaim (type (or null symbol function) *periodic-polling-function*))
 (defvar *periodic-polling-function* nil
-  #!+sb-doc
   "Either NIL, or a designator for a function callable without any
 arguments. Called when the system has been waiting for input for
 longer then *PERIODIC-POLLING-PERIOD* seconds. Shared between all
 threads, unless locally bound. EXPERIMENTAL.")
 (declaim (real *periodic-polling-period*))
 (defvar *periodic-polling-period* 0
-  #!+sb-doc
   "A real number designating the number of seconds to wait for input
 at maximum, before calling the *PERIODIC-POLLING-FUNCTION* \(if any.)
 Shared between all threads, unless locally bound. EXPERIMENTAL.")
@@ -219,7 +213,6 @@ Shared between all threads, unless locally bound. EXPERIMENTAL.")
 ;;; timeout at the correct time irrespective of how many events are handled in
 ;;; the meantime.
 (defun wait-until-fd-usable (fd direction &optional timeout (serve-events t))
-  #!+sb-doc
   "Wait until FD is usable for DIRECTION. DIRECTION should be either :INPUT or
 :OUTPUT. TIMEOUT, if supplied, is the number of seconds to wait before giving
 up. Returns true once the FD is usable, NIL return indicates timeout.
@@ -265,8 +258,7 @@ waiting."
                                      (+ (* 1000 to-sec) (truncate to-usec 1000))
                                      -1)
                    when (or #!+win32 (eq direction :output)
-                            #!+win32 (sb!win32:handle-listen
-                                      (sb!win32:get-osfhandle fd))
+                            #!+win32 (sb!win32:handle-listen fd)
                             #!-win32
                             (sb!unix:unix-simple-poll fd direction to-msec))
                    do (return-from wait-until-fd-usable t)
@@ -277,7 +269,6 @@ waiting."
 ;;; Wait for up to timeout seconds for an event to happen. Make sure all
 ;;; pending events are processed before returning.
 (defun serve-all-events (&optional timeout)
-  #!+sb-doc
   "SERVE-ALL-EVENTS calls SERVE-EVENT with the specified timeout. If
 SERVE-EVENT does something (returns T) it loops over SERVE-EVENT with a
 timeout of 0 until there are no more events to serve. SERVE-ALL-EVENTS returns
@@ -289,7 +280,6 @@ T if SERVE-EVENT did something and NIL if not."
 
 ;;; Serve a single set of events.
 (defun serve-event (&optional timeout)
-  #!+sb-doc
   "Receive pending events on all FD-STREAMS and dispatch to the appropriate
 handler functions. If timeout is specified, server will wait the specified
 time (in seconds) and then return, otherwise it will wait until something

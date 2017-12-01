@@ -19,6 +19,20 @@
 
 ;;;; internal utilities defined in terms of INFO
 
+(defun check-variable-name (name &key
+                                   (context "local variable")
+                                   (signal-via #'compiler-error))
+  (unless (legal-variable-name-p name)
+    (funcall signal-via "~@<~S~[~; is a keyword and~; is not a symbol and~
+                         ~] cannot be used as a ~A.~@:>"
+             name
+             (typecase name
+               (null    0)
+               (keyword 1)
+               (t       2))
+             context))
+  name)
+
 ;;; Check that NAME is a valid function name, returning the name if
 ;;; OK, and signalling an error if not. In addition to checking for
 ;;; basic well-formedness, we also check that symbol names are not NIL
@@ -27,13 +41,14 @@
   (typecase name
     (list
      (unless (legal-fun-name-p name)
-       (compiler-error "illegal function name: ~S" name)))
+       (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
     (symbol
      (when (eq (info :function :kind name) :special-form)
-       (compiler-error "Special form is an illegal function name: ~S" name)))
+       (compiler-error "~@<Special form is an illegal function name: ~S.~@:>"
+                       name)))
     (t
-     (compiler-error "illegal function name: ~S" name)))
-  (values))
+     (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
+  name)
 
 ;;; Record a new function definition, and check its legality.
 (defun proclaim-as-fun-name (name)
@@ -146,7 +161,6 @@
 ;;;; database
 
 (defun sb!xc:macro-function (symbol &optional env)
-  #!+sb-doc
   "If SYMBOL names a macro in ENV, returns the expansion function,
 else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
@@ -192,9 +206,10 @@ only."
     (setf (random-documentation symbol 'function) docstring))
   ;; (SETF SYMBOL-FUNCTION) goes out of its way to disallow this closure,
   ;; but we can trivially replicate its low-level effect.
-  (setf (fdefn-fun (find-or-create-fdefn symbol))
-        (sb!impl::set-closure-name
-         (lambda (&rest args)
+  (let ((fdefn (find-or-create-fdefn symbol))
+        (closure
+         (set-closure-name
+          (lambda (&rest args)
            (declare (ignore args))
            ;; ANSI specification of FUNCALL says that this should be
            ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.
@@ -203,10 +218,24 @@ only."
                       'special-form-function
                       'undefined-function)
                   :name symbol))
-         fun-name)))
+          t
+          fun-name)))
+    ;; For immobile-code, do something slightly different: fmakunbound,
+    ;; then assign the fdefn-fun slot to avoid consing a new closure trampoline.
+    #!+immobile-code
+    (progn (fdefn-makunbound fdefn)
+           ;; There is no :SET-TRANS for the primitive object's fdefn-fun slot,
+           ;; nor do we desire the full effect of %SET-FDEFN-FUN.
+           (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address fdefn))
+                                  (- (ash sb!vm:fdefn-fun-slot sb!vm:word-shift)
+                                     sb!vm:other-pointer-lowtag))
+                 closure))
+    ;; The above would work, but there's no overhead when installing a closure
+    ;; the regular way, so just do that.
+    #!-immobile-code
+    (setf (fdefn-fun fdefn) closure)))
 
 (defun sb!xc:compiler-macro-function (name &optional env)
-  #!+sb-doc
   "If NAME names a compiler-macro in ENV, return the expansion function, else
 return NIL. Can be set with SETF when ENV is NIL."
   (legal-fun-name-or-type-error name)

@@ -13,6 +13,11 @@
  * files for more information.
  */
 
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define LANGUAGE_ASSEMBLY
 #include "sbcl.h"
 #include "validate.h"
@@ -151,17 +156,6 @@
    * jumping through hoops, so just in case, here a default definition: */
 # define SBCL_THREAD_BASE_EA $0
 # define MAYBE_FS(addr) %fs:addr
-#endif
-
-/* gas can't parse 4096LU; redefine */
-#if BACKEND_PAGE_BYTES == 4096
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 4096
-#elif BACKEND_PAGE_BYTES == 32768
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 32768
-#else
-# error BACKEND_PAGE_BYTES mismatch
 #endif
 
 /* OAOOM because we don't have the C headers here */
@@ -672,7 +666,7 @@ DEFINE_ALLOC_TO_REG(alloc_16_to_edi,%edi,$16)
 #ifdef LISP_FEATURE_SB_THREAD
 #define START_REGION %fs:THREAD_ALLOC_REGION_OFFSET
 #else
-#define START_REGION GNAME(boxed_region)
+#define START_REGION GNAME(gc_alloc_region)
 #endif
 
 #if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_WIN32)

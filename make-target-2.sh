@@ -41,26 +41,21 @@ fi
 # for much longer than that, don't worry, it's likely to be normal.
 if [ "$1" != --load ]; then
     echo //doing warm init - compilation phase
-    echo '(load "loader.lisp") (load-sbcl-file "make-host-1.lisp")' | \
-    ./src/runtime/sbcl \
-        --core output/cold-sbcl.core \
-        --lose-on-corruption \
-        --no-sysinit --no-userinit < make-target-2.lisp
+    ./src/runtime/sbcl --core output/cold-sbcl.core \
+     --lose-on-corruption --no-sysinit --no-userinit \
+     --eval '(sb-fasl::!warm-load "src/cold/warm.lisp")' --quit
 fi
 echo //doing warm init - load and dump phase
-echo '(load "loader.lisp") (load-sbcl-file "make-host-1.lisp")' | \
-./src/runtime/sbcl \
---core output/cold-sbcl.core \
---lose-on-corruption \
---no-sysinit --no-userinit < make-target-2-load.lisp
+./src/runtime/sbcl --core output/cold-sbcl.core \
+ --lose-on-corruption --no-sysinit --no-userinit \
+ --eval '(sb-fasl::!warm-load "make-target-2-load.lisp")' \
+ --eval '(progn #+gencgc(setf (extern-alien "gc_coalesce_string_literals" char) 2))' \
+ --eval '(sb-ext:save-lisp-and-die "output/sbcl.core")'
 
 echo //checking for leftover cold-init symbols
-./src/runtime/sbcl \
---core output/sbcl.core \
---lose-on-corruption \
---noinform \
---no-sysinit --no-userinit \
---eval '(restart-case
+./src/runtime/sbcl --core output/sbcl.core \
+ --lose-on-corruption --noinform --no-sysinit --no-userinit --eval '
+    (restart-case
       (let (l)
         (sb-vm::map-allocated-objects
          (lambda (obj type size)
@@ -68,9 +63,8 @@ echo //checking for leftover cold-init symbols
            (when (and (symbolp obj) (not (symbol-package obj))
                       (search "!" (string obj)))
              (push obj l)))
-         :dynamic)
+         :all)
         (format t "Found ~D:~%~S~%" (length l) l))
     (abort ()
       :report "Abort building SBCL."
-      (sb-ext:exit :code 1)))' \
---quit
+      (sb-ext:exit :code 1)))' --quit

@@ -111,7 +111,7 @@ call_into_lisp:
 
 	.align 3
 	.equ	.lra, .+OTHER_POINTER_LOWTAG
-	.word	RETURN_PC_HEADER_WIDETAG
+	.word	RETURN_PC_WIDETAG
 
 	@@ Correct stack pointer for return processing.
 	streq	reg_OCFP, STATIC_SYMBOL_VALUE(CONTROL_STACK_POINTER)
@@ -372,4 +372,9 @@ do_pending_interrupt:
         .byte 0
         .byte 0
 	bx	lr
+#endif
+
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
 #endif

@@ -917,8 +917,12 @@
 
 (defun eval-the (body env)
   (program-destructuring-bind (value-type form) body
-    (let ((values (multiple-value-list (%eval form env)))
-          (vtype (if (ctype-p value-type) value-type (values-specifier-type value-type))))
+    (let* ((values (multiple-value-list (%eval form env)))
+           (vtype (if (ctype-p value-type) value-type (values-specifier-type value-type)))
+           (vtype (typecase vtype
+                    (fun-designator-type (specifier-type '(or function symbol)))
+                    (fun-type (specifier-type 'function))
+                    (t vtype))))
       ;; FIXME: we should probably do this only if SAFETY>SPEED
       (cond
         ((eq vtype *wild-type*) (values-list values))
@@ -986,7 +990,7 @@
   (program-destructuring-bind (values &body body) args
     (if (null values)
         (eval-progn body env)
-        (sb!sys:with-pinned-objects ((car values))
+        (sb!sys:with-pinned-objects ((%eval (car values) env))
           (eval-with-pinned-objects (cons (cdr values) body) env)))))
 
 (defvar *eval-dispatch-functions* nil)

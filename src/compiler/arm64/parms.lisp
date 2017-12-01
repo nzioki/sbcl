@@ -20,10 +20,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 64)
 
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
-
 ;;; Floating-point related constants, both format descriptions and FPU
 ;;; control register descriptions.  These don't exactly match up with
 ;;; what the machine manuals say because the Common Lisp standard
@@ -123,32 +119,25 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   #!-sb-thread
-   '(*binding-stack-pointer*
-     *pseudo-atomic-atomic*
-     *pseudo-atomic-interrupted*)
-   '(*allocation-pointer*
+(defconstant-eqx +static-symbols+
+ `#(#!-sb-thread
+    ,@'(*binding-stack-pointer*
+        *pseudo-atomic-atomic*
+        *pseudo-atomic-interrupted*)
+    *allocation-pointer*
      ;; interrupt handling
+     ,@+common-static-symbols+)
+  #'equalp)
 
-
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-     #!+gencgc *restart-lisp-function*)
-   *common-static-symbols*
-   *c-callable-static-symbols*))
-
-(defparameter *static-funs*
-  '(two-arg-gcd two-arg-lcm
+(defconstant-eqx +static-fdefns+
+  #(two-arg-gcd two-arg-lcm
     two-arg-+ two-arg-- two-arg-* two-arg-/
     two-arg-< two-arg-> two-arg-=
     two-arg-and two-arg-ior two-arg-xor two-arg-eqv
 
     eql
-    sb!kernel:%negate))
+    sb!kernel:%negate)
+  #'equalp)
 
 
 ;;;; Assembler parameters:

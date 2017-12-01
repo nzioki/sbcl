@@ -49,27 +49,26 @@
 
 ;;; Used for interning parts of SLOT-NAME-LISTS, as part of
 ;;; PV-TABLE interning -- just to save space.
-(defvar *slot-name-lists* (make-hash-table :test 'equal))
+(define-load-time-global *slot-name-lists* (make-hash-table :test 'equal))
 
 ;;; Used for interning PV-TABLES, keyed by the SLOT-NAME-LISTS
 ;;; used.
-(defvar *pv-tables* (make-hash-table :test 'equal))
+(define-load-time-global *pv-tables* (make-hash-table :test 'equal))
 
 ;;; ...and one lock to rule them. Lock because for certain (rare)
 ;;; cases this lock might be grabbed in the course of method dispatch
 ;;; -- and mostly this is already under the *world-lock*
-(defvar *pv-lock*
+(define-load-time-global *pv-lock*
   (sb-thread:make-mutex :name "pv table index lock"))
 
 (defun intern-pv-table (&key slot-name-lists)
   (flet ((intern-slot-names (slot-names)
-           (or (gethash slot-names *slot-name-lists*)
-               (setf (gethash slot-names *slot-name-lists*) slot-names)))
+           (ensure-gethash slot-names *slot-name-lists* slot-names))
          (%intern-pv-table (snl)
-           (or (gethash snl *pv-tables*)
-               (setf (gethash snl *pv-tables*)
-                     (make-pv-table :slot-name-lists snl
-                                    :pv-size (* 2 (reduce #'+ snl :key #'length)))))))
+           (ensure-gethash
+            snl *pv-tables*
+            (make-pv-table :slot-name-lists snl
+                           :pv-size (* 2 (reduce #'+ snl :key #'length))))))
     (sb-thread:with-mutex (*pv-lock*)
       (%intern-pv-table (mapcar #'intern-slot-names slot-name-lists)))))
 
@@ -167,11 +166,10 @@
                                                        parameter-or-nil
                                                        env)))
                    (class (find-class class-name nil)))
-              (cond ((not (eq **boot-state** 'complete))
-                     (setq class nil))
+              (cond ((or (not (eq **boot-state** 'complete))
+                         (forward-referenced-class-p class))
+                     (setf class nil))
                     ((and class (not (class-finalized-p class)))
-                     ;; The class itself is never forward-referenced
-                     ;; here, but its superclasses may be.
                      (unless (try-finalize-inheritance class)
                        (when (boundp 'sb-c:*lexenv*)
                          (sb-c:compiler-notify
@@ -402,7 +400,7 @@
                                 `((cons (cdr ,index))))
                         (t
                          +slot-unbound+)))
-         (if (eq ,value +slot-unbound+)
+         (if (unbound-marker-p ,value)
              ,default
              ,value)))))
 
@@ -492,10 +490,10 @@
          (typecase ,index
            ,@(when (or (null kind) (eq kind :instance))
                    `((fixnum (not (and ,slots
-                                       (eq (clos-slots-ref ,slots ,index)
-                                           +slot-unbound+))))))
+                                       (unbound-marker-p
+                                        (clos-slots-ref ,slots ,index)))))))
            ,@(when (or (null kind) (eq kind :class))
-                   `((cons (not (eq (cdr ,index) +slot-unbound+)))))
+                   `((cons (not (unbound-marker-p (cdr ,index))))))
            (t ,default))))))
 
 (defmacro instance-boundp-custom (pv pv-offset parameter)
@@ -767,7 +765,7 @@
                                 ,@(cdddr lmf-params))
                             ,@inner-decls
                             ,@body-sans-decls))))
-                 (mf (%make-method-function fmf nil)))
+                 (mf (%make-method-function fmf)))
             (set-funcallable-instance-function
              mf (method-function-from-fast-function fmf ',(getf initargs 'plist)))
             mf)

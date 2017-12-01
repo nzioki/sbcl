@@ -9,13 +9,10 @@
 
 (in-package "SB!THREAD")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *current-thread* nil))
-
 (def!type thread-name () 'simple-string)
 
-(defstruct (thread (:constructor %make-thread))
-  #!+sb-doc
+(defstruct (thread (:constructor %make-thread)
+                   (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
   (name          nil :type (or thread-name null))
@@ -34,10 +31,25 @@ in future versions."
    :type mutex)
   waiting-for)
 
-(def!struct (mutex (:constructor make-mutex (&key name)))
-  #!+sb-doc
+(def!struct (mutex (:constructor make-mutex (&key name))
+                   (:copier nil))
   "Mutex type."
   (name   nil :type (or null thread-name))
   (%owner nil :type (or null thread))
   #!+(and sb-thread sb-futex)
   (state    0 :type fixnum))
+
+;; The host has a stub for this macro. The cross-compiler doesn't use
+;; it until it's seen. So no SB!XC:DEFMACRO needed
+#-sb-xc-host
+(defmacro with-system-mutex ((mutex &key without-gcing allow-with-interrupts)
+                                    &body body)
+  `(dx-flet ((with-system-mutex-thunk () ,@body))
+     (,(cond (without-gcing
+               'call-with-system-mutex/without-gcing)
+             (allow-with-interrupts
+              'call-with-system-mutex/allow-with-interrupts)
+             (t
+              'call-with-system-mutex))
+       #'with-system-mutex-thunk
+       ,mutex)))

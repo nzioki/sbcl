@@ -10,7 +10,8 @@
 (in-package "SB!KERNEL")
 
 (!defstruct-with-alternate-metaclass condition
-  :slot-names (actual-initargs assigned-slots)
+  :slot-names (assigned-slots hash)
+  ;; constructor is never called, but (FIXME) the macro syntax requires it
   :boa-constructor %make-condition-object
   :superclass-name t
   :metaclass-name condition-classoid
@@ -29,7 +30,8 @@
                    :classoid (make-undefined-classoid name)
                    :inherits (map 'vector #'find-layout (cons t inherits))
                    :depthoid -1
-                   :length 3)
+                   ;; 2 declared slots, plus the layout if it takes a slot
+                   :length (+ sb!vm:instance-data-start 2))
                  nil nil))))
   ;; These are grotesquely OAOO-violating, but on the bright side,
   ;; compilation will fail if the subsequent real definition differs,
@@ -37,6 +39,7 @@
   ;; As has been suggested in 'cross-condition', a DEF!CONDITION macro
   ;; might help, but still that's possibly not a complete solution,
   ;; because DEBUG-CONDITION is defined in a file with the :NOT-HOST flag.
+  (def simple-condition (condition) condition)
   (def warning (condition) condition)
   (def style-warning (warning) condition warning)
   (def compiler-note (condition) condition)
@@ -48,3 +51,6 @@
   (def stream-error (error) condition serious-condition error)
   (def reference-condition (condition) condition)
   )
+
+;;; Needed for !CALL-A-METHOD to pick out CONDITIONs
+(defun !condition-p (x) (typep x 'condition))

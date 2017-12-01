@@ -14,7 +14,7 @@
 
 ;;;; Helpers
 
-(defun check-deprecated-thing (namespace name state make-body
+(defun test (namespace name state make-body
                                &key replacements
                                     (call t)
                                     (expected-warning-count '(eql 1))
@@ -28,35 +28,39 @@
            (search-string/documentation (string)
              (search-string
               string `(,(string-downcase namespace) ,(string name)
-                        "deprecated" "as" "of" "some-lib" "version" "1.2.3"
-                        "Use" ,@replacements "instead")))
+                        "deprecated" "as" "of" "some-lib" "version" "1.2.3"))
+             (when replacements
+               (search-string string `("Use" ,@replacements "instead"))))
            (search-string/describe (string)
              (search-string
               string `(,(string name) ,(string state)
                         "deprecation" "since" "some-lib" "version" "1.2.3"))))
     ;; Check the signaled warning condition.
-    (let* ((condition)
-           (count 0)
-           (function (handler-bind
-                         ((deprecation-condition (lambda (c)
-                                                   (incf count)
-                                                   (setf condition c)
-                                                   (muffle-warning)))
-                          (warning 'muffle-warning))
-                       (compile nil `(lambda ()
-                                       ,@(funcall make-body name))))))
-      (assert (typep count expected-warning-count))
-      (assert (typep condition (ecase state
-                                 (:early 'early-deprecation-warning)
-                                 (:late 'late-deprecation-warning)
-                                 (:final 'final-deprecation-warning))))
-      (search-string/documentation (princ-to-string condition))
-      (when call
-        (ecase state
-          ((:early :late)
-           (assert (eq :deprecated (funcall function))))
-          (:final
-           (assert-error (funcall function) deprecation-error)))))
+    (multiple-value-bind (function failure-p warnings style-warnings)
+        (checked-compile `(lambda () ,@(funcall make-body name))
+                         :allow-style-warnings t ; undefined types, functions
+                         :allow-warnings 'deprecation-condition)
+      (declare (ignore failure-p))
+      (let* ((conditions (remove-if-not
+                          (lambda (condition)
+                            (typep condition 'deprecation-condition))
+                          (append warnings style-warnings)))
+             (condition (first conditions))
+             (count (length conditions)))
+        (assert (typep count expected-warning-count))
+        (when condition
+          (assert (typep condition (ecase state
+                                     (:early 'early-deprecation-warning)
+                                     (:late 'late-deprecation-warning)
+                                     (:final 'final-deprecation-warning))))
+          (search-string/documentation (princ-to-string condition)))
+        (when call
+          (ecase state
+            ((:early :late)
+             (assert (eq :deprecated (funcall function))))
+            (:final
+             (assert-error (funcall function)
+                           (or deprecation-error cell-error)))))))
     ;; Check DESCRIBE output.
     (when check-describe
       (search-string/describe (with-output-to-string (stream)
@@ -75,8 +79,11 @@
           (deprecated :early 1)
           (deprecated :early ("1"))
           (deprecated :early ("a" "b" "c"))
-          (deprecated :early 1 (function))
-          (deprecated :early 1 (unsupported-namespace name))))
+          (deprecated :early "1" (function))
+          (deprecated :early "1" (unsupported-namespace name))
+          (deprecated :early "1" (variable 1))
+          (deprecated :early "1" (variable nil))
+          (deprecated :early "1" (variable :foo))))
 
   ;; These should work.
   (mapc (lambda (declaration)
@@ -128,20 +135,20 @@
                                         :replacement ,replacement)))
 
                     (with-test (:name (deprecated variable ,tag ,state))
-                      (check-deprecated-thing
+                      (test
                        'variable ',variable-name ,state
                        (lambda (name) `(,name))
                        :replacements   '(,(string replacement))
                        :call           ,call
                        :check-describe ,check-describe)
                       ,@(when symbol-value
-                          `((check-deprecated-thing
+                          `((test
                              'variable ',variable-name ,state
                              (lambda (name) `((symbol-value ',name)))
                              :replacements   '(,(string replacement))
                              :call           ,call
                              :check-describe ,check-describe)
-                            (check-deprecated-thing
+                            (test
                              'variable ',variable-name ,state
                              (lambda (name) `((symbol-global-value ',name)))
                              :replacements   '(,(string replacement))
@@ -191,7 +198,7 @@
                                         :replacement ,replacement)))
 
                     (with-test (:name (deprecated function ,tag ,state))
-                      (check-deprecated-thing
+                      (test
                        'function ',function-name ,state
                        (lambda (name) `((,name)))
                        :replacements   '(,(string replacement))
@@ -225,13 +232,16 @@
        `(defstruct ,type-name))
      (definition.define-condition (type-name)
        `(define-condition ,type-name () ()))
-     (define-type-tests (tag definition-name &rest args)
+     (define-type-tests (tag definition-name method class &rest args)
        (flet ((make-test-case (tag state &key check-describe)
-                (let ((type-name (apply #'sb-int::symbolicate
-                                        (append '(#:type.)
-                                                (sb-int:ensure-list tag)
-                                                (list '#:. state (gensym)))))
-                      (replacement   'replacement))
+                (let* ((method (and method (not (eq state :final))))
+                       (class (and class (not (eq state :final))))
+                       (type-name (apply #'sb-int::symbolicate
+                                         (append '(#:type.)
+                                                 (sb-int:ensure-list tag)
+                                                 (list '#:. state (gensym)))))
+                       (extra-warning-count (+ (if method 1 0) (if class 1 0)))
+                       (replacement 'replacement))
                   `(,@(unless (eq state :final)
                         `((,definition-name ,type-name)))
                     (declaim (deprecated
@@ -242,30 +252,56 @@
                     (test-util:with-test (:name (deprecated type
                                                  ,@(sb-int:ensure-list tag)
                                                  ,state))
-                      (check-deprecated-thing
+                      (test
                        'type ',type-name ,state
                        (lambda (name)
                          `((let ((x))
-                             (declare (type (or null ,name) x)))
+                             (declare (type (or null ,name) x)
+                                      (ignore x)))
                            (typep nil ',name)
-                           (defmethod ,(gensym) ((x ,name)))
-                           (defclass ,(gensym) (,name) ())))
+                           ,@,(when method
+                                '`((defmethod ,(gensym) ((x ,name)))))
+                           ,@,(when class
+                                '`((defclass ,(gensym) (,name) ())))))
                        :replacements           '(,(string replacement))
                        :call                   nil
-                       :expected-warning-count '(integer 4 6)
+                       :expected-warning-count '(integer
+                                                 ,(+ 2 extra-warning-count)
+                                                 ,(+ 4 extra-warning-count))
                        :check-describe         ,check-describe))))))
          `(progn
             ,@(apply #'make-test-case tag :early args)
             ,@(apply #'make-test-case tag :late  args)
             ,@(apply #'make-test-case tag :final :check-describe t args)))))
 
-  (define-type-tests :undefined            definition.undefined
+  (define-type-tests :undefined            definition.undefined          nil nil
     :check-describe nil)
-  (define-type-tests (deftype :empty-body) definition.deftype.empty-body)
-  (define-type-tests (deftype :t-body)     definition.deftype.t-body)
-  (define-type-tests defclass              definition.defclass)
-  (define-type-tests defstruct             definition.defstruct)
-  (define-type-tests define-condition      definition.define-condition))
+  (define-type-tests (deftype :empty-body) definition.deftype.empty-body nil nil)
+  (define-type-tests (deftype :t-body)     definition.deftype.t-body     nil nil)
+  (define-type-tests defclass              definition.defclass           t   t)
+  (define-type-tests defstruct             definition.defstruct          t   nil)
+  (define-type-tests define-condition      definition.define-condition   t   nil))
+
+(with-test (:name (deprecated type :unrelated-class))
+  (let ((name (gensym)))
+    (eval `(progn
+             (deftype ,name () 'integer)
+             (declaim (deprecated :early ("some-lib" "1.2.3") (type ,name)))))
+    ;; Make sure the deprecation declaration works.
+    (test
+     'type name :early
+     (lambda (name)
+       `((typep 1 ',name)))
+     :call nil)
+    ;; Check that the declaration does not apply to an unrelated class
+    ;; of the same name.
+    (test
+     'type name :early
+     (lambda (name)
+       `((make-instance ,(make-instance 'standard-class :name name))))
+     :call                   nil
+     :expected-warning-count '(eql 0))))
+
 
 ;;;; Loader deprecation warnings
 
@@ -296,7 +332,7 @@
               :final)))
 
 (with-test (:name (:late-deprecated-fun-doc :bug-1439151)
-                  :skipped-on '(not :sb-doc))
+                  :skipped-on (not :sb-doc))
   (assert (string= (documentation 'you-cant-use-this 'function)
                    (documentation #'you-cant-use-this 'function)))
   (assert (string= (documentation 'function.defun.late 'function)
@@ -308,7 +344,7 @@
   (let ((source "load-test.tmp") fasl)
     (with-open-file (f source :direction :output
                        :if-does-not-exist :create :if-exists :supersede)
-      (write-string "(defun a () (quit))" f)
+      (write-string "(defun a () (sb-unix:unix-exit))" f)
       ;; a full warning even though the PLEASE-DONT- function is only :early
       (write-string "(defun b () (please-dont-use-this 1) (really-dont-do-it 2))" f)
       (write-string "(defun c () (you-cant-use-this 3))" f))

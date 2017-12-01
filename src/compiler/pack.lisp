@@ -24,8 +24,7 @@
 
 ;;;; conflict determination
 
-;;; Return true if the element at the specified offset, or in any of
-;;; the [size-1] subsequent offsets, in SB has a conflict with TN:
+;;; Return true if TN has a conflict in SC at the specified offset.
 ;;; -- If a component-live TN (:COMPONENT kind), then iterate over
 ;;;    all the blocks. If the element at OFFSET is used anywhere in
 ;;;    any of the component's blocks (always-live /= 0), then there
@@ -41,12 +40,14 @@
 ;;;    it is local to.
 ;;;
 ;;; If there is a conflict, returns the first such conflicting offset.
-(defun offset-conflicts-in-sb (tn sb offset &key (size 1))
-  (declare (type tn tn) (type finite-sb sb) (type index offset size))
-  (let ((confs (tn-global-conflicts tn))
-        (kind (tn-kind tn))
-        (sb-conflicts (finite-sb-conflicts sb))
-        (sb-always-live (finite-sb-always-live sb)))
+(declaim (ftype (sfunction (tn sc index) (or null index)) conflicts-in-sc))
+(defun conflicts-in-sc (tn sc offset)
+  (let* ((confs (tn-global-conflicts tn))
+         (kind (tn-kind tn))
+         (sb (sc-sb sc))
+         (sb-conflicts (finite-sb-conflicts sb))
+         (sb-always-live (finite-sb-always-live sb))
+         (size (sc-element-size sc)))
     (macrolet ((do-offsets ((var) &body body)
                  `(loop for ,var upfrom offset
                         repeat size
@@ -69,13 +70,13 @@
                  (do-offsets (offset-iter)
                      (let ((loc-live (svref sb-always-live offset-iter)))
                        (when (/= (sbit loc-live num) 0)
-                         (return-from offset-conflicts-in-sb offset-iter))))
+                         (return-from conflicts-in-sc offset-iter))))
                  (do-offsets (offset-iter)
                      (let ((loc-confs (svref sb-conflicts offset-iter)))
                        (when (/= (sbit (svref loc-confs num)
                                        (global-conflicts-number conf))
                                  0)
-                         (return-from offset-conflicts-in-sb offset-iter))))))))
+                         (return-from conflicts-in-sc offset-iter))))))))
         (t
          (do-offsets (offset-iter)
              (and (/= (sbit (svref (svref sb-conflicts offset-iter)
@@ -83,13 +84,6 @@
                             (tn-local-number tn))
                       0)
                   offset-iter)))))))
-
-;;; Return true if TN has a conflict in SC at the specified offset.
-(declaim (ftype (sfunction (tn sc index) (or null index)) conflicts-in-sc))
-(defun conflicts-in-sc (tn sc offset)
-  (declare (type tn tn) (type sc sc) (type index offset))
-  (offset-conflicts-in-sb tn (sc-sb sc) offset
-                          :size (sc-element-size sc)))
 
 ;;; Add TN's conflicts into the conflicts for the location at OFFSET
 ;;; in SC. We iterate over each location in TN, adding to the
@@ -150,7 +144,7 @@
 ;; offset has been marked as ALWAYS-LIVE.
 (defun find-location-usage (sb offset)
   (declare (optimize speed))
-  (declare (type sb sb) (type index offset))
+  (declare (type storage-base sb) (type index offset))
   (let* ((always-live (svref (finite-sb-always-live sb) offset)))
     (declare (simple-bit-vector always-live))
     (count 1 always-live)))
@@ -170,7 +164,7 @@
 ;;; conflicts and reset the current size to the initial size.
 (defun init-sb-vectors (component)
   (let ((nblocks (ir2-block-count component)))
-    (dolist (sb *backend-sb-list*)
+    (dovector (sb *backend-sbs*)
       (unless (eq (sb-kind sb) :non-packed)
         (let* ((conflicts (finite-sb-conflicts sb))
                (always-live (finite-sb-always-live sb))
@@ -383,8 +377,7 @@
       (let* ((sb (sc-sb sc))
              (confs (finite-sb-live-tns sb)))
         (aver (eq (sb-kind sb) :finite))
-        (dolist (el (sc-locations sc))
-          (declare (type index el))
+        (dovector (el (sc-locations sc))
           (let ((conf (load-tn-conflicts-in-sc op sc el t)))
             (if conf
                 (used (describe-tn-use el conf op))
@@ -589,7 +582,10 @@
     (when (eq (vop-info-save-p (vop-info vop)) t)
       (do-live-tns (tn (vop-save-set vop) block)
         (when (and (sc-save-p (tn-sc tn))
-                   (not (eq (tn-kind tn) :component)))
+                   (not (eq (tn-kind tn) :component))
+                   ;; Ignore closed over but not read values (due to
+                   ;; type propagation)
+                   (tn-offset tn))
           (basic-save-tn tn vop)))))
 
   (values))
@@ -713,11 +709,14 @@
             (case (vop-info-save-p info)
               ((t)
                (dolist (tn restores-list)
-                 (restore-tn tn (vop-next vop) vop)
-                 (let ((num (tn-number tn)))
-                   (when (zerop (sbit saves num))
-                     (push tn saves-list)
-                     (setf (sbit saves num) 1))))
+                 ;; Ignore closed over but not read values (due to
+                 ;; type propagation)
+                 (when (tn-offset tn)
+                   (restore-tn tn (vop-next vop) vop)
+                   (let ((num (tn-number tn)))
+                     (when (zerop (sbit saves num))
+                       (push tn saves-list)
+                       (setf (sbit saves num) 1)))))
                (setq restores-list nil)
                (clear-bit-vector restores))
               (:compute-only
@@ -853,7 +852,7 @@
 ;;; Set the LIVE-TNS vectors in all :FINITE SBs to represent the TNs
 ;;; live at the end of BLOCK.
 (defun init-live-tns (block)
-  (dolist (sb *backend-sb-list*)
+  (dovector (sb *backend-sbs*)
     (when (eq (sb-kind sb) :finite)
       (fill (finite-sb-live-tns sb) nil)))
 
@@ -896,43 +895,45 @@
       ((eq current vop)
        (do ((res (vop-results vop) (tn-ref-across res)))
            ((null res))
-         (let* ((tn (tn-ref-tn res))
-                (sc (tn-sc tn))
-                (sb (sc-sb sc)))
-           (when (eq (sb-kind sb) :finite)
+         (unless (eq (tn-kind (tn-ref-tn res)) :unused)
+           (let* ((tn (tn-ref-tn res))
+                  (sc (tn-sc tn))
+                  (sb (sc-sb sc)))
+             (when (eq (sb-kind sb) :finite)
+               (do ((offset (tn-offset tn) (1+ offset))
+                    (end (+ (tn-offset tn) (sc-element-size sc))))
+                   ((= offset end))
+                 (declare (type index offset end))
+                 (setf (svref (finite-sb-live-tns sb) offset) nil)))))))
+    (do ((ref (vop-refs current) (tn-ref-next-ref ref)))
+        ((null ref))
+      (unless (eq (tn-kind (tn-ref-tn ref)) :unused)
+       (let ((ltn (tn-ref-load-tn ref)))
+         (when ltn
+           (let* ((sc (tn-sc ltn))
+                  (sb (sc-sb sc)))
+             (when (eq (sb-kind sb) :finite)
+               (let ((tns (finite-sb-live-tns sb)))
+                 (do ((offset (tn-offset ltn) (1+ offset))
+                      (end (+ (tn-offset ltn) (sc-element-size sc))))
+                     ((= offset end))
+                   (declare (type index offset end))
+                   (aver (null (svref tns offset)))))))))
+
+       (let* ((tn (tn-ref-tn ref))
+              (sc (tn-sc tn))
+              (sb (sc-sb sc)))
+         (when (eq (sb-kind sb) :finite)
+           (let ((tns (finite-sb-live-tns sb)))
              (do ((offset (tn-offset tn) (1+ offset))
                   (end (+ (tn-offset tn) (sc-element-size sc))))
                  ((= offset end))
                (declare (type index offset end))
-               (setf (svref (finite-sb-live-tns sb) offset) nil))))))
-    (do ((ref (vop-refs current) (tn-ref-next-ref ref)))
-        ((null ref))
-      (let ((ltn (tn-ref-load-tn ref)))
-        (when ltn
-          (let* ((sc (tn-sc ltn))
-                 (sb (sc-sb sc)))
-            (when (eq (sb-kind sb) :finite)
-              (let ((tns (finite-sb-live-tns sb)))
-                (do ((offset (tn-offset ltn) (1+ offset))
-                     (end (+ (tn-offset ltn) (sc-element-size sc))))
-                    ((= offset end))
-                  (declare (type index offset end))
-                  (aver (null (svref tns offset)))))))))
-
-      (let* ((tn (tn-ref-tn ref))
-             (sc (tn-sc tn))
-             (sb (sc-sb sc)))
-        (when (eq (sb-kind sb) :finite)
-          (let ((tns (finite-sb-live-tns sb)))
-            (do ((offset (tn-offset tn) (1+ offset))
-                 (end (+ (tn-offset tn) (sc-element-size sc))))
-                ((= offset end))
-              (declare (type index offset end))
-              (if (tn-ref-write-p ref)
-                  (setf (svref tns offset) nil)
-                  (let ((old (svref tns offset)))
-                    (aver (or (null old) (eq old tn)))
-                    (setf (svref tns offset) tn)))))))))
+               (if (tn-ref-write-p ref)
+                   (setf (svref tns offset) nil)
+                   (let ((old (svref tns offset)))
+                     (aver (or (null old) (eq old tn)))
+                     (setf (svref tns offset) tn))))))))))
 
   (setq *live-vop* vop)
   (values))
@@ -963,7 +964,7 @@
 ;;;
 ;;; We return a conflicting TN if there is a conflict.
 (defun load-tn-offset-conflicts-in-sb (op sb offset)
-  (declare (type tn-ref op) (type finite-sb sb) (type index offset))
+  (declare (type tn-ref op) (type sb!c::finite-sb-template sb) (type index offset))
   (aver (eq (sb-kind sb) :finite))
   (let ((vop (tn-ref-vop op)))
     (labels ((tn-overlaps (tn)
@@ -1038,7 +1039,7 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (if (and (eq (tn-sc tn) sc)
-                 (member (the index loc) (sc-locations sc))
+                 (find (the index loc) (sc-locations sc))
                  (not (load-tn-conflicts-in-sc op sc loc nil)))
             loc
             nil)))))
@@ -1055,11 +1056,11 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (when (and (eq (sc-sb sc) (sc-sb (tn-sc tn)))
-                   (member (the index loc) (sc-locations sc))
+                   (find (the index loc) (sc-locations sc))
                    (not (load-tn-conflicts-in-sc op sc loc nil)))
               (return-from select-load-tn-location loc)))))
 
-  (dolist (loc (sc-locations sc) nil)
+  (dovector (loc (sc-locations sc) nil)
     (unless (load-tn-conflicts-in-sc op sc loc nil)
       (return loc))))
 
@@ -1113,7 +1114,7 @@
                (event unpack-tn node)
                (unpack-tn victim))
              (throw 'unpacked-tn nil)))
-      (dolist (loc (sc-locations sc))
+      (dovector (loc (sc-locations sc))
         (declare (type index loc))
         (block SKIP
           (collect ((victims nil adjoin))
@@ -1273,7 +1274,7 @@
     ;; -- TN doesn't conflict with target's location.
     (if (and (eq target-sb (sc-sb sc))
              (or (eq (sb-kind target-sb) :unbounded)
-                 (member loc (sc-locations sc)))
+                 (find loc (sc-locations sc)))
              (= (sc-element-size target-sc) (sc-element-size sc))
              (not (conflicts-in-sc tn sc loc))
              (zerop (mod loc (sc-alignment sc))))
@@ -1349,7 +1350,7 @@
 ;;; on register-starved architectures (x86) this seems to be a bad
 ;;; strategy. -- JES 2004-09-11
 (defun select-location (tn sc &key use-reserved-locs optimize)
-  (declare (type tn tn) (type sc sc) (inline member))
+  (declare (type tn tn) (type sc sc))
   (let* ((sb (sc-sb sc))
          (element-size (sc-element-size sc))
          (alignment (sc-alignment sc))
@@ -1368,7 +1369,7 @@
           (let ((locations (sc-locations sc)))
             (when optimize
               (setf locations
-                    (schwartzian-stable-sort-list
+                    (schwartzian-stable-sort-vector
                      locations '>
                      :key (lambda (location-offset)
                             (loop for offset from location-offset
@@ -1376,10 +1377,9 @@
                                   maximize (svref
                                             (finite-sb-always-live-count sb)
                                             offset))))))
-            (dolist (offset locations)
+            (dovector (offset locations)
               (when (or use-reserved-locs
-                        (not (member offset
-                                     (sc-reserve-locations sc))))
+                        (not (find offset (sc-reserve-locations sc))))
                 (attempt-location offset))))))))
 
 ;;; If a save TN, return the saved TN, otherwise return TN. This is
@@ -1477,7 +1477,7 @@
     ;; For non-x86 ports the presence of a save-tn associated with a
     ;; tn is used to identify the old-fp and return-pc tns. It depends
     ;; on the old-fp and return-pc being passed in registers.
-    #!-(or x86 x86-64 arm arm64)
+    #!-fp-and-pc-standard-save
     (when (and (not (eq (tn-kind tn) :specified-save))
                (conflicts-in-sc original sc offset))
       (error "~S is wired to a location that it conflicts with." tn))
@@ -1504,13 +1504,13 @@
     ;; the stack so the above hack for the other ports does not always
     ;; work. Here the old-fp and return-pc tns are identified by being
     ;; on the stack in their standard save locations.
-    #!+(or x86 x86-64 arm arm64)
-    (when (and (not (eq (tn-kind tn) :specified-save))
-               (not (and (string= (sb-name sb)
-                                  #!-(or arm arm64) "STACK"
-                                  #!+(or arm arm64) "CONTROL-STACK")
-                         (or (= offset 0)
-                             (= offset 1))))
+    #!+fp-and-pc-standard-save
+    (when (and (not (and
+                     (= (sc-number sc) #.(sc-offset-scn old-fp-passing-offset))
+                     (= offset #.(sc-offset-offset old-fp-passing-offset))))
+               (not (and
+                     (= (sc-number sc) #.(sc-offset-scn return-pc-passing-offset))
+                     (= offset #.(sc-offset-offset return-pc-passing-offset))))
                (conflicts-in-sc original sc offset))
       (error "~S is wired to location ~D in SC ~A of kind ~S that it conflicts with."
              tn offset sc (tn-kind tn)))
@@ -1530,13 +1530,15 @@
 ;;; done nothing to improve the reentrance or threadsafety of the
 ;;; compiler; it still fails to be callable from several threads at
 ;;; the same time.
+;;; But (FIXME) - we should not make new arrays here, just clear the old
+;;; because new ones are made on each call to COMPILE or COMPILE-FILE.
 ;;;
 ;;; Brief experiments indicate that during a compilation cycle this
 ;;; causes about 10% more consing, and takes about 1%-2% more time.
 ;;;
 ;;; -- CSR, 2004-04-12
 (defun clean-up-pack-structures ()
-  (dolist (sb *backend-sb-list*)
+  (dovector (sb *backend-sbs*)
     (unless (eq (sb-kind sb) :non-packed)
       (let ((size (sb-size sb)))
         (fill (finite-sb-always-live sb) nil)

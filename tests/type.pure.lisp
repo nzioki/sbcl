@@ -139,7 +139,7 @@
                         floating-point-underflow
                         simple-bit-vector)))
   (dolist (type standard-types)
-    (format t "~&~S~%" type)
+    #+nil (format t "~&~S~%" type)
     (assert (not (sb-kernel:unknown-type-p (sb-kernel:specifier-type type))))
     (assert (atom (sb-kernel:type-specifier (sb-kernel:specifier-type type))))))
 
@@ -649,3 +649,8 @@
                  '(string 10)))
   (assert (equal (type-specifier (specifier-type '(simple-string 10)))
                  '(simple-string 10))))
+
+(in-package "CL-USER")
+
+(with-test (:name (typep :complex-integer))
+  (assert (not (eval '(typep #c(0 1/2) '(complex integer))))))

@@ -11,7 +11,12 @@
 
 ;;;; Rudimentary DEFMETHOD
 
-(sb!xc:defmacro defmethod (name lambda-list &rest body)
+(sb!xc:defmacro defmethod (name lambda-list &rest body &aux qualifier)
+  (when (keywordp lambda-list)
+    ;; Allow an :AFTER method in 'condition.lisp'.
+    ;; It's ignored during cold-init, but eventually takes effect.
+    (assert (eq lambda-list :after))
+    (setq qualifier lambda-list lambda-list (pop body)))
   (ecase name
     (make-load-form
      ;; Expect one mandatory class-name and the optional environment.
@@ -26,8 +31,10 @@
              (unspecialized-ll `(,(caar lambda-list) ,@(cdr lambda-list)))
              ((forms decls) (parse-body body nil))) ; Note: disallowing docstring
     `(!trivial-defmethod
-      ',name ',specializer ',unspecialized-ll
-      (named-lambda (fast-method ,name (,specializer))
+      ',name ',specializer ,qualifier ',unspecialized-ll
+      ;; OAOO problem: compute the same lambda name as real DEFMETHOD would
+      (named-lambda (fast-method ,name
+                     (,specializer ,@(if (eq name 'print-object) '(t))))
           (.pv. .next-method-call. .arg0. ,@(cdr unspecialized-ll)
                 ;; Rebind specialized arg with unchecked type assertion.
                 &aux (,(car unspecialized-ll) (truly-the ,specializer .arg0.)))
@@ -47,20 +54,14 @@
       (sb!c::source-location))))
 
 (defvar *!trivial-methods* '())
-(defun !trivial-defmethod (name specializer lambda-list lambda source-loc)
+(defun !trivial-defmethod (name specializer qualifier lambda-list lambda source-loc)
   (let ((gf (assoc name *!trivial-methods*)))
-    (unless gf
-      (setq gf (cons name #()))
-      (push gf *!trivial-methods*))
-    (let ((entry (list specializer lambda-list lambda source-loc)))
-      (setf (cdr gf)
-            (merge '(simple-array t (*)) ; SIMPLE-VECTOR not DEFTYPEd yet!
-                   (list entry) (cdr gf) #'>
-                   ;; We only use hierarchical objects in self-build,
-                   ;; so sorting by LAYOUT-DEPTHOID is an accurate indicator
-                   ;; of what precedes what in the precedence list.
-                   :key (lambda (x) (layout-depthoid (find-layout (car x))))))
-      entry)))
+    ;; Append the method but don't bother finding a predicate for it.
+    ;; Methods occurring in early warm load (notably from SB-FASTEVAL)
+    ;; wil be properly installed when 'pcl/print-object.lisp' is loaded.
+    (rplacd gf (concatenate 'vector (cdr gf)
+                            (list (list nil lambda specializer qualifier
+                                        lambda-list source-loc))))))
 
 ;;; Slow-but-correct logic for single-dispatch sans method combination,
 ;;; allowing exactly one primary method. Methods are sorted most-specific-first,
@@ -70,26 +71,20 @@
                     (cdr (or (assoc gf-name *!trivial-methods*)
                              (error "No methods on ~S" gf-name)))))
          (applicable-method
-          ;; First try matching the type name exactly. Failing that, use TYPEP.
-          (or (find (type-of specialized-arg) methods :key #'car :test #'eq)
-              (find-if (lambda (x) (typep specialized-arg (car x))) methods))))
+          (find specialized-arg methods
+                :test (lambda (arg method &aux (guard (car method)))
+                        (and (or (functionp guard) (fboundp guard))
+                             (funcall guard arg))))))
     (assert applicable-method)
-    ;; no permutation-vector / no precomputed next method
-    (apply (third applicable-method) nil nil specialized-arg rest)))
+    ;; The "method" is a list: (GUARD LAMBDA . OTHER-STUFF)
+    ;; Call using no permutation-vector / no precomputed next method.
+    (apply (cadr applicable-method) nil nil specialized-arg rest)))
 
 (defun make-load-form (object &optional environment)
   (!call-a-method 'make-load-form object environment))
 (defun print-object (object stream)
   (!call-a-method 'print-object object stream))
 
-;;; This method gets removed by force-delayed-methods
-(defmethod print-object ((self t) stream)
-  (print-unreadable-object (self stream :type t :identity t)))
-
-;;;; Complete DEFMETHOD, not usable until CLOS works.
-
+;;; FIXME: this no longer holds methods, but it seems to have an effect
+;;; on the caching of a discriminating function for PRINT-OBJECT
 (defvar *!delayed-defmethod-args* nil)
-;;; By our convention, "DEF!METHOD" would imply behavior in both the
-;;; host and target, but this is only for the target, so ...
-(defmacro def*method (&rest args)
-  `(push (cons (sb!c:source-location) ',args) *!delayed-defmethod-args*))

@@ -26,13 +26,9 @@
 #include "parse.h"
 #include "vars.h"
 
-/* Almost all of this file can be skipped if we're not supporting LDB. */
-#if defined(LISP_FEATURE_SB_LDB)
-
 #include "print.h"
 #include "arch.h"
 #include "interr.h"
-#include "gc.h"
 #include "search.h"
 #include "purify.h"
 #include "globals.h"
@@ -114,9 +110,14 @@ dump_cmd(char **ptr)
 
     char *addr = lastaddr;
     int count = lastcount, displacement;
+    int force = 0;
 
     if (more_p(ptr)) {
-        addr = parse_addr(ptr);
+        if (!strncmp(*ptr, "-f ", 3)) {
+          force = 1;
+          *ptr += 3;
+        }
+        addr = parse_addr(ptr, !force);
 
         if (more_p(ptr))
             count = parse_number(ptr);
@@ -142,7 +143,7 @@ dump_cmd(char **ptr)
 #else
         printf("0x%08X: ", (u32) addr);
 #endif
-        if (is_valid_lisp_addr((os_vm_address_t)addr)) {
+        if (force || gc_managed_addr_p((lispobj)addr)) {
 #ifndef LISP_FEATURE_ALPHA
             unsigned long *lptr = (unsigned long *)addr;
 #else
@@ -197,7 +198,7 @@ kill_cmd(char **ptr)
 static void
 regs_cmd(char **ptr)
 {
-    struct thread *thread=arch_os_get_current_thread();
+    struct thread __attribute__((unused)) *thread=arch_os_get_current_thread();
 
     printf("CSP\t=\t%p   ", access_control_stack_pointer(thread));
 #if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
@@ -207,30 +208,26 @@ regs_cmd(char **ptr)
 #ifdef reg_BSP
     printf("BSP\t=\t%p\n", get_binding_stack_pointer(thread));
 #else
-    /* printf("BSP\t=\t0x%08lx\n",
-           (unsigned long)SymbolValue(BINDING_STACK_POINTER)); */
+    /* printf("BSP\t=\t%p\n", (void*)SymbolValue(BINDING_STACK_POINTER)); */
     printf("\n");
 #endif
 
 #ifdef LISP_FEATURE_GENCGC
-    /* printf("DYNAMIC\t=\t0x%08lx\n", DYNAMIC_SPACE_START); */
+    /* printf("DYNAMIC\t=\t%p\n", (void*)DYNAMIC_SPACE_START); */
 #else
-    printf("STATIC\t=\t%p   ",
-           SymbolValue(STATIC_SPACE_FREE_POINTER, thread));
-    printf("RDONLY\t=\t0x%08lx   ",
-           (unsigned long)SymbolValue(READ_ONLY_SPACE_FREE_POINTER, thread));
-    printf("DYNAMIC\t=\t0x%08lx\n", (unsigned long)current_dynamic_space);
+    printf("STATIC\t=\t%p   ", static_space_free_pointer);
+    printf("RDONLY\t=\t%p   ", read_only_space_free_pointer);
+    printf("DYNAMIC\t=\t%p\n", (void*)current_dynamic_space);
 #endif
 
-#ifdef reg_ALLOC
-    printf("ALLOC\t=\t0x%08lx\n", (unsigned long)dynamic_space_free_pointer);
+#ifndef ALLOCATION_POINTER
+    printf("ALLOC\t=\t%p\n", (void*)dynamic_space_free_pointer);
 #else
-    printf("ALLOC\t=\t0x%08lx\n",
-           (unsigned long)SymbolValue(ALLOCATION_POINTER, thread));
+    printf("ALLOC\t=\t%p\n", (void*)SymbolValue(ALLOCATION_POINTER, thread));
 #endif
 
 #ifndef LISP_FEATURE_GENCGC
-    printf("TRIGGER\t=\t0x%08lx\n", (unsigned long)current_auto_gc_trigger);
+    printf("TRIGGER\t=\t%p\n", (void*)current_auto_gc_trigger);
 #endif
 }
 
@@ -249,7 +246,7 @@ search_cmd(char **ptr)
             return;
         }
         if (more_p(ptr)) {
-            addr = (lispobj *)native_pointer((uword_t)parse_addr(ptr));
+            addr = native_pointer((uword_t)parse_addr(ptr, 1));
             if (more_p(ptr)) {
                 count = parse_number(ptr);
             }
@@ -282,7 +279,7 @@ search_cmd(char **ptr)
         obj = *end;
         addr = end;
         end += 2;
-        if (widetag_of(obj) == SIMPLE_FUN_HEADER_WIDETAG) {
+        if (widetag_of(obj) == SIMPLE_FUN_WIDETAG) {
             print((uword_t)addr | FUN_POINTER_LOWTAG);
         } else if (other_immediate_lowtag_p(obj)) {
             print((lispobj)addr | OTHER_POINTER_LOWTAG);
@@ -352,14 +349,13 @@ print_context(os_context_t *context)
 
     for (i = 0; i < NREGS; i++) {
         printf("%s:\t", lisp_register_names[i]);
-#ifdef LISP_FEATURE_X86
-        brief_print((lispobj)(*os_context_register_addr(context,
-                                                        i*2)));
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+        brief_print((lispobj)(*os_context_register_addr(context, i*2)));
 #else
         brief_print((lispobj)(*os_context_register_addr(context,i)));
 #endif
     }
-#ifdef LISP_FEATURE_DARWIN
+#if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_PPC)
     printf("DAR:\t\t 0x%08lx\n", (unsigned long)(*os_context_register_addr(context, 41)));
     printf("DSISR:\t\t 0x%08lx\n", (unsigned long)(*os_context_register_addr(context, 42)));
 #endif
@@ -373,7 +369,7 @@ print_context_cmd(char **ptr)
     int free_ici;
     struct thread *thread=arch_os_get_current_thread();
 
-    free_ici = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,thread));
+    free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
     if (more_p(ptr)) {
         int index;
@@ -417,10 +413,8 @@ backtrace_cmd(char **ptr)
 static void
 catchers_cmd(char **ptr)
 {
-    struct catch_block *catch;
-    struct thread *thread=arch_os_get_current_thread();
-
-    catch = (struct catch_block *)SymbolValue(CURRENT_CATCH_BLOCK,thread);
+    struct catch_block *catch = (struct catch_block *)
+        read_TLS(CURRENT_CATCH_BLOCK, arch_os_get_current_thread());
 
     if (catch == NULL)
         printf("There are no active catchers!\n");
@@ -428,16 +422,16 @@ catchers_cmd(char **ptr)
         while (catch != NULL) {
             printf("0x%08lX:\n\tuwp: 0x%08lX\n\tfp: 0x%08lX\n\t"
                    "code: 0x%08lX\n\tentry: 0x%08lX\n\ttag: ",
-                   (uword_t)catch,
-                   (uword_t)(catch->uwp),
-                   (uword_t)(catch->cfp),
+                   (long unsigned)catch,
+                   (long unsigned)(catch->uwp),
+                   (long unsigned)(catch->cfp),
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-                   (uword_t)component_ptr_from_pc((void*)catch->entry_pc)
+                   (long unsigned)component_ptr_from_pc((void*)catch->entry_pc)
                        + OTHER_POINTER_LOWTAG,
 #else
-                   (uword_t)(catch->code),
+                   (long unsigned)(catch->code),
 #endif
-                   (uword_t)(catch->entry_pc));
+                   (long unsigned)(catch->entry_pc));
             brief_print((lispobj)catch->tag);
             catch = catch->previous_catch;
         }
@@ -534,20 +528,9 @@ throw_to_monitor()
     longjmp(curbuf, 1);
 }
 
-#endif /* defined(LISP_FEATURE_SB_LDB) */
-
 /* what we do when things go badly wrong at a low level */
 void
 monitor_or_something()
 {
-#if defined(LISP_FEATURE_SB_LDB)
     ldb_monitor();
-#else
-     fprintf(stderr,
-"The system is too badly corrupted or confused to continue at the Lisp\n\
-level. If the system had been compiled with the SB-LDB feature, we'd drop\n\
-into the LDB low-level debugger now. But there's no LDB in this build, so\n\
-we can't really do anything but just exit, sorry.\n");
-    exit(1);
-#endif
 }

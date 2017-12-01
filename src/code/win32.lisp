@@ -74,39 +74,12 @@
 ;;; last-error code is maintained on a per-thread basis.
 (define-alien-routine ("GetLastError" get-last-error) dword)
 
-;;;; File Handles
-
-;;; Historically, SBCL on Windows used CRT (lowio) file descriptors,
-;;; unlike other Lisps. They really help to minimize required effort
-;;; for porting Unix-specific software, at least to the level that it
-;;; mostly works most of the time.
-;;;
-;;; Alastair Bridgewater recommended to switch away from CRT
-;;; descriptors, and Anton Kovalenko thinks it's the time to heed his
-;;; advice. I see that SBCL for Windows needs much more effort in the
-;;; area of OS IO abstractions and the like; using or leaving lowio
-;;; FDs doesn't change the big picture so much.
-;;;
-;;; Lowio layer, in exchange for `semi-automatic almost-portability',
-;;; brings some significant problems, which a grown-up cross-platform
-;;; CL implementation shouldn't have. Therefore, as its benefits
-;;; become negligible, it's a good reason to throw it away.
-;;;
-;;;  -- comment from AK's branch
-
-;;; For a few more releases, let's preserve old functions (now
-;;; implemented as identity) for user code which might have had to peek
-;;; into our internals in past versions when we hadn't been using
-;;; handles yet. -- DFL, 2012
-(defun get-osfhandle (fd) fd)
-(defun open-osfhandle (handle flags) (declare (ignore flags)) handle)
-
 ;;; Get the operating system handle for a C file descriptor.  Returns
 ;;; INVALID-HANDLE on failure.
-(define-alien-routine ("_get_osfhandle" real-get-osfhandle) handle
+(define-alien-routine ("_get_osfhandle" get-osfhandle) handle
   (fd int))
 
-(define-alien-routine ("_close" real-crt-close) int
+(define-alien-routine ("_close" crt-close) int
   (fd int))
 
 ;;; Read data from a file handle into a buffer.  This may be used
@@ -154,8 +127,11 @@
   (length dword)
   (nevents (* dword)))
 
-(define-alien-routine ("socket_input_available" socket-input-available) int
+(define-alien-routine "socket_input_available" int
   (socket handle))
+
+(define-alien-routine "console_handle_p" boolean
+  (handle handle))
 
 ;;; Listen for input on a Windows file handle.  Unlike UNIX, there
 ;;; isn't a unified interface to do this---we have to know what sort
@@ -164,30 +140,19 @@
 ;;; something that works.  Returns true if there could be input
 ;;; available, or false if there is not.
 (defun handle-listen (handle)
-  (with-alien ((avail dword)
-               (buf (array char #.input-record-size)))
-    (when
-        ;; Make use of the fact that console handles are technically no
-        ;; real handles, and unlike those, have these bits set:
-        (= 3 (logand 3 handle))
-      (return-from handle-listen
-        (alien-funcall (extern-alien "win32_tty_listen"
-                                     (function boolean handle))
-                       handle)))
-    (unless (zerop (peek-named-pipe handle nil 0 nil (addr avail) nil))
-      (return-from handle-listen (plusp avail)))
-    (let ((res (socket-input-available handle)))
-      (unless (zerop res)
-        (return-from handle-listen (= res 1))))
-    t))
+  (cond ((console-handle-p handle)
+         (alien-funcall (extern-alien "win32_tty_listen"
+                                      (function boolean handle))
+                        handle))
+        (t
+         (with-alien ((avail dword))
 
-;;; Listen for input on a C runtime file handle.  Returns true if
-;;; there could be input available, or false if there is not.
-(defun fd-listen (fd)
-  (let ((handle (get-osfhandle fd)))
-    (if handle
-        (handle-listen handle)
-        t)))
+           (unless (zerop (peek-named-pipe handle nil 0 nil (addr avail) nil))
+             (return-from handle-listen (plusp avail))))
+         (let ((res (socket-input-available handle)))
+           (unless (zerop res)
+             (return-from handle-listen (= res 1))))
+         t)))
 
 ;;; Clear all available input from a file handle.
 (defun handle-clear-input (handle)
@@ -201,12 +166,6 @@
        (return))
      (when (< count 1024)
        (return)))))
-
-;;; Clear all available input from a C runtime file handle.
-(defun fd-clear-input (fd)
-  (let ((handle (get-osfhandle fd)))
-    (when handle
-      (handle-clear-input handle))))
 
 ;;;; System Functions
 
@@ -876,11 +835,15 @@ absense."
   (whence dword))
 
 (defun lseeki64 (handle offset whence)
-  (multiple-value-bind (moved to-place)
-      (set-file-pointer-ex handle offset whence)
-    (if moved
-        (values to-place 0)
-        (values -1 (get-last-error)))))
+  (let ((type (get-file-type handle)))
+    (if (or (= type file-type-char)
+            (= type file-type-disk))
+        (multiple-value-bind (moved to-place)
+            (set-file-pointer-ex handle offset whence)
+          (if moved
+              (values to-place 0)
+              (values -1 (get-last-error))))
+        (values -1 0))))
 
 ;; File mapping support routines
 (define-alien-routine (#!+sb-unicode "CreateFileMappingW"
@@ -958,7 +921,7 @@ absense."
 (define-alien-routine ("CloseHandle" close-handle) bool
   (handle handle))
 
-(define-alien-routine ("_open_osfhandle" real-open-osfhandle)
+(define-alien-routine ("_open_osfhandle" open-osfhandle)
     int
   (handle handle)
   (flags int))
@@ -1120,10 +1083,10 @@ absense."
 (defun duplicate-and-unwrap-fd (fd &key inheritp)
   (let ((me (get-current-process)))
     (multiple-value-bind (duplicated handle)
-        (duplicate-handle me (real-get-osfhandle fd)
+        (duplicate-handle me (get-osfhandle fd)
                           me 0 inheritp +duplicate-same-access+)
       (if duplicated
-          (prog1 handle (real-crt-close fd))
+          (prog1 handle (crt-close fd))
           (win32-error 'duplicate-and-unwrap-fd)))))
 
 (define-alien-routine ("CreatePipe" create-pipe) lispbool
@@ -1167,9 +1130,9 @@ absense."
   (multiple-value-bind (duplicate errno)
       (sb!unix:unix-dup handle)
     (if duplicate
-        (let ((fd (real-open-osfhandle duplicate flags)))
+        (let ((fd (open-osfhandle duplicate flags)))
           (unwind-protect (funcall thunk fd)
-            (real-crt-close fd)))
+            (crt-close fd)))
         (values nil errno))))
 
 ;;; random seeding

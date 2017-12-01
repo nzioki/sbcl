@@ -39,7 +39,6 @@
 
 #-sb-xc-host
 (defun find-foreign-symbol-address (name)
-  #!+sb-doc
   "Returns the address of the foreign symbol NAME, or NIL. Does not enter the
 symbol in the linkage table, and never returns an address in the linkage-table."
   (or #!-sb-dynamic-core
@@ -48,11 +47,9 @@ symbol in the linkage table, and never returns an address in the linkage-table."
 
 #-sb-xc-host
 (defun foreign-symbol-address (name &optional datap)
-  #!+sb-doc
   "Returns the address of the foreign symbol NAME. DATAP must be true if the
-symbol designates a variable (used only on linkage-table platforms). Returns a
-secondary value that is true if DATAP was true and the symbol is a dynamic
-foreign symbol.
+symbol designates a variable (used only on linkage-table platforms).
+Returns a secondary value T if the symbol is a dynamic foreign symbol.
 
 On linkage-table ports the returned address is always static: either direct
 address of a static symbol, or the linkage-table address of a dynamic one.
@@ -81,7 +78,6 @@ On non-linkage-table ports signals an error if the symbol isn't found."
 
 #-sb-xc-host ; SAPs don't exist
 (defun foreign-symbol-sap (symbol &optional datap)
-  #!+sb-doc
   "Returns a SAP corresponding to the foreign symbol. DATAP must be true if the
 symbol designates a variable (used only on linkage-table platforms). May enter
 the symbol into the linkage-table. On non-linkage-table ports signals an error
@@ -136,10 +132,10 @@ if the symbol isn't found."
     (when (<= sb!vm:linkage-table-space-start
               addr
               sb!vm:linkage-table-space-end)
-      (dohash ((name-and-datap table-addr) *linkage-info* :locked t)
-        (when (and (<= table-addr addr)
-                   (< addr (+ table-addr sb!vm:linkage-table-entry-size)))
-          (return-from sap-foreign-symbol (car name-and-datap)))))
+      (dohash ((key table-addr) *linkage-info* :locked t)
+        (let ((datap (listp key)))
+          (when (<= table-addr addr (+ table-addr (1- sb!vm:linkage-table-entry-size)))
+            (return-from sap-foreign-symbol (if datap (car key) key))))))
     #!+os-provides-dladdr
     (with-alien ((info (struct dl-info
                                (filename c-string)
@@ -165,12 +161,12 @@ if the symbol isn't found."
 #-sb-xc-host
 (defun !foreign-cold-init ()
   #!-sb-dynamic-core
-  (dolist (symbol *!initial-foreign-symbols*)
+  (dovector (symbol *!initial-foreign-symbols*)
     (setf (gethash (car symbol) *static-foreign-symbols*) (cdr symbol)))
   #!+sb-dynamic-core
-  (loop for table-address from sb!vm::linkage-table-space-start
+  (loop for table-address from sb!vm:linkage-table-space-start
           by sb!vm::linkage-table-entry-size
-          and reference in sb!vm::*required-runtime-c-symbols*
+          and reference across (symbol-value 'sb!vm::+required-foreign-symbols+)
         do (setf (gethash reference *linkage-info*) table-address))
   #!+os-provides-dlopen
   (setf *runtime-dlhandle* (dlopen-or-lose))

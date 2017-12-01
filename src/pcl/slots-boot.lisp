@@ -23,38 +23,23 @@
 
 (in-package "SB-PCL")
 
-(let ((reader-specializers '(slot-object))
-      (writer-specializers '(t slot-object)))
-  (defun ensure-accessor (type fun-name slot-name)
-    (unless (fboundp fun-name)
-      (multiple-value-bind (lambda-list specializers method-class initargs doc)
-          (ecase type
-            ;; FIXME: change SLOT-OBJECT here to T to get SLOT-MISSING
-            ;; behaviour for non-slot-objects too?
-            (reader
-             (values '(object) reader-specializers 'global-reader-method
-                     (make-std-reader-method-function 'slot-object slot-name)
-                     "automatically-generated reader method"))
-            (writer
-             (values '(new-value object) writer-specializers
-                     'global-writer-method
-                     (make-std-writer-method-function 'slot-object slot-name)
-                     "automatically-generated writer method"))
-            (boundp
-             (values '(object) reader-specializers 'global-boundp-method
-                     (make-std-boundp-method-function 'slot-object slot-name)
-                     "automatically-generated boundp method")))
-        (let ((gf (ensure-generic-function fun-name :lambda-list lambda-list)))
-          (add-method gf (make-a-method method-class
-                                        () lambda-list specializers
-                                        initargs doc :slot-name slot-name)))))
-    t)
-  ;; KLUDGE: this is maybe PCL bootstrap mechanism #6 or #7, invented
-  ;; by CSR in June 2007.  Making the bootstrap sane is getting higher
-  ;; on the "TODO: URGENT" list.
-  (defun !fix-ensure-accessor-specializers ()
-    (setf reader-specializers (mapcar #'find-class reader-specializers))
-    (setf writer-specializers (mapcar #'find-class writer-specializers))))
+(defvar *!temporary-ensure-accessor-functions* nil)
+(defun ensure-accessor (fun-name)
+  (when (member fun-name *!temporary-ensure-accessor-functions* :test 'equal)
+    (error "ENSURE-ACCESSOR ~S called more than once!?" fun-name))
+  (push fun-name *!temporary-ensure-accessor-functions*)
+  #| We don't really need "fast" global slot accessors while building PCL.
+  ;; With few exceptions, all methods use a permutation vector for slot access.
+  ;; In a pinch, these would suffice, should it become utterly necessary:
+  (destructuring-bind (slot-name method) (cddr fun-name)
+    (setf (fdefinition fun-name)
+          (ecase method
+            (reader (lambda (object) (slot-value object slot-name)))
+            (writer (lambda (newval object) (setf (slot-value object slot-name) newval)))
+            (boundp (lambda (object) (slot-boundp object slot-name))))))|#
+  (setf (fdefinition fun-name)
+        (lambda (&rest args)
+          (error "Nooooo! ~S accidentally invoked on ~S" fun-name args))))
 
 (defun make-structure-slot-boundp-function (slotd)
   (declare (ignore slotd))
@@ -83,8 +68,8 @@
 (defun instance-structure-protocol-error (slotd fun)
   (error 'instance-structure-protocol-error
          :slotd slotd :fun fun
-         :references (list `(:amop :generic-function ,fun)
-                           '(:amop :section (5 5 3)))))
+         :references `((:amop :generic-function ,fun)
+                       (:amop :section (5 5 3)))))
 
 (defun get-optimized-std-accessor-method-function (class slotd name)
   (cond
@@ -133,7 +118,7 @@
             (check-obsolete-instance instance)
             (let ((value (clos-slots-ref (fsc-instance-slots instance)
                                          location)))
-              (if (eq value +slot-unbound+)
+              (if (unbound-marker-p value)
                   (values
                    (slot-unbound (class-of instance) instance slot-name))
                   value)))
@@ -141,7 +126,7 @@
             (check-obsolete-instance instance)
             (let ((value (clos-slots-ref (std-instance-slots instance)
                                          location)))
-              (if (eq value +slot-unbound+)
+              (if (unbound-marker-p value)
                   (values
                    (slot-unbound (class-of instance) instance slot-name))
                   value)))))
@@ -149,7 +134,7 @@
       (lambda (instance)
         (check-obsolete-instance instance)
         (let ((value (cdr location)))
-          (if (eq value +slot-unbound+)
+          (if (unbound-marker-p value)
               (values (slot-unbound (class-of instance) instance slot-name))
               value))))
      (null
@@ -235,17 +220,15 @@
      (fixnum (if fsc-p
                  (lambda (instance)
                    (check-obsolete-instance instance)
-                   (not (eq (clos-slots-ref (fsc-instance-slots instance)
-                                            location)
-                            +slot-unbound+)))
+                   (not (unbound-marker-p (clos-slots-ref (fsc-instance-slots instance)
+                                                          location))))
                  (lambda (instance)
                    (check-obsolete-instance instance)
-                   (not (eq (clos-slots-ref (std-instance-slots instance)
-                                            location)
-                            +slot-unbound+)))))
+                   (not (unbound-marker-p (clos-slots-ref (std-instance-slots instance)
+                                                          location))))))
      (cons (lambda (instance)
              (check-obsolete-instance instance)
-             (not (eq (cdr location) +slot-unbound+))))
+             (not (unbound-marker-p (cdr location)))))
      (null
       (lambda (instance)
         (declare (ignore instance))
@@ -325,7 +308,7 @@
                     (check-obsolete-instance instance)
                     (let ((value (clos-slots-ref (fsc-instance-slots instance)
                                                  location)))
-                      (if (eq value +slot-unbound+)
+                      (if (unbound-marker-p value)
                           (values (slot-unbound class instance slot-name))
                           value)))
                   (lambda (class instance slotd)
@@ -333,14 +316,14 @@
                     (check-obsolete-instance instance)
                     (let ((value (clos-slots-ref (std-instance-slots instance)
                                                  location)))
-                      (if (eq value +slot-unbound+)
+                      (if (unbound-marker-p value)
                           (values (slot-unbound class instance slot-name))
                           value)))))
       (cons (lambda (class instance slotd)
               (declare (ignore slotd))
               (check-obsolete-instance instance)
               (let ((value (cdr location)))
-                (if (eq value +slot-unbound+)
+                (if (unbound-marker-p value)
                     (values (slot-unbound class instance slot-name))
                     value))))
       (null
@@ -395,17 +378,17 @@
            (lambda (class instance slotd)
              (declare (ignore class slotd))
              (check-obsolete-instance instance)
-             (not (eq (clos-slots-ref (fsc-instance-slots instance) location)
-                      +slot-unbound+)))
+             (not (unbound-marker-p
+                   (clos-slots-ref (fsc-instance-slots instance) location))))
            (lambda (class instance slotd)
              (declare (ignore class slotd))
              (check-obsolete-instance instance)
-             (not (eq (clos-slots-ref (std-instance-slots instance) location)
-                      +slot-unbound+)))))
+             (not (unbound-marker-p
+                   (clos-slots-ref (std-instance-slots instance) location))))))
       (cons (lambda (class instance slotd)
               (declare (ignore class slotd))
               (check-obsolete-instance instance)
-              (not (eq (cdr location) +slot-unbound+))))
+              (not (unbound-marker-p (cdr location)))))
       (null
        (lambda (class instance slotd)
          (declare (ignore class instance))

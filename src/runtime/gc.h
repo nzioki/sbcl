@@ -17,34 +17,34 @@
 #define _GC_H_
 
 #include "sbcl.h"
+#include "os.h"
 #include <stdint.h>
 
-#define PAGE_BYTES BACKEND_PAGE_BYTES
-
 typedef intptr_t page_index_t;
-#ifdef LISP_FEATURE_WIN32
-#define PAGE_INDEX_FMT "Id"
-#else
-#define PAGE_INDEX_FMT "ld"
-#endif
 
+// This decl should probably be be in gencgc-internal,
+// except it can't be: collect_garbage() receives a generation number.
 typedef signed char generation_index_t;
 
 extern void gc_init(void);
 extern void gc_initialize_pointers(void);
 extern void collect_garbage(generation_index_t last_gen);
-extern void gc_init_tables(void);
-
-
-#include "os.h"
 
 extern void set_auto_gc_trigger(os_vm_size_t usage);
 extern void clear_auto_gc_trigger(void);
 
-#include "fixnump.h"
-
 extern boolean maybe_gc(os_context_t *context);
 
 extern os_vm_size_t bytes_consed_between_gcs;
+
+/// Maximum number of word backwards from a simple-fun
+/// to its containing code component - corresponds to ~128MB.
+/// The limit exists so that we can store the layout pointer
+/// in the header of any callable object if N_WORD_BITS = 64.
+/// This is not technically a restriction on the code size.
+#define FUN_HEADER_NWORDS_MASK 0xFFFFFF
+
+#define fun_code_header(fun) \
+  ((lispobj*)(fun) - (HeaderValue(*(lispobj*)(fun))&FUN_HEADER_NWORDS_MASK))
 
 #endif /* _GC_H_ */

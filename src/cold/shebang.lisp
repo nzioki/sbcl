@@ -20,6 +20,8 @@
 ;;; the feature list for the target system
 (export '*shebang-features*)
 (declaim (type list *shebang-features*))
+;; FIXME: is there a reason this isn't SB!XC:*FEATURES* ?
+;; We haven't set up the SB!XC package yet, but we certainly could.
 (defvar *shebang-features*)
 
 (defun target-platform-name ()
@@ -94,7 +96,7 @@
   (etypecase feature
     (symbol (unless (member feature '(:ansi-cl :common-lisp :ieee-floating-point))
               (when (member feature *shebang-features* :test #'eq)
-                (error "probable XC bug in host read-time conditional")))
+                (error "probable XC bug in host read-time conditional: ~S" feature)))
             (member feature list :test #'eq))
     (cons (flet ((subfeature-in-list-p (subfeature)
                    (checked-feature-in-features-list-p subfeature list)))

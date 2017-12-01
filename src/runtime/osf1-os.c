@@ -59,7 +59,7 @@ os_init(char *argv[], char *envp[])
 
 
 os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
 {
     int flags = MAP_PRIVATE|MAP_ANONYMOUS;
     if (addr) flags |= MAP_FIXED;
@@ -79,41 +79,12 @@ os_invalidate(os_vm_address_t addr, os_vm_size_t len)
     }
 }
 
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
-{
-    addr = mmap(addr, len,
-                OS_VM_PROT_ALL,
-                MAP_PRIVATE | MAP_FILE | MAP_FIXED,
-                fd, (off_t) offset);
-
-    if (addr == MAP_FAILED) {
-        perror("mmap");
-        lose("unexpected mmap(..) failure\n");
-    }
-
-    return addr;
-}
-
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
     if (mprotect(address, length, prot) == -1) {
         perror("mprotect");
     }
-}
-
-boolean
-is_valid_lisp_addr(os_vm_address_t addr)
-{
-    int ret;
-    os_vm_address_t newaddr;
-    newaddr=os_trunc_to_page(addr);
-    if((ret=mvalid(newaddr,newaddr-addr+4,OS_VM_PROT_ALL)) == 0)
-        return TRUE;
-    else if(errno==EINVAL)
-        perror("mvalid");
-    return FALSE;
 }
 
 /*

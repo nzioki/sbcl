@@ -165,8 +165,8 @@
             ,vector-form))
          ,@(cond ((not other-form-p)
                   `((t
-                     (sb!c::%type-check-error
-                      ,sequence '(or list vector)))))
+                     (sb!c::%type-check-error ,sequence '(or list vector)
+                                              nil))))
                  (other-form
                   `(((extended-sequence-p ,sequence)
                      (let ((,sequence (truly-the extended-sequence ,sequence)))
@@ -174,7 +174,7 @@
                        ,other-form))
                     (t
                      (sb!c::%type-check-error/c
-                      ,sequence 'sb!kernel::object-not-sequence-error)))))))
+                      ,sequence 'sb!kernel::object-not-sequence-error nil)))))))
 
 ;;; Like SEQ-DISPATCH-CHECKING, but also assert that OTHER-FORM produces
 ;;; a sequence. This assumes that the containing function declares its
@@ -186,7 +186,6 @@
                           (the sequence (values ,other-form)))))
 
 (sb!xc:defmacro %make-sequence-like (sequence length)
-  #!+sb-doc
   "Return a sequence of the same type as SEQUENCE and the given LENGTH."
   `(seq-dispatch ,sequence
      (make-list ,length)
@@ -330,7 +329,6 @@
 
 
 (defun emptyp (sequence)
-  #!+sb-doc
   "Returns T if SEQUENCE is an empty sequence and NIL
    otherwise. Signals an error if SEQUENCE is not a sequence."
   (declare (explicit-check sequence))
@@ -340,7 +338,7 @@
                 (sb!sequence:emptyp sequence)))
 
 (defun elt (sequence index)
-  #!+sb-doc "Return the element of SEQUENCE specified by INDEX."
+  "Return the element of SEQUENCE specified by INDEX."
   (declare (explicit-check sequence))
   (seq-dispatch-checking sequence
                 (do ((count index (1- count))
@@ -357,7 +355,7 @@
                 (sb!sequence:elt sequence index)))
 
 (defun %setelt (sequence index newval)
-  #!+sb-doc "Store NEWVAL as the component of SEQUENCE specified by INDEX."
+  "Store NEWVAL as the component of SEQUENCE specified by INDEX."
   (declare (explicit-check sequence))
   (seq-dispatch-checking sequence
                 (do ((count index (1- count))
@@ -374,7 +372,7 @@
                 (setf (sb!sequence:elt sequence index) newval)))
 
 (defun length (sequence)
-  #!+sb-doc "Return an integer that is the length of SEQUENCE."
+  "Return an integer that is the length of SEQUENCE."
   (declare (explicit-check))
   (seq-dispatch-checking sequence
                 (length sequence)
@@ -382,7 +380,6 @@
                 (sb!sequence:length sequence)))
 
 (defun make-sequence (result-type length &key (initial-element nil iep))
-  #!+sb-doc
   "Return a sequence of the given RESULT-TYPE and LENGTH, with
   elements initialized to INITIAL-ELEMENT."
   (declare (index length) (explicit-check))
@@ -501,12 +498,12 @@
             (oops)))
       (if end
           (let ((n (- end start)))
-            (declare (integer n))
             (when (minusp n)
               (oops))
             (when (plusp n)
               (let* ((head (list nil))
                      (tail head))
+                (declare (dynamic-extent head))
                 (macrolet ((pop-one ()
                              `(let ((tmp (list (pop pointer))))
                                 (setf (cdr tail) tmp
@@ -530,7 +527,6 @@
                   collect (pop pointer))))))
 
 (defun subseq (sequence start &optional end)
-  #!+sb-doc
   "Return a copy of a subsequence of SEQUENCE starting with element number
    START and continuing to the end of SEQUENCE or the optional END."
   (declare (explicit-check sequence :result))
@@ -542,7 +538,7 @@
 ;;;; COPY-SEQ
 
 (defun copy-seq (sequence)
-  #!+sb-doc "Return a copy of SEQUENCE which is EQUAL to SEQUENCE but not EQ."
+  "Return a copy of SEQUENCE which is EQUAL to SEQUENCE but not EQ."
   (declare (explicit-check sequence :result))
   (seq-dispatch-checking sequence
     (list-copy-seq* sequence)
@@ -587,31 +583,72 @@
                 do (setf pointer (cdr (rplaca pointer item)))))))
   sequence)
 
-(defun vector-fill* (sequence item start end)
-  (declare (type index start) (type (or index null) end))
-  (with-array-data ((data sequence)
+(defglobal %%fill-bashers%% (make-array (1+ sb!vm:widetag-mask)))
+#.`(progn
+   ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
+           for et = (sb!vm:saetp-specifier saetp)
+           if (or (null et)
+                  (sb!vm:valid-bit-bash-saetp-p saetp))
+           collect
+           (multiple-value-bind (basher value-transform)
+               (if et
+                   (sb!c::find-basher saetp)
+                   '(lambda (item vector start length)
+                     (declare (ignore item start length))
+                     (data-nil-vector-ref (truly-the (simple-array nil (*)) vector) 0)))
+             `(setf
+               (aref %%fill-bashers%% ,(sb!vm:saetp-typecode saetp))
+               (cons #',basher
+                     ,(if et
+                          `(lambda (sb!c::item)
+                             (declare (type ,et sb!c::item))
+                             ,value-transform)
+                          '#'identity))))
+           else do
+           ;; vector-fill* depends on this assertion
+           (assert (member et '(t (complex double-float)
+                                #!-64-bit (complex single-float)
+                                #!-64-bit double-float)
+                           :test #'equal))))
+
+(defun vector-fill* (vector item start end)
+  (declare (type index start) (type (or index null) end)
+           (optimize speed))
+  (with-array-data ((vector vector)
                     (start start)
                     (end end)
                     :force-inline t
                     :check-fill-pointer t)
-    ;; This has vastly different performance for (VECTOR T) and anything else.
-    ;; The rationale is that it is surprising to users that an unoptimized
-    ;; call to MAKE-ARRAY with no keywords, just an integer dimension,
-    ;; pays such a heavy performance penalty - up to 3x slower - merely
-    ;; because you "care" about the size of your code, which causes FILL
-    ;; not to be transformed into a loop.
-    (if (simple-vector-p sequence)
+    (if (simple-vector-p vector)
         (locally
-         (declare (optimize (speed 3) (safety 0))) ; transform will kick in
-         (fill (truly-the simple-vector sequence) item
-               :start start :end end))
-        (let ((setter (!find-data-vector-setter data)))
-          (declare (optimize (speed 3) (safety 0)))
-          (do ((index start (1+ index)))
-              ((= index end))
-            (declare (index index))
-            (funcall setter data index item)))))
-  sequence)
+            (declare (optimize (speed 3) (safety 0))) ; transform will kick in
+          (fill (truly-the simple-vector vector) item
+                :start start :end end))
+        (let* ((widetag (%other-pointer-widetag vector))
+               (bashers (svref %%fill-bashers%% widetag)))
+          (macrolet ((fill-float (type)
+                       `(locally
+                            (declare (optimize (speed 3) (safety 0))
+                                     (type ,type item)
+                                     (type (simple-array ,type (*))
+                                           vector))
+                          (do ((index start (1+ index)))
+                              ((= index end))
+                            (declare (index index))
+                            (setf (aref vector index) item)))))
+            (cond ((neq bashers 0)
+                   (funcall (truly-the function (car (truly-the cons bashers)))
+                            (funcall (truly-the function (cdr bashers)) item)
+                            vector start (- end start)))
+                  #!-64-bit
+                  ((eq widetag sb!vm:simple-array-double-float-widetag)
+                   (fill-float double-float))
+                  #!-64-bit
+                  ((eq widetag sb!vm:simple-array-complex-single-float-widetag)
+                   (fill-float (complex single-float)))
+                  (t
+                   (fill-float (complex double-float))))))))
+  vector)
 
 (defun string-fill* (sequence item start end)
   (declare (string sequence))
@@ -634,7 +671,6 @@
          (fill data item :start start :end end))))))
 
 (defun fill (sequence item &key (start 0) end)
-  #!+sb-doc
   "Replace the specified elements of SEQUENCE with ITEM."
   (declare (explicit-check sequence :result))
   (seq-dispatch-checking=>seq sequence
@@ -767,7 +803,6 @@
 
 (define-sequence-traverser replace
     (sequence1 sequence2 &rest args &key start1 end1 start2 end2)
-  #!+sb-doc
   "Destructively modifies SEQUENCE1 by copying successive elements
 into it from the SEQUENCE2.
 
@@ -806,7 +841,6 @@ many elements are copied."
 
 ;;;; REVERSE
 (defun reverse (sequence)
-  #!+sb-doc
   "Return a new sequence containing the same elements but in reverse order."
   (declare (explicit-check))
   (seq-dispatch-checking sequence
@@ -852,7 +886,7 @@ many elements are copied."
                       :check-fill-pointer t)
       (declare (ignore start))
       (let* ((tag (%other-pointer-widetag vector))
-             (new-vector (allocate-vector-with-widetag tag length)))
+             (new-vector (allocate-vector-with-widetag tag length nil)))
         (cond ((= tag sb!vm:simple-vector-widetag)
                (do ((left-index 0 (1+ left-index))
                     (right-index end))
@@ -926,7 +960,6 @@ many elements are copied."
   vector)
 
 (defun nreverse (sequence)
-  #!+sb-doc
   "Return a sequence of the same elements in reverse order; the argument
    is destroyed."
   (declare (explicit-check))
@@ -940,7 +973,6 @@ many elements are copied."
 
 
 (defmacro sb!sequence:dosequence ((element sequence &optional return) &body body)
-  #!+sb-doc
   "Executes BODY with ELEMENT subsequently bound to each element of
   SEQUENCE, then returns RETURN."
   (multiple-value-bind (forms decls) (parse-body body nil)
@@ -968,7 +1000,6 @@ many elements are copied."
 ;;;; CONCATENATE
 
 (defun concatenate (result-type &rest sequences)
-  #!+sb-doc
   "Return a new sequence of all the argument sequences concatenated together
   which shares no structure with the original argument sequences of the
   specified RESULT-TYPE."
@@ -1082,7 +1113,7 @@ many elements are copied."
     (declare (index length))
     (do-rest-arg ((seq) sequences)
       (incf length (length seq)))
-    (let ((result (allocate-vector-with-widetag widetag length))
+    (let ((result (allocate-vector-with-widetag widetag length nil))
           (setter (the function (svref %%data-vector-setters%% widetag)))
           (index 0))
       (declare (index index))
@@ -1560,7 +1591,6 @@ many elements are copied."
 (define-sequence-traverser delete
     (item sequence &rest args &key from-end test test-not start
      end count key)
-  #!+sb-doc
   "Return a sequence formed by destructively removing the specified ITEM from
   the given SEQUENCE."
   (declare (type fixnum start)
@@ -1601,7 +1631,6 @@ many elements are copied."
 
 (define-sequence-traverser delete-if
     (predicate sequence &rest args &key from-end start key end count)
-  #!+sb-doc
   "Return a sequence formed by destructively removing the elements satisfying
   the specified PREDICATE from the given SEQUENCE."
   (declare (type fixnum start)
@@ -1642,7 +1671,6 @@ many elements are copied."
 
 (define-sequence-traverser delete-if-not
     (predicate sequence &rest args &key from-end start end key count)
-  #!+sb-doc
   "Return a sequence formed by destructively removing the elements not
   satisfying the specified PREDICATE from the given SEQUENCE."
   (declare (type fixnum start)
@@ -1809,7 +1837,6 @@ many elements are copied."
 (define-sequence-traverser remove
     (item sequence &rest args &key from-end test test-not start
      end count key)
-  #!+sb-doc
   "Return a copy of SEQUENCE with elements satisfying the test (default is
    EQL) with ITEM removed."
   (declare (type fixnum start)
@@ -1830,7 +1857,6 @@ many elements are copied."
 
 (define-sequence-traverser remove-if
     (predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a copy of sequence with elements satisfying PREDICATE removed."
   (declare (type fixnum start)
            (truly-dynamic-extent args))
@@ -1850,7 +1876,6 @@ many elements are copied."
 
 (define-sequence-traverser remove-if-not
     (predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a copy of sequence with elements not satisfying PREDICATE removed."
   (declare (type fixnum start)
            (truly-dynamic-extent args))
@@ -2004,7 +2029,6 @@ many elements are copied."
 
 (define-sequence-traverser remove-duplicates
     (sequence &rest args &key test test-not start end from-end key)
-  #!+sb-doc
   "The elements of SEQUENCE are compared pairwise, and if any two match,
    the one occurring earlier is discarded, unless FROM-END is true, in
    which case the one later in the sequence is discarded. The resulting
@@ -2083,7 +2107,6 @@ many elements are copied."
 
 (define-sequence-traverser delete-duplicates
     (sequence &rest args &key test test-not start end from-end key)
-  #!+sb-doc
   "The elements of SEQUENCE are examined, and if any two match, one is
    discarded. The resulting sequence, which may be formed by destroying the
    given sequence, is returned.
@@ -2227,7 +2250,6 @@ many elements are copied."
 (define-sequence-traverser substitute
     (new old sequence &rest args &key from-end test test-not
          start count end key)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements,
   except that all elements equal to OLD are replaced with NEW."
   (declare (type fixnum start)
@@ -2239,7 +2261,6 @@ many elements are copied."
 
 (define-sequence-traverser substitute-if
     (new predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements
   except that all elements satisfying the PRED are replaced with NEW."
   (declare (type fixnum start)
@@ -2252,7 +2273,6 @@ many elements are copied."
 
 (define-sequence-traverser substitute-if-not
     (new predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements
   except that all elements not satisfying the PRED are replaced with NEW."
   (declare (type fixnum start)
@@ -2268,7 +2288,6 @@ many elements are copied."
 (define-sequence-traverser nsubstitute
     (new old sequence &rest args &key from-end test test-not
          end count key start)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements
   except that all elements equal to OLD are replaced with NEW. SEQUENCE
   may be destructively modified."
@@ -2335,7 +2354,6 @@ many elements are copied."
 
 (define-sequence-traverser nsubstitute-if
     (new predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements
    except that all elements satisfying PREDICATE are replaced with NEW.
    SEQUENCE may be destructively modified."
@@ -2390,7 +2408,6 @@ many elements are copied."
 
 (define-sequence-traverser nsubstitute-if-not
     (new predicate sequence &rest args &key from-end start end count key)
-  #!+sb-doc
   "Return a sequence of the same kind as SEQUENCE with the same elements
    except that all elements not satisfying PREDICATE are replaced with NEW.
    SEQUENCE may be destructively modified."
@@ -2636,7 +2653,6 @@ many elements are copied."
 
 (define-sequence-traverser count-if
     (pred sequence &rest args &key from-end start end key)
-  #!+sb-doc
   "Return the number of elements in SEQUENCE satisfying PRED(el)."
   (declare (type fixnum start)
            (truly-dynamic-extent args))
@@ -2657,7 +2673,6 @@ many elements are copied."
 
 (define-sequence-traverser count-if-not
     (pred sequence &rest args &key from-end start end key)
-  #!+sb-doc
   "Return the number of elements in SEQUENCE not satisfying TEST(el)."
   (declare (type fixnum start)
            (truly-dynamic-extent args))
@@ -2679,7 +2694,6 @@ many elements are copied."
 (define-sequence-traverser count
     (item sequence &rest args &key from-end start end
           key (test #'eql test-p) (test-not nil test-not-p))
-  #!+sb-doc
   "Return the number of elements in SEQUENCE satisfying a test with ITEM,
    which defaults to EQL."
   (declare (type fixnum start)
@@ -2783,7 +2797,6 @@ many elements are copied."
 (define-sequence-traverser mismatch
     (sequence1 sequence2 &rest args &key from-end test test-not
      start1 end1 start2 end2 key)
-  #!+sb-doc
   "The specified subsequences of SEQUENCE1 and SEQUENCE2 are compared
    element-wise. If they are of equal length and match in every element, the
    result is NIL. Otherwise, the result is a non-negative integer, the index
@@ -2969,14 +2982,15 @@ many elements are copied."
     (symbol-macrolet ((this-dimension (car dims)))
       (body (axis dims contents) (null dims)
             (frob 0 dimensions initial-contents)
-            (frob (1+ axis) (cdr dims) content))))
+            (frob (1+ axis) (cdr dims) content)))
+    vector)
 
   ;; Identical to FILL-DATA-VECTOR but avoid reference
   ;; to DIMENSIONS as a list except in case of error.
   (defun fill-array (initial-contents array)
     (declare (explicit-check))
     (let ((rank (array-rank array))
-          (vector (%array-data-vector array)))
+          (vector (%array-data array)))
       (symbol-macrolet ((dimensions (array-dimensions array))
                         (this-dimension (%array-dimension array axis)))
         (body (axis contents) (= axis rank)

@@ -33,7 +33,9 @@
               (make-macro-lambda nil lambda-list body :special-form name
                                  :doc-string-allowed :external
                                  :wrap-block nil)))
-    (declare (ignorable doc))
+    (declare (ignorable doc)) ; unused on host
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
     `(progn
       (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
                       ,fn-name))
@@ -47,7 +49,7 @@
         (,lambda-expr ,whole-var *lexenv*)
         (values))
       #-sb-xc-host
-      (install-guard-function ',name '(:special ,name) ,(or #!+sb-doc doc))
+      (install-guard-function ',name '(:special ,name) ,doc)
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
       (setf (info :function :ir1-convert ',name) #',fn-name)
@@ -266,8 +268,8 @@
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
-;;;               :SLIGHTLY, then print a note if SPEED>=INHIBIT-WARNINGS.
-;;;               T,         then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
 ;;;             :SLIGHTLY is the default.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
@@ -294,9 +296,6 @@
                   ,@(and defun-only
                          doc
                          `(,doc))
-                  ,@(if policy
-                        `((unless (policy ,n-node ,policy)
-                            (give-up-ir1-transform))))
                   ;; What purpose does it serve to allow the transform's body
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
@@ -318,7 +317,10 @@
                 (named-lambda ,(if eval-name "xform" `(deftransform ,name))
                   ,@stuff)
                 ,doc
-                ,important)))))))
+                ,important
+                ,(and policy
+                      `(lambda (,n-node)
+                         (policy ,n-node ,policy))))))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
@@ -336,9 +338,14 @@
          ,@body-decls-doc)
        ,@(loop for name in names
                collect
-               `(%deftransform ',name ',type #',transform-name
-                               ,doc
-                               ,important)))))
+               `(let ((policy ,(and policy
+                                    (let ((node-sym (gensym "NODE")))
+                                      `(lambda (,node-sym)
+                                         (policy ,node-sym ,policy))))))
+                  (%deftransform ',name ',type #',transform-name
+                                 ,doc
+                                 ,important
+                                 policy))))))
 
 ;;;; DEFKNOWN and DEFOPTIMIZER
 
@@ -374,8 +381,8 @@
     (setq attributes (union '(unwind) attributes)))
   (when (member 'flushable attributes)
     (pushnew 'unsafely-flushable attributes))
-  (multiple-value-bind (foldable-call callable arg-types)
-      (make-foldable-call-check arg-types attributes)
+  (multiple-value-bind (callable-map arg-types)
+      (make-callable-map arg-types attributes)
     `(%defknown ',(if (and (consp name)
                            (not (legal-fun-name-p name)))
                       name
@@ -383,35 +390,29 @@
                 '(sfunction ,arg-types ,result-type)
                 (ir1-attributes ,@attributes)
                 (source-location)
-                :foldable-call-check ,foldable-call
-                :callable-check ,callable
+                :callable-map ,callable-map
                 ,@keys)))
 
-(defun make-foldable-call-check (arg-types attributes)
-  (let ((call (member 'call attributes))
-        (fold (member 'foldable attributes)))
-    (if (not call)
-        (values nil nil arg-types)
-        (multiple-value-bind (llks required optional rest keys)
-            (parse-lambda-list
-             arg-types
-             :context :function-type
-             :accept (lambda-list-keyword-mask
-                      '(&optional &rest &key &allow-other-keys))
-             :silent t)
-          (let (vars
-                call-vars
-                arg-count-specified)
-            (labels ((callable-p (x)
-                     (member x '(callable function)))
+(defun make-callable-map (arg-types attributes)
+  (if (member 'call attributes)
+      (multiple-value-bind (llks required optional rest keys)
+          (parse-lambda-list
+           arg-types
+           :context :function-type
+           :accept (lambda-list-keyword-mask
+                    '(&optional &rest &key &allow-other-keys))
+           :silent t)
+        (let (vars
+              call-vars)
+          (labels ((callable-p (x)
+                     (member x '(function function-designator)))
                    (process-var (x &optional (name (gensym)))
                      (if (callable-p (if (consp x)
                                          (car x)
                                          x))
-                         (push (cons name
-                                     (cond ((consp x)
-                                            (setf arg-count-specified t)
-                                            (cadr x))))
+                         (push (list* name
+                                      (cond ((consp x)
+                                             (cdr x))))
                                call-vars)
                          (push name vars))
                      name)
@@ -419,57 +420,80 @@
                      (if (and (consp type)
                               (callable-p (car type)))
                          (car type)
-                         type))
-                   (callable-rest-p (x)
-                     (and (consp x)
-                          (callable-p (car x))
-                          (eql (cadr x) '&rest))))
-              (let* (rest-var
-                     (lambda-list
-                       (cond ((find-if #'callable-rest-p required)
-                              (setf rest-var (gensym))
-                              `(,@(loop for var in required
-                                       collect (process-var var)
-                                       until (callable-rest-p var))
-                                &rest ,rest-var))
-                             (t
-                              `(,@(mapcar #'process-var required)
-                                ,@(and optional
-                                       `(&optional ,@(mapcar #'process-var optional)))
-                                ,@(and rest
-                                       `(&rest ,@(mapcar #'process-var rest)))
-                                ,@(and (ll-kwds-keyp llks)
-                                       `(&key ,@(loop for (key type) in keys
-                                                      for var = (gensym)
-                                                      do (process-var type var)
-                                                      collect `((,key ,var))))))))))
+                         type)))
+            (let* (key-arg
+                   rest-var
+                   (lambda-list
+                     `(,@(mapcar #'process-var required)
+                       ,@(and optional
+                              `(&optional ,@(mapcar #'process-var optional)))
+                       ,@(and rest
+                              `(&rest ,(setf rest-var (process-var (car rest)))))
+                       ,@(and (ll-kwds-keyp llks)
+                              `(&key
+                                ,@(loop for (key type) in keys
+                                        for var = (gensym)
+                                        do (process-var type var)
+                                        collect (if (eq key :key)
+                                                    (let ((var-supplied-p (gensym)))
+                                                      (setf key-arg
+                                                            (cons var var-supplied-p))
+                                                      `((,key ,var) nil ,var-supplied-p))
+                                                    `((,key ,var)))))))))
 
-                (assert call-vars)
-                (values
-                 (and fold
-                      `(lambda ,lambda-list
-                         (declare (ignore ,@vars))
-                         (and ,@(loop for (x) in call-vars
-                                      collect `(constant-fold-arg-p ,x)))))
-                 (and arg-count-specified
-                      `(lambda ,lambda-list
-                         (declare (ignore ,@vars))
-                         ,@(loop for (x . arg-count) in call-vars
-                                 when arg-count
-                                 collect (if (eq arg-count '&rest)
-                                             `(valid-callable-argument ,x (length ,rest-var))
-                                             `(valid-callable-argument ,x ,arg-count)))))
-                 `(,@(mapcar #'process-type required)
-                   ,@(and optional
-                          `(&optional ,@(mapcar #'process-type optional)))
-                   ,@(and (ll-kwds-restp llks)
-                          `(&rest ,@rest))
-                   ,@(and (ll-kwds-keyp llks)
-                          `(&key
-                            ,@(loop for (key type) in keys
-                                    collect `(,key ,(process-type type)))))
-                   ,@(and (ll-kwds-allowp llks)
-                          '(&allow-other-keys)))))))))))
+              (values
+               `(lambda (function ,@lambda-list)
+                  (declare (ignorable ,@vars))
+                  ;; Turn all the (nth-arg n . options) into (arg-lvar . options)
+                  ,@(loop for (lvar args results . options) in call-vars
+                          for rest-p = (typep (car (last args)) '(cons (eql rest-args)))
+                          collect
+                          (labels ((handle-keys (options)
+                                   `(list ,@(loop for (key value) on options by #'cddr
+                                                  collect key
+                                                  collect (if (eq key :key)
+                                                              (destructuring-bind (var . var-p)
+                                                                  key-arg
+                                                                `(and ,var-p
+                                                                      ,var))
+                                                              value))))
+                                   (process-arg (arg)
+                                     (if (consp arg)
+                                         (ecase (car arg)
+                                           (nth-arg
+                                            `(list* ,(nth (cadr arg) lambda-list)
+                                                    ,(handle-keys (cddr arg))))
+                                           (or
+                                            `(list* (list 'or ,@(mapcar #'process-arg (cdr arg))))))
+                                         `(load-time-value (values-specifier-type ',arg)))))
+                            `(and ,lvar
+                                  (funcall function
+                                           ,lvar
+                                           (list*
+                                            ,@(loop for arg in (if rest-p
+                                                                   (butlast args)
+                                                                   args)
+                                                    collect (process-arg arg))
+                                            ,(and rest-p
+                                                  `(loop with rest-options = ',(cdar (last args))
+                                                         for x in ,rest-var
+                                                         collect (list* x rest-options))))
+                                           ,(if results
+                                                (process-arg results)
+                                                '*wild-type*)
+                                           ,@options)))))
+               `(,@(mapcar #'process-type required)
+                 ,@(and optional
+                        `(&optional ,@(mapcar #'process-type optional)))
+                 ,@(and (ll-kwds-restp llks)
+                        `(&rest ,@rest))
+                 ,@(and (ll-kwds-keyp llks)
+                        `(&key
+                          ,@(loop for (key type) in keys
+                                  collect `(,key ,(process-type type)))))
+                 ,@(and (ll-kwds-allowp llks)
+                        '(&allow-other-keys))))))))
+      (values nil arg-types)))
 
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
@@ -670,11 +694,11 @@
            while ,node-var
            do (progn ,@body))))
 
-(defmacro do-nested-cleanups ((cleanup-var block &optional return-value)
+(defmacro do-nested-cleanups ((cleanup-var lexenv &optional return-value)
                               &body body)
   `(block nil
      (map-nested-cleanups
-      (lambda (,cleanup-var) ,@body) ,block ,return-value)))
+      (lambda (,cleanup-var) ,@body) ,lexenv ,return-value)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
 ;;; so that new, extra IR1 conversion related to NODE can be done
@@ -685,6 +709,20 @@
      (%with-ir1-environment-from-node
       ,node
       #'closure-needing-ir1-environment-from-node)))
+
+;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
+;;; taken through the source to reach the form. This provides a way to
+;;; keep track of the location of original source forms, even when
+;;; macroexpansions and other arbitary permutations of the code
+;;; happen. This table is initialized by calling FIND-SOURCE-PATHS on
+;;; the original source.
+;;;
+;;; It is fairly useless to store symbols, characters, or fixnums in
+;;; this table, as 42 is EQ to 42 no matter where in the source it
+;;; appears. GET-SOURCE-PATH and NOTE-SOURCE-PATH functions should be
+;;; always used to access this table.
+(declaim (hash-table *source-paths*))
+(defvar *source-paths*)
 
 (defmacro with-source-paths (&body forms)
   (with-unique-names (source-paths)
@@ -933,7 +971,6 @@
 ;;; We use WITH-SANE-IO-SYNTAX to provide safe defaults, and provide
 ;;; *COMPILER-PRINT-VARIABLE-ALIST* for user customization.
 (defvar *compiler-print-variable-alist* nil
-  #!+sb-doc
   "an association list describing new bindings for special variables
 to be used by the compiler for error-reporting, etc. Eg.
 

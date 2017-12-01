@@ -580,7 +580,6 @@
 ;;;; user interface to the pretty printer
 
 (defun pprint-newline (kind &optional stream)
-  #!+sb-doc
   "Output a conditional newline to STREAM (which defaults to
    *STANDARD-OUTPUT*) if it is a pretty-printing stream, and do
    nothing if not. KIND can be one of:
@@ -602,13 +601,12 @@
   (declare (type (member :linear :miser :fill :mandatory) kind)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-newline stream kind)))
   nil)
 
 (defun pprint-indent (relative-to n &optional stream)
-  #!+sb-doc
   "Specify the indentation to use in the current logical block if
 STREAM \(which defaults to *STANDARD-OUTPUT*) is a pretty-printing
 stream and do nothing if not. (See PPRINT-LOGICAL-BLOCK.) N is the
@@ -626,13 +624,12 @@ line break."
            (type real n)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-indent stream relative-to (truncate n))))
   nil)
 
 (defun pprint-tab (kind colnum colinc &optional stream)
-  #!+sb-doc
   "If STREAM (which defaults to *STANDARD-OUTPUT*) is a pretty-printing
    stream, perform tabbing based on KIND, otherwise do nothing. KIND can
    be one of:
@@ -648,13 +645,12 @@ line break."
            (type unsigned-byte colnum colinc)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-tab stream kind colnum colinc)))
   nil)
 
 (defun pprint-fill (stream list &optional (colon? t) atsign?)
-  #!+sb-doc
   "Output LIST to STREAM putting :FILL conditional newlines between each
    element. If COLON? is NIL (defaults to T), then no parens are printed
    around the output. ATSIGN? is ignored (but allowed so that PPRINT-FILL
@@ -671,7 +667,6 @@ line break."
       (pprint-newline :fill stream))))
 
 (defun pprint-linear (stream list &optional (colon? t) atsign?)
-  #!+sb-doc
   "Output LIST to STREAM putting :LINEAR conditional newlines between each
    element. If COLON? is NIL (defaults to T), then no parens are printed
    around the output. ATSIGN? is ignored (but allowed so that PPRINT-LINEAR
@@ -688,7 +683,6 @@ line break."
       (pprint-newline :linear stream))))
 
 (defun pprint-tabular (stream list &optional (colon? t) atsign? tabsize)
-  #!+sb-doc
   "Output LIST to STREAM tabbing to the next column that is an even multiple
    of TABSIZE (which defaults to 16) between each element. :FILL style
    conditional newlines are also output between each element. If COLON? is
@@ -755,7 +749,6 @@ line break."
 ;; This used to involve rewriting into a sexpr if CONS was involved,
 ;; since it was not an official specifier. But now it is.
 (defun compute-test-fn (ctype type-spec function)
-  (declare (special sb!c::*backend-type-predicates*))
   ;; Avoid compiling code for an existing structure predicate
   (or (and (eq (info :type :kind type-spec) :instance)
            (let ((layout (info :type :compiler-layout type-spec)))
@@ -787,26 +780,28 @@ line break."
 (defun copy-pprint-dispatch (&optional (table *print-pprint-dispatch*))
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((orig (or table *initial-pprint-dispatch-table*))
-         (new (make-pprint-dispatch-table
-               (copy-list (pprint-dispatch-table-entries orig)))))
-    (replace/eql-hash-table (pprint-dispatch-table-cons-entries new)
-                            (pprint-dispatch-table-cons-entries orig))
+         (new (make-pprint-dispatch-table (copy-list (pp-dispatch-entries orig)))))
+    (replace/eql-hash-table (pp-dispatch-cons-entries new)
+                            (pp-dispatch-cons-entries orig))
     new))
 
 (defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((table (or table *initial-pprint-dispatch-table*))
-         (cons-entry
-          (and (consp object)
-               (gethash (car object)
-                        (pprint-dispatch-table-cons-entries table))))
          (entry
-          (dolist (entry (pprint-dispatch-table-entries table) cons-entry)
-            (when (and cons-entry
-                       (entry< entry cons-entry))
-              (return cons-entry))
-            (when (funcall (pprint-dispatch-entry-test-fn entry) object)
-              (return entry)))))
+          (when (or (not (numberp object)) (pp-dispatch-number-matchable-p table))
+            (let ((cons-entry
+                   (and (consp object)
+                        (gethash (car object) (pp-dispatch-cons-entries table)))))
+              (if (not cons-entry)
+                  (dolist (entry (pp-dispatch-entries table) nil)
+                    (when (funcall (pprint-dispatch-entry-test-fn entry) object)
+                      (return entry)))
+                  (dolist (entry (pp-dispatch-entries table) cons-entry)
+                    (when (entry< entry cons-entry)
+                      (return cons-entry))
+                    (when (funcall (pprint-dispatch-entry-test-fn entry) object)
+                      (return entry))))))))
     (if entry
         (values (pprint-dispatch-entry-fun entry) t)
         (values #'output-ugly-object nil))))
@@ -846,8 +841,7 @@ line break."
            (type real priority)
            (type pprint-dispatch-table table))
   (declare (explicit-check))
-  (/show0 "entering SET-PPRINT-DISPATCH, TYPE=...")
-  (/hexstr type)
+  #!+(and sb-show (host-feature sb-xc)) (format t "* SET-PP-DISPATCH ~S~%" type)
   (assert-not-standard-pprint-dispatch-table table 'set-pprint-dispatch)
   (let* ((ctype (or (handler-bind
                         ((parse-unknown-type
@@ -868,14 +862,16 @@ line break."
     (when (and function disabled-p)
       ;; a DISABLED-P test function has to close over the ENTRY
       (setf (pprint-dispatch-entry-test-fn entry) (defer-type-checker entry)))
+    (when (types-equal-or-intersect ctype (specifier-type 'number))
+      (setf (pp-dispatch-number-matchable-p table) t))
     (if consp
-        (let ((hashtable (pprint-dispatch-table-cons-entries table)))
+        (let ((hashtable (pp-dispatch-cons-entries table)))
           (dolist (key (member-type-members (cons-type-car-type ctype)))
             (if function
                 (setf (gethash key hashtable) entry)
                 (remhash key hashtable))))
-        (setf (pprint-dispatch-table-entries table)
-              (let ((list (delete type (pprint-dispatch-table-entries table)
+        (setf (pp-dispatch-entries table)
+              (let ((list (delete type (pp-dispatch-entries table)
                                   :key #'pprint-dispatch-entry-type
                                   :test #'equal)))
                 (if function
@@ -885,7 +881,6 @@ line break."
                     ;; (COMPLEMENT #'entry<) is unstable wrt insertion order.
                     (merge 'list list (list entry) (lambda (a b) (entry< b a)))
                     list)))))
-  (/show0 "about to return NIL from SET-PPRINT-DISPATCH")
   nil)
 
 ;;;; standard pretty-printing routines
@@ -895,11 +890,7 @@ line break."
          (output-ugly-object stream array))
         ((and *print-readably*
               (not (array-readably-printable-p array)))
-         (if *read-eval*
-             (if (vectorp array)
-                 (sb!impl::output-unreadable-vector-readably array stream)
-                 (sb!impl::output-unreadable-array-readably array stream))
-             (print-not-readable-error array stream)))
+         (sb!impl::output-unreadable-array-readably array stream))
         ((vectorp array)
          (pprint-vector stream array))
         (t
@@ -1376,7 +1367,7 @@ line break."
   ;; a non-list object which bypasses START-LOGICAL-BLOCK.
   ;; Also, START-LOGICAL-BLOCK could become an FLET inside here.
   (declare (function proc))
-  (with-pretty-stream (stream (out-synonym-of stream))
+  (with-pretty-stream (stream (out-stream-from-designator stream))
     (if (or (not (listp object)) ; implies obj-supplied-p
             (and (eq (car object) 'quasiquote)
                  ;; We can only bail out from printing this logical block

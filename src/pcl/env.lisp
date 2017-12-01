@@ -160,10 +160,13 @@
 
 (defun !incorporate-cross-compiled-methods (gf-name &key except)
   (assert (generic-function-p (fdefinition gf-name)))
-  (loop for (specializer lambda-list fmf source-loc)
-        across (remove-if (lambda (x) (member x except))
-                          (cdr (assoc gf-name *!trivial-methods*))
-                          :key #'car)
+  (loop for (predicate fmf specializer qualifier lambda-list source-loc)
+        ;; Reversing installs less-specific methods first,
+        ;; so that if perchance we crash mid way through the loop,
+        ;; there is (hopefully) at least some installed method that works.
+        across (nreverse (remove-if (lambda (x) (member x except))
+                                    (cdr (assoc gf-name *!trivial-methods*))
+                                    :key #'third))
         do (multiple-value-bind (specializers arg-info)
                (ecase gf-name
                  (print-object
@@ -173,9 +176,10 @@
                   (values (list (find-class specializer))
                           '(:arg-info (1 . t)))))
              (load-defmethod
-              'standard-method gf-name '() specializers lambda-list
+              'standard-method gf-name
+              (if qualifier (list qualifier)) specializers lambda-list
               `(:function
-                ,(let ((mf (%make-method-function fmf nil)))
+                ,(let ((mf (%make-method-function fmf)))
                    (sb-mop:set-funcallable-instance-function
                     mf (method-function-from-fast-function fmf arg-info))
                    mf)

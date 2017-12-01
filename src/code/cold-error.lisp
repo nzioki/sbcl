@@ -12,7 +12,6 @@
 (in-package "SB!KERNEL")
 
 (!defvar *break-on-signals* nil
-  #!+sb-doc
   "When (TYPEP condition *BREAK-ON-SIGNALS*) is true, then calls to SIGNAL will
    enter the debugger prior to signalling that condition.")
 
@@ -70,19 +69,15 @@
         (setf *break-on-signals* new-value)))))
 
 (defun signal (datum &rest arguments)
-  #!+sb-doc
   "Invokes the signal facility on a condition formed from DATUM and
    ARGUMENTS. If the condition is not handled, NIL is returned. If
    (TYPEP condition *BREAK-ON-SIGNALS*) is true, the debugger is invoked
    before any signalling is done."
-  (let* ((condition
-          (coerce-to-condition datum arguments 'simple-condition 'signal))
-         (handler-clusters *handler-clusters*)
-         (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'signal))
-         ;; possible FIXME: despite that fndb says COERCE-TO-CONDITION
-         ;; returns CONDITION, compiler doesn't know that CONDITION
-         ;; is an INSTANCE and emits a type-check.
-         (layout (%instance-layout condition)))
+  (declare (explicit-check))
+  (%signal (apply #'coerce-to-condition datum 'simple-condition 'signal arguments)))
+(defun %signal (condition)
+  (let ((handler-clusters *handler-clusters*)
+        (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* '%signal)))
     (when *break-on-signals*
       (maybe-break-on-signal condition))
     (do ((cluster (pop handler-clusters) (pop handler-clusters)))
@@ -109,7 +104,7 @@
                                       `((t (symbol-function f))))))))
             (let ((test (car (truly-the cons handler))))
               (when (if (%instancep test) ; a condition classoid cell
-                        (classoid-cell-typep layout test condition)
+                        (classoid-cell-typep test condition)
                         (funcall (cast-to-fun test nil) condition))
                 (funcall (cast-to-fun (cdr handler) t) condition)))))))))
 
@@ -154,7 +149,6 @@
            (1+ *current-error-depth*)))))
 
 (defun error (datum &rest arguments)
-  #!+sb-doc
   "Invoke the signal facility on a condition formed from DATUM and ARGUMENTS.
   If the condition is not handled, the debugger is invoked."
   (/show0 "entering ERROR, argument list=..")
@@ -166,26 +160,23 @@
   (/show0 "done cold-printing ERROR arguments")
 
   (infinite-error-protect
-    (let ((condition (coerce-to-condition datum arguments
-                                          'simple-error 'error))
-          (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'error)))
-      (/show0 "done coercing DATUM to CONDITION")
-      (/show0 "signalling CONDITION from within ERROR")
-      (signal condition)
-      (/show0 "done signalling CONDITION within ERROR")
-      (invoke-debugger condition))))
+   (let ((condition (apply #'coerce-to-condition datum 'simple-error 'error
+                           arguments))
+         (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'error)))
+     (/show0 "signalling CONDITION from within ERROR")
+     (%signal condition)
+     (/show0 "done signalling CONDITION within ERROR")
+     (invoke-debugger condition))))
 
 (defun cerror (continue-string datum &rest arguments)
   (infinite-error-protect
     (with-simple-restart
         (continue "~A" (apply #'format nil continue-string arguments))
-      (let ((condition (coerce-to-condition datum
-                                            arguments
-                                            'simple-error
-                                            'cerror)))
+      (let ((condition (apply #'coerce-to-condition datum
+                              'simple-error 'cerror arguments)))
         (with-condition-restarts condition (list (find-restart 'continue))
           (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'cerror)))
-            (signal condition)
+            (%signal condition)
             (invoke-debugger condition))))))
   nil)
 
@@ -196,46 +187,40 @@
 ;;; applications which try to do similar things with *DEBUGGER-HOOK*
 (defun %break (what &optional (datum "break") &rest arguments)
   (infinite-error-protect
-    (with-simple-restart (continue "Return from ~S." what)
-      (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* '%break)))
-        (invoke-debugger
-         (coerce-to-condition datum arguments 'simple-condition what)))))
+   (with-simple-restart (continue "Return from ~S." what)
+     (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* '%break)))
+       (invoke-debugger
+        (apply #'coerce-to-condition datum 'simple-condition what arguments)))))
   nil)
 
 (defun break (&optional (datum "break") &rest arguments)
-  #!+sb-doc
   "Print a message and invoke the debugger without allowing any possibility
 of condition handling occurring."
   (let ((*debugger-hook* nil) ; as specifically required by ANSI
         (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'break)))
     (apply #'%break 'break datum arguments)))
 
-(defun %warn (datum arguments super default-type)
-  (infinite-error-protect
-    (let ((condition (coerce-to-condition datum arguments default-type 'warn))
-          (superclassoid-name (classoid-name super)))
-      ;: CONDITION is necessarily an INSTANCE,
-      ;; but pedantry requires it be the right subtype of instance.
-      (unless (classoid-typep (%instance-layout condition)
-                              super condition)
-        (error 'simple-type-error
-               :datum datum :expected-type superclassoid-name
-               :format-control "~S does not designate a ~A class"
-               :format-arguments (list datum superclassoid-name)))
-      (restart-case (signal condition)
-        (muffle-warning ()
-          :report "Skip warning."
-          (return-from %warn nil)))
-      (format *error-output* "~&~@<~S: ~3i~:_~A~:>~%"
-              superclassoid-name condition)))
-  nil)
-
+;;; These functions definitions are for cold-init.
+;;; The real definitions are found in 'condition.lisp'
+(defvar *!cold-warn-action* nil)
 (defun warn (datum &rest arguments)
-  #!+sb-doc
-  "Warn about a situation by signalling a condition formed by DATUM and
-   ARGUMENTS. While the condition is being signaled, a MUFFLE-WARNING restart
-   exists that causes WARN to immediately return NIL."
-  (%warn datum arguments (find-classoid 'warning) 'simple-warning))
-
+  (when (and (stringp datum) (plusp (mismatch "defining setf macro" datum)))
+    (return-from warn nil))
+  (let ((action (cond ((boundp '*!cold-warn-action*) *!cold-warn-action*)
+                      ((not (member datum
+                                    '(asterisks-around-constant-variable-name
+                                      redefinition-with-defun)))
+                       'print))))
+    (when (member action '(lose print))
+      (let ((*package* *cl-package*))
+        (write-string "cold WARN: datum=") ; WRITE could be too broken as yet
+        (write (get-lisp-obj-address datum) :radix t :base 16)
+        (write-string " = ")
+        (write datum)
+        (write-char #\space)
+        (write (get-lisp-obj-address arguments) :radix t :base 16)
+        (terpri)))
+    (when (eq action 'lose) (sb!sys:%primitive sb!c:halt))))
 (defun style-warn (datum &rest arguments)
-  (%warn datum arguments (find-classoid 'style-warning) 'simple-style-warning))
+  (declare (notinline warn))
+  (apply 'warn datum arguments))

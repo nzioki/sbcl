@@ -125,8 +125,6 @@
                                    (eql (tn-value x) 0))))))
   (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:generator 0
     (let ((x (if (and (sc-is x immediate)
                       (eql (tn-value x) 0))
@@ -208,7 +206,8 @@
                  (t
                   (setf used-load-tn x)
                   x)))
-             (do-moves (source1 source2 dest1 dest2 &optional (fp cfp-tn))
+             (do-moves (source1 source2 dest1 dest2 &optional (fp cfp-tn)
+                                                              fp-load-tn)
                (cond ((and (stack-p dest1)
                            (stack-p dest2)
                            (not (location= dest1 source1))
@@ -230,13 +229,15 @@
                                             (load-tn vop2)))
                           (setf source1 (load-arg source1 (load-tn vop1))
                                 source2 (load-arg source2 (load-tn vop2))))
-                      (assemble (*code-segment* vop1)
-                        (when (> (tn-offset dest1)
-                                 (tn-offset dest2))
-                          (rotatef dest1 dest2)
-                          (rotatef source1 source2))
-                        (inst stp source1 source2
-                              (@ fp (* (tn-offset dest1) n-word-bytes))))
+                      (when (> (tn-offset dest1)
+                               (tn-offset dest2))
+                        (rotatef dest1 dest2)
+                        (rotatef source1 source2))
+                      (when fp-load-tn
+                        (load-stack-tn fp-load-tn fp)
+                        (setf fp fp-load-tn))
+                      (inst stp source1 source2
+                            (@ fp (* (tn-offset dest1) n-word-bytes)))
                       t)
                      ((and (stack-p source1)
                            (stack-p source2)
@@ -244,13 +245,12 @@
                            (register-p dest2)
                            (not (location= dest1 dest2))
                            (suitable-offsets-p source1 source2))
-                      (assemble (*code-segment* vop1)
-                        (when (> (tn-offset source1)
-                                 (tn-offset source2))
-                          (rotatef dest1 dest2)
-                          (rotatef source1 source2))
-                        (inst ldp dest1 dest2
-                              (@ fp (* (tn-offset source1) n-word-bytes))))
+                      (when (> (tn-offset source1)
+                               (tn-offset source2))
+                        (rotatef dest1 dest2)
+                        (rotatef source1 source2))
+                      (inst ldp dest1 dest2
+                            (@ fp (* (tn-offset source1) n-word-bytes)))
                       t))))
       (case (sb!c::vop-name vop1)
         (move
@@ -266,12 +266,13 @@
                (fp2 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop2))))
                (dest1 (dest vop1))
                (dest2 (dest vop2)))
-           (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)
-             (if (and (stack-p dest1)
-                      (stack-p dest2)
-                      (eq fp1 fp2))
-                 fp1
-                 cfp-tn))))))))
+           (when (eq fp1 fp2)
+             (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)
+               (if (and (stack-p dest1)
+                        (stack-p dest2))
+                   fp1
+                   cfp-tn)
+               (tn-ref-load-tn (tn-ref-across (sb!c::vop-args vop1)))))))))))
 
 
 ;;;; ILLEGAL-MOVE
@@ -418,8 +419,6 @@
             :load-if (not (location= x y))))
   (:results (y :scs (signed-reg unsigned-reg)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))

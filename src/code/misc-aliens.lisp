@@ -11,6 +11,13 @@
 
 (in-package "SB!IMPL")
 
+;;; Declare each of the free space pointers (except dynamic) as an alien var
+(define-alien-variable ("read_only_space_free_pointer"
+                        sb!vm:*read-only-space-free-pointer*)
+    system-area-pointer)
+(define-alien-variable ("static_space_free_pointer" sb!vm:*static-space-free-pointer*)
+  system-area-pointer)
+
 (declaim (inline memmove))
 (define-alien-routine ("memmove" memmove) void
   (dest (* char))
@@ -18,7 +25,6 @@
   (n unsigned-int))
 
 (define-alien-routine ("os_get_errno" get-errno) integer)
-#!+sb-doc
 (setf (fdocumentation 'get-errno 'function)
       "Return the value of the C library pseudo-variable named \"errno\".")
 

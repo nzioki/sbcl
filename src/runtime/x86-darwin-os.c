@@ -384,7 +384,7 @@ catch_exception_raise(mach_port_t exception_port,
 
     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
 
-    if (mach_port_get_context(mach_task_self(), exception_port, (mach_port_context_t *)&th)
+    if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
         != KERN_SUCCESS) {
         lose("Can't find the thread for an exception %p", exception_port);
     }
@@ -475,6 +475,15 @@ catch_exception_raise(mach_port_t exception_port,
         /* Trap call */
         handler = sigtrap_handler;
         break;
+    case EXC_BREAKPOINT:
+        if (single_stepping) {
+            signal = SIGTRAP;
+            /* Clear TF or the signal emulation wrapper won't proceed
+               with single stepping enabled. */
+            thread_state.EFLAGS &= ~0x100;
+            handler = sigtrap_handler;
+            break;
+        }
     default:
         ret = KERN_INVALID_RIGHT;
     }

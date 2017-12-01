@@ -83,7 +83,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;;   (<generator> . (<subentry> ...)).
 ;;; Each subentry is of the form
 ;;;   (<args> <constructor> <system>).
-(defvar *dfun-constructors* ())
+(define-load-time-global *dfun-constructors* ())
 
 ;;; If this is NIL, then the whole mechanism for caching dfun constructors is
 ;;; turned off. The only time that makes sense is when debugging LAP code.
@@ -180,20 +180,21 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;; following are helper functions that short-circuit the generic
 ;;; lookup machinery.
 
-(defvar *standard-classes*
+(defconstant-eqx +standard-classes+
   ;; KLUDGE: order matters!  finding effective slot definitions
   ;; involves calling slot-definition-name, and we need to do that to
   ;; break metacycles, so STANDARD-EFFECTIVE-SLOT-DEFINITION must
   ;; precede STANDARD-DIRECT-SLOT-DEFINITION in this list, at least
   ;; until ACCESSES-STANDARD-CLASS-SLOT-P is generalized
   '(standard-method standard-generic-function standard-class
-    standard-effective-slot-definition standard-direct-slot-definition))
+    standard-effective-slot-definition standard-direct-slot-definition)
+  #'equal)
 
-(defvar *standard-slot-locations* (make-hash-table :test 'equal))
+(define-load-time-global *standard-slot-locations* (make-hash-table :test 'equal))
 
 (defun compute-standard-slot-locations ()
   (let ((new (make-hash-table :test 'equal)))
-    (dolist (class-name *standard-classes*)
+    (dolist (class-name +standard-classes+)
       (let ((class (find-class class-name)))
         (dolist (slot (class-slots class))
           (setf (gethash (cons class (slot-definition-name slot)) new)
@@ -202,7 +203,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 
 (defun maybe-update-standard-slot-locations (class)
   (when (and (eq **boot-state** 'complete)
-             (memq (class-name class) *standard-classes*))
+             (memq (class-name class) +standard-classes+))
     (compute-standard-slot-locations)))
 
 (defun standard-slot-value (object slot-name class)
@@ -213,7 +214,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
         (let ((value (if (funcallable-instance-p object)
                          (funcallable-standard-instance-access object location)
                          (standard-instance-access object location))))
-          (when (eq +slot-unbound+ value)
+          (when (unbound-marker-p value)
             (error "~@<slot ~S of class ~S is unbound in object ~S~@:>"
                    slot-name class object))
           value)
@@ -767,7 +768,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
       (boundp #'(lambda (instance)
                   (let* ((class (class-of instance))
                          (class-name (!bootstrap-get-slot 'class class 'name)))
-                    (not (eq +slot-unbound+
+                    (not (unbound-marker-p
                              (!bootstrap-get-slot class-name
                                                   instance slot-name))))))
       (writer #'(lambda (new-value instance)
@@ -885,7 +886,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
           (t
            (make-final-caching-dfun gf classes-list new-class)))))
 
-(defvar *pcl-misc-random-state* (make-random-state))
+(define-load-time-global *pcl-misc-random-state* (make-random-state))
 
 (defun accessor-miss (gf new object dfun-info)
   (let* ((ostate (type-of dfun-info))
@@ -1113,7 +1114,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
          gf classes))
 
 ;;; Return (CLASS SLOTD ACCESSOR-TYPE) if some method of generic
-;;; function GF accesses a slot of some class in *STANDARD-CLASSES*.
+;;; function GF accesses a slot of some class in +STANDARD-CLASSES+.
 ;;; CLASS is the class accessed, SLOTD is the effective slot definition
 ;;; object of the slot accessed, and ACCESSOR-TYPE is one of the symbols
 ;;; READER or WRITER describing the slot access.
@@ -1144,7 +1145,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
             return (values eslotd 'reader)
             else if (member gf-name writers :test #'equal)
             return (values eslotd 'writer))))
-    (dolist (class-name *standard-classes*)
+    (dolist (class-name +standard-classes+)
       (let ((class (find-class class-name)))
         (multiple-value-bind (slotd accessor-type)
             (standard-class-slot-access gf class)
@@ -1610,7 +1611,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;;
 ;;; FIXME: This table also seems to contain early methods, which should
 ;;; presumably be dropped during the bootstrap.
-(defvar *effective-method-cache* (make-hash-table :test 'eq))
+(define-load-time-global *effective-method-cache* (make-hash-table :test 'eq))
 
 (defun flush-effective-method-cache (generic-function)
   (let ((cache *effective-method-cache*))
@@ -1640,8 +1641,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
       (let* ((key (car methods))
              (ht *effective-method-cache*)
              (ht-value (with-locked-system-table (ht)
-                         (or (gethash key ht)
-                             (setf (gethash key ht) (cons nil nil))))))
+                         (ensure-gethash key ht (cons nil nil)))))
         (if (and (null (cdr methods)) all-applicable-p ; the most common case
                  (null method-alist-p) wrappers-p (not function-p))
             (or (car ht-value)
@@ -1660,20 +1660,30 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                     value)))))))
 
 (defun get-secondary-dispatch-function2 (gf methods types method-alist-p
-                                            wrappers-p all-applicable-p
-                                            all-sorted-p function-p)
-  (if (and all-applicable-p all-sorted-p (not function-p))
-      (if (eq **boot-state** 'complete)
-          (let* ((combin (generic-function-method-combination gf))
-                 (effective (compute-effective-method gf combin methods)))
-            (make-effective-method-function1 gf effective method-alist-p
-                                             wrappers-p))
-          (let ((effective (standard-compute-effective-method gf nil methods)))
-            (make-effective-method-function1 gf effective method-alist-p
-                                             wrappers-p)))
-      (let ((net (generate-discrimination-net
-                  gf methods types all-sorted-p)))
-        (compute-secondary-dispatch-function1 gf net function-p))))
+                                         wrappers-p all-applicable-p
+                                         all-sorted-p function-p)
+  (cond
+    ((not (and all-applicable-p all-sorted-p (not function-p)))
+     (let ((net (generate-discrimination-net
+                 gf methods types all-sorted-p)))
+       (compute-secondary-dispatch-function1 gf net function-p)))
+    ((eq **boot-state** 'complete)
+     (let* ((combin (generic-function-method-combination gf))
+            (effective (compute-effective-method gf combin methods)))
+       (make-effective-method-function1
+        gf effective method-alist-p wrappers-p)))
+    ((eq (generic-function-name gf) 'make-specializer-form-using-class)
+     ;; FIXME: instead of the above form, this should be
+     ;; (eq (generic-function-method-combination gf) *or-method-combination*)
+     ;; but that does not work for reasons I (JM) do not understand.
+     (let* ((combin (generic-function-method-combination gf))
+            (effective (short-compute-effective-method gf combin methods)))
+       (make-effective-method-function1
+        gf effective method-alist-p wrappers-p)))
+    (t
+     (let ((effective (standard-compute-effective-method gf nil methods)))
+       (make-effective-method-function1
+        gf effective method-alist-p wrappers-p)))))
 
 (defun get-effective-method-function (gf methods
                                          &optional method-alist wrappers)

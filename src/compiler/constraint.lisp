@@ -143,8 +143,7 @@
               (:constructor make-conset ())
               (:copier %copy-conset))
     (vector (make-array
-             ;; FIXME: make POWER-OF-TWO-CEILING available earlier?
-             (ash 1 (integer-length (1- (length *constraint-universe*))))
+             (power-of-two-ceiling (length *constraint-universe*))
              :element-type 'bit :initial-element 0)
             :type simple-bit-vector)
     ;; Bit-vectors win over lightweight hashes for copy, union,
@@ -171,8 +170,8 @@
     (declare (type index new-size))
     (setf (conset-vector conset)
           (replace (the simple-bit-vector
-                     (make-array
-                      (ash 1 (integer-length (1- new-size)))
+                      (make-array
+                       (power-of-two-ceiling new-size)
                       :element-type 'bit
                       :initial-element 0))
                    (the simple-bit-vector
@@ -332,7 +331,7 @@
   (macrolet ((ensuref (place default)
                `(or ,place (setf ,place ,default)))
              (ensure-hash (place)
-               `(ensuref ,place (make-hash-table)))
+               `(ensuref ,place (make-hash-table :test #'eq)))
              (ensure-vec (place)
                `(ensuref ,place (make-array 8 :adjustable t :fill-pointer 0))))
     (etypecase y

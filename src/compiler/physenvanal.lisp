@@ -255,7 +255,7 @@
                         ;; Many components have no escapes, so we
                         ;; allocate it lazily.
                         (setf *functional-escape-info*
-                              (make-hash-table))))
+                              (make-hash-table :test #'eq))))
              ((bool ok) (gethash functional table)))
     (if ok
         bool
@@ -264,26 +264,29 @@
           (setf (gethash functional table) nil)
           ;; Then compute the real value.
           (setf (gethash functional table)
-                (or
-                 ;; If the functional has a XEP, it's kind is :EXTERNAL --
-                 ;; which means it may escape. ...but if it
-                 ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
-                 ;; TL-XEP, which means it's a toplevel function -- which in
-                 ;; turn means our search has bottomed out without an escape
-                 ;; path. AVER just to make sure, though.
-                 (and (eq :external (functional-kind functional))
-                      (if (functional-has-external-references-p functional)
-                          (aver (eq 'tl-xep (car (functional-debug-name functional))))
-                          t))
-                 ;; If it has an entry point that may escape, that just as bad.
-                 (and entry (functional-may-escape-p entry))
-                 ;; If it has references to it in functions that may escape, that's bad
-                 ;; too.
-                 (dolist (ref (functional-refs functional) nil)
-                   (binding* ((lvar (ref-lvar ref) :exit-if-null)
-                              (dest (lvar-dest lvar) :exit-if-null))
-                     (when (functional-may-escape-p (node-home-lambda dest))
-                       (return t))))))))))
+                (and
+                 ;; ESCAPE functionals would never escape from their target
+                 (neq (functional-kind functional) :escape)
+                 (or
+                  ;; If the functional has a XEP, it's kind is :EXTERNAL --
+                  ;; which means it may escape. ...but if it
+                  ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
+                  ;; TL-XEP, which means it's a toplevel function -- which in
+                  ;; turn means our search has bottomed out without an escape
+                  ;; path. AVER just to make sure, though.
+                  (and (eq :external (functional-kind functional))
+                       (if (functional-has-external-references-p functional)
+                           (aver (eq 'tl-xep (car (functional-debug-name functional))))
+                           t))
+                  ;; If it has an entry point that may escape, that just as bad.
+                  (and entry (functional-may-escape-p entry))
+                  ;; If it has references to it in functions that may escape, that's bad
+                  ;; too.
+                  (dolist (ref (functional-refs functional) nil)
+                    (binding* ((lvar (ref-lvar ref) :exit-if-null)
+                               (dest (lvar-dest lvar) :exit-if-null))
+                      (when (functional-may-escape-p (node-home-lambda dest))
+                        (return t)))))))))))
 
 (defun exit-should-check-tag-p (exit)
   (declare (type exit exit))
@@ -331,7 +334,7 @@
          (entry (exit-entry exit))
          (cleanup (entry-cleanup entry))
          (info (make-nlx-info cleanup exit))
-         (new-block (insert-cleanup-code exit-block next-block
+         (new-block (insert-cleanup-code (list exit-block) next-block
                                          entry
                                          `(%nlx-entry ',info)
                                          cleanup))
@@ -420,51 +423,52 @@
 ;;;; final decision on stack allocation of dynamic-extent structures
 (defun recheck-dynamic-extent-lvars (component)
   (declare (type component component))
-  (dolist (lambda (component-lambdas component))
-    (loop for entry in (lambda-entries lambda)
-          for cleanup = (entry-cleanup entry)
-          do (when (eq (cleanup-kind cleanup) :dynamic-extent)
-               (collect ((real-dx-lvars))
-                 (loop for what in (cleanup-info cleanup)
-                       do (etypecase what
-                            (cons
-                             (let ((dx (car what))
-                                   (lvar (cdr what)))
-                               (cond ((lvar-good-for-dx-p lvar dx component)
-                                      ;; Since the above check does deep
-                                      ;; checks. we need to deal with the deep
-                                      ;; results in here as well.
-                                      (dolist (cell (handle-nested-dynamic-extent-lvars
-                                                     dx lvar component))
-                                        (let ((real (principal-lvar (cdr cell))))
-                                          (setf (lvar-dynamic-extent real) cleanup)
-                                          (real-dx-lvars real))))
-                                     (t
-                                      (note-no-stack-allocation lvar)
-                                      (setf (lvar-dynamic-extent lvar) nil)))))
-                            (node       ; DX closure
-                             (let* ((call what)
-                                    (arg (first (basic-combination-args call)))
-                                    (funs (lvar-value arg))
-                                    (dx nil))
-                               (dolist (fun funs)
-                                 (binding* ((() (leaf-dynamic-extent fun)
-                                             :exit-if-null)
-                                            (xep (functional-entry-fun fun)
-                                                 :exit-if-null)
-                                            (closure (physenv-closure
-                                                      (get-lambda-physenv xep))))
-                                   (cond (closure
-                                          (setq dx t))
-                                         (t
-                                          (setf (leaf-extent fun) nil)))))
-                               (when dx
-                                 (setf (lvar-dynamic-extent arg) cleanup)
-                                 (real-dx-lvars arg))))))
-                 (let ((real-dx-lvars (delete-duplicates (real-dx-lvars))))
-                   (setf (cleanup-info cleanup) real-dx-lvars)
-                   (setf (component-dx-lvars component)
-                         (append real-dx-lvars (component-dx-lvars component))))))))
+  (let (*dx-combination-p-check-local*) ;; catch unconverted combinations
+    (dolist (lambda (component-lambdas component))
+      (loop for entry in (lambda-entries lambda)
+            for cleanup = (entry-cleanup entry)
+            do (when (eq (cleanup-kind cleanup) :dynamic-extent)
+                 (collect ((real-dx-lvars))
+                   (loop for what in (cleanup-info cleanup)
+                         do (etypecase what
+                              (cons
+                               (let ((dx (car what))
+                                     (lvar (cdr what)))
+                                 (cond ((lvar-good-for-dx-p lvar dx component)
+                                        ;; Since the above check does deep
+                                        ;; checks. we need to deal with the deep
+                                        ;; results in here as well.
+                                        (dolist (cell (handle-nested-dynamic-extent-lvars
+                                                       dx lvar component))
+                                          (let ((real (principal-lvar (cdr cell))))
+                                            (setf (lvar-dynamic-extent real) cleanup)
+                                            (real-dx-lvars real))))
+                                       (t
+                                        (note-no-stack-allocation lvar)
+                                        (setf (lvar-dynamic-extent lvar) nil)))))
+                              (node     ; DX closure
+                               (let* ((call what)
+                                      (arg (first (basic-combination-args call)))
+                                      (funs (lvar-value arg))
+                                      (dx nil))
+                                 (dolist (fun funs)
+                                   (binding* ((() (leaf-dynamic-extent fun)
+                                               :exit-if-null)
+                                              (xep (functional-entry-fun fun)
+                                                   :exit-if-null)
+                                              (closure (physenv-closure
+                                                        (get-lambda-physenv xep))))
+                                     (cond (closure
+                                            (setq dx t))
+                                           (t
+                                            (setf (leaf-extent fun) nil)))))
+                                 (when dx
+                                   (setf (lvar-dynamic-extent arg) cleanup)
+                                   (real-dx-lvars arg))))))
+                   (let ((real-dx-lvars (delete-duplicates (real-dx-lvars))))
+                     (setf (cleanup-info cleanup) real-dx-lvars)
+                     (setf (component-dx-lvars component)
+                           (append real-dx-lvars (component-dx-lvars component)))))))))
   (values))
 
 ;;;; cleanup emission
@@ -485,20 +489,19 @@
 ;;; We don't need to adjust the ending cleanup of the cleanup block,
 ;;; since the cleanup blocks are inserted at the start of the DFO, and
 ;;; are thus never scanned.
-(defun emit-cleanups (block1 block2)
-  (declare (type cblock block1 block2))
+(defun emit-cleanups (pred-blocks succ-block)
   (collect ((code)
             (reanalyze-funs))
-    (let ((cleanup2 (block-start-cleanup block2)))
-      (do-nested-cleanups (cleanup block1)
-        (when (eq cleanup cleanup2)
+    (let ((succ-cleanup (block-start-cleanup succ-block)))
+      (do-nested-cleanups (cleanup (block-end-lexenv (car pred-blocks)))
+        (when (eq cleanup succ-cleanup)
           (return))
         (let* ((node (cleanup-mess-up cleanup))
                (args (when (basic-combination-p node)
                        (basic-combination-args node))))
           (ecase (cleanup-kind cleanup)
             (:special-bind
-             (code `(%special-unbind 1)))
+             (code `(%special-unbind ',(leaf-source-name (lvar-value (car args))))))
             (:catch
              (code `(%catch-breakup)))
             (:unwind-protect
@@ -511,26 +514,29 @@
                (code `(%lexical-exit-breakup ',nlx))))
             (:dynamic-extent
              (when (cleanup-info cleanup)
-               (code `(%cleanup-point))))))))
+               (code `(%cleanup-point))))
+            (:restore-nsp
+             (code `(%primitive set-nsp ,(ref-leaf node))))))))
     (flet ((coalesce-unbinds (code)
              code
-             #!+(and sb-thread unbind-n-vop)
-             (loop with cleanup
-                   while code
-                   do (setf cleanup (pop code))
-                   collect (if (eq (car cleanup) '%special-unbind)
-                               `(%special-unbind
-                                 ,(1+ (loop while (eq (caar code) '%special-unbind)
-                                            do (pop code)
-                                            count t)))
-                               cleanup))))
+              #!+(and sb-thread unbind-n-vop)
+              (loop with cleanup
+                    while code
+                    do (setf cleanup (pop code))
+                    collect (if (eq (car cleanup) '%special-unbind)
+                                `(%special-unbind
+                                  ,(cadr cleanup)
+                                  ,@(loop while (eq (caar code) '%special-unbind)
+                                          collect (cadar code)
+                                          do (pop code)))
+                                cleanup))))
      (when (code)
-       (aver (not (node-tail-p (block-last block1))))
+       (aver (not (node-tail-p (block-last (car pred-blocks)))))
        (insert-cleanup-code
-        block1 block2 (block-last block1) `(progn ,@(coalesce-unbinds (code))))
+        pred-blocks succ-block (block-last (car pred-blocks))
+        `(progn ,@(coalesce-unbinds (code))))
        (dolist (fun (reanalyze-funs))
          (locall-analyze-fun-1 fun)))))
-
   (values))
 
 ;;; Loop over the blocks in COMPONENT, calling EMIT-CLEANUPS when we
@@ -553,7 +559,19 @@
                              (eq (node-enclosing-cleanup
                                   (cleanup-mess-up cleanup2))
                                  cleanup1)))
-              (emit-cleanups block1 block2)))))))
+              ;; If multiple blocks with the same cleanups end up at the same block
+              ;; issue only one cleanup, e.g. (let (*) (if x 1 2))
+              ;;
+              ;; Possible improvement: (let (*) (if x (let (**) 1) 2))
+              ;; unbinding * only once.
+              (emit-cleanups (loop for pred in (block-pred block2)
+                                   when (or (eq pred block1)
+                                            (and
+                                             (block-start pred)
+                                             (eq (block-end-cleanup pred) cleanup1)
+                                             (eq (block-physenv pred) env2)))
+                                   collect pred)
+                             block2)))))))
   (values))
 
 ;;; Mark optimizable tail-recursive uses of function result

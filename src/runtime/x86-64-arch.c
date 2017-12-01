@@ -26,20 +26,26 @@
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
+#include "unaligned.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 
-#define BREAKPOINT_INST 0xcc    /* INT3 */
-#define UD2_INST 0x0b0f         /* UD2 */
 
-#ifndef LISP_FEATURE_UD2_BREAKPOINTS
-#define BREAKPOINT_WIDTH 1
-#else
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
+#define UD2_INST 0x0b0f         /* UD2 */
 #define BREAKPOINT_WIDTH 2
+#else
+#ifdef LISP_FEATURE_INT4_BREAKPOINTS
+# define BREAKPOINT_INST 0xce    /* INTO */
+#else
+# define BREAKPOINT_INST 0xcc    /* INT3 */
+#endif
+#define BREAKPOINT_WIDTH 1
 #endif
 
 unsigned int cpuid_fn1_ecx;
+unsigned int avx_supported = 0;
 
 static void cpuid(unsigned info, unsigned subinfo,
                   unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx)
@@ -61,14 +67,27 @@ static void cpuid(unsigned info, unsigned subinfo,
 #endif
 }
 
+static void xgetbv(unsigned *eax, unsigned *edx)
+{
+  __asm__("xgetbv;"
+          :"=a" (*eax), "=d" (*edx)
+          : "c" (0));
+}
+
 void arch_init(void)
 {
   unsigned int eax, ebx, ecx, edx;
 
   cpuid(0, 0, &eax, &ebx, &ecx, &edx);
   if (eax >= 1) { // see if we can execute basic id function 1
+      unsigned avx_mask = 0x18000000; // OXSAVE and AVX
       cpuid(1, 0, &eax, &ebx, &ecx, &edx);
       cpuid_fn1_ecx = ecx;
+      if ((ecx & avx_mask) == avx_mask) {
+          xgetbv(&eax, &edx);
+          if ((eax & 0x06) == 0x06) // YMM and XMM
+              avx_supported = 1;
+      }
   }
 }
 
@@ -147,9 +166,7 @@ void arch_skip_instruction(os_context_t *context)
      * past it. Skip the code; after that, if the code is an
      * error-trap or cerror-trap then skip the data bytes that follow. */
 
-    int vlen;
     long code;
-
 
     /* Get and skip the Lisp interrupt code. */
     code = *(char*)(*os_context_pc_addr(context))++;
@@ -157,12 +174,8 @@ void arch_skip_instruction(os_context_t *context)
         {
         case trap_Error:
         case trap_Cerror:
-            /* Lisp error arg vector length */
-            vlen = *(char*)(*os_context_pc_addr(context))++;
-            /* Skip Lisp error arg data bytes. */
-            while (vlen-- > 0) {
-                ++*os_context_pc_addr(context);
-            }
+            skip_internal_error(context);
+
             break;
 
         case trap_Breakpoint:           /* not tested */
@@ -369,10 +382,15 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
         *os_context_pc_addr(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
+#elif defined(LISP_FEATURE_INT4_BREAKPOINTS) && !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
+    if (*((unsigned char *)*os_context_pc_addr(context)) == BREAKPOINT_INST) {
+        *os_context_pc_addr(context) += BREAKPOINT_WIDTH;
+        return sigtrap_handler(signal, siginfo, context);
+    }
 #endif
 
     fake_foreign_function_call(context);
-    lose("Unhandled SIGILL.");
+    lose("Unhandled SIGILL at %p.", *os_context_pc_addr(context));
 }
 
 #ifdef X86_64_SIGFPE_FIXUP
@@ -413,7 +431,11 @@ sigfpe_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 {
     unsigned int *mxcsr = arch_os_context_mxcsr_addr(context);
 
-    if (siginfo->si_code == 0) { /* XMM exception */
+#ifndef LISP_FEATURE_DARWIN
+    /* Darwin doesn't handle accrued bits right. */
+    if (siginfo->si_code == 0)
+#endif
+    { /* XMM exception */
         siginfo->si_code = mxcsr_to_code(*mxcsr);
 
         /* Clear sticky exception flag. */
@@ -459,23 +481,12 @@ arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 {
-    uword_t addr = (uword_t)target_addr;
-    int i;
-
-    *reloc_addr++ = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
-    *reloc_addr++ = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
-    *reloc_addr++ = 0x00; /* 32-bit displacement field = 0 */
-    *reloc_addr++ = 0x00; /* ... */
-    *reloc_addr++ = 0x00; /* ... */
-    *reloc_addr++ = 0x00; /* ... */
-
-    for (i = 0; i < 8; i++) {
-        *reloc_addr++ = addr & 0xff;
-        addr >>= 8;
-    }
-
+    reloc_addr[0] = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
+    reloc_addr[1] = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
+    UNALIGNED_STORE32((reloc_addr+2), 0); /* 32-bit displacement field = 0 */
+    UNALIGNED_STORE64((reloc_addr+6), (uword_t)target_addr);
     /* write a nop for good measure. */
-    *reloc_addr = 0x90;
+    reloc_addr[14] = 0x90;
 }
 
 void
@@ -539,3 +550,34 @@ arch_set_fp_modes(unsigned int mxcsr)
     temp = mxcsr;
     asm ("ldmxcsr %0" : : "m" (temp));
 }
+
+#ifdef LISP_FEATURE_IMMOBILE_CODE
+/// Return the Lisp object that fdefn's raw_addr slot jumps to.
+/// This will either be:
+/// (1) a simple-fun,
+/// (2) a funcallable-instance with an embedded trampoline that makes
+///     it resemble a simple-fun in terms of call convention, or
+/// (3) a code-component with no simple-fun within it, that makes
+///     closures and other funcallable-instances look like simple-funs.
+lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
+    extern unsigned asm_routines_end;
+    if (((lispobj)fdefn->raw_addr & 0xFE) == 0xE8) {  // looks good
+        int32_t offs = UNALIGNED_LOAD32((char*)&fdefn->raw_addr + 1);
+        unsigned int raw_fun =
+            (int)(long)&fdefn->raw_addr + 5 + offs; // 5 = length of "JMP rel32"
+        switch (((unsigned char*)&fdefn->raw_addr)[5]) {
+        case 0x00: // no closure/fin trampoline
+          // If the target is an assembly routine, there is no simple-fun
+          // that corresponds to the entry point. The code is kept live
+          // by *ASSEMBLER-OBJECTS*. Otherwise, return the simple-fun.
+          return raw_fun < asm_routines_end ? 0 : raw_fun - FUN_RAW_ADDR_OFFSET;
+        case 0x48: // embedded funcallable instance trampoline
+          return (raw_fun - (4<<WORD_SHIFT)) | FUN_POINTER_LOWTAG;
+        case 0x90: // general closure/fin trampoline
+          return (raw_fun - offsetof(struct code, constants)) | OTHER_POINTER_LOWTAG;
+        }
+    } else if (fdefn->raw_addr == 0)
+        return 0;
+    lose("Can't decode fdefn raw addr @ %p: %p\n", fdefn, fdefn->raw_addr);
+}
+#endif

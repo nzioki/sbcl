@@ -66,6 +66,7 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 16)
 (define-storage-base control-stack :unbounded :size 2 :size-increment 1)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
@@ -78,6 +79,7 @@
 ;; {,COMPLEX-}{SINGLE,DOUBLE}-REG SCs below.
 #!-arm-vfp
 (error "Don't know how many float registers for non-VFP systems")
+)
 
 (!define-storage-classes
 
@@ -223,24 +225,24 @@
 (defun immediate-constant-sc (value)
   (typecase value
     (null
-     (sc-number-or-lose 'null))
+     null-sc-number)
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)

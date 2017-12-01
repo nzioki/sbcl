@@ -13,7 +13,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) 'sb!vm)
+  (import '(reg-tn-encoding) "SB!VM")
   ;; Imports from SB-VM into this package
   (import '(;; SBs, SCs, and TNs
             sb!vm::immediate-constant
@@ -1149,14 +1149,14 @@
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   :pinned
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 
 (defun emit-compute-inst (segment vop dst src label temp calc)

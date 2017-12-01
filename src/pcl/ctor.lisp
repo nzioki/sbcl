@@ -177,6 +177,9 @@
                (mapcar #'arg-name list))))
     (list* 'ctor class-name safe-code-p (munge initargs))))
 
+(declaim (ftype (sfunction * function)
+                ensure-ctor ensure-allocator))
+
 ;;; Keep this a separate function for testing.
 (defun ensure-ctor (function-name class-name initargs safe-code-p)
   (with-world-lock ()
@@ -342,62 +345,59 @@
       (setf table (nth-value 1 (put-ctor ctor table))))
     table))
 
-(defun ensure-cached-ctor (class-name store initargs safe-code-p)
-  (flet ((maybe-ctor-for-caching ()
-           (if (typep class-name '(or symbol class))
-               (let ((name (make-ctor-function-name class-name initargs safe-code-p)))
-                 (ensure-ctor name class-name initargs safe-code-p))
-               ;; Invalid first argument: let MAKE-INSTANCE worry about it.
-               (return-from ensure-cached-ctor
-                 (values (lambda (&rest ctor-parameters)
-                           (let (mi-initargs)
-                             (doplist (key value) initargs
-                               (push key mi-initargs)
-                               (push (if (constantp value)
-                                         value
-                                         (pop ctor-parameters))
-                                     mi-initargs))
-                             (apply #'make-instance class-name (nreverse mi-initargs))))
-                         store)))))
-    (if (listp store)
-        (multiple-value-bind (ctor list) (find-ctor class-name store)
-          (if ctor
-              (values ctor list)
-              (let ((ctor (maybe-ctor-for-caching)))
-                (if (< (length list) +ctor-list-max-size+)
-                    (values ctor (cons ctor list))
-                    (values ctor (ctor-list-to-table list))))))
-       (let ((ctor (get-ctor class-name store)))
-         (if ctor
-             (values ctor store)
-             (put-ctor (maybe-ctor-for-caching) store))))))
+(declaim (ftype (function * (values function t &optional))
+                ensure-cached-ctor ensure-cached-allocator))
 
-(defun ensure-cached-allocator (class store)
-  (flet ((maybe-ctor-for-caching ()
-           (if (classp class)
-               (let ((function-name (list 'ctor 'allocator class)))
-                 (declare (dynamic-extent function-name))
-                 (with-world-lock ()
-                   (or (gethash function-name *all-ctors*)
-                       (make-allocator (copy-list function-name) class))))
-               ;; Invalid first argument: let ALLOCATE-INSTANCE worry about it.
-               (return-from ensure-cached-allocator
-                 (values (lambda ()
-                           (declare (notinline allocate-instance))
-                           (allocate-instance class))
-                         store)))))
-    (if (listp store)
-        (multiple-value-bind (ctor list) (find-ctor class store)
-          (if ctor
-              (values ctor list)
-              (let ((ctor (maybe-ctor-for-caching)))
-                (if (< (length list) +ctor-list-max-size+)
-                    (values ctor (cons ctor list))
-                    (values ctor (ctor-list-to-table list))))))
-        (let ((ctor (get-ctor class store)))
-          (if ctor
-              (values ctor store)
-              (put-ctor (maybe-ctor-for-caching) store))))))
+(flet ((get-or-put-ctor (class store thunk)
+         (declare (type function thunk))
+         (if (listp store)
+             (multiple-value-bind (ctor list) (find-ctor class store)
+               (if ctor
+                   (values ctor list)
+                   (let ((ctor (funcall thunk)))
+                     (if (< (length list) +ctor-list-max-size+)
+                         (values ctor (cons ctor list))
+                         (values ctor (ctor-list-to-table list))))))
+             (let ((ctor (get-ctor class store)))
+               (if ctor
+                   (values ctor store)
+                   (put-ctor (funcall thunk) store))))))
+
+  (defun ensure-cached-ctor (class-name store initargs safe-code-p)
+    (get-or-put-ctor
+     class-name store
+     (lambda ()
+       (if (typep class-name '(or symbol class))
+           (let ((name (make-ctor-function-name class-name initargs safe-code-p)))
+             (ensure-ctor name class-name initargs safe-code-p))
+           ;; Invalid first argument: let MAKE-INSTANCE worry about it.
+           (return-from ensure-cached-ctor
+             (values (lambda (&rest ctor-parameters)
+                       (collect ((initargs))
+                         (doplist (key value) initargs
+                           (initargs key)
+                           (initargs (if (constantp value)
+                                         value
+                                         (pop ctor-parameters))))
+                         (apply #'make-instance class-name (initargs))))
+                     store))))))
+
+  (defun ensure-cached-allocator (class store)
+    (get-or-put-ctor
+     class store
+     (lambda ()
+       (if (classp class)
+           (let ((function-name (list 'ctor 'allocator class)))
+             (declare (dynamic-extent function-name))
+             (with-world-lock ()
+               (or (gethash function-name *all-ctors*)
+                   (make-allocator (copy-list function-name) class))))
+           ;; Invalid first argument: let ALLOCATE-INSTANCE worry about it.
+           (return-from ensure-cached-allocator
+             (values (lambda ()
+                       (declare (notinline allocate-instance))
+                       (allocate-instance class))
+                     store)))))))
 
 ;;; ***********************************************
 ;;; Compile-Time Expansion of MAKE-INSTANCE *******
@@ -427,45 +427,44 @@
       (values nil t)
       (allocate-instance->constructor-call class)))
 
+;;; Build an inline cache: a CONS, with the actual cache in the CDR.
+(defun make-ctor-inline-cache-form
+    (ensure-ctor-name class-arg &optional ensure-ctor-args ctor-args)
+  `(locally (declare (disable-package-locks .cache. .class-arg. .store. .fun.))
+     (binding* ((.cache. (load-time-value (cons 'ctor-cache nil)))
+                (.store. (cdr .cache.))
+                (.class-arg. ,class-arg)
+                ((.fun. .new-store.)
+                 (,ensure-ctor-name .class-arg. .store. ,@ensure-ctor-args)))
+       ;; Thread safe: if multiple threads hit this in parallel, the
+       ;; update from the other one is just lost -- no harm done,
+       ;; except for the need to redo the work next time.
+       (unless (eq .store. .new-store.)
+         (setf (cdr .cache.) .new-store.))
+       (funcall .fun. ,@ctor-args))))
+
 (defun allocate-instance->constructor-call (class-arg)
-  (let ((constant-class (if (classp class-arg)
-                            class-arg
-                            (and (proper-list-of-length-p class-arg 2)
-                                 (eq (car class-arg) 'find-class)
-                                 (proper-list-of-length-p (cadr class-arg) 2)
-                                 (eq (caadr class-arg) 'quote)
-                                 (symbolp (cadadr class-arg))
-                                 (cadadr class-arg)))))
-    (if constant-class
-        (let* ((class-or-name constant-class)
-               (function-name (list 'ctor 'allocator class-or-name)))
-          (sb-int:check-deprecated-type (if (classp class-or-name)
-                                            (class-name class-or-name)
-                                            class-or-name))
-          ;; Return code constructing a ctor at load time, which,
-          ;; when called, will set its funcallable instance
-          ;; function to an optimized constructor function.
-          `(funcall (truly-the function
-                               (load-time-value
-                                (ensure-allocator ',function-name ',class-or-name) t))))
-        `(locally (declare (disable-package-locks .cache. .class-arg. .store. .fun.))
-           (let* ((.cache. (load-time-value (cons 'ctor-cache nil)))
-                  (.store. (cdr .cache.))
-                  (.class-arg. ,class-arg))
-             (multiple-value-bind (.fun. .new-store.)
-                 (ensure-cached-allocator .class-arg. .store.)
-               ;; Thread safe: if multiple threads hit this in
-               ;; parallel, the update from the other one is
-               ;; just lost -- no harm done, except for the need
-               ;; to redo the work next time.
-               (unless (eq .store. .new-store.)
-                 (setf (cdr .cache.) .new-store.))
-               (funcall (truly-the function .fun.))))))))
+  (flet ((make-allocator-form (class-or-name)
+           (sb-int:check-deprecated-type class-or-name)
+           (let ((function-name (list 'ctor 'allocator class-or-name)))
+             ;; Return code constructing a ctor at load time, which,
+             ;; when called, will set its funcallable instance
+             ;; function to an optimized constructor function.
+             `(funcall (load-time-value
+                        (ensure-allocator ',function-name ',class-or-name) t)))))
+    (cond
+      ((classp class-arg)
+       (make-allocator-form class-arg))
+      ((typep class-arg '(cons (eql find-class)
+                               (cons (cons (eql quote) (cons symbol null)) null)))
+       (let ((class-name (second (second class-arg))))
+         (make-allocator-form class-name)))
+      (t
+       (make-ctor-inline-cache-form 'ensure-cached-allocator class-arg)))))
 
 (defun make-instance->constructor-call (form safe-code-p)
   (destructuring-bind (class-arg &rest args) (cdr form)
-    (flet (;;
-           ;; Return the name of parameter number I of a constructor
+    (flet (;; Return the name of parameter number I of a constructor
            ;; function.
            (parameter-name (i)
              (format-symbol *pcl-package* ".P~D." i))
@@ -480,54 +479,47 @@
                       (when (or (null more)
                                 (not (constant-symbol-p key))
                                 (eq :allow-other-keys (constant-form-value key)))
-                        (return-from make-instance->constructor-call nil)))))
+                        (return-from make-instance->constructor-call nil))))
+           (maybe-expand-constant (value)
+             (if (symbolp value)
+                 (constant-form-value value)
+                 value)))
       (check-args)
       ;; Collect a plist of initargs and constant values/parameter names
       ;; in INITARGS.  Collect non-constant initialization forms in
       ;; VALUE-FORMS.
-      (multiple-value-bind (initargs value-forms)
+      (multiple-value-bind (keys initargs value-forms)
           (loop for (key value) on args by #'cddr and i from 0
+                ;; Initarg key
+                collect (constant-form-value key) into keys
                 collect (constant-form-value key) into initargs
+                ;; Initarg value
                 if (constantp value)
-                collect value into initargs
+                collect (maybe-expand-constant value) into keys
+                and collect value into initargs
                 else
-                collect (parameter-name i) into initargs
+                collect (parameter-name i) into keys
+                and collect (parameter-name i) into initargs
                 and collect value into value-forms
                 finally
-                (return (values initargs value-forms)))
-        (if (constant-class-p)
-            (let* ((class-or-name (constant-form-value class-arg))
-                   (function-name (make-ctor-function-name class-or-name initargs
-                                                           safe-code-p)))
-              (sb-int:check-deprecated-type (if (classp class-or-name)
-                                                (class-name class-or-name)
-                                                class-or-name))
-              ;; Return code constructing a ctor at load time, which,
-              ;; when called, will set its funcallable instance
-              ;; function to an optimized constructor function.
-              `(funcall (truly-the function
-                                   (load-time-value
-                                    (ensure-ctor ',function-name ',class-or-name ',initargs
-                                                 ',safe-code-p)
-                                    t))
-                        ,@value-forms))
-            (when (and class-arg (not (constantp class-arg)))
-              ;; Build an inline cache: a CONS, with the actual cache
-              ;; in the CDR.
-              `(locally (declare (disable-package-locks .cache. .class-arg. .store. .fun.
-                                                        make-instance))
-                 (let* ((.cache. (load-time-value (cons 'ctor-cache nil)))
-                        (.store. (cdr .cache.))
-                        (.class-arg. ,class-arg))
-                   (multiple-value-bind (.fun. .new-store.)
-                       (ensure-cached-ctor .class-arg. .store. ',initargs ',safe-code-p)
-                     ;; Thread safe: if multiple threads hit this in
-                     ;; parallel, the update from the other one is
-                     ;; just lost -- no harm done, except for the need
-                     ;; to redo the work next time.
-                     (unless (eq .store. .new-store.)
-                       (setf (cdr .cache.) .new-store.))
-                     (funcall (truly-the function .fun.) ,@value-forms))))))))))
+                (return (values keys initargs value-forms)))
+        (cond
+          ((constant-class-p)
+           (let* ((class-or-name (constant-form-value class-arg))
+                  (function-name (make-ctor-function-name class-or-name keys
+                                                          safe-code-p)))
+             (sb-int:check-deprecated-type class-or-name)
+             ;; Return code constructing a ctor at load time, which,
+             ;; when called, will set its funcallable instance
+             ;; function to an optimized constructor function.
+             `(funcall (load-time-value
+                        (ensure-ctor ',function-name ',class-or-name ',initargs
+                                     ',safe-code-p)
+                        t)
+                       ,@value-forms)))
+          ((and class-arg (not (constantp class-arg)))
+           (make-ctor-inline-cache-form
+            'ensure-cached-ctor class-arg `(',initargs ',safe-code-p) value-forms)))))))
 
 ;;; **************************************************
 ;;; Load-Time Constructor Function Generation  *******
@@ -537,8 +529,8 @@
 ;;; SHARED-INITIALIZE methods.  One cannot initialize these variables
 ;;; to the right values here because said functions don't exist yet
 ;;; when this file is first loaded.
-(defvar *the-system-ii-method* nil)
-(defvar *the-system-si-method* nil)
+(define-load-time-global *the-system-ii-method* nil)
+(define-load-time-global *the-system-si-method* nil)
 
 (defun install-optimized-constructor (ctor)
   (with-world-lock ()
@@ -563,7 +555,8 @@
               (apply
                (let ((*compiling-optimized-constructor* t))
                  (handler-bind ((compiler-note #'muffle-warning))
-                   (compile nil `(lambda ,names ,form))))
+                   (compile nil `(lambda ,names (declare #.*optimize-speed*)
+                                   ,form))))
                locations)
               (ctor-state ctor) (if optimizedp 'optimized 'fallback))))))
 
@@ -791,12 +784,12 @@
          (allocation-function (raw-instance-allocator class))
          (slots-fetcher (slots-fetcher class)))
     (if (eq allocation-function 'allocate-standard-instance)
-        `(let ((.instance. (%make-standard-instance nil 0))
+        `(let ((.instance. (%make-standard-instance nil #-compact-instance-header 0))
                (.slots. (make-array
                          ,(layout-length wrapper)
                          ,@(when early-unbound-markers-p
                                  '(:initial-element +slot-unbound+)))))
-           (setf (std-instance-wrapper .instance.) ,wrapper)
+           (setf (%instance-layout .instance.) ,wrapper)
            (setf (std-instance-slots .instance.) .slots.)
            ,body
            .instance.)
@@ -1018,8 +1011,7 @@
                                (if (member slotd sbuc-slots :test #'eq)
                                    `(not (slot-boundp-using-class
                                           ,class .instance. ,slotd))
-                                   `(eq (clos-slots-ref .slots. ,i)
-                                        +slot-unbound+))))
+                                   `(unbound-marker-p (clos-slots-ref .slots. ,i)))))
                         (ecase kind
                           ((nil)
                            (unless early-unbound-markers-p
@@ -1217,7 +1209,7 @@
     (when invalid-keys
       ;; FIXME: should have an operation here, and maybe a set of
       ;; valid keys.
-      (error 'initarg-error :class class :initargs invalid-keys))))
+      (initarg-error class invalid-keys))))
 
 (defun check-ri-initargs (instance initargs)
   (let* ((class (class-of instance))
@@ -1240,6 +1232,6 @@
                       (acons keys invalid cache))
                 invalid))))
     (when invalid-keys
-      (error 'initarg-error :class class :initargs invalid-keys))))
+      (initarg-error class invalid-keys))))
 
 ;;; end of ctor.lisp

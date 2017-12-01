@@ -89,36 +89,27 @@
           value)
     (move result value)))
 
-(define-vop (code-from-mumble)
+(define-vop (code-from-function)
+  (:translate fun-code-header)
   (:policy :fast-safe)
   (:args (thing :scs (descriptor-reg)))
   (:results (code :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp)
-  (:variant-vars lowtag)
   (:generator 5
     (let ((bogus (gen-label))
           (done (gen-label)))
-      (loadw temp thing 0 lowtag)
+      (loadw temp thing 0 fun-pointer-lowtag)
       (inst shr temp n-widetag-bits)
       (inst jmp :z bogus)
-      (inst shl temp (1- (integer-length n-word-bytes)))
-      (unless (= lowtag other-pointer-lowtag)
-        (inst add temp (- lowtag other-pointer-lowtag)))
-      (move code thing)
-      (inst sub code temp)
+      (inst neg temp)
+      (inst lea code
+            (make-ea :dword :base thing :index temp :scale n-word-bytes
+                            :disp (- other-pointer-lowtag fun-pointer-lowtag)))
       (emit-label done)
       (assemble (*elsewhere*)
         (emit-label bogus)
         (inst mov code nil-value)
         (inst jmp done)))))
-
-(define-vop (code-from-lra code-from-mumble)
-  (:translate sb!di::lra-code-header)
-  (:variant other-pointer-lowtag))
-
-(define-vop (code-from-function code-from-mumble)
-  (:translate sb!di::fun-code-header)
-  (:variant fun-pointer-lowtag))
 
 (define-vop (%make-lisp-obj)
   (:policy :fast-safe)
@@ -141,14 +132,3 @@
   (:result-types unsigned-num)
   (:generator 1
     (move result thing)))
-
-
-(define-vop (fun-word-offset)
-  (:policy :fast-safe)
-  (:translate sb!di::fun-word-offset)
-  (:args (fun :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 5
-    (loadw res fun 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))

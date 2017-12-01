@@ -40,10 +40,10 @@
 #include "dynbind.h"
 #include "genesis/cons.h"
 #include "genesis/fdefn.h"
+#include "genesis/vector.h"
 #include "interr.h"             /* for lose() */
 #include "alloc.h"
 #include "gc-internal.h"
-#include "cpputil.h"
 #include "pseudo-atomic.h"
 #include "interrupt.h"
 #include "lispregs.h"
@@ -62,10 +62,6 @@
 # define IMMEDIATE_POST_MORTEM
 #endif
 
-#if defined(LISP_FEATURE_FREEBSD) || defined(LISP_FEATURE_DRAGONFLY) || defined (LISP_FEATURE_DARWIN)
-#define LOCK_CREATE_THREAD
-#endif
-
 struct thread_post_mortem {
     os_thread_t os_thread;
     pthread_attr_t *os_attr;
@@ -80,9 +76,9 @@ struct thread *all_threads;
 
 #ifdef LISP_FEATURE_SB_THREAD
 pthread_mutex_t all_threads_lock = PTHREAD_MUTEX_INITIALIZER;
-#ifdef LOCK_CREATE_THREAD
+
 static pthread_mutex_t create_thread_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
+
 #ifdef LISP_FEATURE_GCC_TLS
 __thread struct thread *current_thread;
 #endif
@@ -225,7 +221,10 @@ initial_thread_trampoline(struct thread *th)
     protect_binding_stack_guard_page(1, NULL);
     protect_alien_stack_guard_page(1, NULL);
 
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+    /* WIN32 has a special stack arrangment, calling
+     * call_into_lisp_first_time will put the new stack in the middle
+     * of the current stack */
+#if !defined(LISP_FEATURE_WIN32) && (defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
     return call_into_lisp_first_time(function,args,0);
 #else
     return funcall0(function);
@@ -244,7 +243,8 @@ static void
 schedule_thread_post_mortem(struct thread *corpse)
 {
     pthread_detach(pthread_self());
-    gc_assert(!pthread_attr_destroy(corpse->os_attr));
+    int result = pthread_attr_destroy(corpse->os_attr);
+    gc_assert(!result);
 #if defined(LISP_FEATURE_WIN32)
     os_invalidate_free(corpse->os_address, THREAD_STRUCT_SIZE);
 #else
@@ -288,21 +288,20 @@ perform_thread_post_mortem(struct thread_post_mortem *post_mortem)
 #endif
     int result;
     if (post_mortem) {
-#if defined(LOCK_CREATE_THREAD) && defined (LISP_FEATURE_DARWIN)
         /* The thread may exit before pthread_create() has finished
            initialization and it may write into already unmapped
            memory. This lock doesn't actually need to protect
            anything, just to make sure that at least one call to
            pthread_create() has finished.
 
-          Possible improvements: stash the address of the thread
-          struct for which a pthread is being created and don't lock
-          here if it's not the one being terminated. */
+           Possible improvements: stash the address of the thread
+           struct for which a pthread is being created and don't lock
+           here if it's not the one being terminated. */
         result = pthread_mutex_lock(&create_thread_lock);
         gc_assert(result == 0);
         result = pthread_mutex_unlock(&create_thread_lock);
         gc_assert(result == 0);
-#endif
+
         if ((result = pthread_join(post_mortem->os_thread, NULL))) {
             lose("Error calling pthread_join in perform_thread_post_mortem:\n%s",
                  strerror(result));
@@ -324,7 +323,9 @@ schedule_thread_post_mortem(struct thread *corpse)
         post_mortem = plan_thread_post_mortem(corpse);
 
 #ifdef CREATE_POST_MORTEM_THREAD
-        gc_assert(!pthread_create(&thread, NULL, perform_thread_post_mortem, post_mortem));
+        pthread_t thread;
+        int result = pthread_create(&thread, NULL, perform_thread_post_mortem, post_mortem);
+        gc_assert(!result);
 #else
         post_mortem = (struct thread_post_mortem *)
             swap_lispobjs((lispobj *)(void *)&pending_thread_post_mortem,
@@ -454,9 +455,9 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
  * lisp function after doing arch_os_thread_init and whatever other
  * bookkeeping needs to be done
  */
-int
-new_thread_trampoline(struct thread *th)
+void* new_thread_trampoline(void* arg)
 {
+    struct thread *th = (struct thread *)arg;
     int result;
     init_thread_data scribble;
 
@@ -475,10 +476,11 @@ new_thread_trampoline(struct thread *th)
     schedule_thread_post_mortem(th);
 
     FSHOW((stderr,"/exiting thread %lu\n", thread_self()));
-    return result;
+    return (void*)(uintptr_t)result;
 }
 
 static struct thread *create_thread_struct(lispobj);
+static void free_thread_struct(struct thread *th);
 
 void
 attach_os_thread(init_thread_data *scribble)
@@ -494,7 +496,7 @@ attach_os_thread(init_thread_data *scribble)
      * keeping it initialized: */
     pthread_attr_init(th->os_attr);
 
-#ifndef LISP_FEATURE_WIN32
+#if !defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     /* On windows, arch_os_thread_init will take care of finding the
      * stack. */
     void *stack_addr;
@@ -521,6 +523,7 @@ attach_os_thread(init_thread_data *scribble)
     pthread_getattr_np(os, &attr);
 #endif
     pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+    pthread_attr_destroy(&attr);
 #endif
 
     th->control_stack_start = stack_addr;
@@ -536,7 +539,8 @@ attach_os_thread(init_thread_data *scribble)
      * tempting to just perform such unsafe allocation though.  So let's
      * at least try to suppress GC before consing, and hope that it
      * works: */
-    bind_variable(GC_INHIBIT, T, th);
+    // Just stomp on the value already set by create_thread_struct()
+    write_TLS(GC_INHIBIT, T, th);
 
     uword_t stacksize
         = (uword_t) th->control_stack_end - (uword_t) th->control_stack_start;
@@ -555,7 +559,14 @@ detach_os_thread(init_thread_data *scribble)
     odxprint(misc, "deattach_os_thread: detached");
     pthread_setspecific(lisp_thread, (void *)0);
     thread_sigmask(SIG_SETMASK, &scribble->oldset, 0);
+    free_thread_struct(th);
 }
+
+#if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
+extern void funcall_alien_callback(lispobj arg1, lispobj arg2, lispobj arg0,
+                                   struct thread* thread)
+  __attribute__((sysv_abi));
+#endif
 
 void
 callback_wrapper_trampoline(
@@ -591,8 +602,11 @@ callback_wrapper_trampoline(
     WITH_GC_AT_SAFEPOINTS_ONLY()
 #endif
     {
-       funcall3(SymbolValue(ENTER_ALIEN_CALLBACK, 0), arg0, arg1, arg2);
-
+#if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
+        funcall_alien_callback(arg1, arg2, arg0, th);
+#else
+        funcall3(StaticSymbolFunction(ENTER_ALIEN_CALLBACK), arg0,arg1,arg2);
+#endif
     }
 }
 #endif /* LISP_FEATURE_SB_THREAD */
@@ -623,7 +637,7 @@ create_thread_struct(lispobj initial_function) {
     union per_thread_data *per_thread;
     struct thread *th=0;        /*  subdue gcc */
     void *spaces=0;
-    void *aligned_spaces=0;
+    char *aligned_spaces=0;
 #if defined(LISP_FEATURE_SB_THREAD) || defined(LISP_FEATURE_WIN32)
     unsigned int i;
 #endif
@@ -636,15 +650,13 @@ create_thread_struct(lispobj initial_function) {
      * on the alignment passed from os_validate, since that might
      * assume the current (e.g. 4k) pagesize, while we calculate with
      * the biggest (e.g. 64k) pagesize allowed by the ABI. */
-    spaces=os_validate(0, THREAD_STRUCT_SIZE);
+    spaces = os_allocate(THREAD_STRUCT_SIZE);
     if(!spaces)
         return NULL;
     /* Aligning up is safe as THREAD_STRUCT_SIZE has
      * THREAD_ALIGNMENT_BYTES padding. */
-    aligned_spaces = (void *)((((uword_t)(char *)spaces)
-                               + THREAD_ALIGNMENT_BYTES-1)
-                              &~(uword_t)(THREAD_ALIGNMENT_BYTES-1));
-    void* csp_page=
+    aligned_spaces = PTR_ALIGN_UP(spaces, THREAD_ALIGNMENT_BYTES);
+    char* csp_page=
         (aligned_spaces+
          thread_control_stack_size+
          BINDING_STACK_SIZE+
@@ -659,13 +671,13 @@ create_thread_struct(lispobj initial_function) {
 
     th=&per_thread->thread;
     th->os_address = spaces;
-    th->control_stack_start = aligned_spaces;
+    th->control_stack_start = (lispobj*)aligned_spaces;
     th->binding_stack_start=
-        (lispobj*)((void*)th->control_stack_start+thread_control_stack_size);
+        (lispobj*)((char*)th->control_stack_start+thread_control_stack_size);
     th->control_stack_end = th->binding_stack_start;
     th->control_stack_guard_page_protected = T;
     th->alien_stack_start=
-        (lispobj*)((void*)th->binding_stack_start+BINDING_STACK_SIZE);
+        (lispobj*)((char*)th->binding_stack_start+BINDING_STACK_SIZE);
     set_binding_stack_pointer(th,th->binding_stack_start);
     th->this=th;
     th->os_thread=0;
@@ -701,10 +713,10 @@ create_thread_struct(lispobj initial_function) {
 #endif
     th->state=STATE_RUNNING;
 #ifdef ALIEN_STACK_GROWS_DOWNWARD
-    th->alien_stack_pointer=((void *)th->alien_stack_start
-                             + ALIEN_STACK_SIZE-N_WORD_BYTES);
+    th->alien_stack_pointer=(lispobj*)((char*)th->alien_stack_start
+                                       + ALIEN_STACK_SIZE-N_WORD_BYTES);
 #else
-    th->alien_stack_pointer=((void *)th->alien_stack_start);
+    th->alien_stack_pointer=(lispobj*)((char*)th->alien_stack_start);
 #endif
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -745,36 +757,36 @@ create_thread_struct(lispobj initial_function) {
     SetSymbolValue(ALIEN_STACK_POINTER,(lispobj)th->alien_stack_pointer,th);
 #endif
 #endif
-    bind_variable(CURRENT_CATCH_BLOCK,make_fixnum(0),th);
-    bind_variable(CURRENT_UNWIND_PROTECT_BLOCK,make_fixnum(0),th);
-    bind_variable(FREE_INTERRUPT_CONTEXT_INDEX,make_fixnum(0),th);
-    bind_variable(INTERRUPT_PENDING, NIL,th);
-    bind_variable(INTERRUPTS_ENABLED,T,th);
-    bind_variable(ALLOW_WITH_INTERRUPTS,T,th);
-    bind_variable(GC_PENDING,NIL,th);
-    bind_variable(ALLOC_SIGNAL,NIL,th);
-#ifdef PINNED_OBJECTS
-    bind_variable(PINNED_OBJECTS,NIL,th);
-#endif
-#ifdef LISP_FEATURE_SB_THREAD
-    bind_variable(STOP_FOR_GC_PENDING,NIL,th);
-#endif
-#if defined(LISP_FEATURE_SB_SAFEPOINT)
-    bind_variable(GC_SAFE,NIL,th);
-    bind_variable(IN_SAFEPOINT,NIL,th);
-#endif
-#ifdef LISP_FEATURE_SB_THRUPTION
-    bind_variable(THRUPTION_PENDING,NIL,th);
-    bind_variable(RESTART_CLUSTERS,NIL,th);
-#endif
 #ifndef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
     access_control_stack_pointer(th)=th->control_stack_start;
 #endif
 
     th->interrupt_data->pending_handler = 0;
     th->interrupt_data->gc_blocked_deferrables = 0;
-#ifdef GENCGC_IS_PRECISE
+#if GENCGC_IS_PRECISE
     th->interrupt_data->allocation_trap_context = 0;
+#endif
+
+#include "genesis/thread-init.inc"
+#ifdef LISP_FEATURE_SB_THREAD
+    /* Each initial binding is a cons whose car is a symbol evaluated as if
+     * by SYMBOL-GLOBAL-VALUE (unsafely), and whose cdr is the target symbol.
+     * In particular, we will obligingly assign the unbound-marker.
+     * An atom implies NIL for the value. */
+    struct vector* tls_init = VECTOR(SYMBOL(THREAD_INITIAL_BINDINGS)->value);
+    for (i = 0; i < tls_init->length; i += make_fixnum(1)) {
+        lispobj binding = tls_init->data[fixnum_value(i)];
+        lispobj value = NIL;
+        if (lowtag_of(binding) == LIST_POINTER_LOWTAG) {
+            value = SYMBOL(CONS(binding)->car)->value;
+            binding = CONS(binding)->cdr;
+        }
+        struct symbol* sym = SYMBOL(binding);
+        write_TLS_index(tls_index_of(sym), value, th, sym);
+    }
+    /* If a symbol assigned above had a TLS index of 0, then it'll
+     * mess up th->no_tls_value_marker. Fail now if that happened. */
+    gc_assert(th->no_tls_value_marker == NO_TLS_VALUE_MARKER_WIDETAG);
 #endif
     th->no_tls_value_marker=initial_function;
 
@@ -790,7 +802,7 @@ create_thread_struct(lispobj initial_function) {
 }
 
 void create_initial_thread(lispobj initial_function) {
-    struct thread *th=create_thread_struct(initial_function);
+    struct thread *th = create_thread_struct(initial_function);
 #ifdef LISP_FEATURE_SB_THREAD
     pthread_key_create(&lisp_thread, 0);
 #endif
@@ -821,11 +833,10 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
      * all_threads until it's ready. */
     block_deferrable_signals(&oldset);
 
-#ifdef LOCK_CREATE_THREAD
+    /* See perform_thread_post_mortem for at least one reason why this lock is neccessary */
     retcode = pthread_mutex_lock(&create_thread_lock);
     gc_assert(retcode == 0);
     FSHOW_SIGNAL((stderr,"/create_os_thread: got lock\n"));
-#endif
 
     if((initcode = pthread_attr_init(th->os_attr)) ||
        /* call_into_lisp_first_time switches the stack for the initial
@@ -841,8 +852,7 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
                               ALIEN_STACK_SIZE)) ||
 # endif
 #endif
-       (retcode = pthread_create
-        (kid_tid,th->os_attr,(void *(*)(void *))new_thread_trampoline,th))) {
+       (retcode = pthread_create(kid_tid, th->os_attr, new_thread_trampoline, th))) {
         FSHOW_SIGNAL((stderr, "init = %d\n", initcode));
         FSHOW_SIGNAL((stderr, "pthread_create returned %d, errno %d\n",
                       retcode, errno));
@@ -852,11 +862,10 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
         r=0;
     }
 
-#ifdef LOCK_CREATE_THREAD
     retcode = pthread_mutex_unlock(&create_thread_lock);
     gc_assert(retcode == 0);
     FSHOW_SIGNAL((stderr,"/create_os_thread: released lock\n"));
-#endif
+
     thread_sigmask(SIG_SETMASK,&oldset,0);
     return r;
 }
@@ -866,7 +875,7 @@ os_thread_t create_thread(lispobj initial_function) {
     os_thread_t kid_tid = 0;
 
     /* Must defend against async unwinds. */
-    if (SymbolValue(INTERRUPTS_ENABLED, thread) != NIL)
+    if (read_TLS(INTERRUPTS_ENABLED, thread) != NIL)
         lose("create_thread is not safe when interrupts are enabled.\n");
 
     /* Assuming that a fresh thread struct has no lisp objects in it,
@@ -898,14 +907,12 @@ void gc_stop_the_world()
 {
     struct thread *p,*th=arch_os_get_current_thread();
     int status, lock_ret;
-#ifdef LOCK_CREATE_THREAD
     /* KLUDGE: Stopping the thread during pthread_create() causes deadlock
      * on FreeBSD. */
     FSHOW_SIGNAL((stderr,"/gc_stop_the_world:waiting on create_thread_lock\n"));
     lock_ret = pthread_mutex_lock(&create_thread_lock);
     gc_assert(lock_ret == 0);
     FSHOW_SIGNAL((stderr,"/gc_stop_the_world:got create_thread_lock\n"));
-#endif
     FSHOW_SIGNAL((stderr,"/gc_stop_the_world:waiting on lock\n"));
     /* keep threads from starting while the world is stopped. */
     lock_ret = pthread_mutex_lock(&all_threads_lock);      \
@@ -974,10 +981,9 @@ void gc_start_the_world()
 
     lock_ret = pthread_mutex_unlock(&all_threads_lock);
     gc_assert(lock_ret == 0);
-#ifdef LOCK_CREATE_THREAD
     lock_ret = pthread_mutex_unlock(&create_thread_lock);
     gc_assert(lock_ret == 0);
-#endif
+
 
     FSHOW_SIGNAL((stderr,"/gc_start_the_world:end\n"));
 }

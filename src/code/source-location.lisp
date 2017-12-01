@@ -11,20 +11,72 @@
 
 (in-package "SB!C")
 
+;;; A DEFINITION-SOURCE-LOCATION contains two packed fixnums in the INDICES slot,
+;;; and unless there is a non-nil plist, does not store the plist.
+;;; Packed representation is: header + layout, namestring, indices, (padding)
 (def!struct (definition-source-location
-             (:constructor %make-definition-source-location
-                           (namestring toplevel-form-number form-number))
+             (:constructor %make-basic-definition-source-location
+                           (namestring indices))
              (:copier nil))
   ;; Namestring of the source file that the definition was compiled from.
   ;; This is null if the definition was not compiled from a file.
   (namestring nil :type (or string null) :read-only t)
-  ;; Toplevel form index
-  (toplevel-form-number nil :type (or fixnum null) :read-only t)
-  ;; DFO form number within the top-level form
-  (form-number nil :type (or fixnum null) :read-only t)
-  ;; plist from WITH-COMPILATION-UNIT
-  (plist *source-plist* :read-only t))
+  (indices 0 :type integer :read-only t))
 (!set-load-form-method definition-source-location  (:xc :target))
+(def!struct (definition-source-location+plist
+             (:include definition-source-location)
+             (:constructor %make-full-definition-source-location
+                           (namestring indices plist))
+             (:copier nil))
+  (plist nil :read-only t))
+
+(declaim (inline definition-source-location-toplevel-form-number
+                 definition-source-location-form-number
+                 definition-source-location-plist))
+;;; Toplevel form index
+(defun definition-source-location-toplevel-form-number (source-loc)
+  (let ((val (ash (definition-source-location-indices source-loc) -15)))
+    (cond ((plusp val) (1- val))
+          ((minusp val) val))))
+;; DFO form number within the top-level form
+(defun definition-source-location-form-number (source-loc)
+  (let ((val (ldb (byte 15 0) (definition-source-location-indices source-loc))))
+    (if (plusp val) (1- val))))
+;; plist from WITH-COMPILATION-UNIT
+(defun definition-source-location-plist (source-loc)
+  (when (typep (the definition-source-location source-loc)
+               'definition-source-location+plist)
+    (definition-source-location+plist-plist source-loc)))
+
+(defun %make-definition-source-location (namestring tlf-num subform-num)
+  (declare (type (or null (integer -1 *)) tlf-num)
+           (type (or null unsigned-byte) subform-num))
+  (let* ((plist *source-plist*)
+         ;; Use 15 bits for subform#, and all other bits (including sign) for TLF#.
+         ;; Map 0 to NIL, 1 to 0, 2 to 1, etc; but -1 remains itself.
+         (indices
+          (logior (ash (cond ((eql tlf-num -1) -1)
+                             (tlf-num (1+ tlf-num))
+                             (t 0))
+                       15)
+                  ;; If subform-num exceeds 32766 just drop it.
+                  (if (and subform-num (< subform-num 32767))
+                      (1+ subform-num)
+                      0)))
+         (source-info (and (boundp '*source-info*) *source-info*))
+         (last (and source-info
+                    (source-info-last-defn-source-loc source-info))))
+    (if (and last
+             (eql (definition-source-location-indices last) indices)
+             (string= (definition-source-location-namestring last) namestring)
+             (equal (definition-source-location-plist last) plist))
+        last
+        (let ((new (if plist
+                       (%make-full-definition-source-location namestring indices plist)
+                       (%make-basic-definition-source-location namestring indices))))
+          (when source-info
+            (setf (source-info-last-defn-source-loc source-info) new))
+          new))))
 
 (defun make-definition-source-location ()
   (let* ((source-info (and (boundp '*source-info*) *source-info*))
@@ -33,47 +85,19 @@
               (when source-info
                 (make-file-info-namestring
                  *compile-file-pathname*
-                 (get-toplevelish-file-info *source-info*)))))
+                 (get-toplevelish-file-info source-info)))))
          tlf-number
-         form-number
-         (last (and source-info
-                    (source-info-last-defn-source-loc source-info))))
+         form-number)
     (acond ((boundp '*current-path*)
             (setf tlf-number (source-path-tlf-number *current-path*)
                   form-number (source-path-form-number *current-path*)))
            ((and source-info (source-info-file-info source-info))
             (setf tlf-number (1- (fill-pointer (file-info-forms it))))))
-    ;; FIXME: Probably can never coalesce entries now that both a tlf number
-    ;; and subform number are stored. Maybe delete this.
-    (if (and last
-             (eql (definition-source-location-toplevel-form-number last) tlf-number)
-             (eql (definition-source-location-form-number last) form-number)
-             (string= (definition-source-location-namestring last) namestring)
-             (equal (definition-source-location-plist last) *source-plist*))
-        last
-        (let ((new (%make-definition-source-location namestring tlf-number form-number)))
-          (when source-info
-            (setf (source-info-last-defn-source-loc source-info) new))
-          new))))
-
-#+sb-xc-host
-(defun lpnify-namestring (untruename dir type)
-  (let ((src (position "src" dir :test #'string= :from-end t)))
-    (cond
-     ((and src (not (string= (car (last dir)) "output")))
-      (format nil "SYS:~{~:@(~A~);~}~:@(~A~).~:@(~A~)"
-              (subseq dir src) (pathname-name untruename) type))
-     (t (aver (string-equal (car (last dir)) "output"))
-        (aver (string-equal (pathname-name untruename) "stuff-groveled-from-headers"))
-        (format nil "SYS:OUTPUT;STUFF-GROVELED-FROM-HEADERS.~:@(~A~)" type)))))
+    (%make-definition-source-location namestring tlf-number form-number)))
 
 (defun make-file-info-namestring (name file-info)
-  #+sb-xc-host (declare (ignore name))
   (let* ((untruename (file-info-untruename file-info))
          (dir (and untruename (pathname-directory untruename))))
-    #+sb-xc-host
-    (lpnify-namestring untruename dir (pathname-type untruename))
-    #-sb-xc-host
     (if (and dir (eq (first dir) :absolute))
         (namestring untruename)
         (if name

@@ -27,16 +27,12 @@
 
 ;;; The generic conditional branch, emitted immediately after test
 ;;; VOPs that only set flags.
-
-;;; FIXME: Unlike the PPC (from whence this was cribbed), ARM actually
-;;; has flags.  We should take advantage of them here.
-
 (define-vop (branch-if)
   (:info dest flags not-p)
   (:generator 0
     (flet ((negate-condition (name)
              (let ((code (logxor 1 (conditional-opcode name))))
-               (aref *condition-name-vec* code))))
+               (aref +condition-name-vec+ code))))
       (aver (null (rest flags)))
       (inst b
             (if not-p

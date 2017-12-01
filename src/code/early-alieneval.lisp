@@ -9,7 +9,7 @@
 
 (in-package "SB!ALIEN")
 
-(defvar *alien-type-classes* (make-hash-table :test 'eq))
+(defglobal *alien-type-classes* (make-hash-table :test 'eq))
 
 (defvar *new-auxiliary-types* nil)
 
@@ -46,7 +46,6 @@
          ,@body)))
 
 (defmacro define-alien-type (name type &environment env)
-  #!+sb-doc
   "Define the alien type NAME to be equivalent to TYPE. Name may be NIL for
    STRUCT and UNION types, in which case the name is taken from the type
    specifier."
@@ -57,9 +56,7 @@
              `((%def-auxiliary-alien-types ',*new-auxiliary-types*
                                            (sb!c:source-location))))
          ,@(when name
-             `((%define-alien-type ',name ',alien-type)
-               (setf (info :source-location :alien-type ',name)
-                     (sb!c:source-location))))))))
+             `((%define-alien-type ',name ',alien-type (sb!c:source-location))))))))
 
 (defstruct (alien-type-class (:copier nil))
   (name nil :type symbol)

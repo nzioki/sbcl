@@ -52,7 +52,7 @@ int arch_os_thread_init(struct thread *thread) {
      * swapped stacks, require that the control stack contain only
      * boxed data, and expands upwards while the C stack expands
      * downwards. */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
+    sigstack.ss_sp=((char *) thread)+dynamic_values_bytes;
     sigstack.ss_flags=0;
     sigstack.ss_size = 32*SIGSTKSZ;
     if(sigaltstack(&sigstack,0)<0)
@@ -67,13 +67,13 @@ int arch_os_thread_cleanup(struct thread *thread) {
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
 {
-    return &(context->uc_mcontext.regs[offset]);
+    return (os_context_register_t *)&(context->uc_mcontext.regs[offset]);
 }
 
 os_context_register_t *
 os_context_pc_addr(os_context_t *context)
 {
-    return &(context->uc_mcontext.pc);
+    return (os_context_register_t *)&(context->uc_mcontext.pc);
 }
 
 os_context_register_t *
@@ -97,14 +97,17 @@ os_restore_fp_control(os_context_t *context)
 os_context_register_t   *
 os_context_float_register_addr(os_context_t *context, int offset)
 {
+    /* KLUDGE: neither glibc nor the kernel can settle down on a name,
+       the kernel used __reserved, now glibc uses __glibc_reserved1.
+       Hardcode it until they make up their mind */
     return (os_context_register_t*)
-        &((struct fpsimd_context *)context->uc_mcontext.__reserved)->vregs[offset];
+        &((struct fpsimd_context *)((uintptr_t)&context->uc_mcontext + 288))->vregs[offset];
 }
 
 void
 os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
     os_vm_address_t end_address
-        = (os_vm_address_t)(((pointer_sized_uint_t) address) + length);
+        = (os_vm_address_t)(((uintptr_t) address) + length);
     __clear_cache(address, end_address);
 }

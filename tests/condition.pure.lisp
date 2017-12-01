@@ -321,25 +321,27 @@
 ;; Using an undefined condition type in a HANDLER-BIND clause should
 ;; signal an ERROR at runtime. Bug 1378939 was about landing in LDB
 ;; because of infinite recursion in SIGNAL instead.
-;;
-;; We suppress the compile-time WARNING to avoid noise when running
-;; tests.
-(locally (declare (muffle-conditions warning))
-  (with-test (:name (handler-bind :undefined-condition-type
-                     :bug-1378939))
-    (assert-error
-     (handler-bind ((no-such-condition-class #'print))
-       (error "does not matter"))
-     simple-error)))
+(with-test (:name (handler-bind :undefined-condition-type
+                   :bug-1378939))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile '(lambda ()
+                         (handler-bind ((no-such-condition-class #'print))
+                           (error "does not matter")))
+                       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (assert (= (length style-warnings) 1))
+    (assert-error (funcall fun) simple-error)))
 
 ;; Using an undefined condition type in a HANDLER-BIND clause should
 ;; signal a [STYLE-]WARNING at compile time.
 (with-test (:name (handler-bind :undefined-condition-type
                    :compile-time-warning))
-  (assert-signal
-   (compile nil '(lambda () (handler-bind
-                                ((no-such-condition-class #'print)))))
-   warning))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile '(lambda ()
+                         (handler-bind ((no-such-condition-class #'print))))
+                       :allow-style-warnings t)
+    (declare (ignore fun failure-p warnings))
+    (assert (= (length style-warnings) 1))))
 
 ;; Empty bindings in HANDLER-BIND pushed an empty cluster onto
 ;; *HANDLER-CLUSTERS* which was not expected by SIGNAL (and wasteful).
@@ -349,32 +351,36 @@
 ;; Parsing of #'FUNCTION in %HANDLER-BIND was too liberal.
 ;; This code should not compile.
 (with-test (:name (handler-bind :no-sloppy-semantics))
-  (assert
-   (nth-value 2 ; errorp
-    (let ((*error-output* (make-broadcast-stream)))
-      (compile nil '(lambda (x)
-                      (sb-impl::%handler-bind
-                         ((condition (function (lambda (c) (print c)) garb)))
-                       (print x)))))))
-  (assert
-   (nth-value 2 ; errorp
-    (let ((*error-output* (make-broadcast-stream)))
-      (compile nil '(lambda (x)
-                      (handler-bind ((warning "woot")) (print x))))))))
+  (multiple-value-bind (fun failure-p)
+      (checked-compile '(lambda (x)
+                         (sb-impl::%handler-bind
+                          ((condition (function (lambda (c) (print c)) garb)))
+                          (print x)))
+                       :allow-failure t)
+    (declare (ignore fun))
+    (assert failure-p))
 
-(with-test (:name :handler-bind-satisfies-pred-style-warn)
-  (multiple-value-bind (f warnp errorp)
-      (let ((*error-output* (make-broadcast-stream)))
-        (compile nil
-                 '(lambda ()
-                    ;; Just in case we ever change the meaning of #'F in
-                    ;; high safety so that it evals #'F, this test will break,
-                    ;; indicating that HANDLER-BIND will have to be changed.
-                    (declare (optimize (safety 3)))
-                    (declare (notinline +))
-                    (handler-bind (((satisfies snorky) #'abort)) (+ 2 2)))))
-    (assert (and f warnp (not errorp)))
-    (assert (= (funcall f) 4)))) ; there is no runtime error either
+  (multiple-value-bind (fun failure-p)
+      (checked-compile '(lambda (x)
+                         (handler-bind ((warning "woot")) (print x)))
+                       :allow-failure t :allow-warnings t)
+    (declare (ignore fun))
+    (assert failure-p)))
+
+(with-test (:name (handler-bind satisfies :predicate style-warning))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile
+       '(lambda ()
+         ;; Just in case we ever change the meaning of #'F in high
+         ;; safety so that it evals #'F, this test will break,
+         ;; indicating that HANDLER-BIND will have to be changed.
+         (declare (optimize (safety 3)))
+         (declare (notinline +))
+         (handler-bind (((satisfies snorky) #'abort)) (+ 2 2)))
+       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (assert (= (length style-warnings) 1))
+    (assert (= (funcall fun) 4)))) ; there is no runtime error either
 
 (with-test (:name :with-condition-restarts-evaluation-order)
   (let (result)
@@ -384,3 +390,25 @@
         (progn (push 2 result) nil)
       (push 3 result))
     (assert (equal result '(3 2 1)))))
+
+(with-test (:name (type-error print *print-pretty*))
+  (let ((error (make-condition 'type-error :datum 1 :expected-type 'string)))
+    (assert (string= (let ((*print-pretty* nil))
+                       (princ-to-string error))
+                     "The value 1 is not of type STRING"))
+    (assert (string= (let ((*print-pretty* t))
+                       (princ-to-string error))
+                     "The value
+  1
+is not of type
+  STRING"))))
+
+;;; Instances of LAYOUT for condition classoids created by genesis
+;;; should resemble ones created normally. Due to a bug, they did not.
+(with-test (:name :condition-layout-lengths)
+  (loop for layout being each hash-value of (sb-kernel:classoid-subclasses
+                                             (sb-kernel:find-classoid 'condition))
+        for len = (sb-kernel:layout-length layout)
+        minimize len into min
+        maximize len into max
+        finally (assert (= min max))))

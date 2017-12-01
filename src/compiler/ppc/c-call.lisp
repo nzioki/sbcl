@@ -23,11 +23,6 @@
   ;; But Darwin doesn't
   #!+darwin 15)
 
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
-
 (defstruct arg-state
   (gpr-args 0)
   (fpr-args 0)
@@ -42,20 +37,20 @@
   (let ((reg-args (arg-state-gpr-args state)))
     (cond ((< reg-args 8)
            (setf (arg-state-gpr-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc (+ reg-args nl0-offset)))
+           (make-wired-tn* prim-type reg-sc (+ reg-args nl0-offset)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 ;;; The Linux/PPC 32bit ABI says:
 ;;;
@@ -74,11 +69,11 @@
     (cond ((< fprs 8)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (my-make-wired-tn 'single-float 'single-reg (1+ fprs)))
+           (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs)))
           (t
            (let* ((stack-offset (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (+ stack-offset 1))
-             (my-make-wired-tn 'single-float 'single-stack stack-offset))))))
+             (make-wired-tn* 'single-float single-stack-sc-number stack-offset))))))
 
 ;;; If a single-float arg has to go on the stack, it's promoted to
 ;;; double.  That way, C programs can get subtle rounding errors when
@@ -91,18 +86,18 @@
     (cond ((< gprs 8) ; and by implication also (< fprs 13)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (list (my-make-wired-tn 'single-float 'single-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)))
+           (list (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)))
           ((< fprs 13)
            ;; See comments below for double-float.
            (incf (arg-state-fpr-args state))
            (incf (arg-state-stack-frame-size state))
-           (my-make-wired-tn 'single-float 'single-reg (1+ fprs)))
+           (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs)))
           (t
            ;; Pass on stack only
            (let ((stack-offset (arg-state-stack-frame-size state)))
              (incf (arg-state-stack-frame-size state))
-             (my-make-wired-tn 'single-float 'single-stack stack-offset))))))
+             (make-wired-tn* 'single-float single-stack-sc-number stack-offset))))))
 
 #!-darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
@@ -111,13 +106,13 @@
     (cond ((< fprs 8)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (my-make-wired-tn 'double-float 'double-reg (1+ fprs)))
+           (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs)))
           (t
            (let* ((stack-offset (arg-state-stack-frame-size state)))
              (if (oddp stack-offset)
                (incf stack-offset))
              (setf (arg-state-stack-frame-size state) (+ stack-offset 2))
-             (my-make-wired-tn 'double-float 'double-stack stack-offset))))))
+             (make-wired-tn* 'double-float double-stack-sc-number stack-offset))))))
 
 #!+darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
@@ -134,19 +129,19 @@
            ;; to %alien-funcall ir2-convert by making a list of the
            ;; TNs for the float reg and for the int regs.
            ;;
-           (list (my-make-wired-tn 'double-float 'double-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-                 (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+           (list (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+                 (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
           ((< fprs 13)
            (incf (arg-state-fpr-args state))
-           (list (my-make-wired-tn 'double-float 'double-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-                 (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+           (list (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+                 (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
           (t
            ;; Pass on stack only
            (let ((stack-offset (arg-state-stack-frame-size state)))
              (incf (arg-state-stack-frame-size state) 2)
-             (my-make-wired-tn 'double-float 'double-stack stack-offset))))))
+             (make-wired-tn* 'double-float double-stack-sc-number stack-offset))))))
 
 ;;; Result state handling
 
@@ -167,16 +162,16 @@
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'system-area-pointer 'sap-reg
+    (make-wired-tn* 'system-area-pointer sap-reg-sc-number
                       (result-reg-offset num-results))))
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'single-float 'single-reg 1))
+  (make-wired-tn* 'single-float single-reg-sc-number 1))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'double-float 'double-reg 1))
+  (make-wired-tn* 'double-float double-reg-sc-number 1))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -191,9 +186,9 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-32 'signed-reg)
-            (values 'unsigned-byte-32 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc (result-reg-offset num-results)))))
+            (values 'signed-byte-32 signed-reg-sc-number)
+            (values 'unsigned-byte-32 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc (result-reg-offset num-results)))))
 
 (defun make-call-out-tns (type)
   (declare (type alien-fun-type type))
@@ -201,7 +196,7 @@
     (collect ((arg-tns))
       (dolist (arg-type (alien-fun-type-arg-types type))
         (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
-      (values (my-make-wired-tn 'positive-fixnum 'any-reg nsp-offset)
+      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number nsp-offset)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
               (invoke-alien-type-method
@@ -641,9 +636,8 @@
 
               (destructuring-bind (arg1 arg2 arg3 arg4)
                   (mapcar #'make-gpr '(3 4 5 6))
-                (load-address-into arg1 (+ nil-value (static-symbol-offset
-                                                      'sb!alien::*enter-alien-callback*)))
-                (loadw arg1 arg1 symbol-value-slot other-pointer-lowtag)
+                (load-address-into arg1 (static-fdefn-fun-addr 'enter-alien-callback))
+                (loadw arg1 arg1)
                 (inst li arg2 (fixnumize index))
                 (inst addi arg3 stack-pointer (- arg-store-pos))
                 (inst addi arg4 stack-pointer (- return-area-pos)))
@@ -788,27 +782,8 @@
                          (inst lis reg high)
                          (inst ori reg reg low))))
                 ;; Setup the args
-
-                ;; CLH 2006/02/10 -Following JES' logic in
-                ;; x86-64/c-call.lisp, we need to access
-                ;; ENTER-ALIEN-CALLBACK through the symbol-value slot
-                ;; of SB-ALIEN::*ENTER-ALIEN-CALLBACK* to ensure that
-                ;; it works if GC moves ENTER-ALIEN-CALLBACK.
-                ;;
-                ;; old way:
-                ;; (load-address-into arg1 (get-lisp-obj-address #'enter-alien-callback))
-
-                ;; new way:
-                ;; (load-symbol arg1 'sb!alien::*enter-alien-callback*)
-                ;;
-                ;; whoops: can't use load-symbol here as null-tn might
-                ;; not be loaded with the proper value as we are
-                ;; coming in from C code. Use nil-value constant
-                ;; instead, following the logic in x86-64/c-call.lisp.
-                (load-address-into arg1 (+ nil-value (static-symbol-offset
-                                                      'sb!alien::*enter-alien-callback*)))
-                (loadw arg1 arg1 symbol-value-slot other-pointer-lowtag)
-
+                (load-address-into arg1 (static-fdefn-fun-addr 'enter-alien-callback))
+                (loadw arg1 arg1)
                 (inst li arg2 (fixnumize index))
                 (inst addi arg3 sp n-foreign-linkage-area-bytes)
                 ;; FIXME: This was (- (* RETURN-AREA-SIZE N-WORD-BYTES)), while

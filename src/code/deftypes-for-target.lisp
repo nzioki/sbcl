@@ -68,12 +68,10 @@
   '(character-set ((0 . #.(1- base-char-code-limit)))))
 
 (sb!xc:deftype extended-char ()
-  #!+sb-doc
   "Type of CHARACTERs that aren't BASE-CHARs."
   '(and character (not base-char)))
 
 (sb!xc:deftype standard-char ()
-  #!+sb-doc
   "Type corresponding to the characters required by the standard."
   '(member
     #\Newline #\Space #\! #\" #\# #\$ #\% #\& #\' #\( #\) #\* #\+ #\,
@@ -108,6 +106,12 @@
   `(or (simple-array character (,size))
        (simple-array nil (,size))
        (simple-base-string ,size)))
+;;; On Unicode builds, SIMPLE-CHARACTER-STRING is a builtin type.
+;;; For non-Unicode it is convenient to be able to use the type name
+;;; as an alias of SIMPLE-BASE-STRING.
+#!-sb-unicode
+(sb!xc:deftype simple-character-string (&optional size)
+  `(simple-base-string ,size))
 
 (sb!xc:deftype bit-vector (&optional size)
   `(array bit (,size)))
@@ -128,6 +132,9 @@
 
 (sb!xc:deftype format-control ()
   '(or string function))
+
+(sb!xc:deftype condition-designator-head ()
+  '(or format-control symbol condition sb!pcl::condition-class))
 
 (sb!xc:deftype restart-designator ()
   '(or (and symbol (not null)) restart))

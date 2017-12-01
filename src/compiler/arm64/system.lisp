@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -84,21 +75,6 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
-  (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst strb type (@ function (- (ecase *backend-byte-order*
-                                     (:little-endian 0)
-                                     (:big-endian (1- n-word-bytes)))
-                                   fun-pointer-lowtag)))
-    (move result type)))
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -117,7 +93,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst lsr res res n-widetag-bits)))
+    (inst ubfm res res n-widetag-bits
+          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -184,7 +161,7 @@
   (:result-types system-area-pointer)
   (:generator 10
     (loadw ndescr code 0 other-pointer-lowtag)
-    (inst lsr ndescr ndescr n-widetag-bits)
+    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
     (inst add sap code (lsl ndescr word-shift))
     (inst sub sap sap other-pointer-lowtag)))
 
@@ -196,7 +173,7 @@
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
     (loadw ndescr code 0 other-pointer-lowtag)
-    (inst lsr ndescr ndescr n-widetag-bits)
+    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
     (inst add ndescr offset (lsl ndescr word-shift))
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))

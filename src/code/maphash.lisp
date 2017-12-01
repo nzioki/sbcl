@@ -15,11 +15,10 @@
 ;;; an internal tag for marking empty slots, which needs to be defined
 ;;; no later than the compiler-macro for MAPHASH.
 ;;;
-;;; Note that as of version 0.pre7 there's a dependence in the
-;;; gencgc.c code on this value being a symbol. (This is only one of
-;;; several nasty dependencies between that code and this, alas.)
-;;; -- WHN 2001-08-17
-(defconstant +empty-ht-slot+ '%empty-ht-slot%)
+;;; Note that scav_vector() and scav_hash_table_entries() both
+;;; have to be aware of the type of object this is.
+(define-symbol-macro +empty-ht-slot+ (make-unbound-marker))
+(defmacro empty-ht-slot-p (x) `(unbound-marker-p ,x))
 
 (define-compiler-macro maphash (&whole form function-designator hash-table
                                 &environment env)
@@ -45,7 +44,7 @@
         ;; key or the value is empty.
          (let* ((,kv-vector (hash-table-table ,table))
                 (,value (aref ,kv-vector ,i)))
-           (unless (eq ,value +empty-ht-slot+)
+           (unless (empty-ht-slot-p ,value)
              (let ((,key
                     ;; I is bounded below by 3, and bounded above by INDEX max,
                     ;; so (1- I) isn't checked for being an INDEX, but would
@@ -53,11 +52,10 @@
                     ;; being obviously valid; so we force elision of the test.
                     (locally (declare (optimize (sb!c::insert-array-bounds-checks 0)))
                       (aref ,kv-vector (1- ,i)))))
-               (unless (eq ,key +empty-ht-slot+)
+               (unless (empty-ht-slot-p ,key)
                  (funcall ,fun ,key ,value)))))))))
 
 (defun maphash (function-designator hash-table)
-  #!+sb-doc
   "For each entry in HASH-TABLE, call the designated two-argument function on
 the key and value of the entry. Return NIL.
 
@@ -70,7 +68,6 @@ to protect the MAPHASH call."
   (maphash function-designator hash-table)) ; via compiler-macro
 
 (defmacro with-hash-table-iterator ((name hash-table) &body body)
-  #!+sb-doc
   "WITH-HASH-TABLE-ITERATOR ((name hash-table) &body body)
 
 Provides a method of manually looping over the elements of a hash-table. NAME
@@ -101,12 +98,12 @@ for."
                         (let ((i index))
                           (incf (truly-the index index) 2)
                           (let ((value (aref kv-vector i)))
-                            (unless (eq value +empty-ht-slot+)
+                            (unless (empty-ht-slot-p value)
                               (let ((key
                                      (locally
                                       (declare (optimize (sb!c::insert-array-bounds-checks 0)))
                                       (aref kv-vector (1- i)))))
-                                (unless (eq key +empty-ht-slot+)
+                                (unless (empty-ht-slot-p key)
                                   (return (values t key value)))))))))))
                 #',name))))
        (macrolet ((,name () '(funcall ,function)))

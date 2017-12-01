@@ -131,7 +131,7 @@
   (let* ((name (lvar-value name))
          (cell (find-classoid-cell name :create t)))
     `(or (classoid-cell-classoid ',cell)
-         (error "class not yet defined: ~S" name))))
+         (error "Class not yet defined: ~S" name))))
 
 (defoptimizer (%typep-wrapper constraint-propagate-if)
     ((test-value variable type) node gen)
@@ -210,7 +210,8 @@
 
 (define-source-transform atom (x)
   `(not (consp ,x)))
-#!+sb-unicode
+
+#!+(and sb-unicode (not (or x86-64 arm64)))
 (define-source-transform base-char-p (x)
   `(typep ,x 'base-char))
 ;; CONS is implemented as (and list (not (eql nil))) where the 'and' is
@@ -305,7 +306,12 @@
            (when (policy *lexenv* (> speed inhibit-warnings))
              (compiler-notify "can't open-code test of unknown type ~S"
                               (type-specifier type)))
-           `(%typep ,object ',spec))
+           `(let ((object ,object)
+                  (cache (load-time-value (cons #'sb!kernel::cached-typep ',spec)
+                                          t)))
+              (truly-the (values t &optional)
+                         (funcall (truly-the function (car (truly-the cons cache)))
+                                  cache object))))
           (t
            (ecase (first spec)
              (satisfies
@@ -422,18 +428,22 @@
 
 (defun source-transform-character-set-typep (object type)
   (let ((pairs (character-set-type-pairs type)))
-    (if (and (= (length pairs) 1)
-            (= (caar pairs) 0)
-            (= (cdar pairs) (1- sb!xc:char-code-limit)))
-       `(characterp ,object)
-       (once-only ((n-obj object))
-         (let ((n-code (gensym "CODE")))
-           `(and (characterp ,n-obj)
-                 (let ((,n-code (sb!xc:char-code ,n-obj)))
-                   (or
-                    ,@(loop for pair in pairs
-                            collect
-                            `(<= ,(car pair) ,n-code ,(cdr pair)))))))))))
+    (or (and (= (length pairs) 1)
+             (= (caar pairs) 0)
+             (cond
+               #!+(and sb-unicode (or x86-64 arm64))
+               ((= (cdar pairs) (1- base-char-code-limit))
+                `(base-char-p ,object))
+               ((= (cdar pairs) (1- sb!xc:char-code-limit))
+                `(characterp ,object))))
+        (once-only ((n-obj object))
+          (let ((n-code (gensym "CODE")))
+            `(and (characterp ,n-obj)
+                  (let ((,n-code (sb!xc:char-code ,n-obj)))
+                    (or
+                     ,@(loop for pair in pairs
+                             collect
+                             `(<= ,(car pair) ,n-code ,(cdr pair)))))))))))
 
 #!+sb-simd-pack
 (defun source-transform-simd-pack-typep (object type)
@@ -522,9 +532,9 @@
              ;; If we know OBJ is an array header, and that the array is
              ;; simple, we also know there is exactly one indirection to
              ;; follow.
-             `((eq (%other-pointer-widetag (%array-data-vector ,obj)) ,typecode))
-             `((do ((,data ,(if headerp `(%array-data-vector ,obj) obj)
-                           (%array-data-vector ,data)))
+             `((eq (%other-pointer-widetag (%array-data ,obj)) ,typecode))
+             `((do ((,data ,(if headerp `(%array-data ,obj) obj)
+                           (%array-data ,data)))
                    ((not (array-header-p ,data))
                     (eq (%other-pointer-widetag ,data) ,typecode))))))))))
 
@@ -537,35 +547,49 @@
   ;; By design the simple arrays of of rank 1 occupy a contiguous
   ;; range of widetags, and unlike the arbitrary-widetags code for unions,
   ;; this nonstandard predicate can be generically defined for all backends.
-  (if (and (not (array-type-complexp type))
-           (eq (array-type-element-type type) *wild-type*)
-           (equal (array-type-dimensions type) '(*)))
-      (return-from source-transform-array-typep
-        `(simple-rank-1-array-*-p ,obj)))
-  (multiple-value-bind (pred stype) (find-supertype-predicate type)
-    (if (and (array-type-p stype)
-             ;; (If the element type hasn't been defined yet, it's
-             ;; not safe to assume here that it will eventually
-             ;; have (UPGRADED-ARRAY-ELEMENT-TYPE type)=T, so punt.)
-             (not (unknown-type-p (array-type-element-type type)))
-             (or (eq (array-type-complexp stype) (array-type-complexp type))
-                 (and (eql (array-type-complexp stype) :maybe)
-                      (eql (array-type-complexp type) t))))
-        (once-only ((n-obj obj))
-          (multiple-value-bind (tests headerp)
-              (test-array-dimensions n-obj type stype)
-            `(and (,pred ,n-obj)
-                  ,@(when (and (eql (array-type-complexp stype) :maybe)
-                               (eql (array-type-complexp type) t))
-                      ;; KLUDGE: this is a bit lame; if we get here,
-                      ;; we already know that N-OBJ is an array, but
-                      ;; (NOT SIMPLE-ARRAY) doesn't know that.  On the
-                      ;; other hand, this should get compiled down to
-                      ;; two widetag tests, so it's only a bit lame.
-                      `((typep ,n-obj '(not simple-array))))
-                  ,@tests
-                  ,@(test-array-element-type n-obj type stype headerp))))
-        `(%typep ,obj ',(type-specifier type)))))
+  (let ((dims (array-type-dimensions type))
+        (et (array-type-element-type type)))
+   (if (and (not (array-type-complexp type))
+            (eq et *wild-type*)
+            (equal dims '(*)))
+       (return-from source-transform-array-typep
+         `(simple-rank-1-array-*-p ,obj)))
+    (multiple-value-bind (pred stype) (find-supertype-predicate type)
+      (if (and (array-type-p stype)
+               ;; (If the element type hasn't been defined yet, it's
+               ;; not safe to assume here that it will eventually
+               ;; have (UPGRADED-ARRAY-ELEMENT-TYPE type)=T, so punt.)
+               (not (unknown-type-p (array-type-element-type type)))
+               (or (eq (array-type-complexp stype) (array-type-complexp type))
+                   (and (eql (array-type-complexp stype) :maybe)
+                        (eql (array-type-complexp type) t))))
+          (let ((complex-tag (and
+                              (eql (array-type-complexp type) t)
+                              (singleton-p dims)
+                              (and (neq et *wild-type*)
+                                   (sb!vm:saetp-complex-typecode
+                                    (find-saetp-by-ctype (array-type-element-type type)))))))
+            (once-only ((n-obj obj))
+              (if complex-tag
+                  `(and (eq (%other-pointer-widetag ,n-obj) ,complex-tag)
+                        ,@(unless (eq (car dims) '*)
+                            `((= (%array-dimension ,n-obj 0) ,(car dims)))))
+                  (multiple-value-bind (tests headerp)
+                      (test-array-dimensions n-obj type stype)
+                    `(and ,@(unless (and headerp (eql pred 'arrayp))
+                              ;; ARRAY-HEADER-P from TESTS will test for that
+                              `((,pred ,n-obj)))
+                          ,@(when (and (eql (array-type-complexp stype) :maybe)
+                                       (eql (array-type-complexp type) t))
+                              ;; KLUDGE: this is a bit lame; if we get here,
+                              ;; we already know that N-OBJ is an array, but
+                              ;; (NOT SIMPLE-ARRAY) doesn't know that.  On the
+                              ;; other hand, this should get compiled down to
+                              ;; two widetag tests, so it's only a bit lame.
+                              `((typep ,n-obj '(not simple-array))))
+                          ,@tests
+                          ,@(test-array-element-type n-obj type stype headerp))))))
+          `(%typep ,obj ',(type-specifier type))))))
 
 ;;; Transform a type test against some instance type. The type test is
 ;;; flushed if the result is known at compile time. If not properly
@@ -665,6 +689,18 @@
                     ;; path is pretty heavy.
                     `(locally (declare (optimize (safety 0)))
                        (data-vector-ref (layout-inherits ,n-layout) ,depthoid)))
+                   (ancestor-layout-eq
+                    ;; Layouts are immediate constants in immobile space.
+                    ;; It would be far nicer if we had a pattern-matching pass
+                    ;; wherein the backend would recognize that
+                    ;; (eq (data-vector-ref ...) k) has a single instruction form,
+                    ;; but lacking that, force it into a single call
+                    ;; that a vop can translate.
+                    #!+(and immobile-space x86-64)
+                    `(sb!vm::layout-inherits-ref-eq ; only implemented on x86-64
+                      (layout-inherits ,n-layout) ,depthoid ,layout)
+                    #!-(and immobile-space x86-64)
+                    `(eq ,get-ancestor ,layout))
                    (deeper-p `(> (layout-depthoid ,n-layout) ,depthoid)))
               (aver (equal pred '(%instancep object)))
               `(and ,pred
@@ -679,7 +715,7 @@
                       ,(if abstract-base-p
                            `(eq (if ,deeper-p ,get-ancestor ,n-layout) ,layout)
                            `(cond ((eq ,n-layout ,layout) t)
-                                  (,deeper-p (eq ,get-ancestor ,layout))))))))
+                                  (,deeper-p ,ancestor-layout-eq)))))))
            ((and layout (>= (layout-depthoid layout) 0))
             ;; hierarchical layout depths for other things (e.g.
             ;; CONDITION, STREAM)
@@ -709,10 +745,8 @@
 
            (t
             (/noshow "default case -- ,PRED and CLASS-CELL-TYPEP")
-            `(block typep
-               (classoid-cell-typep ,get-layout-or-return-false
-                                       ',(find-classoid-cell name :create t)
-                                       object)))))))))
+            `(classoid-cell-typep ',(find-classoid-cell name :create t)
+                                  object))))))))
 
 ;;; If the specifier argument is a quoted constant, then we consider
 ;;; converting into a simple predicate or other stuff. If the type is

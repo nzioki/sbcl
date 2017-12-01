@@ -3,9 +3,21 @@
   (:export #:with-test #:report-test-status #:*failures*
            #:really-invoke-debugger
            #:*break-on-failure* #:*break-on-expected-failure*
+
+           ;; thread tools
            #:make-kill-thread #:make-join-thread
-           #:checked-compile
-           #:runtime #:split-string))
+
+           ;; MAP-OPTIMIZATION-*
+           #:map-optimization-quality-combinations
+           #:map-optimize-declarations
+
+           ;; CHECKED-COMPILE and friends
+           #:checked-compile #:checked-compile-and-assert
+           #:checked-compile-capturing-source-paths
+           #:checked-compile-condition-source-paths
+
+           ;; RUNTIME
+           #:runtime #:split-string #:shuffle))
 
 (in-package :test-util)
 
@@ -27,6 +39,7 @@
 #+sb-thread
 (defun make-kill-thread (&rest args)
   (let ((thread (apply #'sb-thread:make-thread args)))
+    #-win32 ;; poor thread interruption on safepoints
     (when (boundp '*threads-to-kill*)
       (push thread *threads-to-kill*))
     thread))
@@ -64,9 +77,9 @@
     `(progn
        (start-test)
        (cond
-         ((broken-p ,broken-on)
+         ((broken-p ',broken-on)
           (fail-test :skipped-broken ',name "Test broken on this platform"))
-         ((skipped-p ,skipped-on)
+         ((skipped-p ',skipped-on)
           (fail-test :skipped-disabled ',name "Test disabled for this combination of platform and features"))
          (t
           (let (#+sb-thread (,threads (sb-thread:list-all-threads))
@@ -74,7 +87,7 @@
                 (*threads-to-kill* nil))
             (block ,block-name
               (handler-bind ((error (lambda (error)
-                                      (if (expected-failure-p ,fails-on)
+                                      (if (expected-failure-p ',fails-on)
                                           (fail-test :expected-failure ',name error)
                                           (fail-test :unexpected-failure ',name error))
                                       (return-from ,block-name))))
@@ -102,11 +115,12 @@
                                   (member thread ,threads)
                                   (sb-thread:thread-ephemeral-p thread))
                         (setf any-leftover thread)
+                        #-win32
                         (ignore-errors (sb-thread:terminate-thread thread))))
                     (when any-leftover
                       (fail-test :leftover-thread ',name any-leftover)
                       (return-from ,block-name)))
-                  (if (expected-failure-p ,fails-on)
+                  (if (expected-failure-p ',fails-on)
                       (fail-test :unexpected-success ',name nil)
                       ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
                       (log-msg/non-pretty "Success ~S" ',name)))))))))))
@@ -135,7 +149,7 @@
       (log-msg "~@<~A ~S ~:_~A~:>"
                type test-name condition)
       (log-msg "~@<~A ~S ~:_due to ~S: ~4I~:_\"~A\"~:>"
-               type test-name condition condition))
+               type test-name (type-of condition) condition))
   (push (list type *test-file* (or test-name *test-count*))
         *failures*)
   (unless (stringp condition)
@@ -152,82 +166,473 @@
 
 (defun skipped-p (skipped-on)
   (sb-impl::featurep skipped-on))
+
+;;;; MAP-{OPTIMIZATION-QUALITY-COMBINATIONS,OPTIMIZE-DECLARATIONS}
+
+(sb-int:defconstant-eqx +optimization-quality-names+
+    '(speed safety debug compilation-speed space) #'equal)
+
+(sb-int:defconstant-eqx +optimization-quality-keywords+
+    '(:speed :safety :debug :compilation-speed :space) #'equal)
+
+(deftype optimization-quality-range-designator ()
+  '(or (eql nil)                                ; skip quality
+       (integer 0 3)                            ; one value
+       (cons (or (eql nil) (integer 0 3)) list) ; list of values, nil means skip
+       (eql t)))                                ; all values
+
+;;; Call FUNCTION with the specified combinations of optimization
+;;; quality values.
+;;;
+;;; MAP-OPTIMIZATION-QUALITY-COMBINATIONS calls FUNCTION with keyword
+;;; argument thus expecting a lambda list of the form
+;;;
+;;;   (&key speed safety debug compilation-speed space)
+;;;
+;;; or any subset compatible with the generated combinations.
+;;;
+;;; MAP-OPTIMIZE-DECLARATIONS calls FUNCTION with a list intended to
+;;; be spliced into a DECLARE form like this:
+;;;
+;;;   (lambda (quality-values)
+;;;     `(declare (optimize ,@quality-values)))
+;;;
+;;; The set of combinations is controlled via keyword arguments
+;;;
+;;;   :FILTER FILTER-FUNCTION
+;;;     A function that should be called with optimization quality
+;;;     keyword arguments and whose return value controls whether
+;;;     FUNCTION should be called for the given combination.
+;;;
+;;;   (:SPEED | :SAFETY | :DEBUG | :COMPILATION-SPEED | :SPACE) SPEC
+;;;     Specify value range for the given optimization quality. SPEC
+;;;     can be
+;;;
+;;;       NIL
+;;;         Omit the quality.
+;;;
+;;;       (INTEGER 0 3)
+;;;
+;;;         Use the specified value for the quality.
+;;;
+;;;       (NIL | (INTEGER 0 3))*
+;;;         Generate the specified values. A "value" of NIL omits the
+;;;         quality from the combination.
+;;;
+;;;       T
+;;;         Generate all values (0, 1, 2, 3) for the quality.
+(declaim (ftype (function #.`(function
+                              &key
+                              ,@(mapcar #'list +optimization-quality-keywords+
+                                        '#1=(optimization-quality-range-designator . #1#))
+                              (:filter function)))
+                map-optimization-quality-combinations
+                map-optimize-declarations))
+(defun map-optimization-quality-combinations
+    (function &key (speed t) (safety t) (debug t) (compilation-speed t) (space t)
+                   filter)
+  (labels ((map-quantity-values (values thunk)
+             (typecase values
+               ((eql t)
+                (dotimes (i 4) (funcall thunk i)))
+               (cons
+                (map nil thunk values))
+               ((integer 0 3)
+                (funcall thunk values))))
+           (one-quality (qualities specs values)
+             (let ((quality (first qualities))
+                   (spec    (first specs)))
+               (cond
+                 ((not quality)
+                  (when (or (not filter) (apply filter values))
+                    (apply function values)))
+                 ((not spec)
+                  (one-quality (rest qualities) (rest specs) values))
+                 (t
+                  (map-quantity-values
+                   spec
+                   (lambda (value)
+                     (one-quality (rest qualities) (rest specs)
+                                  (if value
+                                      (list* quality value values)
+                                      values)))))))))
+    (one-quality +optimization-quality-keywords+
+                 (list speed safety debug compilation-speed space)
+                 '())))
+
+(defun map-optimize-declarations
+    (function &rest args
+              &key speed safety debug compilation-speed space filter)
+  (declare (ignore speed safety debug compilation-speed space filter))
+  (apply #'map-optimization-quality-combinations
+         (lambda (&rest args &key &allow-other-keys)
+           (funcall function (loop for name in +optimization-quality-names+
+                                for keyword in +optimization-quality-keywords+
+                                for value = (getf args keyword)
+                                when value collect (list name value))))
+         args))
+
+(defun expand-optimize-specifier (specifier)
+  (etypecase specifier
+    (cons
+     specifier)
+    ((eql nil)
+     '(:speed nil :safety nil :debug nil :compilation-speed nil :space nil))
+    ((eql :default)
+     '(:speed 1 :safety 1 :debug 1 :compilation-speed 1 :space 1))
+    ((eql :safe)
+     (list :filter (lambda (&key speed safety &allow-other-keys)
+                     (and (> safety 0) (>= safety speed)))))
+    ((eql :quick)
+     '(:compilation-speed 1 :space 1))
+    ((eql :quick/incomplete)
+     '(:compilation-speed nil :space nil))
+    ((eql :all)
+     '())))
+
+(defun map-optimization-quality-combinations* (function specifier)
+  (apply #'map-optimization-quality-combinations
+         function (expand-optimize-specifier specifier)))
+
+(defun map-optimize-declarations* (function specifier)
+  (apply #'map-optimize-declarations
+         function (expand-optimize-specifier specifier)))
+
+;;;; CHECKED-COMPILE
+
+(defun prepare-form (thing &key optimize)
+  (cond
+    ((functionp thing)
+     (error "~@<~S is a function, not a form.~@:>" thing))
+    ((not optimize)
+     thing)
+    ((typep thing '(cons (eql sb-int:named-lambda)))
+     `(,@(subseq thing 0 3)
+         (declare (optimize ,@optimize))
+         ,@(nthcdr 3 thing)))
+    ((typep thing '(cons (eql lambda)))
+     `(,(first thing) ,(second thing)
+        (declare (optimize ,@optimize))
+        ,@(nthcdr 2 thing)))
+    (t
+     (error "~@<Cannot splice ~A declaration into forms other than ~
+             ~{~S~#[~; and ~:;, ~]~}: ~S.~@:>"
+            'optimize '(lambda sb-int:named-lambda) thing))))
+
+(defun compile-capturing-output-and-conditions
+    (form &key name condition-transform)
+  (let ((warnings '())
+        (style-warnings '())
+        (notes '())
+        (compiler-errors '())
+        (error-output (make-string-output-stream)))
+    (flet ((maybe-transform (condition)
+             (if condition-transform
+                 (funcall condition-transform condition)
+                 condition)))
+      (handler-bind ((sb-ext:compiler-note
+                       (lambda (condition)
+                         (push (maybe-transform condition) notes)
+                         (muffle-warning condition)))
+                     (style-warning
+                       (lambda (condition)
+                         (push (maybe-transform condition) style-warnings)
+                         (muffle-warning condition)))
+                     (warning
+                       (lambda (condition)
+                         (push (maybe-transform condition) warnings)
+                         (muffle-warning condition)))
+                     (sb-c:compiler-error
+                       (lambda (condition)
+                         (push (maybe-transform condition) compiler-errors))))
+        (multiple-value-bind (function warnings-p failure-p)
+            (let ((*error-output* error-output))
+              (compile name form))
+          (values function warnings-p failure-p
+                  warnings style-warnings notes compiler-errors
+                  error-output))))))
+
+(defun print-form-and-optimize (stream form-and-optimize &optional colonp atp)
+  (declare (ignore colonp atp))
+  (destructuring-bind (form . optimize) form-and-optimize
+    (format stream "~@:_~@:_~2@T~S~@:_~@:_~
+                    with ~:[~
+                      default optimization policy~
+                    ~;~
+                      ~:*~@:_~@:_~2@T~S~@:_~@:_~
+                      optimization policy~
+                    ~]"
+            form optimize)))
+
+(defun print-signaled-conditions (stream conditions &optional colonp atp)
+  (declare (ignore colonp atp))
+  (format stream "~{~@:_~@:_~{~/sb-ext:print-symbol-with-prefix/: ~A~}~}"
+          (mapcar (lambda (condition)
+                    (list (type-of condition) condition))
+                  conditions)))
 
 ;;; Compile FORM capturing and muffling all [style-]warnings and notes
-;;; and return five values: 1) the compiled function 2) a Boolean
+;;; and return six values: 1) the compiled function 2) a Boolean
 ;;; indicating whether compilation failed 3) a list of warnings 4) a
-;;; list of style-warnigns 5) a list of notes.
+;;; list of style-warnings 5) a list of notes 6) a list of
+;;; SB-C:COMPILER-ERROR conditions.
 ;;;
 ;;; An error can be signaled when COMPILE indicates failure as well as
 ;;; in case [style-]warning or note conditions are signaled. The
-;;; keyword parameters ALLOW-{FAILURE,[STYLE-]WARNINGS,NOTES} control
+;;; keyword parameters
+;;; ALLOW-{FAILURE,[STYLE-]WARNINGS,NOTES,COMPILER-ERRORS} control
 ;;; this behavior. All but ALLOW-NOTES default to NIL.
 ;;;
-;;; Arguments to the ALLOW-{FAILURE,[STYLE-]WARNINGS,NOTES} keyword
+;;; Arguments to the
+;;; ALLOW-{FAILURE,[STYLE-]WARNINGS,NOTES,COMPILER-ERRORS} keyword
 ;;; parameters are interpreted as type specifiers restricting the
 ;;; allowed conditions of the respective kind.
+;;;
+;;; When supplied, the value of CONDITION-TRANSFORM has to be a
+;;; function of one argument, the condition currently being
+;;; captured. The returned value is captured and later returned in
+;;; place of the condition.
 (defun checked-compile (form
                         &key
                         name
                         allow-failure
                         allow-warnings
                         allow-style-warnings
-                        (allow-notes t))
-  (let ((warnings '())
-        (style-warnings '())
-        (notes '())
-        (error-output (make-string-output-stream)))
-    (handler-bind ((sb-ext:compiler-note
-                    (lambda (condition)
-                      (push condition notes)
-                      (muffle-warning condition)))
-                   (style-warning
-                    (lambda (condition)
-                      (push condition style-warnings)
-                      (muffle-warning condition)))
-                   (warning
-                    (lambda (condition)
-                      (push condition warnings)
-                      (muffle-warning condition))))
-      (multiple-value-bind (function warnings-p failure-p)
-          (let ((*error-output* error-output))
-            (compile name form))
-        (declare (ignore warnings-p))
-        (labels ((fail (kind conditions &optional allowed-type)
-                   (error "~@<Compilation of ~S signaled ~A~P:~
-                           ~{~@:_~@:_~{~/sb-impl:print-symbol-with-prefix/: ~A~}~}~
-                           ~@[~@:_~@:_Allowed type is ~S.~]~@:>"
-                          form kind (length conditions)
-                          (mapcar (lambda (condition)
-                                    (list (type-of condition) condition))
-                                  conditions)
-                          allowed-type))
-                 (check-conditions (kind conditions allow)
-                   (cond
-                     (allow
-                      (let ((offenders (remove-if (lambda (condition)
-                                                    (typep condition allow))
-                                                  conditions)))
-                        (when offenders
-                          (fail kind offenders allow))))
-                     (conditions
-                      (fail kind conditions)))))
+                        (allow-notes t)
+                        (allow-compiler-errors allow-failure)
+                        condition-transform
+                        optimize)
+  (sb-int:binding* ((prepared-form (prepare-form form :optimize optimize))
+                    ((function nil failure-p
+                      warnings style-warnings notes compiler-errors
+                      error-output)
+                     (compile-capturing-output-and-conditions
+                      prepared-form :name name :condition-transform condition-transform)))
+    (labels ((fail (kind conditions &optional allowed-type)
+               (error "~@<Compilation of~/test-util::print-form-and-optimize/ ~
+                       signaled ~A~P:~/test-util::print-signaled-conditions/~
+                       ~@[~@:_~@:_Allowed type is ~
+                      ~/sb-ext:print-type-specifier/.~]~@:>"
+                      (cons form optimize) kind (length conditions) conditions
+                      allowed-type))
+             (check-conditions (kind conditions allow)
+               (cond
+                 (allow
+                  (let ((offenders (remove-if (lambda (condition)
+                                                (typep condition allow))
+                                              conditions)))
+                    (when offenders
+                      (fail kind offenders allow))))
+                 (conditions
+                  (fail kind conditions)))))
 
-          (when (and (not allow-failure) failure-p)
-            (let ((output (get-output-stream-string error-output)))
-              (error "~@<Compilation of ~S failed~@[ with ~
-                      output~@:_~@:_~A~@:_~@:_~].~@:>"
-                     form (when (plusp (length output)) output))))
+      (when (and (not allow-failure) failure-p)
+        (let ((output (get-output-stream-string error-output)))
+          (error "~@<Compilation of~/test-util::print-form-and-optimize/ ~
+                  failed~@[ with output~
+                  ~@:_~@:_~2@T~@<~@;~A~:>~@:_~@:_~].~@:>"
+                 (cons form optimize) (when (plusp (length output)) output))))
 
-          (check-conditions "warning"       warnings       allow-warnings)
-          (check-conditions "style-warning" style-warnings allow-style-warnings)
-          (check-conditions "note"          notes          allow-notes)
+      (check-conditions "warning"        warnings        allow-warnings)
+      (check-conditions "style-warning"  style-warnings  allow-style-warnings)
+      (check-conditions "note"           notes           allow-notes)
+      (check-conditions "compiler-error" compiler-errors allow-compiler-errors)
 
-          ;; Since we may have prevented warnings from being taken
-          ;; into account for FAILURE-P by muffling them, adjust the
-          ;; second return value accordingly.
-          (values function (when (or failure-p warnings) t)
-                  warnings style-warnings notes))))))
+      ;; Since we may have prevented warnings from being taken
+      ;; into account for FAILURE-P by muffling them, adjust the
+      ;; second return value accordingly.
+      (values function (when (or failure-p warnings) t)
+              warnings style-warnings notes compiler-errors))))
+
+(defun print-arguments (stream arguments &optional colonp atp)
+  (declare (ignore colonp atp))
+  (format stream "~:[~
+                    without arguments ~
+                  ~;~:*~
+                    with arguments~@:_~@:_~
+                    ~2@T~@<~{~S~^~@:_~}~:>~@:_~@:_~
+                  ~]"
+          arguments))
+
+(defun call-capturing-values-and-conditions (function &rest args)
+  (let ((values     nil)
+        (conditions '()))
+    (block nil
+      (handler-bind ((condition (lambda (condition)
+                                  (push condition conditions)
+                                  (typecase condition
+                                    (warning
+                                     (muffle-warning condition))
+                                    (serious-condition
+                                     (return))))))
+        (setf values (multiple-value-list (apply function args)))))
+    (values values (nreverse conditions))))
+
+(defun %checked-compile-and-assert-one-case
+    (form optimize function args-thunk expected test)
+  (let ((args (multiple-value-list (funcall args-thunk))))
+    (flet ((failed-to-signal (expected-type)
+             (error "~@<Calling the result of compiling~
+                      ~/test-util::print-form-and-optimize/ ~
+                      ~/test-util::print-arguments/~
+                      returned normally instead of signaling a ~
+                      condition of type ~
+                      ~/sb-ext:print-type-specifier/.~@:>"
+                    (cons form optimize) args expected-type))
+           (signaled-unexpected (conditions)
+             (error "~@<Calling the result of compiling~
+                      ~/test-util::print-form-and-optimize/ ~
+                      ~/test-util::print-arguments/~
+                      signaled unexpected condition~P~
+                      ~/test-util::print-signaled-conditions/~
+                      .~@:>"
+                    (cons form optimize) args (length conditions) conditions))
+           (returned-unexpected (values expected test)
+             (error "~@<Calling the result of compiling~
+                     ~/test-util::print-form-and-optimize/ ~
+                     ~/test-util::print-arguments/~
+                     returned values~@:_~@:_~
+                     ~2@T~<~{~S~^~@:_~}~:>~@:_~@:_~
+                     with is not ~S to~@:_~@:_~
+                     ~2@T~<~{~S~^~@:_~}~:>~@:_~@:_~
+                     .~@:>"
+                    (cons form optimize) args
+                    (list values) test (list expected))))
+      (multiple-value-bind (values conditions)
+          (apply #'call-capturing-values-and-conditions function args)
+        (typecase expected
+          ((cons (eql condition) (cons t null))
+           (let* ((expected-condition-type (second expected))
+                  (unexpected (remove-if (lambda (condition)
+                                           (typep condition
+                                                  expected-condition-type))
+                                         conditions))
+                  (expected (set-difference conditions unexpected)))
+             (cond
+               (unexpected
+                (signaled-unexpected unexpected))
+               ((null expected)
+                (failed-to-signal expected-condition-type)))))
+          (t
+           (let ((expected (funcall expected)))
+             (cond
+               (conditions
+                (signaled-unexpected conditions))
+               ((not (funcall test values expected))
+                (returned-unexpected values expected test))))))))))
+
+(defun %checked-compile-and-assert-one-compilation
+    (form optimize other-checked-compile-args cases)
+  (let ((function (apply #'checked-compile form
+                         (if optimize
+                             (list* :optimize optimize
+                                    other-checked-compile-args)
+                             other-checked-compile-args))))
+    (loop for (args-thunk values test) in cases
+       do (%checked-compile-and-assert-one-case
+           form optimize function args-thunk values test))))
+
+(defun %checked-compile-and-assert (form checked-compile-args cases)
+  (let ((optimize (getf checked-compile-args :optimize))
+        (other-args (loop for (key value) on checked-compile-args by #'cddr
+                          unless (eq key :optimize)
+                          collect key and collect value)))
+    (map-optimize-declarations*
+     (lambda (&optional optimize)
+       (%checked-compile-and-assert-one-compilation
+        form optimize other-args cases))
+     optimize)))
+
+;;; Compile FORM using CHECKED-COMPILE, then call the resulting
+;;; function with arguments and assert expected return values
+;;; according to CASES.
+;;;
+;;; Elements of CASES are of the form
+;;;
+;;;   ((&rest ARGUMENT-FORMS) VALUES-FORM &optional TEST)
+;;;
+;;; where ARGUMENT-FORMS are evaluated to produce the arguments for
+;;; one call of the function and VALUES-FORM is evaluated to produce
+;;; the expected return values for that function call. TEST is used to
+;;; compare a list of the values returned by the function call to the
+;;; list of values obtained by calling VALUES-FORM.
+;;;
+;;; If VALUES-FORM is of the form
+;;;
+;;;   (CONDITION CONDITION-TYPE)
+;;;
+;;; the function call is expected to signal the designated condition
+;;; instead of returning values. CONDITION-TYPE is evaluated.
+;;;
+;;; The OPTIMIZE keyword parameter controls the optimization policies
+;;; (or policy) used when compiling FORM. The argument is interpreted
+;;; as described for MAP-OPTIMIZE-DECLARATIONS*.
+;;;
+;;; The other keyword parameters, NAME and
+;;; ALLOW-{WARNINGS,STYLE-WARNINGS,NOTES}, behave as with
+;;; CHECKED-COMPILE.
+(defmacro checked-compile-and-assert ((&key name
+                                            allow-warnings
+                                            allow-style-warnings
+                                            (allow-notes t)
+                                            (optimize :quick))
+                                         form &body cases)
+  (flet ((make-case-form (case)
+           (destructuring-bind (args values &key (test ''equal testp))
+               case
+             (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
+               (when (and testp conditionp)
+                 (sb-ext:with-current-source-form (case)
+                   (error "~@<Cannot use ~S with ~S ~S.~@:>"
+                          values :test test)))
+               `(list (lambda () (values ,@args))
+                      ,(if conditionp
+                           `(list 'condition ,(second values))
+                           `(lambda () (multiple-value-list ,values)))
+                      ,test)))))
+    `(%checked-compile-and-assert
+      ,form (list :name ,name
+                  :allow-warnings ,allow-warnings
+                  :allow-style-warnings ,allow-style-warnings
+                  :allow-notes ,allow-notes
+                  :optimize ,optimize)
+      (list ,@(mapcar #'make-case-form cases)))))
+
+;;; Like CHECKED-COMPILE, but for each captured condition, capture and
+;;; later return a cons
+;;;
+;;;   (CONDITION . SOURCE-PATH)
+;;;
+;;; instead. SOURCE-PATH is the path of the source form associated to
+;;; CONDITION.
+(defun checked-compile-capturing-source-paths (form &rest args)
+  (labels ((context-source-path ()
+             (let ((context (sb-c::find-error-context nil)))
+               (sb-c::compiler-error-context-original-source-path
+                context)))
+           (add-source-path (condition)
+             (cons condition (context-source-path))))
+    (apply #'checked-compile form :condition-transform #'add-source-path
+           args)))
+
+;;; Similar to CHECKED-COMPILE, but allow compilation failure and
+;;; warnings and only return source paths associated to those
+;;; conditions.
+(defun checked-compile-condition-source-paths (form)
+  (let ((source-paths '()))
+    (labels ((context-source-path ()
+               (let ((context (sb-c::find-error-context nil)))
+                 (sb-c::compiler-error-context-original-source-path
+                  context)))
+             (push-source-path (condition)
+               (declare (ignore condition))
+               (push (context-source-path) source-paths)))
+      (checked-compile form
+                       :allow-failure t
+                       :allow-warnings t
+                       :allow-style-warnings t
+                       :condition-transform #'push-source-path))
+    (nreverse source-paths)))
 
 ;;; Repeat calling THUNK until its cumulated runtime, measured using
 ;;; GET-INTERNAL-RUN-TIME, is larger than PRECISION. Repeat this
@@ -267,3 +672,15 @@
         for end = (position delimiter string) then (position delimiter string :start begin)
         collect (subseq string begin end)
         while end))
+
+(defun shuffle (sequence)
+  (typecase sequence
+    (list
+     (coerce (shuffle (coerce sequence 'vector)) 'list))
+    (vector ; destructive
+     (let ((vector sequence))
+       (loop for lim from (1- (length vector)) downto 0
+             for chosen = (random (1+ lim))
+             unless (= chosen lim)
+             do (rotatef (aref vector chosen) (aref vector lim)))
+       vector))))

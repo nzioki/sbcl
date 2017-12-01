@@ -12,8 +12,9 @@
 
 (in-package "SB!C")
 
+(defvar *location-context* nil)
+
 (defun note-this-location (vop kind)
-  #!+sb-doc
   "NOTE-THIS-LOCATION VOP Kind
   Note that the current code location is an interesting (to the debugger)
   location of the specified Kind. VOP is the VOP responsible for this code.
@@ -21,10 +22,9 @@
   that the live set is computed."
   (let ((lab (gen-label)))
     (emit-label lab)
-    (note-debug-location vop lab kind)))
+    (note-debug-location vop lab kind *location-context*)))
 
 (defun note-next-instruction (vop kind)
-  #!+sb-doc
   "NOTE-NEXT-INSTRUCTION VOP Kind
    Similar to NOTE-THIS-LOCATION, except the use the location of the next
    instruction for the code location, wherever the scheduler decided to put

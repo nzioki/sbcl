@@ -42,7 +42,7 @@
        (setf not-p (not not-p)))
      (flet ((negate-condition (name)
               (let ((code (logxor 1 (conditional-opcode name))))
-                (aref *condition-name-vec* code))))
+                (aref +condition-name-vec+ code))))
        (cond ((null (rest flags))
               (inst jmp
                     (if not-p
@@ -86,7 +86,6 @@
               double-float complex-double-float))
 
             (system-area-pointer sap-reg move-if/sap)))
-  #!+sb-doc
   "Alist of primitive type -> (storage-class-name VOP-name)
    if values of such a type should be cmoved, and NIL otherwise.
 
@@ -106,7 +105,10 @@
           (labels ((make-tn ()
                      (make-representation-tn ptype scn))
                    (frob-tn (tn)
-                     (if (immediate-tn-p tn)
+                     ;; Careful not to load constants which require boxing
+                     ;; and may overwrite the flags.
+                     ;; Representation selection should avoid that.
+                     (if (eq (tn-kind tn) :constant)
                          tn
                          (make-tn))))
             (values vop
@@ -123,7 +125,7 @@
        (when not-p (pop flags))
        (flet ((negate-condition (name)
                 (let ((code (logxor 1 (conditional-opcode name))))
-                  (aref *condition-name-vec* code)))
+                  (aref +condition-name-vec+ code)))
               (load-immediate (dst constant-tn
                                &optional (sc (sc-name (tn-sc dst))))
                 ;; Can't use ZEROIZE, since XOR will affect the flags.
@@ -194,34 +196,29 @@
 ;;; Note: a constant-tn is allowed in CMP; it uses an EA displacement,
 ;;; not immediate data.
 (define-vop (if-eq)
-  (:args (x :scs (any-reg descriptor-reg control-stack constant)
-            :load-if (not (and (sc-is x immediate)
-                               (sc-is y any-reg descriptor-reg
-                                      control-stack constant))))
+  (:args (x :scs (any-reg descriptor-reg control-stack))
          (y :scs (any-reg descriptor-reg immediate)
-            :load-if (not (and (sc-is x any-reg descriptor-reg immediate)
-                               (sc-is y control-stack constant)))))
-  (:temporary (:sc descriptor-reg) temp)
+            :load-if (and (sc-is x control-stack)
+                          (not (sc-is y any-reg descriptor-reg immediate)))))
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eq)
   (:generator 6
     (cond
-      ((or (sc-is y immediate)
-           (sc-is x immediate))
-       (when (sc-is x immediate)
-         (rotatef x y))
-       (let ((value (encode-value-if-immediate y))
-             (immediate (immediate32-p x)))
-         (cond ((and (zerop value) (sc-is x any-reg descriptor-reg))
+      ((sc-is y immediate)
+       (let* ((value (encode-value-if-immediate y))
+              (immediate (immediate32-p value)))
+         (cond ((fixup-p value) ; immobile object
+                (inst cmp x value))
+               ((and (zerop value) (sc-is x any-reg descriptor-reg))
                 (inst test x x))
                (immediate
                 (inst cmp x immediate))
                ((not (sc-is x control-stack))
                 (inst cmp x (constantize value)))
                (t
-                (inst mov temp value)
-                (inst cmp x temp)))))
+                (inst mov temp-reg-tn value)
+                (inst cmp x temp-reg-tn)))))
       (t
        (inst cmp x y)))))
 

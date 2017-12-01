@@ -24,6 +24,13 @@
   (specifier-type
    `(function (&rest t) (values ,(type-specifier (lvar-type value)) &optional))))
 
+(defoptimizer (complement derive-type) ((fun))
+  (let ((type (lvar-fun-type fun)))
+    (when (fun-type-p type)
+      (specifier-type
+       (append (butlast (type-specifier type))
+               '(boolean))))))
+
 ;;; If the function has a known number of arguments, then return a
 ;;; lambda with the appropriate fixed number of args. If the
 ;;; destination is a FUNCALL, then do the &REST APPLY thing, and let
@@ -45,26 +52,6 @@
      (t
       (give-up-ir1-transform
        "The function doesn't have a fixed argument count.")))))
-
-;;;; SYMBOL-VALUE &co
-(defun derive-symbol-value-type (lvar node)
-  (if (constant-lvar-p lvar)
-      (let* ((sym (lvar-value lvar))
-             (var (maybe-find-free-var sym))
-             (local-type (when var
-                           (let ((*lexenv* (node-lexenv node)))
-                             (lexenv-find var type-restrictions))))
-             (global-type (info :variable :type sym)))
-        (if local-type
-            (type-intersection local-type global-type)
-            global-type))
-      *universal-type*))
-
-(defoptimizer (symbol-value derive-type) ((symbol) node)
-  (derive-symbol-value-type symbol node))
-
-(defoptimizer (symbol-global-value derive-type) ((symbol) node)
-  (derive-symbol-value-type symbol node))
 
 ;;;; list hackery
 
@@ -564,20 +551,23 @@
     (t (bug "Unexpected arguments to bounds coercion: ~S ~S" val type))))
 
 (defun coerce-for-bound (val type)
-  (if (consp val)
-      (let ((xbound (coerce-for-bound (car val) type)))
-        (if (coercion-loses-precision-p (car val) type)
-            xbound
-            (list xbound)))
-      (cond
-        ((subtypep type 'double-float)
-         (if (<= most-negative-double-float val most-positive-double-float)
-             (coerce val type)))
-        ((or (subtypep type 'single-float) (subtypep type 'float))
-         ;; coerce to float returns a single-float
-         (if (<= most-negative-single-float val most-positive-single-float)
-             (coerce val type)))
-        (t (coerce val type)))))
+  (cond
+    ((or (null val)
+         (null type))
+     val)
+    ((consp val)
+     (let ((xbound (coerce-for-bound (car val) type)))
+       (if (coercion-loses-precision-p (car val) type)
+           xbound
+           (list xbound))))
+    ((subtypep type 'double-float)
+     (if (<= most-negative-double-float val most-positive-double-float)
+         (coerce val type)))
+    ((or (subtypep type 'single-float) (subtypep type 'float))
+     ;; coerce to float returns a single-float
+     (if (<= most-negative-single-float val most-positive-single-float)
+         (coerce val type)))
+    (t (coerce val type))))
 
 (defun coerce-and-truncate-floats (val type)
   (when val
@@ -965,6 +955,9 @@
                  ((zerop (type-bound-number y))
                   ;; Divide by zero means result is infinity
                   nil)
+                 ((and (numberp x) (zerop x))
+                  ;; Zero divided by anything is zero, but don't lose the sign
+                  (/ x (signum (type-bound-number y))))
                  (t
                   (bound-binop / x y)))))
     (let ((top-range (interval-range-info top))
@@ -1749,10 +1742,15 @@
 
 (defun truncate-derive-type-rem-aux (num div same-arg)
   (declare (ignore same-arg))
-  (if (and (numeric-type-real-p num)
-           (numeric-type-real-p div))
-      (truncate-derive-type-rem num div)
-      *empty-type*))
+  (cond ((not (and (numeric-type-real-p num)
+                   (numeric-type-real-p div)))
+         *empty-type*)
+        ;; Floats introduce rounding errors
+        ((and (memq (numeric-type-class num) '(integer rational))
+              (memq (numeric-type-class div) '(integer rational)))
+         (truncate-derive-type-rem num div))
+        (t
+         (numeric-contagion num div))))
 
 (defoptimizer (truncate derive-type) ((number divisor))
   (let ((quot (two-arg-derive-type number divisor
@@ -1767,11 +1765,12 @@
   ;; result is a float of some type. We need to determine what that
   ;; type is. Basically it's the more contagious of the two types.
   (let ((q-type (truncate-derive-type-quot number-type divisor-type))
-        (res-type (numeric-contagion number-type divisor-type)))
+        (format (numeric-type-format
+                 (numeric-contagion number-type divisor-type))))
     (make-numeric-type :class 'float
-                       :format (numeric-type-format res-type)
-                       :low (numeric-type-low q-type)
-                       :high (numeric-type-high q-type))))
+                       :format format
+                       :low (coerce-for-bound (numeric-type-low q-type) format)
+                       :high (coerce-for-bound (numeric-type-high q-type) format))))
 
 (defun ftruncate-derive-type-quot-aux (n d same-arg)
   (declare (ignore same-arg))
@@ -1889,12 +1888,17 @@
                                (numeric-type-real-p d))
                           (,q-aux n d)
                           *empty-type*))
-                    (derive-r (n d same-arg)
+                    (derive-r (num div same-arg)
                       (declare (ignore same-arg))
-                      (if (and (numeric-type-real-p n)
-                               (numeric-type-real-p d))
-                          (,r-aux n d)
-                          *empty-type*)))
+                      (cond ((not (and (numeric-type-real-p num)
+                                       (numeric-type-real-p div)))
+                             *empty-type*)
+                            ;; Floats introduce rounding errors
+                            ((and (memq (numeric-type-class num) '(integer rational))
+                                  (memq (numeric-type-class div) '(integer rational)))
+                             (,r-aux num div))
+                            (t
+                             (numeric-contagion num div)))))
                (let ((quot (two-arg-derive-type
                             number divisor #'derive-q #',name))
                      (rem (two-arg-derive-type
@@ -1913,18 +1917,19 @@
                   ;; Compute type of quotient (first) result.
                   (defun ,q-aux (number-type divisor-type)
                     (let* ((number-interval
-                            (numeric-type->interval number-type))
+                             (numeric-type->interval number-type))
                            (divisor-interval
-                            (numeric-type->interval divisor-type))
+                             (numeric-type->interval divisor-type))
                            (quot (,q-name (interval-div number-interval
                                                         divisor-interval)))
                            (res-type (numeric-contagion number-type
-                                                        divisor-type)))
+                                                        divisor-type))
+                           (format (numeric-type-format res-type)))
                       (make-numeric-type
                        :class (numeric-type-class res-type)
-                       :format (numeric-type-format res-type)
-                       :low  (interval-low quot)
-                       :high (interval-high quot))))
+                       :format format
+                       :low  (coerce-for-bound (interval-low quot) format)
+                       :high (coerce-for-bound (interval-high quot) format))))
 
                   (defoptimizer (,name derive-type) ((number divisor))
                     (flet ((derive-q (n d same-arg)
@@ -1933,12 +1938,17 @@
                                       (numeric-type-real-p d))
                                  (,q-aux n d)
                                  *empty-type*))
-                           (derive-r (n d same-arg)
+                           (derive-r (num div same-arg)
                              (declare (ignore same-arg))
-                             (if (and (numeric-type-real-p n)
-                                      (numeric-type-real-p d))
-                                 (,r-aux n d)
-                                 *empty-type*)))
+                             (cond ((not (and (numeric-type-real-p num)
+                                              (numeric-type-real-p div)))
+                                    *empty-type*)
+                                   ;; Floats introduce rounding errors
+                                   ((and (memq (numeric-type-class num) '(integer rational))
+                                         (memq (numeric-type-class div) '(integer rational)))
+                                    (,r-aux num div))
+                                   (t
+                                    (numeric-contagion num div)))))
                       (let ((quot (two-arg-derive-type
                                    number divisor #'derive-q #',name))
                             (rem (two-arg-derive-type
@@ -1958,9 +1968,13 @@
         (hi (interval-high quot)))
     ;; Take the floor of the lower bound. The result is always a
     ;; closed lower bound.
-    (setf lo (if lo
-                 (floor (type-bound-number lo))
-                 nil))
+    (when lo
+      (setf lo (- (floor (type-bound-number lo))
+                  ;; FLOOR on floats depends on the divisor,
+                  ;; make it conservative
+                  (if (floatp (type-bound-number lo))
+                      1
+                      0))))
     ;; For the upper bound, we need to be careful.
     (setf hi
           (cond ((consp hi)
@@ -2050,9 +2064,13 @@
         (hi (interval-high quot)))
     ;; Take the ceiling of the upper bound. The result is always a
     ;; closed upper bound.
-    (setf hi (if hi
-                 (ceiling (type-bound-number hi))
-                 nil))
+    (when hi
+      (setf hi (+ (floor (type-bound-number hi))
+                  ;; CEILING on floats depends on the divisor,
+                  ;; make it conservative
+                  (if (ceiling (type-bound-number hi))
+                      1
+                      0))))
     ;; For the lower bound, we need to be careful.
     (setf lo
           (cond ((consp lo)
@@ -2654,13 +2672,9 @@
   (defun %ash/right (integer amount)
     (ash integer (- amount)))
 
-  (deftransform ash ((integer amount))
+  (deftransform ash ((integer amount) (sb!vm:signed-word (integer * 0)) *
+                     :important nil)
     "Convert ASH of signed word to %ASH/RIGHT"
-    (unless (and (csubtypep (lvar-type integer) ; do that ourselves to avoid
-                            (specifier-type 'sb!vm:signed-word)) ; optimization
-                 (csubtypep (lvar-type amount)  ; notes.
-                            (specifier-type '(integer * 0))))
-      (give-up-ir1-transform))
     (when (constant-lvar-p amount)
       (give-up-ir1-transform))
     (let ((use (lvar-uses amount)))
@@ -2677,13 +2691,9 @@
                                       ,(1- sb!vm:n-word-bits)
                                       (- amount)))))))
 
-  (deftransform ash ((integer amount))
+  (deftransform ash ((integer amount) (word (integer * 0)) *
+                     :important nil)
     "Convert ASH of word to %ASH/RIGHT"
-    (unless (and (csubtypep (lvar-type integer)
-                            (specifier-type 'sb!vm:word))
-                 (csubtypep (lvar-type amount)
-                            (specifier-type '(integer * 0))))
-      (give-up-ir1-transform))
     (when (constant-lvar-p amount)
       (give-up-ir1-transform))
     (let ((use (lvar-uses amount)))
@@ -3199,10 +3209,8 @@
     (frob y t)))
 
 ;;; Do the same for MOD.
-(deftransform mod ((x y) (integer integer) *)
+(deftransform mod ((x y) (integer (constant-arg integer)) *)
   "convert remainder mod 2^k to LOGAND"
-  (unless (constant-lvar-p y)
-    (give-up-ir1-transform))
   (let* ((y (lvar-value y))
          (y-abs (abs y))
          (len (1- (integer-length y-abs))))
@@ -3214,32 +3222,28 @@
           `(logand x ,mask)))))
 
 ;;; If arg is a constant power of two, turn TRUNCATE into a shift and mask.
-(deftransform truncate ((x y) (integer integer))
+(deftransform truncate ((x y) (integer (constant-arg integer)))
   "convert division by 2^k to shift"
-  (unless (constant-lvar-p y)
-    (give-up-ir1-transform))
   (let* ((y (lvar-value y))
          (y-abs (abs y))
          (len (1- (integer-length y-abs))))
     (unless (and (> y-abs 0) (= y-abs (ash 1 len)))
       (give-up-ir1-transform))
-    (let* ((shift (- len))
-           (mask (1- y-abs)))
+    (let ((shift (- len))
+          (mask (1- y-abs)))
       `(if (minusp x)
            (values ,(if (minusp y)
                         `(ash (- x) ,shift)
                         `(- (ash (- x) ,shift)))
                    (- (logand (- x) ,mask)))
            (values ,(if (minusp y)
-                        `(ash (- ,mask x) ,shift)
+                        `(- (ash x ,shift))
                         `(ash x ,shift))
                    (logand x ,mask))))))
 
 ;;; And the same for REM.
-(deftransform rem ((x y) (integer integer) *)
+(deftransform rem ((x y) (integer (constant-arg integer)) *)
   "convert remainder mod 2^k to LOGAND"
-  (unless (constant-lvar-p y)
-    (give-up-ir1-transform))
   (let* ((y (lvar-value y))
          (y-abs (abs y))
          (len (1- (integer-length y-abs))))
@@ -3381,7 +3385,7 @@
   (and (/= x -1)
        (1- (integer-length (logxor x (1+ x))))))
 
-(deftransform logand ((x y) (* (constant-arg t)) *)
+(deftransform logand ((x y) (* (constant-arg integer)) *)
   "fold identity operation"
   (let* ((y (lvar-value y))
          (width (or (least-zero-bit y) '*)))
@@ -3413,38 +3417,36 @@
 ;;; More complicated stuff that also depends on commutativity
 ;;; (e.g. (f (f x k1) (f y k2)) => (f (f x y) (f k1 k2))) should
 ;;; probably be handled with a more general tree-rewriting pass.
-(macrolet ((def (operator &key (type 'integer) (folded operator))
+(macrolet ((def (operator &key (type 'integer) (folded (list operator)))
              `(deftransform ,operator ((x z) (,type (constant-arg ,type)))
                 ,(format nil "associate ~A/~A of constants"
                          operator folded)
                 (binding* ((node  (if (lvar-has-single-use-p x)
                                       (lvar-use x)
                                       (give-up-ir1-transform)))
-                           (nil (or (and (combination-p node)
-                                         (eq (lvar-fun-name
-                                              (combination-fun node))
-                                             ',folded))
-                                    (give-up-ir1-transform)))
+                           (folded (or (and (combination-p node)
+                                            (car (memq (lvar-fun-name
+                                                        (combination-fun node))
+                                                       ',folded)))
+                                       (give-up-ir1-transform)))
                            (y   (second (combination-args node)))
                            (nil (or (constant-lvar-p y)
                                     (give-up-ir1-transform)))
                            (y   (lvar-value y)))
                   (unless (typep y ',type)
                     (give-up-ir1-transform))
-                  (splice-fun-args x ',folded 2)
+                  (splice-fun-args x folded 2)
                   `(lambda (x y z)
                      (declare (ignore y z))
                      ;; (operator (folded x y) z)
                      ;; == (operator x (folded z y))
-                     (,',operator x ',(,folded (lvar-value z) y)))))))
+                     (,',operator x (,folded ,(lvar-value z) ,y)))))))
   (def logand)
   (def logior)
   (def logxor)
-  (def logtest :folded logand)
-  (def + :type rational)
-  (def + :type rational :folded -)
-  (def * :type rational)
-  (def * :type rational :folded /))
+  (def logtest :folded (logand))
+  (def + :type rational :folded (+ -))
+  (def * :type rational :folded (* /)))
 
 (deftransform mask-signed-field ((width x) ((constant-arg unsigned-byte) *))
   "Fold mask-signed-field/mask-signed-field of constant width"
@@ -3498,36 +3500,15 @@
 ;;; Return T if in an arithmetic op including lvars X and Y, the
 ;;; result type is not affected by the type of X. That is, Y is at
 ;;; least as contagious as X.
-#+nil
 (defun not-more-contagious (x y)
-  (declare (type continuation x y))
   (let ((x (lvar-type x))
         (y (lvar-type y)))
-    (values (type= (numeric-contagion x y)
-                   (numeric-contagion y y)))))
-;;; Patched version by Raymond Toy. dtc: Should be safer although it
-;;; XXX needs more work as valid transforms are missed; some cases are
-;;; specific to particular transform functions so the use of this
-;;; function may need a re-think.
-(defun not-more-contagious (x y)
-  (declare (type lvar x y))
-  (flet ((simple-numeric-type (num)
-           (and (numeric-type-p num)
-                ;; Return non-NIL if NUM is integer, rational, or a float
-                ;; of some type (but not FLOAT)
-                (case (numeric-type-class num)
-                  ((integer rational)
-                   t)
-                  (float
-                   (numeric-type-format num))
-                  (t
-                   nil)))))
-    (let ((x (lvar-type x))
-          (y (lvar-type y)))
-      (if (and (simple-numeric-type x)
-               (simple-numeric-type y))
-          (values (type= (numeric-contagion x y)
-                         (numeric-contagion y y)))))))
+    (cond
+      ((csubtypep x (specifier-type 'rational)))
+      ((csubtypep x (specifier-type 'single-float))
+       (csubtypep y (specifier-type 'float)))
+      ((csubtypep x (specifier-type 'double-float))
+       (csubtypep y (specifier-type 'double-float))))))
 
 (def!type exact-number ()
   '(or rational (complex rational)))
@@ -3781,6 +3762,15 @@
                                             (integerp y-dim)
                                             (not (= x-dim y-dim)))))))))))
 
+;;; Only a simple array will always remain non-empty
+(defun array-type-non-empty-p (type)
+  (and (csubtypep type (specifier-type 'simple-array))
+       (let ((dimensions (ctype-array-dimensions type)))
+         (and (consp dimensions)
+              (every (lambda (dim)
+                       (typep dim '(integer 1)))
+                     dimensions)))))
+
 ;;; similarly to the EQL transform above, we attempt to constant-fold
 ;;; or convert to a simpler predicate: mostly we have to be careful
 ;;; with strings and bit-vectors.
@@ -3805,12 +3795,6 @@
                         (csubtypep y-type ctype2))
                    (and (csubtypep y-type ctype1)
                         (csubtypep x-type ctype2)))))
-           (mismatching-types-p (type)
-             (let* ((ctype (specifier-type type))
-                    (x-equal (types-equal-or-intersect x-type ctype))
-                    (y-equal (types-equal-or-intersect y-type ctype)))
-               (or (and x-equal (not y-equal))
-                   (and (not x-equal) y-equal))))
            (non-equal-array-p (type)
              (and (csubtypep type (specifier-type 'array))
                   (let ((equal-types (specifier-type '(or bit character)))
@@ -3861,10 +3845,6 @@
                 (give-up-ir1-transform))
                (t
                 '(eql x y))))
-        ((or (mismatching-types-p 'cons)
-             (mismatching-types-p 'bit-vector)
-             (mismatching-types-p 'string))
-         nil)
         ((some-csubtypep2 '(and array (not vector))
                           'vector)
          nil)
@@ -3881,13 +3861,7 @@
     (flet ((both-csubtypep (type)
              (let ((ctype (specifier-type type)))
                (and (csubtypep x-type ctype)
-                    (csubtypep y-type ctype))))
-           (mismatching-types-p (type)
-             (let* ((ctype (specifier-type type))
-                    (x-equal (types-equal-or-intersect x-type ctype))
-                    (y-equal (types-equal-or-intersect y-type ctype)))
-               (or (and x-equal (not y-equal))
-                   (and (not x-equal) y-equal)))))
+                    (csubtypep y-type ctype)))))
       (cond
         ((same-leaf-ref-p x y) t)
         ((array-type-dimensions-mismatch x-type y-type)
@@ -3913,6 +3887,10 @@
         ((both-csubtypep 'hash-table)
          '(hash-table-equalp x y))
         ((and (both-csubtypep 'array)
+              ;; At least one array has to be longer than 0
+              ;; and not adjustable, because #() and "" are equal.
+              (or (array-type-non-empty-p x-type)
+                  (array-type-non-empty-p y-type))
               (flet ((upgraded-et (type)
                        (multiple-value-bind (specialized supetype)
                            (array-type-upgraded-element-type type)
@@ -3934,10 +3912,6 @@
                  (types-equal-or-intersect y-type combination-type))
              (give-up-ir1-transform)
              '(eq x y)))
-        ((or (mismatching-types-p 'cons)
-             (mismatching-types-p 'array)
-             (mismatching-types-p 'number))
-         nil)
         (t (give-up-ir1-transform))))))
 
 ;;; Convert to EQL if both args are rational and complexp is specified
@@ -3977,8 +3951,12 @@
                                        (lvar-type lvar))))
 
 (flet ((maybe-invert (node op inverted x y)
-         ;; Don't invert if either argument can be a float (NaNs)
          (cond
+           #!+(or x86-64 arm64) ;; have >=/<= VOPs
+           ((and (csubtypep (lvar-type x) (specifier-type 'float))
+                 (csubtypep (lvar-type y) (specifier-type 'float)))
+            (give-up-ir1-transform))
+           ;; Don't invert if either argument can be a float (NaNs)
            ((or (maybe-float-lvar-p x) (maybe-float-lvar-p y))
             (delay-ir1-transform node :constraint)
             `(or (,op x y) (= x y)))
@@ -4236,9 +4214,26 @@
                          arg)))
           (cond ((not (funcall one-arg-constant-p value))
                  (not-constants arg))
-                (reduced-value
-                 (setf reduced-value (funcall fun reduced-value value)
-                       reduced-p t))
+                 (reduced-value
+                  (handler-case (funcall fun reduced-value value)
+                    (arithmetic-error ()
+                      (not-constants arg))
+                    (:no-error (value)
+                      ;; Some backends have no float traps
+                      (cond #!+(and (or arm arm64)
+                                    (not (host-feature sb-xc-host)))
+                            ((or (and (floatp value)
+                                      (or (float-infinity-p value)
+                                          (float-nan-p value)))
+                                 (and (complex-float-p value)
+                                      (or (float-infinity-p (imagpart value))
+                                          (float-nan-p (imagpart value))
+                                          (float-infinity-p (realpart value))
+                                          (float-nan-p (realpart value)))))
+                             (not-constants arg))
+                            (t
+                             (setf reduced-value value
+                                   reduced-p t))))))
                 (t
                  (setf reduced-value value)))))
       ;; It is tempting to drop constants reduced to identity here,
@@ -4349,7 +4344,7 @@
     (aver (eq :rest (arg-info-kind info)))
     (setf (arg-info-default info) t)))
 
-;;; This determines of we the REF to a &REST variable is headed towards
+;;; This determines if the REF to a &REST variable is headed towards
 ;;; parts unknown, or if we can really use the context.
 (defun rest-var-more-context-ok (lvar)
   (let* ((use (lvar-use lvar))
@@ -4539,7 +4534,7 @@
   (declare (ignore control args))
   (when (and (constant-lvar-p dest)
              (null (lvar-value dest)))
-    (specifier-type '(simple-array character (*)))))
+    (specifier-type 'simple-string)))
 
 ;;; We disable this transform in the cross-compiler to save memory in
 ;;; the target image; most of the uses of FORMAT in the compiler are for
@@ -4555,12 +4550,14 @@
          ;; Expanding the control string now avoids deferring to FORMATTER
          ;; so that we don't need an internal-only variant of it that
          ;; passes through extra args to %FORMATTER.
+         ;; FIXME: instead of checking the condition report, define a
+         ;; dedicated condition class
          (expr (handler-case ; in case %formatter wants to signal an error
                    (sb!format::%formatter control argc nil)
                  ;; otherwise, let the macro complain
                  (sb!format:format-error (c)
                    (if (string= (sb!format::format-error-complaint c)
-                                "no package named ~S")
+                                "No package named ~S")
                        ;; "~/apackage:afun/" might become legal later.
                        ;; To put it in perspective, "~/f" (no closing slash)
                        ;; *will* be a runtime error, but this only *might* be
@@ -5020,5 +5017,56 @@
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
-       `(sb!impl::%make-string-output-stream ',element-type)
+       `(sb!impl::%make-string-output-stream
+         ',element-type
+         (function ,(case element-type
+                      (base-char 'sb!impl::string-ouch/base-char)
+                      (t 'sb!impl::string-ouch))))
        (give-up-ir1-transform))))
+
+(flet ((xform (symbol match-kind fallback)
+         (when (constant-lvar-p symbol)
+           (let* ((symbol (lvar-value symbol))
+                  (kind (info :variable :kind symbol))
+                  (state (deprecated-thing-p 'variable symbol)))
+             (when state
+               (check-deprecated-thing 'variable symbol)
+               (case state
+                 ((:early :late)
+                  (unless (gethash symbol *free-vars*)
+                    (setf (gethash symbol *free-vars*) :deprecated)))))
+             ;; :global in the test below is redundant if match-kind is :global
+             ;; but it's harmless and a convenient way to express this.
+             ;; Note that some 3rd-party libraries use variations on DEFCONSTANT
+             ;; expanding into expressions such as:
+             ;;  (CL:DEFCONSTANT S (IF (BOUNDP 'S) (SYMBOL-VALUE 'S) (COMPUTE)))
+             ;; which means we have to use care if S in for-evaluation position would
+             ;; be converted to (LOAD-TIME-VALUE (SYMBOL-VALUE 'S)).
+             ;; When S's value is directly dumpable, it works fine, but otherwise
+             ;; it's dangerous. If the user wishes to avoid eager evaluation entirely,
+             ;; a local notinline declaration on SYMBOL-VALUE will do.
+             (when (or (eq kind match-kind)
+                       (eq kind :global)
+                       (and (eq kind :constant)
+                            (boundp symbol)
+                            (typep (symbol-value symbol) '(or number character symbol))))
+               (return-from xform symbol))))
+         fallback))
+  (deftransform symbol-global-value ((symbol))
+    (xform symbol :global `(sym-global-val symbol)))
+  (deftransform symbol-value ((symbol))
+    (xform symbol :special `(symeval symbol))))
+
+(flet ((xform (symbol match-kind)
+         (let* ((symbol (lvar-value symbol))
+                (kind (info :variable :kind symbol)))
+           (if (or (eq kind match-kind) (memq kind '(:constant :global))) ; as above
+               `(setq ,symbol value)
+               (give-up-ir1-transform)))))
+  (deftransform set-symbol-global-value ((symbol value) ((constant-arg symbol) *))
+    (xform symbol :global))
+  (deftransform set ((symbol value) ((constant-arg symbol) *))
+    (xform symbol :special)))
+
+(deftransforms (prin1-to-string princ-to-string) ((object) (number))
+  `(stringify-object object))

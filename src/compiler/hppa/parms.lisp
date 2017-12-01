@@ -10,10 +10,6 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
-
 (defconstant float-sign-shift 31)
 
 (defconstant single-float-bias 126)
@@ -112,14 +108,12 @@
 ;;; The fdefn objects for the static functions are loaded into static
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '()))
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+)
+  #'equalp)
 
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -136,5 +130,6 @@
     two-arg-ior
     two-arg-xor
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)
 

@@ -506,3 +506,61 @@
   (assert-error (this-should-fail))
   (defun some-nonexistent-handler (x) x)
   (assert (integerp (this-should-fail)))) ; but not now it shouldn't
+
+(defun (setf thing) (a b) (declare (ignore b)) a)
+
+(with-test (:name :undefined-restart
+            :skipped-on (not :undefined-fun-restarts))
+  (let* ((name (gensym))
+         (tail-call (checked-compile `(lambda () (,name)) :allow-style-warnings t))
+         (call (checked-compile `(lambda () (1+ (,name))) :allow-style-warnings t))
+         (return (checked-compile `(lambda () #',name) :allow-style-warnings t))
+         (value-lambda (lambda () 10)))
+    (flet ((test-continue (fun)
+             (fmakunbound name)
+             (handler-bind ((undefined-function
+                              (lambda (c)
+                                (declare (ignore c))
+                                (setf (fdefinition name)
+                                      (lambda () 123))
+                                (invoke-restart 'continue))))
+               (funcall fun)))
+           (test-use-value (fun value)
+             (fmakunbound name)
+             (handler-bind ((undefined-function
+                              (lambda (c)
+                                (declare (ignore c))
+                                (invoke-restart 'use-value value))))
+               (funcall fun))))
+      (assert (eq (test-continue tail-call) 123))
+      (assert (eq (test-continue call) 124))
+      (assert (eq (test-continue return) (fdefinition name)))
+      (assert (eq (test-use-value tail-call value-lambda) 10))
+      (assert (eq (test-use-value call value-lambda) 11))
+      (assert (eq (test-use-value return value-lambda) value-lambda))
+      (assert (eq (test-use-value return '(setf thing)) #'(setf thing)))
+      (assert (eq (test-use-value return #'(setf thing)) #'(setf thing))))))
+
+;;; Assert that the USE-VALUE restart for SYMBOL-FUNCTION
+;;; lets you specify any function.
+(with-test (:name :undefined-restart-symbol-function)
+  (flet ((test-use-value (value-to-use)
+           (let ((f (handler-bind
+                        ((undefined-function
+                          (lambda (c)
+                            (declare (ignore c))
+                            (use-value value-to-use))))
+                      (symbol-function 'nonexistent-fun))))
+             (assert (eq :win (funcall f :win 'whatever))))))
+    (test-use-value #'(setf thing))
+    (test-use-value '(setf thing))))
+
+(with-test (:name :unknown-key-restart)
+  (handler-bind ((sb-ext:unknown-keyword-argument
+                   (lambda (c)
+                     (assert (eq (sb-ext:unknown-keyword-argument-name c)
+                                 :bogus))
+                     (continue c))))
+    (assert (= (funcall (checked-compile '(lambda (&key abc) (1+ abc)))
+                        :bogus 30 :abc 20)
+               21))))

@@ -44,18 +44,17 @@
 (defclass pattern-gf/1 (standard-generic-function) ()
   (:metaclass funcallable-standard-class))
 
-(defmethod compute-discriminating-function ((generic-function pattern-gf/1))
-  (lambda (arg)
-    (let* ((methods (generic-function-methods generic-function))
-           (function (method-interpreting-function methods generic-function)))
-      (set-funcallable-instance-function generic-function function)
-      (funcall function arg))))
-
-(defun method-interpreting-function (methods gf)
-  (lambda (arg)
-    (dolist (method methods (no-applicable-method gf (list arg)))
-      (when (matchesp arg (pattern (car (method-specializers method))))
-        (return (funcall (method-function method) (list arg) nil))))))
+(defmethod sb-pcl:specializer-type-specifier
+    ((proto-generic-function pattern-gf/1)
+     (proto-method t)
+     (specializer pattern-specializer))
+  (labels ((to-type (pattern)
+             (cond
+               ((null pattern) 't)
+               ((atom pattern) `(eql ,pattern))
+               (t `(cons ,(to-type (car pattern))
+                         ,(to-type (cdr pattern)))))))
+    (to-type (pattern specializer))))
 
 (defun matchesp (arg pattern)
   (cond
@@ -64,6 +63,18 @@
     (t (and (matchesp (car arg) (car pattern))
             (matchesp (cdr arg) (cdr pattern))))))
 
+(defun method-interpreting-function (methods gf)
+  (lambda (arg)
+    (dolist (method methods (no-applicable-method gf (list arg)))
+      (when (matchesp arg (pattern (car (method-specializers method))))
+        (return (funcall (method-function method) (list arg) nil))))))
+
+(defmethod compute-discriminating-function ((generic-function pattern-gf/1))
+  (lambda (arg)
+    (let* ((methods (generic-function-methods generic-function))
+           (function (method-interpreting-function methods generic-function)))
+      (set-funcallable-instance-function generic-function function)
+      (funcall function arg))))
 
 ;;; protocol functions.  SPECIALIZER-DIRECT-METHODS is implemented by
 ;;; a reader on the specializer.  FIXME: implement

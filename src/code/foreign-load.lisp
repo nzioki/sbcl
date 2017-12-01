@@ -12,7 +12,7 @@
 (in-package "SB!ALIEN")
 
 ;;; Used to serialize modifications to *shared-objects*.
-(defvar *shared-objects-lock*
+(define-load-time-global *shared-objects-lock*
   (sb!thread:make-mutex :name "shared object list lock"))
 
 (define-unsupported-fun load-foreign
@@ -30,10 +30,9 @@
 
 (defvar *shared-objects*)
 
-(defstruct shared-object pathname namestring handle dont-save)
+(defstruct (shared-object (:copier nil)) pathname namestring handle dont-save)
 
 (defun load-shared-object (pathname &key dont-save)
-  #!+sb-doc
   "Load a shared library / dynamic shared object file / similar foreign
 container specified by designated PATHNAME, such as a .so on an ELF platform.
 
@@ -104,7 +103,6 @@ will be signalled when the core is saved -- this is orthogonal from DONT-SAVE."
     pathname))
 
 (defun unload-shared-object (pathname)
-  #!+sb-doc
   "Unloads the shared object loaded earlier using the designated PATHNAME with
 LOAD-SHARED-OBJECT, to the degree supported on the platform.
 
@@ -172,10 +170,10 @@ Experimental."
   #!-hpux
   (dlclose-or-lose))
 
+;;; These tables are synchronized by the lock on *LINKAGE-INFO*
 (let ((symbols (make-hash-table :test #'equal))
       (undefineds (make-hash-table :test #'equal)))
   (defun ensure-dynamic-foreign-symbol-address (symbol &optional datap)
-    #!+sb-doc
     "Returns the address of the foreign symbol as an integer. On linkage-table
 ports if the symbols isn't found a special guard address is returned instead,
 accesses to which will result in an UNDEFINED-ALIEN-ERROR. On other ports an
@@ -195,7 +193,7 @@ is never in the linkage-table."
               (if datap
                   undefined-alien-address
                   (or
-                   (gethash 'sb!vm::undefined-alien-tramp sb!fasl:*assembler-routines*)
+                   (sb!fasl::get-asm-routine 'sb!vm::undefined-alien-tramp)
                    (find-foreign-symbol-address "undefined_alien_function"))))
              (addr
               (setf (gethash symbol symbols) t)
