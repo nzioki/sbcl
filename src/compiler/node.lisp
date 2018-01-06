@@ -1503,6 +1503,15 @@
   (caller :test caller)
   (arg-specs :test arg-specs)
   (result-specs :test result-specs))
+
+;;; Something will modify this value, warn if it's a constant
+(def!struct (modifying-cast (:include cast) (:copier nil))
+  ;; NIL after a warning has been issued
+  caller)
+
+;;; The hook is called when the value becomes constant
+(def!struct (cast-with-hook (:include cast) (:copier nil))
+  (hook #'missing-arg :type (or null function)))
 
 ;;;; non-local exit support
 ;;;;

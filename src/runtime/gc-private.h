@@ -80,12 +80,12 @@ gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
 extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
 extern struct weak_pointer *weak_pointers; /* in gc-common.c */
 extern struct hash_table *weak_hash_tables; /* in gc-common.c */
-extern struct hash_table *weak_AND_hash_tables; /* in gc-common.c */
 
 // These next two are prototyped for both GCs
 // but only gencgc will ever call them.
 void gc_mark_range(lispobj*start, long count);
 void gc_mark_obj(lispobj);
+void gc_dispose_private_pages();
 
 extern void heap_scavenge(lispobj *start, lispobj *limit);
 extern sword_t scavenge(lispobj *start, sword_t n_words);
@@ -94,13 +94,15 @@ extern void scav_weak_hash_tables(int (*[5])(lispobj,lispobj),
                                   void (*)(lispobj*));
 extern void scav_binding_stack(lispobj*, lispobj*, void(*)(lispobj));
 extern void scan_binding_stack(void);
-extern void scan_weak_hash_tables(int (*[5])(lispobj,lispobj));
+extern void cull_weak_hash_tables(int (*[5])(lispobj,lispobj));
 extern void scan_weak_pointers(void);
 extern void scav_hash_table_entries (struct hash_table *hash_table,
                                      int (*[5])(lispobj,lispobj),
                                      void (*)(lispobj*));
 extern int (*weak_ht_alivep_funs[5])(lispobj,lispobj);
 extern void gc_scav_pair(lispobj where[2]);
+extern void weakobj_init();
+extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
 
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
 lispobj  copy_object(lispobj object, sword_t nwords);
@@ -263,14 +265,6 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 
 #define NON_FAULTING_STORE(operation, addr) operation
 
-#endif
-
-// For x86[-64], a simple-fun or closure's "self" slot is a fixum
-// On other backends, it is a lisp ointer.
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-#define FUN_SELF_FIXNUM_TAGGED 1
-#else
-#define FUN_SELF_FIXNUM_TAGGED 0
 #endif
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE

@@ -604,6 +604,8 @@
              :name name
              #!-fp-and-pc-standard-save :return-pc
              #!-fp-and-pc-standard-save (tn-sc-offset (ir2-physenv-return-pc 2env))
+             #!-fp-and-pc-standard-save :return-pc-pass
+             #!-fp-and-pc-standard-save (tn-sc-offset (ir2-physenv-return-pc-pass 2env))
              #!-fp-and-pc-standard-save :old-fp
              #!-fp-and-pc-standard-save (tn-sc-offset (ir2-physenv-old-fp 2env))
              :encoded-locs
@@ -614,7 +616,11 @@
                 (tn-sc-offset (ir2-physenv-closure-save-tn 2env)))
               #!+unwind-to-frame-and-call-vop
               (when (ir2-physenv-bsp-save-tn 2env)
-                (tn-sc-offset (ir2-physenv-bsp-save-tn 2env)))))))
+                (tn-sc-offset (ir2-physenv-bsp-save-tn 2env)))
+              #!-fp-and-pc-standard-save
+              (label-position (ir2-physenv-lra-saved-pc 2env))
+              #!-fp-and-pc-standard-save
+              (label-position (ir2-physenv-cfp-saved-pc 2env))))))
 
 ;;; Return a complete C-D-F structure for FUN. This involves
 ;;; determining the DEBUG-INFO level and filling in optional slots as

@@ -547,31 +547,28 @@ necessary, since type inference may take arbitrarily long to converge.")
         (return))
       (incf loop-count)))
 
-  (when *check-consistency*
-    (do-blocks-backwards (block component)
-      (awhen (flush-dead-code block)
-        (let ((*compiler-error-context* it))
-          (compiler-warn "dead code detected at the end of ~S"
-                         'ir1-phases)))))
-
   (ir1-finalize component)
   (values))
 
 #!+immobile-code
 (progn
-  (declaim (type (member :immobile :dynamic) *compile-to-memory-space*))
+  (declaim (type (member :immobile :dynamic)
+                 *compile-to-memory-space*
+                 *compile-file-to-memory-space*))
   ;; COMPILE-FILE puts all nontoplevel code in immobile space, but COMPILE
   ;; offers a choice. Because the collector does not run often enough (yet),
   ;; COMPILE usually places code in the dynamic space managed by our copying GC.
   ;; Change this variable if your application always demands immobile code.
   ;; The real default is set to :DYNAMIC in make-target-2-load.lisp
   (defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+  (defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
   (defun code-immobile-p (node-or-component)
     (if (fasl-output-p *compile-object*)
-        (neq (component-kind (if (node-p node-or-component)
-                                 (node-component node-or-component)
-                                 node-or-component))
-             :toplevel)
+        (and (eq *compile-file-to-memory-space* :immobile)
+             (neq (component-kind (if (node-p node-or-component)
+                                      (node-component node-or-component)
+                                      node-or-component))
+                  :toplevel))
         (eq *compile-to-memory-space* :immobile))))
 
 (defun %compile-component (component)
@@ -584,6 +581,7 @@ necessary, since type inference may take arbitrarily long to converge.")
     (maybe-mumble "LTN ")
     (ltn-analyze component)
     (dfo-as-needed component)
+
     (maybe-mumble "control ")
     (control-analyze component #'make-ir2-block)
 

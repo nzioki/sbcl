@@ -118,11 +118,11 @@ run in any thread.")
 (define-alien-routine collect-garbage int
   (#!+gencgc last-gen #!-gencgc ignore int))
 
-#!+sb-thread
+#!+(or sb-thread sb-safepoint)
 (progn
   (define-alien-routine gc-stop-the-world void)
   (define-alien-routine gc-start-the-world void))
-#!-sb-thread
+#!-(or sb-thread sb-safepoint)
 (progn
   (defun gc-stop-the-world ())
   (defun gc-start-the-world ()))
@@ -197,12 +197,12 @@ statistics are appended to it."
                       ;; turn is a type-error.
                       (when (plusp run-time)
                         (incf *gc-run-time* run-time)))
-                    #!+sb-safepoint
+                    #!+(and sb-thread sb-safepoint)
                     (setf *stop-for-gc-pending* nil)
                     (setf *gc-pending* nil
                           new-usage (dynamic-usage))
                     #!+sb-thread
-                    (assert (not *stop-for-gc-pending*))
+                    (aver (not *stop-for-gc-pending*))
                     (gc-start-the-world)
                     ;; In a multithreaded environment the other threads
                     ;; will see *n-b-f-o-p* change a little late, but
@@ -223,7 +223,6 @@ statistics are appended to it."
              (sb!thread::without-thread-waiting-for
                  (:already-without-interrupts t)
                (let ((sb!impl::*deadline* nil)
-                     (sb!impl::*deadline-seconds* nil)
                      (epoch *gc-epoch*))
                  (loop
                   ;; GCing must be done without-gcing to avoid

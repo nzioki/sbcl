@@ -518,7 +518,8 @@
 
 (with-test (:name (wait-on-semaphore semaphore-notification :lp-1038034)
             :skipped-on (not :sb-thread)
-            :fails-on :sb-thread
+            :fails-on (and :sb-thread
+                           (not :darwin)) ;; Maybe because it doesn't use futexes?
             :broken-on :win32)
   ;; Test robustness of semaphore acquisition and notification with
   ;; asynchronous thread termination...  Which we know is currently
@@ -564,54 +565,6 @@
       (write-string "; "))
     (write-char #\.)
     (force-output)))
-
-(with-test (:name (wait-on-semaphore semaphore-notification)
-            :skipped-on (not :sb-thread)
-            :broken-on :win32)
-  (let ((sem (make-semaphore))
-        (ok nil)
-        (n 0))
-    (flet ((critical ()
-             (let ((note (make-semaphore-notification)))
-               (sb-sys:without-interrupts
-                 (unwind-protect
-                      (progn
-                        (sb-sys:with-local-interrupts
-                          (wait-on-semaphore sem :notification note)
-                          (sleep (random 0.1)))
-                        (incf n))
-                   ;; Re-increment on exit if we decremented it.
-                   (when (semaphore-notification-status note)
-                     (signal-semaphore sem))
-                   ;; KLUDGE: Prevent interrupts after this point from
-                   ;; unwinding us, so that we can reason about the counts.
-                   #+sb-thread
-                   (sb-thread::block-deferrable-signals))))))
-      (let* ((threads (loop for i from 1 upto 100
-                            collect (make-join-thread #'critical :name (format nil "T~A" i))))
-             (safe nil)
-             (unsafe nil)
-             (interruptor (make-thread (lambda ()
-                                         (loop until ok)
-                                         (let (x)
-                                           (dolist (thread threads)
-                                             (cond (x
-                                                    (push thread unsafe)
-                                                    (sleep (random 0.1))
-                                                    (ignore-errors
-                                                     (terminate-thread thread)))
-                                                   (t
-                                                    (push thread safe)))
-                                             (setf x (not x))))))))
-        (signal-semaphore sem)
-        (setf ok t)
-        (join-thread interruptor)
-        (mapc #'join-thread safe)
-        (let ((k (count-if (lambda (th)
-                             (join-thread th :default nil))
-                           unsafe)))
-          (assert (= n (+ k (length safe))))
-          (assert unsafe))))))
 
 (with-test (:name (wait-on-semaphore :n))
   (let ((semaphore (make-semaphore :count 3)))
@@ -668,16 +621,19 @@
   (write-string "; ")
   (force-output)
   (dotimes (i 100)
-    (let ((threads '())
+    (let (outer-threads
+          (inner-threads (list nil))
           (parent *current-thread*))
       (dotimes (i 100)
         (push (make-thread
                (lambda ()
                  (interrupt-thread
                   parent
-                  (lambda () (push (make-thread (lambda ())) threads)))))
-              threads)
-        (push (make-thread (lambda ())) threads))
-      (mapc #'join-thread threads))
+                  (lambda () (atomic-push (make-thread (lambda ()))
+                                          (car inner-threads))))))
+              outer-threads)
+        (push (make-thread (lambda ())) outer-threads))
+      (mapc #'join-thread outer-threads)
+      (mapc #'join-thread (car inner-threads)))
     (write-char #\.)
     (force-output)))

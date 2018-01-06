@@ -57,8 +57,10 @@ DOCSTRINGDIR="${DOCSTRINGDIR:-docstrings/}"
 
 echo /creating docstring snippets from SBCL=\'$SBCLRUNTIME\' for packages \'$PACKAGES\'
 $SBCL <<EOF
-(load "docstrings.lisp")
+(with-compilation-unit ()
+  (load "docstrings.lisp"))
 (require :asdf)
+(asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
 (dolist (module (quote ($MODULES)))
   (require module))
 (sb-texinfo:generate-includes "$DOCSTRINGDIR" $PACKAGES)
@@ -78,6 +80,7 @@ $SBCL <<EOF
 (with-open-file (s "encodings.texi-temp" :direction :output :if-exists :supersede)
   (let (result)
     (sb-int:dohash ((key val) sb-impl::*external-formats*)
+      (declare (ignore key))
       (pushnew (sb-impl::ef-names val) result :test #'equal))
     (setq result (sort result #'string< :key #'car))
     (format s "@table @code~%~%")

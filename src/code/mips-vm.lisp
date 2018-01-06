@@ -10,15 +10,15 @@
 
 ;;;; FIXUP-CODE-OBJECT
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :jmp :lui :addi) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset value kind &optional flavor)
+(defun fixup-code-object (code offset value kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
        (:absolute
         (setf (sap-ref-32 sap offset) value))
        (:jump
@@ -30,7 +30,8 @@
               (ash (1+ (ash value -15)) -1)))
        (:addi
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) value))))))))
+              (ldb (byte 16 0) value)))))
+  nil))
 
 
 #-sb-xc-host (progn

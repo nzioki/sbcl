@@ -1112,13 +1112,15 @@
                (make-lexenv
                 :default (process-inline-lexenv (second fun))
                 :handled-conditions (lexenv-handled-conditions *lexenv*)
-                :policy policy)
+                :policy policy
+                :flushable (lexenv-flushable *lexenv*))
                (make-almost-null-lexenv
                 policy
                 ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
                 ;; rather than the definition-site lexenv, since it seems
                 ;; like a much more common case.
-                (lexenv-handled-conditions *lexenv*))))
+                (lexenv-handled-conditions *lexenv*)
+                (lexenv-flushable *lexenv*))))
          (clambda (ir1-convert-lambda body
                                       :source-name source-name
                                       :debug-name debug-name
@@ -1145,7 +1147,7 @@
                                           (list (parse-key-arg-spec spec) t))
                                         key-list))))
             (allow (when (ll-kwds-allowp llks) '(&allow-other-keys))))
-        (compiler-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
+        (careful-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
 ;;; Get a DEFINED-FUN object for a function we are about to define. If
 ;;; the function has been forward referenced, then substitute for the
@@ -1165,8 +1167,8 @@
                                           :defined-here)
                           :type (if (eq :declared where-from)
                                     (leaf-type found)
-                                    (if lp
-                                        (ftype-from-lambda-list lambda-list)
+                                    (or (and lp
+                                             (ftype-from-lambda-list lambda-list))
                                         (specifier-type 'function))))))
                (substitute-leaf res found)
                (setf (gethash name *free-funs*) res)))

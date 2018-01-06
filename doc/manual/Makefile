@@ -66,8 +66,8 @@ html-stamp: $(DOCFILES) docstrings
 	@rm -f $(HTMLFILES)
 #	$(MAKEINFO) $(I_FLAGS) --html --css-include=style-multi.css $(SBCLTEXI)
 #	$(MAKEINFO) --html --css-include=style-multi.css $(ASDFTEXI)
-	$(MAKEINFO) $(I_FLAGS) --html --no-split --css-include=style-single.css $(SBCLTEXI)
-	$(MAKEINFO) --html --no-split --css-include=style-single.css $(ASDFTEXI)
+	$(MAKEINFO) $(I_FLAGS) --html --no-split --css-include=style-common.css --css-include=style-single.css $(SBCLTEXI)
+	$(MAKEINFO) --html --no-split --css-include=style-common.css --css-include=style-single.css $(ASDFTEXI)
 	touch html-stamp
 
 # Postscript documentation
@@ -75,18 +75,18 @@ html-stamp: $(DOCFILES) docstrings
 ps: $(PSFILES)
 
 %.ps: %.dvi
-	dvips -o $@ $<
+	dvips -q -o $@ $<
 
 # DVI generation
 %.dvi: %.texinfo $(DOCFILES) docstrings
-	texi2dvi $(I_FLAGS) $<
+	texi2dvi -q $(I_FLAGS) $<
 
 # PDF documentation
 .PHONY: pdf
 pdf: $(PDFFILES)
 
 %.pdf: %.texinfo $(DOCFILES) docstrings
-	$(TEXI2PDF) $(I_FLAGS) $<
+	$(TEXI2PDF) -q $(I_FLAGS) $<
 
 # info docfiles
 .PHONY: info

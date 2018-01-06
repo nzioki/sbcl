@@ -4460,15 +4460,13 @@
       `(values-list list)))
 
 (deftransform %rest-ref ((n list context count &optional length-checked-p))
-  (cond ((rest-var-more-context-ok list)
-         (if (and (constant-lvar-p length-checked-p)
-                  (lvar-value length-checked-p))
-             `(%more-arg context n)
-             `(and (< (the index n) count) (%more-arg context n))))
-        ((and (constant-lvar-p n) (zerop (lvar-value n)))
-         `(car list))
+  (cond ((not (rest-var-more-context-ok list))
+         `(nth n list))
+        ((and (constant-lvar-p length-checked-p)
+              (lvar-value length-checked-p))
+         `(%more-arg context n))
         (t
-         `(nth n list))))
+         `(and (< (the index n) count) (%more-arg context n)))))
 
 (deftransform %rest-length ((list context count))
   (if (rest-var-more-context-ok list)
@@ -4983,7 +4981,9 @@
 
 #!-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((integer 0 #.(expt 10 8))))
-  `(sb!unix:nanosleep seconds 0))
+  `(if sb!impl::*deadline*
+       (locally (declare (notinline sleep)) (sleep seconds))
+       (sb!unix:nanosleep seconds 0)))
 
 #!-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((constant-arg (real 0))))
@@ -4992,7 +4992,9 @@
         (sb!impl::split-seconds-for-sleep seconds-value)
       (if (> seconds (expt 10 8))
           (give-up-ir1-transform)
-          `(sb!unix:nanosleep ,seconds ,nano)))))
+          `(if sb!impl::*deadline*
+               (locally (declare (notinline sleep)) (sleep seconds))
+               (sb!unix:nanosleep ,seconds ,nano))))))
 
 ;; On 64-bit architectures the TLS index is in the symbol header,
 ;; !DEFINE-PRIMITIVE-OBJECT doesn't define an accessor for it.
@@ -5013,7 +5015,8 @@
   (let ((element-type (cond ((not element-type)
                              'character)
                             ((constant-lvar-p element-type)
-                             (let ((specifier (careful-specifier-type (lvar-value element-type))))
+                             (let ((specifier (ir1-transform-specifier-type
+                                               (lvar-value element-type))))
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
@@ -5056,6 +5059,15 @@
     (xform symbol :global `(sym-global-val symbol)))
   (deftransform symbol-value ((symbol))
     (xform symbol :special `(symeval symbol))))
+
+(deftransform symeval ((symbol) ((constant-arg symbol)))
+  (let* ((symbol (lvar-value symbol))
+         (kind (info :variable :kind symbol)))
+    (if (and (eq kind :constant)
+             (boundp symbol)
+             (typep (symbol-value symbol) '(or number character symbol)))
+        symbol
+        (give-up-ir1-transform))))
 
 (flet ((xform (symbol match-kind)
          (let* ((symbol (lvar-value symbol))

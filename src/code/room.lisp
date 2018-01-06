@@ -214,7 +214,10 @@
           ;; a non-nil, non-ROOM-INFO object as INFO.
         ((specialized-array-element-type-properties-p info)
          (reconstitute-vector (tagged-object other-pointer-lowtag) info))
-
+        ((= widetag sb-vm:filler-widetag)
+         (values nil
+                 sb-vm:filler-widetag
+                 (boxed-size (logand header-value short-header-max-words))))
         ((null info)
          (error "Unrecognized widetag #x~2,'0X in reconstitute-object"
                 widetag))
@@ -269,8 +272,9 @@
      (multiple-value-bind (obj typecode size) (reconstitute-object start)
       ;; SIZE is almost surely a fixnum. Non-fixnum would mean at least
       ;; a 512MB object if 32-bit words, and is inconceivable if 64-bit.
-      (aver (not (logtest (the word size) lowtag-mask)))
-      (funcall fun obj typecode size)
+       (aver (not (logtest (the word size) lowtag-mask)))
+       (unless (= typecode sb-vm:filler-widetag)
+         (funcall fun obj typecode size))
              ;; This special little dance is to add a number of octets
              ;; (and it had best be a number evenly divisible by our
              ;; allocation granularity) to an unboxed, aligned address
@@ -321,7 +325,7 @@
     (define-alien-variable "fixedobj_pages" (* (struct immobile-page))))
   (declaim (inline find-page-index))
   (define-alien-routine ("ext_find_page_index" find-page-index)
-    long (index signed))
+    long (index unsigned))
   (define-alien-variable "last_free_page" sb-kernel::page-index-t)
   (define-alien-variable "page_table" (* (struct page))))
 
@@ -379,7 +383,9 @@ We could try a few things to mitigate this:
 ;;; bytes, including any header and padding. As a special case, if exactly one
 ;;; space named :ALL is requested, then map over the known spaces.
 (defun map-allocated-objects (fun &rest spaces)
-  (declare (type function fun))
+  (declare (type function fun)
+           ;; KLUDGE: rest-arg and self calls do not play nice and it'll get consed
+           (optimize (sb-c::recognize-self-calls 0)))
   (when (and (= (length spaces) 1) (eq (first spaces) :all))
     (return-from map-allocated-objects
      (map-allocated-objects fun
@@ -693,9 +699,11 @@ We could try a few things to mitigate this:
                             sorted))
            (bytes-width (decimal-with-grouped-digits-width total-bytes))
            (objects-width (decimal-with-grouped-digits-width total-objects))
+           (totals-label (format nil "~:(~A~) instance total" space))
            (types-width (reduce #'max interesting
-                                :key (lambda (x) (length (symbol-name (classoid-name (first x)))))
-                                :initial-value 0))
+                                :key (lambda (x)
+                                       (length (symbol-name (classoid-name (first x)))))
+                                :initial-value (length totals-label)))
            (printed-bytes 0)
            (printed-objects 0))
       (declare (unsigned-byte printed-bytes printed-objects))
@@ -710,12 +718,12 @@ We could try a few things to mitigate this:
              (incf printed-bytes bytes)
              (incf printed-objects objects)
              (type-usage type objects bytes))
+        (terpri)
         (let ((residual-objects (- total-objects printed-objects))
               (residual-bytes (- total-bytes printed-bytes)))
           (unless (zerop residual-objects)
-            (type-usage "Other types" residual-bytes residual-objects)))
-        (type-usage (format nil "~:(~A~) instance total" space)
-                    total-bytes total-objects))))
+            (type-usage "Other types" residual-objects residual-bytes)))
+        (type-usage totals-label total-objects total-bytes))))
   (values))
 
 ;;;; PRINT-ALLOCATED-OBJECTS

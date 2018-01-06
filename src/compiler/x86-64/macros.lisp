@@ -351,24 +351,31 @@
 
 #!+sb-safepoint
 (defun emit-safepoint ()
-  (inst test al-tn (make-ea :byte :disp gc-safepoint-page-addr)))
+  (inst test al-tn (make-ea :byte :disp
+                            (- nil-value n-word-bytes other-pointer-lowtag
+                               gc-safepoint-trap-offset))))
 
-#!+sb-thread
 (defmacro pseudo-atomic (&rest forms)
   #!+sb-safepoint-strictly
   `(progn ,@forms (emit-safepoint))
   #!-sb-safepoint-strictly
-  (with-unique-names (label)
-    `(let ((,label (gen-label)))
-       (inst mov (make-ea :qword
-                          :base thread-base-tn
-                          :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
-             rbp-tn)
+  (with-unique-names (label pa-bits-ea)
+    `(let ((,label (gen-label))
+           (,pa-bits-ea
+            #!+sb-thread
+            (make-ea :qword
+                     :base thread-base-tn
+                     :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
+            #!-sb-thread
+            (make-ea :qword
+                     :disp (+ nil-value
+                            (static-symbol-offset
+                             '*pseudo-atomic-bits*)
+                            (ash symbol-value-slot word-shift)
+                            (- other-pointer-lowtag)))))
+       (inst mov ,pa-bits-ea rbp-tn)
        ,@forms
-       (inst xor (make-ea :qword
-                          :base thread-base-tn
-                          :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
-             rbp-tn)
+       (inst xor ,pa-bits-ea rbp-tn)
        (inst jmp :z ,label)
        ;; if PAI was set, interrupts were disabled at the same time
        ;; using the process signal mask.
@@ -380,32 +387,6 @@
        ;; trap instead.  Let's take the opportunity to trigger that
        ;; safepoint right now.
        (emit-safepoint))))
-
-
-#!-sb-thread
-(defmacro pseudo-atomic (&rest forms)
-  (with-unique-names (label)
-    `(let ((,label (gen-label)))
-       ;; FIXME: The MAKE-EA noise should become a MACROLET macro or
-       ;; something. (perhaps SVLB, for static variable low byte)
-       (inst mov (make-ea :qword :disp (+ nil-value
-                                          (static-symbol-offset
-                                           '*pseudo-atomic-bits*)
-                                          (ash symbol-value-slot word-shift)
-                                          (- other-pointer-lowtag)))
-             rbp-tn)
-       ,@forms
-       (inst xor (make-ea :qword :disp (+ nil-value
-                                          (static-symbol-offset
-                                           '*pseudo-atomic-bits*)
-                                          (ash symbol-value-slot word-shift)
-                                          (- other-pointer-lowtag)))
-             rbp-tn)
-       (inst jmp :z ,label)
-       ;; if PAI was set, interrupts were disabled at the same time
-       ;; using the process signal mask.
-       (inst break pending-interrupt-trap)
-       (emit-label ,label))))
 
 ;;;; indexed references
 
@@ -621,3 +602,17 @@
                   ((sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
                    (reg-in-size x size-override))))))
     (inst test (or modified-x x) y)))
+
+
+(defun move-dword-if-immobile-code (dest src)
+  (flet ((downsize (tn)
+           (cond #!+immobile-code
+                 (sb!c::*code-is-immobile*
+                  (cond ((sc-is tn signed-stack unsigned-stack sap-stack)
+                         (make-ea :dword :base rbp-tn
+                                         :disp (frame-byte-offset (tn-offset tn))))
+                        (t
+                         (reg-in-size tn :dword))))
+                 (t
+                  tn))))
+    (inst mov (downsize dest) (downsize src))))

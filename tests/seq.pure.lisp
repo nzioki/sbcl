@@ -248,7 +248,8 @@
                (t t)))
            (test (type expr &key (filter #'safe))
              (checked-compile-and-assert
-                 (:optimize `(:compilation-speed nil :space nil :filter ,filter))
+                 (:optimize `(:compilation-speed nil :space nil :filter ,filter)
+                  :allow-style-warnings t)
                  `(lambda () ,expr)
                (() (condition type)))))
     (test 'sb-kernel:bounding-indices-bad-error
@@ -461,3 +462,11 @@
   (checked-compile-and-assert ()
     `(lambda (e) (search '(a) '(b) :end1 e))
     ((0) 0)))
+
+(with-test (:name (count :no-consing)
+            :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (count 1 x)))))
+    (ctu:assert-no-consing (funcall f #(1 2 3 4)))
+    (ctu:assert-no-consing (funcall f '(1 2 3 4)))))

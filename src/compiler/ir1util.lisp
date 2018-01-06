@@ -91,11 +91,11 @@
 
 (defun principal-lvar-dest (lvar)
   (labels ((pld (lvar)
-             (declare (type lvar lvar))
-             (let ((dest (lvar-dest lvar)))
-               (if (cast-p dest)
-                   (pld (cast-lvar dest))
-                   dest))))
+             (and lvar
+                  (let ((dest (lvar-dest lvar)))
+                    (if (cast-p dest)
+                        (pld (cast-lvar dest))
+                        dest)))))
     (pld lvar)))
 
 ;;; Update lvar use information so that NODE is no longer a use of its
@@ -199,7 +199,7 @@
                       (ref
                        (go :next))
                       (cast
-                       (when (and (eq :external (cast-type-check node))
+                       (when (and (memq (cast-type-check node) '(:external nil))
                                   (eq dest (node-dest node)))
                          (go :next)))
                       (combination
@@ -420,22 +420,41 @@
            (unlink-node node))))
 
 ;;; Make a CAST and insert it into IR1 before node NEXT.
+
 (defun insert-cast-before (next lvar type policy &optional context)
   (declare (type node next) (type lvar lvar) (type ctype type))
   (with-ir1-environment-from-node next
-    (let* ((ctran (node-prev next))
-           (cast (make-cast lvar type policy context))
-           (internal-ctran (make-ctran)))
-      (setf (ctran-next ctran) cast
-            (node-prev cast) ctran)
-      (use-ctran cast internal-ctran)
-      (link-node-to-previous-ctran next internal-ctran)
-      (setf (lvar-dest lvar) cast)
-      (reoptimize-lvar lvar)
-      (when (return-p next)
-        (node-ends-block cast))
-      (setf (block-type-check (node-block cast)) t)
-      cast)))
+    (%insert-cast-before next (make-cast lvar type policy context))))
+
+(defun %insert-cast-before (next cast)
+  (declare (type node next) (type cast cast))
+  (let* ((ctran (node-prev next))
+         (lvar (cast-value cast))
+         (internal-ctran (make-ctran)))
+    (setf (ctran-next ctran) cast
+          (node-prev cast) ctran)
+    (use-ctran cast internal-ctran)
+    (link-node-to-previous-ctran next internal-ctran)
+    (setf (lvar-dest lvar) cast)
+    (reoptimize-lvar lvar)
+    (when (return-p next)
+      (node-ends-block cast))
+    (setf (block-type-check (node-block cast)) t)
+    cast))
+
+(defun insert-ref-before (leaf node)
+  (let* ((ref (make-ref leaf))
+         (lvar (make-lvar node))
+         (ctran (make-ctran))
+         (node-ctran (node-prev node)))
+    (push ref (leaf-refs leaf))
+    (setf (leaf-ever-used leaf) t)
+    (setf (ctran-next node-ctran) ref
+          (node-prev ref) node-ctran)
+    (use-ctran ref ctran)
+    (use-lvar ref lvar)
+    (link-node-to-previous-ctran node ctran)
+    lvar))
 
 ;;;; miscellaneous shorthand functions
 
@@ -464,21 +483,70 @@
   (awhen (node-lvar node)
     (lvar-dynamic-extent it)))
 
+(defun flushable-callable-arg-p (name arg-count)
+  (typecase name
+    (null
+     t)
+    (symbol
+     (let* ((info (info :function :info name))
+            (attributes (and info
+                             (fun-info-attributes info))))
+       (and info
+            (ir1-attributep attributes flushable)
+            (not (ir1-attributep attributes call))
+            (let ((type (proclaimed-ftype name)))
+              (or
+               (not (fun-type-p type)) ;; Functions that accept anything, e.g. VALUES
+               (multiple-value-bind (min max) (fun-type-arg-limits type)
+                 (cond ((and (not min) (not max))
+                        nil)
+                       ((< arg-count min)
+                        nil)
+                       ((and max (> arg-count max))
+                        nil)
+                       (t
+                        ;; Just check for T to ensure it won't signal type errors.
+                        (not (find *universal-type*
+                                   (fun-type-n-arg-types arg-count type)
+                                   :test-not #'eql))))))))))))
+
+(defun flushable-combination-args-p (combination info)
+  (block nil
+    (map-combination-args-and-types
+     (lambda (arg type lvars &optional annotation)
+       (declare (ignore type lvars))
+       (case (car annotation)
+         (function-designator
+          (let ((fun (or (lvar-fun-name arg t)
+                         (and (constant-lvar-p arg)
+                              (lvar-value arg)))))
+            (unless (and fun
+                         (flushable-callable-arg-p fun (length (cadr annotation))))
+              (return))))
+         (inhibit-flushing
+          (let* ((except (cddr annotation)))
+            (unless (and except
+                         (constant-lvar-p arg)
+                         (memq (lvar-value arg) except))
+              (return))
+            nil))))
+     combination
+     info)
+    t))
+
 (defun flushable-combination-p (call)
   (declare (type combination call))
   (let ((kind (combination-kind call))
         (info (combination-fun-info call)))
-    (when (and (eq kind :known) (fun-info-p info))
-      (let ((attr (fun-info-attributes info)))
-        (when (and (not (ir1-attributep attr call))
-                   ;; FIXME: For now, don't consider potentially flushable
-                   ;; calls flushable when they have the CALL attribute.
-                   ;; Someday we should look at the functional args to
-                   ;; determine if they have any side effects.
-                   (if (policy call (= safety 3))
-                       (ir1-attributep attr flushable)
-                       (ir1-attributep attr unsafely-flushable)))
-          t)))))
+    (or (when (and (eq kind :known) (fun-info-p info))
+          (let ((attr (fun-info-attributes info)))
+            (and (if (policy call (= safety 3))
+                     (ir1-attributep attr flushable)
+                     (ir1-attributep attr unsafely-flushable))
+                 (flushable-combination-args-p call info))))
+        ;; Is it declared flushable locally?
+        (let ((name (lvar-fun-name (combination-fun call) t)))
+          (memq name (lexenv-flushable (node-lexenv call)))))))
 
 ;;;; BLOCK UTILS
 
@@ -606,14 +674,15 @@
   ;; across components, or an explanation of when they do it. ...in the
   ;; meanwhile AVER that our assumption holds true.
   (aver (or (not component) (eq component (node-component use))))
-  (or (dx-combination-p use dx)
-      (and (cast-p use)
-           (not (cast-type-check use))
-           (lvar-good-for-dx-p (cast-value use) dx component))
-      (and (trivial-lambda-var-ref-p use)
-           (let ((uses (lvar-uses (trivial-lambda-var-ref-lvar use))))
-             (or (eq use uses)
-                 (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx component))))))
+  (and (not (node-to-be-deleted-p use))
+       (or (dx-combination-p use dx)
+           (and (cast-p use)
+                (not (cast-type-check use))
+                (lvar-good-for-dx-p (cast-value use) dx component))
+           (and (trivial-lambda-var-ref-p use)
+                (let ((uses (lvar-uses (trivial-lambda-var-ref-lvar use))))
+                  (or (eq use uses)
+                      (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx component)))))))
 
 (defun lvar-good-for-dx-p (lvar dx &optional component)
   (let ((uses (lvar-uses lvar)))
@@ -641,24 +710,31 @@
 (defvar *dx-combination-p-check-local* t)
 
 (defun dx-combination-p (use dx)
-  (and (combination-p use)
-       (or
-        ;; Known, and can do DX.
-        (known-dx-combination-p use dx)
-        ;; Possibly a not-yet-eliminated lambda which ends up returning the
-        ;; results of an actual known DX combination.
-        (and *dx-combination-p-check-local*
-             (let* ((fun (combination-fun use))
-                    (ref (principal-lvar-use fun))
-                    (clambda (when (ref-p ref)
-                               (ref-leaf ref)))
-                    (creturn (when (lambda-p clambda)
-                               (lambda-return clambda)))
-                    (result-use (when (return-p creturn)
-                                  (principal-lvar-use (return-result creturn)))))
-               ;; FIXME: We should be able to deal with multiple uses here as well.
-               (and (dx-combination-p result-use dx)
-                    (combination-args-flow-cleanly-p use result-use dx)))))))
+  (let (seen)
+    (labels ((recurse (use)
+               (and (combination-p use)
+                    (not (memq use seen))
+                    (or
+                     ;; Known, and can do DX.
+                     (known-dx-combination-p use dx)
+                     ;; Possibly a not-yet-eliminated lambda which ends up returning the
+                     ;; results of an actual known DX combination.
+                     (and *dx-combination-p-check-local*
+                          (let* ((fun (combination-fun use))
+                                 (ref (principal-lvar-use fun))
+                                 (clambda (when (ref-p ref)
+                                            (ref-leaf ref)))
+                                 (creturn (when (lambda-p clambda)
+                                            (lambda-return clambda)))
+                                 (result-use (when (return-p creturn)
+                                               (principal-lvar-use (return-result creturn)))))
+                            ;; Unlikely to have enough recursive local
+                            ;; functions to warrant a hash-table
+                            (push use seen)
+                            ;; FIXME: We should be able to deal with multiple uses here as well.
+                            (and (recurse result-use)
+                                 (combination-args-flow-cleanly-p use result-use dx))))))))
+      (recurse use))))
 
 (defun combination-args-flow-cleanly-p (combination1 combination2 dx)
   (labels ((recurse (combination)
@@ -725,6 +801,19 @@
           for arg in args
           when (eq var this)
           return arg)))
+
+(defun lambda-var-ref-lvar (ref)
+  (let ((var (ref-leaf ref)))
+    (when (and (lambda-var-p var)
+               (not (lambda-var-sets var)))
+      (let* ((fun (lambda-var-home var))
+             (vars (lambda-vars fun))
+             (combination (lvar-dest (ref-lvar (car (lambda-refs fun))))))
+        (when (combination-p combination)
+          (loop for v in vars
+                for arg in (combination-args combination)
+                when (eq v var)
+                return arg))))))
 
 ;;; This needs to play nice with LVAR-GOOD-FOR-DX-P and friends.
 (defun handle-nested-dynamic-extent-lvars (dx lvar &optional recheck-component)
@@ -918,7 +1007,8 @@
                          (disabled-package-locks
                           (lexenv-disabled-package-locks default))
                          (policy (lexenv-policy default))
-                         (user-data (lexenv-user-data default)))
+                         (user-data (lexenv-user-data default))
+                         (flushable (lexenv-flushable default)))
   (macrolet ((frob (var slot)
                `(let ((old (,slot default)))
                   (if ,var
@@ -930,6 +1020,7 @@
      (frob blocks lexenv-blocks)
      (frob tags lexenv-tags)
      (frob type-restrictions lexenv-type-restrictions)
+     (frob flushable lexenv-flushable)
      lambda
      cleanup handled-conditions disabled-package-locks
      policy
@@ -964,6 +1055,7 @@
      nil
      nil
      (lexenv-type-restrictions lexenv) ; XXX
+     nil
      nil
      nil
      (lexenv-handled-conditions lexenv)
@@ -2308,21 +2400,21 @@ is :ANY, the function name is not checked."
        `(progn
           (defun ,careful (specifier)
             (handler-case (,basic specifier)
-              ((or sb!kernel::arg-count-error
-                type-error) (condition)
-                (values nil (list (princ-to-string condition))))
-              (simple-error (condition)
-                (values nil (list* (simple-condition-format-control condition)
-                                   (simple-condition-format-arguments condition))))))
+              (error (condition)
+                (values nil condition))))
           (defun ,compiler (specifier)
-            (multiple-value-bind (type error-args) (,careful specifier)
-              (or type
-                  (apply #'compiler-error error-args))))
+            (handler-case (,basic specifier)
+              (simple-error (condition)
+                (apply #'compiler-warn
+                       (simple-condition-format-control condition)
+                       (simple-condition-format-arguments condition)))
+              (error (condition)
+                (compiler-warn "~a" condition))))
           (defun ,transform (specifier)
-            (multiple-value-bind (type error-args) (,careful specifier)
+            (multiple-value-bind (type condition) (,careful specifier)
               (or type
-                  (apply #'give-up-ir1-transform
-                         error-args)))))))
+                  (give-up-ir1-transform
+                   (princ-to-string condition))))))))
   (deffrob specifier-type careful-specifier-type compiler-specifier-type ir1-transform-specifier-type)
   (deffrob values-specifier-type careful-values-specifier-type compiler-values-specifier-type ir1-transform-values-specifier-type))
 
@@ -2389,12 +2481,6 @@ is :ANY, the function name is not checked."
               :value value
               :derived-type (coerce-to-values type)
               :context context))
-
-(defun cast-type-check (cast)
-  (declare (type cast cast))
-  (when (cast-reoptimize cast)
-    (ir1-optimize-cast cast t))
-  (cast-%type-check cast))
 
 (defun note-single-valuified-lvar (lvar)
   (declare (type (or lvar null) lvar))

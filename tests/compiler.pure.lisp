@@ -226,9 +226,8 @@
       (checked-compile `(lambda (x)
                           (declare (type (0) x))
                           x)
-                       :allow-failure t)
-    (assert failure-p)
-    (assert-error (funcall fun 1) program-error)))
+                       :allow-warnings t)
+    (assert failure-p)))
 
 (with-test (:name (compile make-array :bad-type-specifier :bug-181))
   (multiple-value-bind (fun failure-p warnings)
@@ -4416,8 +4415,7 @@
                         (or (if (= d c)  2 (= 3 b)) 4)))
                    :allow-style-warnings t))
 
-(with-test (:name (compile :bug-913232)
-            :fails-on :interpreter) ; no idea why it fails randomly
+(with-test (:name (compile :bug-913232))
   (checked-compile `(lambda (x)
                       (declare (optimize speed)
                                (type (or (and (or (integer -100 -50)
@@ -4527,8 +4525,10 @@
    sb-int:simple-program-error))
 
 (with-test (:name (compile :malformed-type-declaraions))
-  (checked-compile '(lambda (a) (declare (type (integer 1 2 . 3) a)))
-                   :allow-failure t))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (a) (declare (type (integer 1 2 . 3) a)) a)
+                      :allow-warnings t))))
 
 (with-test (:name :compiled-program-error-escaped-source)
   (assert
@@ -5772,17 +5772,21 @@
                      (the (eql #\A) y)))
     ((#\a #\A) t)))
 
-(with-test (:name (oddp fixnum :no-consing))
+(with-test (:name (oddp fixnum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (oddp x)))))
     (ctu:assert-no-consing (funcall f most-positive-fixnum))))
-(with-test (:name (oddp bignum :no-consing))
+(with-test (:name (oddp bignum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (oddp x))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
-(with-test (:name (logtest fixnum :no-consing :bug-1277690))
+(with-test (:name (logtest fixnum :no-consing :bug-1277690)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (logtest x most-positive-fixnum)))))
     (ctu:assert-no-consing (funcall f 1))))
-(with-test (:name (logtest bignum :no-consing))
+(with-test (:name (logtest bignum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (logtest x 1))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))

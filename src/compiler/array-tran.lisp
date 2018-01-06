@@ -332,8 +332,18 @@
 
 (defoptimizer (%make-array derive-type)
     ((dims widetag n-bits &key adjustable fill-pointer displaced-to
-                          &allow-other-keys))
+           &allow-other-keys)
+     node)
   (declare (ignore n-bits))
+  (when (constant-lvar-p dims)
+    (let ((dims (lvar-value dims)))
+      (unless (or (typep dims 'index)
+                  (and (proper-list-p dims)
+                       (every (lambda (x)
+                                (typep x 'index))
+                              dims)))
+        (let ((*compiler-error-context* node))
+          (compiler-warn "Bad array dimensions: ~a" dims)))))
   (let ((saetp (and (constant-lvar-p widetag)
                     (find (lvar-value widetag)
                           sb!vm:*specialized-array-element-type-properties*
@@ -385,7 +395,9 @@
     (return-from rewrite-initial-contents (values nil nil)))
   (let ((dimensions (make-array rank :initial-element nil))
         (output))
-    (named-let recurse ((form (sb!xc:macroexpand initial-contents env))
+    (named-let recurse ((form (handler-case (sb!xc:macroexpand initial-contents env)
+                                (error ()
+                                  (return-from rewrite-initial-contents))))
                         (axis 0))
       (flet ((make-list-ctor (tail &optional (prefix nil prefixp) &aux val)
                (when (and (sb!xc:constantp tail)
@@ -582,7 +594,8 @@
       (let* ((type (constant-form-value type env))
              (length (1- (length x)))
              (ctype (careful-values-specifier-type type)))
-        (if (csubtypep ctype (specifier-type '(array * (*))))
+        (if (and ctype
+                 (csubtypep ctype (specifier-type '(array * (*)))))
             (multiple-value-bind (type element-type upgraded had-dimensions)
                 (simplify-vector-type ctype)
               (declare (ignore type upgraded))
@@ -595,6 +608,11 @@
                                       `(:element-type ',(type-specifier element-type))))))
             (values nil t)))
       (values nil t)))
+
+(defun proper-sequence-p (sequence)
+  (if (consp sequence)
+      (proper-list-p sequence)
+      (typep sequence 'sequence)))
 
 ;;; This baby is a bit of a monster, but it takes care of any MAKE-ARRAY
 ;;; call which creates a vector with a known element type -- and tries
@@ -637,23 +655,26 @@
          (typecode (sb!vm:saetp-typecode saetp))
          (n-pad-elements (sb!vm:saetp-n-pad-elements saetp))
          (n-words-form
-           (if c-length
-               (ceiling (* (+ c-length n-pad-elements) n-bits)
-                        sb!vm:n-word-bits)
-               (let ((padded-length-form (if (zerop n-pad-elements)
-                                             'length
-                                             `(+ length ,n-pad-elements))))
-                 (cond
-                   ((= n-bits 0) 0)
-                   ((>= n-bits sb!vm:n-word-bits)
-                    `(* ,padded-length-form
-                        ;; i.e., not RATIO
-                        ,(the fixnum (/ n-bits sb!vm:n-word-bits))))
-                   (t
-                    (let ((n-elements-per-word (/ sb!vm:n-word-bits n-bits)))
-                      (declare (type index n-elements-per-word)) ; i.e., not RATIO
-                      `(ceiling (truly-the index ,padded-length-form)
-                                ,n-elements-per-word)))))))
+           (cond ((not c-length)
+                  (let ((padded-length-form (if (zerop n-pad-elements)
+                                                'length
+                                                `(+ length ,n-pad-elements))))
+                    (cond
+                      ((= n-bits 0) 0)
+                      ((>= n-bits sb!vm:n-word-bits)
+                       `(* ,padded-length-form
+                           ;; i.e., not RATIO
+                           ,(the fixnum (/ n-bits sb!vm:n-word-bits))))
+                      (t
+                       (let ((n-elements-per-word (/ sb!vm:n-word-bits n-bits)))
+                         (declare (type index n-elements-per-word)) ; i.e., not RATIO
+                         `(ceiling (truly-the index ,padded-length-form)
+                                   ,n-elements-per-word))))))
+                 ((fixnump c-length)
+                  (ceiling (* (+ c-length n-pad-elements) n-bits)
+                           sb!vm:n-word-bits))
+                 (t
+                  (give-up-ir1-transform))))
          (data-result-spec
            `(simple-array ,(sb!vm:saetp-specifier saetp) (,(or c-length '*))))
          (result-spec
@@ -768,7 +789,9 @@
                   ;; To make matters worse, the time grows superlinearly,
                   ;; and it's not entirely obvious that passing a constant array
                   ;; of 100x100 things is responsible for such an explosion.
-                  (<= (length (lvar-value initial-contents)) 1000))
+                  (let ((initial-contents (lvar-value initial-contents)))
+                    (and (proper-sequence-p initial-contents)
+                         (<= (length initial-contents) 1000))))
              (let ((contents (lvar-value initial-contents)))
                (unless (= c-length (length contents))
                  (abort-ir1-transform "~S has ~S elements, vector length is ~S."
@@ -1526,7 +1549,7 @@
     (with-unique-names (n-vector)
       `(let ((,n-vector ,vector))
          (truly-the ,elt-type (data-vector-set
-                               (the simple-vector ,n-vector)
+                               (the* (simple-vector :modifying (setf svref)) ,n-vector)
                                (check-bound ,n-vector (length ,n-vector) ,index)
                                (the ,elt-type ,value)))))))
 

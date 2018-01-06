@@ -1060,7 +1060,7 @@
       (let ((last nil)
             (first nil))
         (dotimes (num nargs)
-          (locs (standard-arg-location num))
+          (locs (sb!vm::standard-call-arg-location num))
           (let ((ref (reference-tn (lvar-tn node block (elt args num))
                                    nil)))
             (if last
@@ -1287,8 +1287,6 @@
       (vop xep-allocate-frame node block start-label)
       ;; Arg verification needs to be done before the stack pointer is adjusted
       ;; so that the extra arguments are still present when the error is signalled
-      #!-precise-arg-count-error
-      (vop xep-setup-sp node block)
       (let ((verified (unless (eq (functional-kind fun) :toplevel)
                         (setf arg-count-tn (make-arg-count-location))
                         (xep-verify-arg-count node block fun arg-count-tn))))
@@ -1297,10 +1295,11 @@
        (cond ((and (optional-dispatch-p ef)
                    (optional-dispatch-more-entry ef)
                    (neq (functional-kind (optional-dispatch-more-entry ef)) :deleted))
-              ;; COPY-MORE-ARG does the job of XEP-SETUP-SP on +precise-arg-count-error
+              ;; COPY-MORE-ARG does the job of XEP-SETUP-SP on some architectures
+              #!-(or arm arm64 x86 x86-64)
+              (vop xep-setup-sp node block)
               (vop copy-more-arg node block (optional-dispatch-max-args ef)
                    #!+x86-64 verified))
-             #!+precise-arg-count-error
              (t
               (vop xep-setup-sp node block))))
       (when (ir2-physenv-closure env)
@@ -1333,7 +1332,7 @@
                   (emit-move node block pass home))))
           (incf n))))
 
-    (emit-move node block (make-old-fp-passing-location t)
+    (emit-move node block (make-old-fp-passing-location)
                (ir2-physenv-old-fp env)))
 
   (values))
@@ -1391,11 +1390,24 @@
                      (entry-2env (physenv-info (lambda-physenv entry-fun))))
                  (setf (ir2-physenv-closure-save-tn 2env)
                        (ir2-physenv-closure-save-tn entry-2env)))))))
+    #!-fp-and-pc-standard-save
+    (let ((lab (gen-label)))
+      ;; KLUDGE: Technically, we should be doing this before VOP
+      ;; COUNT-ME for XEPs (above), but :SB-DYNCOUNT isn't used or
+      ;; expected to work anyway, so there's no real window to worry
+      ;; about.
+      (vop emit-label node block lab)
+      (setf (ir2-physenv-cfp-saved-pc env) lab))
 
     (emit-move node
                block
                (ir2-physenv-return-pc-pass env)
                (ir2-physenv-return-pc env))
+    #!-fp-and-pc-standard-save
+    (let ((lab (gen-label)))
+      (vop emit-label node block lab)
+      (setf (ir2-physenv-lra-saved-pc env) lab))
+
     #!+unwind-to-frame-and-call-vop
     (when (and (lambda-allow-instrumenting fun)
                (not (lambda-inline-expanded fun))

@@ -45,11 +45,13 @@
            (- list-pointer-lowtag)))
       0))
 
+(defconstant-eqx +all-static-fdefns+
+    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
+
 ;;; Return the (byte) offset from NIL to the start of the fdefn object
 ;;; for the static function NAME.
 (defun static-fdefn-offset (name)
-  (let ((static-fun-index
-          (position name #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+))))
+  (let ((static-fun-index (position name +all-static-fdefns+)))
     (and static-fun-index
          (+ (* (length +static-symbols+) (pad-data-block symbol-size))
             (pad-data-block (1- symbol-size))
@@ -101,6 +103,17 @@
       (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
                      (nth n *register-arg-offsets*))
       (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+
+;;; Same as above but marks stack locations as :arg-pass
+(defun standard-call-arg-location (n)
+  (declare (type unsigned-byte n))
+  (if (< n register-arg-count)
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
+                     (nth n *register-arg-offsets*))
+      (let ((tn
+              (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+        (setf (tn-kind tn) :arg-pass)
+        tn)))
 
 (defun standard-arg-location-sc (n)
   (declare (type unsigned-byte n))
@@ -159,3 +172,10 @@
 (defun cerror-call (vop error-code &rest values)
   "Cause a continuable error.  ERROR-CODE is the error to cause."
   (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))
+
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))

@@ -173,6 +173,7 @@
  ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
  ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
  ("src/code/signal" :not-host)
+ ("src/code/target-lfhash" :not-host)
  ("src/compiler/info-vector" :c-headers)
  ("src/compiler/globaldb" :c-headers)
  ("src/code/primordial-type" :c-headers)
@@ -205,6 +206,10 @@
 
  ("src/code/early-float"   :not-host)
  ("src/pcl/early-low" :not-host)
+  ;; Define at most one INTERPRETED-FUNCTION type based on target features
+ #!+sb-eval ("src/code/early-full-eval" :not-host)
+ #!+sb-fasteval ("src/interpreter/function" :not-host)
+
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
  ("src/code/list"   :not-host)
@@ -242,6 +247,7 @@
  ("src/code/share-vm" :not-host)
 
  ("src/code/thread" :not-host) ; provides *CURRENT-THREAD* for target-signal
+ ("src/code/target-signal-common" :not-host)
  #!-win32 ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from share-vm
  #!+win32 ("src/code/target-exception" :not-host)
 
@@ -351,9 +357,6 @@
 
  ("src/code/debug-info" :c-headers)
  ("src/code/source-location")
- ;; Define at most one INTERPRETED-FUNCTION type based on target features
- #!+sb-eval ("src/code/early-full-eval" :not-host)
- #!+sb-fasteval ("src/interpreter/function" :not-host)
  ("src/code/early-class")
  ("src/code/condition" :not-host)
  ("src/code/toplevel"  :not-host)

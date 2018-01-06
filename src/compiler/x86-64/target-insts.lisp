@@ -211,17 +211,14 @@
 ;;; Return contents of memory if either it refers to an unboxed code constant
 ;;; or is RIP-relative with a displacement of 0.
 (defun unboxed-constant-ref (dstate segment-offset addr disp)
-  (or  (and (eql disp 0)
+  ;; FIXME: why in one case do we read via SEGMENT-SAP and the other via ADDR?
+  (cond ((< segment-offset
+            (sb!disassem::seg-initial-raw-bytes (dstate-segment dstate)))
+         (sap-ref-word (dstate-segment-sap dstate) segment-offset))
+        ((eql disp 0)
             ;; Assume this is safe to read, since we're disassembling
             ;; from the memory just a few bytes preceding 'addr'.
-            (sap-ref-word (int-sap addr) 0))
-       (let* ((seg (dstate-segment dstate))
-              (code-offset
-               (sb!disassem::segment-offs-to-code-offs segment-offset seg))
-              (unboxed-range (sb!disassem::seg-unboxed-data-range seg)))
-         (or (and unboxed-range
-                  (<= (car unboxed-range) code-offset (cdr unboxed-range))
-                  (sap-ref-word (dstate-segment-sap dstate) segment-offset))))))
+         (sap-ref-word (int-sap addr) 0))))
 
 ;;; Prints a memory reference to STREAM. VALUE is a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component may be
@@ -548,10 +545,26 @@
                                          verbose)
   (flet ((match-p (name include exclude)
            (and (not (member name exclude :test 'equal))
-                (or (not include) (member name include :test 'equal)))))
+                (or (not include) (member name include :test 'equal))))
+         (ambiguous-name-p (fun funs)
+           ;; Return T if FUN occurs more than once in FUNS
+           (declare (simple-vector funs))
+           (dotimes (i (length funs))
+             (when (eq (svref funs i) fun)
+               (loop (cond ((>= (incf i) (length funs))
+                            (return-from ambiguous-name-p nil))
+                           ((eq (svref funs i) fun)
+                            (return-from ambiguous-name-p t))))))))
     (do-immobile-functions (code fun addr)
       (when (match-p (%simple-fun-name fun) callers exclude-callers)
-        (let ((printed-fun-name nil))
+        (dx-let ((printed-fun-name nil)
+                 (code-header-funs (make-array (code-header-words code))))
+          ;; Collect the called functions
+          (do ((i code-constants-offset (1+ i)))
+              ((= i (length code-header-funs)))
+            (let ((obj (code-header-ref code i)))
+              (when (fdefn-p obj)
+                (setf (aref code-header-funs i) (fdefn-fun obj)))))
           ;; Loop over function's assembly code
           (map-segment-instructions
            (lambda (chunk inst)
@@ -564,7 +577,8 @@
                               (and (immobile-space-obj-p callee)
                                    (not (sb!vm::fun-requires-simplifying-trampoline-p callee))
                                    (match-p (%fun-name callee)
-                                            callees exclude-callees))))
+                                            callees exclude-callees)
+                                   (not (ambiguous-name-p callee code-header-funs)))))
                    (let ((entry (sb!vm::fdefn-call-target fdefn)))
                      (when verbose
                        (let ((*print-pretty* nil))

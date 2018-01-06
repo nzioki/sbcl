@@ -74,8 +74,10 @@
 ;;; portable, because as of sbcl-0.7.4 we need somewhat more than
 ;;; 16Mbytes to represent a core, and ANSI only guarantees that
 ;;; ARRAY-DIMENSION-LIMIT is not less than 1024. -- WHN 2002-06-13
-(defstruct bigvec
+(defstruct (bigvec (:constructor %make-bigvec))
   (outer-vector (vector (make-smallvec)) :type (vector smallvec)))
+(defun make-bigvec (&optional (min-size 0))
+  (expand-bigvec (%make-bigvec) min-size))
 
 ;;; analogous to SVREF, but into a BIGVEC
 (defun bvref (bigvec index)
@@ -118,17 +120,18 @@
 
 ;;; Grow BIGVEC (exponentially, so that large increases in size have
 ;;; asymptotic logarithmic cost per byte).
-(defun expand-bigvec (bigvec)
-  (let* ((old-outer-vector (bigvec-outer-vector bigvec))
-         (length-old-outer-vector (length old-outer-vector))
-         (new-outer-vector (make-array (* 2 length-old-outer-vector))))
-    (replace new-outer-vector old-outer-vector)
-    (loop for i from length-old-outer-vector below (length new-outer-vector) do
-          (setf (svref new-outer-vector i)
-                (make-smallvec)))
-    (setf (bigvec-outer-vector bigvec)
-          new-outer-vector))
-  bigvec)
+(defun expand-bigvec (bigvec required-length)
+  (loop
+    (when (>= (bvlength bigvec) required-length)
+      (return bigvec))
+    (let* ((old-outer-vector (bigvec-outer-vector bigvec))
+           (length-old-outer-vector (length old-outer-vector))
+           (new-outer-vector (make-array (* 2 length-old-outer-vector))))
+      (replace new-outer-vector old-outer-vector)
+      (loop for i from length-old-outer-vector below (length new-outer-vector)
+            do (setf (svref new-outer-vector i) (make-smallvec)))
+      (setf (bigvec-outer-vector bigvec)
+            new-outer-vector))))
 
 ;;;; looking up bytes and multi-byte values in a BIGVEC (considering
 ;;;; it as an image of machine memory on the cross-compilation target)
@@ -203,6 +206,7 @@
   (word-address (missing-arg) :type unsigned-byte :read-only t)
   ;; the gspace contents as a BIGVEC
   (data (make-bigvec) :type bigvec :read-only t)
+  (objects nil)
   ;; the index of the next unwritten word (i.e. chunk of
   ;; SB!VM:N-WORD-BYTES bytes) in DATA, or equivalently the number of
   ;; words actually written in DATA. In order to convert to an actual
@@ -231,6 +235,9 @@
              byte-address target-space-alignment)))
   (%make-gspace :name name
                 :identifier identifier
+                ;; Track object boundaries if a page table will be produced.
+                :objects (if (= identifier dynamic-core-space-id)
+                             (make-array 5000 :fill-pointer 0 :adjustable t))
                 :word-address (ash byte-address (- sb!vm:word-shift))))
 
 ;;;; representation of descriptors
@@ -295,6 +302,23 @@
   (let* ((word-index
           (gspace-claim-n-bytes gspace length page-attributes))
          (ptr (+ (gspace-word-address gspace) word-index)))
+    #!+gencgc
+    (when (gspace-objects gspace)
+      (let ((this (ash word-index sb!vm:word-shift))
+            (next (ash (gspace-free-word-index gspace) sb!vm:word-shift))
+            (objects (gspace-objects gspace)))
+        (flet ((page-index (offset) (floor offset sb!vm:gencgc-card-bytes)))
+          ;; Record this object's byte offset unless it is unimportant
+          ;; for finding page scan start offsets. Define "unimportant" as:
+          ;; starts and ends on same page, and the preceding object does too.
+          ;; This records more objects than are strictly necessary,
+          ;; but it makes life simpler.
+          (unless (and (plusp (length objects))
+                       (= (page-index (aref objects (1- (length objects))))
+                          (page-index (1- this))
+                          (page-index this)
+                          (page-index (1- next))))
+            (vector-push-extend this objects)))))
     (make-descriptor (logior (ash ptr sb!vm:word-shift) lowtag)
                      gspace
                      word-index)))
@@ -302,12 +326,8 @@
 (defun gspace-claim-n-words (gspace n-words)
   (let* ((old-free-word-index (gspace-free-word-index gspace))
          (new-free-word-index (+ old-free-word-index n-words)))
-    ;; Grow GSPACE as necessary until it's big enough to handle
-    ;; NEW-FREE-WORD-INDEX.
-    (do ()
-        ((>= (bvlength (gspace-data gspace))
-             (* new-free-word-index sb!vm:n-word-bytes)))
-      (expand-bigvec (gspace-data gspace)))
+    ;; Grow GSPACE as necessary
+    (expand-bigvec (gspace-data gspace) (* new-free-word-index sb!vm:n-word-bytes))
     ;; Now that GSPACE is big enough, we can meaningfully grab a chunk of it.
     (setf (gspace-free-word-index gspace) new-free-word-index)
     old-free-word-index))
@@ -2057,16 +2077,16 @@ core and return a descriptor to it."
           sb!vm:word-shift)
      insts-offset-bytes))
 
-(declaim (ftype (function (descriptor sb!vm:word sb!vm:word
-                           keyword &optional keyword) descriptor)
+(declaim (ftype (sfunction (descriptor sb!vm:word sb!vm:word keyword keyword)
+                           descriptor)
                 cold-fixup))
-(defun cold-fixup (code-object after-header value kind &optional flavor)
+(defun cold-fixup (code-object after-header value kind flavor)
   (declare (ignorable flavor))
   (let* ((offset-within-code-object (calc-offset code-object after-header))
          (gspace-byte-offset (+ (descriptor-byte-offset code-object)
                                 offset-within-code-object)))
     #!-(or x86 x86-64)
-    (sb!vm::fixup-code-object code-object gspace-byte-offset value kind)
+    (sb!vm::fixup-code-object code-object gspace-byte-offset value kind flavor)
 
     #!+(or x86 x86-64)
     (let* ((gspace-data (descriptor-mem code-object))
@@ -2158,7 +2178,8 @@ core and return a descriptor to it."
                (if (listp key) (cold-list sym) sym))
              'sb!vm::+required-foreign-symbols+)
     (cold-set (cold-intern '*assembler-routines*) (car *cold-assembler-obj*))
-    (to-core (sort *cold-assembler-routines* #'< :key 'cdr)
+    (to-core (setq *cold-assembler-routines*
+                   (sort (copy-list *cold-assembler-routines*) #'< :key 'cdr))
              (lambda (rtn)
                (cold-cons (cold-intern (first rtn)) (make-fixnum-descriptor (cdr rtn))))
              '*!initial-assembler-routines*)))
@@ -2597,10 +2618,6 @@ core and return a descriptor to it."
          (fun (cold-fdefn-fun (cold-fdefinition-object name))))
     (if (cold-null fun) `(:known-fun . ,name) fun)))
 
-#!-(or x86 (and x86-64 (not immobile-space)))
-(define-cold-fop (fop-sanctify-for-execution)
-  (pop-stack))
-
 ;;; Setting this variable shows what code looks like before any
 ;;; fixups (or function headers) are applied.
 #!+sb-show (defvar *show-pre-fixup-code-p* nil)
@@ -2669,7 +2686,7 @@ core and return a descriptor to it."
                      "/#X~8,'0x: #X~8,'0x~%"
                      (+ i (gspace-byte-address (descriptor-gspace des)))
                      (bvref-32 (descriptor-mem des) i)))))
-       des)))
+       (apply-fixups (%fasl-input-stack fasl-input) des 0))))
 
 #-c-headers-only
 (let ((i (get 'fop-code 'opcode)))
@@ -2730,52 +2747,6 @@ core and return a descriptor to it."
   (fill **fop-funs** #'cold-fop-fun-entry :start i :end (+ i 4))
   (values))
 
-;;; For combining all assembler code components into one code component
-;;; we have to adjust offsets of fixups into the single new component
-(defvar *fixup-offset-addend*)
-(defun read-fixup-offset (stream) (+ (read-word-arg stream) *fixup-offset-addend*))
-
-#!+sb-thread
-(define-cold-fop (fop-symbol-tls-fixup)
-  (let* ((symbol (pop-stack))
-         (kind (pop-stack))
-         (code-object (pop-stack)))
-    (cold-fixup code-object
-                (read-fixup-offset (fasl-input-stream))
-                (ensure-symbol-tls-index symbol)
-                kind))) ; and re-push code-object
-
-(define-cold-fop (fop-foreign-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len))
-         (dummy (read-string-as-bytes (fasl-input-stream) sym))
-         (offset (read-fixup-offset (fasl-input-stream)))
-         (value #!+sb-dynamic-core (dyncore-note-symbol sym nil)
-                #!-sb-dynamic-core (cold-foreign-symbol-address sym)))
-    (declare (ignore dummy))
-    (cold-fixup code-object offset value kind :foreign))) ; and re-push code-object
-
-#!+linkage-table
-(define-cold-fop (fop-foreign-dataref-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len)))
-    #!-sb-dynamic-core (declare (ignore code-object))
-    (read-string-as-bytes (fasl-input-stream) sym)
-    #!+sb-dynamic-core
-    (let ((offset (read-word-arg (fasl-input-stream)))
-          (value (dyncore-note-symbol sym t)))
-      (cold-fixup code-object offset value kind :foreign-dataref)) ; and re-push code-object
-    #!-sb-dynamic-core
-    (progn
-      (maphash (lambda (k v)
-                 (format *error-output* "~&~S = #X~8X~%" k v))
-               *cold-foreign-symbol-table*)
-      (error "shared foreign symbol in cold load: ~S (~S)" sym kind))))
-
 (define-cold-fop (fop-assembler-code)
   (let* ((length (read-word-arg (fasl-input-stream)))
          (aligned-length (round-up length (* 2 sb!vm:n-word-bytes)))
@@ -2810,74 +2781,55 @@ core and return a descriptor to it."
                                       (fasl-input-stream)
                                       :start start
                                       :end (+ start length)))
-    des))
+    ;; Extra offset is the amount by which this assembly code component moves
+    ;; to stick it on to the end of the previous batch of assembly routines.
+    (let ((extra-offset (apply #'+ (cddr asm-code))))
+      ;; Update the name -> address table.
+      (dotimes (i (descriptor-fixnum (pop-stack)))
+        (let ((offset (+ (descriptor-fixnum (pop-stack)) extra-offset))
+              (name (pop-stack)))
+          (push (cons name offset) *cold-assembler-routines*)))
+      (apply-fixups (%fasl-input-stack (fasl-input)) des extra-offset))))
 
-(define-cold-fop (fop-assembler-routine)
-  (let* ((name (pop-stack))
-         (code-component (pop-stack))
-         (offset (read-word-arg (fasl-input-stream))))
-    (aver (eq code-component (car *cold-assembler-obj*)))
-    (push (cons name (apply #'+ offset (cddr *cold-assembler-obj*)))
-          *cold-assembler-routines*)
-    code-component))
-
-(define-cold-fop (fop-assembler-fixup)
-  (let* ((routine (pop-stack))
-         (kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-fixup-offset (fasl-input-stream))))
-    (cold-fixup code-object offset (lookup-assembler-reference routine) kind)))
-
-(define-cold-fop (fop-code-object-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-fixup-offset (fasl-input-stream)))
-         (value (descriptor-bits code-object)))
-    (cold-fixup code-object offset value kind))) ; and re-push code-object
-
-#!+immobile-space
-(progn
-  (define-cold-fop (fop-layout-fixup)
-    (let* ((obj (pop-stack))
-           (kind (pop-stack))
-           (code-object (pop-stack))
-           (offset (read-fixup-offset (fasl-input-stream)))
-           (cold-layout (or (gethash obj *cold-layouts*)
-                            (error "No cold-layout for ~S~%" obj))))
-      (cold-fixup code-object offset
-                  (descriptor-bits cold-layout)
-                  kind :layout)))
-  (define-cold-fop (fop-immobile-obj-fixup)
-    (let ((obj (pop-stack))
-          (kind (pop-stack))
-          (code-object (pop-stack))
-          (offset (read-fixup-offset (fasl-input-stream))))
-      (cold-fixup code-object offset
-                  (descriptor-bits (if (symbolp obj) (cold-intern obj) obj))
-                  kind :immobile-object))))
-
-#!+immobile-code
-(define-cold-fop (fop-named-call-fixup)
-  (let* ((name (pop-stack))
-         (fdefn (cold-fdefinition-object name))
-         (kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-fixup-offset (fasl-input-stream))))
-    (cold-fixup code-object offset
-                (+ (descriptor-bits fdefn)
-                   (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
-                   (- sb!vm:other-pointer-lowtag))
-                kind :named-call)))
-
-#!+immobile-code
-(define-cold-fop (fop-static-call-fixup)
-  (let ((name (pop-stack))
-        (kind (pop-stack))
-        (code-object (pop-stack))
-        (offset (read-fixup-offset (fasl-input-stream))))
-    (push (list name kind code-object offset) *cold-static-call-fixups*)
-    code-object))
-
+;;; Target variant of this is defined in 'target-load'
+(defun apply-fixups (fop-stack code-obj extra-offset)
+  (dotimes (i (descriptor-fixnum (pop-fop-stack fop-stack)) code-obj)
+    (binding* ((info (descriptor-fixnum (pop-fop-stack fop-stack)))
+               (sym (pop-fop-stack fop-stack))
+               ((offset kind flavor) (!unpack-fixup-info info)))
+      (incf offset extra-offset) ; for assembler routines
+      (if (eq flavor :static-call)
+          (push (list sym kind code-obj offset) *cold-static-call-fixups*)
+          (cold-fixup
+           code-obj offset
+           (ecase flavor
+             (:assembly-routine (lookup-assembler-reference sym))
+             (:foreign
+              (let ((sym (base-string-from-core sym)))
+                #!+sb-dynamic-core (dyncore-note-symbol sym nil)
+                #!-sb-dynamic-core (cold-foreign-symbol-address sym)))
+             (:foreign-dataref
+              (let ((sym (base-string-from-core sym)))
+                #!+sb-dynamic-core (dyncore-note-symbol sym t)
+                #!-sb-dynamic-core
+                (progn (maphash (lambda (k v)
+                                  (format *error-output* "~&~S = #X~8X~%" k v))
+                                *cold-foreign-symbol-table*)
+                       (error "shared foreign symbol in cold load: ~S (~S)" sym kind))))
+             (:code-object (descriptor-bits code-obj))
+             #!+sb-thread ; ENSURE-SYMBOL-TLS-INDEX isn't defined otherwise
+             (:symbol-tls-index (ensure-symbol-tls-index sym))
+             (:layout (descriptor-bits (or (gethash sym *cold-layouts*)
+                                           (error "No cold-layout for ~S~%" sym))))
+             (:immobile-object
+              ;; an interned symbol is represented by its host symbol,
+              ;; but an uninterned symbol is a descriptor.
+              (descriptor-bits (if (symbolp sym) (cold-intern sym) sym)))
+             (:named-call
+              (+ (descriptor-bits (cold-fdefinition-object sym))
+                 (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
+                 (- sb!vm:other-pointer-lowtag))))
+           kind flavor)))))
 
 ;;;; sanity checking space layouts
 
@@ -3122,6 +3074,11 @@ core and return a descriptor to it."
   #!+sb-safepoint
   (format t "#define GC_SAFEPOINT_PAGE_ADDR ((void*)0x~XUL) /* ~:*~A */~%"
             sb!vm:gc-safepoint-page-addr)
+  #!+sb-safepoint
+  (format t "#define GC_SAFEPOINT_TRAP_ADDR ((void*)0x~XUL) /* ~:*~A */~%"
+            (+ sb!vm:gc-safepoint-page-addr
+               sb!c:+backend-page-bytes+
+               (- sb!vm:gc-safepoint-trap-offset)))
 
   (dolist (symbol '(sb!vm::float-traps-byte
                     sb!vm::float-exceptions-byte
@@ -3343,7 +3300,7 @@ core and return a descriptor to it."
         (format t "~4<~@R.~> ~A~%" (1+ i) (nth i sections))))
     (format t "=================~2%")
     (format t "I. assembler routines defined in core image:~2%")
-    (dolist (routine (reverse *cold-assembler-routines*))
+    (dolist (routine *cold-assembler-routines*)
       (let ((name (car routine)))
         (format t "~8,'0X: ~S~%" (lookup-assembler-reference name) name)))
     (let ((funs nil)
@@ -3401,7 +3358,6 @@ III. initially undefined function references (alphabetically):
 ;;;; writing core file
 
 (defvar *core-file*)
-(defvar *data-page*)
 
 ;;; magic numbers to identify entries in a core file
 ;;;
@@ -3431,15 +3387,14 @@ III. initially undefined function references (alphabetically):
                    *core-file*))))
   num)
 
-(defun output-gspace (gspace verbose)
+(defun output-gspace (gspace data-page verbose)
   (force-output *core-file*)
   (let* ((posn (file-position *core-file*))
          (bytes (* (gspace-free-word-index gspace) sb!vm:n-word-bytes))
          (pages (ceiling bytes sb!c:+backend-page-bytes+))
          (total-bytes (* pages sb!c:+backend-page-bytes+)))
 
-    (file-position *core-file*
-                   (* sb!c:+backend-page-bytes+ (1+ *data-page*)))
+    (file-position *core-file* (* sb!c:+backend-page-bytes+ (1+ data-page)))
     (when verbose
       (format t "writing ~S byte~:P [~S page~:P] from ~S~%"
               total-bytes pages gspace))
@@ -3465,14 +3420,61 @@ III. initially undefined function references (alphabetically):
     ;;   PAGE COUNT
     (write-word (gspace-identifier gspace))
     (write-word (gspace-free-word-index gspace))
-    (write-word *data-page*)
-    (multiple-value-bind (floor rem)
-        (floor (gspace-byte-address gspace) 1024) ; units as per core.h
-      (aver (zerop rem))
-      (write-word floor))
+    (write-word data-page)
+    (write-word (gspace-byte-address gspace))
     (write-word pages)
 
-    (incf *data-page* pages)))
+    (+ data-page pages)))
+
+#!+gencgc
+(defun output-page-table (gspace data-page verbose)
+  (declare (ignore verbose))
+  ;; Write as many PTEs as there are pages used.
+  ;; A corefile PTE is { uword_t scan_start_offset; page_bytes_t bytes_used; }
+  (let* ((data-bytes (* (gspace-free-word-index gspace) sb!vm:n-word-bytes))
+         (n-ptes (ceiling data-bytes sb!c:+backend-page-bytes+))
+         (sizeof-usage ; see similar expression in 'src/code/room'
+          (if (typep sb!vm:gencgc-card-bytes '(unsigned-byte 16)) 2 4))
+         (sizeof-corefile-pte (+ sb!vm:n-word-bytes sizeof-usage))
+         (pte-bytes (round-up (* sizeof-corefile-pte n-ptes) sb!vm:n-word-bytes))
+         (ptes (make-bigvec))
+         (start 0))
+    (expand-bigvec ptes pte-bytes)
+    (dotimes (page-index n-ptes)
+      ;; compute scan-start-offset
+      (let ((sso (let* ((page-start (* page-index sb!vm:gencgc-card-bytes))
+                        (p (position page-start (gspace-objects gspace)
+                                     :test #'<= :start start)))
+                   ;; P is the position in OBJECTS of the first object whose start
+                   ;; is >= PAGE-START. If page-spanning, we want the preceding object
+                   ;; because SCAN-START must satisfy the condition that it points to
+                   ;; an object such that scanning from it will cover every byte of the
+                   ;; page. If the very last item in OBJECTS spans pages, P will be NIL,
+                   ;; because no object's start is >= PAGE-START.
+                   (cond ((not p)
+                          (setq p (1- (length (gspace-objects gspace)))))
+                         ((> (aref (gspace-objects gspace) p) page-start)
+                          (decf p)))
+                   ;; This is an optimization, not a correctness requirement:
+                   ;; the next scan-start object can't be at an index less than P.
+                   (setq start p)
+                   (- page-start (aref (gspace-objects gspace) p))))
+            (usage sb!vm:gencgc-card-bytes)
+            (pte-offset (* page-index sizeof-corefile-pte)))
+        (when (= page-index (1- n-ptes)) ; calculate last page's exact usage
+          (decf usage (- (* n-ptes sb!vm:gencgc-card-bytes) data-bytes)))
+        ;; #b11 = worst-case assumption: boxed and unboxed data on the page
+        (setf (bvref-word ptes pte-offset) (logior sso #b11))
+        (funcall (if (eql sizeof-usage 2) #'(setf bvref-16) #'(setf bvref-32))
+                 usage ptes (+ pte-offset sb!vm:n-word-bytes))))
+    (force-output *core-file*)
+    (let ((posn (file-position *core-file*)))
+      (file-position *core-file* (* sb!c:+backend-page-bytes+ (1+ data-page)))
+      (write-bigvec-as-sequence ptes *core-file* :end pte-bytes)
+      (force-output *core-file*)
+      (file-position *core-file* posn))
+    (mapc 'write-word ; 5 = number of words in this core header entry
+          `(,page-table-core-entry-type-code 5 ,n-ptes ,pte-bytes ,data-page))))
 
 ;;; Create a core file created from the cold loaded image. (This is
 ;;; the "initial core file" because core files could be created later
@@ -3481,7 +3483,7 @@ III. initially undefined function references (alphabetically):
 (defun write-initial-core-file (filename verbose)
 
   (let ((filenamestring (namestring filename))
-        (*data-page* 0))
+        (data-page 0))
 
     (when verbose
       (format t "[building initial core file in ~S: ~%" filenamestring))
@@ -3519,7 +3521,8 @@ III. initially undefined function references (alphabetically):
         ;; length = (5 words/space) * N spaces + 2 for header.
         (write-word (+ (* (length spaces) 5) 2))
         (dolist (space spaces)
-          (output-gspace space verbose)))
+          (setq data-page (output-gspace space data-page verbose))))
+      #!+gencgc (output-page-table *dynamic* data-page verbose)
 
       ;; Write the initial function.
       (write-word initial-fun-core-entry-type-code)
@@ -3641,7 +3644,6 @@ III. initially undefined function references (alphabetically):
            *cold-static-call-fixups*
            *cold-assembler-routines*
            *cold-assembler-obj*
-           (*fixup-offset-addend* 0)
            (*code-fixup-notes* (make-hash-table))
            (*deferred-known-fun-refs* nil))
 
@@ -3651,10 +3653,8 @@ III. initially undefined function references (alphabetically):
       ;; Load all assembler code
       (flet ((assembler-file-p (name) (tailwise-equal (namestring name) ".assem-obj")))
         (dolist (file-name (remove-if-not #'assembler-file-p object-file-names))
-          (cold-load file-name verbose)
-          (incf *fixup-offset-addend* (cadr *cold-assembler-obj*)))
+          (cold-load file-name verbose))
         (setf object-file-names (remove-if #'assembler-file-p object-file-names)))
-      (setf *fixup-offset-addend* 0)
 
       ;; Prepare for cold load.
       (initialize-layouts)
@@ -3732,10 +3732,7 @@ III. initially undefined function references (alphabetically):
       (dolist (pair (sort (%hash-table-alist *code-fixup-notes*) #'< :key #'car))
         (write-wordindexed (make-random-descriptor (car pair))
                            sb!vm::code-fixups-slot
-                           #!+x86 (ub32-vector-in-core (cdr pair))
-                           #!+x86-64 (number-to-core
-                                      (sb!c::pack-code-fixup-locs
-                                       (sort (cdr pair) #'<)))))
+                           (number-to-core (sb!c::pack-code-fixup-locs (cdr pair)))))
       (when core-file-name
         (finish-symbols))
       (finalize-load-time-value-noise)

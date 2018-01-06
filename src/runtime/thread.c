@@ -371,9 +371,9 @@ init_new_thread(struct thread *th, init_thread_data *scribble, int guardp)
      * non-safepoint versions of this code.  Can we unify this more?
      */
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-    gc_state_lock();
-    gc_state_wait(GC_NONE);
-    gc_state_unlock();
+    WITH_GC_STATE_LOCK {
+        gc_state_wait(GC_NONE);
+    }
     push_gcing_safety(&scribble->safety);
 #endif
 }
@@ -461,7 +461,7 @@ void* new_thread_trampoline(void* arg)
     int result;
     init_thread_data scribble;
 
-    FSHOW((stderr,"/creating thread %lu\n", thread_self()));
+    FSHOW((stderr,"/creating thread %p\n", thread_self()));
     check_deferrables_blocked_or_lose(0);
 #ifndef LISP_FEATURE_SB_SAFEPOINT
     check_gc_signals_unblocked_or_lose(0);
@@ -475,7 +475,7 @@ void* new_thread_trampoline(void* arg)
 
     schedule_thread_post_mortem(th);
 
-    FSHOW((stderr,"/exiting thread %lu\n", thread_self()));
+    FSHOW((stderr,"/exiting thread %p\n", thread_self()));
     return (void*)(uintptr_t)result;
 }
 
@@ -490,6 +490,14 @@ attach_os_thread(init_thread_data *scribble)
 
     struct thread *th = create_thread_struct(NIL);
     block_deferrable_signals(&scribble->oldset);
+
+#ifndef LISP_FEATURE_SB_SAFEPOINT
+    /* initial-thread-function-trampoline doesn't like when the GC signal is blocked */
+    /* FIXME: could be done using a single call to pthread_sigmask
+       together with locking the deferrable signals above. */
+    unblock_gc_signals(0, 0);
+#endif
+
     th->no_tls_value_marker = NO_TLS_VALUE_MARKER_WIDETAG;
     /* We don't actually want a pthread_attr here, but rather than add
      * `if's to the post-mostem, let's just keep that code happy by
@@ -512,8 +520,8 @@ attach_os_thread(init_thread_data *scribble)
   stack_size = stack.ss_size;
   stack_addr = (void*)((size_t)stack.ss_sp - stack_size);
 #elif defined(LISP_FEATURE_DARWIN)
-    stack_addr = pthread_get_stackaddr_np(os);
     stack_size = pthread_get_stacksize_np(os);
+    stack_addr = pthread_get_stackaddr_np(os) - stack_size;
 #else
     pthread_attr_t attr;
 #ifdef LISP_FEATURE_FREEBSD
@@ -531,16 +539,6 @@ attach_os_thread(init_thread_data *scribble)
 #endif
 
     init_new_thread(th, scribble, 0);
-
-    /* We will be calling into Lisp soon, and the functions being called
-     * recklessly ignore the comment in target-thread which says that we
-     * must be careful to not cause GC while initializing a new thread.
-     * Since we first need to create a fresh thread object, it's really
-     * tempting to just perform such unsafe allocation though.  So let's
-     * at least try to suppress GC before consing, and hope that it
-     * works: */
-    // Just stomp on the value already set by create_thread_struct()
-    write_TLS(GC_INHIBIT, T, th);
 
     uword_t stacksize
         = (uword_t) th->control_stack_end - (uword_t) th->control_stack_start;
@@ -588,7 +586,12 @@ callback_wrapper_trampoline(
     if (!th) {                  /* callback invoked in non-lisp thread */
         init_thread_data scribble;
         attach_os_thread(&scribble);
-        funcall3(StaticSymbolFunction(ENTER_FOREIGN_CALLBACK), arg0,arg1,arg2);
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+        WITH_GC_AT_SAFEPOINTS_ONLY()
+#endif
+        {
+            funcall3(StaticSymbolFunction(ENTER_FOREIGN_CALLBACK), arg0,arg1,arg2);
+        }
         detach_os_thread(&scribble);
         return;
     }
@@ -686,10 +689,7 @@ create_thread_struct(lispobj initial_function) {
 # ifdef LISP_FEATURE_WIN32
     th->carried_base_pointer = 0;
 # endif
-# ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-    th->pc_around_foreign_call = 0;
-# endif
-    th->csp_around_foreign_call = csp_page;
+    th->csp_around_foreign_call = (lispobj *)th - 1;
 #endif
 
     struct nonpointer_thread_data *nonpointer_data

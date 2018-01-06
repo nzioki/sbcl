@@ -67,10 +67,14 @@ typedef enum {
 
 void map_gc_page();
 void unmap_gc_page();
-int check_pending_interrupts();
 void gc_state_lock();
 void gc_state_wait(gc_phase_t);
+int gc_cycle_active(void);
 void gc_state_unlock();
+
+#define WITH_GC_STATE_LOCK \
+    gc_state_lock(); \
+    RUN_BODY_ONCE(gc_state_lock, gc_state_unlock())
 
 #endif
 
@@ -441,6 +445,7 @@ void *os_dlsym_default(char *name);
 struct lisp_startup_options {
     boolean noinform;
 };
+extern struct lisp_startup_options lisp_startup_options;
 
 /* Even with just -O1, gcc optimizes the jumps in this "loop" away
  * entirely, giving the ability to define WITH-FOO-style macros. */

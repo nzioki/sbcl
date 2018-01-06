@@ -235,14 +235,6 @@ unsigned long block_deferrables_and_return_mask()
     return (unsigned long)sset;
 }
 
-#if defined(LISP_FEATURE_SB_THREAD)
-void apply_sigmask(unsigned long sigmask)
-{
-    sigset_t sset = (sigset_t)sigmask;
-    thread_sigmask(SIG_SETMASK, &sset, 0);
-}
-#endif
-
 /* The exception handling function looks like this: */
 EXCEPTION_DISPOSITION handle_exception(EXCEPTION_RECORD *,
                                        struct lisp_exception_frame *,
@@ -284,7 +276,7 @@ static void set_seh_frame(void *frame)
 
 void alloc_gc_page()
 {
-    AVER(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                       MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
 }
 
@@ -312,14 +304,14 @@ void alloc_gc_page()
 void map_gc_page()
 {
     DWORD oldProt;
-    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                         PAGE_READWRITE, &oldProt));
 }
 
 void unmap_gc_page()
 {
     DWORD oldProt;
-    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                         PAGE_NOACCESS, &oldProt));
 }
 
@@ -1206,7 +1198,7 @@ handle_access_violation(os_context_t *ctx,
 
     /* Safepoint pages */
 #ifdef LISP_FEATURE_SB_THREAD
-    if (fault_address == (void *) GC_SAFEPOINT_PAGE_ADDR) {
+    if (fault_address == (void *) GC_SAFEPOINT_TRAP_ADDR) {
         thread_in_lisp_raised(ctx);
         return 0;
     }
@@ -1856,9 +1848,7 @@ win32_maybe_interrupt_io(void* thread)
                 goto unlock;
             }
             if (ptr_CancelSynchronousIo) {
-                pthread_mutex_lock(&th->os_thread->fiber_lock);
-                done = !!ptr_CancelSynchronousIo(th->os_thread->fiber_group->handle);
-                pthread_mutex_unlock(&th->os_thread->fiber_lock);
+                done = !!ptr_CancelSynchronousIo(th->os_thread->handle);
             }
             done |= !!ptr_CancelIoEx(h,NULL);
         }

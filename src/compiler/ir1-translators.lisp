@@ -666,7 +666,7 @@ be a lambda expression."
       (let ((cname (lvar-constant-global-fun-name lvar)))
         (cond (cname
                ;; Don't lose type restrictions
-               (if (and (cast-p (lvar-use lvar))
+               (if (and (cast-p (lvar-uses lvar))
                         (fun-type-p (cast-asserted-type (lvar-use lvar))))
                    `(global-function-preserve-cast ,cname ,lvar)
                    `(global-function ,cname)))
@@ -693,6 +693,9 @@ be a lambda expression."
               (fun-lvar (make-lvar)))
           (ir1-convert start ctran fun-lvar `(the function ,function))
           (ir1-convert-combination-args fun-lvar ctran next result args)))))
+
+(def-ir1-translator %funcall-lvar ((function &rest args) start next result)
+  (ir1-convert-combination-args function start next result args))
 
 ;;; This source transform exists to reduce the amount of work for the
 ;;; compiler. If the called function is a FUNCTION form, then convert
@@ -954,8 +957,14 @@ other."
 
 ;;; A logic shared among THE and TRULY-THE.
 (defun the-in-policy (type value policy start next result)
-  (let ((type (if (ctype-p type) type
-                   (compiler-values-specifier-type type))))
+  (let ((type (cond ((ctype-p type)
+                     type)
+                    ((compiler-values-specifier-type type))
+                    (t
+                     (ir1-convert start next result
+                                  `(error "Bad type specifier: ~a"
+                                          ,type))
+                     (return-from the-in-policy)))))
     (cond ((or (eq type *wild-type*)
                (eq type *universal-type*)
                (and (leaf-p value)
@@ -1016,9 +1025,30 @@ care."
   (the-in-policy value-type form **zero-typecheck-policy** start next result))
 
 ;;; THE with some options for the CAST
-(def-ir1-translator the* (((value-type &key context silent-conflict) form)
+(def-ir1-translator the* (((value-type &key context silent-conflict
+                                       truly
+                                       modifying) form)
                           start next result)
-  (let ((cast (the-in-policy value-type form (lexenv-policy *lexenv*) start next result)))
+  (let* ((policy (lexenv-policy *lexenv*))
+         (value-type (values-specifier-type value-type))
+         (cast (if modifying
+                   (let* ((value-ctran (make-ctran))
+                          (value-lvar (make-lvar))
+                          (cast (make-modifying-cast
+                                 :asserted-type value-type
+                                 :type-to-check (maybe-weaken-check value-type
+                                                                    (if truly
+                                                                        **zero-typecheck-policy**
+                                                                        policy))
+                                 :value value-lvar
+                                 :derived-type (coerce-to-values value-type)
+                                 :caller modifying)))
+                     (ir1-convert start value-ctran value-lvar form)
+                     (link-node-to-previous-ctran cast value-ctran)
+                     (setf (lvar-dest value-lvar) cast)
+                     (use-continuation cast next result)
+                     cast)
+                   (the-in-policy value-type form policy start next result))))
     (when cast
 
       (setf (cast-context cast) context)
@@ -1202,13 +1232,16 @@ the thrown values will be returned."
   ;; We represent the possibility of the control transfer by making an
   ;; "escape function" that does a lexical exit, and instantiate the
   ;; cleanup using %WITHIN-CLEANUP.
-  (ir1-convert
-   start next result
-   (with-unique-names (exit-block)
-     `(block ,exit-block
-        (%within-cleanup
-         :catch (%catch (%escape-fun ,exit-block) ,tag)
-         ,@body)))))
+  (let* ((tag-ctran (make-ctran))
+         (tag-lvar (make-lvar)))
+    (ir1-convert start tag-ctran tag-lvar tag)
+    (ir1-convert
+     tag-ctran next result
+     (with-unique-names (exit-block)
+       `(block ,exit-block
+          (%within-cleanup
+           :catch (%catch (%escape-fun ,exit-block) ,tag-lvar)
+           ,@body))))))
 
 ;;; Since NSP is restored on unwind we only need to protect against
 ;;; local transfers of control, basically the same as special

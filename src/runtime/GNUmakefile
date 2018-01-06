@@ -88,6 +88,23 @@ sbcl.o: $(OBJS)
 libsbcl.a: $(OBJS)
 	rm -f $@ ; ar rcs $@ $^
 
+libsbcl.so: $(subst .o,.pic.o,$(filter-out ldso-stubs.o,$(OBJS)))
+	cc -shared -o $@ $^ -ldl -lpthread -lm
+%.pic.o: %.c
+	$(CC) -DLISP_FEATURE_GCC_TLS -fPIC -c $(CFLAGS) $< -o $@
+%.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
+	$(CC) -DLISP_FEATURE_GCC_TLS -DPOSITION_INDEPENDENT_ASM -c $(CFLAGS) $< -o $@
+testmain: testmain.c libsbcl.so -ldl
+
+shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: ../../output/sbcl.core \
+ ../../tools-for-build/editcore.lisp
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split \
+		../../output/sbcl.core shrinkwrap-sbcl.s
+shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
+	$(CC) -Wl,-export-dynamic $(CFLAGS) -o $@ $^ $(LIBS)
+semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
+	$(CC) -Wl,-export-dynamic $(CFLAGS) -o $@ $^ $(LIBS)
+
 sbcl.mk:
 	( echo 'CC=$(CC)' ; \
 	  echo 'LD=$(LD)' ; \

@@ -165,7 +165,6 @@
     *in-without-gcing*
     *gc-inhibit*
     *gc-pending*
-    #!+sb-safepoint sb!impl::*gc-safe*
     #!+sb-safepoint sb!impl::*in-safepoint*
     #!+sb-thread *stop-for-gc-pending*
     ;; non-x86oid gencgc object pinning
@@ -190,7 +189,7 @@
 
     ;; sb-safepoint in addition to accessing this symbol via TLS,
     ;; uses the symbol itself as a value. Kinda weird.
-    #!+sb-safepoint *in-without-gcing*
+    #!+(and sb-safepoint sb-thread) *in-without-gcing*
 
     #!+immobile-space *immobile-freelist* ; not per-thread (yet...)
 

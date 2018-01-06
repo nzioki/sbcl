@@ -253,8 +253,7 @@
    (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
 
 #!+sb-safepoint
-(defconstant thread-saved-csp-offset
-  (- (/ +backend-page-bytes+ n-word-bytes)))
+(defconstant thread-saved-csp-offset -1)
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg)
@@ -265,35 +264,20 @@
   ;; determine which alien was accessed in case it's undefined.
   (:temporary (:sc sap-reg :offset rbx-offset :from (:argument 0)) rbx)
   (:temporary (:sc unsigned-reg :offset rax-offset :to :result) rax)
-  ;; For safepoint builds: Force values of non-volatiles to the stack.
-  ;; These are the callee-saved registers in the native ABI, but
-  ;; safepoint-based GC needs to see all Lisp values on the stack.  Note
-  ;; that R12-R15 are non-volatile registers, but there is no need to
-  ;; spill R12 because it is our thread-base-tn.  RDI and RSI are
-  ;; non-volatile on Windows, but argument passing registers on other
-  ;; platforms.
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r13-offset) r13)
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r14-offset) r14)
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r15-offset) r15)
-  #!+(and sb-safepoint win32) (:temporary
-                               (:sc unsigned-reg :offset rdi-offset) rdi)
-  #!+(and sb-safepoint win32) (:temporary
-                               (:sc unsigned-reg :offset rsi-offset) rsi)
-  (:ignore results
-           #!+(and sb-safepoint win32) rdi
-           #!+(and sb-safepoint win32) rsi
-           #!+sb-safepoint r15
-           #!+sb-safepoint r13)
+  #!+sb-safepoint
+  (:temporary (:sc unsigned-stack :from :eval :to :result) pc-save)
+  (:ignore results)
   (:vop-var vop)
   (:save-p t)
   (:generator 0
+    (move rbx function)
+    ;; Current PC - don't rely on function to keep it in a form that
+    ;; GC understands
     #!+sb-safepoint
-    (progn
-      ;; Current PC - don't rely on function to keep it in a form that
-      ;; GC understands
-      (let ((label (gen-label)))
-        (inst lea r14 (make-fixup nil :code-object label))
-        (emit-label label)))
+    (let ((label (gen-label)))
+      (inst lea (reg-in-size rax :immobile-code-pc) (make-fixup nil :code-object label))
+      (emit-label label)
+      (move-dword-if-immobile-code pc-save rax))
     (when sb!c::*msan-compatible-stack-unpoison*
       (inst mov rax (static-symbol-value-ea 'msan-param-tls))
       ;; Unpoison parameters
@@ -311,22 +295,16 @@
                           while tn-ref
                           count (eq (sb-name (sc-sb (tn-sc (tn-ref-tn tn-ref))))
                                     'float-registers)))
-    #!+win32 (inst sub rsp-tn #x20) ;MS_ABI: shadow zone
     #!+sb-safepoint
-    (progn                 ;Store SP and PC in thread struct
-      (storew rsp-tn thread-base-tn thread-saved-csp-offset)
-      (storew r14 thread-base-tn thread-pc-around-foreign-call-slot))
-    (move rbx function)
+    ;; Store SP in thread struct
+    (storew rsp-tn thread-base-tn thread-saved-csp-offset)
+    #!+win32 (inst sub rsp-tn #x20) ;MS_ABI: shadow zone
     (inst call rbx)
     #!+win32 (inst add rsp-tn #x20) ;MS_ABI: remove shadow space
     #!+sb-safepoint
-    (progn
-      ;; Zeroing out
-      (inst xor r14 r14)
-      ;; Zero PC storage place. NB. CSP-then-PC: same sequence on
-      ;; entry/exit, is actually corrent.
-      (storew r14 thread-base-tn thread-saved-csp-offset)
-      (storew r14 thread-base-tn thread-pc-around-foreign-call-slot))
+    ;; Zero the saved CSP
+    (inst xor (make-ea-for-object-slot thread-base-tn thread-saved-csp-offset 0)
+          rsp-tn)
     ;; To give the debugger a clue. XX not really internal-error?
     (note-this-location vop :internal-error)))
 

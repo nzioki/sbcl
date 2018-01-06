@@ -265,7 +265,10 @@ created and old ones may exit at any time."
 
 (declaim (inline current-thread-sap))
 (defun current-thread-sap ()
-  (sb!vm::current-thread-offset-sap sb!vm::thread-this-slot))
+  #!+sb-thread
+  (sb!vm::current-thread-offset-sap sb!vm::thread-this-slot)
+  #!-sb-thread
+  (int-sap 0))
 
 (declaim (inline current-thread-os-thread))
 (defun current-thread-os-thread ()
@@ -281,16 +284,17 @@ created and old ones may exit at any time."
   (/show0 "Entering INIT-INITIAL-THREAD")
   (setf sb!impl::*exit-lock* (make-mutex :name "Exit Lock")
         *make-thread-lock* (make-mutex :name "Make-Thread Lock"))
-  (let ((initial-thread (%make-thread :name "main thread"
-                                      :%alive-p t)))
-    (setf (thread-os-thread initial-thread) (current-thread-os-thread)
-          *initial-thread* initial-thread
-          *current-thread* initial-thread)
+  (let ((thread (%make-thread :name "main thread"
+                              :%alive-p t)))
+    (setf (thread-os-thread thread) (current-thread-os-thread)
+          (thread-primitive-thread thread) (sap-int (current-thread-sap))
+          *initial-thread* thread
+          *current-thread* thread)
     (grab-mutex (thread-result-lock *initial-thread*))
     ;; Either *all-threads* is empty or it contains exactly one thread
     ;; in case we are in reinit since saving core with multiple
     ;; threads doesn't work.
-    (setq *all-threads* (list initial-thread))))
+    (setq *all-threads* (list thread))))
 
 (defun main-thread ()
   "Returns the main thread of the process."
@@ -361,12 +365,12 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 ;;;; Aliens, low level stuff
 
 (define-alien-routine "kill_safely"
-    integer
+    int
   (os-thread #!-alpha unsigned #!+alpha unsigned-int)
   (signal int))
 
 (define-alien-routine "wake_thread"
-    integer
+    int
   (os-thread unsigned))
 
 #!+sb-thread
@@ -407,9 +411,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
     `(let* ((,n-thread ,thread)
             (,n-lock ,lock)
             (,n-timeout ,(when timeoutp
-                           `(or ,timeout
-                                (when sb!impl::*deadline*
-                                  sb!impl::*deadline-seconds*))))
+                           `(or ,timeout sb!impl::*deadline*)))
             (,new (if ,n-timeout
                       ;; Using CONS tells the rest of the system there's a
                       ;; timeout in place, so it isn't considered a deadlock.
@@ -1239,7 +1241,8 @@ on this semaphore, then N of them is woken up."
   ;; Lisp-side cleanup
   (with-all-threads-lock
     (setf (thread-%alive-p thread) nil)
-    (setf (thread-os-thread thread) 0)
+    (setf (thread-os-thread thread)
+          (ldb (byte sb!vm:n-word-bits 0) -1))
     (setq *all-threads* (delq thread *all-threads*))
     (when *session*
       (%delete-thread-from-session thread *session*))))
@@ -1416,80 +1419,73 @@ session."
 ;;;; The beef
 
 #!+sb-thread
-(defun initial-thread-function-trampoline
-    (thread setup-sem real-function thread-list arguments arg1 arg2 arg3)
-  ;; As it is, this lambda must not cons until we are ready to run
-  ;; GC. Be very careful.
-  (let ()
-    (setq *current-thread* thread) ; is thread-local already
-    ;; *ALLOC-SIGNAL* is made thread-local by create_thread_struct()
-    ;; so this assigns into TLS, not the global value.
-    (setf sb!vm:*alloc-signal* *default-alloc-signal*)
-    (setf (thread-os-thread thread) (current-thread-os-thread))
-    (with-mutex ((thread-result-lock thread))
-      ;; Normally the list is allocated in the parent thread to
-      ;; avoid consing in a nascent thread.
+(defun initial-thread-function-trampoline (thread setup-sem real-function arguments)
+  ;; Can't initiate GC before *current-thread* is set, otherwise the
+  ;; locks grabbed by SUB-GC wouldn't function.
+  ;; Other threads can GC with impunity.
+  (setf *current-thread* thread ; is thread-local already
+        (thread-os-thread thread) (current-thread-os-thread)
+        (thread-primitive-thread thread) (sap-int (current-thread-sap)))
+  ;; *ALLOC-SIGNAL* is made thread-local by create_thread_struct()
+  ;; so this assigns into TLS, not the global value.
+  (setf sb!vm:*alloc-signal* *default-alloc-signal*)
+  (with-mutex ((thread-result-lock thread))
+    (let* ((thread-list (list thread thread))
+           (session-cons (cdr thread-list)))
+      (with-all-threads-lock
+        (setf (cdr thread-list) *all-threads*
+              *all-threads* thread-list))
+      (let ((session *session*))
+        (with-session-lock (session)
+          (setf (cdr session-cons) (session-threads session)
+                (session-threads session) session-cons))))
+    (setf (thread-%alive-p thread) t)
 
-      (let* ((thread-list (or thread-list
-                              (list thread thread)))
-             (session-cons (cdr thread-list)))
-        (with-all-threads-lock
-          (setf (cdr thread-list) *all-threads*
-                *all-threads* thread-list))
-        (let ((session *session*))
-          (with-session-lock (session)
-            (setf (cdr session-cons) (session-threads session)
-                  (session-threads session) session-cons))))
-      (setf (thread-%alive-p thread) t)
+    (when setup-sem
+      (signal-semaphore setup-sem)
+      ;; setup-sem was dx-allocated, set it to NIL so that the
+      ;; backtrace doesn't get confused
+      (setf setup-sem nil))
 
-      (when setup-sem
-        (signal-semaphore setup-sem)
-        ;; setup-sem was dx-allocated, set it to NIL so that the
-        ;; backtrace doesn't get confused
-        (setf setup-sem nil))
-
-      ;; Using handling-end-of-the-world would be a bit tricky
-      ;; due to other catches and interrupts, so we essentially
-      ;; re-implement it here. Once and only once more.
-      (catch 'sb!impl::toplevel-catcher
-        (catch 'sb!impl::%end-of-the-world
-          (catch '%abort-thread
-            (restart-bind ((abort
-                             (lambda ()
-                               (throw '%abort-thread nil))
-                             :report-function
-                             (lambda (stream)
-                               (format stream "~@<abort thread (~a)~@:>"
-                                       *current-thread*))))
-              (without-interrupts
-                (unwind-protect
-                     (with-local-interrupts
-                       (setf *gc-inhibit* nil) ;for foreign callbacks
-                       (sb!unix::unblock-deferrable-signals)
-                       (setf (thread-result thread)
-                             (prog1
-                                 (multiple-value-list
-                                  (unwind-protect
-                                       (catch '%return-from-thread
-                                         (if (listp arguments)
-                                             (apply real-function arguments)
-                                             (funcall real-function arg1 arg2 arg3)))
-                                    (when *exit-in-process*
-                                      (sb!impl::call-exit-hooks))))
-                               #!+sb-safepoint
-                               (sb!kernel::gc-safepoint))))
-                  ;; we're going down, can't handle interrupts
-                  ;; sanely anymore. gc remains enabled.
-                  (block-deferrable-signals)
-                  ;; we don't want to run interrupts in a dead
-                  ;; thread when we leave without-interrupts.
-                  ;; this potentially causes important
-                  ;; interupts to be lost: sigint comes to
-                  ;; mind.
-                  (setq *interrupt-pending* nil)
-                  #!+sb-thruption
-                  (setq *thruption-pending* nil)
-                  (handle-thread-exit thread)))))))))
+    ;; Using handling-end-of-the-world would be a bit tricky
+    ;; due to other catches and interrupts, so we essentially
+    ;; re-implement it here. Once and only once more.
+    (catch 'sb!impl::toplevel-catcher
+      (catch 'sb!impl::%end-of-the-world
+        (catch '%abort-thread
+          (restart-bind ((abort
+                           (lambda ()
+                             (throw '%abort-thread nil))
+                           :report-function
+                           (lambda (stream)
+                             (format stream "~@<abort thread (~a)~@:>"
+                                     *current-thread*))))
+            (without-interrupts
+              (unwind-protect
+                   (with-local-interrupts
+                     (sb!unix::unblock-deferrable-signals)
+                     (setf (thread-result thread)
+                           (prog1
+                               (multiple-value-list
+                                (unwind-protect
+                                     (catch '%return-from-thread
+                                       (apply real-function arguments))
+                                  (when *exit-in-process*
+                                    (sb!impl::call-exit-hooks))))
+                             #!+sb-safepoint
+                             (sb!kernel::gc-safepoint))))
+                ;; we're going down, can't handle interrupts
+                ;; sanely anymore. gc remains enabled.
+                (block-deferrable-signals)
+                ;; we don't want to run interrupts in a dead
+                ;; thread when we leave without-interrupts.
+                ;; this potentially causes important
+                ;; interupts to be lost: sigint comes to
+                ;; mind.
+                (setq *interrupt-pending* nil)
+                #!+sb-thruption
+                (setq *thruption-pending* nil)
+                (handle-thread-exit thread))))))))
   (values))
 
 (defun make-thread (function &key name arguments ephemeral)
@@ -1519,26 +1515,23 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
            (arguments     (ensure-list arguments))
            #!+(or win32 darwin)
            (fp-modes (dpb 0 sb!vm::float-sticky-bits ;; clear accrued bits
-                          (sb!vm:floating-point-modes)))
-           ;; Allocate in the parent
-           (thread-list (list thread thread)))
+                          (sb!vm:floating-point-modes))))
       (declare (dynamic-extent setup-sem))
       (dx-flet ((initial-thread-function ()
                   ;; Inherit parent thread's FP modes
                   #!+(or win32 darwin)
                   (setf (sb!vm:floating-point-modes) fp-modes)
                   ;; As it is, this lambda must not cons until we are
-                  ;; ready to run GC. Be very careful.
-                  (initial-thread-function-trampoline
-                   thread setup-sem real-function thread-list
-                   arguments nil nil nil)))
-        ;; If the starting thread is stopped for gc before it signals
-        ;; the semaphore then we'd be stuck.
-        (assert (not *gc-inhibit*))
+                  ;; ready to run GC. Be careful.
+                  (initial-thread-function-trampoline thread setup-sem
+                                                      real-function arguments)))
+        ;; Holding mutexes or waiting on sempahores inside WITHOUT-GCING will lock up
+        (aver (not *gc-inhibit*))
         ;; Keep INITIAL-FUNCTION in the dynamic extent until the child
         ;; thread is initialized properly. Wrap the whole thing in
-        ;; WITHOUT-INTERRUPTS because we pass INITIAL-FUNCTION to
-        ;; another thread.
+        ;; WITHOUT-INTERRUPTS (via WITH-SYSTEM-MUTEX) because we pass
+        ;; INITIAL-FUNCTION to another thread.
+        ;; (Does WITHOUT-INTERRUPTS really matter now that it's DXed?)
         (with-system-mutex (*make-thread-lock*)
           (if (zerop
                (%create-thread (get-lisp-obj-address #'initial-thread-function)))
@@ -1604,10 +1597,14 @@ subject to change."
           (function destroy-thread :replacement terminate-thread)))
 
 #!+sb-thread
-(defun enter-foreign-callback (arg1 arg2 arg3)
-  (initial-thread-function-trampoline
-   (make-foreign-thread :name "foreign callback")
-   nil #'sb!alien::enter-alien-callback nil t arg1 arg2 arg3))
+(defun enter-foreign-callback (index return arguments)
+  (let ((thread (without-gcing
+                  ;; Hold off GCing until *current-thread* is set up
+                  (setf *current-thread*
+                        (make-foreign-thread :name "foreign callback")))))
+    (dx-flet ((enter ()
+                (sb!alien::enter-alien-callback index return arguments)))
+      (initial-thread-function-trampoline thread nil #'enter nil))))
 
 (defmacro with-interruptions-lock ((thread) &body body)
   `(with-system-mutex ((thread-interruptions-lock ,thread))
@@ -1628,7 +1625,7 @@ subject to change."
       (funcall interruption))))
 
 #!+sb-thruption
-(defun run-interruption ()
+(defun run-interruption (*current-internal-error-context*)
   (in-interruption () ;the non-thruption code does this in the signal handler
     (let ((interruption (with-interruptions-lock (*current-thread*)
                           (pop (thread-interruptions *current-thread*)))))
@@ -1713,7 +1710,7 @@ Short version: be careful out there."
     (with-interrupts (funcall function)))
   #!-(and (not sb-thread) win32)
   (let ((os-thread (thread-os-thread thread)))
-    (cond ((not os-thread)
+    (cond ((= os-thread (ldb (byte sb!vm:n-word-bits 0) -1))
            (error 'interrupt-thread-error :thread thread))
           (t
            (with-interruptions-lock (thread)
@@ -1786,26 +1783,13 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
   #!+ppc ; only PPC uses a separate symbol for the TLS index lock
   (!defglobal sb!vm::*tls-index-lock* 0)
 
-  (defun %thread-sap (thread)
-    (let ((thread-sap (alien-sap (extern-alien "all_threads" (* t))))
-          (target (thread-os-thread thread)))
-      (loop
-        (when (sap= thread-sap (int-sap 0)) (return nil))
-        (let ((os-thread (sap-ref-word thread-sap
-                                       (* sb!vm:n-word-bytes
-                                          sb!vm::thread-os-thread-slot))))
-          (when (= os-thread target) (return thread-sap))
-          (setf thread-sap
-                (sap-ref-sap thread-sap (* sb!vm:n-word-bytes
-                                           sb!vm::thread-next-slot)))))))
-
 (defun %symbol-value-in-thread (symbol thread)
     ;; Prevent the thread from dying completely while we look for the TLS
     ;; area...
     (with-all-threads-lock
       (if (thread-alive-p thread)
           (let* ((offset (get-lisp-obj-address (symbol-tls-index symbol)))
-                 (obj (sap-ref-lispobj (%thread-sap thread) offset))
+                 (obj (sap-ref-lispobj (int-sap (thread-primitive-thread thread)) offset))
                  (tl-val (get-lisp-obj-address obj)))
             (cond ((zerop offset)
                    (values nil :no-tls-value))
@@ -1817,19 +1801,19 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
           (values nil :thread-dead))))
 
   (defun %set-symbol-value-in-thread (symbol thread value)
-    (with-pinned-objects (value)
-      ;; Prevent the thread from dying completely while we look for the TLS
-      ;; area...
-      (with-all-threads-lock
-        (if (thread-alive-p thread)
-            (let ((offset (get-lisp-obj-address (symbol-tls-index symbol))))
-              (cond ((zerop offset)
-                     (values nil :no-tls-value))
-                    (t
-                     (setf (sap-ref-lispobj (%thread-sap thread) offset)
-                           value)
-                     (values value :ok))))
-            (values nil :thread-dead)))))
+    ;; Prevent the thread from dying completely while we look for the TLS
+    ;; area...
+    (with-all-threads-lock
+      (if (thread-alive-p thread)
+          (let ((offset (get-lisp-obj-address (symbol-tls-index symbol))))
+            (cond ((zerop offset)
+                   (values nil :no-tls-value))
+                  (t
+                   (setf (sap-ref-lispobj (int-sap (thread-primitive-thread thread))
+                                          offset)
+                         value)
+                   (values value :ok))))
+          (values nil :thread-dead))))
 
   (define-alien-variable tls-index-start unsigned-int)
 

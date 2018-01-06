@@ -9,15 +9,16 @@
 
 ;;;; FIXUP-CODE-OBJECT
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch)
+  #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset 4))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-    (let ((sap (code-instructions code)))
-      (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
         (:absolute
          (setf (sap-ref-word sap offset) fixup))
         (:cond-branch
@@ -25,7 +26,8 @@
                (ash (- fixup (+ (sap-int sap) offset)) -2)))
         (:uncond-branch
          (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
-               (ash (- fixup (+ (sap-int sap) offset)) -2))))))))
+               (ash (- fixup (+ (sap-int sap) offset)) -2)))))
+  nil))
 
 ;;;; "Sigcontext" access functions, cut & pasted from sparc-vm.lisp,
 ;;;; then modified for ARM.

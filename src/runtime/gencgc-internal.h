@@ -152,20 +152,6 @@ struct __attribute__((packed)) corefile_pte {
   page_bytes_t bytes_used;
 };
 
-/// There is some additional cleverness that could potentially be had -
-/// the "need_to_zero" bit (a/k/a "page dirty") is obviously 1 if the page
-/// contains objects. Only for an empty page must we distinguish between pages
-/// not needing be zero-filled before next use and those which must be.
-/// Thus, masking off the dirty bit could be avoided by not storing it for
-/// any in-use page. But since that's not what we do - we set the bit to 1
-/// as soon as a page is used - we do have to mask off the bit.
-#define page_bytes_used(index) (page_table[index].bytes_used_ & ~1)
-#define page_need_to_zero(index) (page_table[index].bytes_used_ & 1)
-#define set_page_bytes_used(index,val) \
-  page_table[index].bytes_used_ = (val) | page_need_to_zero(index)
-#define set_page_need_to_zero(index,val) \
-  page_table[index].bytes_used_ = page_bytes_used(index) | val
-
 /* values for the page.allocated field */
 
 
@@ -239,6 +225,13 @@ from_space_p(lispobj obj)
         && !pinned_p(obj, page_index);
 }
 
+static boolean __attribute__((unused)) new_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    return page_index >= 0 && page_table[page_index].gen == new_space;
+}
+
 #include "genesis/weak-pointer.h"
 static inline void add_to_weak_pointer_list(struct weak_pointer *wp) {
     /* Since we overwrite the 'next' field, we have to make
@@ -278,7 +271,6 @@ extern struct fixedobj_page *fixedobj_pages;
 #endif
 
 extern page_index_t last_free_page;
-extern boolean gencgc_partial_pickup;
 
 extern uword_t
 walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),

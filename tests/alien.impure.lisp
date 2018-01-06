@@ -238,8 +238,11 @@
       (return-from try-to-leak-alien-stack 'going))
     (locally (declare (muffle-conditions style-warning))
       (never))))
-(with-test (:name :nlx-causes-alien-stack-leak
-                  :fails-on :interpreter) ; should it work?
+
+;;; Can't stack allocate aliens with an interpreter
+(compile 'try-to-leak-alien-stack)
+
+(with-test (:name :nlx-causes-alien-stack-leak)
   (let ((*sap-int* nil))
     (loop repeat 1024
           do (try-to-leak-alien-stack t))))
@@ -282,7 +285,8 @@
   ;; by default, then the warning already happened above at DEFINE-ALIEN-ROUTINE
   ;; because when that got compiled, it warned, which inhibited further
   ;; warnings for the same foreign symbol.
-  (checked-compile '(lambda () (multiple-value-list (bug-316075)))))
+  (checked-compile '(lambda () (multiple-value-list (bug-316075)))
+                   :allow-style-warnings t))
 
 ;;; Bug #316325: "return values of alien calls assumed truncated to
 ;;; correct width on x86"

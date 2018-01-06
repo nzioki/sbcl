@@ -16,15 +16,15 @@
   "Returns a string describing the type of the local machine."
   "SPARC")
 
+(defconstant-eqx +fixup-kinds+ #(:call :sethi :add :absolute) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
        (:call
         (error "Can't deal with CALL fixups, yet."))
        (:sethi
@@ -35,7 +35,8 @@
               (ldb (byte 10 0) fixup)))
        (:absolute
         (setf (sap-ref-32 sap offset)
-              fixup)))))))
+              fixup))))
+  nil))
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from alpha-vm.lisp.

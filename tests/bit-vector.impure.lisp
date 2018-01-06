@@ -60,10 +60,10 @@
 ;;;
 ;;; except on machines where the arrays won't fit into the dynamic
 ;;; space.
-#.(cl:when (cl:> (sb-ext:dynamic-space-size)
-                 (cl:truncate (cl:1- cl:array-dimension-limit)
-                              sb-vm:n-word-bits))
-    (cl:push :sufficient-dynamic-space cl:*features*))
+(when (> (sb-ext:dynamic-space-size)
+         (truncate (1- array-dimension-limit)
+                   sb-vm:n-word-bits))
+  (push :sufficient-dynamic-space *features*))
 (with-test (:name (bit-vector bit-not bit-and :big)
                   :skipped-on (:not :sufficient-dynamic-space))
   (locally
@@ -134,3 +134,25 @@
       (assert (simple-bit-vector-p object))
       (assert (= size n-bytes))
       (assert (not (sb-kernel:%bit-position/1 object nil 0 n-bits))))))
+
+;;; Shamelessly piggybacking on the approach above to grab a page
+;;; which adjoins an unreadable page for testing the disassembler.
+#-win32 ;; no sb-posix:mmap
+(with-test (:name :disassembler-overrun :skipped-on (not (or :x86 :x86-64)))
+  (let* ((n-bytes 7)
+         (first (sb-posix:mmap nil (* sb-c:+backend-page-bytes+ 2)
+                               (logior sb-posix:prot-read
+                                       sb-posix:prot-write)
+                               (logior sb-posix:map-private sb-posix:map-anon) -1 0))
+         (second (sb-sys:sap+ first sb-c:+backend-page-bytes+))
+         (addr (sb-sys:sap+ second (- n-bytes))))
+    (assert (sb-sys:sap=
+             second
+             (sb-posix:mmap second sb-c:+backend-page-bytes+
+                            sb-posix:prot-none
+                            (logior sb-posix:map-private sb-posix:map-anon sb-posix:map-fixed)
+                            -1 0)))
+    (loop for byte in '(#x8B #x50 #xFD #x8B #xE5 #xF8 #x5D)
+          for i from 0
+          do (setf (sb-sys:sap-ref-8 addr i) byte))
+    (sb-disassem:disassemble-memory addr 7 :stream (make-broadcast-stream))))
