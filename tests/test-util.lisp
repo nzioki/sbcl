@@ -476,7 +476,7 @@
     (values values (nreverse conditions))))
 
 (defun %checked-compile-and-assert-one-case
-    (form optimize function args-thunk expected test)
+    (form optimize function args-thunk expected test allow-conditions)
   (let ((args (multiple-value-list (funcall args-thunk))))
     (flet ((failed-to-signal (expected-type)
              (error "~@<Calling the result of compiling~
@@ -523,7 +523,11 @@
           (t
            (let ((expected (funcall expected)))
              (cond
-               (conditions
+               ((and conditions
+                     (not (and allow-conditions
+                               (every (lambda (condition)
+                                        (typep condition allow-conditions))
+                                      conditions))))
                 (signaled-unexpected conditions))
                ((not (funcall test values expected))
                 (returned-unexpected values expected test))))))))))
@@ -535,9 +539,9 @@
                              (list* :optimize optimize
                                     other-checked-compile-args)
                              other-checked-compile-args))))
-    (loop for (args-thunk values test) in cases
+    (loop for (args-thunk values test allow-conditions) in cases
        do (%checked-compile-and-assert-one-case
-           form optimize function args-thunk values test))))
+           form optimize function args-thunk values test allow-conditions))))
 
 (defun %checked-compile-and-assert (form checked-compile-args cases)
   (let ((optimize (getf checked-compile-args :optimize))
@@ -556,13 +560,19 @@
 ;;;
 ;;; Elements of CASES are of the form
 ;;;
-;;;   ((&rest ARGUMENT-FORMS) VALUES-FORM &optional TEST)
+;;;   ((&rest ARGUMENT-FORMS) VALUES-FORM &key TEST ALLOW-CONDITIONS)
 ;;;
 ;;; where ARGUMENT-FORMS are evaluated to produce the arguments for
 ;;; one call of the function and VALUES-FORM is evaluated to produce
-;;; the expected return values for that function call. TEST is used to
-;;; compare a list of the values returned by the function call to the
-;;; list of values obtained by calling VALUES-FORM.
+;;; the expected return values for that function call.
+;;;
+;;; TEST is used to compare a list of the values returned by the
+;;; function call to the list of values obtained by calling
+;;; VALUES-FORM.
+;;;
+;;; If supplied, the value of ALLOW-CONDITIONS is a type-specifier
+;;; indicating which conditions should be allowed (and ignored) during
+;;; the function call.
 ;;;
 ;;; If VALUES-FORM is of the form
 ;;;
@@ -585,7 +595,8 @@
                                             (optimize :quick))
                                          form &body cases)
   (flet ((make-case-form (case)
-           (destructuring-bind (args values &key (test ''equal testp))
+           (destructuring-bind (args values &key (test ''equal testp)
+                                     allow-conditions)
                case
              (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
                (when (and testp conditionp)
@@ -596,7 +607,8 @@
                       ,(if conditionp
                            `(list 'condition ,(second values))
                            `(lambda () (multiple-value-list ,values)))
-                      ,test)))))
+                      ,test
+                      ,allow-conditions)))))
     `(%checked-compile-and-assert
       ,form (list :name ,name
                   :allow-warnings ,allow-warnings

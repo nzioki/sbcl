@@ -30,15 +30,8 @@ static inline void *
 gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
 {
     struct alloc_region *my_region;
-#ifdef SEGREGATED_CODE
     if (1 <= page_type_flag && page_type_flag <= 3) {
         my_region = &gc_alloc_region[page_type_flag-1];
-#else
-    if (UNBOXED_PAGE_FLAG == page_type_flag) {
-        my_region = &unboxed_region;
-    } else if (BOXED_PAGE_FLAG & page_type_flag) {
-        my_region = &boxed_region;
-#endif
     } else {
         lose("bad page type flag: %d", page_type_flag);
     }
@@ -90,16 +83,14 @@ void gc_dispose_private_pages();
 extern void heap_scavenge(lispobj *start, lispobj *limit);
 extern sword_t scavenge(lispobj *start, sword_t n_words);
 extern void scavenge_interrupt_contexts(struct thread *thread);
-extern void scav_weak_hash_tables(int (*[5])(lispobj,lispobj),
-                                  void (*)(lispobj*));
 extern void scav_binding_stack(lispobj*, lispobj*, void(*)(lispobj));
 extern void scan_binding_stack(void);
-extern void cull_weak_hash_tables(int (*[5])(lispobj,lispobj));
+extern void cull_weak_hash_tables(int (*[4])(lispobj,lispobj));
 extern void scan_weak_pointers(void);
-extern void scav_hash_table_entries (struct hash_table *hash_table,
-                                     int (*[5])(lispobj,lispobj),
-                                     void (*)(lispobj*));
-extern int (*weak_ht_alivep_funs[5])(lispobj,lispobj);
+extern boolean scav_hash_table_entries(struct hash_table *hash_table,
+                                       int (*)(lispobj,lispobj),
+                                       void (*)(lispobj*));
+extern int (*weak_ht_alivep_funs[4])(lispobj,lispobj);
 extern void gc_scav_pair(lispobj where[2]);
 extern void weakobj_init();
 extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
@@ -195,6 +186,10 @@ static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
     return positive_bignum_logbitp(index, (struct bignum*)native_pointer(bitmap));
 }
 
+/* Keep in sync with 'target-hash-table.lisp' */
+#define hashtable_weakp(ht) (ht->flags & (1<<N_FIXNUM_TAG_BITS))
+#define hashtable_weakness(ht) (ht->flags >> (3+N_FIXNUM_TAG_BITS))
+
 #if defined(LISP_FEATURE_GENCGC)
 
 /* Define a macro to avoid a detour through the write fault handler.
@@ -278,6 +273,15 @@ varyobj_page_address(low_page_index_t page_num)
 {
     return (void*)(VARYOBJ_SPACE_START + (page_num * IMMOBILE_CARD_BYTES));
 }
+#endif
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#include "genesis/layout.h"
+#define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
+/// First 5 layouts: T, FUNCTION, STRUCTURE-OBJECT, LAYOUT, PACKAGE
+/// (These #defines ought to be emitted by genesis)
+#define LAYOUT_OF_LAYOUT  ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_PACKAGE ((FIXEDOBJ_SPACE_START+4*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
 #endif
 
 #endif /* _GC_PRIVATE_H_ */

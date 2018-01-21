@@ -128,12 +128,38 @@
                   (make-array '(-10)))
                :allow-warnings t))))
 
+(with-test (:name (make-array :bad-dimensions.2))
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda ()
+                  (make-array '(0 . 2)))
+               :allow-warnings t))))
+
+(with-test (:name (make-array :bad-dimensions.3))
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda ()
+                  (make-array '(0 . 2)
+                              :element-type 'fixnum
+                              :adjustable t))
+               :allow-warnings t))))
+
 (with-test (:name (make-array :initial-contents :bad-macro))
   (assert
    (nth-value 1
               (checked-compile
                `(lambda ()
                   (make-array '(10) :initial-contents (do)))
+               :allow-failure t))))
+
+(with-test (:name (make-array :dimensions :bad-macro))
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda ()
+                  (make-array (do)))
                :allow-failure t))))
 
 (with-test (:name :&rest-ref-bad-n)
@@ -151,3 +177,62 @@
     (declare (ignore fun))
     (assert failure)
     (mapcar #'princ-to-string warnings)))
+
+(with-test (:name :ldb-transform-macroexpand)
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda () (ldb (do) 0))
+               :allow-failure t))))
+
+(with-test (:name :bad-values-ftype)
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda () (declare (values 0)))
+               :allow-warnings t))))
+
+(with-test (:name :bad-progv)
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda (x) (progv x 1))
+               :allow-warnings t)))
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda (x) (progv 1 x))
+               :allow-warnings t))))
+
+(with-test (:name :coerce-to-nil)
+  (assert
+   (nth-value 1
+              (checked-compile
+               '(lambda () (coerce (list t) nil))
+               :allow-warnings t))))
+
+(with-test (:name :unknown-vector-type-conflict)
+  (assert
+   (nth-value 1
+              (checked-compile
+               '(lambda () (the (vector nonsense-type) nil))
+               :allow-warnings t
+               :allow-style-warnings t))))
+
+(with-test (:name :subseq-unknown-vector-type)
+  (assert
+   (nth-value 1
+              (checked-compile
+               '(lambda () (subseq (the (vector nonsense-type) :x) 0 1))
+               :allow-warnings t
+               :allow-style-warnings t))))
+(with-test (:name :derive-node-type-unknown-type)
+  (assert
+   (nth-value 3
+              (checked-compile
+               '(lambda (x)
+                 (let ((k (make-array 8 :element-type '(unsigned-byte 8))))
+                   (setf (aref k 0) (the unknown-type (the integer x)))
+                   (setf k (subseq "y" 0))))
+               :allow-warnings t
+               :allow-style-warnings t))))

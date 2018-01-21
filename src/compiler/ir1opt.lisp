@@ -289,7 +289,9 @@
     (unless (eq initial-type rtype)
       (let ((int (values-type-intersection node-type rtype))
             (lvar (node-lvar node)))
-        (when (type/= initial-type int)
+        ;; Don't use type/=, it will return NIL on unknown types.
+        ;; Instead of checking the second value just negate TYPE=
+        (unless (type= initial-type int)
           (when (and *check-consistency*
                      (eq int *empty-type*)
                      (not (eq rtype *empty-type*)))
@@ -962,7 +964,7 @@
 ;;;
 ;;; Why do we need to consider LVAR type? -- APD, 2003-07-30
 (defun maybe-terminate-block (node ir1-converting-not-optimizing-p)
-  (declare (type (or basic-combination cast ref) node))
+  (declare (type (or basic-combination cast cset ref) node))
   (let* ((block (node-block node))
          (lvar (node-lvar node))
          (ctran (node-next node))
@@ -1451,8 +1453,10 @@
                                    (fdefinition name)
                                    (lvar-value lvar)))
                              lvar))
-                       (resolve-key-args (combination-args call)
-                                         type))))
+                       (let ((args (combination-args call)))
+                         (if (fun-type-p type)
+                             (resolve-key-args args type)
+                             args)))))
     (multiple-value-bind (values win)
         (careful-call fun-name
                       args
@@ -1546,6 +1550,7 @@
           (let ((s-int (make-single-value-type int)))
             (dolist (ref refs)
               (derive-node-type ref s-int)
+              (maybe-terminate-block ref nil)
               ;; KLUDGE: LET var substitution
               (let* ((lvar (node-lvar ref)))
                 (when (and lvar (combination-p (lvar-dest lvar)))
@@ -1654,6 +1659,7 @@
           (let ((old-type (node-derived-type set)))
             (unless (values-subtypep old-type type)
               (derive-node-type set (make-single-value-type type))
+              (maybe-terminate-block set nil)
               (setf changes t)))
           (setf (node-reoptimize set) nil))))
     (when changes

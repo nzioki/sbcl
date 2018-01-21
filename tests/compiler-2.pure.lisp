@@ -148,6 +148,7 @@
   (ctu:assert-no-consing (sb-vm::space-bytes :static)))
 
 (with-test (:name (sb-vm::map-allocated-objects :no-consing)
+                  :fails-on :cheneygc
                   :skipped-on :interpreter)
   (let ((n 0))
     (sb-int:dx-flet ((f (obj type size)
@@ -938,3 +939,160 @@
       `(lambda (op) (funcall (case op (equal '=) (t '=)) 1 2))
     (('equal) nil)
     ((t) nil)))
+
+(with-test (:name :substitute-let-funargs-during-find-initial-dfo)
+  (checked-compile
+   `(lambda ()
+      (labels ((%r (f)
+                 (loop)
+                 (%r f)))
+        (%r (lambda ()))))))
+
+(with-test (:name :split-ir2-blocks-cmov)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((v (list 0)))
+           (if (block nil
+                 (eq v (cdr v)))
+               1
+               2)))
+    (() 2)))
+
+(with-test (:name :=-rational-complex-rational-fold)
+  (let ((fun (checked-compile '(lambda (x)
+                                (declare ((complex integer) x))
+                                (= x 10))))
+        (fun2 (checked-compile '(lambda (x)
+                                (declare ((complex rational) x))
+                                (= x 10d0)))))
+    (assert (equal (sb-kernel:%simple-fun-type fun)
+                   '(function ((complex integer)) (values null &optional))))
+    (assert (not (funcall fun #C(10 10))))
+    (assert (equal (sb-kernel:%simple-fun-type fun2)
+                   '(function ((complex rational)) (values null &optional))))
+    (assert (not (funcall fun2 #C(10 10))))))
+
+(with-test (:name :find-type-deriver)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (find 1 x :key #'values))
+    (('(1)) 1)))
+
+(with-test (:name :tail-call-ltn-annotation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (labels ((ff1 ()
+                    (multiple-value-call #'print
+                      (if x
+                          (values t t)
+                          nil))
+                    (ff1)))
+           (identity (ff1))))))
+
+(with-test (:name (:substitute-lvar-uses :deleted-code-and-dx-lvars))
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda ()
+                         (let ((v (values
+                                   (the integer
+                                        (flet ((%f5 (x) x))
+                                          (%f5)))
+                                   (unwind-protect 1))))
+                           (declare (dynamic-extent v))
+                           v))
+                      :allow-warnings t))))
+
+(with-test (:name (restart-case :declaration-processing))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (restart-case (list)
+           (my-restart (x) "foo" "bar" x)))
+    (() ()))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (restart-case (list)
+           (my-restart () (declare))))
+    (() ())))
+
+(with-test (:name (handler-case :declaration-processing))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (handler-case (list 1 2) (error (e) "foo" "bar" e)))
+    (() '(1 2)))
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda ()
+                         (handler-case (declare)))
+                      :allow-failure t))))
+
+(with-test (:name (:unconvert-tail-calls :deleted-call))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (labels ((%f (&optional (x (* 2 nil (%f)))) x))
+                          (%f)
+                          (%f 1)))
+                      :allow-warnings t))))
+
+(with-test (:name (:equal-transform :nil-types))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (loop for y below 3
+                              count (or
+                                     (not (or (>= y y) (equal y -787357528)))
+                                     (the integer (or (>= y y) (equal y -787357528))))))
+                      :allow-warnings t))))
+
+
+
+(with-test (:name (:delete-recursive-optional))
+  (checked-compile '(lambda (x)
+                     (lambda ()
+                       (labels ((f (&optional a) (values x a #'f))))))))
+
+(with-test (:name (:combination-args-flow-cleanly-p :unused-result))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((v (flet ((%f (x)
+                           (list x)
+                           (list 1)))
+                    (%f 2))))
+           (declare (dynamic-extent v))
+           (car v)))
+    (() 1)))
+
+(with-test (:name (:delete-ref :maintain-lambda-calls-or-closes))
+  (checked-compile `(lambda (c y)
+                      (labels ((f1 ()
+                                 (if y
+                                     (f3 2)))
+                               (l () (loop))
+                               (f2 ()
+                                 (l)
+                                 (f3 3))
+                               (f3 (x)
+                                 (f3 x))
+                               (f4 ()
+                                 (f1)
+                                 (f2)))
+                        (f4)
+                        c))))
+
+(with-test (:name (the :nil-type))
+  (checked-compile
+   `(lambda ()
+      (flet ((f () (the nil 0)))
+        (oddp (f))))))
+
+(with-test (:name :concatenate-transform-hairy-type)
+  (checked-compile
+      '(lambda (x)
+        (concatenate '(and string (satisfies eval)) x))))

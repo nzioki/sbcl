@@ -327,7 +327,7 @@ trans_code(struct code *code)
     sword_t nheader_words = code_header_words(code->header);
     sword_t ncode_words = code_instruction_words(code->code_size);
     lispobj l_new_code = copy_large_object(l_code, nheader_words + ncode_words,
-                                           CODE_PAGE_FLAG);
+                                           CODE_PAGE_ALLOCATED);
 
 #ifdef LISP_FEATURE_GENCGC
     if (l_new_code == l_code)
@@ -1074,13 +1074,12 @@ int debug_weak_ht = 0;
 static void inline add_kv_triggers(lispobj* pair, int weakness)
 {
     if (debug_weak_ht) {
-        const char *const strings[3] = {"key","val","key-or-val"};
+        const char *const strings[3] = {"key","val","key-or-val"}; // {1, 2, 3}
         fprintf(stderr, "weak %s: <%"OBJ_FMTX",%"OBJ_FMTX">\n",
-                strings[fixnum_value(weakness)-1],
-                pair[0], pair[1]);
+                strings[weakness-1], pair[0], pair[1]);
     }
-    if (weakness & MAKE_FIXNUM(1)) add_trigger(pair[0], &pair[1]);
-    if (weakness & MAKE_FIXNUM(2)) add_trigger(pair[1], &pair[0]);
+    if (weakness & 1) add_trigger(pair[0], &pair[1]);
+    if (weakness & 2) add_trigger(pair[1], &pair[0]);
 }
 
 /* This is essentially a set join operation over the set of all live objects
@@ -1172,19 +1171,18 @@ void weakobj_init()
 }
 
 /* Only need to worry about scavenging the _real_ entries in the
- * table. Phantom entries such as the hash table itself at index 0 and
- * the empty marker at index 1 were scavenged by scav_vector that
- * either called this function directly or arranged for it to be
- * called later by pushing the hash table onto weak_hash_tables. */
-void scav_hash_table_entries (struct hash_table *hash_table,
-                              int (*alivep[5])(lispobj,lispobj),
-                              void (*scav_entry)(lispobj*))
+ * table. The vector element at index 0 (the hash table itself)
+ * was scavenged already. */
+boolean scav_hash_table_entries(struct hash_table *hash_table,
+                                int (*predicate)(lispobj,lispobj),
+                                void (*scav_entry)(lispobj*))
 {
     uword_t kv_length;
     uword_t length;
     uword_t next_vector_length;
     uword_t hash_vector_length;
     uword_t i;
+    boolean any_deferred = 0;
 
     lispobj *kv_vector = get_array_data(hash_table->table,
                                         SIMPLE_VECTOR_WIDETAG, &kv_length);
@@ -1218,7 +1216,6 @@ void scav_hash_table_entries (struct hash_table *hash_table,
 
     /* Work through the KV vector. */
     boolean rehash = 0;
-    int weakp = hash_table->_weakness;
     // We can disregard any entry in which both key and value are immediates.
     // This effectively ignores empty pairs, as well as makes fixnum -> fixnum
     // mappings more efficient.
@@ -1228,7 +1225,7 @@ void scav_hash_table_entries (struct hash_table *hash_table,
     for (i = 1; i < next_vector_length; i++) {                                 \
         lispobj key = kv_vector[2*i], value = kv_vector[2*i+1];                \
         if (is_lisp_pointer(key|value)) {                                      \
-          if (!entry_alivep) { defer; } else {                                 \
+          if (!entry_alivep) { defer; any_deferred = 1; } else {               \
             /* Scavenge the key and value. */                                  \
             scav_entry(&kv_vector[2*i]);                                       \
             /* If an EQ-based key has moved, mark the hash-table for rehash */ \
@@ -1236,10 +1233,16 @@ void scav_hash_table_entries (struct hash_table *hash_table,
                 (!hash_vector || hash_vector[i] == MAGIC_HASH_VECTOR_VALUE))   \
                 rehash = 1;                                                    \
     }}}
-    if (weakp) {
-        int (*predicate)(lispobj,lispobj) = alivep[fixnum_value(weakp)];
-        SCAV_ENTRIES(predicate(key, value), add_kv_triggers(&kv_vector[2*i], weakp));
-    } else {
+    if (predicate) { // Call the predicate on each entry to decide liveness
+        int weakness = hashtable_weakness(hash_table);
+        SCAV_ENTRIES(predicate(key, value),
+                     add_kv_triggers(&kv_vector[2*i], weakness));
+        if (!any_deferred && debug_weak_ht)
+            fprintf(stderr,
+                    "will skip rescan of weak ht: %d/%d items\n",
+                    (int)fixnum_value(hash_table->number_entries),
+                    (int)fixnum_value(hash_table->rehash_trigger));
+    } else { // The entries are always live
         SCAV_ENTRIES(1,);
     }
 
@@ -1247,6 +1250,7 @@ void scav_hash_table_entries (struct hash_table *hash_table,
     // element 1 on a write-protected page.
     if (rehash)
         NON_FAULTING_STORE(kv_vector[1] = make_fixnum(1), &kv_vector[1]);
+    return any_deferred;
 }
 
 sword_t
@@ -1300,16 +1304,33 @@ scav_vector (lispobj *where, lispobj header)
         lose("hash_table table!=this table %"OBJ_FMTX, hash_table->table);
     }
 
-    if (!hash_table->_weakness) {
-        scav_hash_table_entries(hash_table, weak_ht_alivep_funs, gc_scav_pair);
+    if (!hashtable_weakp(hash_table)) {
+        scav_hash_table_entries(hash_table, 0, gc_scav_pair);
     } else if (hash_table->next_weak_hash_table == NIL) {
-        NON_FAULTING_STORE(hash_table->next_weak_hash_table
-                           = (lispobj)weak_hash_tables,
-                           &hash_table->next_weak_hash_table);
-        weak_hash_tables = hash_table;
-        if (hash_table->_weakness != make_fixnum(WEAKNESS_KEY_AND_VALUE))
-            scav_hash_table_entries(hash_table,
-                                    weak_ht_alivep_funs, gc_scav_pair);
+        int weakness = hashtable_weakness(hash_table);
+        boolean defer = 1;
+        /* Key-AND-Value means that no scavenging can/will be performed as
+         * a consequence of visiting the table. Each entry is looked at once
+         * only, after _all_ other work is done, and then it's either live
+         * or it isn't based on whether both halves are live. So the initial
+         * value of 'defer = 1' is correct. For all other weakness kinds,
+         * we might be able to skip rescan depending on whether all entries
+         * are actually live right now, as opposed to provisionally live */
+        if (weakness != WEAKNESS_KEY_AND_VALUE)
+            defer = scav_hash_table_entries(hash_table,
+                                            weak_ht_alivep_funs[weakness],
+                                            gc_scav_pair);
+        /* There is a down-side to *not* pushing the table into the list,
+         * but it should not matter too much: if we attempt to scavenge more
+         * than once (when and only when the newspace areas overflow),
+         * then we don't know that we already did it, and we'll do it again.
+         * This is the same as occurs on all other objects */
+        if (defer) {
+            NON_FAULTING_STORE(hash_table->next_weak_hash_table
+                               = (lispobj)weak_hash_tables,
+                               &hash_table->next_weak_hash_table);
+            weak_hash_tables = hash_table;
+        }
     }
 
     return (ALIGN_UP(kv_length + 2, 2));
@@ -1323,6 +1344,7 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table, lispobj *prev,
                             lispobj *next_vector, lispobj *hash_vector,
                             int (*alivep_test)(lispobj,lispobj),
                             void (*fix_pointers)(lispobj[2]),
+                            boolean save_culled_values,
                             boolean *rehash)
 {
     const lispobj empty_symbol = UNBOUND_MARKER_WIDETAG;
@@ -1340,6 +1362,18 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table, lispobj *prev,
             next_vector[index] = fixnum_value(hash_table->next_free_kv);
             hash_table->next_free_kv = make_fixnum(index);
             kv_vector[2 * index] = empty_symbol;
+            if (save_culled_values) {
+                lispobj val = kv_vector[2 * index + 1];
+                gc_assert(is_lisp_immediate(val));
+                struct cons *cons = (struct cons*)
+                  gc_general_alloc(sizeof(struct cons), BOXED_PAGE_FLAG, ALLOC_QUICK);
+                // Lisp code which manipulates the culled_values slot must use
+                // compare-and-swap, but C code need not, because GC runs in one
+                // thread and has stopped the Lisp world.
+                cons->cdr = hash_table->culled_values;
+                hash_table->culled_values = make_lispobj(cons, LIST_POINTER_LOWTAG);
+                cons->car = val;
+            }
             kv_vector[2 * index + 1] = empty_symbol;
             if (hash_vector)
                 hash_vector[index] = MAGIC_HASH_VECTOR_VALUE;
@@ -1377,26 +1411,29 @@ cull_weak_hash_table (struct hash_table *hash_table,
                                           SIMPLE_ARRAY_WORD_WIDETAG, NULL);
 
     boolean rehash = 0;
+    boolean save_culled_values = (hash_table->flags & MAKE_FIXNUM(4)) != 0;
     for (i = 0; i < length; i++) {
         cull_weak_hash_table_bucket(hash_table, &index_vector[i],
                                     kv_vector, index_vector, next_vector,
-                                    hash_vector, alivep_test,
-                                    fix_pointers, &rehash);
+                                    hash_vector, alivep_test, fix_pointers,
+                                    save_culled_values, &rehash);
     }
     /* If an EQ-based key has moved, mark the hash-table for rehash */
     if (rehash)
         NON_FAULTING_STORE(kv_vector[1] = make_fixnum(1), &kv_vector[1]);
 }
 
-/* Fix one <k,v> pair in a weak key-AND-value hashtable.
+/* Fix one <k,v> pair in a weak hashtable.
  * Do not call scavenge(), just follow forwarding pointers */
 static void pair_follow_fps(lispobj ht_entry[2])
 {
     lispobj obj = ht_entry[0];
-    if (is_lisp_pointer(obj) && forwarding_pointer_p(native_pointer(obj)))
+    if (is_lisp_pointer(obj) && from_space_p (obj) &&
+        forwarding_pointer_p(native_pointer(obj)))
         ht_entry[0] = forwarding_pointer_value(native_pointer(obj));
     obj = ht_entry[1];
-    if (is_lisp_pointer(obj) && forwarding_pointer_p(native_pointer(obj)))
+    if (is_lisp_pointer(obj) && from_space_p (obj) &&
+        forwarding_pointer_p(native_pointer(obj)))
         ht_entry[1] = forwarding_pointer_value(native_pointer(obj));
 }
 
@@ -1409,7 +1446,7 @@ void cull_weak_hash_tables(int (*alivep[5])(lispobj,lispobj))
         next = (struct hash_table *)table->next_weak_hash_table;
         NON_FAULTING_STORE(table->next_weak_hash_table = NIL,
                            &table->next_weak_hash_table);
-        cull_weak_hash_table(table, alivep[fixnum_value(table->_weakness)],
+        cull_weak_hash_table(table, alivep[hashtable_weakness(table)],
                              pair_follow_fps);
     }
     weak_hash_tables = NULL;

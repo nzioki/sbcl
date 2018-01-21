@@ -2498,7 +2498,9 @@
 ;;;; A transform approximates that, but fails when BYTE is produced by an
 ;;;; inline function and not a macro.
 (flet ((xform (bytespec-form env int fun &optional (new nil setter-p))
-         (let ((spec (%macroexpand bytespec-form env)))
+         (let ((spec (handler-case (%macroexpand bytespec-form env)
+                       (error ()
+                         (return-from xform (values nil t))))))
            (if (and (consp spec) (eq (car spec) 'byte))
                (if (proper-list-of-length-p (cdr spec) 2)
                    (values `(,fun ,@(if setter-p (list new))
@@ -3942,6 +3944,14 @@
            ;; They are both rationals and complexp is the same.
            ;; Convert to EQL.
            '(eql x y))
+          ((or (and (csubtypep x-type (specifier-type 'real))
+                    (csubtypep y-type
+                               (specifier-type '(complex rational))))
+               (and (csubtypep y-type (specifier-type 'real))
+                    (csubtypep x-type
+                               (specifier-type '(complex rational)))))
+           ;; Can't be EQL since imagpart can't be 0.
+           nil)
           (t
            (give-up-ir1-transform
             "The operands might not be the same type.")))))

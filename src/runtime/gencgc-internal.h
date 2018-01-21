@@ -25,7 +25,6 @@
 #include "genesis/code.h"
 #include "hopscotch.h"
 
-void gc_free_heap(void);
 extern char *page_address(page_index_t);
 int gencgc_handle_wp_violation(void *);
 
@@ -108,7 +107,7 @@ struct page {
          * xxx_PAGE_FLAG definitions.
          *
          * If the page is free, all the following fields are zero. */
-        allocated :3,
+        allocated :4,
         /* This is set when the page is write-protected. This should
          * always reflect the actual write_protect status of a page.
          * (If the page is written into, we catch the exception, make
@@ -122,11 +121,6 @@ struct page {
         /* If this page should not be moved during a GC then this flag
          * is set. It's only valid during a GC for allocated pages. */
         dont_move :1,
-        // FIXME: this should be identical to (dont_move & !large_object),
-        // so we don't need to store it as a bit unto itself.
-        /* If this page is not a large object page and contains
-         * any objects which are pinned */
-        has_pins :1,
         /* If the page is part of a large object then this flag is
          * set. No other objects should be allocated to these pages.
          * This is only valid when the page is allocated. */
@@ -140,11 +134,11 @@ struct page {
 };
 extern struct page *page_table;
 #ifdef LISP_FEATURE_BIG_ENDIAN
-#define WRITE_PROTECTED_BIT (1<<4)
-#define WP_CLEARED_BIT (1<<3)
+# define WP_CLEARED_BIT      (1<<2)
+# define WRITE_PROTECTED_BIT (1<<3)
 #else
-#define WRITE_PROTECTED_BIT (1<<3)
-#define WP_CLEARED_BIT (1<<4)
+# define WRITE_PROTECTED_BIT (1<<4)
+# define WP_CLEARED_BIT      (1<<5)
 #endif
 
 struct __attribute__((packed)) corefile_pte {
@@ -161,9 +155,26 @@ extern page_index_t page_table_pages;
 /* forward declarations */
 
 void update_dynamic_space_free_pointer(void);
-void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);
-void gc_alloc_update_all_page_tables(int);
-void gc_set_region_empty(struct alloc_region *region);
+void gc_close_region(int page_type_flag, struct alloc_region *alloc_region);
+static void inline ensure_region_closed(int page_type_flag,
+                                        struct alloc_region *alloc_region)
+{
+    if (alloc_region->start_addr)
+        gc_close_region(page_type_flag, alloc_region);
+}
+
+static void inline gc_set_region_empty(struct alloc_region *region)
+{
+    /* last_page is not reset. It can be used as a hint where to resume
+     * allocating after closing and re-opening the region */
+    region->start_addr = region->free_pointer = region->end_addr = 0;
+}
+
+static void inline gc_init_region(struct alloc_region *region)
+{
+    region->last_page = 0; // must always be a valid page index
+    gc_set_region_empty(region);
+}
 
 /*
  * predicates
@@ -189,16 +200,19 @@ find_page_index(void *addr)
 #ifndef GENCGC_IS_PRECISE
 #error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
 #endif
+#define page_has_smallobj_pins(page) \
+  (page_table[page].dont_move && !page_table[page].large_object)
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
     gc_dcheck(compacting_p());
 #if !GENCGC_IS_PRECISE
-    return page_table[page].has_pins
+    return page_has_smallobj_pins(page)
         && hopscotch_containsp(&pinned_objects, obj);
 #else
     /* There is almost never anything in the hashtable on precise platforms */
-    if (!pinned_objects.count || !page_table[page].has_pins) return 0;
+    if (!pinned_objects.count || !page_has_smallobj_pins(page))
+        return 0;
 # ifdef RETURN_PC_WIDETAG
     /* Conceivably there could be a precise GC without RETURN-PC objects */
     if (widetag_of(*native_pointer(obj)) == RETURN_PC_WIDETAG)

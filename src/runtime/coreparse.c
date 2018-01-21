@@ -593,6 +593,7 @@ static void relocate_heap(struct heap_adjust* adj)
 }
 #endif
 
+#ifdef LISP_FEATURE_RELOCATABLE_HEAP
 static void
 set_adjustment(struct heap_adjust* adj,
                uword_t actual_addr,
@@ -606,6 +607,7 @@ set_adjustment(struct heap_adjust* adj,
     adj->range[j].delta = actual_addr - desired_addr;
     adj->n_ranges = j+1;
 }
+#endif
 
 static void
 process_directory(int count, struct ndir_entry *entry,
@@ -931,15 +933,13 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                 lose("can't load .core for different runtime, sorry\n");
             }
 
-        case NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE:
-            SHOW("NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE case");
+        case DIRECTORY_CORE_ENTRY_TYPE_CODE:
             process_directory(remaining_len / NDIR_ENTRY_LENGTH,
                               (struct ndir_entry*)ptr, fd, file_offset,
                               merge_core_pages, &adj);
             break;
 
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
-            SHOW("INITIAL_FUN_CORE_ENTRY_TYPE_CODE case");
             initial_function = adjust_word(&adj, (lispobj)*ptr);
             break;
 

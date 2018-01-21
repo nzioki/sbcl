@@ -214,6 +214,40 @@
                           (node-prev dest))
                   (return-from almost-immediately-used-p t))))))))
 
+;;;; BLOCK UTILS
+
+(declaim (inline block-to-be-deleted-p))
+(defun block-to-be-deleted-p (block)
+  (or (block-delete-p block)
+      (eq (functional-kind (block-home-lambda block)) :deleted)))
+
+;;; Checks whether NODE is in a block to be deleted
+(declaim (inline node-to-be-deleted-p))
+(defun node-to-be-deleted-p (node)
+  (block-to-be-deleted-p (node-block node)))
+
+(declaim (ftype (sfunction (clambda) cblock) lambda-block))
+(defun lambda-block (clambda)
+  (node-block (lambda-bind clambda)))
+(declaim (ftype (sfunction (clambda) component) lambda-component))
+(defun lambda-component (clambda)
+  (block-component (lambda-block clambda)))
+
+(declaim (ftype (sfunction (cblock) node) block-start-node))
+(defun block-start-node (block)
+  (ctran-next (block-start block)))
+
+;;; Return the enclosing cleanup for environment of the first or last
+;;; node in BLOCK.
+(defun block-start-cleanup (block)
+  (node-enclosing-cleanup (block-start-node block)))
+(defun block-end-cleanup (block)
+  (node-enclosing-cleanup (block-last block)))
+
+;;; Return the lexenv of the last node in BLOCK.
+(defun block-end-lexenv (block)
+  (node-lexenv (block-last block)))
+
 ;;;; lvar substitution
 
 (defun update-dependent-casts (new old)
@@ -254,7 +288,6 @@
   (declare (type lvar old)
            (type (or lvar null) new)
            (type boolean propagate-dx))
-
   (cond (new
          (update-dependent-casts new old)
          (do-uses (node old)
@@ -268,7 +301,8 @@
              (setf (cleanup-info it) (subst new old (cleanup-info it)))))
          (when (lvar-dynamic-extent new)
            (do-uses (node new)
-             (node-ends-block node))))
+             (unless (node-to-be-deleted-p node)
+               (node-ends-block node)))))
         (t (flush-dest old)))
 
   (values))
@@ -548,40 +582,6 @@
         (let ((name (lvar-fun-name (combination-fun call) t)))
           (memq name (lexenv-flushable (node-lexenv call)))))))
 
-;;;; BLOCK UTILS
-
-(declaim (inline block-to-be-deleted-p))
-(defun block-to-be-deleted-p (block)
-  (or (block-delete-p block)
-      (eq (functional-kind (block-home-lambda block)) :deleted)))
-
-;;; Checks whether NODE is in a block to be deleted
-(declaim (inline node-to-be-deleted-p))
-(defun node-to-be-deleted-p (node)
-  (block-to-be-deleted-p (node-block node)))
-
-(declaim (ftype (sfunction (clambda) cblock) lambda-block))
-(defun lambda-block (clambda)
-  (node-block (lambda-bind clambda)))
-(declaim (ftype (sfunction (clambda) component) lambda-component))
-(defun lambda-component (clambda)
-  (block-component (lambda-block clambda)))
-
-(declaim (ftype (sfunction (cblock) node) block-start-node))
-(defun block-start-node (block)
-  (ctran-next (block-start block)))
-
-;;; Return the enclosing cleanup for environment of the first or last
-;;; node in BLOCK.
-(defun block-start-cleanup (block)
-  (node-enclosing-cleanup (block-start-node block)))
-(defun block-end-cleanup (block)
-  (node-enclosing-cleanup (block-last block)))
-
-;;; Return the lexenv of the last node in BLOCK.
-(defun block-end-lexenv (block)
-  (node-lexenv (block-last block)))
-
 ;;; Return the non-LET LAMBDA that holds BLOCK's code, or NIL
 ;;; if there is none.
 ;;;
@@ -740,7 +740,9 @@
   (labels ((recurse (combination)
              (or (eq combination combination2)
                  (if (known-dx-combination-p combination dx)
-                     (let ((dest (lvar-dest (combination-lvar combination))))
+                     (let* ((lvar (combination-lvar combination))
+                            (dest (and lvar
+                                       (lvar-dest lvar))))
                        (and (combination-p dest)
                             (recurse dest)))
                      (let* ((fun1 (combination-fun combination))
@@ -808,7 +810,9 @@
                (not (lambda-var-sets var)))
       (let* ((fun (lambda-var-home var))
              (vars (lambda-vars fun))
-             (combination (lvar-dest (ref-lvar (car (lambda-refs fun))))))
+             (lvar (ref-lvar (car (lambda-refs fun))))
+             (combination (and lvar
+                               (lvar-dest lvar))))
         (when (combination-p combination)
           (loop for v in vars
                 for arg in (combination-args combination)
@@ -1208,6 +1212,7 @@
 
 ;;; Make NODE the LAST node in its block, splitting the block if necessary.
 ;;; The new block is added to the DFO immediately following NODE's block.
+;;; Returns the new block if it's created.
 (defun node-ends-block (node)
   (declare (type node node))
   (let* ((block (node-block node))
@@ -1219,9 +1224,9 @@
                  (not (block-delete-p block))))
       (let* ((succ (block-succ block))
              (new-block
-              (make-block-key :start start
-                              :component (block-component block)
-                              :succ succ :last last)))
+               (make-block-key :start start
+                               :component (block-component block)
+                               :succ succ :last last)))
         (setf (ctran-kind start) :block-start)
         (setf (ctran-use start) nil)
         (setf (block-last block) node)
@@ -1236,8 +1241,8 @@
 
         (do ((ctran start (node-next (ctran-next ctran))))
             ((not ctran))
-          (setf (ctran-block ctran) new-block)))))
-  (values))
+          (setf (ctran-block ctran) new-block))
+        new-block))))
 
 ;;;; deleting stuff
 
@@ -1501,9 +1506,13 @@
 (defun delete-ref (ref)
   (declare (type ref ref))
   (let* ((leaf (ref-leaf ref))
-         (refs (delq ref (leaf-refs leaf))))
+         (refs (delq ref (leaf-refs leaf)))
+         (home (node-home-lambda ref)))
     (setf (leaf-refs leaf) refs)
-
+    (when (and (typep leaf '(or clambda lambda-var))
+               (not (find home refs :key #'node-home-lambda)))
+      ;; It was the last reference from this lambda, remove it
+      (sset-delete leaf (lambda-calls-or-closes home)))
     (cond ((null refs)
            (typecase leaf
              (lambda-var
@@ -1780,6 +1789,8 @@
                      ;; the CAST will get a note, no need to note
                      ;; twice.
                      (not (cast-p node))
+                     ;; Nothing interesting in BIND nodes
+                     (not (bind-p node))
                      (or (eq first 'original-source-start)
                          (and (atom first)
                               (or (not (symbolp first))

@@ -2835,3 +2835,20 @@
 
 (with-test (:name :defined-fun-in-a-deleted-home-lambda)
   (checked-compile `(lambda (cache key) (bug-1728074-foo cache key #'bug-1728074-to-boolean))))
+
+(defstruct (lambda-var-ref-lvar-null (:type list))
+  (x nil)
+  (y 0))
+
+(with-test (:name :lambda-var-ref-lvar-null)
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda (a)
+                         (setf (lambda-var-ref-lvar-null-x :b) nil
+                               (lambda-var-ref-lvar-null-y a) 0))
+                      :allow-warnings t))))
+
+(sb-c:defknown blah * * (sb-c:foldable))
+(defun blah (x) (- x))
+(with-test (:name :foldable-wild-args-fun)
+  (assert (eql (funcall (checked-compile '(lambda () (blah (+ 1 2))))) -3)))
