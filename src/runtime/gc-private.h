@@ -16,6 +16,7 @@
 #define _GC_PRIVATE_H_
 
 #include "genesis/weak-pointer.h"
+#include "immobile-space.h"
 
 // Gencgc distinguishes between "quick" and "ordinary" requests.
 // Even on cheneygc we need this flag, but it's actually just ignored.
@@ -24,18 +25,15 @@
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h"
 void *
-gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_region,
-                     int quick_p);
+gc_alloc_with_region(struct alloc_region *my_region, sword_t nbytes,
+                     int page_type_flag, int quick_p);
 static inline void *
 gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
 {
-    struct alloc_region *my_region;
-    if (1 <= page_type_flag && page_type_flag <= 3) {
-        my_region = &gc_alloc_region[page_type_flag-1];
-    } else {
-        lose("bad page type flag: %d", page_type_flag);
-    }
-    return gc_alloc_with_region(nbytes, page_type_flag, my_region, quick_p);
+    if (1 <= page_type_flag && page_type_flag <= 3)
+        return gc_alloc_with_region(&gc_alloc_region[page_type_flag-1],
+                                    nbytes, page_type_flag, quick_p);
+    lose("bad page type flag: %d", page_type_flag);
 }
 #else
 extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
@@ -135,8 +133,6 @@ extern void fixup_immobile_refs(lispobj (*)(lispobj), lispobj, struct code*);
 // because a simple-fun header does not contain a generation.
 #define __immobile_obj_generation(x) (__immobile_obj_gen_bits(x) & IMMOBILE_OBJ_GENERATION_MASK)
 
-typedef int low_page_index_t;
-
 #ifdef LISP_FEATURE_LITTLE_ENDIAN
 static inline int immobile_obj_gen_bits(lispobj* pointer) // native pointer
 {
@@ -155,7 +151,7 @@ static inline int __immobile_obj_gen_bits(lispobj* pointer) // native pointer
 #endif /* little-endian */
 
 static inline boolean filler_obj_p(lispobj* obj) {
-  return *(int*)obj == (2<<N_WIDETAG_BITS | CODE_HEADER_WIDETAG);
+  return *obj == CODE_HEADER_WIDETAG;
 }
 
 #endif /* immobile space */
@@ -230,8 +226,8 @@ static inline void unprotect_page_index(page_index_t page_index)
 {
     os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_ALL);
     unsigned char *pflagbits = (unsigned char*)&page_table[page_index].gen - 1;
-    __sync_fetch_and_or(pflagbits, WP_CLEARED_BIT);
-    __sync_fetch_and_and(pflagbits, ~WRITE_PROTECTED_BIT);
+    __sync_fetch_and_or(pflagbits, WP_CLEARED_FLAG);
+    __sync_fetch_and_and(pflagbits, ~WRITE_PROTECTED_FLAG);
 }
 
 static inline void protect_page(void* page_addr, page_index_t page_index)
@@ -260,28 +256,6 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 
 #define NON_FAULTING_STORE(operation, addr) operation
 
-#endif
-
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-static inline void *
-fixedobj_page_address(low_page_index_t page_num)
-{
-    return (void*)(FIXEDOBJ_SPACE_START + (page_num * IMMOBILE_CARD_BYTES));
-}
-static inline void *
-varyobj_page_address(low_page_index_t page_num)
-{
-    return (void*)(VARYOBJ_SPACE_START + (page_num * IMMOBILE_CARD_BYTES));
-}
-#endif
-
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-#include "genesis/layout.h"
-#define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
-/// First 5 layouts: T, FUNCTION, STRUCTURE-OBJECT, LAYOUT, PACKAGE
-/// (These #defines ought to be emitted by genesis)
-#define LAYOUT_OF_LAYOUT  ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
-#define LAYOUT_OF_PACKAGE ((FIXEDOBJ_SPACE_START+4*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
 #endif
 
 #endif /* _GC_PRIVATE_H_ */

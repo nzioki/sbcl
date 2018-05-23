@@ -12,9 +12,6 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#ifdef MEMORY_SANITIZER
-#include <sanitizer/msan_interface.h>
-#endif
 
 #include "sbcl.h"
 #include "globals.h"
@@ -30,6 +27,7 @@
 #include "os.h"
 #include "arch.h"
 #include "interr.h"
+#include "immobile-space.h"
 #if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
 # include <dlfcn.h>
 #endif
@@ -134,12 +132,6 @@ os_sem_destroy(os_sem_t *sem)
 
 #endif
 
-#if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
-void* os_dlopen(char* name, int flags) {
-    return dlopen(name,flags);
-}
-#endif
-
 /* When :SB-DYNAMIC-CORE is enabled, the special category of /static/ foreign
  * symbols disappears. Foreign fixups are resolved to linkage table locations
  * during genesis, and for each of them a record is added to
@@ -161,25 +153,9 @@ os_dlsym_default(char *name)
 }
 #endif
 
-#ifdef MEMORY_SANITIZER
-/* Unless the Lisp compiler annotates every (SETF SAP-REF-n) to update
- * shadow memory indicating non-poison state byte-for-byte,
- * we need to unpoison all malloc() results,
- * otherwise the memory can't be read by sanitized code.
- */
-static void* malloc_unpoisoned(size_t size)
-{
-    void* result = malloc(size);
-    if (result)
-        __msan_unpoison(result, size);
-    return result;
-}
-#endif
-
+int lisp_linkage_table_n_prelinked;
 void os_link_runtime()
 {
-    extern void write_protect_immobile_space();
-
 #ifdef LISP_FEATURE_SB_DYNAMIC_CORE
     char *link_target = (char*)(intptr_t)LINKAGE_TABLE_SPACE_START;
     void *validated_end = link_target;
@@ -189,20 +165,18 @@ void os_link_runtime()
     void* result;
     int n = 0, m = 0, j;
 
+    if (lisp_linkage_table_n_prelinked)
+        return; // Linkage was already performed by coreparse
+
     struct vector* symbols = VECTOR(SymbolValue(REQUIRED_FOREIGN_SYMBOLS,0));
-    n = fixnum_value(symbols->length);
+    n = lisp_linkage_table_n_prelinked = fixnum_value(symbols->length);
     for (j = 0 ; j < n ; ++j)
     {
         lispobj item = symbols->data[j];
-        datap = lowtag_of(item) == LIST_POINTER_LOWTAG;
+        datap = listp(item);
         symbol_name = datap ? CONS(item)->car : item;
         namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
-#ifdef MEMORY_SANITIZER
-        if (!strcmp(namechars,"malloc"))
-            result = malloc_unpoisoned;
-        else
-#endif
-            result = os_dlsym_default(namechars);
+        result = os_dlsym_default(namechars);
         odxprint(runtime_link, "linking %s => %p", namechars, result);
 
         if (link_target == validated_end) {
@@ -212,10 +186,7 @@ void os_link_runtime()
 #endif
         }
         if (result) {
-            if (datap)
-                arch_write_linkage_table_ref(link_target,result);
-            else
-                arch_write_linkage_table_jmp(link_target,result);
+            arch_write_linkage_table_entry(link_target, result, datap);
         } else {
             m++;
         }
@@ -225,13 +196,26 @@ void os_link_runtime()
     odxprint(runtime_link, "%d total symbols linked, %d undefined",
              n, m);
 #endif /* LISP_FEATURE_SB_DYNAMIC_CORE */
+}
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    /* Delayed until after dynamic space has been mapped, fixups made,
-     * and/or immobile-space linkage entries written,
-     * since it was too soon earlier to handle write faults. */
-    write_protect_immobile_space();
+boolean
+gc_managed_heap_space_p(lispobj addr)
+{
+    if ((READ_ONLY_SPACE_START <= addr && addr < READ_ONLY_SPACE_END)
+        || (STATIC_SPACE_START <= addr && addr < STATIC_SPACE_END)
+#if defined LISP_FEATURE_GENCGC
+        || (DYNAMIC_SPACE_START <= addr &&
+            addr < (DYNAMIC_SPACE_START + dynamic_space_size))
+        || immobile_space_p(addr)
+#else
+        || (DYNAMIC_0_SPACE_START <= addr &&
+            addr < DYNAMIC_0_SPACE_START + dynamic_space_size)
+        || (DYNAMIC_1_SPACE_START <= addr &&
+            addr < DYNAMIC_1_SPACE_START + dynamic_space_size)
 #endif
+        )
+        return 1;
+    return 0;
 }
 
 #ifndef LISP_FEATURE_WIN32
@@ -250,28 +234,18 @@ void os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 }
 
 boolean
-gc_managed_addr_p(lispobj ad)
+gc_managed_addr_p(lispobj addr)
 {
     struct thread *th;
 
-    if ((READ_ONLY_SPACE_START <= ad && ad < READ_ONLY_SPACE_END)
-        || (STATIC_SPACE_START <= ad && ad < STATIC_SPACE_END)
-#if defined LISP_FEATURE_GENCGC
-        || (DYNAMIC_SPACE_START <= ad &&
-            ad < (DYNAMIC_SPACE_START + dynamic_space_size))
-        || immobile_space_p(ad)
-#else
-        || (DYNAMIC_0_SPACE_START <= ad && ad < DYNAMIC_0_SPACE_END)
-        || (DYNAMIC_1_SPACE_START <= ad && ad < DYNAMIC_1_SPACE_END)
-#endif
-        )
+    if (gc_managed_heap_space_p(addr))
         return 1;
     for_each_thread(th) {
-        if(th->control_stack_start <= (lispobj*)ad
-           && (lispobj*)ad < th->control_stack_end)
+        if(th->control_stack_start <= (lispobj*)addr
+           && (lispobj*)addr < th->control_stack_end)
             return 1;
-        if(th->binding_stack_start <= (lispobj*)ad
-           && (lispobj*)ad < th->binding_stack_start + BINDING_STACK_SIZE)
+        if(th->binding_stack_start <= (lispobj*)addr
+           && (lispobj*)addr < th->binding_stack_start + BINDING_STACK_SIZE)
             return 1;
     }
     return 0;

@@ -50,11 +50,6 @@ extern int kill_safely(os_thread_t os_thread, int signal);
 #define THREAD_SLOT_OFFSET_WORDS(c) \
  (offsetof(struct thread,c)/(sizeof (struct thread *)))
 
-union per_thread_data {
-    struct thread thread;
-    lispobj dynamic_values[1];  /* actually more like 4000 or so */
-};
-
 /* The thread struct is generated from lisp during genesis and it
  * needs to know the sizes of all its members, but some types may have
  * arbitrary lengths, thus the pointers are stored instead. This
@@ -102,19 +97,22 @@ extern int dynamic_values_bytes;
 static inline unsigned int
 tls_index_of(struct symbol *symbol) // untagged pointer
 {
+#ifdef LISP_FEATURE_X86_64
+  return ((unsigned int*)symbol)[1];
+#else
   return symbol->header >> 32;
+#endif
 }
 #else
 #  define tls_index_of(x) (x->tls_index)
 #endif
-#define per_thread_value(sym,th) \
-  ((union per_thread_data *)th)->dynamic_values[tls_index_of(sym)>>WORD_SHIFT]
+#  define per_thread_value(sym,th) *(lispobj*)(tls_index_of(sym) + (char*)th)
 #endif
 
 static inline lispobj
-SymbolValue(u64 tagged_symbol_pointer, void *thread)
+SymbolValue(lispobj tagged_symbol_pointer, void *thread)
 {
-    struct symbol *sym= SYMBOL(tagged_symbol_pointer);
+    struct symbol *sym = SYMBOL(tagged_symbol_pointer);
     if(thread && tls_index_of(sym)) {
         lispobj r = per_thread_value(sym, thread);
         if(r!=NO_TLS_VALUE_MARKER_WIDETAG) return r;
@@ -123,9 +121,9 @@ SymbolValue(u64 tagged_symbol_pointer, void *thread)
 }
 
 static inline void
-SetSymbolValue(u64 tagged_symbol_pointer,lispobj val, void *thread)
+SetSymbolValue(lispobj tagged_symbol_pointer,lispobj val, void *thread)
 {
-    struct symbol *sym= SYMBOL(tagged_symbol_pointer);
+    struct symbol *sym = SYMBOL(tagged_symbol_pointer);
     if(thread && tls_index_of(sym)) {
         if (per_thread_value(sym, thread) != NO_TLS_VALUE_MARKER_WIDETAG) {
             per_thread_value(sym, thread) = val;
@@ -140,9 +138,8 @@ SetSymbolValue(u64 tagged_symbol_pointer,lispobj val, void *thread)
  * be thread-local without saving a prior value on the binding stack. */
 # define write_TLS(sym, val, thread) write_TLS_index(sym##_tlsindex, val, thread, _ignored_)
 # define write_TLS_index(index, val, thread, sym) \
-   *(lispobj*)(index + (char*)((union per_thread_data*)thread)->dynamic_values) = val
-# define read_TLS(sym, thread) \
-   *(lispobj*)(sym##_tlsindex + (char*)((union per_thread_data*)thread)->dynamic_values)
+   *(lispobj*)(index + (char*)thread) = val
+# define read_TLS(sym, thread) *(lispobj*)(sym##_tlsindex + (char*)thread)
 #else
 # define write_TLS(sym, val, thread) SYMBOL(sym)->value = val
 # define write_TLS_index(index, val, thread, sym) sym->value = val
@@ -205,14 +202,49 @@ extern __thread struct thread *current_thread;
 #define ALT_STACK_SIZE 32 * SIGSTKSZ
 #endif
 
+#ifdef LISP_FEATURE_X86_64
+  #define THREAD_MEMORY_LAYOUT_NEW 1
+  /* Referring to the "old" and "new" pictures in the comment at
+   * create_thread_struct(), observe that in the old scheme the interrupt
+   * contexts are accounted for in dynamic_values_bytes (4K words by default).
+   * In the new, they aren't, so sum them separately in THREAD_STRUCT_SIZE */
+  #define INTERRUPT_CONTEXTS_SIZE (MAX_INTERRUPTS*sizeof(os_context_t*))
+  /* context 0 is the word immediately before the thread struct, and so on.
+   * Pointer subtraction is well-defined in C, but negative indexing is not,
+   * despite the equivalence of *(a+j) and a[j], or so I'm led to believe. */
+  #define nth_interrupt_context(n,thread) *((os_context_t**)thread - 1 - THREAD_CSP_PAGE_SIZE / N_WORD_BYTES - (n))
+#else
+  #define THREAD_MEMORY_LAYOUT_NEW 0
+  #define INTERRUPT_CONTEXTS_SIZE 0
+  // context 0 is the word following the entire thread struct, and so on
+  #define nth_interrupt_context(n,thread) ((os_context_t**)(thread+1))[n]
+#endif
+
 #define THREAD_STRUCT_SIZE (thread_control_stack_size + BINDING_STACK_SIZE + \
                             ALIEN_STACK_SIZE +                          \
                             sizeof(struct nonpointer_thread_data) +     \
                             dynamic_values_bytes +                      \
+                            INTERRUPT_CONTEXTS_SIZE +                   \
                             ALT_STACK_SIZE +                            \
                             THREAD_ALIGNMENT_BYTES +                    \
                             THREAD_CSP_PAGE_SIZE)
 
+/* sigaltstack() - "Signal stacks are automatically adjusted
+ * for the direction of stack growth and alignment requirements." */
+static inline void* calc_altstack_base(struct thread* thread) {
+    // Refer to the picture in the comment above create_thread_struct().
+    // Always return the lower limit as the base even if stack grows down.
+    return ((char*) thread) + dynamic_values_bytes
+        + ALIGN_UP(sizeof (struct nonpointer_thread_data), N_WORD_BYTES);
+}
+static inline int calc_altstack_size(struct thread* thread) {
+    // 'end' is calculated as exactly the end address we got from the OS.
+    // The usually ends up making the stack slightly larger than ALT_STACK_SIZE
+    // bytes due to the addition of THREAD_ALIGNMENT_BYTES of padding.
+    // If the memory was as aligned as we'd like, the padding is ours to keep.
+    char *thread_memory_end = (char*)thread->os_address + THREAD_STRUCT_SIZE;
+    return thread_memory_end - (char*)calc_altstack_base(thread);
+}
 #if defined(LISP_FEATURE_WIN32)
 static inline struct thread* arch_os_get_current_thread()
     __attribute__((__const__));

@@ -429,6 +429,7 @@ static void print_environment(int argc, char *argv[])
     }
 }
 
+extern void write_protect_immobile_space();
 struct lisp_startup_options lisp_startup_options;
 int
 main(int argc, char *argv[], char *envp[])
@@ -460,8 +461,8 @@ main(int argc, char *argv[], char *envp[])
     int merge_core_pages = -1;
     struct memsize_options memsize_options = {0, 0, 0};
 
+    boolean have_hardwired_spaces = os_preinit(argv, envp);
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-    os_preinit();
     pthreads_win32_init();
 #endif
 
@@ -630,14 +631,12 @@ main(int argc, char *argv[], char *envp[])
      * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
      * it must follow os_init(). -- WHN 2000-01-26 */
     os_init(argv, envp);
-    /* os_init may re-execute the runtime, don't print anything before
-     * that, otherwise it will be duplicated. */
     if (debug_environment_p) {
         print_environment(argc, argv);
     }
     dyndebug_init();
     arch_init();
-    allocate_spaces();
+    allocate_spaces(have_hardwired_spaces);
     gc_init();
 
     setup_locale();
@@ -675,7 +674,10 @@ main(int argc, char *argv[], char *envp[])
         core = search_for_core();
     }
 
-    if (!lisp_startup_options.noinform && embedded_core_offset == 0) {
+    if (embedded_core_offset)
+        lisp_startup_options.noinform = 1;
+
+    if (!lisp_startup_options.noinform) {
         print_banner();
         fflush(stdout);
     }
@@ -716,6 +718,12 @@ main(int argc, char *argv[], char *envp[])
         enable_lossage_handler();
 
     os_link_runtime();
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    /* Delayed until after dynamic space has been mapped, fixups made,
+     * and/or immobile-space linkage entries written,
+     * since it was too soon earlier to handle write faults. */
+    write_protect_immobile_space();
+#endif
 #ifdef LISP_FEATURE_HPUX
     /* -1 = CLOSURE_FUN_OFFSET, 23 = SIMPLE_FUN_CODE_OFFSET, we are
      * not in LANGUAGE_ASSEMBLY so we cant reach them. */

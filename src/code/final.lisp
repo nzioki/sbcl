@@ -218,23 +218,20 @@ Examples:
          (atomic-push it (finalizer-recycle-bin store)))))
     object))
 
-;;; TODO: start a thread dedicated to finalizations.
-;;; It just needs to wait on a semaphore signaled each time GC finishes.
-;;; As well, this function can be run in more than one thread concurrently,
-;;; if anyone wanted to do that.
-(defun run-pending-finalizers ()
+;;; Drain the queue of finalizers and return when empty.
+;;; Concurrent invocations of this function are ok.
+(defun scan-finalizers ()
   ;; This never acquires the finalizer store lock. Code accordingly.
   (let ((hashtable (finalizer-id-map **finalizer-store**)))
     (loop
      (let ((cell (hash-table-culled-values hashtable)))
-       ;; Remove an item from the pending list
-       (unless cell (return))
        ;; This is like atomic-pop, but its obtains the first cons cell
        ;; in the list, not the car of the first cons.
-       (loop (let ((actual (cas (hash-table-culled-values hashtable)
+       (loop (unless cell (return-from scan-finalizers))
+             (let ((actual (cas (hash-table-culled-values hashtable)
                                 cell (cdr cell))))
                (if (eq actual cell) (return) (setq cell actual))))
-       (let* ((id (car cell))
+       (let* ((id (the index (car cell)))
               ;; No other thread can modify **FINALIZER-STORE** at index ID
               ;; because the table no longer contains an object mapping to
               ;; that element; however the vector could be grown at any point,
@@ -244,6 +241,14 @@ Examples:
               ;; on (CAR CELL) and STORE. (Alpha with threads, anyone?)
               (finalizers (svref store id))) ; [1] load
          (setf (svref store id) 0)           ; [2] store
+         ;; The ID can be reused right away. Link it into the recycle list,
+         ;; which has an extra NIL at the head so that we can use RPLACD,
+         ;; making this operation agnostic of whether the vector was switched.
+         (let* ((list (svref store 0))
+                (old (cdr list)))
+           (loop (let ((actual (cas (cdr list) old (rplacd cell old))))
+                   (if (eq actual old) (return) (setq old actual)))))
+         ;; Now call the function(s)
          (flet ((call (finalizer)
                   (let ((fun (if (consp finalizer) (car finalizer) finalizer)))
                     (handler-case (funcall fun)
@@ -269,9 +274,65 @@ Examples:
          ;; removing dangling references, but if it's just a function,
          ;; there's nothing to smash.
          (cond ((simple-vector-p finalizers) (fill finalizers 0))
-               ((consp finalizers) (rplaca finalizers 0)))
-         ;; Recycle the ID by linking CELL into the recycle bin.
-         (let* ((list (svref store 0))
-                (old (cdr list)))
-           (loop (let ((actual (cas (cdr list) old (rplacd cell old))))
-                   (if (eq actual old) (return) (setq old actual))))))))))
+               ((consp finalizers) (rplaca finalizers 0))))))))
+
+#!+sb-thread
+(progn
+  ;; *FINALIZER-THREAD* is either a boolean value indicating whether to start a
+  ;; thread, or a thread object (which is created no sooner than needed).
+  ;; Saving a core sets the flag to NIL so that finalizers which execute
+  ;; between stopping the thread and writing to disk will be synchronous.
+  ;; Restarting a saved core resets the flag to T.
+  (define-load-time-global *finalizer-thread* t)
+  (declaim (type (or sb!thread:thread boolean) *finalizer-thread*))
+  (define-load-time-global *finalizer-queue-lock*
+      (sb!thread:make-mutex :name "finalizer"))
+  (define-load-time-global *finalizer-queue*
+      (sb!thread:make-waitqueue :name "finalizer")))
+
+(defun run-pending-finalizers ()
+  (when (hash-table-culled-values (finalizer-id-map **finalizer-store**))
+    (cond #!+sb-thread
+          ((%instancep *finalizer-thread*)
+           (sb!thread::with-system-mutex (*finalizer-queue-lock*)
+             (sb!thread:condition-notify *finalizer-queue*)))
+          #!+sb-thread
+          ((eq *finalizer-thread* t) ; Create a new thread
+           (sb!thread:make-thread
+            (lambda ()
+              (when (eq t (cas *finalizer-thread* t
+                               sb!thread:*current-thread*))
+                ;; Don't enter the loop if this thread lost the
+                ;; competition to become a finalizer thread.
+                (loop
+                  (scan-finalizers)
+                  ;; Wait for a notification
+                  (sb!thread::with-system-mutex (*finalizer-queue-lock*)
+                    ;; Don't go to sleep if *FINALIZER-THREAD* became NIL
+                    (unless *finalizer-thread*
+                      (return))
+                    ;; The return value of CONDITION-WAIT is irrelevant
+                    ;; since it is always legal to call SCAN-FINALIZERS
+                    ;; even when it has nothing to do.
+                    ;; Spurious wakeup is of no concern to us here.
+                    (sb!thread:condition-wait
+                     *finalizer-queue* *finalizer-queue-lock*)))))
+            :name "finalizer"
+            :ephemeral t))
+          (t
+           (scan-finalizers)))))
+
+;;; If a finalizer thread was started, stop it and wait for it to finish.
+;;; Make no attempt to drain the queue of pending finalizers.
+;;; (When called from EXIT, the user must invoke a final GC if there is
+;;; an expectation that GC-based things run. Similarly when saving a core)
+(defun finalizer-thread-stop ()
+  #!+sb-thread
+  (let ((thread *finalizer-thread*))
+    (when thread ; if it was NIL it can't become a thread. So there's no race.
+      ;; Setting to NIL causes the thread to exit after waking
+      (setq thread (cas *finalizer-thread* thread nil))
+      (when (%instancep thread) ; only if it was a thread, do this
+        (sb!thread::with-system-mutex (*finalizer-queue-lock*)
+          (sb!thread:condition-notify *finalizer-queue*))
+        (sb!thread:join-thread thread))))) ; wait for it

@@ -11,8 +11,8 @@
 
 (in-package "SB!VM")
 
-(defconstant arg-count-sc (make-sc-offset any-reg-sc-number ecx-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number eax-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number ecx-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number eax-offset))
 
 ;;; Make a passing location TN for a local call return PC.
 ;;;
@@ -24,7 +24,7 @@
                  sap-stack-sc-number return-pc-save-offset))
 
 (defconstant return-pc-passing-offset
-  (make-sc-offset sap-stack-sc-number return-pc-save-offset))
+  (make-sc+offset sap-stack-sc-number return-pc-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -38,7 +38,7 @@
                  ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset control-stack-sc-number ocfp-save-offset))
+  (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -236,9 +236,7 @@
     (emit-label start-lab)
     ;; Skip space for the function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst dword 0))
-
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Save the return-pc.
     (popw ebp-tn (frame-word-offset return-pc-save-offset))))
@@ -388,7 +386,7 @@
            (move esp-tn ebx-tn)
            (let ((defaults (defaults)))
              (when defaults
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (emit-label default-stack-slots)
                  (dolist (default defaults)
                    (emit-label (car default))
@@ -756,7 +754,8 @@
 
                (:ignore
                ,@(unless (or variable (eq return :tail)) '(arg-locs))
-               ,@(unless variable '(args)))
+               ,@(unless variable '(args))
+               ,@(when (eq named :direct) '(step-instrumenting)))
 
                ;; We pass either the fdefn object (for named call) or
                ;; the actual function object (for unnamed call) in
@@ -861,8 +860,7 @@
                           ;; For tail call, we have to push the
                           ;; return-pc so that it looks like we CALLed
                           ;; despite the fact that we are going to JMP.
-                          (inst push return-pc)
-                          ))
+                          (inst push return-pc)))
                        (t
                         ;; For non-tail call, we have to save our
                         ;; frame pointer and install the new frame
@@ -890,11 +888,11 @@
                                   (frame-word-offset ocfp-save-offset))
 
                           (move ebp-tn new-fp))))  ; NB - now on new stack frame.
-
-               (when step-instrumenting
-                 (emit-single-step-test)
-                 (inst jmp :eq DONE)
-                 (inst break single-step-around-trap))
+               ,@(unless (eq named :direct)  ;; handle-single-step-around-trap can't handle it
+                   `((when step-instrumenting
+                       (emit-single-step-test)
+                       (inst jmp :eq DONE)
+                       (inst break single-step-around-trap))))
                DONE
 
                (note-this-location vop :call-site)

@@ -49,12 +49,16 @@
   `(inst mov ,value (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
 
 (defun storew (value ptr &optional (slot 0) (lowtag 0))
-  (cond ((and (integerp value)
-              (not (typep value '(signed-byte 32))))
-         (inst mov temp-reg-tn value)
-         (inst mov (make-ea-for-object-slot ptr slot lowtag) temp-reg-tn))
-        (t
-         (inst mov (make-ea-for-object-slot ptr slot lowtag) value))))
+  (let* ((size (if (tn-p value)
+                   (sc-operand-size (tn-sc value))
+                   :qword))
+         (ea (make-ea size :base ptr :disp (- (* slot n-word-bytes) lowtag))))
+    (cond ((and (integerp value)
+                (not (typep value '(signed-byte 32))))
+           (inst mov temp-reg-tn value)
+           (inst mov ea temp-reg-tn))
+          (t
+           (inst mov ea value)))))
 
 (defmacro pushw (ptr &optional (slot 0) (lowtag 0))
   `(inst push (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
@@ -62,13 +66,6 @@
 (defmacro popw (ptr &optional (slot 0) (lowtag 0))
   `(inst pop (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
 
-(defun call-indirect (offset)
-  (typecase offset
-    ((signed-byte 32)
-     (inst call (make-ea :qword :disp offset)))
-    (t
-     (inst mov temp-reg-tn offset)
-     (inst call (make-ea :qword :base temp-reg-tn)))))
 
 ;;;; macros to generate useful values
 
@@ -96,13 +93,23 @@
                      (ash symbol-value-slot word-shift)
                      (- other-pointer-lowtag))))
 
+(defun thread-tls-ea (index &optional (size :qword))
+  (if (tn-p index)
+      ;; Due to an encoding peculiarity, flipping the base and index is better.
+      ;; Base of r13 is reg=5 in ModRegRM, so if mod were 0, it would imply
+      ;; RIP-relative addressing. (And attempting to encode an index is illegal)
+      ;; So the 'mod' bits must be nonzero, which mandates encoding of an
+      ;; explicit displacement of 0.  Using INDEX as base avoids the extra byte.
+      (make-ea size :base index :index thread-base-tn)
+      (make-ea size :base thread-base-tn :disp index)))
+
 #!+sb-thread
 (progn
   ;; Return an EA for the TLS of SYMBOL, or die.
   (defun symbol-known-tls-cell (symbol)
     (let ((index (info :variable :wired-tls symbol)))
       (aver (integerp index))
-      (make-ea :qword :base thread-base-tn :disp index)))
+      (thread-tls-ea index)))
 
   ;; LOAD/STORE-TL-SYMBOL-VALUE macros are ad-hoc (ugly) emulations
   ;; of (INFO :VARIABLE :WIRED-TLS) = :ALWAYS-THREAD-LOCAL
@@ -130,153 +137,7 @@
 (defmacro load-type (target source &optional (offset 0))
   "Loads the type bits of a pointer into target independent of
    byte-ordering issues."
-  (once-only ((n-target target)
-              (n-source source)
-              (n-offset offset))
-    (ecase *backend-byte-order*
-      (:little-endian
-       `(inst movzx ,n-target
-              (make-ea :byte :base ,n-source :disp ,n-offset)))
-      (:big-endian
-       `(inst movzx ,n-target
-              (make-ea :byte :base ,n-source
-                             :disp (+ ,n-offset (1- n-word-bytes))))))))
-
-;;;; allocation helpers
-
-;;; All allocation is done by calls to assembler routines that
-;;; eventually invoke the C alloc() function.
-
-;;; Emit code to allocate an object with a size in bytes given by
-;;; Size. The size may be an integer of a TN. If Inline is a VOP
-;;; node-var then it is used to make an appropriate speed vs size
-;;; decision.
-
-(defun allocation-dynamic-extent (alloc-tn size lowtag)
-  (aver (not (location= alloc-tn rsp-tn)))
-  (inst sub rsp-tn size)
-  ;; see comment in x86/macros.lisp implementation of this
-  ;; However that comment seems inapplicable here because:
-  ;; - PAD-DATA-BLOCK quite clearly enforces double-word alignment,
-  ;;   contradicting "... unfortunately not enforced by ..."
-  ;; - It's not the job of WITH-FIXED-ALLOCATION to realign anything.
-  ;; - The real issue is that it's not obvious that the stack is
-  ;;   16-byte-aligned at *all* times. Maybe it is, maybe it isn't.
-  (inst and rsp-tn #.(lognot lowtag-mask))
-  (inst lea alloc-tn (make-ea :byte :base rsp-tn :disp lowtag))
-  (values))
-
-;;; This macro should only be used inside a pseudo-atomic section,
-;;; which should also cover subsequent initialization of the
-;;; object.
-(defun allocation-tramp (result-tn size lowtag)
-  (cond ((typep size '(and integer (not (signed-byte 32))))
-         ;; MOV accepts large immediate operands, PUSH does not
-         (inst mov result-tn size)
-         (inst push result-tn))
-        (t
-         (inst push size)))
-  ;; This really would be better if it recognized TEMP-REG-TN as the "good" case
-  ;; rather than specializing on R11, which just happens to be the temp reg.
-  ;; But the assembly routine is hand-written, not generated, and it has to match,
-  ;; so there's not much that can be done to generalize it.
-  (let* ((to-r11 (location= result-tn r11-tn))
-         (fixup (make-fixup (if to-r11
-                                'alloc-tramp-r11
-                                'alloc-tramp) :assembly-routine)))
-    (inst call (cond #!+immobile-code
-                     (sb!c::*code-is-immobile* fixup)
-                     (t (inst mov result-tn fixup)
-                        result-tn)))
-    (unless to-r11
-      (inst pop result-tn)))
-
-  (when lowtag
-    (inst or (reg-in-size result-tn :byte) lowtag))
-  (values))
-
-(defun allocation (alloc-tn size &optional ignored dynamic-extent lowtag)
-  (declare (ignore ignored))
-  (when dynamic-extent
-    (allocation-dynamic-extent alloc-tn size lowtag)
-    (return-from allocation (values)))
-  (aver (and (not (location= alloc-tn temp-reg-tn))
-             (or (integerp size) (not (location= size temp-reg-tn)))))
-
-  #!+(and (not sb-thread) sb-dynamic-core)
-  ;; We'd need a spare reg in which to load boxed_region from the linkage table.
-  ;; Probably could use r12 since it's reserved for the thread base,
-  ;; but that seems like the wrong answer, because r12 should be available
-  ;; to the register allocator when not using it as the thread base.
-  ;; Could push/pop any random register on the stack and own it temporarily,
-  ;; but seeing as nobody cared about this, just punt.
-  (allocation-tramp alloc-tn size lowtag)
-
-  #!-(and (not sb-thread) sb-dynamic-core)
-  ;; Otherwise do the normal inline allocation thing
-  (let ((NOT-INLINE (gen-label))
-        (DONE (gen-label))
-        ;; Yuck.
-        (in-elsewhere (eq *elsewhere* sb!assem::**current-segment**))
-        ;; thread->alloc_region.free_pointer
-        (free-pointer
-         #!+sb-thread
-         (make-ea :qword :base thread-base-tn
-                  :disp (* n-word-bytes thread-alloc-region-slot))
-         #!-sb-thread
-         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign)))
-        ;; thread->alloc_region.end_addr
-        (end-addr
-         #!+sb-thread
-         (make-ea :qword :base thread-base-tn
-                  :disp (* n-word-bytes (1+ thread-alloc-region-slot)))
-         #!-sb-thread
-         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign 8))))
-    (cond ((or in-elsewhere
-               ;; large objects will never be made in a per-thread region
-               (and (integerp size)
-                    (>= size large-object-size)))
-           (allocation-tramp alloc-tn size lowtag))
-          (t
-           (inst mov temp-reg-tn free-pointer)
-           (cond ((integerp size)
-                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :disp size)))
-                 ((location= alloc-tn size)
-                  (inst add alloc-tn temp-reg-tn))
-                 (t
-                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :index size))))
-           (inst cmp alloc-tn end-addr)
-           (inst jmp :a NOT-INLINE)
-           (inst mov free-pointer alloc-tn)
-           (emit-label DONE)
-           (if lowtag
-               (inst lea alloc-tn (make-ea :byte :base temp-reg-tn :disp lowtag))
-               (inst mov alloc-tn temp-reg-tn))
-           (assemble (*elsewhere*)
-             (emit-label NOT-INLINE)
-             (cond ((numberp size)
-                    (allocation-tramp temp-reg-tn size nil))
-                   (t
-                    (inst sub alloc-tn free-pointer)
-                    (allocation-tramp temp-reg-tn alloc-tn nil)))
-             (inst jmp DONE))))
-    (values)))
-
-;;; Allocate an other-pointer object of fixed SIZE with a single word
-;;; header having the specified WIDETAG value. The result is placed in
-;;; RESULT-TN.
-(defmacro with-fixed-allocation ((result-tn widetag size &optional inline stack-allocate-p)
-                                 &body forms)
-  (unless forms
-    (bug "empty &body in WITH-FIXED-ALLOCATION"))
-  (once-only ((result-tn result-tn) (size size) (stack-allocate-p stack-allocate-p))
-    `(maybe-pseudo-atomic ,stack-allocate-p
-      (allocation ,result-tn (pad-data-block ,size) ,inline ,stack-allocate-p
-                  other-pointer-lowtag)
-      (storew* (logior (ash (1- ,size) n-widetag-bits) ,widetag)
-               ,result-tn 0 other-pointer-lowtag
-               (not ,stack-allocate-p))
-      ,@forms)))
+  `(inst movzx ,target (make-ea :byte :base ,source :disp ,offset)))
 
 ;;;; error code
 (defun emit-error-break (vop kind code values)
@@ -294,19 +155,9 @@
     ;; The return PC points here; note the location for the debugger.
     (when vop
       (note-this-location vop :internal-error))
-    (inst byte kind)                       ; eg trap_Xyyy
-    (case kind
-      (#.invalid-arg-count-trap) ; there is no "payload" in this trap kind
-      (t
-       (inst byte code)
-       (encode-internal-error-args
-        (mapcar (lambda (tn)
-                  (cond ((and (tn-p tn) (sc-is tn immediate))
-                         (aver (typep (tn-value tn) '(or symbol layout)))
-                         (make-sc-offset constant-sc-number (tn-offset tn)))
-                        (t
-                         tn)))
-                values))))))
+    (if (= kind invalid-arg-count-trap) ; there is no "payload" in this trap kind
+        (inst byte kind)
+        (emit-internal-error kind code values))))
 
 (defun generate-error-code (vop error-code &rest values)
   (apply #'generate-error-code+ nil vop error-code values))
@@ -314,7 +165,7 @@
 (defun generate-error-code+ (preamble-emitter vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (when preamble-emitter
@@ -345,9 +196,7 @@
 ;;; pa section.
 #!+sb-thread
 (defmacro %clear-pseudo-atomic ()
-  '(inst mov (make-ea :qword :base thread-base-tn
-              :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
-    0))
+  '(inst mov (thread-tls-ea (* n-word-bytes thread-pseudo-atomic-bits-slot)) 0))
 
 #!+sb-safepoint
 (defun emit-safepoint ()
@@ -363,9 +212,7 @@
     `(let ((,label (gen-label))
            (,pa-bits-ea
             #!+sb-thread
-            (make-ea :qword
-                     :base thread-base-tn
-                     :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
+            (thread-tls-ea (* n-word-bytes thread-pseudo-atomic-bits-slot))
             #!-sb-thread
             (make-ea :qword
                      :disp (+ nil-value
@@ -500,11 +347,11 @@
        (:results (result :scs ,scs))
        (:result-types ,el-type)
        (:generator 4                    ; was 5
-         (inst mov (make-ea :qword :base object :index index
+         (gen-cell-set
+                   (make-ea :qword :base object :index index
                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                             :disp (- (* ,offset n-word-bytes) ,lowtag))
-               value)
-         (move result value)))
+                   value result)))
      (define-vop (,(symbolicate name "-C"))
        ,@(when translate
            `((:translate ,translate)))
@@ -519,11 +366,11 @@
        (:results (result :scs ,scs))
        (:result-types ,el-type)
        (:generator 3                    ; was 5
-         (inst mov (make-ea :qword :base object
+         (gen-cell-set
+                   (make-ea :qword :base object
                             :disp (- (* (+ ,offset index) n-word-bytes)
                                      ,lowtag))
-               value)
-         (move result value)))))
+                   value result)))))
 
 (defmacro define-full-setter+offset (name type offset lowtag scs el-type &optional translate)
   `(progn
@@ -543,11 +390,11 @@
        (:results (result :scs ,scs))
        (:result-types ,el-type)
        (:generator 4                    ; was 5
-         (inst mov (make-ea :qword :base object :index index
+         (gen-cell-set
+                   (make-ea :qword :base object :index index
                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                             :disp (- (* (+ ,offset offset) n-word-bytes) ,lowtag))
-               value)
-         (move result value)))
+                   value result)))
      (define-vop (,(symbolicate name "-C"))
        ,@(when translate
            `((:translate ,translate)))
@@ -565,54 +412,9 @@
        (:results (result :scs ,scs))
        (:result-types ,el-type)
        (:generator 3                    ; was 5
-         (inst mov (make-ea :qword :base object
+         (gen-cell-set
+                   (make-ea :qword :base object
                             :disp (- (* (+ ,offset index offset) n-word-bytes)
                                      ,lowtag))
-               value)
-         (move result value)))))
+                   value result)))))
 
-;;; Emit the most compact form of the test immediate instruction
-;;; by using the smallest operand size that is the large enough to hold
-;;; the immediate value Y. The operand size makes no difference since the result
-;;; of the implied AND is not written back to a register. However, if the msb
-;;; (the sign bit) of the immediate at a smaller size is 1 but at its true size
-;;; (always a :QWORD) is 0, the S flag value could come out 1 instead of 0.
-;;; SIGN-BIT-MATTERS specifies that a shorter operand size must not be selected
-;;; if doing so could affect whether the sign flag comes out the same.
-;;; e.g. if EDX is #xff, "TEST EDX, #x80" indicates a non-negative result
-;;; whereas "TEST DL, #x80" indicates a negative result.
-(defun emit-optimized-test-inst (x y sign-bit-matters)
-  (let* ((size-override
-          (cond ((or (typep y '(unsigned-byte 7))
-                     (and (typep y '(unsigned-byte 8)) (not sign-bit-matters)))
-                 :byte)
-                ((or (typep y '(unsigned-byte 15))
-                     (and (typep y '(unsigned-byte 16)) (not sign-bit-matters)))
-                 :word)
-                ((or (typep y '(unsigned-byte 31))
-                     (and (typep y '(unsigned-byte 32)) (not sign-bit-matters)))
-                 :dword)))
-         (offset (tn-offset x))
-         (modified-x
-          (when size-override
-            (cond ((sc-is x control-stack)
-                   ;; TODO: a 7- or 8-bit pattern that does not span bytes
-                   ;; should be testable as a :BYTE by suitably altering :DISP.
-                   (make-ea size-override :base rbp-tn :disp (frame-byte-offset offset)))
-                  ((sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
-                   (reg-in-size x size-override))))))
-    (inst test (or modified-x x) y)))
-
-
-(defun move-dword-if-immobile-code (dest src)
-  (flet ((downsize (tn)
-           (cond #!+immobile-code
-                 (sb!c::*code-is-immobile*
-                  (cond ((sc-is tn signed-stack unsigned-stack sap-stack)
-                         (make-ea :dword :base rbp-tn
-                                         :disp (frame-byte-offset (tn-offset tn))))
-                        (t
-                         (reg-in-size tn :dword))))
-                 (t
-                  tn))))
-    (inst mov (downsize dest) (downsize src))))

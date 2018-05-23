@@ -157,12 +157,6 @@
               :ref-trans %code-debug-info
               :set-known ()
               :set-trans (setf %code-debug-info))
-  #!-64-bit
-  (n-entries :type fixnum
-             :set-known ()
-             :set-trans (setf %code-n-entries)
-             :ref-trans %code-n-entries
-             :ref-known (flushable foldable))
   #!+(or x86 immobile-space)
   (fixups :type t
           :ref-known (flushable)
@@ -377,7 +371,7 @@
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
 ;;; can take care of maintaining Lisp and C versions.
-(!define-primitive-object (thread)
+(!define-primitive-object (thread :size primitive-thread-object-length)
   ;; no_tls_value_marker is borrowed very briefly at thread startup to
   ;; pass the address of initial-function into new_thread_trampoline.
   ;; tls[0] = NO_TLS_VALUE_MARKER_WIDETAG because a the tls index slot
@@ -396,6 +390,9 @@
   ;; Doing so reduces code size for allocation sequences and special variable
   ;; manipulations by fixing their TLS offsets to be < 2^7, the largest
   ;; aligned displacement fitting in a signed byte.
+  ;;
+  ;; Information for constructing deterministic consing profile.
+  (profile-data :c-type "uword_t *" :pointer t)
   #!+gencgc (alloc-region :c-type "struct alloc_region" :length 4)
   #!+sb-thread (pseudo-atomic-bits #!+(or x86 x86-64) :special #!+(or x86 x86-64) *pseudo-atomic-bits*)
   ;; next two not used in C, but this wires the TLS offsets to small values
@@ -467,5 +464,28 @@
   #!+sb-safepoint (csp-around-foreign-call :c-type "lispobj *")
   #!+win32 (synchronous-io-handle-and-flag :c-type "HANDLE" :length 1)
   #!+(and sb-safepoint-strictly (not win32))
-  (sprof-alloc-region :c-type "struct alloc_region" :length 5)
-  (interrupt-contexts :c-type "os_context_t *" :rest-p t :pointer t))
+  (sprof-alloc-region :c-type "struct alloc_region" :length 4)
+  ;; The following slot's existence must NOT be conditional on #+msan
+  #!+x86-64 (msan-param-tls) ; = &__msan_param_tls
+  ;; function-layout is needed for closure creation. it's constant,
+  ;; but we need somewhere to read it from.
+  #!+(and immobile-space 64-bit sb-thread) (function-layout))
+
+;;; Compute the smallest TLS index that will be assigned to a special variable
+;;; that does not map onto a thread slot.
+;;; Given N thread slots, the tls indices are 0..N-1 scaled by word-shift.
+;;; This constant is the index prior to scaling.
+(defconstant sb!thread::tls-index-start
+  (+ primitive-thread-object-length
+     ;; x86-64 interrupt contexts precede 'struct thread' so that TLS indices
+     ;; continue without a gap from the offset of the last primitive thread slot
+     ;; up until the TLS-SIZE'th slot (at which point exhaustion occurs).
+     ;;
+     ;; Other backends that haven't been converted over to use that thread memory
+     ;; layout have the interrupt contexts array intruding into the TLS area.
+     ;; That array must be skipped over when computing the next available index.
+     #!-x86-64 (1+ sb!vm:max-interrupts)))
+
+(defmacro make-code-header-word (boxed-nwords)
+  `(logior (ash ,boxed-nwords #!+64-bit 32 #!-64-bit n-widetag-bits)
+           code-header-widetag))

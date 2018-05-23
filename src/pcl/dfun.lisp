@@ -434,7 +434,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
      dfun-info)))
 
 (defun make-checking-dfun (generic-function function &optional cache)
-  (unless cache
+  (unless (or cache (use-default-method-only-dfun-p generic-function))
     (when (use-caching-dfun-p generic-function)
       (return-from make-checking-dfun (make-caching-dfun generic-function)))
     (when (use-dispatch-dfun-p generic-function)
@@ -445,8 +445,11 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
     (if (every (lambda (mt) (eq mt t)) metatypes)
         (let ((dfun-info (default-method-only-dfun-info)))
           (values
-           (funcall (get-dfun-constructor 'emit-default-only metatypes applyp)
-                    function)
+           (let* ((constructor (get-dfun-constructor 'emit-default-only metatypes applyp))
+                  (fun (funcall constructor function))
+                  (name (generic-function-name generic-function)))
+             (set-fun-name fun `(default-only ,name))
+             fun)
            nil
            dfun-info))
         (let* ((cache (or cache (make-cache :key-count nkeys :value nil :size 2)))
@@ -663,11 +666,8 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
            0))))
 
 (declaim (inline make-callable))
-(defun make-callable (gf methods generator method-alist wrappers)
-  (declare (ignore gf))
-  (let* ((*applicable-methods* methods)
-         (callable (function-funcall generator method-alist wrappers)))
-    callable))
+(defun make-callable (generator method-alist wrappers)
+  (function-funcall generator method-alist wrappers))
 
 (defun make-dispatch-dfun (gf)
   (values (get-dispatch-function gf) nil (dispatch-dfun-info)))
@@ -676,7 +676,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let* ((methods (generic-function-methods gf))
          (generator (get-secondary-dispatch-function1
                      gf methods nil nil nil nil nil t)))
-    (make-callable gf methods generator nil nil)))
+    (make-callable generator nil nil)))
 
 (defun make-final-dispatch-dfun (gf)
   (make-dispatch-dfun gf))
@@ -737,7 +737,6 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 ;;; Note that within the states that cache, there are dfun updates
 ;;; which simply select a new cache or cache field. Those are not
 ;;; considered as state transitions.
-(defvar *lazy-dfun-compute-p* t)
 (defvar *early-p* nil)
 
 (defun make-initial-dfun (gf)
@@ -1073,8 +1072,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                          (get-secondary-dispatch-function1
                           gf methods types nil (and for-cache-p wrappers)
                           all-applicable-and-sorted-p)))
-                    (make-callable gf methods generator
-                                   nil (and for-cache-p wrappers)))
+                    (make-callable generator nil (and for-cache-p wrappers)))
                   (default-secondary-dispatch-function gf))))
     (multiple-value-bind (index accessor-type)
         (and for-accessor-p all-applicable-and-sorted-p methods
@@ -1625,7 +1623,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
          (get-secondary-dispatch-function1
           gf methods types (not (null method-alist)) (not (null wrappers))
           (not (methods-contain-eql-specializer-p methods)))))
-    (make-callable gf methods generator method-alist wrappers)))
+    (make-callable generator method-alist wrappers)))
 
 (defun get-secondary-dispatch-function1 (gf methods types method-alist-p
                                             wrappers-p
@@ -1690,7 +1688,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let ((generator
          (get-secondary-dispatch-function1
           gf methods nil (not (null method-alist)) (not (null wrappers)) t)))
-    (make-callable gf methods generator method-alist wrappers)))
+    (make-callable generator method-alist wrappers)))
 
 (defun get-effective-method-function1 (gf methods &optional (sorted-p t))
   (get-secondary-dispatch-function1 gf methods nil nil nil t sorted-p))
@@ -1740,15 +1738,15 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
             ;; still enabled...
             (sb-thread::call-with-recursive-system-lock #'update lock))))))
 
-(defvar *dfun-count* nil)
-(defvar *dfun-list* nil)
-(defvar *minimum-cache-size-to-list*)
-
 ;;; These functions aren't used in SBCL, or documented anywhere that
 ;;; I'm aware of, but they look like they might be useful for
 ;;; debugging or performance tweaking or something, so I've just
 ;;; commented them out instead of deleting them. -- WHN 2001-03-28
 #||
+(defvar *dfun-count* nil)
+(defvar *dfun-list* nil)
+(defvar *minimum-cache-size-to-list*)
+
 (defun list-dfun (gf)
   (let* ((sym (type-of (gf-dfun-info gf)))
          (a (assq sym *dfun-list*)))

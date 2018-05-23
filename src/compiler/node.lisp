@@ -12,6 +12,9 @@
 
 (in-package "SB!C")
 
+(declaim (type fixnum *compiler-sset-counter*))
+(defvar *compiler-sset-counter* 0)
+
 ;;; The front-end data structure (IR1) is composed of nodes,
 ;;; representing actual evaluations. Linear sequences of nodes in
 ;;; control-flow order are combined into blocks (but see
@@ -121,7 +124,9 @@
   (setf (lvar-%externally-checkable-type lvar) nil))
 
 (def!struct (node (:constructor nil)
-                  (:include sset-element (number (incf *compiler-sset-counter*)))
+                  (:include sset-element
+                            (number (unless (eql *compiler-sset-counter* 0)
+                                      (incf *compiler-sset-counter*))))
                   (:copier nil))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
@@ -178,6 +183,7 @@
 
 (defun %with-ir1-environment-from-node (node fun)
   (declare (type node node) (type function fun))
+  #-sb-xc-host (declare (dynamic-extent fun)) ; "unable"
   (let ((*current-component* (node-component node))
         (*lexenv* (node-lexenv node))
         (*current-path* (node-source-path node)))
@@ -673,7 +679,9 @@
 ;;; structures. A reference to a LEAF is indicated by a REF node. This
 ;;; allows us to easily substitute one for the other without actually
 ;;; hacking the flow graph.
-(def!struct (leaf (:include sset-element (number (incf *compiler-sset-counter*)))
+(def!struct (leaf (:include sset-element
+                            (number (unless (eql *compiler-sset-counter* 0)
+                                      (incf *compiler-sset-counter*))))
                   (:copier nil)
                   (:constructor nil))
   ;; unique ID for debugging
@@ -733,8 +741,6 @@
       extent)))
 
 ;;; LEAF name operations
-;;;
-;;; KLUDGE: wants CLOS..
 (defun leaf-has-source-name-p (leaf)
   (not (eq (leaf-%source-name leaf)
            '.anonymous.)))
@@ -756,7 +762,17 @@
   ;; kind of variable described
   (kind (missing-arg)
         :type (member :special :global-function :global :unknown)))
-(defprinter (global-var :identity t)
+
+(defun pretty-print-global-var (var stream)
+  (let ((name (leaf-source-name var)))
+    (princ (if (eq (global-var-kind var) :global-function)
+               `(function ,name)
+               name)
+           stream)))
+
+(defprinter (global-var :identity t
+             :pretty-ir-printer
+             (pretty-print-global-var structure stream))
   %source-name
   #!+sb-show id
   (type :test (not (eq type *universal-type*)))
@@ -792,7 +808,8 @@
   ;; RECOGNIZE-KNOWN-CALL) - we need separate functionals for each policy in
   ;; which the function is used.
   (functionals nil :type list))
-(defprinter (defined-fun :identity t)
+(defprinter (defined-fun :identity t
+             :pretty-ir-printer (pretty-print-global-var structure stream))
   %source-name
   #!+sb-show id
   inlinep
@@ -952,8 +969,20 @@
   (xref () :type list)
   ;; True if this functional was created from an inline expansion. This
   ;; is either T, or the GLOBAL-VAR for which it is an expansion.
-  (inline-expanded nil))
-(defprinter (functional :identity t)
+  (inline-expanded nil)
+  ;; Is it coming from a top-level NAMED-LAMBDA?
+  (top-level-defun-p nil))
+
+(defun pretty-print-functional (functional stream)
+  (let ((name (functional-debug-name functional)))
+    (princ `(function
+             ,(if (typep name '(cons (member xep tl-xep)))
+                  (cadr name)
+                  name))
+           stream)))
+
+(defprinter (functional :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id)
@@ -1073,7 +1102,8 @@
   ;; the lambda itself is not, and the bindings introduced by it are considered
   ;; transparent by the nested DX analysis.
   (system-lambda-p nil :type boolean))
-(defprinter (clambda :conc-name lambda- :identity t)
+(defprinter (clambda :conc-name lambda- :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id
@@ -1154,7 +1184,8 @@
   ;; be used by callers that supply at least MAX-ARGS arguments and
   ;; know what they are doing.
   (main-entry nil :type (or clambda null)))
-(defprinter (optional-dispatch :identity t)
+(defprinter (optional-dispatch :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id
@@ -1364,12 +1395,14 @@
   ;; NOTINLINE. :ERROR is like :FULL, but means that we have
   ;; discovered that the call contains an error, and should not be
   ;; reconsidered for optimization.
-  (kind :full :type (member :local :full :error :known))
+  (kind :full :type (member :local :full :error :known
+                            :unknown-keys))
   ;; if a call to a known global function, contains the FUN-INFO.
   (fun-info nil :type (or fun-info null))
   ;; Untrusted type we have asserted for this combination.
   (type-validated-for-leaf nil)
   ;; some kind of information attached to this node by the back end
+  ;; or by CHECK-IMPORTANT-RESULT
   (info nil)
   (step-info))
 

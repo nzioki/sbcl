@@ -30,10 +30,15 @@
             #\newline)))
       (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)
       (setq lines (cddr lines)) ; remove "Disassembly for"
-      (when (string= (car (last lines)) "")
-        (setq lines (nbutlast lines)))
       ;; For human-readability, kill the whitespace
       (setq lines (mapcar (lambda (x) (string-left-trim " ;" x)) lines))
+      ;; Same old same old- filler in simple-funs manifests as one of two
+      ;; things dependin on whether even-or odd-length padding was needed.
+      (loop while (member (car (last lines))
+                          '("00               BYTE #X00"
+                            "0000             ADD [RAX], AL"
+                            "") :test 'string=)
+            do (setq lines (nbutlast lines)))
       ;; Remove safepoint traps
       (setq lines (remove-if (lambda (x) (search "; safepoint" x)) lines))
       ;; If the last 4 lines are of the expected form
@@ -49,6 +54,8 @@
 (with-test (:name :symeval-known-thread-local)
   ;; It should take 1 instruction to read a known thread-local var
   (assert (= (length (disasm 1 'sb-thread:*current-thread*)) 1))
+  (assert (= (length (disasm 1 'sb-sys:*interrupt-pending*)) 1))
+  (assert (= (length (disasm 1 'sb-kernel:*gc-inhibit*)) 1))
   (assert (= (length (disasm 1 'sb-kernel:*restart-clusters*)) 1))
   (assert (= (length (disasm 1 'sb-kernel:*handler-clusters*)) 1)))
 
@@ -61,15 +68,15 @@
 
 (with-test (:name :symeval-known-tls-index :skipped-on :immobile-symbols)
   ;; When symbol SC is IMMEDIATE:
-  ;;    498B942478210000   MOV RDX, [R12+8568]       ; tls: *PRINT-BASE*
+  ;;    498B9578210000     MOV RDX, [R13+disp]       ; tls: *PRINT-BASE*
   ;;    83FA61             CMP EDX, 97
   ;;    480F44142538F94B20 CMOVEQ RDX, [#x204BF938]  ; *PRINT-BASE*
   ;; (TODO: could use "CMOVEQ RDX, [RIP-n]" in immobile code)
   (assert (= (length (disasm 0 '*print-base*)) 3))
 
   ;; When symbol SC is CONSTANT:
-  ;;    498B942478290000   MOV RDX, [R12+10616]        ; tls: FOO
-  ;;    488B05A4FFFFFF     MOV RAX, [RIP-92]           ; 'FOO
+  ;;    498B9578290000     MOV RDX, [R13+disp]       ; tls: FOO
+  ;;    488B059EFFFFFF     MOV RAX, [RIP-98]         ; 'FOO
   ;;    83FA61             CMP EDX, 97
   ;;    480F4450F9         CMOVEQ RDX, [RAX-7]
   (assert (= (length (disasm 0 'foo)) 4)))
@@ -82,7 +89,7 @@
 (with-test (:name :symeval-unknown-tls-index :skipped-on :immobile-symbols)
   ;; When symbol SC is immediate:
   ;;    8B142514A24C20     MOV EDX, [#x204CA214]    ; tls_index: *BLUB*
-  ;;    498B1414           MOV RDX, [R12+RDX]
+  ;;    4A8B142A           MOV RDX, [RDX+R13]
   ;;    83FA61             CMP EDX, 97
   ;;    480F44142518A24C20 CMOVEQ RDX, [#x204CA218] ; *BLUB*
   ;; (TODO: could use "CMOVEQ RDX, [RIP-n]" in immobile code)
@@ -91,7 +98,7 @@
   ;; When symbol SC is constant:
   ;;    488B05B3FFFFFF     MOV RAX, [RIP-77]          ; 'BLUB"
   ;;    8B50F5             MOV EDX, [RAX-11]
-  ;;    498B1414           MOV RDX, [R12+RDX]
+  ;;    4A8B142A           MOV RDX, [RDX+R13]
   ;;    83FA61             CMP EDX, 97
   ;;    480F4450F9         CMOVEQ RDX, [RAX-7]
   (assert (= (length (disasm 0 'blub)) 5)))
@@ -107,15 +114,14 @@
                            :stream s)))
            #\newline))
          (index
-          (position "; error trap" lines :test 'search)))
-    (assert (search "OBJECT-NOT-TYPE-ERROR" (nth (1+ index) lines)))
-    (assert (search "; 'SB-ASSEM:LABEL" (nth (+ index 3) lines)))))
+          (position "OBJECT-NOT-TYPE-ERROR" lines :test 'search)))
+    (assert (search "; #<SB-KERNEL:LAYOUT for SB-ASSEM:LABEL" (nth (+ index 2) lines)))))
 
 #+immobile-code
 (with-test (:name :reference-assembly-tramp)
   (dolist (testcase '(("FUNCALLABLE-INSTANCE-TRAMP"
                        sb-kernel:%make-funcallable-instance)
-                      ("UNDEFINED-TRAMP"
+                      ("UNDEFINED-FDEFN"
                        sb-kernel:make-fdefn)))
     (let ((lines
            (split-string
@@ -132,6 +138,7 @@
 #+immobile-code
 (with-test (:name :static-unlinker)
   (let ((sb-c::*compile-to-memory-space* :immobile))
+    (declare (muffle-conditions style-warning))
     (flet ((disassembly-lines (name)
              (split-string
               (with-output-to-string (s)
@@ -159,3 +166,110 @@
         (defun g (x) (- x)))
       (let ((lines (disassembly-lines 'c)))
         (expect "#<FDEFN G>" lines)))))
+
+(with-test (:name :c-call
+            :broken-on (not :sb-dynamic-core))
+  (let* ((lines (split-string
+                 (with-output-to-string (s)
+                   (let ((sb-disassem:*disassem-location-column-width* 0))
+                     (disassemble 'sb-sys:deallocate-system-memory :stream s)))
+                 #\newline))
+         (c-call (find "os_deallocate" lines :test #'search)))
+    ;; Depending on #+immobile-code it's either direct or memory indirect.
+    #+immobile-code (assert (search "CALL #x" c-call))
+    #-immobile-code (assert (search "CALL QWORD PTR [#x" c-call))))
+
+(with-test (:name :set-symbol-value-imm)
+  (let (success)
+    (dolist (line (split-string
+                   (with-output-to-string (s)
+                     (let ((sb-disassem:*disassem-location-column-width* 0))
+                       (disassemble '(lambda () (setq *print-base* 8)) :stream s)))
+                   #\newline))
+      (when (and #+sb-thread (search "MOV QWORD PTR [R" line)
+                 #-sb-thread (search "MOV QWORD PTR [" line)
+                 (search (format nil ", ~D" (ash 8 sb-vm:n-fixnum-tag-bits)) line))
+        (setq success t)))
+    (assert success)))
+
+(defglobal *avar* nil)
+(with-test (:name :set-symbol-value-imm-2)
+  (let (success)
+    (dolist (line (split-string
+                   (with-output-to-string (s)
+                     (let ((sb-disassem:*disassem-location-column-width* 0))
+                       (disassemble '(lambda () (setq *avar* :downcase)) :stream s)))
+                   #\newline))
+      ;; Should have an absolute mem ref and an immediate operand:
+      ;;   48C7042568904B207F723A20 MOV QWORD PTR [#x204B9068], #x203A727F
+      (when (and (search "MOV QWORD PTR [#x" line)
+                 (search "], #x" line))
+        (setq success t)))
+    (assert success)))
+
+(defun test-arith-op-codegen (fun imm)
+  (split-string
+   (with-output-to-string (s)
+    (let ((sb-disassem:*disassem-location-column-width* 0))
+      (disassemble `(lambda (a b)
+                      (declare (fixnum b))
+                      (print 1) ; force spilling args to stack
+                      ;; Use an expression that doesn't select CMOV
+                      ;; as the implementation.
+                      ;; CMOV thinks it needs all args loaded,
+                      ;; defeating the purpose of this test.
+                      (values a (if (,fun b ,imm) 'baz (print 2))))
+                   :stream s)))
+   #\newline))
+
+(with-test (:name :test-high-byte-reg)
+  ;; Assert two things:
+  ;; - that LOGBITP can use a high byte register (sometimes)
+  ;; - that the fixnum #x80 (representation #x100) is a single byte test
+  (let (success)
+    (dolist (line
+             (split-string
+              (with-output-to-string (s)
+               (let ((sb-disassem:*disassem-location-column-width* 0))
+                 (disassemble '(lambda (x) (logtest (the fixnum x) #x80))
+                              :stream s)))
+              #\newline))
+      (when (search (format nil "TEST DH, ~D"
+                            (ash (ash #x80 sb-vm:n-fixnum-tag-bits) -8))
+                    line)
+        (setq success t)))
+    (assert success)))
+
+(with-test (:name :test-byte-stack-imm)
+  ;; Assert that LOGBITP can accept memory + immediate as the operands
+  (let (success)
+    (dolist (line (test-arith-op-codegen 'logtest #x80))
+      (when (and (search "TEST BYTE PTR [RBP-" line)
+                 (search (format nil
+                          ", ~d"
+                          (ash (ash #x80 sb-vm:n-fixnum-tag-bits) -8))
+                         line))
+        (setq success t)))
+    (assert success)))
+
+(with-test (:name :fixnum-cmp-stack-imm)
+  ;; Assert that < can accept memory + immediate as the operands
+  (let (success)
+    (dolist (line (test-arith-op-codegen '< -5))
+      (when (and (search "CMP QWORD PTR [RBP-" line)
+                 (search (format nil
+                          ", ~d" (ash -5 sb-vm:n-fixnum-tag-bits))
+                         line))
+        (setq success t)))
+    (assert success)))
+
+(with-test (:name :list-vop-immediate-to-mem)
+  (let ((lines
+         (split-string
+          (with-output-to-string (s)
+            (let ((sb-disassem:*disassem-location-column-width* 0))
+              (disassemble '(lambda () (list :key :test)) :stream s)))
+          #\newline)))
+    (assert (loop for line in lines
+                  thereis (and (search "MOV QWORD PTR [" line)
+                               (search ":KEY" line))))))

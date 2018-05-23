@@ -204,16 +204,14 @@
   (let ((fixup (gen-label)))
     (when (integerp size)
       (load-immediate-word alloc-tn size))
-    (emit-word sb!assem::**current-segment** (logior #xe92d0000
-                                                     (ash 1 (if (integerp size)
-                                                                (tn-offset alloc-tn)
-                                                                (tn-offset size)))
-                                                     (ash 1 (tn-offset lr-tn))))
+    (inst word (logior #xe92d0000
+                       (ash 1 (if (integerp size) (tn-offset alloc-tn) (tn-offset size)))
+                       (ash 1 (tn-offset lr-tn))))
     (inst load-from-label alloc-tn alloc-tn fixup)
     (inst blx alloc-tn)
-    (emit-word sb!assem::**current-segment** (logior #xe8bd0000
-                                                     (ash 1 (tn-offset alloc-tn))
-                                                     (ash 1 (tn-offset lr-tn))))
+    (inst word (logior #xe8bd0000
+                       (ash 1 (tn-offset alloc-tn))
+                       (ash 1 (tn-offset lr-tn))))
     (inst b back-label)
     (emit-label fixup)
     (inst word (make-fixup "alloc_tramp" :foreign))))
@@ -270,7 +268,7 @@
               (when ,lowtag
                 (inst orr ,result-tn ,result-tn ,lowtag))
 
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label ALLOC)
                 (allocation-tramp ,result-tn ,size BACK-FROM-ALLOC)
                 (emit-label FIXUP)
@@ -305,16 +303,13 @@
     ;; Use the magic officially-undefined instruction that Linux
     ;; treats as generating SIGTRAP.
     (inst debug-trap)
-    ;; The rest of this is "just" the encoded error details.
-    (inst byte kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values)
     (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (emit-error-break vop error-trap (error-number-or-lose error-code) values)

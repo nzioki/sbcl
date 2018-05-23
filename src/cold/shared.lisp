@@ -186,9 +186,9 @@
 ;;; When cross-compiling, the *FEATURES* set for the target Lisp is
 ;;; not in general the same as the *FEATURES* set for the host Lisp.
 ;;; In order to refer to target features specifically, we refer to
-;;; *SHEBANG-FEATURES* instead of *FEATURES*, and use the #!+ and #!-
+;;; SB!XC:*FEATURES* instead of CL:*FEATURES*, and use the #!+ and #!-
 ;;; readmacros instead of the ordinary #+ and #- readmacros.
-(setf *shebang-features*
+(setf sb!xc:*features*
       (let* ((default-features
                (funcall (compile
                          nil
@@ -199,7 +199,7 @@
                              (compile nil
                                       (read-from-file customizer-file-name))
                              #'identity)))
-        (funcall customizer default-features)))
+        (sort (funcall customizer default-features) #'string<)))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -215,7 +215,7 @@
 
 ;;; You can get all the way through make-host-1 without either one of these
 ;;; features, but then 'bit-bash' will fail to cross-compile.
-(unless (intersection '(:big-endian :little-endian) *shebang-features*)
+(unless (intersection '(:big-endian :little-endian) sb!xc:*features*)
   (warn "You'll have bad time without either endian-ness defined"))
 
 ;;; Some feature combinations simply don't work, and sometimes don't
@@ -239,10 +239,12 @@
           ":SB-SAFEPOINT not supported on selected architecture")
          ("(and sb-safepoint-strictly (not sb-safepoint))"
           ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
+         ("(not (or elf mach-o win32))"
+          "No execute object file format feature defined")
          ("(and sb-dynamic-core (not linkage-table))"
           ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
-         ("(and relocatable-heap (or cheneygc win32))"
-          "Relocatable heap requires gencgc + not win32")
+         ("(and relocatable-heap win32)"
+          "Relocatable heap requires (not win32)")
          ("(and sb-linkable-runtime (not sb-dynamic-core))"
           ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
@@ -255,18 +257,20 @@
           "At most one interpreter can be selected")
          ("(and immobile-space (not x86-64))"
           ":IMMOBILE-SPACE is supported only on x86-64")
-        ("(and compact-instance-header (not immobile-space))"
+         ("(and immobile-space (not relocatable-heap))"
+          ":IMMOBILE-SPACE requires :RELOCATABLE-HEAP")
+         ("(and compact-instance-header (not immobile-space))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
-        ("(and immobile-code (not immobile-space))"
+         ("(and immobile-code (not immobile-space))"
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
-        ("(and immobile-symbols (not immobile-space))"
+         ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
-    (let ((*features* *shebang-features*))
+    (let ((cl:*features* sb!xc:*features*))
       (when (read-from-string (concatenate 'string "#+" (first test) "T NIL"))
         (push (second test) failed-test-descriptions))))
   (when failed-test-descriptions
@@ -303,11 +307,6 @@
     ;; SBCL. ("not target code" -- but still presumably host code,
     ;; used to support the cross-compilation process)
     :not-target
-    ;; meaning: This file must always be compiled by 'slam.lisp' even if
-    ;; the object is not out of date with respect to its source.
-    ;; Necessary if there are compile-time-too effects that are not
-    ;; reflected into make-host-2 by load-time actions of make-host-1.
-    :slam-forcibly
     ;; meaning: The #'COMPILE-STEM argument :TRACE-FILE should be T.
     ;; When the compiler is SBCL's COMPILE-FILE or something like it,
     ;; compiling "foo.lisp" will generate "foo.trace" which contains lots
@@ -587,7 +586,9 @@
            (lambda ()
              (progv (list (intern "*SOURCE-NAMESTRING*" "SB!C"))
                     (list (lpnify-stem stem))
-               (compile-stem stem flags :target-compile)))))
+               (loop
+                (with-simple-restart (recompile "Recompile")
+                  (return (compile-stem stem flags :target-compile))))))))
 (compile 'target-compile-stem)
 
 ;;; (This function is not used by the build process, but is intended

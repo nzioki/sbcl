@@ -27,9 +27,8 @@
 (in-package "SB!PCL")
 
 (declaim (type (member nil early braid complete) **boot-state**))
-(defglobal **boot-state** nil)
+(define-load-time-global **boot-state** nil)
 
-(/show0 "starting early-low.lisp")
 
 ;;; The PCL package is internal and is used by code in potential
 ;;; bottlenecks. And since it's internal, no one should be
@@ -165,5 +164,3 @@
 ;; The first data slot (either index 0 or 1) in the primitive funcallable
 ;; instance is the vector of CLOS slots. Following that is the hash.
 (defconstant fsc-instance-hash-slot-index (1+ sb!vm:instance-data-start)))
-
-(/show0 "finished with early-low.lisp")

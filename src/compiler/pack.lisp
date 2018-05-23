@@ -40,7 +40,7 @@
 ;;;    it is local to.
 ;;;
 ;;; If there is a conflict, returns the first such conflicting offset.
-(declaim (ftype (sfunction (tn sc index) (or null index)) conflicts-in-sc))
+(declaim (ftype (sfunction (tn storage-class index) (or null index)) conflicts-in-sc))
 (defun conflicts-in-sc (tn sc offset)
   (let* ((confs (tn-global-conflicts tn))
          (kind (tn-kind tn))
@@ -100,7 +100,7 @@
 ;;; -- If the TN is local, then we just do the block it is local to,
 ;;;    setting always-live and OR'ing in the local conflicts.
 (defun add-location-conflicts (tn sc offset optimize)
-  (declare (type tn tn) (type sc sc) (type index offset))
+  (declare (type tn tn) (type storage-class sc) (type index offset))
   (let ((confs (tn-global-conflicts tn))
         (sb (sc-sb sc))
         (kind (tn-kind tn)))
@@ -218,7 +218,7 @@
 ;;; the SC element size, whichever is larger. If NEEDED-SIZE is
 ;;; larger, then use that size.
 (defun grow-sc (sc &optional (needed-size 0))
-  (declare (type sc sc) (type index needed-size))
+  (declare (type storage-class sc) (type index needed-size))
   (let* ((sb (sc-sb sc))
          (size (finite-sb-current-size sb))
          (align-mask (1- (sc-alignment sc)))
@@ -377,7 +377,7 @@
       (let* ((sb (sc-sb sc))
              (confs (finite-sb-live-tns sb)))
         (aver (eq (sb-kind sb) :finite))
-        (dovector (el (sc-locations sc))
+        (do-sc-locations (el (sc-locations sc) nil (sc-element-size sc))
           (let ((conf (load-tn-conflicts-in-sc op sc el t)))
             (if conf
                 (used (describe-tn-use el conf op))
@@ -1013,8 +1013,9 @@
              (same (ref)
                (let ((tn (tn-ref-tn ref))
                      (ltn (tn-ref-load-tn ref)))
-                 (or (tn-overlaps tn)
-                     (and ltn (tn-overlaps ltn)))))
+                 (and (not (eq (tn-kind tn) :unused))
+                      (or (tn-overlaps tn)
+                          (and ltn (tn-overlaps ltn))))))
              (is-op (ops)
                (do ((ops ops (tn-ref-across ops)))
                    ((null ops) nil)
@@ -1073,7 +1074,8 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (if (and (eq (tn-sc tn) sc)
-                 (find (the index loc) (sc-locations sc))
+                 (sc-locations-member (the sb!vm:finite-sc-offset loc)
+                                      (sc-locations sc))
                  (not (load-tn-conflicts-in-sc op sc loc nil)))
             loc
             nil)))))
@@ -1082,7 +1084,7 @@
 ;;; iterate over the SC's locations. If we can't find a legal
 ;;; location, return NIL.
 (defun select-load-tn-location (op sc)
-  (declare (type tn-ref op) (type sc sc))
+  (declare (type tn-ref op) (type storage-class sc))
 
   ;; Check any target location first.
   (let ((target (tn-ref-target op)))
@@ -1090,11 +1092,12 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (when (and (eq (sc-sb sc) (sc-sb (tn-sc tn)))
-                   (find (the index loc) (sc-locations sc))
+                   (sc-locations-member (the sb!vm:finite-sc-offset loc)
+                                        (sc-locations sc))
                    (not (load-tn-conflicts-in-sc op sc loc nil)))
               (return-from select-load-tn-location loc)))))
 
-  (dovector (loc (sc-locations sc) nil)
+  (do-sc-locations (loc (sc-locations sc) nil (sc-element-size sc))
     (unless (load-tn-conflicts-in-sc op sc loc nil)
       (return loc))))
 
@@ -1136,7 +1139,7 @@
 ;;; argument or result TN. The only way we can fail is if all
 ;;; locations in SC are used by load-TNs or temporaries in VOP.
 (defun unpack-for-load-tn (sc op)
-  (declare (type sc sc) (type tn-ref op))
+  (declare (type storage-class sc) (type tn-ref op))
   (let ((sb (sc-sb sc))
         (normal-tns (ir2-component-normal-tns
                      (component-info *component-being-compiled*)))
@@ -1148,8 +1151,7 @@
                (event unpack-tn node)
                (unpack-tn victim))
              (throw 'unpacked-tn nil)))
-      (dovector (loc (sc-locations sc))
-        (declare (type index loc))
+      (do-sc-locations (loc (sc-locations sc) nil (sc-element-size sc))
         (block SKIP
           (collect ((victims nil adjoin))
             (do ((i loc (1+ i))
@@ -1233,32 +1235,36 @@
   (do ((scs scs (cdr scs))
        (op ops (tn-ref-across op)))
       ((null scs))
-      (let ((target (tn-ref-target op)))
-        (when target
-           (let* ((load-tn (tn-ref-load-tn op))
-                  (load-scs (svref (car scs)
-                                   (sc-number
-                                    (tn-sc (or load-tn (tn-ref-tn op)))))))
-             (if load-tn
-                 (aver (eq load-scs t))
-               (unless (eq load-scs t)
-                       (setf (tn-ref-load-tn op)
-                             (pack-load-tn (car scs) op))))))))
+    (let ((target (tn-ref-target op))
+          (tn (tn-ref-tn op)))
+      (when (and target
+                 (not (eq (tn-kind tn) :unused)))
+        (let* ((load-tn (tn-ref-load-tn op))
+               (load-scs (svref (car scs)
+                                (sc-number
+                                 (tn-sc (or load-tn (tn-ref-tn op)))))))
+          (if load-tn
+              (aver (eq load-scs t))
+              (unless (eq load-scs t)
+                (setf (tn-ref-load-tn op)
+                      (pack-load-tn (car scs) op))))))))
 
   (do ((scs scs (cdr scs))
        (op ops (tn-ref-across op)))
       ((null scs))
-      (let ((target (tn-ref-target op)))
-        (unless target
-           (let* ((load-tn (tn-ref-load-tn op))
-                  (load-scs (svref (car scs)
-                                   (sc-number
-                                    (tn-sc (or load-tn (tn-ref-tn op)))))))
-             (if load-tn
-                 (aver (eq load-scs t))
-               (unless (eq load-scs t)
-                       (setf (tn-ref-load-tn op)
-                             (pack-load-tn (car scs) op))))))))
+    (let ((target (tn-ref-target op))
+          (tn (tn-ref-tn op)))
+      (unless (or target
+                  (eq (tn-kind tn) :unused))
+        (let* ((load-tn (tn-ref-load-tn op))
+               (load-scs (svref (car scs)
+                                (sc-number
+                                 (tn-sc (or load-tn tn))))))
+          (if load-tn
+              (aver (eq load-scs t))
+              (unless (eq load-scs t)
+                (setf (tn-ref-load-tn op)
+                      (pack-load-tn (car scs) op))))))))
 
   (values))
 
@@ -1290,14 +1296,16 @@
   ;; the write and vice versa.
   (aver (eq (tn-ref-write-p read)
             (not (tn-ref-write-p write))))
-  (setf (tn-ref-target read) write)
-  (setf (tn-ref-target write) read))
+  (unless (or (eq (tn-kind (tn-ref-tn write)) :unused)
+              (eq (tn-kind (tn-ref-tn read)) :unused))
+    (setf (tn-ref-target read) write)
+    (setf (tn-ref-target write) read)))
 
 ;;; If TN can be packed into SC so as to honor a preference to TARGET,
 ;;; then return the offset to pack at, otherwise return NIL. TARGET
 ;;; must be already packed.
 (defun check-ok-target (target tn sc)
-  (declare (type tn target tn) (type sc sc) (inline member))
+  (declare (type tn target tn) (type storage-class sc) (inline member))
   (let* ((loc (tn-offset target))
          (target-sc (tn-sc target))
          (target-sb (sc-sb target-sc)))
@@ -1308,7 +1316,7 @@
     ;; -- TN doesn't conflict with target's location.
     (if (and (eq target-sb (sc-sb sc))
              (or (eq (sb-kind target-sb) :unbounded)
-                 (find loc (sc-locations sc)))
+                 (sc-locations-member loc (sc-locations sc)))
              (= (sc-element-size target-sc) (sc-element-size sc))
              (not (conflicts-in-sc tn sc loc))
              (zerop (mod loc (sc-alignment sc))))
@@ -1363,7 +1371,7 @@
        (%call-with-target-tns ,source-tn #',callback ,@keys))))
 
 (defun find-ok-target-offset (tn sc)
-  (declare (type tn tn) (type sc sc))
+  (declare (type tn tn) (type storage-class sc))
   (do-target-tns (target tn)
     (awhen (and (tn-offset target)
                 (neq (tn-kind target) :arg-pass)
@@ -1385,37 +1393,50 @@
 ;;; on register-starved architectures (x86) this seems to be a bad
 ;;; strategy. -- JES 2004-09-11
 (defun select-location (tn sc &key use-reserved-locs optimize)
-  (declare (type tn tn) (type sc sc))
+  (declare (type tn tn) (type storage-class sc))
   (let* ((sb (sc-sb sc))
          (element-size (sc-element-size sc))
          (alignment (sc-alignment sc))
          (align-mask (1- alignment))
          (size (finite-sb-current-size sb)))
-    (flet ((attempt-location (start-offset)
+    (flet ((available-locations ()
+             (if use-reserved-locs
+                 (sc-locations sc)
+                 (logand (sc-locations sc)
+                         (lognot (sc-reserve-locations sc)))))
+           (location-cost (location-offset)
+             (let ((always-live-count (finite-sb-always-live-count sb)))
+               (loop for offset from location-offset
+                  repeat element-size
+                  maximize (svref always-live-count offset))))
+           (attempt-location (start-offset)
              (let ((conflict (conflicts-in-sc tn sc start-offset)))
                (if conflict
                    (logandc2 (+ conflict align-mask 1)
                              align-mask)
                    (return-from select-location start-offset)))))
-      (if (eq (sb-kind sb) :unbounded)
-          (loop with offset = 0
-                until (> (+ offset element-size) size) do
-                (setf offset (attempt-location offset)))
-          (let ((locations (sc-locations sc)))
-            (when optimize
-              (setf locations
-                    (schwartzian-stable-sort-vector
-                     locations '>
-                     :key (lambda (location-offset)
-                            (loop for offset from location-offset
-                                  repeat element-size
-                                  maximize (svref
-                                            (finite-sb-always-live-count sb)
-                                            offset))))))
-            (dovector (offset locations)
-              (when (or use-reserved-locs
-                        (not (find offset (sc-reserve-locations sc))))
-                (attempt-location offset))))))))
+      (cond
+        ((eq (sb-kind sb) :unbounded)
+         (loop with offset = 0
+            until (> (+ offset element-size) size) do
+              (setf offset (attempt-location offset))))
+        (optimize ; finite SB, optimizing
+         ;; Sort locations available in the SC by LOCATION-COST
+         (let* ((locations (available-locations))
+                (locations+costs (make-array (sc-locations-count locations))))
+           (declare (dynamic-extent locations+costs))
+           (let ((i 0))
+             (do-sc-locations (location locations nil (sc-element-size sc))
+               (setf (aref locations+costs i)
+                     (cons location (location-cost location)))
+               (incf i)))
+           (setq locations+costs (sort locations+costs #'> :key #'cdr))
+           (dovector (location-and-cost locations+costs)
+             (attempt-location (car location-and-cost)))))
+        (t ; finite SB, not optimizing
+         (do-sc-locations (location (available-locations) nil
+                                    (sc-element-size sc))
+           (attempt-location location)))))))
 
 ;;; If a save TN, return the saved TN, otherwise return TN. This is
 ;;; useful for getting the conflicts of a TN that might be a save TN.
@@ -1541,11 +1562,11 @@
     ;; on the stack in their standard save locations.
     #!+fp-and-pc-standard-save
     (when (and (not (and
-                     (= (sc-number sc) #.(sc-offset-scn old-fp-passing-offset))
-                     (= offset #.(sc-offset-offset old-fp-passing-offset))))
+                     (= (sc-number sc) #.(sc+offset-scn old-fp-passing-offset))
+                     (= offset #.(sc+offset-offset old-fp-passing-offset))))
                (not (and
-                     (= (sc-number sc) #.(sc-offset-scn return-pc-passing-offset))
-                     (= offset #.(sc-offset-offset return-pc-passing-offset))))
+                     (= (sc-number sc) #.(sc+offset-scn return-pc-passing-offset))
+                     (= offset #.(sc+offset-offset return-pc-passing-offset))))
                (conflicts-in-sc original sc offset))
       (error "~S is wired to location ~D in SC ~A of kind ~S that it conflicts with."
              tn offset sc (tn-kind tn)))

@@ -77,7 +77,7 @@
  ;; of CL special binding when the variable is undeclared.
  ("src/code/globals" :not-host)
 
- ("src/code/cmacros" :not-host :slam-forcibly)
+ ("src/code/cmacros" :not-host)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; cross-compiler-only replacements for stuff which in target Lisp would be
@@ -97,8 +97,7 @@
  ("src/code/uncross" :c-headers)
 
  ("src/code/defbangtype" :c-headers)
- ("src/code/defbangconstant" :c-headers)
- ("src/code/early-constants" :c-headers) ; needs DEF!CONSTANT
+ ("src/code/early-constants" :c-headers)
 
  ("src/compiler/deftype" :c-headers)     ; on host for SB!XC:DEFTYPE
  ("src/compiler/early-lexenv" :c-headers)
@@ -109,20 +108,18 @@
 
  ;; for various constants e.g. SB!XC:MOST-POSITIVE-FIXNUM and
  ;; SB!VM:N-LOWTAG-BITS, needed by "early-objdef" and others
- ("src/compiler/target/backend-parms" :c-headers)
  ("src/compiler/generic/parms" :c-headers)
  ("src/compiler/target/parms" :c-headers)
  ("src/compiler/generic/early-vm" :c-headers)
  ("src/compiler/generic/early-objdef" :c-headers)
  ("src/code/early-array" :c-headers) ; needs "early-vm" numbers
 
- ("src/code/kernel" :not-host)
  ;; This has the BARRIER stuff that the threading support needs,
  ;; required for some code in 'early-extensions'
  ("src/code/barrier" :not-host)
  ("src/code/parse-body" :c-headers)       ; on host for PARSE-BODY
  ("src/code/unportable-float")
- ("src/compiler/policy" :c-headers :slam-forcibly)
+ ("src/compiler/policy" :c-headers)
  #!+sb-fasteval ("src/interpreter/basic-env")
  ;; PARSE-{UNKNOWN,DEPRECATED}-TYPE and other things should be known
  ;; condition subtypes as soon as possible
@@ -130,8 +127,6 @@
  ("src/code/early-extensions" :c-headers) ; on host for COLLECT, SYMBOLICATE, etc.
  ("src/compiler/parse-lambda-list" :c-headers)
  ("src/code/restart" :not-host) ; %DEFCONSTANT can bind a restart
-
- ("src/code/specializable-array")
 
  ("src/code/early-cl")
  ("src/code/ansi-stream" :not-host)
@@ -158,13 +153,12 @@
 
  ("src/code/funutils" :not-host)
 
- ("src/code/maphash" :not-host :slam-forcibly)
+ ("src/code/maphash" :not-host)
  ("src/code/xset" :c-headers) ; for representation of MEMBER type
  ;; This needs DEF!STRUCT, and is itself needed early so that structure
  ;; accessors and inline functions defined here can be compiled inline
  ;; later. (Avoiding full calls increases efficiency)
  ("src/code/type-class" :c-headers)
- ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/cas" :not-host)
  ("src/compiler/early-c" :c-headers)
@@ -178,6 +172,7 @@
  ("src/compiler/globaldb" :c-headers)
  ("src/code/primordial-type" :c-headers)
  ("src/code/early-classoid" :c-headers)
+ ("src/code/early-alieneval" :c-headers)  ; for funs and vars needed at build and run time
 
  ("src/code/sysmacs" :not-host)
 
@@ -209,6 +204,7 @@
   ;; Define at most one INTERPRETED-FUNCTION type based on target features
  #!+sb-eval ("src/code/early-full-eval" :not-host)
  #!+sb-fasteval ("src/interpreter/function" :not-host)
+ ("src/compiler/generic/pinned-objects" :not-host)
 
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
@@ -216,7 +212,6 @@
  ("src/code/seq"    :not-host) ; "code/seq" should come after "code/list".
  ("src/code/coerce" :not-host)
 
- ("src/code/char" :c-headers)
  ("src/code/huffman")
  ("src/code/target-char"    :not-host)
  ("src/code/target-unicode" :not-host)
@@ -237,12 +232,6 @@
  #!+bsd   ("src/code/bsd-os"   :not-host)
  #!+linux ("src/code/linux-os" :not-host)
  #!+win32 ("src/code/win32-os" :not-host)
-
- ;; sparc-vm and ppc-vm need sc-offset defined to get at internal
- ;; error args. This file contains stuff previously in
- ;; debug-info.lisp.  Should it therefore be :not-host?  -- CSR,
- ;; 2002-02-05
- ("src/code/sc-offset" :c-headers)
 
  ("src/code/share-vm" :not-host)
 
@@ -289,6 +278,7 @@
 
  ("src/compiler/constantp" :c-headers)
  ("src/compiler/info-functions" :c-headers)
+ ("src/code/specializable-array" :not-target)
 
  ("src/compiler/generic/vm-macs" :c-headers)
  ("src/compiler/generic/objdef" :c-headers)
@@ -296,6 +286,11 @@
  ;; needed by "compiler/vop"
  ("src/compiler/sset" :c-headers)
  ("src/code/early-type" :c-headers)
+ ;; sparc-vm and ppc-vm need sc+offset defined to get at internal
+ ;; error args. This file contains stuff previously in
+ ;; debug-info.lisp.  Should it therefore be :not-host?  -- CSR,
+ ;; 2002-02-05
+ ("src/code/sc-offset" :c-headers)
 
  ;; for e.g. BLOCK-ANNOTATION, needed by "compiler/vop"
  ("src/compiler/node" :c-headers)
@@ -316,7 +311,6 @@
  ;; for e.g. MAX-VOP-TN-REFS, needed by "meta-vmdef"
  ("src/compiler/vmdef" :c-headers)
 
- ("src/code/force-delayed-defbangconstants")
  ("src/code/defmacro" :c-headers)
  ("src/code/destructuring-bind" :c-headers)
 
@@ -451,10 +445,10 @@
  ("src/code/load")
 
  #!+linkage-table ("src/code/linkage-table" :not-host)
+ ("src/code/foreign" :not-host)
  #!+os-provides-dlopen ("src/code/foreign-load" :not-host)
  #!+(and os-provides-dlopen (not win32)) ("src/code/unix-foreign-load" :not-host)
  #!+(and os-provides-dlopen win32) ("src/code/win32-foreign-load" :not-host)
- ("src/code/foreign")
 
  ("src/code/fop") ; needs macros from code/load.lisp
 
@@ -466,6 +460,7 @@
  ("src/compiler/dump")
 
  ("src/compiler/ir1report") ; for COMPILER-ERROR-CONTEXT
+ ("src/code/target-pathname" :not-host) ; needs "code/pathname"
  ("src/compiler/main") ; needs DEFSTRUCT FASL-OUTPUT from dump.lisp
  ("src/compiler/xref")
  ("src/compiler/target-main" :not-host)
@@ -486,6 +481,7 @@
  ("src/compiler/float-tran")
  ("src/compiler/saptran")
  ("src/compiler/srctran")
+ ("src/compiler/sxhash")
  ("src/code/quantifiers")
  ("src/compiler/bitops-derive-type")
  ("src/compiler/generic/vm-tran")
@@ -505,15 +501,9 @@
 
  ("src/assembly/assemfile" :not-target)
 
- ;; Compiling this file requires the macros SB!ASSEM:EMIT-LABEL and
- ;; SB!ASSEM:EMIT-POST-IT, defined in assem.lisp, and also possibly
- ;; the definition of the LOCATION-INFO structure (if structures in
- ;; the host lisp have setf expanders rather than setf functions).
- ("src/compiler/late-vmdef")
-
+ ("src/compiler/target-dstate" :not-host)
  ("src/compiler/target/insts")
  ("src/compiler/target/macros")
- ("src/compiler/generic/pinned-objects")
  ("src/compiler/generic/early-type-vops")
 
  ("src/assembly/target/support")
@@ -552,9 +542,6 @@
 
  ("src/compiler/target/subprim")
  ("src/compiler/target/debug")
- ;; src/compiler/sparc/c-call contains a deftransform for
- ;; %ALIEN-FUNCALL -- CSR
- ("src/compiler/early-aliencomp")
  ("src/compiler/target/c-call")
  ("src/compiler/target/cell")
  ("src/compiler/target/values")
@@ -626,10 +613,9 @@
  ("src/compiler/generic/target-core" :not-host) ; uses stuff from
                                                 ;   "compiler/generic/core"
 
+ ("src/code/simple-fun"        :not-host) ; function slot accessors
  ("src/code/eval"              :not-host) ; uses INFO, wants compiler macro
- ("src/code/target-sap"        :not-host) ; uses SAP-INT type
  ("src/code/target-package"    :not-host) ; needs "code/package"
- ("src/code/module"            :not-host)
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
@@ -638,7 +624,6 @@
  ("src/code/print" :not-host)
  ("src/code/reader"            :not-host) ; needs "code/readtable"
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
- ("src/code/target-pathname"   :not-host) ; needs "code/pathname"
  #!-win32
  ("src/code/unix-pathname"     :not-host)
  #!+win32
@@ -650,11 +635,11 @@
 
  ("src/code/early-step")                  ; target-thread needs *STEP-OUT*
 
+ ("src/code/gc"     :not-host)
  ("src/code/target-thread"     :not-host)
  ("src/code/timer" :not-host)
 
  ;; defines SB!DI:DO-DEBUG-FUN-BLOCKS, needed by target-disassem.lisp
- ("src/code/gc"     :not-host)
  ("src/code/alloc"  :not-host) ; needs foo-SPACE-START
  ("src/code/debug-int" :not-host)
  ("src/code/interr" :not-host)
@@ -704,14 +689,9 @@
  ;; machinery like SB!XC:DEFMACRO exists
 
  ("src/code/late-format") ; needs SB!XC:DEFMACRO
- ("src/code/sxhash") ; needs SB!XC:DEFINE-MODIFY-MACRO
 
- ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
- ;; PCL-related stuff, which shouldn't need to be done earlier than
- ;; anything else in cold build because after all it used to be
- ;; postponed 'til warm init with no problems.
-
- ("src/pcl/walk"))
+ ("src/code/late-globaldb" :not-host)
+ )
 
 ;;; warm build skips the list of files above even though there is no "#!" macro
 ;;; at this point. That's not specified behavior of *READ-SUPPRESS*.
@@ -725,7 +705,8 @@
   ;; We re-nickname SB-SEQUENCE as SEQUENCE now.
   ;; It could be done in genesis, but not earlier,
   ;; since the host has a package of that name.
-  "src/code/defpackage")
+  "src/code/defpackage"
+  "src/pcl/walk") ; needs DEFPACKAGE
 
  #+sb-fasteval
  ("src/interpreter/macros"
@@ -749,6 +730,8 @@
   "src/code/external-formats/enc-jpn-tbl"
   "src/code/external-formats/enc-jpn"
   "src/code/external-formats/enc-utf")
+
+ ("src/code/stubs")
 
  ;; CLOS, derived from the PCL reference implementation
  ;;
@@ -789,7 +772,6 @@
   "src/pcl/precom2")
 
  ("src/code/setf-funs"
-  "src/code/stubs"
   ;; miscellaneous functionality which depends on CLOS
   "src/code/late-condition"
 
@@ -810,9 +792,11 @@
   "src/code/describe-policy"
   "src/code/inspect"
   "src/code/profile"
+  #+x86-64 "src/code/aprof" ; precise allocation profiler
   "src/code/ntrace"
   "src/code/step"
   "src/code/warm-lib"
+  "src/code/alien-callback"
   #+win32 "src/code/warm-mswin"
   "src/code/run-program"
   #+gencgc "src/code/traceroot"
@@ -820,4 +804,5 @@
   #+immobile-code "src/code/immobile-space"
   "src/code/repack-xref"
   #+cheneygc "src/code/purify"
+  "src/code/module"
   "src/code/save"))

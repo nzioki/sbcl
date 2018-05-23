@@ -388,9 +388,9 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
      */
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     block_blockable_signals(0);
-    ensure_region_closed(BOXED_PAGE_FLAG, &th->alloc_region);
+    ensure_region_closed(&th->alloc_region, BOXED_PAGE_FLAG);
 #if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
-    ensure_region_closed(BOXED_PAGE_FLAG, &th->sprof_alloc_region);
+    ensure_region_closed(&th->sprof_alloc_region, BOXED_PAGE_FLAG);
 #endif
     pop_gcing_safety(&scribble->safety);
     lock_ret = pthread_mutex_lock(&all_threads_lock);
@@ -408,9 +408,9 @@ undo_init_new_thread(struct thread *th, init_thread_data *scribble)
     lock_ret = pthread_mutex_lock(&all_threads_lock);
     gc_assert(lock_ret == 0);
 
-    ensure_region_closed(BOXED_PAGE_FLAG, &th->alloc_region);
+    ensure_region_closed(&th->alloc_region, BOXED_PAGE_FLAG);
 #if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
-    ensure_region_closed(BOXED_PAGE_FLAG, &th->sprof_alloc_region);
+    ensure_region_closed(&th->sprof_alloc_region, BOXED_PAGE_FLAG);
 #endif
     unlink_thread(th);
     pthread_mutex_unlock(&all_threads_lock);
@@ -488,7 +488,7 @@ attach_os_thread(init_thread_data *scribble)
     os_thread_t os = pthread_self();
     odxprint(misc, "attach_os_thread: attaching to %p", os);
 
-    struct thread *th = create_thread_struct(NIL);
+    struct thread *th = create_thread_struct(NO_TLS_VALUE_MARKER_WIDETAG);
     block_deferrable_signals(&scribble->oldset);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
@@ -498,7 +498,6 @@ attach_os_thread(init_thread_data *scribble)
     unblock_gc_signals(0, 0);
 #endif
 
-    th->no_tls_value_marker = NO_TLS_VALUE_MARKER_WIDETAG;
     /* We don't actually want a pthread_attr here, but rather than add
      * `if's to the post-mostem, let's just keep that code happy by
      * keeping it initialized: */
@@ -624,23 +623,65 @@ free_thread_struct(struct thread *th)
 #endif
 }
 
-#ifdef LISP_FEATURE_SB_THREAD
-/* FIXME: should be MAX_INTERRUPTS -1 ? */
-const unsigned int tls_index_start =
-  MAX_INTERRUPTS + sizeof(struct thread)/sizeof(lispobj);
-#endif
-
 /* this is called from any other thread to create the new one, and
  * initialize all parts of it that can be initialized from another
  * thread
+ *
+ * The allocated memory will be laid out as depicted below.
+ * Left-to-right is in order of lowest to highest address:
+ *
+ *      ______ spaces as obtained from OS
+ *     /   ___ aligned_spaces
+ *    /   /
+ *  (0) (1)       (2)       (3)       (4)    (5)          (6)
+ *   |   | CONTROL | BINDING |  ALIEN  |  CSP | per_thread |          |
+ *   |   |  STACK  |  STACK  |  STACK  | PAGE | structure  | altstack |
+ *   |...|------------------------------------------------------------|
+ *          2MiB       1MiB     1MiB               (*)         (**)
+ *
+ *
+ *  |       (*) per_thread detail       |    (**) altstack detail    |
+ *  |-----------------------------------|----------------------------|
+ *  |           Lisp TLS area           |            |               |
+ *  |-----------------------------------|            |               |
+ *  | struct   | interrupt |            | nonpointer |               |
+ *  | thread   | contexts  |            |    data    |   sigstack    |
+ *  |----------+-----------+------------|------------+---------------|
+ *  | 30 words | 1K words  |  remainder | ~200 bytes | 32*SIGSTKSIZE |
+ *  |                                   |
+ *  |  <--  4K words in total   -->     |
+ *          (32KB for x86-64)
+ *
+ *   (1) = control stack start. default size shown
+ *   (2) = binding stack start. size = BINDING_STACK_SIZE
+ *   (3) = alien stack start.   size = ALIEN_STACK_SIZE
+ *   (4) = C safepoint page.    size = BACKEND_PAGE_BYTES or 0
+ *   (5) = per_thread_data.     size = dynamic_values_bytes
+ *   (6) = nonpointer_thread_data and signal stack.
+ *
+ *   (0) and (1) may coincide; (4) and (5) may coincide
+ *
+ *   - Lisp TLS overlaps 'struct thread' so that the first N (~30) words
+ *     have preassigned TLS indices.
+ *     Others are assigned on demand, skipping over interrupt_contexts[]
+ *
+ *   - nonpointer data are not in 'struct thread' because placing them there
+ *     makes it tough to calculate addresses in 'struct thread' from Lisp.
+ *     (Every 'struct thread' slot has a known size)
+ *
+ * New layout:
+ *  |-----------|-----------------------|------------|--------------|
+ *  |           |     Lisp TLS area     |            |              |
+ *  | interrupt | struct                | nonpointer |   sigstack   |
+ *  | contexts  | thread                |     data   |              |
+ *  +-----------+-----------------------|------------+--------------|
+ *  | 1K words  |   <-- 4K words --->   | ~200 bytes |              |
+ *              ^ thread base
+ * On sb-safepoint builds one page before the thread base is used for the foreign calls safepoint.
  */
 
 static struct thread *
 create_thread_struct(lispobj initial_function) {
-    union per_thread_data *per_thread;
-    struct thread *th=0;        /*  subdue gcc */
-    void *spaces=0;
-    char *aligned_spaces=0;
 #if defined(LISP_FEATURE_SB_THREAD) || defined(LISP_FEATURE_WIN32)
     unsigned int i;
 #endif
@@ -653,26 +694,28 @@ create_thread_struct(lispobj initial_function) {
      * on the alignment passed from os_validate, since that might
      * assume the current (e.g. 4k) pagesize, while we calculate with
      * the biggest (e.g. 64k) pagesize allowed by the ABI. */
-    spaces = os_allocate(THREAD_STRUCT_SIZE);
+    void *spaces = os_validate(IS_THREAD_STRUCT, NULL, THREAD_STRUCT_SIZE);
     if(!spaces)
         return NULL;
     /* Aligning up is safe as THREAD_STRUCT_SIZE has
      * THREAD_ALIGNMENT_BYTES padding. */
-    aligned_spaces = PTR_ALIGN_UP(spaces, THREAD_ALIGNMENT_BYTES);
+    char *aligned_spaces = PTR_ALIGN_UP(spaces, THREAD_ALIGNMENT_BYTES);
     char* csp_page=
         (aligned_spaces+
          thread_control_stack_size+
          BINDING_STACK_SIZE+
-         ALIEN_STACK_SIZE);
-    per_thread=(union per_thread_data *)
-        (csp_page + THREAD_CSP_PAGE_SIZE);
+         ALIEN_STACK_SIZE +
+         INTERRUPT_CONTEXTS_SIZE);
+
+    // Refer to the ASCII art in the block comment above
+    struct thread *th = (void*)(csp_page + THREAD_CSP_PAGE_SIZE);
 
 #ifdef LISP_FEATURE_SB_THREAD
-    for(i = 0; i < (dynamic_values_bytes / sizeof(lispobj)); i++)
-        per_thread->dynamic_values[i] = NO_TLS_VALUE_MARKER_WIDETAG;
+    lispobj* tls = (lispobj*)th;
+    for(i = 0; i < TLS_SIZE; i++)
+        tls[i] = NO_TLS_VALUE_MARKER_WIDETAG;
 #endif
 
-    th=&per_thread->thread;
     th->os_address = spaces;
     th->control_stack_start = (lispobj*)aligned_spaces;
     th->binding_stack_start=
@@ -684,6 +727,12 @@ create_thread_struct(lispobj initial_function) {
     set_binding_stack_pointer(th,th->binding_stack_start);
     th->this=th;
     th->os_thread=0;
+#if defined(LAYOUT_OF_FUNCTION) && defined(LISP_FEATURE_SB_THREAD)
+    th->function_layout = LAYOUT_OF_FUNCTION << 32;
+#endif
+    // Once allocated, the allocation profiling buffer sticks around.
+    // If present and enabled, assign into the new thread.
+    th->profile_data = (uword_t*)(alloc_profiling ? alloc_profile_buffer : 0);
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 # ifdef LISP_FEATURE_WIN32
@@ -693,8 +742,7 @@ create_thread_struct(lispobj initial_function) {
 #endif
 
     struct nonpointer_thread_data *nonpointer_data
-      = (void *) &per_thread->dynamic_values[TLS_SIZE];
-
+      = (void *)((char*)th + dynamic_values_bytes);
     th->interrupt_data = &nonpointer_data->interrupt_data;
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -767,6 +815,16 @@ create_thread_struct(lispobj initial_function) {
     th->interrupt_data->allocation_trap_context = 0;
 #endif
 
+#ifdef LISP_FEATURE_SB_THREAD
+// This macro is the same as "write_TLS(sym,val,th)" but can't be spelled thus.
+// 'sym' would get substituted prior to token pasting, so you end up with a bad
+// token "(*)_tlsindex" because all symbols are #defined to "(*)" so that #ifdef
+// remains meaningful to the preprocessor, while use of 'sym' itself yields
+// a deliberate syntax error if you try to compile an expression involving it.
+#  define INITIALIZE_TLS(sym,val) write_TLS_index(sym##_tlsindex, val, th, _ignored_)
+#else
+#  define INITIALIZE_TLS(sym,val) SYMBOL(sym)->value = val
+#endif
 #include "genesis/thread-init.inc"
 #ifdef LISP_FEATURE_SB_THREAD
     /* Each initial binding is a cons whose car is a symbol evaluated as if
@@ -777,8 +835,9 @@ create_thread_struct(lispobj initial_function) {
     for (i = 0; i < tls_init->length; i += make_fixnum(1)) {
         lispobj binding = tls_init->data[fixnum_value(i)];
         lispobj value = NIL;
-        if (lowtag_of(binding) == LIST_POINTER_LOWTAG) {
-            value = SYMBOL(CONS(binding)->car)->value;
+        if (listp(binding)) {
+            lispobj val_form = CONS(binding)->car;
+            value = fixnump(val_form) ? val_form : SYMBOL(val_form)->value;
             binding = CONS(binding)->cdr;
         }
         struct symbol* sym = SYMBOL(binding);

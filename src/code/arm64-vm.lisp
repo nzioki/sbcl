@@ -81,11 +81,9 @@
          (error-number (ldb (byte 8 13) instruction))
          (trap-number (ldb (byte 8 5) instruction)))
     (declare (type system-area-pointer pc))
-    (values error-number
-            (if (= trap-number invalid-arg-count-trap)
-                '(#.arg-count-sc)
-                (sb!kernel::decode-internal-error-args (sap+ pc 4) error-number))
-            trap-number)))
+    (if (= trap-number invalid-arg-count-trap)
+        (values error-number '(#.arg-count-sc) trap-number)
+        (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number error-number))))
 ) ; end PROGN
 
 ;;; Undo the effects of XEP-ALLOCATE-FRAME
@@ -93,15 +91,16 @@
 #-sb-xc-host
 (defun context-call-function (context function &optional arg-count)
   (with-pinned-objects (function)
-    (let* ((fun-addr (get-lisp-obj-address function))
-           (entry (+ (sap-ref-word (int-sap fun-addr)
-                                   (- (ash simple-fun-self-slot word-shift)
-                                      fun-pointer-lowtag))
-                     (- (ash simple-fun-code-offset word-shift)
-                        fun-pointer-lowtag))))
-      (when arg-count
-        (setf (context-register context nargs-offset)
-              (get-lisp-obj-address arg-count)))
-      (setf (context-register context lexenv-offset) fun-addr
-            (context-register context lr-offset) entry)
-      (set-context-pc context entry))))
+    (with-pinned-context-code-object (context)
+      (let* ((fun-addr (get-lisp-obj-address function))
+             (entry (+ (sap-ref-word (int-sap fun-addr)
+                                     (- (ash simple-fun-self-slot word-shift)
+                                        fun-pointer-lowtag))
+                       (- (ash simple-fun-code-offset word-shift)
+                          fun-pointer-lowtag))))
+        (when arg-count
+          (setf (context-register context nargs-offset)
+                (get-lisp-obj-address arg-count)))
+        (setf (context-register context lexenv-offset) fun-addr
+              (context-register context lr-offset) entry)
+        (set-context-pc context entry)))))

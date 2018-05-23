@@ -74,6 +74,27 @@
         (and (fun-type-p ctype)
              (contains-unknown-type-p (fun-type-returns ctype)))))))
 
+(defun contains-hairy-type-p (ctype)
+  (typecase ctype
+    (hairy-type t)
+    (compound-type (some #'contains-hairy-type-p (compound-type-types ctype)))
+    (negation-type (contains-hairy-type-p (negation-type-type ctype)))))
+
+(defun replace-hairy-type (type)
+  (if (contains-hairy-type-p type)
+      (typecase type
+        (hairy-type *universal-type*)
+        (intersection-type (%type-intersection
+                            (mapcar #'replace-hairy-type (intersection-type-types type))))
+        (union-type (%type-union
+                     (mapcar #'replace-hairy-type (union-type-types type))))
+        (negation-type
+         (let ((new (replace-hairy-type (negation-type-type type))))
+           (if (eq new *universal-type*)
+               new
+               (type-negation new)))))
+      type))
+
 ;; Similar to (NOT CONTAINS-UNKNOWN-TYPE-P), but report that (SATISFIES F)
 ;; is not a testable type unless F is currently bound.
 (defun testable-type-p (ctype)
@@ -873,6 +894,22 @@
                                :complex-arg1 :complex-subtypep-arg1)))))
 
 ;;; Just parse the type specifiers and call CSUBTYPE.
+;;; Well, not "just" - Despite memoization of parsing and CSUBTYPEP,
+;;; it's nonetheless better to test EQUAL first, which is ~10x faster
+;;; in the positive case, and insigificant in the negative.
+;;; The specifiers might not be legal type specifiers,
+;;; but we're not obligated to police that:
+;;;   "This version eliminates the requirement to signal an error."
+;;; http://www.lispworks.com/documentation/HyperSpec/Issues/iss335_w.htm
+;;; (Status: Passed, as amended, Jun89 X3J13)
+;;;
+;;; Also, inferring from the version of the text that was obsoleted
+;;; - which while it has no direct impact on the final requirement,
+;;; implies something about what would have been legal -
+;;;   "SUBTYPEP must always return values T T in the case where the two
+;;;    type specifiers (or their expansions) are EQUAL."
+;;; i.e. though it is not longer technically a MUST, it suggests that EQUAL is
+;;; in fact a valid implementation, at least where it computes T.
 (defun sb!xc:subtypep (type1 type2 &optional environment)
   "Return two values indicating the relationship between type1 and type2.
   If values are T and T, type1 definitely is a subtype of type2.
@@ -880,7 +917,9 @@
   If values are NIL and NIL, it couldn't be determined."
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
-  (csubtypep (specifier-type type1) (specifier-type type2)))
+  (if (equal type1 type2)
+      (values t t)
+      (csubtypep (specifier-type type1) (specifier-type type2))))
 
 ;;; If two types are definitely equivalent, return true. The second
 ;;; value indicates whether the first value is definitely correct.
@@ -2051,7 +2090,7 @@
                (complex1 (component-type)
                  (unless (numeric-type-p component-type)
                    (not-numeric))
-                 (when (eq (numeric-type-complexp component-type) :complex)
+                 (unless (eq (numeric-type-complexp component-type) :real)
                    (not-real))
                  (if (csubtypep component-type (specifier-type '(eql 0)))
                      *empty-type*
@@ -2068,7 +2107,10 @@
                    ((typep ctype 'member-type)
                     (apply #'type-union
                            (mapcar-member-type-members
-                            (lambda (x) (do-complex (ctype-of x)))
+                            (lambda (x)
+                              (if (realp x)
+                                  (do-complex (ctype-of x))
+                                  (not-real)))
                             ctype)))
                    ((and (typep ctype 'intersection-type)
                          ;; FIXME: This is very much a
@@ -2985,6 +3027,14 @@ used for a COMPLEX component.~:@>"
   (or (find type '(ratio keyword compiled-function) :key #'specifier-type :test #'type=)
       `(and ,@(mapcar #'type-specifier (intersection-type-types type)))))
 
+(!define-type-method (intersection :singleton-p) (type)
+  (loop for constituent in (intersection-type-types type)
+        do
+        (multiple-value-bind (single value) (type-singleton-p constituent)
+          (when single
+            (return (values single value))))
+        finally (return (values nil nil))))
+
 ;;; shared machinery for type equality: true if every type in the set
 ;;; TYPES1 matches a type in the set TYPES2 and vice versa
 (defun type=-set (types1 types2)
@@ -3289,18 +3339,21 @@ used for a COMPLEX component.~:@>"
   ;; implemented in terms of subtypep.
   ;;
   ;; Ouch. - CSR, 2002-04-10
-  (multiple-value-bind (sub-value sub-certain?)
-      (type= type1
-             (apply #'type-union
-                    (mapcar (lambda (x) (type-intersection type1 x))
-                            (union-type-types type2))))
-    (if sub-certain?
-        (values sub-value sub-certain?)
-        ;; The ANY/TYPE expression above is a sufficient condition for
-        ;; subsetness, but not a necessary one, so we might get a more
-        ;; certain answer by this CALL-NEXT-METHOD-ish step when the
-        ;; ANY/TYPE expression is uncertain.
-        (invoke-complex-subtypep-arg1-method type1 type2))))
+  (cond ((fun-designator-type-p type1)
+         (type= type2 (specifier-type 'callable)))
+        (t
+         (multiple-value-bind (sub-value sub-certain?)
+             (type= type1
+                    (apply #'type-union
+                           (mapcar (lambda (x) (type-intersection type1 x))
+                                   (union-type-types type2))))
+           (if sub-certain?
+               (values sub-value sub-certain?)
+               ;; The ANY/TYPE expression above is a sufficient condition for
+               ;; subsetness, but not a necessary one, so we might get a more
+               ;; certain answer by this CALL-NEXT-METHOD-ish step when the
+               ;; ANY/TYPE expression is uncertain.
+               (invoke-complex-subtypep-arg1-method type1 type2))))))
 
 (!define-type-method (union :complex-subtypep-arg2) (type1 type2)
   (union-complex-subtypep-arg2 type1 type2))

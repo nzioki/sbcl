@@ -14,9 +14,9 @@
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:temporary (:scs (non-descriptor-reg)) alloc-temp)
@@ -80,17 +80,16 @@
 ;;;; Special purpose inline allocators.
 #!-gencgc
 (define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
+  ;; BOXED is a count of words as a fixnum; it is therefore also a byte count
+  ;; as a raw value because n-fixnum-tag-bits = word-shift.
+  (:args (boxed :scs (any-reg))
          (unboxed-arg :scs (any-reg)))
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:temporary (:scs (non-descriptor-reg)) size)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:generator 100
-    (inst addi boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst clrrwi boxed boxed n-lowtag-bits)
     (inst srwi unboxed unboxed-arg word-shift)
     (inst addi unboxed unboxed lowtag-mask)
     (inst clrrwi unboxed unboxed n-lowtag-bits)

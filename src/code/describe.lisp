@@ -50,19 +50,16 @@
     (sb-interpreter:interpreted-function
      (sb-interpreter:fun-lambda-expression fun))
     (function
-     (let* ((name (%fun-name fun))
-            (fun (%fun-fun fun))
-            (code (sb-di::fun-code-header fun))
-            (info (sb-kernel:%code-debug-info code))
-            (source (if info (sb-c::debug-info-source info))))
-       (cond ((and source (sb-c::debug-source-form source)
-                   (eq (sb-c::debug-source-function source) fun))
-              (values (sb-c::debug-source-form source) nil name))
-             ((legal-fun-name-p name)
-              (let ((exp (fun-name-inline-expansion name)))
-                (values exp (not exp) name)))
-             (t
-              (values nil t name)))))))
+     (let ((name (%fun-name fun))
+           (fun (%fun-fun fun)))
+       (acond ((%simple-fun-lexpr fun)
+               (values it t name))
+              ((legal-fun-name-p name)
+               (let ((exp (fun-name-inline-expansion name)))
+                 ;; Isn't this (NOT EXP) wrong if it's a syntactic closure?
+                 (values exp (not exp) name)))
+              (t
+               (values nil t name)))))))
 
 ;;; Prints X on a single line, limiting output length by *PRINT-RIGHT-MARGIN*
 ;;; -- good for printing object parts, etc.
@@ -349,7 +346,6 @@
       (let ((exports nil))
         (do-external-symbols (ext object)
           (push ext exports))
-        #+sb-package-locks
         (let ((implemented (humanize (package-implemented-by-list object)))
               (implements (humanize (package-implements-list object)))
               (this (list (package-name object))))
@@ -541,23 +537,23 @@
     (format stream "~@:_Argument precedence order: ~:A" argument-list)))
 
 (defun describe-function-source (function stream)
-  (if (compiled-function-p (the function function))
-      (let* ((code (fun-code-header (%fun-fun function)))
-             (info (sb-kernel:%code-debug-info code)))
-        (when info
-          (let ((source (sb-c::debug-info-source info)))
-            (when source
-              (let ((namestring (sb-c::debug-source-namestring source)))
-                ;; This used to also report the times the source was created
-                ;; and compiled, but that seems more like noise than useful
-                ;; information -- but FWIW that are to be had as
-                ;; SB-C::DEBUG-SOUCE-CREATED/COMPILED.
-                (cond (namestring
-                       (format stream "~@:_Source file: ~A" namestring))
-                      ((sb-di:debug-source-form source)
-                       (format stream "~@:_Source form:~@:_  ~S"
-                               (sb-di:debug-source-form source)))))))))
-      (let ((source
+  (declare (function function))
+  (typecase function
+    (generic-function
+     (let ((source (sb-pcl::definition-source function)))
+       (when source
+         (format stream "~@:_Source file: ~A"
+                 (sb-c:definition-source-location-namestring source)))))
+    (compiled-function
+     (binding* ((code (fun-code-header (%fun-fun function)))
+                (info (sb-kernel:%code-debug-info code) :exit-if-null)
+                (source (sb-c::debug-info-source info) :exit-if-null))
+       (acond ((sb-c::debug-source-namestring source)
+               (format stream "~@:_Source file: ~A" it))
+              ((%simple-fun-lexpr (%fun-fun function))
+               (format stream "~@:_Source form:~@:_  ~S" it)))))
+    (t
+     (let ((source
              (typecase function
                #+sb-eval
                (sb-eval:interpreted-function
@@ -565,10 +561,10 @@
                #+sb-fasteval
                (sb-interpreter:interpreted-function
                 (sb-interpreter:fun-source-location function)))))
-        (when source
-          (let ((namestring (sb-c:definition-source-location-namestring source)))
-            (when namestring
-              (format stream "~@:_Source file: ~A" namestring)))))))
+       (when source
+         (let ((namestring (sb-c:definition-source-location-namestring source)))
+           (when namestring
+             (format stream "~@:_Source file: ~A" namestring))))))))
 
 (defun describe-function (name function stream)
   (let ((name (if function (%fun-name function) name)))
@@ -637,8 +633,7 @@
                                  declared-type
                                  (cons
                                   (info :function :inlinep name)
-                                  (info :function :inline-expansion-designator
-                                        name)))))))
+                                  (fun-name-inline-expansion name)))))))
           (describe-block (stream (unless function "~A names ~A:") name what)
             (describe-deprecation 'function name stream)
             (describe-lambda-list lambda-list stream)

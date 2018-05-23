@@ -231,55 +231,37 @@
           (defaulted-fasl-truename defaulted-fasl-pathname)
           (defaulted-source-truename defaulted-source-pathname))))
 
-;;; Load a code object. BOX-NUM objects are popped off the stack for
-;;; the boxed storage section, then CODE-LENGTH bytes of code are read in.
-(defun load-code (nfuns box-num code-length stack ptr fasl-input)
-  (declare (fixnum box-num code-length))
-  (declare (simple-vector stack) (type index ptr))
-  (let* ((debug-info-index (+ ptr box-num))
-         (immobile-p (svref stack (1+ debug-info-index)))
-         (code (sb!c:allocate-code-object immobile-p box-num code-length)))
-    (setf (%code-debug-info code) (svref stack debug-info-index))
-    (loop for i of-type index from sb!vm:code-constants-offset
-          for j of-type index from ptr below debug-info-index
-          do (setf (code-header-ref code i) (svref stack j)))
-    (with-pinned-objects (code)
-      (read-n-bytes (%fasl-input-stream fasl-input)
-                    (code-instructions code) 0 code-length)
-      (sb!c::set-code-entrypoints
-       code (loop repeat nfuns collect (read-varint-arg fasl-input)))
-      (sb!c::apply-fasl-fixups stack code))
-    code))
-
 ;;;; linkage fixups
 
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
-(defun get-asm-routine (name &aux (code *assembler-routines*))
-  (awhen (gethash (the symbol name) (car (%code-debug-info code)))
-    (sap-int (sap+ (code-instructions code) (car it)))))
+(defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
+  (awhen (the list (gethash (the symbol name) (car (%code-debug-info code))))
+    (sap-int (sap+ (code-instructions code)
+                   (if indirect
+                       ;; Return the address containing the routine address
+                       (ash (cddr it) sb!vm:word-shift)
+                       ;; Return the routine address itself
+                       (car it))))))
 
 (defun !loader-cold-init ()
   (let* ((code *assembler-routines*)
-         (size (%code-code-size code))
+         ;; Neither CODE-SIZE nor TEXT-SIZE delimits the final asm routine.
+         ;; CODE-SIZE minus 2 includes the trailing NOP filler but excludes
+         ;; the two trailer words, so it's the most consistent choice.
+         ;; (all routines are padded to a multiple of 2 words)
+         (size (- (%code-code-size code) (* 2 sb!vm:n-word-bytes)))
          (vector (the simple-vector *!initial-assembler-routines*))
          (count (length vector))
          (ht (make-hash-table :test 'eq)))
-    ;; code-debug-info stores the name->addr hashtable, but readonly
-    ;; space can't point to dynamic space. indirect through a static cons
-    (setf (%code-debug-info code)
-          (rplaca (let ((ptr (sap-int sb!vm:*static-space-free-pointer*)))
-                    (setf sb!vm:*static-space-free-pointer*
-                          (int-sap (+ ptr (* sb!vm:n-word-bytes 2))))
-                    (%make-lisp-obj (logior ptr sb!vm:list-pointer-lowtag)))
-                  ht))
+    (rplaca (%code-debug-info code) ht)
     (dotimes (i count)
       (destructuring-bind (name . offset) (svref vector i)
         (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
           (aver (> next-offset offset))
-          ;; store inclusive bounds on PC offset range
-          (setf (gethash name ht) (cons offset (1- next-offset))))))))
+          ;; store inclusive bounds on PC offset range and the function index
+          (setf (gethash name ht) (list* offset (1- next-offset) i)))))))
 
 (defun !warm-load (file)
   (restart-case (let ((sb!c::*source-namestring*

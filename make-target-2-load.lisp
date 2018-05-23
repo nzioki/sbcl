@@ -11,10 +11,10 @@
 ;;; random bootstrap stuff on per-package basis.
 (defun !unintern-init-only-stuff (&aux result)
   (dolist (package (list-all-packages))
-    (sb-int:binding* ((s (find-symbol "!UNINTERN-SYMBOLS" package)
-                         :exit-if-null)
-                      (list (funcall s))
-                      (package (car list)))
+    (sb-int:awhen (find-symbol "!REMOVE-BOOTSTRAP-SYMBOLS" package)
+      (funcall sb-int:it)))
+  (dolist (list sb-impl::*!removable-symbols*)
+    (let ((package (find-package (car list))))
       (dolist (symbol (cdr list))
         (fmakunbound symbol)
         (unintern symbol package))))
@@ -67,6 +67,8 @@
 |#
                 (fmakunbound symbol)
                 (unintern symbol package))))))
+  (sb-int:dohash ((k v) sb-c::*backend-parsed-vops*)
+    (setf (sb-c::vop-parse-body v) nil))
   result)
 
 (progn
@@ -82,7 +84,9 @@
   (let ((count 0))
     (macrolet ((clear-it (place)
                  `(when ,place
-                    (setf ,place nil)
+                    ,(if (typep place '(cons (eql sb-int:info)))
+                         `(sb-int:clear-info ,@(cdr place))
+                         `(setf ,place nil))
                     (incf count))))
       ;; 1. Functions, macros, special operators
       (sb-vm::map-allocated-objects
@@ -111,18 +115,45 @@
       (format t "~&Removed ~D doc string~:P" count)))
 
   ;; Remove source forms of compiled-to-memory lambda expressions.
-  ;; The disassembler is the major culprit for retention of these.
+  ;; The disassembler is the major culprit for retention of these,
+  ;; but there are others and I don't feel like figuring out where from.
+  ;; Globally declaiming EVAL-STORE-SOURCE-FORM 0 would work too,
+  ;; but isn't it nice to know that the logic for storing the forms
+  ;; actually works? (Yes)
   (sb-vm::map-allocated-objects
    (lambda (obj type size)
-     (declare (ignore type size))
-     (when (typep obj 'sb-c::debug-source)
-       (unless (sb-c::debug-source-namestring obj)
-         (setf (sb-c::debug-source-form obj) nil))))
+     (declare (ignore size))
+     (when (= type sb-vm:code-header-widetag)
+       (dotimes (i (sb-kernel:code-n-entries obj))
+         (let ((fun (sb-kernel:%code-entry-point obj i)))
+           (when (sb-impl::%simple-fun-lexpr fun)
+             (sb-impl::set-simple-fun-info
+              fun nil
+              (sb-kernel:%simple-fun-doc fun)
+              (sb-kernel:%simple-fun-xrefs fun)))))))
    :all)
+
+  ;; Fix unknown types in globaldb
+  (let ((l nil))
+    (do-all-symbols (s)
+      (flet ((fixup (kind)
+               (multiple-value-bind (type present)
+                   (sb-int:info kind :type s)
+                 (when (and present
+                            (sb-kernel:contains-unknown-type-p type))
+                   (setf (sb-int:info kind :type s)
+                         (sb-kernel:specifier-type (sb-kernel:type-specifier type)))
+                   (push s l)))))
+        (fixup :function)
+        (fixup :variable)))
+    (unless (sb-impl::!c-runtime-noinform-p)
+      (let ((*print-pretty* nil)
+            (*print-length* nil))
+        (format t "~&; Fixed types: ~S~%" (sort l #'string<)))))
 
   ;; Unintern no-longer-needed stuff before the possible PURIFY in
   ;; SAVE-LISP-AND-DIE.
-  #-sb-fluid (!unintern-init-only-stuff)
+  #-(or sb-fluid sb-devel) (!unintern-init-only-stuff)
 
   ;; Mark interned immobile symbols so that COMPILE-FILE knows
   ;; which symbols will always be physically in immobile space.
@@ -196,13 +227,64 @@
 #+sb-xref-for-internals (sb-c::repack-xref :verbose 1)
 (fmakunbound 'sb-c::repack-xref)
 
+;;; The "--with" command-line mechanism (or equivalent 'customize-' file)
+;;; is convenient for passing boolean flags, but we shouldn't reflect
+;;; that mechanism into the target for every potential compile-time option
+;;; once build is complete.
+(setq *features* (delete :sb-after-xc-core *features*))
+;;; :CONS-PROFILING is not intended to persist after build.
+;;; It was merely a way to pass in a default OPTIMIZE quality.
+;;; Use (DESCRIBE-COMPILER-POLICY) to see the policy at startup.
+(setq *features* (delete :cons-profiling *features*))
+
 (progn
   (load "src/code/shaketree")
   (sb-impl::shake-packages
-   (lambda (symbol)
+   ;; Retain all symbols satisfying this predicate
+   #+sb-devel
+   (lambda (symbol accessibility)
+     (declare (ignore accessibility))
      ;; Retain all symbols satisfying this predicate
      (or (sb-kernel:symbol-info symbol)
-         (and (boundp symbol) (not (keywordp symbol))))))
+         (and (boundp symbol) (not (keywordp symbol)))))
+   #-sb-devel
+   (lambda (symbol accessibility)
+     (case (symbol-package symbol)
+      (#.(find-package "SB-VM")
+       (or (eq accessibility :external)
+           ;; overapproximate what we need for contribs and tests
+           (member symbol '(sb-vm::map-referencing-objects
+                            sb-vm::map-stack-references
+                            sb-vm::thread-profile-data-slot
+                            sb-vm::thread-alloc-region-slot
+                            ;; Naughty outside-world code uses this.
+                            sb-vm::thread-control-stack-start-slot
+                            sb-vm::primitive-object-size))
+           (search "-OFFSET" (string symbol))
+           (search "-TN" (string symbol))))
+      ((#.(find-package "SB-C")
+        #.(find-package "SB-ASSEM")
+        #.(find-package "SB-DISASSEM")
+        #.(find-package "SB-IMPL")
+        #.(find-package "SB-PRETTY")
+        #.(find-package "SB-KERNEL"))
+       ;; Assume all and only external symbols must be retained
+       (eq accessibility :external))
+      (#.(find-package "SB-FASL")
+       ;; Retain +BACKEND-FASL-FILE-IMPLEMENTATION+ and +FASL-FILE-VERSION+
+       ;; (and anything else otherwise reachable)
+       (and (eq accessibility :external)
+            (constantp symbol)))
+      (#.(find-package "SB-BIGNUM")
+       ;; There are 2 important external symbols for sb-gmp.
+       ;; Other externals can disappear.
+       (member symbol '(sb-bignum:%allocate-bignum
+                        sb-bignum:make-small-bignum)))
+      (t
+       ;; By default, retain any symbol with any attachments
+       (or (sb-kernel:symbol-info symbol)
+           (and (boundp symbol) (not (keywordp symbol)))))))
+   :verbose nil :print nil)
   (unintern 'sb-impl::shake-packages 'sb-impl))
 
 ;;; Use historical (stupid) behavior for storing pathname namestrings
@@ -210,7 +292,6 @@
 (setq sb-c::*name-context-file-path-selector* 'truename)
 
 ;;; Lock internal packages
-#+sb-package-locks
 (dolist (p (list-all-packages))
   (unless (member p (mapcar #'find-package '("KEYWORD" "CL-USER")))
     (sb-ext:lock-package p)))

@@ -404,6 +404,8 @@
                       :lambda-list lambda-list
                       :argument-precedence-order argument-precedence-order)
         (set-arg-info gf))
+    (let ((mc (generic-function-method-combination gf)))
+      (setf (gethash gf (method-combination-%generic-functions mc)) t))
     (when (arg-info-valid-p (slot-value gf 'arg-info))
       (update-dfun gf))))
 
@@ -412,9 +414,13 @@
      (lambda-list nil lambda-list-p) (argument-precedence-order nil apo-p))
   (let ((old-mc (generic-function-method-combination gf)))
     (prog1 (call-next-method)
-      ;; KLUDGE: EQ is too strong a test.
-      (unless (eq old-mc (generic-function-method-combination gf))
-        (flush-effective-method-cache gf))
+      (let ((mc (generic-function-method-combination gf)))
+        (unless (eq mc old-mc)
+          (aver (gethash gf (method-combination-%generic-functions old-mc)))
+          (aver (not (gethash gf (method-combination-%generic-functions mc))))
+          (remhash gf (method-combination-%generic-functions old-mc))
+          (setf (gethash gf (method-combination-%generic-functions mc)) t)
+          (flush-effective-method-cache gf)))
       (cond
         ((and lambda-list-p apo-p)
          (set-arg-info gf
@@ -426,8 +432,6 @@
         (update-dfun gf))
       (map-dependents gf (lambda (dependent)
                            (apply #'update-dependent gf dependent args))))))
-
-(declaim (special *lazy-dfun-compute-p*))
 
 (defun set-methods (gf methods)
   (setf (generic-function-methods gf) nil)
@@ -731,10 +735,9 @@
        (specializer-class specializer)))
 
 (defun error-need-at-least-n-args (function n)
-  (error 'simple-program-error
-         :format-control "~@<The function ~2I~_~S ~I~_requires ~
-                          at least ~W argument~:P.~:>"
-         :format-arguments (list function n)))
+  (%program-error "~@<The function ~2I~_~S ~I~_requires at least ~W ~
+                   argument~:P.~:>"
+                  function n))
 
 (defun types-from-args (generic-function arguments &optional type-modifier)
   (multiple-value-bind (nreq applyp metatypes nkeys arg-info)
@@ -768,7 +771,7 @@
         (compute-applicable-methods-using-types gf types)
       (let ((generator (get-secondary-dispatch-function1
                         gf methods types nil t all-applicable-and-sorted-p)))
-        (make-callable gf methods generator
+        (make-callable generator
                        nil (mapcar #'class-wrapper classes))))))
 
 (defun value-for-caching (gf classes)

@@ -474,10 +474,6 @@
            two-arg-char-not-greaterp)
     (character character) boolean (movable foldable flushable))
 
-(defknown char-equal-constant (character character character)
-  boolean
-  (movable foldable flushable))
-
 (defknown character (t) character (movable foldable unsafely-flushable))
 (defknown char-code (character) char-code (movable foldable flushable))
 (defknown (char-upcase char-downcase) (character) character
@@ -832,7 +828,7 @@
                                    (:start index)
                                    (:end sequence-end))
   sequence
-  ()
+  (recursive)
   :derive-type #'result-type-first-arg)
 
 ;;;; from the "Manipulating List Structure" chapter:
@@ -1814,7 +1810,9 @@
   (values (simple-array * (*)) index index index)
   (foldable flushable))
 (defknown %set-symbol-package (symbol t) t ())
-(defknown %coerce-callable-to-fun (function-designator) function (flushable))
+(defknown (%coerce-callable-to-fun %coerce-callable-for-call)
+    (function-designator)
+    function (flushable))
 (defknown array-bounding-indices-bad-error (t t t) nil)
 (defknown sequence-bounding-indices-bad-error (t t t) nil)
 (defknown %find-position
@@ -1920,6 +1918,8 @@
   :derive-type #'result-type-last-arg)
 
 ;;;; ALIEN and call-out-to-C stuff
+
+(defknown %alien-funcall ((or string system-area-pointer) alien-type &rest *) *)
 
 ;; Used by WITH-PINNED-OBJECTS
 #!+(or x86 x86-64)

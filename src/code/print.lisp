@@ -57,10 +57,11 @@
 variable: an unreadable object representing the error is printed instead.")
 
 ;; duplicate defglobal because this file is compiled before "reader"
-(defglobal *standard-readtable* nil)
+(define-load-time-global *standard-readtable* nil)
 
 (defun %with-standard-io-syntax (function)
   (declare (type function function))
+  (declare (dynamic-extent function))
   (let ((*package* (load-time-value (find-package "COMMON-LISP-USER") t))
         (*print-array* t)
         (*print-base* 10)
@@ -82,7 +83,8 @@ variable: an unreadable object representing the error is printed instead.")
         (*read-eval* t)
         (*read-suppress* nil)
         (*readtable* *standard-readtable*)
-        (*suppress-print-errors* nil))
+        (*suppress-print-errors* nil)
+        (*print-vector-length* nil))
     (funcall function)))
 
 ;;;; routines to print objects
@@ -1009,7 +1011,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;;
 ;;; It doesn't need a lock, but if you work on SCRUB-POWER-CACHE or
 ;;; POWERS-FOR-BASE, see that you don't break the assumptions!
-(defglobal *power-cache* (make-array 37 :initial-element nil))
+(define-load-time-global *power-cache* (make-array 37 :initial-element nil))
 (declaim (type (simple-vector 37) *power-cache*))
 
 (defconstant +power-cache-integer-length-limit+ 2048)
@@ -1184,9 +1186,6 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defun flonum-to-string (x &optional width fdigits scale fmin)
   (declare (type float x))
-  ;; FIXME: I think only FORMAT-DOLLARS calls FLONUM-TO-STRING with
-  ;; possibly-negative X.
-  (setf x (abs x))
   (multiple-value-bind (e string)
       (if fdigits
           (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
@@ -1615,8 +1614,10 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defmethod print-object ((component code-component) stream)
   (print-unreadable-object (component stream :identity t)
-    (let ((dinfo (%code-debug-info component)))
-      (cond ((eq dinfo :bogus-lra)
+    (let (dinfo)
+      (cond ((code-obj-is-filler-p component)
+             (format stream "filler ~db" (%code-code-size component)))
+            ((eq (setq dinfo (%code-debug-info component)) :bogus-lra)
              (write-string "bogus code object" stream))
             ((functionp dinfo)
              (format stream "trampoline ~S" dinfo))
@@ -1661,16 +1662,18 @@ variable: an unreadable object representing the error is printed instead.")
                 (values "#.(~S #X~16,'0X #X~16,'0X)"
                         '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
            (multiple-value-call
-            #'format stream format maker (funcall extractor pack))))
+               #'format stream format maker (funcall extractor pack))))
+        (*print-readably*
+         (print-not-readable-error pack stream))
         (t
          (print-unreadable-object (pack stream)
            (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
-                      (= (logand value mask) mask))
+                    (= (logand value mask) mask))
                   (split-num (value start)
-                      (loop
-                         for i from 0 to 3
-                         and v = (ash value (- start)) then (ash v -8)
-                         collect (logand v #xFF))))
+                    (loop
+                       for i from 0 to 3
+                       and v = (ash value (- start)) then (ash v -8)
+                       collect (logand v #xFF))))
              (multiple-value-bind (low high)
                  (%simd-pack-ub64s pack)
                (etypecase pack
@@ -1710,6 +1713,9 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;;; catch-all for unknown things
 
+(declaim (inline lowtag-of))
+(defun lowtag-of (x) (logand (get-lisp-obj-address x) sb!vm:lowtag-mask))
+
 (defmethod print-object ((object t) stream)
   (flet ((output-it (stream)
           (when (eq object sb!pcl:+slot-unbound+)
@@ -1727,6 +1733,10 @@ variable: an unreadable object representing the error is printed instead.")
                       (#.sb!vm:value-cell-widetag
                        (write-string "value cell " stream)
                        (output-object (value-cell-ref object) stream))
+                      (#.sb!vm:filler-widetag
+                       (write-string "pad " stream)
+                       (write (1+ (get-header-data object)) :stream stream)
+                       (write-string "w" stream)) ; words
                       (t
                        (write-string "unknown pointer object, widetag=" stream)
                        (output-integer widetag stream 16 t)))))

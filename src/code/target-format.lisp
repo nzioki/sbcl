@@ -332,29 +332,29 @@
                   (format-print-ordinal stream arg)
                   (format-print-cardinal stream arg)))))))
 
-(defglobal *cardinal-ones*
+(define-load-time-global *cardinal-ones*
   #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"))
 
-(defglobal *cardinal-tens*
+(define-load-time-global *cardinal-tens*
   #(nil nil "twenty" "thirty" "forty"
         "fifty" "sixty" "seventy" "eighty" "ninety"))
 
-(defglobal *cardinal-teens*
+(define-load-time-global *cardinal-teens*
   #("ten" "eleven" "twelve" "thirteen" "fourteen"  ;;; RAD
     "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
 
-(defglobal *cardinal-periods*
+(define-load-time-global *cardinal-periods*
   #("" " thousand" " million" " billion" " trillion" " quadrillion"
     " quintillion" " sextillion" " septillion" " octillion" " nonillion"
     " decillion" " undecillion" " duodecillion" " tredecillion"
     " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
     " octodecillion" " novemdecillion" " vigintillion"))
 
-(defglobal *ordinal-ones*
+(define-load-time-global *ordinal-ones*
   #(nil "first" "second" "third" "fourth"
         "fifth" "sixth" "seventh" "eighth" "ninth"))
 
-(defglobal *ordinal-tens*
+(define-load-time-global *ordinal-tens*
   #(nil "tenth" "twentieth" "thirtieth" "fortieth"
         "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 
@@ -723,7 +723,7 @@
                           (if atsign "+" "")))
              (signlen (length signstr)))
         (multiple-value-bind (str strlen ig2 ig3 pointplace)
-            (sb!impl::flonum-to-string number nil d nil)
+            (sb!impl::flonum-to-string (abs number) nil d nil)
           (declare (ignore ig2 ig3 strlen))
           (when colon
             (write-string signstr stream))

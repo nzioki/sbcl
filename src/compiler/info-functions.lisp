@@ -128,7 +128,7 @@
             :inlinep
             :kind
             :macro-function
-            :inline-expansion-designator
+            :inlining-data
             :source-transform
             :assumed-type)))
   (values))
@@ -142,20 +142,30 @@
     (if (info :function :assumed-type name)
         (clear-info :function :assumed-type name))))
 
-;;; Trivially wrap (INFO :FUNCTION :INLINE-EXPANSION-DESIGNATOR FUN-NAME)
-(declaim (ftype (function ((or symbol cons)) list) fun-name-inline-expansion))
+;;; Trivially wrap (INFO :FUNCTION :INLINING-DATA FUN-NAME)
+;;; to extract an inlineable lambda.
+;;; Secondary value is T only if an explicit expansion was stored, and NOT
+;;; an implicit expansion of a auto-defined product of DEFSTRUCT.
+(declaim (ftype (function ((or symbol cons)) (values list boolean))
+                fun-name-inline-expansion))
 (defun fun-name-inline-expansion (fun-name)
-  (multiple-value-bind (answer winp)
-      (info :function :inline-expansion-designator fun-name)
+  (multiple-value-bind (answer winp) (info :function :inlining-data fun-name)
+    (typecase answer
+      ;; an INLINING-DATA is a DXABLE-ARGS, so test it first
+      (inlining-data (setq answer (inlining-data-expansion answer)))
+      (dxable-args   (setq answer nil winp nil)))
     (when (and (not winp) (symbolp fun-name))
       (let ((info (info :function :type fun-name)))
         (when (typep info 'defstruct-description)
           (let ((spec (assq fun-name (dd-constructors info))))
             (aver spec)
             (setq answer `(lambda ,@(structure-ctor-lambda-parts
-                                     info (cdr spec)))
-                  winp t)))))
+                                     info (cdr spec))))))))
     (values answer winp)))
+(defun fun-name-dx-args (fun-name)
+  (let ((answer (info :function :inlining-data fun-name)))
+    (when (typep answer 'dxable-args)
+      (dxable-args-list answer))))
 
 ;;;; ANSI Common Lisp functions which are defined in terms of the info
 ;;;; database
@@ -197,43 +207,6 @@ only."
     (setf (info :function :macro-function symbol) function)
     #-sb-xc-host (install-guard-function symbol `(:macro ,symbol) nil))
   function)
-
-;; Set (SYMBOL-FUNCTION SYMBOL) to a closure that signals an error,
-;; preventing funcall/apply of macros and special operators.
-#-sb-xc-host
-(defun install-guard-function (symbol fun-name docstring)
-  (when docstring
-    (setf (random-documentation symbol 'function) docstring))
-  ;; (SETF SYMBOL-FUNCTION) goes out of its way to disallow this closure,
-  ;; but we can trivially replicate its low-level effect.
-  (let ((fdefn (find-or-create-fdefn symbol))
-        (closure
-         (set-closure-name
-          (lambda (&rest args)
-           (declare (ignore args))
-           ;; ANSI specification of FUNCALL says that this should be
-           ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.
-           ;; SPECIAL-FORM-FUNCTION is a subtype of UNDEFINED-FUNCTION.
-           (error (if (eq (info :function :kind symbol) :special-form)
-                      'special-form-function
-                      'undefined-function)
-                  :name symbol))
-          t
-          fun-name)))
-    ;; For immobile-code, do something slightly different: fmakunbound,
-    ;; then assign the fdefn-fun slot to avoid consing a new closure trampoline.
-    #!+immobile-code
-    (progn (fdefn-makunbound fdefn)
-           ;; There is no :SET-TRANS for the primitive object's fdefn-fun slot,
-           ;; nor do we desire the full effect of %SET-FDEFN-FUN.
-           (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address fdefn))
-                                  (- (ash sb!vm:fdefn-fun-slot sb!vm:word-shift)
-                                     sb!vm:other-pointer-lowtag))
-                 closure))
-    ;; The above would work, but there's no overhead when installing a closure
-    ;; the regular way, so just do that.
-    #!-immobile-code
-    (setf (fdefn-fun fdefn) closure)))
 
 (defun sb!xc:compiler-macro-function (name &optional env)
   "If NAME names a compiler-macro in ENV, return the expansion function, else
@@ -329,35 +302,6 @@ return NIL. Can be set with SETF when ENV is NIL."
           ((typep name '(or symbol cons))
            (setf (random-documentation name doc-type) string))))
   string)
-
-#-sb-xc-host
-(defun real-function-name (name)
-  ;; Resolve the actual name of the function named by NAME
-  ;; e.g. (setf (name-function 'x) #'car)
-  ;; (real-function-name 'x) => CAR
-  (cond ((not (fboundp name))
-         nil)
-        ((and (symbolp name)
-              (macro-function name))
-         (let ((name (%fun-name (macro-function name))))
-           (and (consp name)
-                (eq (car name) 'macro-function)
-                (cadr name))))
-        (t
-         (%fun-name (fdefinition name)))))
-
-#-sb-xc-host
-(defun random-documentation (name type)
-  (cdr (assoc type (info :random-documentation :stuff name))))
-
-#-sb-xc-host
-(defun (setf random-documentation) (new-value name type)
-  (let ((pair (assoc type (info :random-documentation :stuff name))))
-    (if pair
-        (setf (cdr pair) new-value)
-        (push (cons type new-value)
-              (info :random-documentation :stuff name))))
-  new-value)
 
 ;; Return the number of calls to NAME that IR2 emitted as full calls,
 ;; not counting calls via #'F that went untracked.

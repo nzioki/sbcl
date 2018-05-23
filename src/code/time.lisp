@@ -193,7 +193,7 @@ format."
           (truncate years 100))
        (truncate (+ years 300) 400))))
 
-(defglobal **days-before-month**
+(define-load-time-global **days-before-month**
   #.(let ((reversed-result nil)
           (sum 0))
       (push nil reversed-result)
@@ -234,15 +234,14 @@ format."
     (if time-zone
         (setf encoded-time (+ second (* (+ minute (* (+ hours time-zone) 60)) 60)))
         (let* ((secwest-guess
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range (* hours 60 60))))
+                 (sb!unix::get-timezone
+                  (truncate-to-unix-range (* hours 60 60))))
                (guess (+ second (* 60 (+ minute (* hours 60)))
                          secwest-guess))
                (secwest
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range guess))))
+                 (sb!unix::get-timezone
+                  (truncate-to-unix-range guess))))
           (setf encoded-time (+ guess (- secwest secwest-guess)))))
-    (assert (typep encoded-time '(integer 0)))
     encoded-time))
 
 ;;;; TIME
@@ -424,6 +423,7 @@ returns values returned by FUNCTION.
       NIL.)
 
 EXPERIMENTAL: Interface subject to change."
+  (declare (dynamic-extent timer function))
   (let (old-run-utime
         new-run-utime
         old-run-stime

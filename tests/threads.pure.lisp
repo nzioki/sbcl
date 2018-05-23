@@ -190,11 +190,9 @@
       (assert (= 42 (join-thread child)))
       (assert (eq :from-child (symbol-value 'this-is-new))))))
 
-;;; Disabled on Darwin due to deadlocks caused by apparent OS specific deadlocks,
-;;; wich _appear_ to be caused by malloc() and free() not being thread safe: an
-;;; interrupted malloc in one thread can apparently block a free in another.
 (with-test (:name :symbol-value-in-thread.3
-            :skipped-on (not :sb-thread))
+            :skipped-on (not :sb-thread)
+            :broken-on :sb-safepoint)
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (running t)
@@ -215,15 +213,17 @@
         (force-output))
       (let* ((mom-mark (cons t t))
              (kid-mark (cons t t))
-             (child (make-thread (lambda ()
-                                   (wait-on-semaphore semaphore)
-                                   (let ((old (symbol-value-in-thread 'this-is-new parent)))
-                                     (setf (symbol-value-in-thread 'this-is-new parent)
-                                           (make-array 24 :initial-element kid-mark))
-                                     old)))))
+             (child (make-thread
+                     (lambda ()
+                       (if (wait-on-semaphore semaphore :timeout 10)
+                           (let ((old (symbol-value-in-thread 'this-is-new parent)))
+                             (setf (symbol-value-in-thread 'this-is-new parent)
+                                   (make-array 24 :initial-element kid-mark))
+                             old)
+                           :timeout)))))
         (progv '(this-is-new) (list (make-array 24 :initial-element mom-mark))
           (signal-semaphore semaphore)
-          (assert (eq mom-mark (aref (join-thread child) 0)))
+          (assert (eq mom-mark (aref (join-thread child :timeout 10) 0)))
           (assert (eq kid-mark (aref (symbol-value 'this-is-new) 0))))))
     (setf running nil)
     (join-thread noise)))
@@ -249,7 +249,7 @@
                                          (cell-error-name e)
                                          (sb-thread::symbol-value-in-thread-error-info e))))))))
     (signal-semaphore semaphore)
-    (assert (equal (list *current-thread* 'this-is-new (list :read :unbound-in-thread))
+    (assert (equal (list *current-thread* 'this-is-new (list :read :no-tls-value))
                    (join-thread child)))))
 
 (with-test (:name :symbol-value-in-thread.6 :skipped-on (not :sb-thread))

@@ -13,8 +13,6 @@
 
 (cl:in-package :cl-user)
 
-(load "compiler-test-util.lisp")
-
 ;; The tests in this file do not work under the legacy interpreter.
 (when (and (eq sb-ext:*evaluator-mode* :interpret)
            (not (member :sb-fasteval *features*)))
@@ -3522,9 +3520,9 @@
                    `(lambda ()
                       (list (if (typep ,v '(simple-array ,et (*)))
                                 :good
-                                :bad)
+                                ',et)
                             (if (typep (elt ,v 0) '(simple-array ,et (*)))
-                                :bad
+                                ',et
                                 :good))))))
         (assert (equal '(:good :good) (funcall fun)))))))
 
@@ -4128,8 +4126,10 @@
   ;; This used to blow stack with a sufficiently long list.
   (let ((cycle (list t)))
     (nconc cycle cycle)
-    (checked-compile `(lambda (x)
-                        (member x ',cycle)))))
+    (assert (nth-value 1
+                       (checked-compile `(lambda (x)
+                                           (member x ',cycle))
+                                        :allow-warnings t)))))
 
 (with-test (:name (compile :bug-722734))
   (checked-compile-and-assert (:allow-warnings t :optimize :safe)
@@ -5063,7 +5063,7 @@
                        x))))
 
 (with-test (:name (compile :copy-more-arg)
-            :fails-on (not (or :x86 :x86-64 :arm :arm64)))
+                  :fails-on (or :alpha :hppa :mips :sparc))
   ;; copy-more-arg might not copy in the right direction
   ;; when there are more fixed args than stack frame slots,
   ;; and thus end up splatting a single argument everywhere.
@@ -5436,44 +5436,6 @@
    '(lambda (x) ; the call to POSITION can't return 4
      (let ((i (position x #(a b c d) :test 'eq)))
        (case i (4 'nope) (t 'okeydokey))))))
-
-;; Assert that DO-PACKED-TNS has unsurprising behavior if the body RETURNs.
-;; This isn't a test in the problem domain of CL - it's of an internal macro,
-;; and x86-64-specific not because of broken-ness, but because it uses
-;; known random TNs to play with. Printing "skipped on" for other backends
-;; would be somewhat misleading in as much as it means nothing about
-;; the correctness of the test on other architectures.
-#+x86-64
-(with-test (:name :do-packed-tn-iterator)
-  (dotimes (i (ash 1 6))
-    (labels ((make-tns (n)
-               (mapcar 'copy-structure
-                       (subseq `sb-vm::(,rax-tn ,rbx-tn ,rcx-tn) 0 n)))
-             (link (list)
-               (when list
-                 (setf (sb-c::tn-next (car list)) (link (cdr list)))
-                 (car list))))
-      (let* ((normal     (make-tns (ldb (byte 2 0) i)))
-             (restricted (make-tns (ldb (byte 2 2) i)))
-             (wired      (make-tns (ldb (byte 2 4) i)))
-             (expect     (append normal restricted wired))
-             (comp       (sb-c::make-empty-component))
-             (ir2-comp   (sb-c::make-ir2-component)))
-        (setf (sb-c::component-info comp) ir2-comp
-              (sb-c::ir2-component-normal-tns ir2-comp) (link normal)
-              (sb-c::ir2-component-restricted-tns ir2-comp) (link restricted)
-              (sb-c::ir2-component-wired-tns ir2-comp) (link wired))
-        (let* ((list)
-               (result (sb-c::do-packed-tns (tn comp 42) (push tn list))))
-          (assert (eq result 42))
-          (assert (equal expect (nreverse list))))
-        (let* ((n 0) (list)
-               (result (sb-c::do-packed-tns (tn comp 'bar)
-                         (push tn list)
-                         (if (= (incf n) 4) (return 'foo)))))
-          (assert (eq result (if (>= (length expect) 4) 'foo 'bar)))
-          (assert (equal (subseq expect 0 (min 4 (length expect)))
-                         (nreverse list))))))))
 
 ;; lp# 310267
 (with-test (:name (optimize :quality-multiply-specified :bug-310267))
@@ -6339,6 +6301,14 @@
   (checked-compile-and-assert ()
       `(lambda (x) (* #C(4.457268f31 0.0) 4 x -46253801283659))
     ((5.0f-9) #C(-4.123312f37 -0.0))))
+
+(with-test (:name :reducing-constants.2
+                  ;; x86 delays FPE signalling
+                  :fails-on :x86)
+  (checked-compile-and-assert (:allow-style-warnings t)
+      `(lambda () (*  1.0 2 (expt 2 127)))
+    (() #-(or arm64 arm) (condition 'floating-point-overflow)
+        #+(or arm64 arm) sb-ext:single-float-positive-infinity)))
 
 (with-test (:name (logbitp :past fixnum))
   (checked-compile-and-assert ()

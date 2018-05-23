@@ -938,7 +938,6 @@ constant shift greater than word length")))
 
     DONE))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -953,7 +952,6 @@ constant shift greater than word length")))
     (move rcx amount)
     (inst shr result :cl)))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/signed)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -968,7 +966,6 @@ constant shift greater than word length")))
     (move rcx amount)
     (inst sar result :cl)))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/fixnum)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -1219,24 +1216,124 @@ constant shift greater than word length")))
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
   (:info y))
 
+(defun ensure-not-mem+mem (x y)
+  (cond ((sc-is x immediate)
+         (inst mov temp-reg-tn (tn-value x))
+         (ensure-not-mem+mem temp-reg-tn y))
+        (t
+         (when (and (tn-p y)
+                    (sc-is y immediate))
+           (setf y (tn-value y)))
+         (when (integerp y)
+           (acond ((immediate32-p y)
+                   (return-from ensure-not-mem+mem (values x it)))
+                  ((typep y '(unsigned-byte 32))
+                   ;; Rather than a RIP-relative constant, load a dword (w/o sign-extend)
+                   (inst mov (reg-in-size temp-reg-tn :dword) y)
+                   (return-from ensure-not-mem+mem (values x temp-reg-tn))))
+           (setq y (register-inline-constant :qword y)))
+         (cond ((or (gpr-p x) (gpr-p y))
+                (values x y))
+               (t
+                (inst mov temp-reg-tn x)
+                (values temp-reg-tn y))))))
+
+(defun immediate-operand-smallest-nbits (x)
+  (declare (word x))
+  (typecase x
+    ((unsigned-byte  8)  8)
+    ((unsigned-byte 16) 16)
+    ((unsigned-byte 32) 32)
+    (t                  64)))
+
+(defun bits->size (bits)
+  (ecase bits
+    (8  :byte)
+    (16 :word)
+    (32 :dword)
+    (64 :qword)))
+
+;;; Emit the most compact form of the test immediate instruction
+;;; by using the smallest operand size that is the large enough to hold
+;;; the immediate value Y. The operand size makes little difference since only
+;;; flags are affected. However, if the msb (the sign bit) of the immediate
+;;; operand at a smaller size is 1 but at its true size (always a :QWORD) is 0,
+;;; the S flag value could come out 1 instead of 0.
+;;; SIGN-BIT-MATTERS specifies that a shorter operand size must not be selected
+;;; if doing so could affect whether the sign flag comes out the same.
+;;; e.g. if EDX is #xff, "TEST EDX, #x80" indicates a non-negative result
+;;; whereas "TEST DL, #x80" indicates a negative result.
+(defun emit-optimized-test-inst (x y sign-bit-matters)
+  (let* ((bits (if (or (not (integerp y)) (minusp y))
+                   64
+                   (immediate-operand-smallest-nbits y)))
+         (size (unless (eql bits 64)
+                 (when (and (logbitp (1- bits) y) sign-bit-matters)
+                   (setq bits (* bits 2)))
+                 (unless (eql bits 64)
+                   (bits->size bits))))
+         ;; A size is reducible to byte if there are at most 8 bits set
+         ;; in an 8-bit-aligned field. For now I'm only dealing with
+         ;; the restricted case of 8 bits at (BYTE 8 8).
+         (reducible-to-byte-p
+          (and (eq size :word) (not (logtest #xFF y)))))
+    (cond ((not size)
+           ;; Ensure that both operands are acceptable
+           ;; by possibly loading one into TEMP-REG-TN
+           (multiple-value-setq (x y) (ensure-not-mem+mem x y)))
+          ((sc-is x control-stack unsigned-stack signed-stack)
+           ;; Otherwise, when using an immediate operand smaller
+           ;; than 64 bits, narrow the reg/mem operand to match.
+           (let ((disp (frame-byte-offset (tn-offset x))))
+             (when reducible-to-byte-p
+               (setq size :byte disp (1+ disp) y (ash y -8)))
+             (setq x (make-ea size :base rbp-tn :disp disp))))
+          (t
+           (aver (gpr-p x))
+           (if (and reducible-to-byte-p (<= (tn-offset x) 6)) ; 0, 2, 4, 6
+               ;; Use upper byte of word reg (AX -> AH, BX -> BX ...)
+               (setq x (make-random-tn :kind :normal
+                                       :sc (sc-or-lose 'byte-reg)
+                                       :offset (1+ (tn-offset x)))
+                     y (ash y -8))
+               (setq x (reg-in-size x size))))))
+  (inst test x y))
+
 ;; Stolen liberally from the x86 32-bit implementation.
 (macrolet ((define-logtest-vops ()
              `(progn
                ,@(loop for suffix in '(/fixnum -c/fixnum
                                        /signed -c/signed
                                        /unsigned -c/unsigned)
+                       ;; FIXME: remove, after changing the ancestor vops
+                       ;; to not pessimize their allowable SCs
+                       for scs = (case (let ((s (string suffix)))
+                                         (intern (subseq s (1+ (position #\/ s)))))
+                                   (fixnum '(any-reg control-stack))
+                                   (signed '(signed-reg signed-stack))
+                                   (unsigned '(unsigned-reg unsigned-stack)))
+                       ;;
                        for cost in '(4 3 6 5 6 5)
                        collect
                        `(define-vop (,(symbolicate "FAST-LOGTEST" suffix)
                                      ,(symbolicate "FAST-CONDITIONAL" suffix))
                          (:translate logtest)
+                         ;; Simplify the lambda made by MAKE-GENERATOR-FUNCTION:
+                         ;; LOAD-IF can be NIL because the only alternate SCs to
+                         ;; register SCs are stack SCs. And since we're pretending
+                         ;; that the CPU can directly receive two stack operands,
+                         ;; loading would just check that each argument individually
+                         ;; is either in a register or on the stack - which it is -
+                         ;; and do nothing.
+                         (:args (x :scs ,scs :load-if nil)
+                                ,@(unless (search "-C/" (string suffix)) `((y :scs ,scs :load-if nil))))
+                         ;; This temp spec is just being cautious. TEMP-REG-TN is reserved
+                         (:temporary (:sc unsigned-reg :offset #.(tn-offset temp-reg-tn)) scratch)
+                         (:ignore scratch)
                          (:conditional :ne)
                          (:generator ,cost
                           (emit-optimized-test-inst x
-                           ,(case suffix
-                             (-c/fixnum `(constantize (fixnumize y)))
-                             ((-c/signed -c/unsigned) `(constantize y))
-                             (t 'y))
+                           ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)
                            nil)))))))
   (define-logtest-vops))
 
@@ -1286,27 +1383,38 @@ constant shift greater than word length")))
   (:generator 5
     (inst bt x y)))
 
+(defun emit-optimized-cmp (x y)
+  (if (and (gpr-p x) (eql y 0))
+      ;; Amazingly (to me), use of TEST in lieu of CMP produces all the correct
+      ;; flag bits for inequality comparison as well as EQL comparison.
+      ;; You'd think that the Jxx instruction should examine _only_ the S flag,
+      ;; but in fact the other flags are right too. Nonetheless this is
+      ;; quite confusing, and I would prefer that we alter the branch test
+      ;; when emitting TEST in place of CMP.
+      (inst test x x) ; smaller instruction
+      (progn (multiple-value-setq (x y) (ensure-not-mem+mem x y))
+             (inst cmp x y))))
+
 (macrolet ((define-conditional-vop (tran cond unsigned not-cond not-unsigned)
              (declare (ignore not-cond not-unsigned))
              `(progn
                 ,@(mapcar
                    (lambda (suffix cost signed)
+                     (let ((scs (case (let ((s (string suffix)))
+                                        (intern (subseq s (1+ (position #\/ s)))))
+                                  (fixnum '(any-reg control-stack))
+                                  (signed '(signed-reg signed-stack))
+                                  (unsigned '(unsigned-reg unsigned-stack)))))
                      `(define-vop (,(symbolicate "FAST-IF-" tran suffix)
                                    ,(symbolicate "FAST-CONDITIONAL"  suffix))
+                        (:args (x :scs ,scs :load-if nil)
+                               ,@(unless (search "-C/" (string suffix))
+                                   `((y :scs ,scs :load-if nil))))
                         (:translate ,tran)
                         (:conditional ,(if signed cond unsigned))
                         (:generator ,cost
-                          (cond ((and (sc-is x any-reg signed-reg unsigned-reg)
-                                      (eql y 0))
-                                 (inst test x x))
-                                (t
-                                 (inst cmp x
-                                       ,(case suffix
-                                          (-c/fixnum
-                                           `(constantize (fixnumize y)))
-                                          ((-c/signed -c/unsigned)
-                                           `(constantize y))
-                                          (t 'y))))))))
+                          (emit-optimized-cmp
+                           x ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y))))))
                    '(/fixnum -c/fixnum /signed -c/signed /unsigned -c/unsigned)
 ;                  '(/fixnum  /signed  /unsigned)
                    '(4 3 6 5 6 5)
@@ -1748,7 +1856,6 @@ constant shift greater than word length")))
     (move hi edx)
     (move lo eax)))
 
-#!+multiply-high-vops
 (define-vop (mulhi)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1766,7 +1873,6 @@ constant shift greater than word length")))
     (inst mul eax y)
     (move hi edx)))
 
-#!+multiply-high-vops
 (define-vop (mulhi/fx)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1917,10 +2023,7 @@ constant shift greater than word length")))
           ((= width 64)
            (move r x))
           ((member width '(32 16 8))
-           (inst movsx r (reg-in-size x (ecase width
-                                             (32 :dword)
-                                             (16 :word)
-                                             (8  :byte)))))
+           (inst movsx r (reg-in-size x (bits->size width))))
           (t
            (move r x)
            (let ((delta (- n-word-bits width)))
@@ -1942,7 +2045,7 @@ constant shift greater than word length")))
            (ecase width
              (64 (loadw r x bignum-digits-offset other-pointer-lowtag))
              ((32 16 8)
-              (inst movsx r (make-ea (ecase width (32 :dword) (16 :word) (8 :byte))
+              (inst movsx r (make-ea (bits->size width)
                                      :base x
                                      :disp (- (* bignum-digits-offset n-word-bytes)
                                               other-pointer-lowtag))))))

@@ -59,8 +59,9 @@ LDFLAGS += -nopie
 __LDFLAGS__ += -nopie
 endif
 
-COMMON_SRC = alloc.c backtrace.c breakpoint.c coreparse.c dynbind.c     \
-	funcall.c gc-common.c globals.c hopscotch.c interr.c interrupt.c\
+COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
+	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
+	interr.c interrupt.c                                            \
 	largefile.c monitor.c murmur_hash.c os-common.c parse.c print.c \
 	purify.c pthread-futex.c regnames.c run-program.c runtime.c     \
 	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
@@ -100,10 +101,12 @@ shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: ../../output/sbcl.core \
  ../../tools-for-build/editcore.lisp
 	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split \
 		../../output/sbcl.core shrinkwrap-sbcl.s
+comma := , # "Commas ... cannot appear in the text of an argument as written"
 shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
-	$(CC) -Wl,-export-dynamic $(CFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
+ $(CFLAGS) -o $@ $(filter-out ldso-stubs.o, $^) $(LIBS)
 semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
-	$(CC) -Wl,-export-dynamic $(CFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
 
 sbcl.mk:
 	( echo 'CC=$(CC)' ; \

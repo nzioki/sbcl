@@ -12,8 +12,8 @@
 (in-package "SB!VM")
 
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If
 ;;; standard is true, then use the standard (full call) location,
@@ -34,7 +34,7 @@
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset descriptor-reg-sc-number ocfp-offset))
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold Old-FP and Return-PC within the current
 ;;; function.  We treat these specially so that the debugger can find
@@ -118,8 +118,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Fix CODE, cause the function object was passed in.
     (inst compute-code-from-fn code-tn code-tn start-lab temp)))
@@ -281,7 +280,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (when defaults
-                (assemble (*elsewhere*)
+                (assemble (:elsewhere)
                   (emit-label default-stack-vals)
                   (do ((remaining defaults (cdr remaining)))
                       ((null remaining))
@@ -328,7 +327,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (inst compute-code-from-lra code-tn code-tn lra-label temp)
       (do ((arg *register-arg-tns* (rest arg))
@@ -738,7 +737,7 @@ default-value-8
                     ;; the register number of CALLABLE-TN.
                     (inst unimp (logior single-step-around-trap
                                         (ash (reg-tn-encoding callable-tn)
-                                             5)))
+                                             8)))
                     (emit-label step-done-label))))
            (declare (ignorable #'insert-step-instrumenting))
            ,@(case named

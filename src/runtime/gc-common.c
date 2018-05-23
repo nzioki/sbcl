@@ -92,7 +92,7 @@ os_vm_size_t bytes_consed_between_gcs = 12*1024*1024;
 #define BOXED_NWORDS(obj) ((HeaderValue(obj) & 0x7FFFFF) | 1)
 
 /* Medium-sized payload count is expressed in 15 bits. Objects in this category
- * may reside in immobile space: CODE, CLOSURE, INSTANCE, FUNCALLABLE-INSTANCE.
+ * may reside in immobile space: CLOSURE, INSTANCE, FUNCALLABLE-INSTANCE.
  * The single data bit is used as a closure's NAMED flag.
  *
  * Header:  gen# |  data |     size |    tag
@@ -289,7 +289,7 @@ static lispobj trans_short_boxed(lispobj object);
 static sword_t
 scav_fun_pointer(lispobj *where, lispobj object)
 {
-    gc_dcheck(lowtag_of(object) == FUN_POINTER_LOWTAG);
+    gc_dcheck(functionp(object));
 
     /* Object is a pointer into from_space - not a FP. */
     lispobj *first_pointer = native_pointer(object);
@@ -325,9 +325,10 @@ trans_code(struct code *code)
     /* prepare to transport the code vector */
     lispobj l_code = (lispobj) LOW_WORD(code) | OTHER_POINTER_LOWTAG;
     sword_t nheader_words = code_header_words(code->header);
-    sword_t ncode_words = code_instruction_words(code->code_size);
-    lispobj l_new_code = copy_large_object(l_code, nheader_words + ncode_words,
-                                           CODE_PAGE_ALLOCATED);
+    sword_t ncode_words = code_unboxed_nwords(code->code_size);
+    lispobj l_new_code = copy_large_object(l_code,
+                                           ALIGN_UP(nheader_words + ncode_words, 2),
+                                           CODE_PAGE_TYPE);
 
 #ifdef LISP_FEATURE_GENCGC
     if (l_new_code == l_code)
@@ -388,7 +389,7 @@ scav_code_header(lispobj *where, lispobj header)
                  SIMPLE_FUN_SCAV_NWORDS(function_ptr));
     })
 
-    return n_header_words + code_instruction_words(code->code_size);
+    return ALIGN_UP(n_header_words + code_unboxed_nwords(code->code_size), 2);
 }
 
 static lispobj
@@ -401,8 +402,9 @@ trans_code_header(lispobj object)
 static sword_t
 size_code_header(lispobj *where)
 {
-    return code_header_words(((struct code *)where)->header)
-         + code_instruction_words(((struct code *)where)->code_size);
+    struct code* c = (struct code*)where;
+    return ALIGN_UP(code_header_words(c->header) + code_unboxed_nwords(c->code_size),
+                    2);
 }
 
 #ifdef RETURN_PC_WIDETAG
@@ -486,7 +488,7 @@ trans_fun_header(lispobj object)
 static lispobj
 trans_instance(lispobj object)
 {
-    gc_dcheck(lowtag_of(object) == INSTANCE_POINTER_LOWTAG);
+    gc_dcheck(instancep(object));
     lispobj header = *(lispobj*)(object - INSTANCE_POINTER_LOWTAG);
     return copy_object(object, 1 + (instance_length(header)|1));
 }
@@ -515,7 +517,7 @@ static lispobj trans_list(lispobj object);
 static sword_t
 scav_list_pointer(lispobj *where, lispobj object)
 {
-    gc_dcheck(lowtag_of(object) == LIST_POINTER_LOWTAG);
+    gc_dcheck(listp(object));
 
     lispobj copy = trans_list(object);
     gc_dcheck(copy != object);
@@ -541,7 +543,7 @@ trans_list(lispobj object)
 
     /* Try to linearize the list in the cdr direction to help reduce
      * paging. */
-    while (lowtag_of(cdr) == LIST_POINTER_LOWTAG && from_space_p(cdr)) {
+    while (listp(cdr) && from_space_p(cdr)) {
         lispobj* native_cdr = (lispobj*)CONS(cdr);
         if (forwarding_pointer_p(native_cdr)) {  // Might as well fix now.
             cdr = forwarding_pointer_value(native_cdr);
@@ -1364,7 +1366,7 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table, lispobj *prev,
             kv_vector[2 * index] = empty_symbol;
             if (save_culled_values) {
                 lispobj val = kv_vector[2 * index + 1];
-                gc_assert(is_lisp_immediate(val));
+                gc_assert(!is_lisp_pointer(val));
                 struct cons *cons = (struct cons*)
                   gc_general_alloc(sizeof(struct cons), BOXED_PAGE_FLAG, ALLOC_QUICK);
                 // Lisp code which manipulates the culled_values slot must use
@@ -1610,7 +1612,7 @@ properly_tagged_p_internal(lispobj pointer, lispobj *start_addr)
             }
         }
 #endif
-        if (lowtag_of(pointer) == FUN_POINTER_LOWTAG) {
+        if (functionp(pointer)) {
             struct simple_fun *pfun =
                 (struct simple_fun*)(pointer-FUN_POINTER_LOWTAG);
             for_each_simple_fun(i, function, (struct code*)start_addr, 0, {
@@ -2090,7 +2092,7 @@ scavenge_interrupt_contexts(struct thread *th)
 #endif
 
     for (i = 0; i < index; i++) {
-        context = th->interrupt_contexts[i];
+        context = nth_interrupt_context(i, th);
         scavenge_interrupt_context(context);
     }
 }
@@ -2184,150 +2186,4 @@ void gc_heapsort_uwords(heap array, int length)
         --end;
         sift_down(array, 0, end);
     }
-}
-
-//// Coalescing of constant vectors for SAVE-LISP-AND-DIE
-
-static boolean coalescible_number_p(lispobj* where)
-{
-    int widetag = widetag_of(*where);
-    return widetag == BIGNUM_WIDETAG
-        // Ratios and complex integers containing pointers to bignums don't work.
-        || ((widetag == RATIO_WIDETAG || widetag == COMPLEX_WIDETAG)
-            && fixnump(where[1]) && fixnump(where[2]))
-#ifndef LISP_FEATURE_64_BIT
-        || widetag == SINGLE_FLOAT_WIDETAG
-#endif
-        || widetag == DOUBLE_FLOAT_WIDETAG
-        || widetag == COMPLEX_SINGLE_FLOAT_WIDETAG
-        || widetag == COMPLEX_DOUBLE_FLOAT_WIDETAG;
-}
-
-/// Return true of fixnums, bignums, strings, symbols.
-/// Strings are considered eql-comparable,
-/// because they're coalesced before comparing.
-static boolean eql_comparable_p(lispobj obj)
-{
-    if (fixnump(obj) || obj == NIL) return 1;
-    if (lowtag_of(obj) != OTHER_POINTER_LOWTAG) return 0;
-    int widetag = widetag_of(*native_pointer(obj));
-    return widetag == BIGNUM_WIDETAG
-        || widetag == SYMBOL_WIDETAG
-#ifdef SIMPLE_CHARACTER_STRING_WIDETAG
-        || widetag == SIMPLE_CHARACTER_STRING_WIDETAG
-#endif
-        || widetag == SIMPLE_BASE_STRING_WIDETAG;
-}
-
-static boolean vector_isevery(boolean (*pred)(lispobj), struct vector* v)
-{
-    int i;
-    for (i = fixnum_value(v->length)-1; i >= 0; --i)
-        if (!pred(v->data[i])) return 0;
-    return 1;
-}
-
-static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
-{
-    lispobj ptr = *where;
-    if (lowtag_of(ptr) != OTHER_POINTER_LOWTAG)
-        return;
-
-    extern char gc_coalesce_string_literals;
-    // gc_coalesce_string_literals represents the "aggressiveness" level.
-    // If 1, then we share vectors tagged as +VECTOR-SHAREABLE+,
-    // but if >1, those and also +VECTOR-SHAREABLE-NONSTD+.
-    int mask = gc_coalesce_string_literals > 1
-      ? (VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<N_WIDETAG_BITS
-      : (VECTOR_SHAREABLE                        )<<N_WIDETAG_BITS;
-
-    lispobj* obj = native_pointer(ptr);
-    lispobj header = *obj;
-    int widetag = widetag_of(header);
-
-    if ((((header & mask) != 0) // optimistically assume it's a vector
-         && ((widetag == SIMPLE_VECTOR_WIDETAG
-              && vector_isevery(eql_comparable_p, (struct vector*)obj))
-             || specialized_vector_widetag_p(widetag)))
-        || coalescible_number_p(obj)) {
-        if (widetag == SIMPLE_VECTOR_WIDETAG) {
-            sword_t n_elts = fixnum_value(obj[1]), i;
-            for (i = 2 ; i < n_elts+2 ; ++i)
-                coalesce_obj(obj + i, ht);
-        }
-        int index = hopscotch_get(ht, (uword_t)obj, 0);
-        if (!index) // Not found
-            hopscotch_insert(ht, (uword_t)obj, 1);
-        else
-            *where = make_lispobj((void*)ht->keys[index-1], OTHER_POINTER_LOWTAG);
-    }
-}
-
-static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
-{
-    struct hopscotch_table* ht = (struct hopscotch_table*)arg;
-    lispobj layout, bitmap, *next;
-    sword_t nwords, i, j;
-
-    for ( ; where < limit ; where = next ) {
-        lispobj header = *where;
-        if (is_cons_half(header)) {
-            coalesce_obj(where+0, ht);
-            coalesce_obj(where+1, ht);
-            next = where + 2;
-        } else {
-            int widetag = widetag_of(header);
-            nwords = sizetab[widetag](where);
-            next = where + nwords;
-            switch (widetag) {
-            case INSTANCE_WIDETAG: // mixed boxed/unboxed objects
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-            case FUNCALLABLE_INSTANCE_WIDETAG:
-#endif
-                layout = instance_layout(where);
-                bitmap = LAYOUT(layout)->bitmap;
-                for(i=1; i<nwords; ++i)
-                    if (layout_bitmap_logbitp(i-1, bitmap))
-                        coalesce_obj(where+i, ht);
-                continue;
-            case CODE_HEADER_WIDETAG:
-                for_each_simple_fun(i, fun, (struct code*)where, 0, {
-                    lispobj* fun_slots = SIMPLE_FUN_SCAV_START(fun);
-                    for (j=0; j<SIMPLE_FUN_SCAV_NWORDS(fun); ++j)
-                        coalesce_obj(fun_slots+j, ht);
-                })
-                nwords = code_header_words(header);
-                break;
-            default:
-                if (unboxed_obj_widetag_p(widetag))
-                    continue; // Ignore this object.
-            }
-            for(i=1; i<nwords; ++i)
-                coalesce_obj(where+i, ht);
-        }
-    }
-    return 0;
-}
-
-void coalesce_similar_objects()
-{
-    struct hopscotch_table ht;
-    hopscotch_create(&ht, HOPSCOTCH_VECTOR_HASH, 0, 1<<17, 0);
-#ifndef LISP_FEATURE_WIN32
-    // Apparently this triggers the "Unable to recommit" lossage message
-    // in handle_access_violation() in src/runtime/win32-os.c
-    coalesce_range((lispobj*)STATIC_SPACE_START,
-                   (lispobj*)STATIC_SPACE_END,
-                   (uword_t)&ht);
-#endif
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    coalesce_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, (uword_t)&ht);
-    coalesce_range((lispobj*)VARYOBJ_SPACE_START, varyobj_free_pointer, (uword_t)&ht);
-#endif
-#ifdef LISP_FEATURE_GENCGC
-    walk_generation(coalesce_range, -1, (uword_t)&ht);
-#else
-    // FIXME: implement
-#endif
-    hopscotch_destroy(&ht);
 }

@@ -716,14 +716,15 @@
                                                 nil constraints
                                                 consequent-constraints)))))
                  ((< >)
-                  (let* ((arg1 (first args))
-                         (var1 (ok-lvar-lambda-var arg1 constraints))
-                         (arg2 (second args))
-                         (var2 (ok-lvar-lambda-var arg2 constraints)))
-                    (when var1
-                      (add name var1 (lvar-type arg2) nil))
-                    (when var2
-                      (add (if (eq name '<) '> '<) var2 (lvar-type arg1) nil))))
+                  (when (= (length args) 2)
+                    (let* ((arg1 (first args))
+                           (var1 (ok-lvar-lambda-var arg1 constraints))
+                           (arg2 (second args))
+                           (var2 (ok-lvar-lambda-var arg2 constraints)))
+                      (when var1
+                        (add name var1 (lvar-type arg2) nil))
+                      (when var2
+                        (add (if (eq name '<) '> '<) var2 (lvar-type arg1) nil)))))
                  (t
                   (add-combination-test-constraints use constraints
                                                     consequent-constraints
@@ -1209,7 +1210,11 @@
   (init-var-constraints component)
   ;; Previous results can confuse propagation and may loop forever
   (do-blocks (block component)
-    (setf (block-out block) nil))
+    (setf (block-out block) nil)
+    (let ((last (block-last block)))
+      (when (if-p last)
+        (setf (if-alternative-constraints last) nil)
+        (setf (if-consequent-constraints last) nil))))
   (setf (block-out (component-head component)) (make-conset))
   (dolist (block (find-and-propagate-constraints component))
     (unless (block-delete-p block)

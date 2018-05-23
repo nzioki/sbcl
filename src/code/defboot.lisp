@@ -170,7 +170,7 @@ evaluated as a PROGN."
 ;;;; DEFUN
 
 ;;; Should we save the inline expansion of the function named NAME?
-(defun inline-fun-name-p (name)
+(defun save-inline-expansion-p (name)
   (or
    ;; the normal reason for saving the inline expansion
    (let ((inlinep (info :function :inlinep name)))
@@ -187,7 +187,45 @@ evaluated as a PROGN."
    ;; what should we do with the old inline expansion when we see the
    ;; new DEFUN? Overwriting it with the new definition seems like
    ;; the only unsurprising choice.
-   (info :function :inline-expansion-designator name)))
+   (nth-value 1 (fun-name-inline-expansion name))))
+
+(defun extract-dx-args (lambda-list decl-forms)
+  (let (dx-decls)
+    (dolist (form decl-forms)
+      (dolist (expr (cdr form))
+        (when (eq (car expr) 'dynamic-extent)
+          (setf dx-decls (union dx-decls (cdr expr))))))
+    (unless dx-decls
+      (return-from extract-dx-args nil))
+    ;; TODO: in addition to ":SILENT T" supressing warnings, PARSE-LAMBDA-LIST
+    ;; needs to allow :CONDITION-CLASS = NIL to ask that no errors be signaled.
+    ;; An indicator can be returned so that at worst the code below does nothing.
+    (multiple-value-bind (llks required optional rest key aux)
+        (parse-lambda-list lambda-list :silent t)
+      (declare (ignore llks rest))
+      ;; We enforce uniqueness of the symbols in the union of REQUIRED,
+      ;; OPTIONAL, REST, KEY (including any supplied-p variables),
+      ;; but there may be an AUX binding shadowing a lambda binding.
+      ;; This affects something like:
+      ;;  (LAMBDA (X &AUX (X (MAKE-FOO X))) (DECLARE (DYNAMIC-EXTENT X))
+      ;; in which the decl does not pertain to argument X.
+      (let ((arg-index 0) caller-dxable)
+        (labels ((examine (sym dx-note)
+                   (when (and (member sym dx-decls) (not (shadowed-p sym)))
+                     (push dx-note caller-dxable))
+                   (incf arg-index))
+                 (shadowed-p (sym)
+                   (dolist (binding aux)
+                     (when (eq (if (listp binding) (car binding) binding) sym)
+                       (return t)))))
+          (dolist (spec required)
+            (examine spec arg-index))
+          (dolist (spec optional)
+            (examine (if (listp spec) (car spec) spec) arg-index))
+          (dolist (spec key)
+            (multiple-value-bind (keyword var) (parse-key-arg-spec spec)
+              (examine var keyword))))
+        (nreverse caller-dxable)))))
 
 (sb!xc:defmacro defun (&environment env name lambda-list &body body)
   "Define a function at top level."
@@ -201,10 +239,12 @@ evaluated as a PROGN."
            (lambda-guts `(,@decls (block ,(fun-name-block-name name) ,@forms)))
            (lambda `(lambda ,lambda-list ,@lambda-guts))
            (named-lambda `(named-lambda ,name ,lambda-list
-                            ,@(when doc (list doc)) ,@lambda-guts))
+                           ,@(when *top-level-form-p* '((declare (sb!c::top-level-form))))
+                           ,@(when doc (list doc)) ,@lambda-guts))
+           (dxable-args (extract-dx-args lambda-list decls))
            (inline-thing
             (or (sb!kernel::defstruct-generated-defn-p name lambda-list body)
-                (when (inline-fun-name-p name)
+                (when (save-inline-expansion-p name)
                   ;; we want to attempt to inline, so complain if we can't
                   (acond ((sb!c:maybe-inline-syntactic-closure lambda env)
                           (list 'quote it))
@@ -216,9 +256,10 @@ evaluated as a PROGN."
                           nil))))))
       `(progn
          (eval-when (:compile-toplevel)
-           (sb!c:%compiler-defun ',name ,inline-thing t))
-         (%defun ',name ,named-lambda (sb!c:source-location)
-                 ,@(and inline-thing (list inline-thing)))
+           (sb!c:%compiler-defun ',name t ,inline-thing ',dxable-args))
+         (%defun ',name ,named-lambda
+                 ,@(when (or inline-thing dxable-args) (list inline-thing))
+                 ,@(when dxable-args `(',dxable-args)))
          ;; This warning, if produced, comes after the DEFUN happens.
          ;; When compiling, there's no real difference, but when interpreting,
          ;; if there is a handler for style-warning that nonlocally exits,
@@ -229,23 +270,6 @@ evaluated as a PROGN."
                  (sb!c::warn-if-setf-macro ',name))
                ',name))))))
 
-#-sb-xc-host
-(defun %defun (name def source-location &optional inline-lambda)
-  (declare (type function def))
-  ;; should've been checked by DEFMACRO DEFUN
-  (aver (legal-fun-name-p name))
-  (sb!c:%compiler-defun name inline-lambda nil)
-  (when (fboundp name)
-    (warn 'redefinition-with-defun
-          :name name :new-function def :new-location source-location))
-  (setf (fdefinition name) def)
-  ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
-  ;; also checks package locks. By doing this here we let (SETF
-  ;; FDEFINITION) do the load-time package lock checking before
-  ;; we frob any existing inline expansions.
-  (sb!c::%set-inline-expansion name nil inline-lambda)
-  (sb!c::note-name-defined name :function)
-  name)
 
 ;;;; DEFVAR and DEFPARAMETER
 
@@ -281,30 +305,19 @@ evaluated as a PROGN."
                     ,@(and docp
                            `(',doc)))))
 
+(defun %compiler-defglobal (name always-boundp value assign-it-p)
+  (sb!xc:proclaim `(global ,name))
+  (when assign-it-p
+    (set-symbol-global-value name value))
+  (sb!c::process-variable-declaration
+   name 'always-bound
+   ;; don't "weaken" the proclamation if it's in fact always bound now
+   (if (eq (info :variable :always-bound name) :always-bound)
+       :always-bound
+       always-boundp)))
+
 (defun %compiler-defvar (var)
   (sb!xc:proclaim `(special ,var)))
-
-#-sb-xc-host
-(defun %defvar (var source-location &optional (val nil valp) (doc nil docp))
-  (%compiler-defvar var)
-  (when (and valp
-             (not (boundp var)))
-    (set var val))
-  (when docp
-    (setf (fdocumentation var 'variable) doc))
-  (when source-location
-    (setf (info :source-location :variable var) source-location))
-  var)
-
-#-sb-xc-host
-(defun %defparameter (var val source-location &optional (doc nil docp))
-  (%compiler-defvar var)
-  (set var val)
-  (when docp
-    (setf (fdocumentation var 'variable) doc))
-  (when source-location
-    (setf (info :source-location :variable var) source-location))
-  var)
 
 ;;;; iteration constructs
 
@@ -654,26 +667,21 @@ evaluated as a PROGN."
     (flet ((const-cons (test handler)
              ;; If possible, render HANDLER as a load-time constant so that
              ;; consing the test and handler is also load-time constant.
-             (let ((name (when (typep handler
-                                      '(cons (member function quote)
-                                        (cons symbol null)))
-                           (cadr handler))))
-               (cond ((or (not name)
-                          (assq name (local-functions))
-                          (and (eq (car handler) 'function)
+             (let ((quote (car handler))
+                   (name (cadr handler)))
+               (cond ((and (eq quote 'function)
+                           (or (assq name (local-functions))
                                (sb!c::fun-locally-defined-p name env)))
                       `(cons ,(case (car test)
                                 ((named-lambda function) test)
                                 (t `(load-time-value ,test t)))
-                             ,(locally
-                                  ;; Regardless of lexical policy, never allow
-                                  ;; a non-callable into handler-clusters.
-                                  (declare (optimize (safety 3)))
-                                `(the (function-designator (condition)) ,handler))))
+                             (the (function-designator (condition)) ,handler)))
                      ((info :function :info name) ; known
                       ;; This takes care of CONTINUE,ABORT,MUFFLE-WARNING.
                       ;; #' will be evaluated in the null environment.
-                      `(load-time-value (cons ,test (the (function-designator (condition)) #',name)) t))
+                      `(load-time-value
+                        (cons ,test (the (function-designator (condition)) #',name))
+                        t))
                      (t
                       ;; For each handler specified as #'F we must verify
                       ;; that F is fboundp upon entering the binding scope.
@@ -688,7 +696,8 @@ evaluated as a PROGN."
                                         (find-or-create-fdefn ',name) t))))
                       ;; Resolve to an fdefn at load-time.
                       `(load-time-value
-                        (cons ,test (find-or-create-fdefn (the (function-designator (condition)) ',name)))
+                        (cons ,test (find-or-create-fdefn
+                                     (the (function-designator (condition)) ',name)))
                         t)))))
 
            (const-list (items)
@@ -747,19 +756,31 @@ evaluated as a PROGN."
                        `(named-lambda (%handler-bind ,type) (c)
                           (declare (optimize (sb!c::verify-arg-count 0)))
                           (typep c ',type))))
-                ;; Compute the handler expression
-                (let ((lexpr (typecase handler
-                               ((cons (eql lambda)) handler)
-                               ((cons (eql function)
-                                      (cons (cons (eql lambda)) null))
-                                (cadr handler)))))
-                  (if lexpr
-                      (let ((name (let ((sb!xc:*gensym-counter*
-                                         (length (cluster-entries))))
-                                    (sb!xc:gensym "H"))))
-                        (local-functions `(,name ,@(rest lexpr)))
-                        `#',name)
-                      handler))))))))
+                ;; Compute the handler expression.
+                ;; Unless the expression is ({FUNCTION|QUOTE} <sym>), then create a
+                ;; new local function. If the supplied handler is spelled
+                ;; (LAMBDA ...) or #'(LAMBDA ...), then the local function is the
+                ;; lambda but named. If not spelled as such, the function funcalls
+                ;; the user's sexpr so that the compiler enforces callable-ness.
+                (if (typep handler '(cons (member function quote) (cons symbol null)))
+                    handler
+                    (let ((lexpr
+                           (typecase handler
+                             ;; These two are merely expansion prettifiers,
+                             ;; and not strictly necessary.
+                             ((cons (eql function) (cons (cons (eql lambda)) null))
+                              (cadr handler))
+                             ((cons (eql lambda))
+                              handler)
+                             (t
+                              ;; Should be (THE (FUNCTION-DESIGNATOR (CONDITION)))
+                              ;; but the cast kills DX allocation.
+                              `(lambda (c) (funcall ,handler c)))))
+                          (name (let ((sb!xc:*gensym-counter*
+                                       (length (cluster-entries))))
+                                  (sb!xc:gensym "H"))))
+                      (local-functions `(,name ,@(rest lexpr)))
+                      `#',name))))))))
 
       `(dx-flet ,(local-functions)
          ,@(dummy-forms)

@@ -79,7 +79,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 900
-    ;; FIXME: this should be in the *elsewhere* segment.
+    ;; FIXME: this should be in the :elsewhere segment.
     ;; For lack of an architecture-independent way to emit
     ;; a jump, it's in the regular segment which pollutes the
     ;; instruction pipe with undecodable junk (the sc-numbers).
@@ -131,15 +131,40 @@
     sb!c::%odd-key-args-error nil)
   (def unknown-key-arg-error unknown-key-arg-error
     sb!c::%unknown-key-arg-error t key)
-  (def nil-fun-returned-error nil-fun-returned-error nil nil fun))
+  (def nil-fun-returned-error nil-fun-returned-error nil nil fun)
+  (def failed-aver sb!kernel::failed-aver-error
+    sb!impl::%failed-aver
+    nil form))
 
+
+(defun emit-internal-error (kind code values &key trap-emitter
+                                                  (compact-error-trap t))
+  (let ((trap-number (if (and (eq kind error-trap)
+                              compact-error-trap)
+                         (+ kind code)
+                         kind)))
+    (if trap-emitter
+        (funcall trap-emitter trap-number)
+        (inst byte trap-number)))
+  (unless (and (eq kind error-trap)
+               compact-error-trap)
+    (inst byte code))
+  (encode-internal-error-args
+   (mapcar (lambda (tn)
+             (cond ((and (tn-p tn) (sc-is tn immediate))
+                    (aver (typep (tn-value tn) '(or symbol layout)))
+                    (make-sc+offset constant-sc-number (tn-offset tn)))
+                   (t
+                    tn)))
+           values)))
+
 (defun encode-internal-error-args (values)
-  (with-adjustable-vector (vector)
+  (sb!c::with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset
        (if (tn-p where)
-           (make-sc-offset (sc-number (tn-sc where)) (or (tn-offset where) 0))
+           (make-sc+offset (sc-number (tn-sc where)) (or (tn-offset where) 0))
            where)
        vector))
     (loop for octet across vector do (inst byte octet))))

@@ -1006,6 +1006,14 @@
              (progn
                ,@forms))))))))
 
+;; FIXME: really should be an aspect of the lexical environment,
+;; but LEXENVs don't know whether they are toplevel or not.
+(defun has-toplevelness-decl (lambda-expr)
+  (dolist (expr (cddr lambda-expr)) ; Skip over (LAMBDA (ARGS))
+    (cond ((equal expr '(declare (top-level-form))) (return t))
+          ((typep expr '(or (cons (eql declare)) string))) ; DECL | DOCSTRING
+          (t (return nil)))))
+
 ;;; helper for LAMBDA-like things, to massage them into a form
 ;;; suitable for IR1-CONVERT-LAMBDA.
 (defun ir1-convert-lambdalike (thing
@@ -1029,6 +1037,8 @@
                                           :maybe-add-debug-catch t
                                           :source-name name))
                  (info (info :function :info name)))
+             (when (has-toplevelness-decl lambda-expression)
+               (setf (functional-top-level-defun-p res) t))
              (assert-global-function-definition-type name res)
              (push res (defined-fun-functionals defined-fun-res))
              (unless (or
@@ -1260,14 +1270,19 @@
     fun))
 
 ;;; Store INLINE-LAMBDA as the inline expansion of NAME.
-(defun %set-inline-expansion (name defined-fun inline-lambda)
+(defun %set-inline-expansion (name defined-fun inline-lambda dxable-args)
   (cond ((member inline-lambda '(:accessor :predicate))
-         ;; Special-case that implies a structure-related source-transform.
-         (when (info :function :inline-expansion-designator name)
-           ;; Any inline expansion that existed can't be useful.
-           (warn "structure ~(~A~) ~S clobbers inline function"
-                 inline-lambda name))
-         (setq inline-lambda nil)) ; will be cleared below
+         ;; This special case implies a structure-related source transform.
+         ;; Warn if blowing away a previously existing inline expansion that
+         ;; came from an ordinary DEFUN that recorded an expansion.
+         (let ((old (info :function :inlining-data name)))
+           ;; KLUDGE: This is like (NTH-VALUE 1 (FUN-NAME-INLINE-EXPANSION))
+           ;; but expressed in a way that doesn't crash in cold-init.
+           (when (or (typep old 'inlining-data) (consp old))
+             ;; Any inline expansion that existed can't be useful.
+             (warn "structure ~(~A~) ~S clobbers inline function"
+                   inline-lambda name))
+           (setq inline-lambda nil))) ; will be cleared below
         (t
          ;; Warn if stomping on a structure predicate or accessor
          ;; whether or not we are about to install an inline-lambda.
@@ -1279,21 +1294,46 @@
              ;; - and one because the source-transform is erased.
              (warn "redefinition of ~S clobbers structure ~:[accessor~;predicate~]"
                    name (eq (cdr info) :predicate))))))
-  (cond (inline-lambda
-         (setf (info :function :inline-expansion-designator name)
-               inline-lambda)
-         (when defined-fun
-           (setf (defined-fun-inline-expansion defined-fun)
-                 inline-lambda)))
-        (t
-         (clear-info :function :inline-expansion-designator name))))
+  ;; says CLHS: "Only an implementation that was willing to be responsible
+  ;; for recompiling f if the definition of g changed incompatibly could
+  ;; legitimately stack allocate the list argument to g in f."
+  ;; Yeah, well, we're not going be responsible for bupkis.
+  ;; If you want to do something dangerous, then do it.
+  ;; Of course it would be nice NOT to warn when we haven't actually baked-in
+  ;; any assumptions about callees, but I don't feel like adding more metadata
+  ;; to track when we assumed something.
+  (let ((old (fun-name-dx-args name)))
+    (when (and old (not (subsetp old dxable-args)))
+      (warn "redefinition of ~S with differing DYNAMIC-EXTENT declarations ~
+is potentially harmful to any already-compiled callers using (SAFETY 0)."
+            name)))
+  (if (or inline-lambda dxable-args)
+      (setf (info :function :inlining-data name)
+            (if dxable-args
+                (if inline-lambda
+                    (make-inlining-data inline-lambda dxable-args)
+                    (make-dxable-args dxable-args))
+                inline-lambda))
+      (clear-info :function :inlining-data name))
+  (when (and inline-lambda defined-fun)
+    (setf (defined-fun-inline-expansion defined-fun)
+          inline-lambda)))
 
 ;;; the even-at-compile-time part of DEFUN
 ;;;
-;;; The INLINE-LAMBDA is either the symbol :ACCESSOR, meaning that
-;;; the function is a structure accessor, or a LAMBDA-WITH-LEXENV,
-;;; or NIL if there is no inline expansion.
-(defun %compiler-defun (name inline-lambda compile-toplevel)
+;;; The INLINE-LAMBDA is either a symbol in {:ACCESSOR, :PREDICATE} meaning
+;;; that the function is a structure accessor or predicate respectively,
+;;; or a LAMBDA-WITH-LEXENV, or NIL if there is no inline expansion.
+(defun %compiler-defun (name compile-toplevel inline-lambda
+                             &optional (dxable-args nil dxable-args-supplied-p))
+  (unless dxable-args-supplied-p
+    ; TEMPORARY KLUDGE to avoid compilation failure in hu.hu.dwim.delico
+    ; which causes a cascade of problems in quicklisp.
+    ; The call must match "(sb-c:%compiler-defun {x} nil t)"
+    (aver (and (not compile-toplevel) (eq inline-lambda t)))
+    ; It was inside (EVAL-WHEN (:compile-toplevel) ...) so now fix the
+    ; arguments to reflect that.
+    (setq compile-toplevel t inline-lambda nil))
   (let ((defined-fun nil)) ; will be set below if we're in the compiler
     (when compile-toplevel
       (with-single-package-locked-error
@@ -1309,7 +1349,7 @@
         (if (member name *fun-names-in-this-file* :test #'equal)
             (warn 'duplicate-definition :name name)
             (push name *fun-names-in-this-file*)))
-      (%set-inline-expansion name defined-fun inline-lambda))
+      (%set-inline-expansion name defined-fun inline-lambda dxable-args))
 
     (become-defined-fun-name name)
 
@@ -1340,14 +1380,13 @@
 ;; and not flat-out wrong, though there is indeed some waste in the fasl.
 ;;
 ;; KIND is the globaldb KIND of this NAME
-(defun %compiler-defmacro (kind name compile-toplevel)
-  (when compile-toplevel
-    (let ((name-key `(,kind ,name)))
-      (when (boundp '*lexenv*)
-        (aver (producing-fasl-file))
-        (if (member name-key *fun-names-in-this-file* :test #'equal)
-            (compiler-style-warn 'same-file-redefinition-warning :name name)
-            (push name-key *fun-names-in-this-file*))))))
+(defun %compiler-defmacro (kind name)
+  (let ((name-key `(,kind ,name)))
+    (when (boundp '*lexenv*)
+      (aver (producing-fasl-file))
+      (if (member name-key *fun-names-in-this-file* :test #'equal)
+          (compiler-style-warn 'same-file-redefinition-warning :name name)
+          (push name-key *fun-names-in-this-file*)))))
 
 
 ;;; Entry point utilities

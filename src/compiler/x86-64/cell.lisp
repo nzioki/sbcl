@@ -21,42 +21,39 @@
   (:generator 1
    (loadw result object offset lowtag)))
 
+;; This vop is selected by name from vm-ir2tran for converting any
+;; setter or setf'er that is defined by 'objdef'
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg immediate)))
-  (:temporary (:sc descriptor-reg) temp)
   (:info name offset lowtag)
  ;(:ignore name)
   (:results)
   (:generator 1
     (progn name) ; ignore it
-    (generate-set-slot object value temp offset lowtag)))
-
-(defun generate-set-slot (object value temp offset lowtag &optional zeroed)
-    (if (sc-is value immediate)
-        (move-immediate (make-ea :qword
-                                 :base object
-                                 :disp (- (* offset n-word-bytes)
-                                          lowtag))
-                        (encode-value-if-immediate value)
-                        temp zeroed)
-        ;; Else, value not immediate.
-        (storew value object offset lowtag)))
+    (gen-cell-set (make-ea-for-object-slot object offset lowtag) value nil)))
 
 ;; INIT-SLOT has to know about the :COMPACT-INSTANCE-HEADER feature.
 (define-vop (init-slot set-slot)
   (:info name dx-p offset lowtag)
   (:generator 1
     (progn name dx-p)
-    (if (or #!+compact-instance-header
-            (and (eq name '%make-structure-instance) (eql offset :layout)))
+    (cond #!+compact-instance-header
+          ((and (eq name '%make-structure-instance) (eql offset :layout))
         ;; The layout is in the upper half of the header word.
-        (inst mov
+           (inst mov
               (make-ea :dword :base object :disp (- 4 instance-pointer-lowtag))
               (if (sc-is value immediate)
                   (make-fixup (tn-value value) :layout)
-                  (reg-in-size value :dword)))
-        (generate-set-slot object value temp offset lowtag (not dx-p)))))
+                  (reg-in-size value :dword))))
+          ((sc-is value immediate)
+           (move-immediate (make-ea :qword
+                                    :base object
+                                    :disp (- (* offset n-word-bytes) lowtag))
+                           (encode-value-if-immediate value)
+                           temp-reg-tn (not dx-p)))
+          (t
+           (storew value object offset lowtag))))) ; Else, value not immediate.
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg) :to :eval)
@@ -77,13 +74,28 @@
 
 ;;;; symbol hacking VOPs
 
-(define-vop (%set-symbol-global-value cell-set)
-  (:variant symbol-value-slot other-pointer-lowtag))
+(define-vop (%set-symbol-global-value)
+  (:args (object :scs (descriptor-reg immediate))
+         (value :scs (descriptor-reg any-reg immediate)))
+  (:policy :fast-safe)
+  (:generator 4
+    (gen-cell-set (cond ((sc-is object immediate)
+                         (symbol-slot-ea (tn-value object) symbol-value-slot))
+                        (t
+                         (make-ea-for-object-slot object symbol-value-slot
+                                                  other-pointer-lowtag)))
+                  value nil)))
 
-(define-vop (fast-symbol-global-value cell-ref)
-  (:variant symbol-value-slot other-pointer-lowtag)
+(define-vop (fast-symbol-global-value)
+  (:args (object :scs (descriptor-reg immediate)))
+  (:results (value :scs (descriptor-reg any-reg)))
   (:policy :fast)
-  (:translate sym-global-val))
+  (:translate sym-global-val)
+  (:generator 4
+    (cond ((sc-is object immediate)
+           (inst mov value (symbol-slot-ea (tn-value object) symbol-value-slot)))
+          (t
+           (loadw value object symbol-value-slot other-pointer-lowtag)))))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
@@ -127,10 +139,7 @@
                       no-tls-value-marker-widetag)
                 (inst cmov :e cell symbol))) ; now possibly get the symbol
            (access-wired-tls-val (sym) ; SYM is a symbol
-             `(make-ea :qword :disp (load-time-tls-offset ,sym)
-                       :base thread-base-tn))
-           (access-tls-val (index size)
-             `(make-ea ,size :base thread-base-tn :index ,index :scale 1))
+             `(thread-tls-ea (load-time-tls-offset ,sym)))
            (access-value-slot (sym &optional (size :qword)) ; SYM is a TN
              (ecase size
                (:dword `(make-ea-for-object-slot-half
@@ -191,18 +200,14 @@
     ;; TODO: SET could be shorter for any known wired-tls symbol.
     (define-vop (set)
       (:args (symbol :scs (descriptor-reg))
-             (value :scs (descriptor-reg any-reg)
-                    :load-if (or (not (sc-is value immediate))
-                                 (not (typep (encode-value-if-immediate value)
-                                             '(or (signed-byte 32) fixup))))))
+             (value :scs (descriptor-reg any-reg immediate)))
       (:temporary (:sc descriptor-reg) cell)
       (:generator 4
         ;; Compute the address into which to store. CMOV can only move into
         ;; a register, so we can't conditionally move into the TLS and
         ;; conditionally move in the opposite flag sense to the symbol.
         (compute-virtual-symbol)
-        (inst mov (access-value-slot cell)
-              (encode-value-if-immediate value))))
+        (gen-cell-set (access-value-slot cell) value nil)))
 
     ;; This code is tested by 'codegen.impure.lisp'
     (defun emit-symeval (value symbol symbol-reg check-boundp vop)
@@ -230,17 +235,17 @@
                      ;; slot index 1/2 is the high half of the header word.
                      (symbol-slot-ea known-symbol 1/2 :dword))
                ;; read the TLS value using that index
-               (inst mov value (access-tls-val value :qword)))
+               (inst mov value (thread-tls-ea value :qword)))
                (constant
 
                ;; These reads are inextricably data-dependent
                (inst mov symbol-reg symbol) ; = MOV REG, [RIP-N]
                (inst mov (reg-in-size value :dword) (tls-index-of symbol-reg))
-               (inst mov value (access-tls-val value :qword)))))
+               (inst mov value (thread-tls-ea value :qword)))))
 
             (t ; SYMBOL-VALUE of a random symbol
              (inst mov (reg-in-size symbol-reg :dword) (tls-index-of symbol))
-             (inst mov value (access-tls-val symbol-reg :qword))
+             (inst mov value (thread-tls-ea symbol-reg :qword))
              (setq symbol-reg symbol)))
 
           ;; Load the global value if the TLS value didn't exist
@@ -305,7 +310,7 @@
       (:temporary (:sc dword-reg) temp)
       (:generator 9
         (inst mov temp (tls-index-of object))
-        (inst mov temp (access-tls-val temp :dword))
+        (inst mov temp (thread-tls-ea temp :dword))
         (inst cmp temp no-tls-value-marker-widetag)
         (inst cmov :e temp (access-value-slot object :dword))
         (inst cmp temp unbound-marker-widetag))))
@@ -388,12 +393,13 @@
   (:translate fdefn-makunbound)
   (:args (fdefn :scs (descriptor-reg) :target result))
   (:results (result :scs (descriptor-reg)))
+  (:vop-var vop)
   #!+immobile-code (:temporary (:sc unsigned-reg) temp)
   (:generator 38
     #!+immobile-code
-    (let ((tramp (make-fixup 'undefined-tramp :assembly-routine)))
-     (if sb!c::*code-is-immobile*
-         (inst lea temp tramp)
+    (let ((tramp (make-fixup 'undefined-fdefn :assembly-routine)))
+     (if (sb!c::code-immobile-p vop)
+         (inst lea temp (make-ea :qword :base rip-tn :disp tramp))
          (inst mov temp tramp))
      ;; Compute displacement from the call site
      (inst sub (reg-in-size temp :dword) (reg-in-size fdefn :dword))
@@ -435,12 +441,12 @@
     (inst test (reg-in-size tls-index :dword) (reg-in-size tls-index :dword))
     (inst jmp :ne TLS-INDEX-VALID)
     (inst mov tls-index symbol)
-    (invoke-asm-routine 'call 'alloc-tls-index vop tmp)
+    (invoke-asm-routine 'call 'alloc-tls-index vop)
     TLS-INDEX-VALID
-    (inst mov tmp (make-ea :qword :base thread-base-tn :index tls-index))
+    (inst mov tmp (thread-tls-ea tls-index))
     (storew tmp bsp (- binding-value-slot binding-size))
     (storew tls-index bsp (- binding-symbol-slot binding-size))
-    (inst mov (make-ea :qword :base thread-base-tn :index tls-index) val)))
+    (inst mov (thread-tls-ea tls-index) val)))
 
 (define-vop (bind) ; bind a known symbol
   (:args (val :scs (any-reg descriptor-reg)))
@@ -449,12 +455,11 @@
   (:generator 10
     (inst mov bsp (* binding-size n-word-bytes))
     (inst xadd
-          (make-ea :qword :base thread-base-tn
-                   :disp (ash thread-binding-stack-pointer-slot word-shift))
+          (thread-tls-ea (ash thread-binding-stack-pointer-slot word-shift))
           bsp)
     (let* ((tls-index (load-time-tls-offset symbol))
-           (tls-cell (make-ea :qword :base thread-base-tn :disp tls-index)))
-      ;; Too bad we can't use "XCHG [r12+disp], val" to write the new value
+           (tls-cell (thread-tls-ea tls-index)))
+      ;; Too bad we can't use "XCHG [thread + disp], val" to write new value
       ;; and read the old value in one step. It will violate the constraints
       ;; prescribed in the internal documentation on special binding.
       (inst mov tmp tls-cell)
@@ -489,7 +494,7 @@
     (inst xorpd zero zero)
     (loop for symbol in symbols
           for tls-index = (load-time-tls-offset symbol)
-          for tls-cell = (make-ea :qword :base thread-base-tn :disp tls-index)
+          for tls-cell = (thread-tls-ea tls-index)
           do
           (inst sub bsp (* binding-size n-word-bytes))
 
@@ -540,8 +545,7 @@
     #!-sb-thread
     (storew value symbol symbol-value-slot other-pointer-lowtag)
     #!+sb-thread
-    (inst mov (make-ea :qword :base thread-base-tn :index symbol)
-          value)
+    (inst mov (thread-tls-ea symbol) value)
 
     SKIP
     (inst movapd (make-ea :qword :base bsp) zero)
@@ -575,12 +579,10 @@
 
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg immediate)))
-  (:temporary (:sc unsigned-reg) temp)
+         (value :scs (descriptor-reg any-reg)))
   (:info offset)
   (:generator 4
-     (generate-set-slot object value temp
-                        (+ closure-info-offset offset) fun-pointer-lowtag)))
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -602,13 +604,15 @@
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
+  ;; Explicitly fixnumizing admits a 32-bit left-shift which might encode
+  ;; in 1 less byte. (Other backends return an UNSIGNED-REG here.)
+  (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (inst mov (reg-in-size res :word)
-              (make-ea :word :base struct
-                       :disp (1+ (- instance-pointer-lowtag))))
-    (inst movzx (reg-in-size res :dword) (reg-in-size res :word))))
+    (let ((res (reg-in-size res :dword)))
+      (inst movzx res (make-ea :word :base struct
+                               :disp (1+ (- instance-pointer-lowtag))))
+      (inst shl res n-fixnum-tag-bits))))
 
 #!+compact-instance-header
 (progn
@@ -643,7 +647,7 @@
   instance-pointer-lowtag (any-reg descriptor-reg) * %instance-ref)
 
 (define-full-setter instance-index-set * instance-slots-offset
-  instance-pointer-lowtag (any-reg descriptor-reg) * %instance-set)
+  instance-pointer-lowtag (any-reg descriptor-reg immediate) * %instance-set)
 
 (define-full-compare-and-swap %instance-cas instance
   instance-slots-offset instance-pointer-lowtag
@@ -772,3 +776,75 @@
     (:generator 4
       (inst xadd (make-ea-for-raw-slot object index) diff :lock)
       (move result diff))))
+
+;;;;
+
+(defknown %cons-cas-pair (cons t t t t) (values t t))
+(defknown %vector-cas-pair (simple-vector index t t t t) (values t t))
+;; %INSTANCE-CAS-PAIR only operates on tagged slots (for now)
+(defknown %instance-cas-pair (instance index t t t t) (values t t))
+
+(defun generate-dblcas (memory-operand old-lo old-hi new-lo new-hi
+                        rax rbx rcx rdx result-lo result-hi)
+  (move rax old-lo)
+  (move rdx old-hi)
+  (move rbx new-lo)
+  (move rcx new-hi)
+  (inst cmpxchg16b memory-operand :lock)
+  ;; RDX:RAX hold the actual old contents of memory.
+  ;; Manually analyze result lifetimes to avoid clobbering.
+  (cond ((and (location= result-lo rdx) (location= result-hi rax))
+         (inst xchg rax rdx)) ; unlikely, but possible
+        ((location= result-lo rdx) ; result-hi is not rax
+         (move result-hi rdx) ; move high part first
+         (move result-lo rax))
+        (t                    ; result-lo is not rdx
+         (move result-lo rax) ; move low part first
+         (move result-hi rdx))))
+
+(macrolet
+    ((define-cmpxchg-vop (name memory-operand more-stuff &optional index-arg)
+       `(define-vop (,name)
+          (:policy :fast-safe)
+          ,@more-stuff
+          (:args (object :scs (descriptor-reg) :to :eval)
+                 ,@index-arg
+                 (expected-old-lo :scs (descriptor-reg any-reg) :target eax)
+                 (expected-old-hi :scs (descriptor-reg any-reg) :target edx)
+                 (new-lo :scs (descriptor-reg any-reg) :target ebx)
+                 (new-hi :scs (descriptor-reg any-reg) :target ecx))
+          (:results (result-lo :scs (descriptor-reg any-reg))
+                    (result-hi :scs (descriptor-reg any-reg)))
+          (:temporary (:sc unsigned-reg :offset eax-offset
+                       :from (:argument 2) :to (:result 0)) eax)
+          (:temporary (:sc unsigned-reg :offset edx-offset
+                       :from (:argument 3) :to (:result 0)) edx)
+          (:temporary (:sc unsigned-reg :offset ebx-offset
+                       :from (:argument 4) :to (:result 0)) ebx)
+          (:temporary (:sc unsigned-reg :offset ecx-offset
+                       :from (:argument 5) :to (:result 0)) ecx)
+          (:generator 7
+           (generate-dblcas ,memory-operand
+                            expected-old-lo expected-old-hi new-lo new-hi
+                            eax ebx ecx edx result-lo result-hi)))))
+  (define-cmpxchg-vop compare-and-exchange-pair
+      (make-ea :dword :base object :disp (- list-pointer-lowtag))
+      ((:translate %cons-cas-pair)))
+  (define-cmpxchg-vop compare-and-exchange-pair-indexed
+      (make-ea :dword :base object :disp offset :index index
+                      :scale (ash n-word-bytes (- n-fixnum-tag-bits)))
+      ((:variant-vars offset))
+      ((index :scs (descriptor-reg any-reg) :to :eval))))
+
+;; The CPU requires 16-byte alignment for the memory operand.
+;; A vector's data portion starts on a 16-byte boundary,
+;; so any even numbered index is OK.
+(define-vop (%vector-cas-pair compare-and-exchange-pair-indexed)
+  (:translate %vector-cas-pair)
+  (:variant (- (* n-word-bytes vector-data-offset) other-pointer-lowtag)))
+
+;; Here you specify an odd numbered slot, otherwise get a bus error.
+;; An instance's first user-visible slot at index 1 is 16-byte-aligned.
+(define-vop (%instance-cas-pair compare-and-exchange-pair-indexed)
+  (:translate %instance-cas-pair)
+  (:variant (- (* n-word-bytes instance-slots-offset) instance-pointer-lowtag)))

@@ -102,11 +102,10 @@
          (regnum (ldb (byte 5 0) op)))
     (declare (type system-area-pointer pc))
     (cond ((= op (logior (ash 3 10) (ash 6 5)))
-           (let ((error-number (sap-ref-8 pc 4)))
-             (values error-number
-                     (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
+           (let ((trap-number (sap-ref-8 pc 3)))
+             (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
           ((and (= (ldb (byte 6 10) op) 3) ;; twi
-                (or (= regnum #.(sc-offset-offset arg-count-sc))
+                (or (= regnum #.(sc+offset-offset arg-count-sc))
                     (= (ldb (byte 5 5) op) 24))) ;; :ne
            ;; Type errors are encoded as
            ;; twi 0 value-register error-code
@@ -116,7 +115,7 @@
                       (= (ldb (byte 6 26) prev) 3) ;; is it twi?
                       (= (ldb (byte 5 21) prev) 0)) ;; is it non-trapping?
                  (values (ldb (byte 16 0) prev)
-                         (list (make-sc-offset any-reg-sc-number
+                         (list (make-sc+offset any-reg-sc-number
                                                (ldb (byte 5 16) prev))))
                  ;; arg-count errors are encoded as
                  ;; twi {:ne :llt :lgt} nargs arg-count

@@ -22,6 +22,7 @@
 
 (defvar *readtable*)
 (declaim (type readtable *readtable*))
+
 (setf (fdocumentation '*readtable* 'variable)
       "Variable bound to current readtable.")
 
@@ -30,7 +31,7 @@
 ;;; WITH-STANDARD-IO-SYNTAX), and should not normally be user-visible.
 ;;; If the initial value is changed from NIL to something more interesting,
 ;;; be sure to update the duplicated definition in "src/code/print.lisp"
-(defglobal *standard-readtable* nil)
+(define-load-time-global *standard-readtable* nil)
 
 ;;; In case we get an error trying to parse a symbol, we want to rebind the
 ;;; above stuff so it's cool.
@@ -739,24 +740,22 @@ standard Lisp readtable when NIL."
 ;;; for functions that want comments to return so that they can look
 ;;; past them. CHAR must not be whitespace.
 (defun read-maybe-nothing (stream char)
-  (truly-the
-   (values bit t) ; avoid a type-check. M-V-CALL is lame
-   (multiple-value-call
-       (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
-         (declare (ignore junk)) ; is this ANSI-specified?
-         (when (and supplied-p start-pos)
-           (funcall (form-tracking-stream-observer stream)
-                    start-pos
-                    (form-tracking-stream-input-char-pos stream) result))
-         (values (if supplied-p 1 0) result))
-     ;; KLUDGE: not capturing anything in the lambda avoids closure consing
-     stream
-     (and (form-tracking-stream-p stream)
-          ;; Subtract 1 because the position points _after_ CHAR.
-          (1- (form-tracking-stream-input-char-pos stream)))
-     (funcall (!cmt-entry-to-function
-               (get-raw-cmt-entry char *readtable*) #'read-token)
-              stream char))))
+  (multiple-value-call
+      (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
+        (declare (ignore junk))         ; is this ANSI-specified?
+        (when (and supplied-p start-pos)
+          (funcall (form-tracking-stream-observer stream)
+                   start-pos
+                   (form-tracking-stream-input-char-pos stream) result))
+        (values (if supplied-p 1 0) result))
+    ;; KLUDGE: not capturing anything in the lambda avoids closure consing
+    stream
+    (and (form-tracking-stream-p stream)
+         ;; Subtract 1 because the position points _after_ CHAR.
+         (1- (form-tracking-stream-input-char-pos stream)))
+    (funcall (!cmt-entry-to-function
+              (get-raw-cmt-entry char *readtable*) #'read-token)
+             stream char)))
 
 (defun read (&optional (stream *standard-input*)
                        (eof-error-p t)
@@ -1744,7 +1743,7 @@ extended <package-name>::<form-in-package> syntax."
 (defun make-float-aux (number divisor float-format stream)
   (handler-case
       (coerce (/ number divisor) float-format)
-    (type-error (c)
+    (arithmetic-error (c)
       (error 'reader-impossible-number-error
              :error c :stream stream
              :format-control "failed to build float from ~a"

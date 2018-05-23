@@ -88,7 +88,7 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
         when (or force-all (logbitp (mod index max-policy-qualities) presence))
         collect
        (list (if (minusp index)
-                 (elt **policy-primary-qualities** (lognot index))
+                 (elt +policy-primary-qualities+ (lognot index))
                  (policy-dependent-quality-name
                   (elt **policy-dependent-qualities** index)))
              (if raw
@@ -113,7 +113,7 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
 ;;; If it is, return the integer identifier for the quality name.
 (defun policy-quality-name-p (x)
   ;; Standard (and non-standard) primary qualities are numbered from -1 down.
-  (or (awhen (position x **policy-primary-qualities** :test #'eq)
+  (or (awhen (position x +policy-primary-qualities+ :test #'eq)
         (lognot it))
       ;; Dependent qualities are numbered from 0 up.
       (position x **policy-dependent-qualities**
@@ -167,8 +167,17 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
 ;;; OPTIMIZE forms have messed with it.
 (defun !policy-cold-init-or-resanify ()
   (setq **baseline-policy**
-        (make-policy (loop for i below n-policy-primary-qualities
-                           sum (ash #b01 (* i 2))))
+        (let ((policy
+               (make-policy (loop for i below n-policy-primary-qualities
+                                  sum (ash #b01 (* i 2))))))
+          ;; If :CONS-PROFILING was requested, then add it to the baseline policy.
+          (when (member :cons-profiling sb!xc:*features*)
+            (alter-policy policy
+                          #-sb-xc (policy-quality-name-p 'instrument-consing)
+                          #+sb-xc #.(policy-quality-name-p 'instrument-consing)
+                          2))
+          policy)
+
         **zero-typecheck-policy**
         (alter-policy (copy-policy **baseline-policy**)
                       #-sb-xc (policy-quality-name-p 'type-check)
@@ -263,8 +272,9 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
 ;;; THING. EXPR is a form which accesses optimization qualities by
 ;;; referring to them by name, e.g. (> SPEED SPACE).
 (defmacro policy (thing expr &optional (coercion-fn '%coerce-to-policy))
+  (declare (notinline identity)) ; constant-folding-error otherwise. (FIXME)
   (let* ((n-policy (make-symbol "P"))
-         (binds (loop for name across **policy-primary-qualities**
+         (binds (loop for name across (identity +policy-primary-qualities+)
                       for index downfrom -1
                       collect `(,name (%policy-quality ,n-policy ,index))))
          (dependent-binds

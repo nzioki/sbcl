@@ -27,7 +27,7 @@
             sb!vm::complex-single-reg sb!vm::complex-double-reg
             sb!vm::tmp-tn sb!vm::zr-tn sb!vm::nsp-offset)))
 
-(setf *disassem-inst-alignment-bytes* 4)
+(defconstant +disassem-inst-alignment-bytes+ 4)
 
 
 (defconstant-eqx +conditions+
@@ -54,11 +54,6 @@
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
-
-;;; Set assembler parameters. (In CMU CL, this was done with
-;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf *assem-scheduler-p* nil))
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
@@ -1489,7 +1484,7 @@
                       (fp-reg-type rt1)))))
     (when fp
       (setf size (+ opc 2)))
-    (assert (not (ldb-test (byte size 0) offset)))
+    (aver (not (ldb-test (byte size 0) offset)))
     (emit-ldr-str-pair segment opc v
                        (ecase mode
                          (:post-index #b01)
@@ -1613,13 +1608,13 @@
          (t
           (emit-back-patch segment 4
                            (cond (label
-                                  (assert (label-p label))
+                                  (aver (label-p label))
                                   (lambda (segment posn)
                                     (emit-cond-branch segment
                                                       (ash (- (label-position label) posn) -2)
                                                       (conditional-opcode cond-or-label))))
                                  (t
-                                  (assert (label-p cond-or-label))
+                                  (aver (label-p cond-or-label))
                                   (lambda (segment posn)
                                     (emit-uncond-branch segment
                                                         0
@@ -1691,7 +1686,7 @@
 (define-instruction cbz (segment rt label)
   (:printer compare-branch-imm ((op 0)))
   (:emitter
-   (assert (label-p label))
+   (aver (label-p label))
    (emit-back-patch segment 4
                     (lambda (segment posn)
                       (emit-compare-branch-imm segment
@@ -1703,7 +1698,7 @@
 (define-instruction cbnz (segment rt label)
   (:printer compare-branch-imm ((op 1)))
   (:emitter
-   (assert (label-p label))
+   (aver (label-p label))
    (emit-back-patch segment 4
                     (lambda (segment posn)
                       (emit-compare-branch-imm segment
@@ -1731,7 +1726,7 @@
 (define-instruction tbz (segment rt bit label)
   (:printer test-branch-imm ((op 0)))
   (:emitter
-   (assert (label-p label))
+   (aver (label-p label))
    (check-type bit (integer 0 63))
    (emit-back-patch segment 4
                     (lambda (segment posn)
@@ -1745,7 +1740,7 @@
 (define-instruction tbnz (segment rt bit label)
   (:printer test-branch-imm ((op 1)))
   (:emitter
-   (assert (label-p label))
+   (aver (label-p label))
    (check-type bit (integer 0 63))
    (emit-back-patch segment 4
                     (lambda (segment posn)
@@ -1798,8 +1793,8 @@
   (rd :field (byte 5 0) :type 'x-reg))
 
 (defun emit-pc-relative-inst (op segment rd label &optional (offset 0))
-  (assert (label-p label))
-  (assert (register-p rd))
+  (aver (label-p label))
+  (aver (register-p rd))
   (emit-back-patch segment 4
                    (lambda (segment posn)
                      (let ((offset (+ (- (label-position label) posn)
@@ -1965,7 +1960,7 @@
   `(define-instruction ,name (segment rn rm)
      (:printer fp-compare ((op ,op)))
      (:printer fp-compare ((op ,op) (z 1) (type 0))
-               '(:name :tab rn ", " 0s0))
+               '(:name :tab rn ", " 0f0))
      (:printer fp-compare ((op ,op) (z 1) (type 1))
                '(:name :tab rn ", " 0d0))
      (:emitter
@@ -2289,6 +2284,7 @@
 
 (define-instruction compute-code (segment code lip object-label)
   (:vop-var vop)
+  (:declare (ignore object-label))
   (:emitter
    (emit-compute segment vop code lip
                  (lambda (position &optional magic-value)
@@ -2561,16 +2557,20 @@
   (stable-sort constants #'> :key (lambda (constant)
                                     (size-nbyte (caar constant)))))
 
-(defun emit-inline-constant (constant label)
+(defun emit-inline-constant (section constant label)
   (let* ((type (car constant))
          (size (size-nbyte type)))
-    (emit-alignment (integer-length (1- size)))
-    (emit-label label)
-    (let ((val (cdr constant)))
-      (case type
-        (:fixup
-         (inst word (apply #'make-fixup val)))
-        (t
-         (loop repeat size
-               do (inst byte (ldb (byte 8 0) val))
-                  (setf val (ash val -8))))))))
+    (emit section
+          `(.align ,(integer-length (1- size)))
+          label
+          (let ((val (cdr constant)))
+            (case type
+              (:fixup
+               ;; Use the WORD emitter which knows how to emit fixups
+               `(|word| ,(apply #'make-fixup val)))
+              (t
+               ;; Could add pseudo-ops for .WORD, .INT, .QUAD, .OCTA just like gcc has.
+               ;; But it works fine to emit as a sequence of bytes
+               `(.byte ,@(loop repeat size
+                               collect (prog1 (ldb (byte 8 0) val)
+                                         (setf val (ash val -8)))))))))))

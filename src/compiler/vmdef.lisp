@@ -21,7 +21,7 @@
 ;;; Return the SC structure, SB structure or SC number corresponding
 ;;; to a name, or die trying.
 (defun sc-or-lose (x)
-  (the sc
+  (the storage-class
        (or (gethash x *backend-sc-names*)
            (error "~S is not a defined storage class." x))))
 (defun sb-or-lose (x)
@@ -44,7 +44,7 @@
 ;;; Compute at compiler load time the costs for moving between all SCs that
 ;;; can be loaded from FROM-SC and to TO-SC given a base move cost Cost.
 (defun compute-move-costs (from-sc to-sc cost)
-  (declare (type sc from-sc to-sc) (type index cost))
+  (declare (type storage-class from-sc to-sc) (type index cost))
   (let ((to-scn (sc-number to-sc))
         (from-costs (sc-load-costs from-sc)))
     (dolist (dest-sc (cons to-sc (sc-alternate-scs to-sc)))
@@ -73,7 +73,7 @@
 ;;; Return true if SC is either one of PTYPE's SC's, or one of those
 ;;; SC's alternate or constant SCs.
 (defun sc-allowed-by-primitive-type (sc ptype)
-  (declare (type sc sc) (type primitive-type ptype))
+  (declare (type storage-class sc) (type primitive-type ptype))
   (let ((scn (sc-number sc)))
     (dolist (allowed (primitive-type-scs ptype) nil)
       (when (eql allowed scn)
@@ -92,8 +92,6 @@
   ;;
   ;; See also the description of VOP-INFO-TARGETS. -- APD, 2002-01-30
   (defconstant max-vop-tn-refs 256))
-
-(defconstant sc-bits (integer-length (1- sc-number-limit)))
 
 ;;; Emit a VOP for TEMPLATE. Arguments:
 ;;; NODE Node for source context.
@@ -141,9 +139,10 @@
         (dotimes (i (length temps))
           (let* ((temp (aref temps i))
                  (tn (if (logbitp 0 temp)
-                         (make-wired-tn nil
-                                        (ldb (byte sc-bits 1) temp)
-                                        (ash temp (- (1+ sc-bits))))
+                         (make-wired-tn
+                          nil
+                          (ldb (byte sb!vm:sc-number-bits 1) temp)
+                          (ash temp (- (1+ sb!vm:sc-number-bits))))
                          (make-restricted-tn nil (ash temp -1))))
                  (write-ref (reference-tn tn t)))
                      ;; KLUDGE: These formulas must be consistent with

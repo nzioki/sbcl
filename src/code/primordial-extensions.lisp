@@ -28,6 +28,14 @@
                          bindings)))
      ,@forms))
 
+;;; like Scheme's named LET
+(defmacro named-let (name binds &body body)
+  (dolist (x binds)
+    (unless (proper-list-of-length-p x 2)
+      (error "malformed NAMED-LET variable spec: ~S" x)))
+  `(labels ((,name ,(mapcar #'first binds) ,@body))
+     (,name ,@(mapcar #'second binds))))
+
 ;; Define "exchanged subtract" So that DECF on a symbol requires no LET binding:
 ;;  (DECF I (EXPR)) -> (SETQ I (XSUBTRACT (EXPR) I))
 ;; which meets the CLHS 5.1.3 requirement to eval (EXPR) prior to reading
@@ -199,7 +207,7 @@
                          (if (consp id)
                              (values (car id) (cdr id))
                              (values id nil))
-                       `(def!constant ,sym ,value ,@docstring))))
+                       `(defconstant ,sym ,value ,@docstring))))
                  identifiers))))
 
 ;;; a helper function for various macros which expect clauses of a
@@ -207,11 +215,8 @@
 ;;;
 ;;; Return true if X is a proper list whose length is between MIN and
 ;;; MAX (inclusive).
+;;; Running time is bounded by MAX for circular inputs.
 (defun proper-list-of-length-p (x min &optional (max min))
-  ;; FIXME: This implementation will hang on circular list
-  ;; structure. Since this is an error-checking utility, i.e. its
-  ;; job is to deal with screwed-up input, it'd be good style to fix
-  ;; it so that it can deal with circular list structure.
   (cond ((minusp max) nil)
         ((null x) (zerop min))
         ((consp x)
@@ -242,22 +247,6 @@
 (defun ensure-list (thing)
   (if (listp thing) thing (list thing)))
 
-;;; Helpers for defining error-signalling NOP's for "not supported
-;;; here" operations.
-(defmacro define-unsupported-fun (name &optional
-                                  (doc "Unsupported on this platform.")
-                                  (control
-                                   "~S is unsupported on this platform ~
-                                    (OS, CPU, whatever)."
-                                   controlp)
-                                  arguments)
-  `(defun ,name (&rest args)
-     ,doc
-     (declare (ignore args))
-     (error 'unsupported-operator
-            :format-control ,control
-            :format-arguments (if ,controlp ',arguments (list ',name)))))
-
 ;;; Anaphoric macros
 (defmacro awhen (test &body body)
   `(let ((it ,test))
@@ -285,3 +274,59 @@
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (sb!c::%defconstant ',name ,value (sb!c:source-location)
                          ,@(and docp `(',doc)))))
+
+(defvar *!removable-symbols* nil)
+
+(defun %defconstant-eqx-value (symbol expr eqx)
+  (declare (type function eqx))
+  (if (boundp symbol)
+      (let ((oldval (symbol-value symbol)))
+        ;; %DEFCONSTANT will give a choice of how to proceeed on error.
+        (if (funcall eqx oldval expr) oldval expr))
+      expr))
+
+;;; generalization of DEFCONSTANT to values which are the same not
+;;; under EQL but under e.g. EQUAL or EQUALP
+;;;
+;;; DEFCONSTANT-EQX is to be used instead of DEFCONSTANT for values
+;;; which are appropriately compared using the function given by the
+;;; EQX argument instead of EQL.
+;;;
+#+sb-xc-host
+(defmacro defconstant-eqx (symbol expr eqx &optional doc)
+  ;; CLISP needs the EVAL-WHEN here, or else the symbol defined is unavailable
+  ;; for later uses within the same file. For instance, in x86-64/vm, defining
+  ;; TEMP-REG-TN as R11-TN would get an error that R11-TN is unbound.
+  ;; We don't want that junk in our expansion, especially as our requirement
+  ;; is to separate the compile-time and load-time effect.
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+       ,@(when doc (list doc)))))
+
+;;; This is the expansion as it should be for us, but notice that this
+;;; recapitulation of the macro is actually not defined at compile-time.
+#-sb-xc-host
+(let ()
+  (defmacro defconstant-eqx (symbol expr eqx &optional doc)
+    `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+       ,@(when doc (list doc)))))
+
+;;; Special variant at cross-compile-time. Face it: the "croak-if-not-EQx" test
+;;; is irrelevant - there can be no pre-existing value to test against.
+;;; The extra magic is that we need to discern between constants simple enough
+;;; to assigned during genesis (cold-load) from those assigned in cold-init.
+;;; This choice informs the compiler how to emit references to the symbol.
+(defvar sb!c::*!const-value-deferred* '())
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (sb!xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
+    (let ((constp (sb!xc:constantp expr)))
+      `(progn
+         (eval-when (:compile-toplevel)
+           (sb!xc:defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx))
+           ,@(unless constp
+               `((push ',symbol sb!c::*!const-value-deferred*))))
+         (eval-when (:load-toplevel)
+           (sb!c::%defconstant ',symbol
+             ,(if constp `',(constant-form-value expr) expr)
+             (sb!c:source-location) ,@(when doc (list doc))))))))

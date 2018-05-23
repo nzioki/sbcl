@@ -50,7 +50,7 @@
                (makunbound '*!cold-init-forms*)))
   #-sb-xc (declare (ignore name)))
 
-;;; !DEFGLOBAL, !DEFPARAMETER and !DEFVAR are named by analogy
+;;; !DEFINE-LOAD-TIME-GLOBAL, !DEFPARAMETER and !DEFVAR are named by analogy
 ;;; with !COLD-INIT-FORMS and (not DEF!FOO) because they are
 ;;; basically additional cold-init-helpers to avoid the tedious sequence:
 ;;;    (!begin-collecting-cold-init-forms)
@@ -65,7 +65,7 @@
              `(defmacro ,wrapper (sym value &optional (doc nil doc-p))
                 `(progn (,',real-name ,sym ,value ,@(if doc-p (list doc)))
                         #-sb-xc-host (sb!fasl::setq-no-questions-asked ,sym ,value)))))
-  (def !defglobal defglobal)
+  (def !define-load-time-global define-load-time-global)
   (def !defparameter defparameter)
   (def !defvar defvar))
 
@@ -109,7 +109,7 @@
 ;;; that would exist in the target system, if exposed more generally.
 ;;; (Among the issues is the very restricted initialization form)
 (defmacro !define-thread-local (name initform &optional docstring)
-  (check-type initform symbol)
+  (check-type initform (or fixnum symbol))
   #!-sb-thread `(progn
                   (eval-when (:compile-toplevel :load-toplevel :execute)
                     (setf (info :variable :always-bound ',name) :always-bound))
@@ -121,6 +121,11 @@
                     (setf (info :variable :always-bound ',name) :always-bound))
                   (defvar ,name ,initform ,docstring)))
 
+;;; Note that this mechanism for creation of thread-locals complements the
+;;; mechanism for initializing variables that affect GC and interrupts.
+;;; Those other thread-locals are defined with an ordinary DEFVAR, but the
+;;; full list of such symbols is enumerated by !PER-THREAD-C-INTERFACE-SYMBOLS
+;;; which specifies both the list and the initial value of each symbol.
 (defvar *!thread-initial-bindings* nil)
 #+sb-xc-host
 (setf (get '!%define-thread-local :sb-cold-funcall-handler/for-effect)

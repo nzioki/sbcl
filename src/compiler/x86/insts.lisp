@@ -18,11 +18,10 @@
             register-p ; FIXME: rename to GPR-P
             make-ea ea-disp width-bits) "SB!VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::*byte-sc-names* sb!vm::*word-sc-names* sb!vm::*dword-sc-names*
-            sb!vm::frame-byte-offset
+  (import '(sb!vm::frame-byte-offset
             sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
 
-(setf *disassem-inst-alignment-bytes* 1)
+(defconstant +disassem-inst-alignment-bytes+ 1)
 
 (deftype reg () '(unsigned-byte 3))
 
@@ -31,63 +30,6 @@
 (defparameter *default-address-size*
   ;; Actually, :DWORD is the only one really supported.
   :dword)
-
-;;; Disassembling x86 code needs to take into account little things
-;;; like instructions that have a byte/word length bit in their
-;;; encoding, prefixes to change the default word length for a single
-;;; instruction, and so on.  Unfortunately, there is no easy way with
-;;; this disassembler framework to handle prefixes that will work
-;;; correctly in all cases, so we copy the x86-64 version which at
-;;; least can handle the code output by the compiler.
-;;;
-;;; Width information for an instruction and whether a segment
-;;; override prefix was seen is stored as an inst-prop on the dstate.
-;;; The inst-props are cleared automatically after each non-prefix
-;;; instruction, must be set by prefilters, and contain a single bit of
-;;; data each (presence/absence).
-
-;;; Returns either an integer, meaning a register, or a list of
-;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component
-;;; may be missing or nil to indicate that it's not used or has the
-;;; obvious default value (e.g., 1 for the index-scale).
-(defun prefilter-reg/mem (dstate mod r/m)
-  (declare (type disassem-state dstate)
-           (type (unsigned-byte 2) mod)
-           (type (unsigned-byte 3) r/m))
-  (cond ((= mod #b11)
-           ;; registers
-           r/m)
-        ((= r/m #b100)
-           ;; sib byte
-           (let ((sib (read-suffix 8 dstate)))
-             (declare (type (unsigned-byte 8) sib))
-             (let ((base-reg (ldb (byte 3 0) sib))
-                   (index-reg (ldb (byte 3 3) sib))
-                   (index-scale (ldb (byte 2 6) sib)))
-               (declare (type (unsigned-byte 3) base-reg index-reg)
-                        (type (unsigned-byte 2) index-scale))
-               (let* ((offset
-                       (case mod
-                         (#b00
-                          (if (= base-reg #b101)
-                              (read-signed-suffix 32 dstate)
-                              nil))
-                         (#b01
-                          (read-signed-suffix 8 dstate))
-                         (#b10
-                          (read-signed-suffix 32 dstate)))))
-                 (list (if (and (= mod #b00) (= base-reg #b101)) nil base-reg)
-                       offset
-                       (if (= index-reg #b100) nil index-reg)
-                       (ash 1 index-scale))))))
-        ((and (= mod #b00) (= r/m #b101))
-           (list nil (read-signed-suffix 32 dstate)) )
-        ((= mod #b00)
-           (list r/m))
-        ((= mod #b01)
-           (list r/m (read-signed-suffix 8 dstate)))
-        (t                            ; (= mod #b10)
-           (list r/m (read-signed-suffix 32 dstate)))))
 
 (defun width-bits (width)
   (ecase width
@@ -101,7 +43,8 @@
 
 (define-arg-type displacement
   :sign-extend t
-  :use-label (lambda (value dstate) (+ (dstate-next-addr dstate) value))
+  :use-label (lambda (value dstate)
+               (ldb (byte 32 0) (+ (dstate-next-addr dstate) value)))
   :printer (lambda (value stream dstate)
              (maybe-note-assembler-routine value nil dstate)
              (print-label value stream dstate)))
@@ -236,11 +179,6 @@
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
-
-;;; Set assembler parameters. (In CMU CL, this was done with
-;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* nil))
 
 (define-arg-type condition-code :printer sb!vm::+condition-name-vec+)
 
@@ -585,11 +523,11 @@
                                              (or (label-position offset)
                                                  0))
                                           other-pointer-lowtag))))
-        (emit-dword segment (or offset 0)))))
+        (emit-dword segment offset))))
 
 (defun emit-relative-fixup (segment fixup)
   (note-fixup segment :relative fixup)
-  (emit-dword segment (or (fixup-offset fixup) 0)))
+  (emit-dword segment (fixup-offset fixup)))
 
 ;;;; the effective-address (ea) structure
 
@@ -606,11 +544,11 @@
 
 (defstruct (ea (:constructor make-ea (size &key base index scale disp))
                (:copier nil))
-  (size nil :type (member :byte :word :dword))
-  (base nil :type (or tn null))
-  (index nil :type (or tn null))
-  (scale 1 :type (member 1 2 4 8))
-  (disp 0 :type (or (unsigned-byte 32) (signed-byte 32) fixup)))
+  (size nil :type (member :byte :word :dword) :read-only t)
+  (base nil :type (or tn null) :read-only t)
+  (index nil :type (or tn null) :read-only t)
+  (scale 1 :type (member 1 2 4 8) :read-only t)
+  (disp 0 :type (or (unsigned-byte 32) (signed-byte 32) fixup) :read-only t))
 (defmethod print-object ((ea ea) stream)
   (cond ((or *print-escape* *print-readably*)
          (print-unreadable-object (ea stream :type t)
@@ -721,43 +659,10 @@
                                                  #b11000000)))
     (emit-ea segment thing op)))
 
-(defun byte-reg-p (thing)
-  (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *byte-sc-names*)
-       t))
-
-(defun byte-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :byte))
-    (tn
-     (and (member (sc-name (tn-sc thing)) *byte-sc-names*) t))
-    (t nil)))
-
-(defun word-reg-p (thing)
-  (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *word-sc-names*)
-       t))
-
-(defun word-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :word))
-    (tn (and (member (sc-name (tn-sc thing)) *word-sc-names*) t))
-    (t nil)))
-
 (defun dword-reg-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *dword-sc-names*)
-       t))
-
-(defun dword-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :dword))
-    (tn
-     (and (member (sc-name (tn-sc thing)) *dword-sc-names*) t))
-    (t nil)))
+       (eq (sb!c:sc-operand-size (tn-sc thing)) :dword)))
 
 (defun register-p (thing)
   (and (tn-p thing)
@@ -778,22 +683,8 @@
 (defun operand-size (thing)
   (typecase thing
     (tn
-     ;; FIXME: might as well be COND instead of having to use #. readmacro
-     ;; to hack up the code
-     (case (sc-name (tn-sc thing))
-       (#.*dword-sc-names*
-        :dword)
-       (#.*word-sc-names*
-        :word)
-       (#.*byte-sc-names*
-        :byte)
-       ;; added by jrd: float-registers is a separate size (?)
-       (#.sb!vm::*float-sc-names*
-        :float)
-       (#.sb!vm::*double-sc-names*
-        :double)
-       (t
-        (error "can't tell the size of ~S ~S" thing (sc-name (tn-sc thing))))))
+     (or (sb!c:sc-operand-size (tn-sc thing))
+         (error "can't tell the size of ~S ~S" thing (sc-name (tn-sc thing)))))
     (ea
      (ea-size thing))
     (t
@@ -2556,7 +2447,7 @@
        ;; emit 32-bit, signed relative offset for where
        (emit-dword-displacement-backpatch segment where)
        ;; nowhere to jump: simply jump to the next instruction
-       (emit-skip segment 4 0))))
+       (emit-dword segment 0))))
 
 (define-instruction xend (segment)
   (:printer three-bytes ((op '(#x0f #x01 #xd5))))
@@ -2625,10 +2516,6 @@
     (values label (make-ea size
                            :disp (make-fixup nil :code-object label)))))
 
-(defun emit-constant-segment-header (segment constants optimize)
-  (declare (ignore segment constants))
-  (loop repeat (if optimize 64 16) do (inst byte #x90)))
-
 (defun size-nbyte (size)
   (ecase size
     (:byte  1)
@@ -2640,11 +2527,14 @@
   (stable-sort constants #'> :key (lambda (constant)
                                     (size-nbyte (caar constant)))))
 
-(defun emit-inline-constant (constant label)
+(defun emit-inline-constant (section constant label)
   (let ((size (size-nbyte (car constant))))
-    (emit-alignment (integer-length (1- size)))
-    (emit-label label)
-    (let ((val (cdr constant)))
-      (loop repeat size
-            do (inst byte (ldb (byte 8 0) val))
-               (setf val (ash val -8))))))
+    (emit section
+          `(.align ,(integer-length (1- size)))
+          label
+          ;; Could add pseudo-ops for .WORD, .INT, .QUAD, .OCTA just like gcc has.
+          ;; But it works fine to emit as a sequence of bytes
+          `(.byte ,@(let ((val (cdr constant)))
+                      (loop repeat size
+                            collect (prog1 (ldb (byte 8 0) val)
+                                      (setf val (ash val -8)))))))))

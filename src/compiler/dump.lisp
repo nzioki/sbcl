@@ -155,24 +155,8 @@
     (when arg2p (dump-varint arg2 fasl-output))
     (when arg3p (dump-varint arg3 fasl-output))))
 
-;;; Setting this variable to an (UNSIGNED-BYTE 32) value causes
-;;; DUMP-FOP to use it as a counter and emit a FOP-NOP4 with the
-;;; counter value before every ordinary fop. This can make it easier
-;;; to follow the progress of LOAD-AS-FASL when
-;;; debugging/testing/experimenting.
-#!+sb-show (defvar *fop-nop4-count* nil)
-#!+sb-show (declaim (type (or (unsigned-byte 32) null) *fop-nop4-count*))
-
 ;;; Dump the FOP code for the named FOP to the specified FASL-OUTPUT.
-;;;
-;;; FIXME: This should be a function, with a compiler macro expansion
-;;; for the common constant-FS case. (Among other things, that'll stop
-;;; it from EVALing ,FILE multiple times.)
-;;;
-;;; FIXME: Compiler macros, frozen classes, inlining, and similar
-;;; optimizations should be conditional on #!+SB-FROZEN.
-(eval-when (:compile-toplevel :execute)
-(#+sb-xc-host defmacro #-sb-xc-host sb!xc:defmacro dump-fop (fs-expr file &rest args)
+(defmacro dump-fop (fs-expr file &rest args)
   (let* ((fs (eval fs-expr))
          (val (or (get fs 'opcode)
                   (error "compiler bug: ~S is not a legal fasload operator."
@@ -181,16 +165,10 @@
     (cond
       ((not (eql (length args) fop-argc))
        (error "~S takes ~D argument~:P" fs fop-argc))
+      ((eql fop-argc 0)
+       `(dump-byte ,val ,file))
       (t
-      `(progn
-         #!+sb-show
-         (when *fop-nop4-count*
-           (dump-byte (get 'fop-nop4 'fop-code) ,file)
-           (dump-integer-as-n-bytes (mod (incf *fop-nop4-count*) (expt 2 32))
-                                    4 ,file))
-         ,(if (zerop fop-argc)
-              `(dump-byte ,val ,file)
-              `(dump-fop+operands ,file ,val ,@args))))))))
+       `(dump-fop+operands ,file ,val ,@args)))))
 
 ;;; Push the object at table offset Handle on the fasl stack.
 (defun dump-push (handle fasl-output)
@@ -950,12 +928,12 @@
     ;; see comment in genesis: we need this here for repeatable fasls
     #+sb-xc-host
     (multiple-value-bind (cl-symbol cl-status)
-        (find-symbol (symbol-name s) sb!int:*cl-package*)
+        (find-symbol (symbol-name s) *cl-package*)
       (when (and (eq s cl-symbol)
                  (eq cl-status :external))
         ;; special case, to work around possible xc host "design
         ;; choice" weirdness in COMMON-LISP package
-        (setq pkg sb!int:*cl-package*)))
+        (setq pkg *cl-package*)))
 
     (cond ((null pkg)
            (let ((this-base-p base-string-p))
@@ -972,9 +950,9 @@
                    (dump-fop 'fop-copy-symbol-save file
                              (gethash lookalike (fasl-output-eq-table file)))
                    (return (setq dumped-as-copy t)))))))
-          ((eq pkg sb!int:*cl-package*)
+          ((eq pkg *cl-package*)
            (dump-fop 'fop-lisp-symbol-save file length+flag))
-          ((eq pkg sb!int:*keyword-package*)
+          ((eq pkg *keyword-package*)
            (dump-fop 'fop-keyword-symbol-save file length+flag))
           (t
            (let ((pkg-index (dump-package pkg file)))
@@ -1013,7 +991,7 @@
   (assert (<= (length +fixup-kinds+) 8))) ; fixup-kind fits in 3 bits
 
 (defconstant-eqx +fixup-flavors+
-  #(:assembly-routine :symbol-tls-index
+  #(:assembly-routine :assembly-routine* :symbol-tls-index
     :foreign :foreign-dataref :code-object
     :layout :immobile-object :named-call :static-call)
   #'equalp)
@@ -1051,7 +1029,8 @@
                                    flavor))
            (operand
             (ecase flavor
-              ((:assembly-routine :symbol-tls-index) (the symbol name))
+              ((:assembly-routine :assembly-routine* :symbol-tls-index)
+               (the symbol name))
               ((:foreign #!+linkage-table :foreign-dataref) (the string name))
               (:code-object (the null name))
               #!+immobile-space (:layout (classoid-name (layout-classoid name)))
@@ -1074,8 +1053,7 @@
 ;;; constants.
 ;;;
 ;;; We dump trap objects in any unused slots or forward referenced slots.
-(defun dump-code-object (component code-segment code-length fixups
-                         fasl-output entry-offsets)
+(defun dump-code-object (component code-segment code-length fixups fasl-output)
   (declare (type component component)
            (type index code-length)
            (type fasl-output fasl-output))
@@ -1123,14 +1101,10 @@
               (fasl-output-source-info fasl-output))
         (dump-object info fasl-output))
 
-      (dump-object (or #!+immobile-code (sb!c::code-immobile-p component))
-                   fasl-output)
-      (dump-fop 'fop-code fasl-output code-length
-                (- header-length sb!vm:code-constants-offset)
-                (length entry-offsets))
+      (dump-object (sb!c::code-immobile-p component) fasl-output)
+      (dump-fop 'fop-load-code fasl-output code-length header-length)
 
       (dump-segment code-segment code-length fasl-output)
-      (dolist (val entry-offsets) (dump-varint val fasl-output))
 
       (let ((handle (dump-pop fasl-output)))
         (dolist (patch (patches))
@@ -1191,12 +1165,8 @@
   (let* ((2comp (component-info component))
          (entries (sb!c::ir2-component-entries 2comp))
          (nfuns (length entries))
-         (code-handle (dump-code-object
-                       component code-segment code-length
-                       fixups file
-                       (mapcar (lambda (entry)
-                                 (label-position (sb!c::entry-info-offset entry)))
-                               entries)))
+         (code-handle
+          (dump-code-object component code-segment code-length fixups file))
          (fun-index nfuns))
 
     (dolist (entry entries)

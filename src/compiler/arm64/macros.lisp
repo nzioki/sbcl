@@ -90,7 +90,7 @@
   "Jump to the lisp lip LIP."
   `(let ((function ,function)
          (lip ,lip))
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      (inst add lip function
            (- (ash simple-fun-code-offset word-shift)
               fun-pointer-lowtag))
@@ -103,7 +103,7 @@
      ;; Indicate a single-valued return by clearing all of the status
      ;; flags, or a multiple-valued return by setting all of the status
      ;; flags.
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      ,@(ecase return-style
          (:single-value '((inst msr :nzcv zr-tn)))
          (:multiple-values '((inst orr tmp-tn zr-tn #xf0000000)
@@ -249,7 +249,7 @@
               (when ,lowtag
                 (inst add ,result-tn tmp-tn ,lowtag))
 
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label ALLOC)
                 (allocation-tramp ,result-tn
                                   ,size BACK-FROM-ALLOC
@@ -297,7 +297,7 @@
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (emit-error-break vop

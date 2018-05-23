@@ -21,7 +21,7 @@
   (import '(sb!vm::nil-value sb!vm::registers sb!vm::null-tn sb!vm::null-offset
             sb!vm::pc-tn sb!vm::pc-offset sb!vm::code-offset)))
 
-(setf *disassem-inst-alignment-bytes* 4)
+(defconstant +disassem-inst-alignment-bytes+ 4)
 
 
 (defconstant-eqx +conditions+
@@ -47,11 +47,6 @@
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
-
-;;; Set assembler parameters. (In CMU CL, this was done with
-;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* nil))
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
@@ -323,28 +318,6 @@
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
 
-;;;; fixup emitters
-#|
-(defun emit-absolute-fixup (segment fixup)
-  (note-fixup segment :absolute fixup)
-  (let ((offset (fixup-offset fixup)))
-    (if (label-p offset)
-        (emit-back-patch segment
-                         4 ; FIXME: n-word-bytes
-                         (lambda (segment posn)
-                           (declare (ignore posn))
-                           (emit-dword segment
-                                       (- (+ (component-header-length)
-                                             (or (label-position offset)
-                                                 0))
-                                          other-pointer-lowtag))))
-        (emit-dword segment (or offset 0)))))
-
-(defun emit-relative-fixup (segment fixup)
-  (note-fixup segment :relative fixup)
-  (emit-dword segment (or (fixup-offset fixup) 0)))
-|#
-
 ;;;; miscellaneous hackery
 
 (defun register-p (thing)
@@ -558,11 +531,9 @@
                                      `((lognot ,transformed))
                                      `(,transformed))))))
          ,@(if single-op-op
-              `((handler-case
-                    (progn
-                      (inst ,single-op-op ,r ,x ,transformed))
-                  (cannot-encode-immediate-operand ()
-                    ,@(composite))))
+              `((if (encodable-immediate ,transformed)
+                    (inst ,single-op-op ,r ,x ,transformed)
+                    (progn ,@(composite))))
               (composite))))))
 
 

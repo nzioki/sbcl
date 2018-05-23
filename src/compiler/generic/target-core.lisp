@@ -17,8 +17,14 @@
 (in-package "SB!C")
 
 (declaim (ftype (sfunction (boolean fixnum fixnum) code-component) allocate-code-object))
+;;; Allocate a code component with BOXED words in the header
+;;; followed by UNBOXED bytes of raw data.
+;;; BOXED must be the exact count of boxed words desired. No adjustments
+;;; are made for alignment considerations or the fixed slots.
 (defun allocate-code-object (immobile-p boxed unboxed)
   (declare (ignorable immobile-p))
+  ;; Enforce limit on boxed words dependent on how many bits it gets in header.
+  (aver (typep boxed '(unsigned-byte #!+64-bit 32 #!-64-bit 23)))
   #!+gencgc
   (without-gcing
       (cond #!+immobile-code
@@ -30,111 +36,110 @@
   #!-gencgc
   (%primitive allocate-code-object boxed unboxed))
 
-;;; Assign all simple-fun offsets in CODE, then set N-ENTRIES so that GC sees
-;;; a nonzero number of functions only after their addresses are assigned.
-;;; Otherwise GC would see their offsets as all 0 and bad things would happen.
-;;; Each element of OFFSETS is a byte number beyond (CODE-INSTRUCTIONS CODE).
-(defun set-code-entrypoints (code offsets)
-  (let* ((nfuns (the (unsigned-byte 14) (length offsets)))
-         (fun-index nfuns))
-    (dolist (offset offsets)
-      (declare (type index offset))
-      (unless (zerop (logand offset sb!vm:lowtag-mask))
-        (bug "unaligned function object, offset = #X~X" offset))
-      (decf fun-index)
-      (let ((header-data (get-header-data code)))
-        (if (> fun-index 0)
-            (let* ((n-header-words (logand header-data sb!vm:short-header-max-words))
-                   (index (+ (- sb!vm:other-pointer-lowtag)
-                             (ash n-header-words sb!vm:word-shift)
-                             (ash (1- fun-index) 2))))
-              (aver (eql (sap-ref-32 (int-sap (get-lisp-obj-address code)) index) 0))
-              (setf (sap-ref-32 (int-sap (get-lisp-obj-address code)) index) offset))
-            ;; Special case for the first simple-fun:
-            ;; The value range of 'offset' and 'nfuns' is the same
-            ;; regardless of word size.
-            ;; It's as if it's a positive 32-bit fixnum (29 significant bits).
-            ;; 16 bits is enough for the offset because it only needs to
-            ;; skip over the unboxed constants.
-            #!-64-bit
-            (let ((newval (logior (ash (the (mod #x8000) offset) 14) nfuns)))
-              (aver (eql (sb!vm::%code-n-entries code) 0))
-              (setf (sb!vm::%code-n-entries code) newval))
-            #!+64-bit
-            (let ((newval (logior (ash (the (mod #x8000) offset) 16) nfuns)))
-              (aver (eql (ldb (byte 32 24) header-data) 0))
-              (set-header-data code (dpb newval (byte 32 24) header-data)))))
-      ;; COMPUTE-FUN is ok even if code-obj is not pinned (which it is)
-      (let ((fun (truly-the function (%primitive sb!c:compute-fun code offset))))
-        #!+(and compact-instance-header x86-64)
-        (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
-                          (- 4 sb!vm:fun-pointer-lowtag))
-              (truly-the (unsigned-byte 32)
-                         (get-lisp-obj-address #.(find-layout 'function))))
-        (setf (%simple-fun-self fun)
-              ;; x86 backends store the address of the entrypoint in 'self'
-              #!+(or x86 x86-64)
-              (%make-lisp-obj
-               (truly-the word (+ (get-lisp-obj-address fun)
-                                  (ash sb!vm:simple-fun-code-offset sb!vm:word-shift)
-                                  (- sb!vm:fun-pointer-lowtag))))
-              ;; non-x86 backends store the function itself (what else?) in 'self'
-              #!-(or x86 x86-64)
-              (setf (%simple-fun-self fun) fun))))))
+;;; Map of code-component -> list of PC offsets at which allocations occur.
+;;; This table is needed in order to enable allocation profiling.
+(define-load-time-global *allocation-point-fixups*
+  (make-hash-table :test 'eq :weakness :key :synchronized t))
 
-(flet ((fixup (code-obj offset sym kind flavor layout-finder)
+#!-x86-64
+(defun convert-alloc-point-fixups (dummy1 dummy2)
+  (declare (ignore dummy1 dummy2)))
+
+(flet ((fixup (code-obj offset sym kind flavor layout-finder preserved-lists)
+         ;; PRESERVED-LISTS is a vector of lists of locations (by kind)
+         ;; at which fixup must be re-applied after code movement.
          ;; CODE-OBJ must already be pinned in order to legally call this.
          ;; One call site that reaches here is below at MAKE-CORE-COMPONENT
          ;; and the other is LOAD-CODE, both of which pin the code.
-         (sb!vm:fixup-code-object
-          code-obj offset
-          (ecase flavor
-            (:assembly-routine (or (get-asm-routine sym)
-                                   (error "undefined assembler routine: ~S" sym)))
-            (:foreign (foreign-symbol-address sym))
-            (:foreign-dataref (foreign-symbol-address sym t))
-            (:code-object (get-lisp-obj-address code-obj))
-            (:symbol-tls-index (ensure-symbol-tls-index sym))
-            (:layout (get-lisp-obj-address (funcall layout-finder sym)))
-            (:immobile-object (get-lisp-obj-address sym))
-            #!+immobile-code (:named-call (sb!vm::fdefn-entry-address sym))
-            #!+immobile-code (:static-call (sb!vm::function-raw-address sym)))
-          kind flavor))
-       (finish-fixups (code-obj preserved-fixups)
-         (declare (ignorable code-obj preserved-fixups))
+         (let ((savep
+                (sb!vm:fixup-code-object
+                 code-obj offset
+                 (ecase flavor
+                   ((:assembly-routine :assembly-routine*)
+                    (or (get-asm-routine sym (eq flavor :assembly-routine*))
+                        (error "undefined assembler routine: ~S" sym)))
+                   (:foreign (foreign-symbol-address sym))
+                   (:foreign-dataref (foreign-symbol-address sym t))
+                   (:code-object (get-lisp-obj-address code-obj))
+                   (:symbol-tls-index (ensure-symbol-tls-index sym))
+                   (:layout (get-lisp-obj-address (funcall layout-finder sym)))
+                   (:immobile-object (get-lisp-obj-address sym))
+                   #!+immobile-code (:named-call (sb!vm::fdefn-entry-address sym))
+                   #!+immobile-code (:static-call (sb!vm::function-raw-address sym)))
+                 kind flavor)))
+           ;; These won't exist except for x86-64, but it doesn't matter.
+           (when (member sym '(sb!vm::enable-alloc-counter
+                               sb!vm::enable-sized-alloc-counter))
+             (push offset (elt preserved-lists 2)))
+           (cond ((eq savep :relative) (push offset (elt preserved-lists 0)))
+                 (savep (push offset (elt preserved-lists 1))))))
+
+       (finish-fixups (code-obj preserved-lists)
+         (declare (ignorable code-obj preserved-lists))
          #!+(or immobile-space x86)
-         (when preserved-fixups
-           (setf (sb!vm::%code-fixups code-obj)
-                 (sb!c::pack-code-fixup-locs preserved-fixups)))
+         (let ((rel-fixups (elt preserved-lists 0))
+               (abs-fixups (elt preserved-lists 1)))
+             ;; Store a cons of both only if there are any relative fixups,
+             ;; otherwise just the absolute [sic] fixups (the more common kind),
+             ;; some of which are actually relative fixups on x86. The C code
+             ;; deciphers (usually correctly) which are which. (See lp#1749369)
+           (when (or abs-fixups rel-fixups)
+             (let ((abs (sb!c::pack-code-fixup-locs abs-fixups))
+                   (rel (sb!c::pack-code-fixup-locs rel-fixups)))
+               (setf (sb!vm::%code-fixups code-obj)
+                     (if rel-fixups (cons abs rel) abs)))))
+         (awhen (elt preserved-lists 2)
+           (setf (gethash code-obj *allocation-point-fixups*)
+                 (convert-alloc-point-fixups code-obj it)))
+         ;; Assign all SIMPLE-FUN-SELF slots
+         (dotimes (i (code-n-entries code-obj))
+           (let ((fun (%code-entry-point code-obj i)))
+             (setf (%simple-fun-self fun)
+                   ;; x86 backends store the address of the entrypoint in 'self'
+                   #!+(or x86 x86-64)
+                   (%make-lisp-obj
+                    (truly-the word (+ (get-lisp-obj-address fun)
+                                       (ash sb!vm:simple-fun-code-offset sb!vm:word-shift)
+                                       (- sb!vm:fun-pointer-lowtag))))
+                   ;; non-x86 backends store the function itself (what else?) in 'self'
+                   #!-(or x86 x86-64) fun)
+             ;; And maybe store the layout in the high half of the header
+             #!+(and compact-instance-header x86-64)
+             (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
+                               (- 4 sb!vm:fun-pointer-lowtag))
+                   (truly-the (unsigned-byte 32)
+                     (get-lisp-obj-address #.(find-layout 'function))))))
+         ;; And finally, make the memory range executable
          #!-(or x86 x86-64)
          (sb!vm:sanctify-for-execution code-obj)))
 
-  (defun apply-fasl-fixups (fop-stack code-obj &aux (top (svref fop-stack 0))
-                                                    (preserved-fixups nil))
-    (macrolet ((pop-fop-stack () `(prog1 (svref fop-stack top) (decf top))))
-      (dotimes (i (pop-fop-stack) (setf (svref fop-stack 0) top))
-        (multiple-value-bind (offset kind flavor)
-            (sb!fasl::!unpack-fixup-info (pop-fop-stack))
-          (when (fixup code-obj offset (pop-fop-stack) kind flavor #'find-layout)
-            (push offset preserved-fixups)))))
-    (finish-fixups code-obj preserved-fixups))
+  (defun apply-fasl-fixups (fop-stack code-obj &aux (top (svref fop-stack 0)))
+    (dx-let ((preserved (vector nil nil nil)))
+      (macrolet ((pop-fop-stack () `(prog1 (svref fop-stack top) (decf top))))
+        (dotimes (i (pop-fop-stack) (setf (svref fop-stack 0) top))
+          (multiple-value-bind (offset kind flavor)
+              (sb!fasl::!unpack-fixup-info (pop-fop-stack))
+            (fixup code-obj offset (pop-fop-stack) kind flavor
+                   #'find-layout preserved))))
+      (finish-fixups code-obj preserved)))
 
-  (defun apply-core-fixups (fixup-notes code-obj &aux (preserved-fixups nil))
+  (defun apply-core-fixups (fixup-notes code-obj)
     (declare (list fixup-notes))
-    (dolist (note fixup-notes)
-      (let ((fixup (fixup-note-fixup note))
-            (offset (fixup-note-position note)))
-        (when (fixup code-obj offset
-                     (fixup-name fixup)
-                     (fixup-note-kind note)
-                     (fixup-flavor fixup)
+    (dx-let ((preserved (vector nil nil nil)))
+      (dolist (note fixup-notes)
+        (let ((fixup (fixup-note-fixup note))
+              (offset (fixup-note-position note)))
+          (fixup code-obj offset
+                 (fixup-name fixup)
+                 (fixup-note-kind note)
+                 (fixup-flavor fixup)
                ;; Compiling to memory creates layout fixups with the name being
                ;; an instance of LAYOUT, not a symbol. Those probably should be
                ;; :IMMOBILE-OBJECT fixups. But since they're not, inform the
                ;; fixupper not to call find-layout on them.
-                     #'identity)
-          (push offset preserved-fixups))))
-      (finish-fixups code-obj preserved-fixups)))
+                 #'identity
+                 preserved)))
+      (finish-fixups code-obj preserved))))
 
 ;;; Note the existence of FUNCTION.
 (defun note-fun (info function object)
@@ -169,31 +174,23 @@
            (list fixup-notes)
            (type core-object object))
   (let ((debug-info (debug-info-for-component component)))
-    ;; See also the remark in LOAD-CODE about the order of installing
-    ;; simple-funs and setting the 'nfuns' value.
     (let* ((2comp (component-info component))
            (constants (ir2-component-constants 2comp))
-           (box-num (- (length constants) sb!vm:code-constants-offset))
            (code-obj (allocate-code-object
                       (or #!+immobile-code (eq *compile-to-memory-space* :immobile))
-                      box-num length)))
-      (declare (type index box-num length))
+                      (align-up (length constants) sb!c::code-boxed-words-align)
+                      length)))
 
       ;; The following operations need the code pinned:
       ;; 1. copying into code-instructions (a SAP)
       ;; 2. apply-core-fixups and sanctify-for-execution
-      ;; 3. set-code-entrypointa
       (with-pinned-objects (code-obj)
-         (copy-byte-vector-to-system-area
-          (the (simple-array assembly-unit 1) (segment-contents-as-vector segment))
-          (code-instructions code-obj))
-
-        (apply-core-fixups fixup-notes code-obj)
-
-        (set-code-entrypoints
-         code-obj (mapcar (lambda (entry-info)
-                            (label-position (entry-info-offset entry-info)))
-                          (ir2-component-entries 2comp))))
+        (let ((bytes (the (simple-array assembly-unit 1)
+                          (segment-contents-as-vector segment))))
+          ;; By design, until the last 2 unboxed bytes of CODE-OBJ contain a
+          ;; nonzero value, GC will not see any simple-funs therein.
+          (%byte-blt bytes 0 (code-instructions code-obj) 0 (length bytes)))
+        (apply-core-fixups fixup-notes code-obj))
 
       ;; Don't need code pinned now
       (let* ((entries (ir2-component-entries 2comp))
@@ -203,6 +200,10 @@
             (setf (%simple-fun-name fun) (entry-info-name entry-info))
             (setf (%simple-fun-arglist fun) (entry-info-arguments entry-info))
             (setf (%simple-fun-type fun) (entry-info-type entry-info))
+            ;; We can't make a decision to record the source here
+            ;; because the policy is not available in a simple way.
+            ;; (It would demand groveling through the component to find
+            ;; the lambda-bind corresponding to this entry)
             (setf (%simple-fun-info fun) (entry-info-info entry-info))
             (note-fun entry-info fun object))))
 
@@ -233,8 +234,8 @@
 ;;; SOURCE-INFO list. We also check that there are no outstanding
 ;;; forward references to functions.
 (defun fix-core-source-info (info object &optional function)
-  (declare (type core-object object)
-           (type (or null function) function))
+  (declare (type core-object object))
+  (declare (type (or null function) function))
   (aver (zerop (hash-table-count (core-object-patch-table object))))
   (let ((source (debug-source-for-info info :function function)))
     (dolist (info (core-object-debug-info object))

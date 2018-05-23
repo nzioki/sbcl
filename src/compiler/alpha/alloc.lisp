@@ -14,9 +14,9 @@
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:info num)
   (:results (result :scs (descriptor-reg)))
@@ -85,8 +85,7 @@
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:generator 100
     (inst li (lognot lowtag-mask) ndescr)
-    (inst lda boxed (fixnumize (1+ code-constants-offset)) boxed-arg)
-    (inst and boxed ndescr boxed)
+    (inst lda boxed 0 boxed-arg)
     (inst srl unboxed-arg word-shift unboxed)
     (inst lda unboxed lowtag-mask unboxed)
     (inst and unboxed ndescr unboxed)

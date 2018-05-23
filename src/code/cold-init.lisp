@@ -40,14 +40,13 @@
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
 
-(eval-when (:compile-toplevel :execute)
   ;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
   ;; and use it for most of the cold-init functions. (Just be careful
   ;; not to use it for the COLD-INIT-OR-REINIT functions.)
-  (sb!xc:defmacro show-and-call (name)
+(defmacro show-and-call (name)
     `(progn
        (/primitive-print ,(symbol-name name))
-       (,name))))
+       (,name)))
 
 (defun !encapsulate-stuff-for-cold-init (&aux names)
   (flet ((encapsulate-1 (name handler)
@@ -130,7 +129,7 @@
   (show-and-call !random-cold-init)
 
   ;; Must be done before any non-opencoded array references are made.
-  (show-and-call !hairy-data-vector-reffer-init)
+  (show-and-call sb!vm::!hairy-data-vector-reffer-init)
 
   (show-and-call !character-database-cold-init)
   (show-and-call !character-name-database-cold-init)
@@ -174,15 +173,15 @@
       (when docstring (setf (fdocumentation name 'variable) docstring))))
   (!with-init-wrappers
    (dolist (x *!cold-defuns*)
-     (destructuring-bind (name . inline-expansion) x
-       (%defun name (fdefinition name) nil inline-expansion))))
+     (destructuring-bind (name inline-expansion dxable-args) x
+       (%defun name (fdefinition name) inline-expansion dxable-args))))
 
   ;; KLUDGE: Why are fixups mixed up with toplevel forms? Couldn't
   ;; fixups be done separately? Wouldn't that be clearer and better?
   ;; -- WHN 19991204
   (/show0 "doing cold toplevel forms and fixups")
   (unless (!c-runtime-noinform-p)
-    (write `("Length(TLFs)= " ,(length *!cold-toplevels*)))
+    (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
     (terpri))
   ;; only the basic external formats are present at this point.
   (setq sb!impl::*default-external-format* :latin-1)
@@ -445,15 +444,11 @@ process to continue normally."
     (%cold-print x 0))
   (values))
 
-(in-package "SB!INT")
-(defun !unintern-symbols ()
-    ;; For some reason uninterning these:
-    ;;    DEF!TYPE DEF!CONSTANT DEF!STRUCT
-    ;; does not work, they stick around as uninterned symbols.
-    ;; Some other macros must expand into them. Ugh.
+(push
   '("SB-INT"
-    defenum defun-cached with-globaldb-name
+    defenum defun-cached with-globaldb-name def!type def!struct
     .
     #!+sb-show ()
     #!-sb-show (/hexstr /nohexstr /noshow /noshow0 /noxhow
-                /primitive-print /show /show0 /xhow)))
+                /primitive-print /show /show0 /xhow))
+  sb!impl::*!removable-symbols*)

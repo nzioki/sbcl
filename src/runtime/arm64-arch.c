@@ -133,10 +133,16 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
     handle_trap(context, code);
 }
+void
+sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
+    fake_foreign_function_call(context);
+    lose("Unhandled SIGILL at %p.", *os_context_pc_addr(context));
+}
 
 void arch_install_interrupt_handlers()
 {
     undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
+    undoably_install_low_level_interrupt_handler(SIGILL, sigill_handler);
 }
 
 
@@ -147,10 +153,14 @@ void arch_install_interrupt_handlers()
  * Linkage entry size is 16, because we need 2 instructions and an 8 byte address.
  */
 
-#define LINKAGE_TEMP_REG        reg_NFP
+#define LINKAGE_TEMP_REG reg_NL9
 
-void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
     ldr reg,=address
     br  reg
@@ -174,11 +184,4 @@ void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

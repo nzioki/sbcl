@@ -12,62 +12,63 @@
 
 (in-package "COMMON-LISP")
 
-#.(let ((list           '(cl:*
-                          cl:**
-                          cl:***
-                          cl:*break-on-signals*
-                          cl:*compile-file-pathname*
-                          cl:*compile-file-truename*
-                          cl:*compile-print*
-                          cl:*compile-verbose*
-                          cl:*debug-io*
-                          cl:*debugger-hook*
-                          cl:*default-pathname-defaults*
-                          cl:*error-output*
-                          cl:*features*
-                          cl:*gensym-counter*
-                          cl:*load-pathname*
-                          cl:*load-print*
-                          cl:*load-truename*
-                          cl:*load-verbose*
-                          cl:*macroexpand-hook*
-                          cl:*modules*
-                          cl:*package*
-                          cl:*print-array*
-                          cl:*print-base*
-                          cl:*print-case*
-                          cl:*print-circle*
-                          cl:*print-escape*
-                          cl:*print-gensym*
-                          cl:*print-length*
-                          cl:*print-level*
-                          cl:*print-lines*
-                          cl:*print-miser-width*
-                          cl:*print-pprint-dispatch*
-                          cl:*print-pretty*
-                          cl:*print-radix*
-                          cl:*print-readably*
-                          cl:*print-right-margin*
-                          cl:*query-io*
-                          cl:*random-state*
-                          cl:*read-base*
-                          cl:*read-default-float-format*
-                          cl:*read-eval*
-                          cl:*read-suppress*
-                          cl:*readtable*
-                          cl:*standard-input*
-                          cl:*standard-output*
-                          cl:*terminal-io*
-                          cl:*trace-output*
-                          cl:+
-                          cl:++
-                          cl:+++
-                          cl:-
-                          cl:/
-                          cl://
-                          cl:///)))
+#.(let ((list '(cl:*
+                cl:**
+                cl:***
+                cl:*break-on-signals*
+                cl:*compile-file-pathname*
+                cl:*compile-file-truename*
+                cl:*compile-print*
+                cl:*compile-verbose*
+                cl:*debug-io*
+                cl:*debugger-hook*
+                cl:*default-pathname-defaults*
+                cl:*error-output*
+                cl:*features*
+                cl:*gensym-counter*
+                cl:*load-pathname*
+                cl:*load-print*
+                cl:*load-truename*
+                cl:*load-verbose*
+                cl:*macroexpand-hook*
+                cl:*modules*
+                cl:*package*
+                cl:*print-array*
+                cl:*print-base*
+                cl:*print-case*
+                cl:*print-circle*
+                cl:*print-escape*
+                cl:*print-gensym*
+                cl:*print-length*
+                cl:*print-level*
+                cl:*print-lines*
+                cl:*print-miser-width*
+                cl:*print-pprint-dispatch*
+                cl:*print-pretty*
+                cl:*print-radix*
+                cl:*print-readably*
+                cl:*print-right-margin*
+                cl:*query-io*
+                cl:*random-state*
+                cl:*read-base*
+                cl:*read-default-float-format*
+                cl:*read-eval*
+                cl:*read-suppress*
+                cl:*readtable*
+                cl:*standard-input*
+                cl:*standard-output*
+                cl:*terminal-io*
+                cl:*trace-output*
+                cl:+
+                cl:++
+                cl:+++
+                cl:-
+                cl:/
+                cl://
+                cl:///)))
     `(progn
-       (declaim (special ,@list))
+       (declaim (special ,@list)
+                (sb!ext:always-bound ,@list))
        (eval-when (:compile-toplevel :load-toplevel)
          (dolist (symbol ',list)
            (declare (notinline (setf sb!int:info))) ; skirt failure-to-inline warning
@@ -141,3 +142,45 @@
                        cl:*load-truename*
                        cl:*compile-file-pathname*
                        cl:*compile-file-truename*))
+
+;;;; DEFGLOBAL and DEFINE-LOAD-TIME-GLOBAL
+;;;; These have alternate definitions (in cross-misc) which rely on
+;;;; the underlying host DEFVAR when building the cross-compiler.
+
+(in-package "SB!IMPL")
+
+(defmacro defglobal (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME both at compile- and load-time, but only if NAME is not
+already bound.
+
+Global variables share their values between all threads, and cannot be
+locally bound, declared special, defined as constants, and neither bound
+nor defined as symbol macros.
+
+See also the declarations SB-EXT:GLOBAL and SB-EXT:ALWAYS-BOUND."
+  (let ((boundp (make-symbol "BOUNDP")))
+    `(progn
+       (eval-when (:compile-toplevel)
+         (let ((,boundp (boundp ',name)))
+           (%compiler-defglobal ',name :always-bound
+                                (unless ,boundp ,value) (not ,boundp))))
+       (let ((,boundp (boundp ',name)))
+         (%defglobal ',name (unless ,boundp ,value) ,boundp ',doc ,docp
+                     (sb!c:source-location))))))
+
+(defmacro define-load-time-global (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME at load-time, but only if NAME is not already bound.
+
+Attempts to read NAME at compile-time will signal an UNBOUND-VARIABLE error
+unless it has otherwise been assigned a value.
+
+See also DEFGLOBAL which assigns the VALUE at compile-time too."
+  (let ((boundp (make-symbol "BOUNDP")))
+    `(progn
+       (eval-when (:compile-toplevel)
+         (%compiler-defglobal ',name :eventually nil nil))
+       (let ((,boundp (boundp ',name)))
+         (%defglobal ',name (unless ,boundp ,value) ,boundp ',doc ,docp
+                     (sb!c:source-location))))))

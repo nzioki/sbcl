@@ -83,8 +83,7 @@
   ;; is already zeroed. Otherwise a :qword.
   (cond
     ;; If target is a register, we can just mov it there directly
-    ((and (tn-p target)
-          (sc-is target signed-reg unsigned-reg descriptor-reg any-reg))
+    ((gpr-p target)
      ;; val can be a fixup for an immobile-space symbol, i.e. not a number,
      ;; hence not acceptable to ZEROP.
      (cond ((and (numberp val) (zerop val)) (zeroize target))
@@ -284,7 +283,7 @@
             (inst imul y x #.(ash 1 n-fixnum-tag-bits))
             (inst jmp :no DONE)
             (inst mov y x)))
-     (invoke-asm-routine 'call #.(bignum-from-reg 'y "SIGNED") vop temp-reg-tn)
+     (invoke-asm-routine 'call #.(bignum-from-reg 'y "SIGNED") vop)
      DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
@@ -316,7 +315,7 @@
                               :scale (ash 1 n-fixnum-tag-bits))))
      (inst jmp :z done)
      (inst mov y x)
-     (invoke-asm-routine 'call #.(bignum-from-reg 'y "UNSIGNED") vop temp-reg-tn)
+     (invoke-asm-routine 'call #.(bignum-from-reg 'y "UNSIGNED") vop)
      DONE))
 (define-move-vop move-from-unsigned :move
   (unsigned-reg) (descriptor-reg))

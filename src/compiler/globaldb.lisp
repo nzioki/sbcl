@@ -124,15 +124,10 @@
 ;;;  :DEFAULT (CONSTANTLY #'<a-function-name>) to adhere to the convention
 ;;; that default objects satisfying FUNCTIONP will always be funcalled.
 ;;;
-(eval-when (:compile-toplevel :execute)
-;; This convoluted idiom creates a macro that disappears from the target,
-;; kind of an alternative to the "!" name convention.
-(#+sb-xc-host defmacro
- #-sb-xc-host sb!xc:defmacro
-    define-info-type ((category kind)
-                       &key (type-spec (missing-arg))
-                            (validate-function)
-                            default)
+(defmacro define-info-type ((category kind)
+                            &key (type-spec (missing-arg))
+                                 (validate-function)
+                                 default)
   (declare (type keyword category kind))
   ;; There was formerly a remark that (COPY-TREE TYPE-SPEC) ensures repeatable
   ;; fasls. That's not true now, probably never was. A compiler is permitted to
@@ -146,7 +141,9 @@
            ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
            ,(or (and (eq category :function) (eq kind :definition)
                      +fdefn-info-num+)
-                #+sb-xc (meta-info-number (meta-info category kind))))))
+                #+sb-xc (meta-info-number (meta-info category kind)))))
+;; It's an external symbol of SB-INT so wouldn't be removed automatically
+(push '("SB-INT" define-info-type) sb!impl::*!removable-symbols*)
 
 
 (macrolet ((meta-info-or-lose (category kind)
@@ -266,28 +263,6 @@
       (when hookp
         (funcall (truly-the function (cdr hook)) name info-number answer nil))
       (values answer nil))))
-
-;; Call FUNCTION once for each Name in globaldb that has information associated
-;; with it, passing the function the Name as its only argument.
-;;
-(defun call-with-each-globaldb-name (fun-designator)
-  (let ((function (coerce fun-designator 'function)))
-    (with-package-iterator (iter (list-all-packages) :internal :external)
-      (loop (multiple-value-bind (winp symbol access package) (iter)
-              (declare (ignore access))
-              (if (not winp) (return))
-              ;; Try to process each symbol at most once by associating it with
-              ;; a single package. If a symbol is apparently uninterned,
-              ;; always keep it since we can't know if it has been seen once.
-              (when (or (not (symbol-package symbol))
-                        (eq package (symbol-package symbol)))
-                (dolist (name (info-vector-name-list symbol))
-                  (funcall function name))))))
-    #-sb-xc-host
-    (info-maphash (lambda (name data)
-                    (declare (ignore data))
-                    (funcall function name))
-                  *info-environment*)))
 
 ;;;; ":FUNCTION" subsection - Data pertaining to globally known functions.
 
@@ -343,13 +318,17 @@
   #+sb-xc-host :assumed
   #-sb-xc-host (lambda (name) (if (fboundp name) :defined :assumed)))
 
-;;; something which can be decoded into the inline expansion of the
-;;; function, or NIL if there is none
-;;;
-;;; To inline a function, we want a lambda expression, e.g.
-;;; '(LAMBDA (X) (+ X 1)).
-(define-info-type (:function :inline-expansion-designator)
-  :type-spec list)
+;;; Two kinds of hints for compiling calls as efficiently as possible:
+;;; (A) Inline expansion: To inline a function, we want a lambda
+;;; expression, e.g. '(LAMBDA (X) (+ X 1)) or a lambda-with-lexenv.
+;;; (B) List of arguments which could be dynamic-extent closures, and which
+;;; we could, under suitable compilation policy, DXify in the caller
+;;; especially when compiling a NOTINLINE call to this function.
+;;; If only (A) is stored, then this value is a list (the lambda expression).
+;;; If only (B) is stored, then this is a DXABLE-ARGS.
+;;; If both, this is an INLINING-DATA.
+(define-info-type (:function :inlining-data)
+    :type-spec (or list sb!c::dxable-args sb!c::inlining-data))
 
 ;;; This specifies whether this function may be expanded inline. If
 ;;; null, we don't care.
@@ -573,7 +552,6 @@
 (define-info-type (:source-location :constant) :type-spec t)
 (define-info-type (:source-location :typed-structure) :type-spec t)
 (define-info-type (:source-location :symbol-macro) :type-spec t)
-(define-info-type (:source-location :vop) :type-spec t)
 (define-info-type (:source-location :declaration) :type-spec t)
 (define-info-type (:source-location :alien-type) :type-spec t)
 
@@ -594,5 +572,5 @@
                  (if (not type) type-num)
                  (if type
                      (list (meta-info-category type) (meta-info-kind type))))
-         (write val :level 1)))
+         (write val :level 2)))
      sym)))

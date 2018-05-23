@@ -46,7 +46,7 @@
 ;;; A map from info-number to its META-INFO object.
 ;;; The reverse mapping is obtained by reading the META-INFO.
 (declaim (type (simple-vector #.(ash 1 info-number-bits)) *info-types*))
-(!defglobal *info-types*
+(!define-load-time-global *info-types*
             ;; Must be dumped as a literal for cold-load.
             #.(make-array (ash 1 info-number-bits) :initial-element nil))
 
@@ -92,7 +92,9 @@
 ;;
 #-sb-xc-host
 (progn
- #!-symbol-info-vops (declaim (inline symbol-info-vector))
+ ;; Don't inline this if a vop translates it. Inlining occurs first,
+ ;; causing the vop not to be used.
+ #!-(vop-translates sb!kernel:symbol-info-vector) (declaim (inline symbol-info-vector))
  (defun symbol-info-vector (symbol)
   (let ((info-holder (symbol-info symbol)))
     (truly-the (or null simple-vector)
@@ -101,6 +103,7 @@
 ;;; SYMBOL-INFO is a primitive object accessor defined in 'objdef.lisp'
 ;;; But in the host Lisp, there is no such thing as a symbol-info slot.
 ;;; Instead, symbol-info is kept in the host symbol's plist.
+;;; This must be a SETFable place.
 #+sb-xc-host
 (defmacro symbol-info-vector (symbol) `(get ,symbol :sb-xc-globaldb-info))
 
@@ -253,7 +256,7 @@
 ;;;; operations, we represent the attributes as bits in a fixnum.
 
 (in-package "SB!C")
-(deftype attributes () 'fixnum)
+(def!type attributes () 'fixnum)
 
 ;;; Given a list of attribute names and an alist that translates them
 ;;; to masks, return the OR of the masks.

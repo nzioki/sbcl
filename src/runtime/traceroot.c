@@ -121,8 +121,7 @@ static void add_to_layer(lispobj* obj, int wordindex,
 /// otherwise return obj directly.
 static lispobj canonical_obj(lispobj obj)
 {
-    if (lowtag_of(obj) == FUN_POINTER_LOWTAG &&
-        widetag_of(*native_pointer(obj)) == SIMPLE_FUN_WIDETAG)
+    if (functionp(obj) && widetag_of(*native_pointer(obj)) == SIMPLE_FUN_WIDETAG)
         return make_lispobj(fun_code_header(obj-FUN_POINTER_LOWTAG),
                             OTHER_POINTER_LOWTAG);
     return obj;
@@ -185,35 +184,6 @@ static int find_ref(lispobj* source, lispobj target)
 enum ref_kind { HEAP, CONTROL_STACK, BINDING_STACK, TLS };
 char *ref_kind_name[4] = {"heap","C stack","bindings","TLS"};
 
-/// This unfortunately entails a heap scan,
-/// but it's quite fast if the symbol is found in immobile space.
-#ifdef LISP_FEATURE_SB_THREAD
-static lispobj* find_sym_by_tls_index(lispobj tls_index)
-{
-    lispobj* where = 0;
-    lispobj* end = 0;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    where = (lispobj*)FIXEDOBJ_SPACE_START;
-    end = fixedobj_free_pointer;
-#endif
-    while (1) {
-        while (where < end) {
-            lispobj header = *where;
-            int widetag = widetag_of(header);
-            if (widetag == SYMBOL_WIDETAG &&
-                tls_index_of(((struct symbol*)where)) == tls_index)
-                return where;
-            where += OBJECT_SIZE(header, where);
-        }
-        if (where >= (lispobj*)DYNAMIC_SPACE_START)
-            break;
-        where = (lispobj*)DYNAMIC_SPACE_START;
-        end = (lispobj*)get_alloc_pointer();
-    }
-    return 0;
-}
-#endif
-
 static inline int interestingp(lispobj ptr, struct hopscotch_table* targets)
 {
     return is_lisp_pointer(ptr) && hopscotch_containsp(targets, ptr);
@@ -223,14 +193,14 @@ static inline int interestingp(lispobj ptr, struct hopscotch_table* targets)
 /* Try to find the call frame that contains 'addr', which is the address
  * in which a conservative root was seen.
  * Return the program counter associated with that frame. */
-static char* deduce_thread_pc(struct thread* th, void** addr)
+static char* NO_SANITIZE_MEMORY deduce_thread_pc(struct thread* th, void** addr)
 {
     uword_t* fp = __builtin_frame_address(0);
     char* return_pc = 0;
 
     if (th != arch_os_get_current_thread()) {
         int i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
-        os_context_t *c = th->interrupt_contexts[i-1];
+        os_context_t *c = nth_interrupt_context(i-1, th);
         fp = (uword_t*)*os_context_register_addr(c,reg_FP);
     }
     while (1) {
@@ -252,8 +222,8 @@ static void compare_pointer(void *addr) {
 
 /* Figure out which thread's control stack contains 'pointer'
  * and the PC within the active function in the referencing frame  */
-static struct thread* deduce_thread(void (*context_scanner)(),
-                                    uword_t pointer, char** pc)
+static struct thread* NO_SANITIZE_MEMORY
+deduce_thread(void (*context_scanner)(), uword_t pointer, char** pc)
 {
     struct thread *th;
 
@@ -268,7 +238,7 @@ static struct thread* deduce_thread(void (*context_scanner)(),
             void **esp1;
             free = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
             for(i=free-1;i>=0;i--) {
-                os_context_t *c=th->interrupt_contexts[i];
+                os_context_t *c = nth_interrupt_context(i, th);
                 esp1 = (void **) *os_context_register_addr(c,reg_SP);
                 if (esp1>=(void **)th->control_stack_start && esp1<(void **)th->control_stack_end) {
                     if(esp1<esp) esp=esp1;
@@ -434,9 +404,7 @@ static struct simple_fun* simple_fun_from_pc(char* pc)
 {
     struct code* code = (struct code*)component_ptr_from_pc((lispobj*)pc);
     if (!code) return 0;
-    struct simple_fun* prev_fun = (struct simple_fun*)
-        ((char*)code + (code_header_words(code->header)<<WORD_SHIFT)
-         + FIRST_SIMPLE_FUN_OFFSET(code));
+    struct simple_fun* prev_fun = 0;
     for_each_simple_fun(i, fun, code, 1, {
         if (pc < (char*)fun) break;
         prev_fun = fun;
@@ -489,7 +457,7 @@ static void trace1(lispobj object,
     enum ref_kind root_kind;
     struct thread* root_thread;
     char* thread_pc = 0;
-    lispobj tls_index;
+    lispobj tls_index = 0;
     lispobj target;
     int i;
 
@@ -602,7 +570,8 @@ static void trace1(lispobj object,
         fprintf(file, ":%s:", ref_kind_name[root_kind]);
         if (root_kind==BINDING_STACK || root_kind==TLS) {
 #ifdef LISP_FEATURE_SB_THREAD
-            lispobj* symbol = find_sym_by_tls_index(tls_index);
+            lispobj* symbol = (lispobj*)
+              lisp_symbol_from_tls_index(tls_index);
 #else
             lispobj* symbol = native_pointer(tls_index);
 #endif
@@ -643,14 +612,12 @@ static void trace1(lispobj object,
         // Special-case a few combinations of <type,wordindex>
         switch (next.wordindex) {
         case 0:
-            if (lowtag_of(ptr) == INSTANCE_POINTER_LOWTAG  ||
-                lowtag_of(ptr) == FUN_POINTER_LOWTAG)
+            if (instancep(ptr) || functionp(ptr))
                 target = instance_layout(native_pointer(ptr));
             break;
 #if FUN_SELF_FIXNUM_TAGGED
         case 1:
-            if (lowtag_of(ptr) == FUN_POINTER_LOWTAG &&
-                widetag_of(*native_pointer(ptr)) == CLOSURE_WIDETAG)
+            if (functionp(ptr) && widetag_of(*native_pointer(ptr)) == CLOSURE_WIDETAG)
                 target -= FUN_RAW_ADDR_OFFSET;
             break;
 #endif
@@ -762,7 +729,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
             // tables since we can't decide whether to allow the entry.
             if (is_vector_subtype(*where, VectorValidHashing)) {
                 lispobj lhash_table = where[2];
-                gc_assert(lowtag_of(lhash_table) == INSTANCE_POINTER_LOWTAG);
+                gc_assert(instancep(lhash_table));
                 struct hash_table* hash_table =
                   (struct hash_table *)native_pointer(lhash_table);
                 int weakness = hashtable_weakness(hash_table);
@@ -913,9 +880,7 @@ void gc_prove_liveness(void(*context_scanner)(),
 {
     int n_watched = 0, n_live = 0, n_bad = 0;
     lispobj list;
-    for ( list = objects ;
-          list != NIL && lowtag_of(list) == LIST_POINTER_LOWTAG ;
-          list = CONS(list)->cdr ) {
+    for (list = objects ; list != NIL && listp(list) ; list = CONS(list)->cdr) {
         ++n_watched;
         lispobj car = CONS(list)->car;
         if ((lowtag_of(car) != OTHER_POINTER_LOWTAG ||
@@ -925,7 +890,7 @@ void gc_prove_liveness(void(*context_scanner)(),
             n_live += ((struct weak_pointer*)native_pointer(car))->value
                 != UNBOUND_MARKER_WIDETAG;
     }
-    if (lowtag_of(list) != LIST_POINTER_LOWTAG || n_bad) {
+    if (!listp(list) || n_bad) {
         fprintf(stderr, "; Bad value in liveness tracker\n");
         return;
     }

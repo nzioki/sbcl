@@ -17,6 +17,7 @@
 #include "genesis/closure.h"
 #include "genesis/layout.h"
 #include "genesis/hash-table.h"
+#include "immobile-space.h"
 #include "queue.h"
 
 #include <stdio.h>
@@ -59,14 +60,14 @@ struct unbounded_queue {
 static page_index_t free_page;
 
 /* The whole-page allocator works backwards from the end of dynamic space.
- * If it collides with 'last_free_page', then you lose.
+ * If it collides with 'next_free_page', then you lose.
  * TOOD: It would be reasonably simple to have this request more memory from
  * the OS instead of failing on overflow */
 static void* get_free_page() {
     --free_page;
-    if (free_page < last_free_page)
+    if (free_page < next_free_page)
         lose("Needed more space to GC\n");
-    page_table[free_page].allocated = UNBOXED_PAGE_FLAG;
+    page_table[free_page].type = UNBOXED_PAGE_FLAG;
     char* mem = page_address(free_page);
     zero_dirty_pages(free_page, free_page);
     return mem;
@@ -163,7 +164,7 @@ static inline int pointer_survived_gc_yet(lispobj pointer)
 {
     if (!interesting_pointer_p(pointer))
         return 1;
-    if (lowtag_of(pointer) == LIST_POINTER_LOWTAG)
+    if (listp(pointer))
         return cons_markedp(pointer);
     lispobj header = *native_pointer(pointer);
     if (widetag_of(header) == BIGNUM_WIDETAG)
@@ -178,7 +179,7 @@ void __mark_obj(lispobj pointer)
     gc_dcheck(is_lisp_pointer(pointer));
     if (!interesting_pointer_p(pointer))
         return;
-    if (lowtag_of(pointer) != LIST_POINTER_LOWTAG) {
+    if (!listp(pointer)) {
         lispobj* base = native_pointer(pointer);
         lispobj header = *base;
         if (widetag_of(header) == BIGNUM_WIDETAG) {
@@ -362,13 +363,12 @@ void execute_full_mark_phase()
     while (where < end) {
         lispobj obj = compute_lispobj(where);
         gc_enqueue(obj);
-        where += lowtag_of(obj) != LIST_POINTER_LOWTAG
-                   ? sizetab[widetag_of(*where)](where) : 2;
+        where += listp(obj) ? 2 : sizetab[widetag_of(*where)](where);
     }
     do {
         lispobj ptr = gc_dequeue();
         gc_dcheck(ptr != 0);
-        if (lowtag_of(ptr) != LIST_POINTER_LOWTAG)
+        if (!listp(ptr))
             trace_object(native_pointer(ptr));
         else
             mark_pair((lispobj*)(ptr - LIST_POINTER_LOWTAG));
@@ -412,23 +412,21 @@ __attribute__((unused)) static char *fillerp(lispobj* where)
     page_index_t page;
     if (where[0] | where[1])
         return "cons";
-    if ((page = find_page_index(where)) >= 0 && page_table[page].large_object)
+    if ((page = find_page_index(where)) >= 0 && page_single_obj_p(page))
         return "cons (largeobj filler)";
     return "cons (filler)";
 }
 
-FILE *sweeplog;
+static FILE *sweeplog;
+static int sweep_mode = 1;
 
-#ifdef LOG_SWEEP_ACTIONS
-# define NOTE_GARBAGE(gen,addr,nwords,tally) \
+# define NOTE_GARBAGE(gen,addr,nwords,tally,erase) \
   { tally[gen] += nwords; \
-    if (sweeplog) \
+    if (sweep_mode & 2) /* print before erasing */ \
      fprintf(sweeplog, "%5d %d #x%"OBJ_FMTX": %"OBJ_FMTX" %"OBJ_FMTX"\n", \
              (int)nwords, gen, compute_lispobj(addr), \
-             addr[0], addr[1]); }
-#else
-# define NOTE_GARBAGE(gen,addr,nwords,tally) tally[gen] += nwords
-#endif
+             addr[0], addr[1]); \
+    if (sweep_mode & 1) { erase; } }
 
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
 #define __immobile_obj_gen_bits(x) (lose("No page index?"),0)
@@ -452,8 +450,8 @@ static void sweep_fixedobj_pages(long *zeroed)
             } else if (header & MARK_BIT) { // live object
                 *obj = header ^ MARK_BIT;
             } else {
-                NOTE_GARBAGE(__immobile_obj_gen_bits(obj), obj, nwords, zeroed);
-                memset(obj, 0, nwords * N_WORD_BYTES);
+                NOTE_GARBAGE(__immobile_obj_gen_bits(obj), obj, nwords, zeroed,
+                             memset(obj, 0, nwords * N_WORD_BYTES));
             }
         }
     }
@@ -475,8 +473,8 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                cons:
                     gc_dcheck(!immobile_space_p((lispobj)where));
                     NOTE_GARBAGE(page_table[find_page_index(where)].gen,
-                                 where, 2, zeroed);
-                    where[0] = where[1] = 0;
+                                 where, 2, zeroed,
+                                 where[0] = where[1] = 0);
                 }
             }
         } else {
@@ -491,20 +489,40 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                 if (nwords <= 2) // could be SAP, SIMPLE-ARRAY-NIL, 1-word bignum, etc
                     goto cons;
                 struct code* code  = (struct code*)where;
-                lispobj header = 2<<N_WIDETAG_BITS | CODE_HEADER_WIDETAG;
+                // Keep in sync with the definition of filler_obj_p()
+                lispobj header = CODE_HEADER_WIDETAG;
                 if (code->header != header) {
                     page_index_t page = find_page_index(where);
                     int gen = page >= 0 ? page_table[page].gen
                       : __immobile_obj_gen_bits(where);
-                    NOTE_GARBAGE(gen, where, nwords, zeroed);
-                    code->header = header;
-                    code->code_size = make_fixnum((nwords - 2) * N_WORD_BYTES);
-                    memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
+                    NOTE_GARBAGE(gen, where, nwords, zeroed, {
+                        code->header = header;
+                        code->code_size = make_fixnum(nwords * N_WORD_BYTES);
+                        memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
+                    })
                 }
             }
         }
     }
     return 0;
+}
+
+// sweep_mode: 1 = erase, 2 = print, 3 = both
+void toggle_print_garbage(char *filename, int enable)
+{
+    if (enable) {
+        if (sweeplog) {
+          fprintf(stderr,"Erasing previous sweep log file\n");
+          fclose(sweeplog);
+        }
+        sweeplog = fopen(filename, "w");
+        sweep_mode = enable < 0 ? 2 : 3;
+        fprintf(stderr, "Set sweep mode to %d\n", sweep_mode);
+    } else {
+        fclose(sweeplog);
+        fprintf(stderr, "Sweep log closed\n");
+        sweep_mode = 1;
+    }
 }
 
 void execute_full_sweep_phase()
@@ -514,15 +532,11 @@ void execute_full_sweep_phase()
     cull_weak_hash_tables(alivep_funs);
     smash_weak_pointers();
 
-#ifdef LOG_SWEEP_ACTIONS
-    sweeplog = fopen("/tmp/sweep.log", "a");
-    fprintf(sweeplog, "-- begin sweep --\n");
-#endif
-
     memset(words_zeroed, 0, sizeof words_zeroed);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (sweeplog) fprintf(sweeplog, "-- fixedobj space --\n");
     sweep_fixedobj_pages(words_zeroed);
-    if (sweeplog) fprintf(sweeplog, "-- varyobj pages --\n");
+    if (sweeplog) fprintf(sweeplog, "-- varyobj space --\n");
     sweep((lispobj*)VARYOBJ_SPACE_START, varyobj_free_pointer,
           (uword_t)words_zeroed);
 #endif
@@ -536,13 +550,11 @@ void execute_full_sweep_phase()
         fprintf(stderr, " words zeroed]\n");
     }
     hopscotch_destroy(&mark_bits);
-#ifdef LOG_SWEEP_ACTIONS
-    fclose(sweeplog);
-    sweeplog = 0;
-#endif
+    if (sweeplog)
+        fflush(sweeplog);
 
     page_index_t first_page, last_page;
-    for (first_page = 0; first_page < last_free_page; ++first_page)
+    for (first_page = 0; first_page < next_free_page; ++first_page)
         if (page_table[first_page].write_protected) {
             last_page = first_page;
             while (page_table[last_page+1].write_protected)
@@ -553,6 +565,6 @@ void execute_full_sweep_phase()
             first_page = last_page;
         }
     while (free_page < page_table_pages) {
-        page_table[free_page++].allocated = FREE_PAGE_FLAG;
+        page_table[free_page++].type = FREE_PAGE_FLAG;
     }
 }

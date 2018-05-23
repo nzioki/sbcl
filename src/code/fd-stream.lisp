@@ -48,7 +48,7 @@
   (tail 0 :type index))
 (declaim (freeze-type buffer))
 
-(defglobal *available-buffers* ()
+(define-load-time-global *available-buffers* ()
   "List of available buffers.")
 
 (defconstant +bytes-per-buffer+ (* 4 1024)
@@ -438,7 +438,7 @@
 
 ;;;; output routines and related noise
 
-(defvar *output-routines* ()
+(define-load-time-global *output-routines* ()
   "List of all available output routines. Each element is a list of the
   element-type output, the kind of buffering, the function name, and the number
   of bytes per element.")
@@ -466,6 +466,13 @@
   (error 'c-string-encoding-error
          :external-format external-format
          :code code))
+
+(macrolet ((sap-ref-octets (sap offset count)
+             `(let ((.buffer.
+                     (make-array (the fixnum ,count) :element-type '(unsigned-byte 8))))
+                (%byte-blt ,sap ,offset .buffer. 0 ,count)
+                .buffer.)))
+
 (defun c-string-decoding-error (external-format sap offset count)
   (declare (optimize allow-non-returning-tail-call))
   (error 'c-string-decoding-error
@@ -511,6 +518,7 @@
         (when (> (length string) 0)
           (setf (fd-stream-listen stream) t)))
       nil)))
+) ; end MACROLET
 
 (defun stream-encoding-error-and-handle (stream code)
   (restart-case
@@ -1304,28 +1312,6 @@
            (sap (buffer-sap ibuf)))
       (declare (type index remaining-request head tail available))
       (declare (type index n-this-copy))
-      #!+cheneygc
-      ;; Prevent failure caused by memmove() hitting a write-protected page
-      ;; and the fault handler losing, since it thinks you're not in Lisp.
-      ;; This is wasteful, but better than being randomly broken (lp#1366263).
-      (when (> this-end this-start)
-        (typecase buffer
-          (system-area-pointer
-           (setf (sap-ref-8 buffer this-start) (sap-ref-8 buffer this-start)
-                 (sap-ref-8 buffer (1- this-end)) (sap-ref-8 buffer (1- this-end))))
-          ((simple-array (unsigned-byte 8) (*))
-           (setf (aref buffer this-start) (aref buffer this-start)
-                 (aref buffer (1- this-end)) (aref buffer (1- this-end))))
-          ((simple-array * (*))
-           ;; We might have an array of UNSIGNED-BYTE-32 here, but the
-           ;; bounding indices act as if it were UNSIGNED-BYTE-8.
-           ;; This is strange, and in direct contradiction to what %BYTE-BLT
-           ;; believes it accepts. i.e. according to the comments,
-           ;; it's for want of error checking that this works at all.
-           (with-pinned-objects (buffer)
-             (let ((sap (vector-sap buffer)))
-               (setf (sap-ref-8 sap this-start) (sap-ref-8 sap this-start)
-                     (sap-ref-8 sap (1- this-end)) (sap-ref-8 sap (1- this-end))))))))
       ;; Copy data from stream buffer into user's buffer.
       (%byte-blt sap head buffer this-start this-end)
       (incf (buffer-head ibuf) n-this-copy)
@@ -2708,7 +2694,7 @@
     (t ; call next method
      (fd-stream-misc-routine stream operation arg1 arg2))))
 
-(!defglobal *!cold-stderr-buf* " ")
+(!define-load-time-global *!cold-stderr-buf* " ")
 
 (defun !make-cold-stderr-stream ()
   (let ((stderr

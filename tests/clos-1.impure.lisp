@@ -13,12 +13,6 @@
 
 ;;; clos.impure.lisp was getting too big and confusing
 
-(load "assertoid.lisp")
-
-(cl:defpackage "CLOS-1"
-  (:use "CL" "ASSERTOID" "TEST-UTIL"))
-(cl:in-package "CLOS-1")
-
 ;;; tests that various optimization paths for slot-valuish things
 ;;; respect class redefinitions.
 (defclass foo ()
@@ -200,3 +194,64 @@
   (defmethod foo ((x t)) 3)
   (assert (= (foo t) 3))
   (assert (= (foo 3) 2)))
+
+(with-test (:name :bug-309084-a-i)
+  (assert-error (eval '(define-method-combination bug-309084-a-i :documentation :operator))
+                program-error))
+(with-test (:name :bug-309084-a-ii)
+  (assert-error (eval '(define-method-combination bug-309084-a-ii :documentation nil))
+                program-error))
+(with-test (:name :bug-309084-a-iii)
+  (assert-error (eval '(define-method-combination bug-309084-a-iii nil))
+                program-error))
+(with-test (:name :bug-309084-a-vi)
+  (assert-error (eval '(define-method-combination bug-309084-a-vi nil nil
+                        (:generic-function)))
+                program-error))
+(with-test (:name :bug-309084-a-vii)
+  (assert-error (eval '(define-method-combination bug-309084-a-vii nil nil
+                        (:generic-function bar baz)))
+                program-error))
+(with-test (:name :bug-309084-a-viii)
+  (assert-error (eval '(define-method-combination bug-309084-a-viii nil nil
+                        (:generic-function (bar))))
+                program-error))
+(with-test (:name :bug-309084-a-ix)
+  (assert-error (eval '(define-method-combination bug-309084-a-ix nil ((3))))
+                program-error))
+(with-test (:name :bug-309084-a-x)
+  (assert-error (eval '(define-method-combination bug-309084-a-x nil ((a))))
+                program-error))
+(with-test (:name :bug-309084-a-iv)
+  (assert-error (eval '(define-method-combination bug-309084-a-iv nil nil
+                        (:arguments order &aux &key)))
+                program-error))
+(with-test (:name :bug-309084-a-v)
+  (assert-error (eval '(define-method-combination bug-309084-a-v nil nil
+                        (:arguments &whole)))
+                program-error))
+
+(define-method-combination bug-309084-b/mc nil
+  ((all *))
+  (:arguments x &optional (y 'a yp) &key (z 'b zp) &aux (w (list y z)))
+  `(list ,x ,y ,yp ,z ,zp ,w))
+
+(defgeneric bug-309084-b/gf (a &optional b &key &allow-other-keys)
+  (:method-combination bug-309084-b/mc)
+  (:method (m &optional n &key) (list m n)))
+
+(with-test (:name :bug-309084-b)
+  (assert (equal (bug-309084-b/gf 1) '(1 a nil b nil (a b))))
+  (assert (equal (bug-309084-b/gf 1 2) '(1 2 t b nil (2 b))))
+  (assert (equal (bug-309084-b/gf 1 2 :z 3) '(1 2 t 3 t (2 3)))))
+
+(defgeneric bug-309084-b/gf2 (a b &optional c d &key &allow-other-keys)
+  (:method-combination bug-309084-b/mc)
+  (:method (m n &optional o p &key) (list m n o p)))
+
+(with-test (:name :bug-309084-b2)
+  (assert (equal (bug-309084-b/gf2 1 2) '(1 a nil b nil (a b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3) '(1 3 t b nil (3 b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3 4) '(1 3 t b nil (3 b))))
+  (assert (equal (bug-309084-b/gf2 1 2 :z t) '(1 :z t b nil (:z b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3 4 :z 5) '(1 3 t 5 t (3 5)))))

@@ -1015,8 +1015,17 @@
 (define-alien-type-class (fun :include mem-block)
   (result-type (missing-arg) :type alien-type)
   (arg-types (missing-arg) :type list)
+  ;; The 3rd-party CFFI library uses presence of &REST in an argument list
+  ;; as indicative of "..." in the C prototype. We can record that too.
+  (varargs nil :type (or boolean (eql :unspecified)))
   (stub nil :type (or null function))
   (convention nil :type calling-convention))
+;;; The safe default is to assume that everything is varargs.
+;;; On x86-64 we have to emit a spurious instruction because of it.
+;;; So until all users fix their lambda lists to be explicit about &REST
+;;; (which is never gonna happen), be backward-compatible, unless
+;;; locally toggled to get rid of noise instructions if so inclined.
+(defglobal *alien-fun-type-varargs-default* :unspecified)
 
 ;;; KLUDGE: non-intrusive, backward-compatible way to allow calling
 ;;; convention specification for function types is unobvious.
@@ -1028,17 +1037,19 @@
 
 (define-alien-type-translator function (result-type &rest arg-types
                                                     &environment env)
-  (multiple-value-bind (bare-result-type calling-convention)
-      (typecase result-type
-        ((cons calling-convention *)
-           (values (second result-type) (first result-type)))
-        (t result-type))
+  (binding* (((bare-result-type calling-convention)
+              (typecase result-type
+                ((cons calling-convention *)
+                 (values (second result-type) (first result-type)))
+                (t result-type)))
+             (varargs (eq (car (last arg-types)) '&rest)))
     (make-alien-fun-type
      :convention calling-convention
      :result-type (let ((*values-type-okay* t))
                     (parse-alien-type bare-result-type env))
+     :varargs (or varargs *alien-fun-type-varargs-default*)
      :arg-types (mapcar (lambda (arg-type) (parse-alien-type arg-type env))
-                        arg-types))))
+                        (if varargs (butlast arg-types) arg-types)))))
 
 (define-alien-type-method (fun :unparse) (type)
   `(function ,(let ((result-type
@@ -1047,7 +1058,9 @@
                 (if convention (list convention result-type)
                     result-type))
              ,@(mapcar #'%unparse-alien-type
-                       (alien-fun-type-arg-types type))))
+                       (alien-fun-type-arg-types type))
+             ,@(when (alien-fun-type-varargs type)
+                 '(&rest))))
 
 (define-alien-type-method (fun :type=) (type1 type2)
   (and (alien-type-= (alien-fun-type-result-type type1)
@@ -1138,5 +1151,32 @@
              (when (eq kind :alien)
                `(%heap-alien-addr ',(info :variable :alien-info form))))))
         (error "~S is not a valid L-value." form))))
+
+(push '("SB-ALIEN" define-alien-type-class define-alien-type-method)
+      sb!impl::*!removable-symbols*)
+
+(in-package "SB!IMPL")
+
+(defun extern-alien-name (name)
+ (handler-case (coerce name 'base-string)
+   (error ()
+     (error "invalid external alien name: ~S" name))))
+
+(declaim (ftype (sfunction (string hash-table) (or integer null))
+                find-foreign-symbol-in-table))
+(defun find-foreign-symbol-in-table (name table)
+  (let ((extern (extern-alien-name name)))
+    (values
+     (or (gethash extern table)
+         (gethash (concatenate 'base-string "ldso_stub__" extern) table)))))
+
+;;; *STATIC-FOREIGN-SYMBOLS* are static as opposed to "dynamic" (not
+;;; as opposed to C's "extern"). The table contains symbols known at
+;;; the time that the program was built, but not symbols defined in
+;;; object files which have been loaded dynamically since then.
+#!-sb-dynamic-core
+(progn
+  (declaim (type hash-table *static-foreign-symbols*))
+  (defvar *static-foreign-symbols* (make-hash-table :test 'equal)))
 
 (/show0 "host-alieneval.lisp end of file")

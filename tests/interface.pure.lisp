@@ -11,11 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(load "test-util.lisp")
-(load "compiler-test-util.lisp")
-(use-package :test-util)
 
 ;;;; properties of symbols, e.g. presence of doc strings for public symbols
 
@@ -176,12 +171,12 @@
                     (the (complex single-float) y)))
                :stream (make-broadcast-stream)))
 
-;;; Data in the high bits of a fun header caused CODE-N-UNBOXED-DATA-WORDS
+;;; Data in the high bits of a fun header caused CODE-N-UNBOXED-DATA-BYTES
 ;;; to return a ridiculously huge value.
 (with-test (:name (disassemble :unboxed-data))
-  (assert (< (sb-kernel:code-n-unboxed-data-words
+  (assert (< (sb-kernel:code-n-unboxed-data-bytes
               (sb-kernel:fun-code-header #'expt))
-             100))) ; The exact value is irrelevant.
+             150))) ; The exact value is irrelevant.
 
 #+x86-64
 ;; The labeler for LEA would choke on an illegal encoding

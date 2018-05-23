@@ -61,13 +61,23 @@
 ;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
 ;;;             instantiated once per component, INLINE - for all
 ;;;             references (even under #'without FUNCALL)."
-(deftype inlinep ()
+(def!type inlinep ()
   '(member :inline :maybe-inline :notinline nil))
 (defconstant-eqx +inlinep-translations+
   '((inline . :inline)
     (notinline . :notinline)
     (maybe-inline . :maybe-inline))
   #'equal)
+
+(defstruct (dxable-args (:constructor make-dxable-args (list))
+                        (:predicate nil)
+                        (:copier nil))
+  (list nil :read-only t))
+(defstruct (inlining-data (:include dxable-args)
+                          (:constructor make-inlining-data (expansion list))
+                          (:predicate nil)
+                          (:copier nil))
+  (expansion nil :read-only t))
 
 ;;; *FREE-VARS* translates from the names of variables referenced
 ;;; globally to the LEAF structures for them. *FREE-FUNS* is like
@@ -89,7 +99,6 @@
 (defvar *allow-instrumenting*)
 
 ;;; miscellaneous forward declarations
-(defvar *code-segment*)
 ;; FIXME: this is a kludge due to the absence of a 'vop' argument
 ;; to ALLOCATION-TRAMP in the x86-64 backend.
 #!+immobile-code
@@ -106,26 +115,12 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
+#!+sb-dyncount
 (defvar *dynamic-counts-tn*)
-(defvar *elsewhere*)
 (defvar *elsewhere-label*)
 (defvar *event-info*)
 (defvar *event-note-threshold*)
 (defvar *failure-p*)
-(defvar *fixup-notes*)
-#!+inline-constants
-(progn
-  (defvar *unboxed-constants*)
-  (defstruct (unboxed-constants (:conc-name constant-)
-                                (:predicate nil) (:copier nil))
-    (table (make-hash-table :test #'equal) :read-only t)
-    (segment
-     (sb!assem:make-segment :type :elsewhere
-                            :run-scheduler nil
-                            :inst-hook (default-segment-inst-hook)
-                            :alignment 0) :read-only t)
-    (vector (make-array 16 :adjustable t :fill-pointer 0) :read-only t))
-  (declaim (freeze-type unboxed-constants)))
 (defvar *source-info*)
 (defvar *source-plist*)
 (defvar *source-namestring*)
@@ -133,7 +128,8 @@
 (defvar *warnings-p*)
 (defvar *lambda-conversions*)
 (defvar *compile-object* nil)
-(defvar *msan-compatible-stack-unpoison* nil)
+(defvar *location-context* nil)
+(defvar *msan-unpoison* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
@@ -155,9 +151,6 @@ the stack without triggering overflow protection.")
   `(sb!thread:with-recursive-lock (**world-lock**)
      ,@body))
 
-(declaim (type fixnum *compiler-sset-counter*))
-(defvar *compiler-sset-counter* 0)
-
 ;;; unique ID for the next object created (to let us track object
 ;;; identity even across GC, useful for understanding weird compiler
 ;;; bugs where something is supposed to be unique but is instead
@@ -176,10 +169,11 @@ the stack without triggering overflow protection.")
 ;;; Rather than registering listeners, they can detect changes by comparing
 ;;; their stored nonce to the current nonce. Additionally the observers
 ;;; can detect whether function definitions have occurred.
-(declaim (fixnum *type-cache-nonce*))
-(!defglobal *type-cache-nonce* 0)
+#-sb-xc-host
+(progn (declaim (fixnum *type-cache-nonce*))
+       (!define-load-time-global *type-cache-nonce* 0))
 
-(def!struct (undefined-warning
+(defstruct (undefined-warning
             #-no-ansi-print-object
             (:print-object (lambda (x s)
                              (print-unreadable-object (x s :type t)
@@ -306,9 +300,39 @@ the stack without triggering overflow protection.")
                 debug name." name))
         name))))
 
-;;; Set this to NIL to inhibit assembly-level optimization. (For
-;;; compiler debugging, rather than policy control.)
-(defvar *assembly-optimize* t)
+;;; Bound during eval-when :compile-time evaluation.
+(defvar *compile-time-eval* nil)
+(declaim (always-bound *compile-time-eval*))
+
+#!-immobile-code (defmacro code-immobile-p (thing) `(progn ,thing nil))
+
+;;; Various error-code generating helpers
+(defvar *adjustable-vectors*)
+
+(defmacro with-adjustable-vector ((var) &rest body)
+  `(let ((,var (or (pop *adjustable-vectors*)
+                   (make-array 16
+                               :element-type '(unsigned-byte 8)
+                               :fill-pointer 0
+                               :adjustable t))))
+     ;; Don't declare the length - if it gets adjusted and pushed back
+     ;; onto the freelist, it's anyone's guess whether it was expanded.
+     ;; This code was wrong for >12 years, so nobody must have needed
+     ;; more than 16 elements. Maybe we should make it nonadjustable?
+     (declare (type (vector (unsigned-byte 8)) ,var))
+     (setf (fill-pointer ,var) 0)
+     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
+     ;; and this macro is about speeding up the compiler, not slowing it down.
+     ;; GC will clean up any debris, and since the vector does not point
+     ;; to anything, even an accidental promotion to a higher generation
+     ;; will not cause transitive garbage retention.
+     (prog1 (progn ,@body)
+       (push ,var *adjustable-vectors*))))
+
+
+;;; The allocation quantum for boxed code header words.
+;;; 2 implies an even length boxed header; 1 implies no restriction.
+(defvar code-boxed-words-align (+ 2 #!+(or x86-64) -1))
 
 (in-package "SB!ALIEN")
 
@@ -321,3 +345,8 @@ the stack without triggering overflow protection.")
   ;; Data or code?
   (datap (missing-arg) :type boolean))
 (!set-load-form-method heap-alien-info (:xc :target))
+
+;; from 'llvm/projects/compiler-rt/lib/msan/msan.h':
+;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"
+#!+linux ; shadow space differs by OS
+(defconstant sb!vm::msan-mem-to-shadow-xor-const #x500000000000)

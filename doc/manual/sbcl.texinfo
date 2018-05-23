@@ -1,7 +1,6 @@
 \input texinfo   @c -*-texinfo-*-
 @c %**start of header
 @setfilename sbcl.info
-@settitle SBCL User Manual
 @documentencoding UTF-8
 @c %**end of header
 @afourwide
@@ -112,7 +111,7 @@ provided with absolutely no warranty. See the @file{COPYING} and
 @include ffi.texinfo
 @include pathnames.texinfo
 @include streams.texinfo
-@include package-locks.texi-temp
+@include package-locks.texinfo
 @include threading.texinfo
 @include timers.texinfo
 @include sb-bsd-sockets/sb-bsd-sockets.texinfo

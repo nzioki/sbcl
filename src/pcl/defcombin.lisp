@@ -36,22 +36,45 @@
                (listp (caddr form)))
           (expand-long-defcombin form)
           (expand-short-defcombin form))))
+
+(defstruct method-combination-info
+  (constructor (error "missing arg") :type function)
+  (cache nil :type list)
+  (source-location nil :type (or null sb-c:definition-source-location)))
+(defglobal **method-combinations** (make-hash-table :test 'eql))
+
+(defmethod find-method-combination ((generic-function generic-function)
+                                    name options)
+  (let ((info (gethash name **method-combinations**)))
+    (when info
+      (or (cdr (assoc options (method-combination-info-cache info) :test #'equal))
+          (cdar (push (cons options (funcall (method-combination-info-constructor info) options))
+                      (method-combination-info-cache info)))))))
 
 ;;;; standard method combination
+(setf (gethash 'standard **method-combinations**)
+      (make-method-combination-info
+       :constructor (lambda (options) (when options (method-combination-error "STANDARD method combination accepts no options.")) *standard-method-combination*)
+       :cache (list (cons nil *standard-method-combination*))))
 
-;;; The STANDARD method combination type is implemented directly by
-;;; the class STANDARD-METHOD-COMBINATION. The method on
-;;; COMPUTE-EFFECTIVE-METHOD does standard method combination directly
-;;; and is defined by hand in the file combin.lisp. The method for
-;;; FIND-METHOD-COMBINATION must appear in this file for bootstrapping
-;;; reasons.
-(defmethod find-method-combination ((generic-function generic-function)
-                                    (type-name (eql 'standard))
-                                    options)
-  (when options
-    (method-combination-error
-      "STANDARD method combination accepts no options."))
-  *standard-method-combination*)
+(defun update-mcs (name new old frobmc)
+  (setf (gethash name **method-combinations**) new)
+  ;; for correctness' sake we should probably lock
+  ;; **METHOD-COMBINATIONS** while we're updating things, to defend
+  ;; against defining gfs in one thread while redefining the method
+  ;; combination in another thread.
+  (when old
+    (setf (method-combination-info-cache new) (method-combination-info-cache old))
+    (setf (method-combination-info-cache old) nil)
+    (dolist (entry (method-combination-info-cache new))
+      (let* ((mc (cdr entry))
+             (gfs (method-combination-%generic-functions mc)))
+        (funcall frobmc mc)
+        (flet ((flush (gf ignore)
+                 (declare (ignore ignore))
+                 (flush-effective-method-cache gf)
+                 (reinitialize-instance gf)))
+          (maphash #'flush gfs))))))
 
 ;;;; short method combinations
 ;;;;
@@ -61,47 +84,37 @@
 ;;;; and runs the same rule.
 
 (defun expand-short-defcombin (whole)
-  (let* ((type-name (cadr whole))
-         (documentation
-           (getf (cddr whole) :documentation))
-         (identity-with-one-arg
-           (getf (cddr whole) :identity-with-one-argument nil))
+  (let* ((canary (cons nil nil))
+         (type-name (cadr whole))
+         (documentation (getf (cddr whole) :documentation canary))
+         (ioa (getf (cddr whole) :identity-with-one-argument nil))
          (operator
            (getf (cddr whole) :operator type-name)))
+    (unless (or (eq documentation canary)
+                (stringp documentation))
+      (%program-error "~@<~S argument to the short form of ~S must be a string.~:@>"
+                      :documentation 'define-method-combination))
     `(load-short-defcombin
-     ',type-name ',operator ',identity-with-one-arg ',documentation
+      ',type-name ',operator ',ioa
+      ',(and (neq documentation canary)
+             documentation)
       (sb-c:source-location))))
 
 (defun load-short-defcombin (type-name operator ioa doc source-location)
-  (let* ((specializers
-           (list (find-class 'generic-function)
-                 (intern-eql-specializer type-name)
-                 *the-class-t*))
-         (old-method
-           (get-method #'find-method-combination () specializers nil))
-         (new-method nil))
-    (setq new-method
-          (make-instance 'standard-method
-            :qualifiers ()
-            :specializers specializers
-            :lambda-list '(generic-function type-name options)
-            :function (lambda (args nms &rest cm-args)
-                        (declare (ignore nms cm-args))
-                        (apply
-                         (lambda (gf type-name options)
-                           (declare (ignore gf))
-                           (short-combine-methods
-                            type-name options operator ioa new-method doc))
-                         args))
-            :definition-source source-location))
-    (when old-method
-      (remove-method #'find-method-combination old-method))
-    (add-method #'find-method-combination new-method)
-    (when doc
-      (setf (random-documentation type-name 'method-combination) doc))
-    type-name))
+  (let ((info (make-method-combination-info
+               :source-location source-location
+               :constructor (lambda (options)
+                              (short-combine-methods type-name options operator ioa source-location doc))))
+        (old-info (gethash type-name **method-combinations**)))
+    (flet ((frobber (mc)
+             (change-class mc 'short-method-combination
+                           :operator operator :identity-with-one-argument ioa
+                           'source source-location :documentation doc)))
+      (update-mcs type-name info old-info #'frobber)))
+  (setf (random-documentation type-name 'method-combination) doc)
+  type-name)
 
-(defun short-combine-methods (type-name options operator ioa method doc)
+(defun short-combine-methods (type-name options operator ioa source-location doc)
   (cond ((null options) (setq options '(:most-specific-first)))
         ((equal options '(:most-specific-first)))
         ((equal options '(:most-specific-last)))
@@ -116,7 +129,7 @@
                  :options options
                  :operator operator
                  :identity-with-one-argument ioa
-                 :definition-source method
+                 'source source-location
                  :documentation doc))
 
 (defmethod invalid-qualifiers ((gf generic-function)
@@ -148,13 +161,20 @@
 (defun expand-long-defcombin (form)
   (let ((type-name (cadr form))
         (lambda-list (caddr form))
+        (method-group-specifiers-presentp (cdddr form))
         (method-group-specifiers (cadddr form))
         (body (cddddr form))
         (args-option ())
         (gf-var nil))
+    (unless method-group-specifiers-presentp
+      (%program-error "~@<The long form of ~S requires a list of method group specifiers.~:@>"
+                      'define-method-combination))
     (when (and (consp (car body)) (eq (caar body) :arguments))
       (setq args-option (cdr (pop body))))
     (when (and (consp (car body)) (eq (caar body) :generic-function))
+      (unless (and (cdar body) (symbolp (cadar body)) (null (cddar body)))
+        (%program-error "~@<The argument to the ~S option of ~S must be a single symbol.~:@>"
+                        :generic-function 'define-method-combination))
       (setq gf-var (cadr (pop body))))
     (multiple-value-bind (documentation function)
         (make-long-method-combination-function
@@ -165,36 +185,25 @@
 
 (define-load-time-global *long-method-combination-functions* (make-hash-table :test 'eq))
 
-(defun load-long-defcombin
-    (type-name doc function args-lambda-list source-location)
-  (let* ((specializers
-           (list (find-class 'generic-function)
-                 (intern-eql-specializer type-name)
-                 *the-class-t*))
-         (old-method
-           (get-method #'find-method-combination () specializers nil))
-         (new-method
-           (make-instance 'standard-method
-             :qualifiers ()
-             :specializers specializers
-             :lambda-list '(generic-function type-name options)
-             :function (lambda (args nms &rest cm-args)
-                         (declare (ignore nms cm-args))
-                         (apply
-                          (lambda (generic-function type-name options)
-                            (declare (ignore generic-function))
-                            (make-instance 'long-method-combination
-                                           :type-name type-name
-                                           :options options
-                                           :args-lambda-list args-lambda-list
-                                           :documentation doc))
-                          args))
-             :definition-source source-location)))
-    (setf (gethash type-name *long-method-combination-functions*) function)
-    (when old-method (remove-method #'find-method-combination old-method))
-    (add-method #'find-method-combination new-method)
-    (setf (random-documentation type-name 'method-combination) doc)
-    type-name))
+(defun load-long-defcombin (type-name doc function args-lambda-list source-location)
+  (let ((info (make-method-combination-info
+               :constructor (lambda (options)
+                              (make-instance 'long-method-combination
+                                             :type-name type-name
+                                             :options options
+                                             :args-lambda-list args-lambda-list
+                                             'source source-location
+                                             :documentation doc))
+               :source-location source-location))
+        (old-info (gethash type-name **method-combinations**)))
+    (flet ((frobber (mc)
+             (change-class mc 'long-method-combination
+                           :type-name type-name :args-lambda-list args-lambda-list
+                           'source source-location :documentation doc)))
+      (update-mcs type-name info old-info #'frobber)))
+  (setf (gethash type-name *long-method-combination-functions*) function)
+  (setf (random-documentation type-name 'method-combination) doc)
+  type-name)
 
 (defmethod compute-effective-method ((generic-function generic-function)
                                      (combin long-method-combination)
@@ -316,7 +325,9 @@
         ,@real-body))))
 
 (defun parse-method-group-specifier (method-group-specifier)
-  ;;(declare (values name tests description order required))
+  (unless (symbolp (car method-group-specifier))
+    (%program-error "~@<Method group specifiers in the long form of ~S ~
+                     must begin with a symbol.~:@>" 'define-method-combination))
   (let* ((name (pop method-group-specifier))
          (patterns ())
          (tests
@@ -332,6 +343,10 @@
                        (push (parse-qualifier-pattern name pattern)
                              collect)))))
              (nreverse collect))))
+    (when (null patterns)
+      (%program-error "~@<Method group specifiers in the long form of ~S ~
+                       must have at least one qualifier pattern or predicate.~@:>"
+                      'define-method-combination))
     (values name
             tests
             (getf method-group-specifier :description
@@ -374,96 +389,99 @@
 ;;;
 ;;; At compute-effective-method time, the symbols in the :arguments
 ;;; option are bound to the symbols in the intercept lambda list.
-;;;
-;;; FIXME: in here we have not one but two mini-copies of a weird
-;;; hybrid of PARSE-LAMBDA-LIST and (obsolete) PARSE-DEFMACRO-LAMBDA-LIST.
 (defun deal-with-args-option (wrapped-body args-lambda-list)
-  (let ((intercept-rebindings
-         (let (rebindings)
-           (dolist (arg args-lambda-list (nreverse rebindings))
-             (unless (member arg lambda-list-keywords :test #'eq)
-               (typecase arg
-                 (symbol (push `(,arg ',arg) rebindings))
-                 (cons
-                  (unless (symbolp (car arg))
-                    (error "invalid lambda-list specifier: ~S." arg))
-                  (push `(,(car arg) ',(car arg)) rebindings))
-                 (t (error "invalid lambda-list-specifier: ~S." arg)))))))
-        (nreq 0)
-        (nopt 0)
-        (whole nil))
-    ;; Count the number of required and optional parameters in
-    ;; ARGS-LAMBDA-LIST into NREQ and NOPT, and set WHOLE to the
-    ;; name of a &WHOLE parameter, if any.
-    (when (member '&whole (rest args-lambda-list))
-      (error 'simple-program-error
-             :format-control "~@<The value of the :ARGUMENTS option of ~
-                DEFINE-METHOD-COMBINATION is~2I~_~S,~I~_but &WHOLE may ~
-                only appear first in the lambda list.~:>"
-             :format-arguments (list args-lambda-list)))
-    (loop with state = 'required
-          for arg in args-lambda-list do
-            (if (memq arg lambda-list-keywords)
-                (setq state arg)
-                (case state
-                  (required (incf nreq))
-                  (&optional (incf nopt))
-                  (&whole (setq whole arg state 'required)))))
-    ;; This assumes that the head of WRAPPED-BODY is a let, and it
-    ;; injects let-bindings of the form (ARG 'SYM) for all variables
-    ;; of the argument-lambda-list; SYM is a gensym.
-    (aver (memq (first wrapped-body) '(let let*)))
-    (setf (second wrapped-body)
-          (append intercept-rebindings (second wrapped-body)))
-    ;; Be sure to fill out the args lambda list so that it can be too
-    ;; short if it wants to.
-    (unless (or (memq '&rest args-lambda-list)
-                (memq '&allow-other-keys args-lambda-list))
-      (let ((aux (memq '&aux args-lambda-list)))
-        (setq args-lambda-list
-              (append (ldiff args-lambda-list aux)
-                      (if (memq '&key args-lambda-list)
-                          '(&allow-other-keys)
-                          '(&rest .ignore.))
-                      aux))))
-    ;; .GENERIC-FUNCTION. is bound to the generic function in the
-    ;; method combination function, and .GF-ARGS* is bound to the
-    ;; generic function arguments in effective method functions
-    ;; created for generic functions having a method combination that
-    ;; uses :ARGUMENTS.
-    ;;
-    ;; The DESTRUCTURING-BIND binds the parameters of the
-    ;; ARGS-LAMBDA-LIST to actual generic function arguments.  Because
-    ;; ARGS-LAMBDA-LIST may be shorter or longer than the generic
-    ;; function's lambda list, which is only known at run time, this
-    ;; destructuring has to be done on a slighly modified list of
-    ;; actual arguments, from which values might be stripped or added.
-    ;;
-    ;; Using one of the variable names in the body inserts a symbol
-    ;; into the effective method, and running the effective method
-    ;; produces the value of actual argument that is bound to the
-    ;; symbol.
-    `(let ((inner-result. ,wrapped-body)
-           (gf-lambda-list (generic-function-lambda-list .generic-function.)))
-       `(destructuring-bind ,',args-lambda-list
-            (frob-combined-method-args
-             .gf-args. ',gf-lambda-list
-             ,',nreq ,',nopt)
-          ,,(when (memq '.ignore. args-lambda-list)
-              ''(declare (ignore .ignore.)))
-          ;; If there is a &WHOLE in the args-lambda-list, let
-          ;; it result in the actual arguments of the generic-function
-          ;; not the frobbed list.
-          ,,(when whole
-              ``(setq ,',whole .gf-args.))
-          ,inner-result.))))
+  (binding* (((llks required optional rest key aux env whole)
+              (parse-lambda-list
+               args-lambda-list
+               :context "a define-method-combination arguments lambda list"
+               :accept (lambda-list-keyword-mask '(&allow-other-keys &aux &key &optional &rest &whole)))))
+    (check-lambda-list-names llks required optional rest key aux env whole
+                             :context "a define-method-combination arguments lambda list"
+                             :signal-via #'%program-error)
+    (let (intercept-rebindings)
+      (flet ((intercept (sym) (push `(,sym ',sym) intercept-rebindings)))
+        (when whole (intercept (car whole)))
+        (dolist (arg required)
+          (intercept arg))
+        (dolist (arg optional)
+          (multiple-value-bind (name default suppliedp)
+              (parse-optional-arg-spec arg)
+            (declare (ignore default))
+            (intercept name)
+            (when suppliedp (intercept (car suppliedp)))))
+        (when rest (intercept (car rest)))
+        (dolist (arg key)
+          (multiple-value-bind (keyword name default suppliedp)
+              (parse-key-arg-spec arg)
+            (declare (ignore keyword default))
+            (intercept name)
+            (when suppliedp (intercept (car suppliedp)))))
+        (dolist (arg aux)
+          (intercept (if (consp arg) (car arg) arg)))
+        ;; cosmetic only
+        (setq intercept-rebindings (nreverse intercept-rebindings)))
+      ;; This assumes that the head of WRAPPED-BODY is a let, and it
+      ;; injects let-bindings of the form (ARG 'SYM) for all variables
+      ;; of the argument-lambda-list; SYM is a gensym.
+      (aver (memq (first wrapped-body) '(let let*)))
+      (setf (second wrapped-body)
+            (append intercept-rebindings (second wrapped-body)))
+      ;; Be sure to fill out the args lambda list so that it can be too
+      ;; short if it wants to.
+      (unless (or (memq '&rest args-lambda-list)
+                  (memq '&allow-other-keys args-lambda-list))
+        (let ((aux (memq '&aux args-lambda-list)))
+          (setq args-lambda-list
+                (append (ldiff args-lambda-list aux)
+                        (if (memq '&key args-lambda-list)
+                            '(&allow-other-keys)
+                            '(&rest .ignore.))
+                        aux))))
+      ;; .GENERIC-FUNCTION. is bound to the generic function in the
+      ;; method combination function, and .GF-ARGS* is bound to the
+      ;; generic function arguments in effective method functions
+      ;; created for generic functions having a method combination that
+      ;; uses :ARGUMENTS.
+      ;;
+      ;; The DESTRUCTURING-BIND binds the parameters of the
+      ;; ARGS-LAMBDA-LIST to actual generic function arguments.  Because
+      ;; ARGS-LAMBDA-LIST may be shorter or longer than the generic
+      ;; function's lambda list, which is only known at run time, this
+      ;; destructuring has to be done on a slighly modified list of
+      ;; actual arguments, from which values might be stripped or added.
+      ;;
+      ;; Using one of the variable names in the body inserts a symbol
+      ;; into the effective method, and running the effective method
+      ;; produces the value of actual argument that is bound to the
+      ;; symbol.
+      `(let ((inner-result. ,wrapped-body)
+             (gf-lambda-list (generic-function-lambda-list .generic-function.)))
+         `(destructuring-bind ,',args-lambda-list
+              ;; FIXME: we know enough (generic function lambda list,
+              ;; args lambda list) at generate-effective-method-time
+              ;; that we could partially evaluate this frobber, to
+              ;; inline specific argument list manipulation rather
+              ;; than the generic code currently contained in
+              ;; FROB-COMBINED-METHOD-ARGS.
+              (frob-combined-method-args
+               .gf-args. ',gf-lambda-list
+               ,',(length required) ,',(length optional))
+            ,,(when (memq '.ignore. args-lambda-list)
+                ''(declare (ignore .ignore.)))
+            ;; If there is a &WHOLE in the args-lambda-list, let
+            ;; it result in the actual arguments of the generic-function
+            ;; not the frobbed list.
+            ,,(when whole
+                ``(setq ,',whole .gf-args.))
+            ,inner-result.)))))
 
 ;;; Partition VALUES into three sections: required, optional, and the
 ;;; rest, according to required, optional, and other parameters in
 ;;; LAMBDA-LIST.  Make the required and optional sections NREQ and
-;;; NOPT elements long by discarding values or adding NILs.  Value is
-;;; the concatenated list of required and optional sections, and what
-;;; is left as rest from VALUES.
+;;; NOPT elements long by discarding values or adding NILs, except
+;;; don't extend the optional section when there are no more VALUES.
+;;; Value is the concatenated list of required and optional sections,
+;;; and what is left as rest from VALUES.
 (defun frob-combined-method-args (values lambda-list nreq nopt)
   (loop with section = 'required
         for arg in lambda-list
@@ -474,14 +492,14 @@
         else if (eq section 'required)
           count t into nr
           and collect (pop values) into required
-        else if (eq section '&optional)
+        else if (and values (eq section '&optional))
           count t into no
           and collect (pop values) into optional
         finally
-          (flet ((frob (list n m)
+          (flet ((frob (list n m lengthenp)
                    (cond ((> n m) (butlast list (- n m)))
-                         ((< n m) (nconc list (make-list (- m n))))
+                         ((and (< n m) lengthenp) (nconc list (make-list (- m n))))
                          (t list))))
-            (return (nconc (frob required nr nreq)
-                           (frob optional no nopt)
+            (return (nconc (frob required nr nreq t)
+                           (frob optional no nopt values)
                            values)))))

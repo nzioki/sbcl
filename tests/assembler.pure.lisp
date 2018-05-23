@@ -13,14 +13,13 @@
 
 (in-package sb-vm)
 
-(load "test-util.lisp")
 (use-package :test-util)
 
 ;; this is architecture-agnostic
 (defun test-assemble (inst expect)
-  (let ((segment (sb-assem:make-segment :type :regular)))
-    (sb-assem:assemble (segment)
-      (apply (sb-assem::op-encoder-name (car inst)) (cdr inst)))
+  (let ((segment (sb-assem:make-segment)))
+    (sb-assem:assemble (segment 'nil)
+      (apply (sb-assem::op-encoder-name (car inst)) (cdr inst) segment (cdr inst)))
     (let* ((buf (sb-assem::segment-buffer segment))
            (string
             (with-output-to-string (stream)
@@ -68,6 +67,26 @@
                  "F24F0F38F00C3E   CRC32 R9, BYTE PTR [R14+R15]")
   (test-assemble `(crc32 ,r9-tn ,(make-ea :qword :base r14-tn :index r15-tn))
                  "F24F0F38F10C3E   CRC32 R9, QWORD PTR [R14+R15]"))
+
+(with-test (:name :disassemble-movabs-instruction :skipped-on (not :x86-64))
+  (let* ((bytes (coerce '(#x48 #xA1 8 7 6 5 4 3 2 1
+                          #xA1 8 7 6 5 4 3 2 1
+                          #x66 #xA1 8 7 6 5 4 3 2 1
+                          #xA0 8 7 6 5 4 3 2 1)
+                        '(array (unsigned-byte 8) 1)))
+         (lines
+          (split-string
+           (with-output-to-string (s)
+             (sb-sys:with-pinned-objects (bytes)
+               (sb-disassem:disassemble-memory
+                (sb-sys:sap-int (sb-sys:vector-sap bytes))
+                (length bytes)
+                :stream s)))
+           #\newline)))
+    (pop lines)
+    (dolist (dest-reg '("RAX" "EAX" "AX" "AL"))
+      (assert (search (format nil "MOVABS ~A, [#x102030405060708]" dest-reg)
+                      (pop lines))))))
 
 (with-test (:name :disassemble-arith-insts :skipped-on (not (or :x86 :x86-64)))
   (flet ((try (inst expect)

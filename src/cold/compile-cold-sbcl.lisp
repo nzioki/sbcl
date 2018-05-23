@@ -30,7 +30,7 @@
          . muffle-warning)))
 
 (defun proclaim-target-optimization ()
-  (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
+  (let ((debug (if (position :sb-show sb!xc:*features*) 2 1)))
     (sb!xc:proclaim
      `(optimize
        (compilation-speed 1) (debug ,debug)
@@ -97,9 +97,7 @@
             slot-makunbound
             make-load-form-saving-slots
             sb!ext:run-program
-            sb!vm::map-allocated-objects
-            sb!vm::map-objects-in-range
-            sb!kernel::choose-code-component-order)
+            sb!vm::remove-static-links)
           ;; CLOS implementation
           '(sb!mop:class-finalized-p
             sb!mop:class-prototype

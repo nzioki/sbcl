@@ -20,33 +20,6 @@
 #include "sbcl.h"
 #include "runtime.h"
 
-#if defined(LISP_FEATURE_RELOCATABLE_HEAP) && defined(LISP_FEATURE_GENCGC)
-extern uword_t DYNAMIC_SPACE_START;
-#endif
-#if defined(LISP_FEATURE_RELOCATABLE_HEAP) && defined(LISP_FEATURE_IMMOBILE_SPACE)
-extern uword_t FIXEDOBJ_SPACE_START, VARYOBJ_SPACE_START;
-extern uword_t immobile_space_lower_bound, immobile_space_max_offset;
-extern unsigned int immobile_range_1_max_offset, immobile_range_2_min_offset;
-extern unsigned int varyobj_space_size;
-#endif
-
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-static inline boolean immobile_space_p(lispobj obj)
-{
-/* To test the two immobile ranges, we first check that a pointer is within
- * the outer bounds, and then that is not in the excluded middle (if any).
- * This requires only 1 comparison to weed out dynamic-space pointers,
- * vs doing the more obvious 2 tests, provided that dynamic space starts
- * above 4GB. range_1_max == range_2_min if there is no discontinuity. */
-    uword_t offset = obj - immobile_space_lower_bound;
-    if (offset >= immobile_space_max_offset) return 0;
-    return !(immobile_range_1_max_offset <= offset
-             && offset < immobile_range_2_min_offset);
-}
-#else
-static inline boolean immobile_space_p(lispobj obj) { return 0; }
-#endif
-
 #if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
 /* Should we use page protection to help avoid the scavenging of pages
  * that don't have pointers to younger generations?
@@ -91,6 +64,13 @@ static inline boolean immobile_space_p(lispobj obj) { return 0; }
 
 extern os_vm_size_t os_vm_page_size;
 
+#if (defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)) \
+  || defined(LISP_FEATURE_LINUX)
+boolean os_preinit(char *argv[], char *envp[]);
+#else
+#define os_preinit(dummy1,dummy2) (0)
+#endif
+
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */
 extern void os_init(char *argv[], char *envp[]);
@@ -113,10 +93,14 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 
 /* Allocate 'len' bytes at 'addr',
  * or at an OS-chosen address if 'addr' is zero.
- * If 'movable' then 'addr' is a preference, not a requirement. */
-#define NOT_MOVABLE 0
-#define MOVABLE 1
-#define MOVABLE_LOW 2
+ * If 'movable' then 'addr' is a preference, not a requirement.
+ * These are discrete bits, not opaque enumerated values.
+ * i.e. the consuming code might test via either (x & bit)
+ * or (x == bit) depending on the use-case */
+#define NOT_MOVABLE      0
+#define MOVABLE          1
+#define MOVABLE_LOW      2
+#define IS_THREAD_STRUCT 4
 extern os_vm_address_t os_validate(int movable,
                                    os_vm_address_t addr,
                                    os_vm_size_t len);
@@ -150,7 +134,9 @@ extern void os_protect(os_vm_address_t addr,
 
 /* Return true for an address (with or without lowtag bits) within
  * any range of memory understood by the garbage collector. */
-extern boolean gc_managed_addr_p(lispobj test);
+extern boolean gc_managed_addr_p(lispobj addr);
+/* As for above, but consider only the heap spaces, not stacks */
+extern boolean gc_managed_heap_space_p(lispobj addr);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is

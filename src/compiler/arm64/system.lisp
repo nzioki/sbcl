@@ -160,8 +160,7 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
+    (inst ldr (32-bit-reg ndescr) (@ code (- 4 other-pointer-lowtag)))
     (inst add sap code (lsl ndescr word-shift))
     (inst sub sap sap other-pointer-lowtag)))
 
@@ -172,13 +171,11 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
+    (inst ldr (32-bit-reg ndescr) (@ code (- 4 other-pointer-lowtag)))
     (inst add ndescr offset (lsl ndescr word-shift))
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
 ;;;
-#!+symbol-info-vops
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -194,7 +191,6 @@
     (loadw res res cons-cdr-slot list-pointer-lowtag)
     NE))
 
-#!+symbol-info-vops
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)

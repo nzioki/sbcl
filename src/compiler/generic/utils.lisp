@@ -73,26 +73,6 @@
      (- other-pointer-lowtag)
      (* fdefn-raw-addr-slot n-word-bytes)))
 
-;;; Various error-code generating helpers
-(defvar *adjustable-vectors* nil)
-
-(defmacro with-adjustable-vector ((var) &rest body)
-  `(let ((,var (or (pop *adjustable-vectors*)
-                   (make-array 16
-                               :element-type '(unsigned-byte 8)
-                               :fill-pointer 0
-                               :adjustable t))))
-     ;; Don't declare the length - if it gets adjusted and pushed back
-     ;; onto the freelist, it's anyone's guess whether it was expanded.
-     ;; This code was wrong for >12 years, so nobody must have needed
-     ;; more than 16 elements. Maybe we should make it nonadjustable?
-     (declare (type (vector (unsigned-byte 8)) ,var))
-     (setf (fill-pointer ,var) 0)
-     (unwind-protect
-         (progn
-           ,@body)
-       (push ,var *adjustable-vectors*))))
-
 ;;;; interfaces to IR2 conversion
 
 ;;; Return a wired TN describing the N'th full call argument passing
@@ -118,9 +98,9 @@
 (defun standard-arg-location-sc (n)
   (declare (type unsigned-byte n))
   (if (< n register-arg-count)
-      (make-sc-offset descriptor-reg-sc-number
+      (make-sc+offset descriptor-reg-sc-number
                       (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-sc-number n)))
+      (make-sc+offset control-stack-sc-number n)))
 
 ;;; Make a TN to hold the number-stack frame pointer.  This is allocated
 ;;; once per component, and is component-live.
@@ -150,9 +130,14 @@
 
 ;;; Return a list of TNs that can be used to represent an unknown-values
 ;;; continuation within a function.
-(defun make-unknown-values-locations ()
+(defun make-unknown-values-locations (&optional unused-count)
+  (declare (ignorable unused-count))
   (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
+        (cond #!+x86-64 ;; needs support from receive-unknown-values
+              (unused-count
+               (sb!c::make-unused-tn))
+              (t
+               (make-normal-tn *fixnum-primitive-type*)))))
 
 ;;; This function is called by the ENTRY-ANALYZE phase, allowing
 ;;; VM-dependent initialization of the IR2-COMPONENT structure. We

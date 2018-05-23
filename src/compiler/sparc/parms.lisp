@@ -8,6 +8,24 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
+
+(defconstant sb!assem:assem-scheduler-p t)
+
+(defconstant +backend-fasl-file-implementation+ :sparc)
+(defconstant +backend-page-bytes+ 8192)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -107,11 +125,8 @@
   (defconstant static-space-start        #x28000000)
   (defconstant static-space-end          #x2c000000)
 
-  (defconstant dynamic-0-space-start #x30000000)
-  (defconstant dynamic-0-space-end   #x38000000)
-
-  (defconstant dynamic-1-space-start #x40000000)
-  (defconstant dynamic-1-space-end   #x48000000))
+  (defparameter dynamic-0-space-start #x30000000)
+  (defparameter dynamic-0-space-end   #x38000000))
 
 #!+(and sunos cheneygc) ; might as well start by trying the same numbers
 (progn
@@ -124,11 +139,8 @@
   (defconstant static-space-start        #x28000000)
   (defconstant static-space-end          #x2c000000)
 
-  (defconstant dynamic-0-space-start     #x30000000)
-  (defconstant dynamic-0-space-end       #x38000000)
-
-  (defconstant dynamic-1-space-start     #x40000000)
-  (defconstant dynamic-1-space-end       #x48000000))
+  (defparameter dynamic-0-space-start    #x30000000)
+  (defparameter dynamic-0-space-end      #x38000000))
 
 #!+(and netbsd cheneygc) ; Need a gap at 0x4000000 for shared libraries
 (progn
@@ -141,30 +153,25 @@
   (defconstant static-space-start        #x18000000)
   (defconstant static-space-end          #x1c000000)
 
-  (defconstant dynamic-0-space-start     #x48000000)
-  (defconstant dynamic-0-space-end       #x5ffff000)
-
-  (defconstant dynamic-1-space-start     #x60000000)
-  (defconstant dynamic-1-space-end       #x77fff000))
+  (defparameter dynamic-0-space-start    #x48000000)
+  (defparameter dynamic-0-space-end      #x5ffff000))
 
 ;; Size of one linkage-table entry in bytes. See comment in
 ;; src/runtime/sparc-arch.c
 (defconstant linkage-table-entry-size 16)
 
 
-;;;; other random constants.
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   after-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  #!+gencgc allocation-trap)
+  #!+gencgc allocation-trap
+  error-trap)
 
 ;;;; static symbols.
 

@@ -12,30 +12,42 @@
 (in-package "SB-COLD")
 
 ;;;; definition of #!+ and #!- as a mechanism analogous to #+/#-, but
-;;;; for *SHEBANG-FEATURES* instead of CL:*FEATURES*. (This is handy
+;;;; for SB!XC:*FEATURES* instead of CL:*FEATURES*. (This is handy
 ;;;; when cross-compiling, so that we can make a distinction between
 ;;;; features of the host Common Lisp and features of the target
 ;;;; SBCL.)
 
 ;;; the feature list for the target system
-(export '*shebang-features*)
-(declaim (type list *shebang-features*))
-;; FIXME: is there a reason this isn't SB!XC:*FEATURES* ?
-;; We haven't set up the SB!XC package yet, but we certainly could.
-(defvar *shebang-features*)
+(unless (find-package "SB!XC")
+  (make-package "SB!XC" :use nil :nicknames nil))
+(export (intern "*FEATURES*" "SB!XC") "SB!XC")
+(declaim (type list sb!xc:*features*))
+(defvar sb!xc:*features*)
 
 (defun target-platform-name ()
   (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :sparc :x86 :x86-64)
-                            *shebang-features*)))
+                            sb!xc:*features*)))
     (cond ((not arch) (error "No architecture selected"))
           ((> (length arch) 1) (error "More than one architecture selected")))
     (string-downcase (car arch))))
 
 ;;; Not necessarily the logical place to define BACKEND-ASM-PACKAGE-NAME,
-;;; but a convenient one, because *shebang-features* needs to have been
+;;; but a convenient one, because sb!xc:*features* needs to have been
 ;;; DEFVARed, and because 'chill' loads this and only this file.
 (defun backend-asm-package-name ()
   (concatenate 'string "SB!" (string-upcase (target-platform-name)) "-ASM"))
+
+(defun any-vop-named-p (vop-name)
+  (gethash vop-name (symbol-value (find-symbol "*BACKEND-PARSED-VOPS*" "SB!C"))))
+
+(defun any-vop-translates-p (fun-name)
+  (let ((f (intern "INFO" "SB!INT")))
+    (when (fboundp f)
+      (let ((info (funcall f :function :info fun-name)))
+        (if info
+            (let ((f (intern "FUN-INFO-TEMPLATES" "SB!C")))
+              (and (fboundp f) (not (null (funcall f info)))))
+            (error "vop-translates: ~s is not a known function." fun-name))))))
 
 (defun feature-in-list-p (feature list)
   (labels ((sane-expr-p (x)
@@ -44,7 +56,7 @@
                ;; This allows you to write #!+(host-feature sbcl) <stuff>
                ;; to muffle conditions, bypassing the "probable XC bug" check.
                ;; Using the escape hatch is assumed never to be a mistake.
-               ((cons (eql :host-feature)) t)
+               ((cons (member :host-feature :vop-named :vop-translates)) t)
                (cons (every #'sane-expr-p (cdr x))))))
     (unless (sane-expr-p feature)
       (error "Target feature expression ~S looks screwy" feature)))
@@ -55,14 +67,17 @@
             (ecase (first feature)
               (:or  (some  #'subfeature-in-list-p (rest feature)))
               (:and (every #'subfeature-in-list-p (rest feature)))
-              ((:host-feature :not)
+              ((:host-feature :not :vop-named :vop-translates)
                (destructuring-bind (subexpr) (cdr feature)
-                 (cond ((eq (first feature) :host-feature)
+                 (case (first feature)
+                   (:host-feature
                         ;; (:HOST-FEATURE :sym) looks in *FEATURES* for :SYM
-                        (check-type subexpr symbol)
-                        (member subexpr *features* :test #'eq))
-                       (t
-                        (not (subfeature-in-list-p subexpr)))))))))))
+                    (check-type subexpr symbol)
+                    (member subexpr *features* :test #'eq))
+                   (:vop-named (any-vop-named-p subexpr))
+                   (:vop-translates (any-vop-translates-p subexpr))
+                   (t
+                    (not (subfeature-in-list-p subexpr)))))))))))
 (compile 'feature-in-list-p)
 
 (defun shebang-reader (stream sub-character infix-parameter)
@@ -75,7 +90,7 @@
     (if (char= (if (let* ((*package* (find-package "KEYWORD"))
                           (*read-suppress* nil)
                           (feature (read stream)))
-                     (feature-in-list-p feature *shebang-features*))
+                     (feature-in-list-p feature sb!xc:*features*))
                    #\+ #\-) next-char)
         (read stream t nil t)
         ;; Read (and discard) a form from input.
@@ -89,13 +104,13 @@
 ;;; check our own code; it is too easy to write #+ when meaning #!+,
 ;;; and such mistakes can go undetected for a while.
 ;;;
-;;; ideally we wouldn't use *SHEBANG-FEATURES* but
-;;; *ALL-POSSIBLE-SHEBANG-FEATURES*, but maintaining that variable
-;;; will not be easy.
+;;; ideally we wouldn't use SB!XC:*FEATURES* but something like
+;;; *ALL-POSSIBLE-TARGET-FEATURES*, but maintaining that variable
+;;; would not be easy.
 (defun checked-feature-in-features-list-p (feature list)
   (etypecase feature
     (symbol (unless (member feature '(:ansi-cl :common-lisp :ieee-floating-point))
-              (when (member feature *shebang-features* :test #'eq)
+              (when (member feature sb!xc:*features* :test #'eq)
                 (error "probable XC bug in host read-time conditional: ~S" feature)))
             (member feature list :test #'eq))
     (cons (flet ((subfeature-in-list-p (subfeature)
@@ -125,13 +140,15 @@
   (values))
 (compile 'she-reader)
 
-;;;; variables like *SHEBANG-FEATURES* but different
+;;;; variables like SB!XC:*FEATURES* but different
 
-;;; This variable is declared here (like *SHEBANG-FEATURES*) so that
+;;; This variable is declared here (like SB!XC:*FEATURES*) so that
 ;;; things like chill.lisp work (because the variable has properties
-;;; similar to *SHEBANG-FEATURES*, and chill.lisp was set up to work
+;;; similar to SB!XC:*FEATURES*, and chill.lisp was set up to work
 ;;; for that). For an explanation of what it really does, look
 ;;; elsewhere.
+;;; FIXME: Can we just assign SB!C:*BACKEND-SUBFEATURES* directly?
+;;; (This has nothing whatsoever to do with the so-called "shebang" reader)
 (export '*shebang-backend-subfeatures*)
 (declaim (type list *shebang-backend-subfeatures*))
 (defvar *shebang-backend-subfeatures*)

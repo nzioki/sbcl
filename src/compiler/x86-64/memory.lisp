@@ -19,45 +19,61 @@
                  (+ nil-value (static-symbol-offset symbol) offset)
                  (make-fixup symbol :immobile-object offset)))))
 
+(defun gen-cell-set (ea value result)
+  (when (sc-is value immediate)
+    (let ((bits (encode-value-if-immediate value)))
+      (cond ((not result)
+             ;; Try to move imm-to-mem if BITS fits
+             (acond ((or (and (fixup-p bits)
+                              ;; immobile-object fixups must fit in 32 bits
+                              (eq (fixup-flavor bits) :immobile-object)
+                              bits)
+                         (immediate32-p bits))
+                     (inst mov ea it))
+                    (t
+                     (inst mov temp-reg-tn bits)
+                     (inst mov ea temp-reg-tn)))
+             (return-from gen-cell-set))
+            ;; Move the immediate value into RESULT provided that doing so
+            ;; doesn't clobber EA. If it would, use TEMP-REG-TN instead.
+            ;; TODO: if RESULT is unused, and the immediate fits in an
+            ;; imm32 operand, then perform imm-to-mem move, but as the comment
+            ;; observes, there's no easy way to spot an unused TN.
+            ((or (location= (ea-base ea) result)
+                 (awhen (ea-index ea) (location= it result)))
+             (inst mov temp-reg-tn bits)
+             (setq value temp-reg-tn))
+            (t
+             ;; Can move into RESULT, then into EA
+             (inst mov result bits)
+             (inst mov ea result)
+             (return-from gen-cell-set)))))
+  (inst mov ea value)
+  (when result
+    ;; Ideally we would skip this move if RESULT is unused hereafter,
+    ;; but unfortunately (NOT (TN-READS RESULT)) isn't equivalent
+    ;; to there being no reads from the TN at all.
+    (move result value)))
+
 ;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
 ;;; offset to be read or written is a property of the VOP used.
 (define-vop (cell-ref)
-  (:args (object :scs (descriptor-reg)
-                 :load-if (not (and (sc-is object immediate)
-                                    (symbolp (tn-value object))))))
+  (:args (object :scs (descriptor-reg)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (cond ((sc-is object immediate)
-           ;; This is a hack so that FAST-SYMBOL-GLOBAL-VALUE
-           ;; and %SET-SYMBOL-GLOBAL-VALUE can inherit CELL-REF.
-           ;; (Not sure it's the prettiest way)
-           ;; this sanity-check is meta-compile-time statically assertable
-           (aver (eq offset symbol-value-slot))
-           (inst mov value (symbol-slot-ea (tn-value object) offset)))
-          (t
-           (loadw value object offset lowtag)))))
+    (loadw value object offset lowtag)))
+;; This vop's sole purpose is to be an ancestor for other vops, to assign
+;; default operands, policy, and generator.
 (define-vop (cell-set)
-  (:args (object :scs (descriptor-reg)
-                 :load-if (not (and (sc-is object immediate)
-                                    (symbolp (tn-value object)))))
-         (value :scs (descriptor-reg any-reg)
-                :load-if (not (and (sc-is value immediate)
-                                   (typep (tn-value value)
-                                          '(or symbol
-                                               character
-                                               (signed-byte 32)))))))
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg immediate)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (let ((value (encode-value-if-immediate value)))
-      (cond ((sc-is object immediate)
-             ;; this sanity-check is meta-compile-time statically assertable
-             (aver (eq offset symbol-value-slot))
-             (inst mov (symbol-slot-ea (tn-value object) offset) value))
-            (t
-             (storew value object offset lowtag))))))
+    (gen-cell-set (make-ea-for-object-slot object offset lowtag)
+                  value nil)))
 
 ;;; X86 special
 (define-vop (cell-xadd)

@@ -40,6 +40,7 @@
     (inst shl header n-widetag-bits)
     (inst or  header type)
     (inst shr header n-fixnum-tag-bits)
+    (instrument-alloc bytes node)
     (pseudo-atomic
      (allocation result bytes node nil other-pointer-lowtag)
      (storew header result 0 other-pointer-lowtag))))
@@ -54,12 +55,11 @@
   (:generator 12
     (let* ((header-size (+ rank
                            (1- array-dimensions-offset)))
-           (bytes (logandc2 (+ (* (1+ header-size) n-word-bytes)
-                               lowtag-mask)
-                            lowtag-mask))
+           (bytes (* (align-up (1+ header-size) 2) n-word-bytes))
            (header (logior (ash header-size
                                 n-widetag-bits)
                            type)))
+     (instrument-alloc bytes node)
      (pseudo-atomic
       (allocation result bytes node nil other-pointer-lowtag)
       (storew header result 0 other-pointer-lowtag)))))
@@ -191,7 +191,7 @@
                   ,type vector-data-offset other-pointer-lowtag ,scs
                   ,element-type data-vector-set-with-offset)))
            )
-  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg)
+  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg immediate)
   (def-full-data-vector-frobs simple-array-unsigned-byte-64 unsigned-num
     unsigned-reg)
   (def-full-data-vector-frobs simple-array-fixnum tagged-num any-reg)

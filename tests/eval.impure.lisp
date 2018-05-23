@@ -16,11 +16,6 @@
 ;;;; why this idiom (a sequence of top-level forms) works as a test of
 ;;;; EVAL.
 
-(cl:in-package :cl-user)
-
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; Until sbcl-0.7.9.x, EVAL was not correctly treating LOCALLY,
 ;;; MACROLET and SYMBOL-MACROLET, which should preserve top-levelness
 ;;; of their body forms:
@@ -283,16 +278,21 @@
     (assert (eq :fun (empty-let-is-not-toplevel-fun)))))
 
 (with-test (:name (eval function-lambda-expression))
-  (assert (equal `(sb-int:named-lambda eval-fle-1 (x)
-                    (block eval-fle-1
-                      (+ x 1)))
-                 (function-lambda-expression
+  (assert (equal (function-lambda-expression
                   (eval `(progn
                            (defun eval-fle-1 (x) (+ x 1))
-                           #'eval-fle-1)))))
-  (assert (equal `(lambda (x y z) (+ x 1 y z))
-                 (function-lambda-expression
-                  (eval `(lambda (x y z) (+ x 1 y z)))))))
+                           #'eval-fle-1)))
+                 #+interpreter
+                 `(sb-int:named-lambda eval-fle-1 (x)
+                    (block eval-fle-1
+                      (+ x 1)))
+                 #-interpreter
+                 `(lambda (x)
+                    (block eval-fle-1
+                      (+ x 1)))))
+  (assert (equal (function-lambda-expression
+                  (eval `(lambda (x y z) (+ x 1 y z))))
+                 `(lambda (x y z) (+ x 1 y z)))))
 
 (with-test (:name (:bug-573747 eval :compile))
   (let ((*out* (make-string-output-stream))

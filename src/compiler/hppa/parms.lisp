@@ -1,4 +1,11 @@
 (in-package "SB!VM")
+
+; normally assem-scheduler-p is t, and nil if debugging the assembler
+; but apparently we don't trust any of the instruction definitions.
+(defconstant sb!assem:assem-scheduler-p nil)
+
+(defconstant +backend-fasl-file-implementation+ :hppa)
+(defconstant +backend-page-bytes+ 4096)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -64,10 +71,8 @@
 (defconstant static-space-start    #x4e000000)
 (defconstant static-space-end      #x4fff0000)
 
-(defconstant dynamic-0-space-start   #x50000000)
-(defconstant dynamic-0-space-end     #x5fff0000)
-(defconstant dynamic-1-space-start   #x60000000)
-(defconstant dynamic-1-space-end     #x6fff0000)
+(defparameter dynamic-0-space-start  #x50000000)
+(defparameter dynamic-0-space-end    #x5fff0000)
 
 ); eval-when
 
@@ -90,14 +95,14 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  single-step-after-trap)
+  single-step-after-trap
+  error-trap)
 
 ;;;; Static symbols.
 

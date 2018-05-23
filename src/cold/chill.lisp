@@ -19,23 +19,17 @@
   (:use "CL"))
 (in-package "SB-COLD")
 
+(sb-ext:unlock-package "CL")
+(rename-package "COMMON-LISP" "COMMON-LISP"
+                (cons "SB!XC" (package-nicknames "CL")))
 ;;; We need the #! readtable modifications.
 (load (merge-pathnames "shebang.lisp" *load-truename*))
 
-;;; #!+ and #!- now refer to *FEATURES* values (as opposed to the way
-;;; that they referred to special target-only *SHEBANG-FEATURES* values
-;;; during cold init).
-(setf sb-cold:*shebang-features* *features*)
 ;;; Just in case we want to play with the initial value of
 ;;; backend-subfeatures
 (setf sb-cold:*shebang-backend-subfeatures* sb-c:*backend-subfeatures*)
 
-(handler-bind (#+sb-package-locks (sb-ext:package-locked-error #'continue))
-  ;; The nickname SB!XC now refers to the CL package.
-  (rename-package "COMMON-LISP" "COMMON-LISP"
-                  (cons "SB!XC" (package-nicknames "CL")))
-  #+sb-package-locks (sb-ext:unlock-package "CL")
-
+(handler-bind ((sb-ext:package-locked-error #'continue))
   ;; Any other name SB!FOO refers to the package now called SB-FOO.
   (dolist (package (list-all-packages))
     (let ((name (package-name package))
@@ -48,7 +42,7 @@
         (let* ((stem (subseq name (length cold-name-prefix)))
                (cold-name (concatenate 'simple-string cold-name-prefix stem)))
           (rename-package package name (cons cold-name nicknames)))
-        #+sb-package-locks (sb-ext:unlock-package package)))))
+        (sb-ext:unlock-package package)))))
 
 ;; Reinstate the pre-cold-init variable-defining macros.
 (let ((*package* (find-package "SB-INT")))

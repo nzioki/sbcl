@@ -37,7 +37,7 @@
 #include "thread.h"
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
-
+#include "gc-internal.h"
 
 
 /* When we need to do command input, we use this stream, which is not
@@ -57,7 +57,7 @@ typedef void cmd(char **ptr);
 
 static cmd dump_cmd, print_cmd, quit_cmd, help_cmd;
 static cmd flush_cmd, search_cmd, regs_cmd, exit_cmd;
-static cmd print_context_cmd;
+static cmd print_context_cmd, pte_cmd;
 static cmd backtrace_cmd, purify_cmd, catchers_cmd;
 static cmd grab_sigs_cmd;
 static cmd kill_cmd;
@@ -84,6 +84,7 @@ static struct cmd {
     {"purify", "Purify. (Caveat purifier!)", purify_cmd},
     {"print", "Print object at ADDRESS.", print_cmd},
     {"p", "(an alias for print)", print_cmd},
+    {"pte", "Page table entry for address", pte_cmd},
     {"quit", "Quit.", quit_cmd},
     {"regs", "Display current Lisp registers.", regs_cmd},
     {"search", "Search for TYPE starting at ADDRESS for a max of COUNT words.", search_cmd},
@@ -185,6 +186,13 @@ print_cmd(char **ptr)
     lispobj obj = parse_lispobj(ptr);
 
     print(obj);
+}
+
+static void
+pte_cmd(char **ptr)
+{
+    extern void gc_show_pte(lispobj);
+    gc_show_pte(parse_lispobj(ptr));
 }
 
 static void
@@ -379,7 +387,7 @@ print_context_cmd(char **ptr)
         if ((index >= 0) && (index < free_ici)) {
             printf("There are %d interrupt contexts.\n", free_ici);
             printf("printing context %d\n", index);
-            print_context(thread->interrupt_contexts[index]);
+            print_context(nth_interrupt_context(index, thread));
         } else {
             printf("There aren't that many/few contexts.\n");
             printf("There are %d interrupt contexts.\n", free_ici);
@@ -390,7 +398,7 @@ print_context_cmd(char **ptr)
         else {
             printf("There are %d interrupt contexts.\n", free_ici);
             printf("printing context %d\n", free_ici - 1);
-            print_context(thread->interrupt_contexts[free_ici - 1]);
+            print_context(nth_interrupt_context(free_ici - 1, thread));
         }
     }
 }

@@ -18,7 +18,9 @@
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
-;;; Return T if and only if the fixup needs to be recorded in %CODE-FIXUPS
+;;; Return :ABSOLUTE if an absolute fixup needs to be recorded in %CODE-FIXUPS,
+;;; and return :RELATIVE if a relative fixup needs to be recorded.
+;;; The code object we're fixing up is pinned whenever this is called.
 (defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset) (ignorable flavor))
   (let* ((sap (code-instructions code))
@@ -52,21 +54,25 @@
                      (the (unsigned-byte 64) (+ (sap-int sap) offset 4)))))))))
   ;; An absolute fixup is stored in the code header's %FIXUPS slot if it
   ;; references an immobile-space (but not static-space) object.
-  ;; This needn't be inside WITHOUT-GCING, because code fixups will point
-  ;; only to objects that don't move except during save-lisp-and-die.
-  ;; So there is no race with GC here.
   ;; Note that:
   ;;  (1) Call fixups occur in both :RELATIVE and :ABSOLUTE kinds.
-  ;;      We can ignore the :RELATIVE kind.
+  ;;      We can ignore the :RELATIVE kind, except for foreign call.
   ;;  (2) :STATIC-CALL fixups point to immobile space, not static space.
   #!+immobile-space
   (return-from fixup-code-object
-        (and (eq kind :absolute)
-             (member flavor '(:named-call :layout :immobile-object ; -> fixedobj subspace
-                              :assembly-routine :static-call)))) ; -> varyobj subspace
+    (case flavor
+      ((:named-call :layout :immobile-object ; -> fixedobj subspace
+        :assembly-routine :assembly-routine* :static-call) ; -> varyobj subspace
+       (if (eq kind :absolute) :absolute))
+      (:foreign
+       ;; linkage-table calls using the "CALL rel32" format need to be saved,
+       ;; because the linkage table resides at a fixed address.
+       ;; Space defragmentation can handle the fixup automatically,
+       ;; but core relocation can't - it can't find all the call sites.
+       (if (eq kind :relative) :relative))))
   nil) ; non-immobile-space builds never record code fixups
 
-#!+(or darwin linux win32)
+#!+(or darwin linux openbsd win32)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
@@ -75,11 +81,11 @@
 
 (defun context-float-register (context index format)
   (declare (ignorable context index))
-  #!-(or darwin linux win32)
+  #!-(or darwin linux openbsd win32)
   (progn
     (warn "stub CONTEXT-FLOAT-REGISTER")
     (coerce 0 format))
-  #!+(or darwin linux win32)
+  #!+(or darwin linux openbsd win32)
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
@@ -144,20 +150,13 @@
 ;;; arguments from the instruction stream.
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
-    (/show0 "got PC")
-    ;; using INT3 the pc is .. INT3 <here> code length bytes...
     (if (= trap-number invalid-arg-count-trap)
         (values #.(error-number-or-lose 'invalid-arg-count-error)
                 '(#.arg-count-sc))
-        (let ((error-number (sap-ref-8 pc 1)))
-          (values error-number
-                  (sb!kernel::decode-internal-error-args (sap+ pc 2) error-number)
-                  trap-number)))))
+        (sb!kernel::decode-internal-error-args (sap+ pc 1) trap-number))))
 
 
 #!+immobile-code
@@ -177,7 +176,7 @@
       ;; We could use the #xA1 opcode to save a byte, but that would
       ;; be another headache do deal with when relocating this code.
       ;; There's precedent for this style of hand-assembly,
-      ;; in arch_write_linkage_table_jmp() and arch_do_displaced_inst().
+      ;; in arch_write_linkage_table_entry() and arch_do_displaced_inst().
       (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
             (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7))) ; disp
       (let ((i (if (/= (fun-subtype fun) funcallable-instance-widetag)
@@ -188,6 +187,7 @@
                      (setf (sap-ref-32 sap 7) (logior (ash disp8 24) #x408B48))
                      11))))
         (setf (sap-ref-32 sap i) #xFD60FF))) ; JMP [RAX-3]
+    (aver (zerop (code-n-entries code)))
     code))
 
 ;;; Return T if FUN can't be called without loading RAX with its descriptor.

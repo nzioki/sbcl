@@ -211,7 +211,7 @@
                                   (integerp index)
                                   (eq (info :variable :kind thing) :global)
                                   (typep value '(cons (member lambda function
-                                                              named-lambda))))))
+                                                       named-lambda))))))
                       (and (eq function 'setq)
                            (setq-fopcompilable-p (cdr form)))
 
@@ -448,8 +448,9 @@
                                   (file-info (source-info-file-info *source-info*))
                                   (*compiler-error-context*
                                     (make-compiler-error-context
-                                     :original-source (stringify-form form)
+                                     :original-form form
                                      :file-name (file-info-name file-info)
+                                     :initialized t
                                      :file-position
                                      (nth-value 1 (find-source-root tlf *source-info*))
                                      :original-source-path (source-path-original-source path)
@@ -464,8 +465,7 @@
                          ;; other operations, but I don't see any good
                          ;; candidates in a quick read-through of
                          ;; src/code/fop.lisp.)
-                         ((and (eq operator
-                                   'sb!int:find-undeleted-package-or-lose)
+                         ((and (eq operator 'find-undeleted-package-or-lose)
                                (= 1 (length args))
                                for-value-p)
                           (fopcompile (first args) path t)

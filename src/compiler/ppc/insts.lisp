@@ -22,13 +22,14 @@
             sb!vm::zero-tn sb!vm::lip-tn
             sb!vm::zero-offset sb!vm::null-offset)))
 
+(defconstant +disassem-inst-alignment-bytes+ sb!vm:n-word-bytes)
+
 ;;; needs a little more work in the assembler, to realise that the
 ;;; delays requested here are not mandatory, so that the assembler
 ;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
 ;;; 2003-09-08
 #+nil
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* t)
   (setf sb!assem:*assem-max-locations* 70))
 
 ;;;; Constants, types, conversion functions, some disassembler stuff.
@@ -804,7 +805,7 @@
                     (when (typep si 'fixup)
                       (ecase ,fixup
                         ((:ha :l) (note-fixup segment ,fixup si)))
-                      (setq si (or (fixup-offset si) 0)))
+                      (setq si (fixup-offset si)))
                     (emit-d-form-inst segment ,op (reg-tn-encoding rt) (reg-tn-encoding ra) si)))))
 
            (define-d-rs-ui-instruction (name op &key (cost 1) other-dependencies)
@@ -876,6 +877,7 @@
                  (:delay ,cost)
                  (:dependencies (writes frt) (reads fra) (reads frb) (reads frc) ,@other-dependencies)
                  (:emitter
+                  (progn frc) ; unused sometimes. Why?
                   (emit-a-form-inst segment
                    ,op
                    (fp-reg-tn-encoding frt)

@@ -130,20 +130,6 @@
   (:generator 1
     (load-binding-stack-pointer int)))
 
-(defknown (setf binding-stack-pointer-sap)
-    (system-area-pointer) system-area-pointer ())
-
-(define-vop (set-binding-stack-pointer-sap)
-  (:args (new-value :scs (sap-reg) :target int))
-  (:arg-types system-area-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate (setf binding-stack-pointer-sap))
-  (:policy :fast-safe)
-  (:generator 1
-    (store-binding-stack-pointer new-value)
-    (move int new-value)))
-
 (define-vop (control-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -198,9 +184,6 @@
 
 ;;;; symbol frobbing
 
-;; only define if the feature is enabled to test building without it
-#!+symbol-info-vops
-(progn
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -231,7 +214,7 @@
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
     (emit-optimized-test-inst res fixnum-tag-mask)
-    (inst cmov :e res temp))))
+    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -352,32 +335,27 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;; Memory barrier support
 
-#!+memory-barrier-vops
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
   (:translate %memory-barrier)
   (:generator 3
     (inst add (make-ea :dword :base esp-tn) 0 :lock)))
 
-#!+memory-barrier-vops
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
@@ -388,68 +366,6 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:policy :fast-safe)
   (:generator 0
     (inst pause)))
-
-;;;;
-
-(defknown %cons-cas-pair (cons t t t t) (values t t))
-;; These unsafely permits cmpxchg on any kind of vector, boxed or unboxed
-;; and the same goes for instances.
-(defknown %vector-cas-pair (simple-array index t t t t) (values t t))
-(defknown %instance-cas-pair (instance index t t t t) (values t t))
-
-(macrolet
-    ((define-cmpxchg-vop (name memory-operand more-stuff &optional index-arg)
-       `(define-vop (,name)
-          (:policy :fast)
-          ,@more-stuff
-          (:args (data :scs (descriptor-reg) :to :eval)
-                 ,@index-arg
-                 (expected-old-lo :scs (descriptor-reg any-reg) :target eax)
-                 (expected-old-hi :scs (descriptor-reg any-reg) :target edx)
-                 (new-lo :scs (descriptor-reg any-reg) :target ebx)
-                 (new-hi :scs (descriptor-reg any-reg) :target ecx))
-          (:results (result-lo :scs (descriptor-reg any-reg))
-                    (result-hi :scs (descriptor-reg any-reg)))
-          (:temporary (:sc unsigned-reg :offset eax-offset
-                       :from (:argument 2) :to (:result 0)) eax)
-          (:temporary (:sc unsigned-reg :offset edx-offset
-                       :from (:argument 3) :to (:result 0)) edx)
-          (:temporary (:sc unsigned-reg :offset ebx-offset
-                       :from (:argument 4) :to (:result 0)) ebx)
-          (:temporary (:sc unsigned-reg :offset ecx-offset
-                       :from (:argument 5) :to (:result 0)) ecx)
-          (:generator 7
-           (move eax expected-old-lo)
-           (move edx expected-old-hi)
-           (move ebx new-lo)
-           (move ecx new-hi)
-           (inst cmpxchg8b ,memory-operand :lock)
-           ;; EDX:EAX  hold the actual old contents of memory.
-           ;; Manually analyze result lifetimes to avoid clobbering.
-           (cond ((and (location= result-lo edx) (location= result-hi eax))
-                  (inst xchg eax edx)) ; unlikely, but possible
-                 ((location= result-lo edx) ; result-hi is not eax
-                  (move result-hi edx) ; move high part first
-                  (move result-lo eax))
-                 (t                    ; result-lo is not edx
-                  (move result-lo eax) ; move low part first
-                  (move result-hi edx)))))))
-  (define-cmpxchg-vop compare-and-exchange-pair
-      (make-ea :dword :base data :disp (- list-pointer-lowtag))
-      ((:translate %cons-cas-pair)))
-  (define-cmpxchg-vop compare-and-exchange-pair-indexed
-      (make-ea :dword :base data :disp offset :index index
-                      :scale (ash n-word-bytes (- n-fixnum-tag-bits)))
-      ((:variant-vars offset))
-      ((index :scs (descriptor-reg any-reg) :to :eval))))
-
-(define-vop (%vector-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %vector-cas-pair)
-  (:variant (- (* n-word-bytes vector-data-offset) other-pointer-lowtag)))
-
-(define-vop (%instance-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %instance-cas-pair)
-  (:variant (- (* n-word-bytes instance-slots-offset) instance-pointer-lowtag)))
 
 (defknown %cpu-identification ((unsigned-byte 32) (unsigned-byte 32))
     (values (unsigned-byte 32) (unsigned-byte 32)

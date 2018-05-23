@@ -11,8 +11,6 @@
 
 (in-package :cl-user)
 
-(load "compiler-test-util.lisp")
-
 ;;; Array initialization has complicated defaulting for :ELEMENT-TYPE,
 ;;; and both compile-time and run-time logic takes a whack at it.
 (with-test (:name (make-array :element-type :bug-126))
@@ -525,3 +523,34 @@
   (checked-compile-and-assert (:optimize :safe)
       `(lambda (x) (aref #100(a) x))
     ((#\Nul) (condition 'type-error))))
+
+(with-test (:name (make-array :erroneous-type-specifiers))
+  (dolist (atom '(signed-byte unsigned-byte))
+    (assert (handler-case (make-array 10 :element-type `(,atom "oops"))
+              (error (c) (search (format nil "bad size specified for ~A" atom)
+                                 (princ-to-string c)))
+              (:no-error (obj) obj nil)))))
+
+(declaim (notinline opaque-identity))
+(defun opaque-identity (x) x) ; once and only, uh 6 times?
+
+(with-test (:name (make-array :strange-type-specifiers))
+  (assert (stringp (make-array 10 :element-type (opaque-identity '(base-char)))))
+  (assert (stringp (make-array 10 :element-type (opaque-identity '(standard-char)))))
+  (assert (stringp (make-array 10 :element-type (opaque-identity '(extended-char)))))
+  (assert (bit-vector-p (make-array 10 :element-type (opaque-identity '(bit))))))
+
+(with-test (:name :make-array-satisifies-element-type)
+  (checked-compile-and-assert
+      ()
+      '(lambda (type)
+        (make-array 3 :initial-element #\a :element-type type))
+    (('(and character (satisfies eval))) "aaa" :test #'equal)
+    (('(and character (or (satisfies eval) base-char))) "aaa" :test #'equal)))
+
+(with-test (:name :make-array-or-unsigned-byte-type)
+  (checked-compile-and-assert
+      ()
+      '(lambda (type)
+        (make-array 1 :element-type type))
+    (('(or (eql -16) unsigned-byte)) #(0) :test #'equalp)))

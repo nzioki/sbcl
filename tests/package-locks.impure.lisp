@@ -11,11 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(load "assertoid.lisp")
 (load "compiler-test-util.lisp")
-(use-package "ASSERTOID")
 
 ;;;; Our little labrats and a few utilities
 
@@ -32,6 +28,7 @@
 (defpackage :test
   (:use :test-used)
   (:shadow #:shadowed)
+  (:import-from :cl nil)
   (:export
    #:*special*
    #:*unbound-special*
@@ -57,8 +54,7 @@
    #:numfun
    #:shadowed
    #:symbol-macro
-   #:unused
-   ))
+   #:unused))
 
 (defvar *uninterned* "UNINTERNED")
 (defvar *interned* "INTERNED")
@@ -666,3 +662,7 @@
   (checked-compile '(lambda (test:bound-non-special)
                      (declare (fixnum test:bound-non-special))
                      test:bound-non-special)))
+
+(with-test (:name :unintern-nil)
+  (assert-error (unintern nil 'test)
+                package-locked-error))

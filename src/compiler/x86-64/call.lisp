@@ -11,8 +11,8 @@
 
 (in-package "SB!VM")
 
-(defconstant arg-count-sc (make-sc-offset any-reg-sc-number rcx-offset))
-(defconstant closure-sc (make-sc-offset any-reg-sc-number rax-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number rcx-offset))
+(defconstant closure-sc (make-sc+offset any-reg-sc-number rax-offset))
 
 ;;; Make a passing location TN for a local call return PC.
 ;;;
@@ -24,7 +24,7 @@
                  sap-stack-sc-number return-pc-save-offset))
 
 (defconstant return-pc-passing-offset
-  (make-sc-offset sap-stack-sc-number return-pc-save-offset))
+  (make-sc+offset sap-stack-sc-number return-pc-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -38,7 +38,7 @@
                  ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset control-stack-sc-number ocfp-save-offset))
+  (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -178,9 +178,7 @@
     (emit-label start-lab)
     ;; Skip space for the function header.
     (inst simple-fun-header-word)
-    (dotimes (i (* n-word-bytes (1- simple-fun-code-offset)))
-      (inst byte 0))
-
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Save the return-pc.
     (popw rbp-tn (frame-word-offset return-pc-save-offset))))
@@ -348,7 +346,7 @@
             (move rsp-tn rbx-tn)
             (let ((defaults (defaults)))
               (when defaults
-                (assemble (*elsewhere*)
+                (assemble (:elsewhere)
                   (emit-label default-stack-slots)
                   (dolist (default defaults)
                     (emit-label (car default))
@@ -379,7 +377,8 @@
   (let ((type (sb!c::basic-combination-derived-type node))
         (variable-values (gen-label))
         (stack-values (gen-label))
-        (done (gen-label)))
+        (done (gen-label))
+        (unused-count-p (eq (tn-kind count) :unused)))
     (when (sb!kernel:values-type-may-be-single-value-p type)
       (inst jmp :c variable-values)
       (cond ((location= start (first *register-arg-tns*))
@@ -387,7 +386,8 @@
              (inst lea start (make-ea :qword :base rsp-tn :disp n-word-bytes)))
             (t (inst mov start rsp-tn)
                (inst push (first *register-arg-tns*))))
-      (inst mov count (fixnumize 1))
+      (unless (eq (tn-kind count) :unused)
+        (inst mov count (fixnumize 1)))
       (inst jmp done)
       (emit-label variable-values))
     ;; The stack frame is burnt and RETurned from if there are no
@@ -404,7 +404,8 @@
         ;; doesn't do subtraction.
         (inst shl nargs (- word-shift n-fixnum-tag-bits))
         (inst sub rsp-tn nargs)
-        (inst shr nargs (- word-shift n-fixnum-tag-bits)))
+        (unless unused-count-p
+          (inst shr nargs (- word-shift n-fixnum-tag-bits))))
       (emit-label stack-values))
     ;; dtc: this writes the registers onto the stack even if they are
     ;; not needed, only the number specified in rcx are used and have
@@ -415,7 +416,8 @@
       for j below (sb!kernel:values-type-max-value-count type)
       do (storew arg args i))
     (move start args)
-    (move count nargs)
+    (unless unused-count-p
+      (move count nargs))
 
     (emit-label done))
   (values))
@@ -642,7 +644,9 @@
                ;; passing locs in (FIRST (vop-codegen-info vop)).
                ,@(when (eq named :direct) '(fun))
                ,@(when (eq return :fixed) '(nvals))
-               step-instrumenting)
+               step-instrumenting
+               ,@(unless named
+                   '(callable)))
 
                (:ignore
                ,@(unless (or variable (eq return :tail)) '(arg-locs))
@@ -790,50 +794,54 @@
                           (storew rbp-tn new-fp
                                   (frame-word-offset ocfp-save-offset))
 
-                          (move rbp-tn new-fp) ; NB - now on new stack frame.
-                          )))
+                          (move rbp-tn new-fp))))  ; NB - now on new stack frame.
 
-               (when step-instrumenting
+               (when (and step-instrumenting
+                          ,@(and (eq named :direct)
+                                 `((not (and #!+immobile-code
+                                             ;; handle-single-step-around-trap can't handle it
+                                             (static-fdefn-offset fun))))))
                  (emit-single-step-test)
                  (inst jmp :eq DONE)
                  (inst break single-step-around-trap))
                DONE
-
                (note-this-location vop :call-site)
-
-               ,(if (eq named :direct)
-                    #!+immobile-code
-                    `(let* ((fixup (make-fixup
-                                    fun
-                                    (if (static-fdefn-offset fun)
-                                        :static-call
-                                        :named-call)))
-                            (target
-                              (if (and (sb!c::code-immobile-p node)
-                                       (not step-instrumenting))
-                                  fixup
-                                  (progn
-                                    ;; RAX-TN was not declared as a temp var,
-                                    ;; however it's sole purpose at this point is
-                                    ;; for function call, so even if it was used
-                                    ;; to compute a stack argument, it's free now.
-                                    ;; If the call hits the undefined fun trap,
-                                    ;; RAX will get loaded regardless.
-                                    (inst mov rax-tn fixup)
-                                    rax-tn))))
-                       (inst ,(if (eq return :tail) 'jmp 'call) target))
-                    #!-immobile-code
-                    `(inst ,(if (eq return :tail) 'jmp 'call)
-                           (make-ea :qword :disp
-                                    (+ nil-value (static-fun-offset fun))))
-                    `(inst ,(if (eq return :tail) 'jmp 'call)
-                           (make-ea :qword :base rax
-                                           :disp ,(if named
-                                                      '(- (* fdefn-raw-addr-slot
-                                                           n-word-bytes)
-                                                        other-pointer-lowtag)
-                                                      '(- (* closure-fun-slot n-word-bytes)
-                                                        fun-pointer-lowtag)))))
+               ,(cond ((eq named :direct)
+                       #!+immobile-code
+                       `(let* ((fixup (make-fixup
+                                       fun
+                                       (if (static-fdefn-offset fun)
+                                           :static-call
+                                           :named-call)))
+                               (target
+                                 (if (and (sb!c::code-immobile-p node)
+                                          (not step-instrumenting))
+                                     fixup
+                                     (progn
+                                       ;; RAX-TN was not declared as a temp var,
+                                       ;; however it's sole purpose at this point is
+                                       ;; for function call, so even if it was used
+                                       ;; to compute a stack argument, it's free now.
+                                       ;; If the call hits the undefined fun trap,
+                                       ;; RAX will get loaded regardless.
+                                       (inst mov rax-tn fixup)
+                                       rax-tn))))
+                          (inst ,(if (eq return :tail) 'jmp 'call) target))
+                       #!-immobile-code
+                       `(inst ,(if (eq return :tail) 'jmp 'call)
+                              (make-ea :qword :disp
+                                       (+ nil-value (static-fun-offset fun)))))
+                      #!-immobile-code
+                      (named
+                       `(inst ,(if (eq return :tail) 'jmp 'call)
+                              (make-ea :qword :base rax
+                                              :disp (- (* fdefn-raw-addr-slot
+                                                          n-word-bytes)
+                                                       other-pointer-lowtag))))
+                      ((eq return :tail)
+                       `(tail-call-unnamed rax callable vop))
+                      (t
+                       `(call-unnamed rax callable vop)))
                ,@(ecase return
                    (:fixed
                     '((default-unknown-values vop values nvals node)))
@@ -859,7 +867,58 @@
   (define-full-call call-variable nil :fixed t)
   (define-full-call multiple-call-variable nil :unknown t))
 
+;;; Invoke the function-designator FUN. If DESIGNATOR-P is true, FUN might be
+;;; a symbol; if DESIGNATOR-P is false, FUN is definitely a function.
+;;;
+;;; Note: DESIGNATOR-P used to be named CALLABLE. They're both imperfect.
+;;; While it's true that the noun CALLABLE is synonymous with function-designator,
+;;; the former had a strange connotation of (NOT CALLABLE) counterintuitively
+;;; implying that the FUN *is* directly callable, being strictly a function,
+;;; with "callable" parsed in its adjectival sense.
+;;; Also problematic would be NOT-FUNCTIONP since FUN might satisfy FUNCTIONP.
+;;; A pedantically correct change would be to invert the boolean as supplied,
+;;; and name it DEFINITELY-FUNCTIONP, or name it just FUNCTIONP with the
+;;; notion that T means T and NIL means possibly.
+;;; However, we might really want three values: yes, no, and maybe.
+;;; Because as things are, the definitely-NOT-function case goes through
+;;; the "maybe" path even though it _must_ coerce to a function:
+;;;
+;;; * (disassemble '(lambda (f) (funcall (the symbol f) 42)))
+;;;  3F:       8D58F5           LEA EBX, [RAX-11]
+;;;  42:       F6C30F           TEST BL, 15
+;;;  45:       7503             JNE L1
+;;;  47:       FF60FD           JMP QWORD PTR [RAX-3]
+;;;  4A: L1:   FF242570000020   JMP QWORD PTR [#x20000070]       ; TAIL-CALL-SYMBOL
 
+(defun tail-call-unnamed (fun designator-p vop)
+  (let ((relative-call (sb!c::code-immobile-p vop))
+        (fun-ea (make-ea :qword :base fun
+                         :disp (- (* closure-fun-slot n-word-bytes)
+                                  fun-pointer-lowtag))))
+    (if designator-p
+        (assemble ()
+          (%lea-for-lowtag-test ebx-tn fun fun-pointer-lowtag)
+          (inst test bl-tn lowtag-mask)
+          (inst jmp :nz (if relative-call
+                            (make-fixup 'tail-call-symbol :assembly-routine)
+                            not-fun))
+          (inst jmp fun-ea)
+          not-fun
+          (unless relative-call
+            (invoke-asm-routine 'jmp 'tail-call-symbol vop)))
+        (inst jmp fun-ea))))
+
+(defun call-unnamed (fun designator-p vop)
+  (assemble ()
+    (when designator-p
+      (%lea-for-lowtag-test ebx-tn fun fun-pointer-lowtag)
+      (inst test bl-tn lowtag-mask)
+      (inst jmp :z call)
+      (invoke-asm-routine 'call 'call-symbol vop))
+    call
+    (inst call (make-ea :qword :base fun
+                        :disp (- (* closure-fun-slot n-word-bytes)
+                                 fun-pointer-lowtag)))))
 
 ;;; This is defined separately, since it needs special code that BLT's
 ;;; the arguments down. All the real work is done in the assembly
@@ -869,9 +928,9 @@
          (function :scs (descriptor-reg control-stack) :target rax)
          (old-fp)
          (return-pc))
+  (:info callable)
   (:temporary (:sc unsigned-reg :offset rsi-offset :from (:argument 0)) rsi)
   (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 1)) rax)
-  (:temporary (:sc unsigned-reg) call-target)
   (:vop-var vop)
   (:generator 75
     (check-ocfp-and-return-pc old-fp return-pc)
@@ -879,7 +938,10 @@
     (move rsi args)
     (move rax function)
     ;; And jump to the assembly routine.
-    (invoke-asm-routine 'jmp 'tail-call-variable vop call-target)))
+    (invoke-asm-routine 'jmp (if callable
+                                 'tail-call-callable-variable
+                                 'tail-call-variable)
+                        vop)))
 
 ;;;; unknown values return
 
@@ -995,7 +1057,6 @@
          (nvals :scs (any-reg) :target rcx))
   (:temporary (:sc unsigned-reg :offset rsi-offset :from (:argument 2)) rsi)
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 3)) rcx)
-  (:temporary (:sc unsigned-reg) return-asm)
   (:temporary (:sc descriptor-reg :offset (first *register-arg-offsets*)
                    :from (:eval 0)) a0)
   (:node-var node)
@@ -1020,7 +1081,7 @@
         (emit-label not-single)))
     (move rsi vals)
     (move rcx nvals)
-    (invoke-asm-routine 'jmp 'return-multiple vop return-asm)))
+    (invoke-asm-routine 'jmp 'return-multiple vop)))
 
 ;;;; XEP hackery
 
@@ -1192,7 +1253,7 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:info index)
-  (:arg-types * (:constant (signed-byte 32)))
+  (:arg-types * (:constant (signed-byte #.(- 32 word-shift))))
   (:results (value :scs (descriptor-reg any-reg)))
   (:result-types *)
   (:generator 3
@@ -1237,7 +1298,12 @@
       (inst mov result nil-value)
       (inst jrcxz done)
       (inst lea dst (make-ea :qword :index rcx :scale (ash 2 (- word-shift n-fixnum-tag-bits))))
+      (unless stack-allocate-p
+        (instrument-alloc dst node))
       (maybe-pseudo-atomic stack-allocate-p
+       ;; FIXME: if COUNT >= 8192, allocates to single-object page(s).
+       ;; All we have to do is unset the '.singleton' bit,
+       ;; a permissible state change as long as pseudo-atomic.
        (allocation dst dst node stack-allocate-p list-pointer-lowtag)
        ;; Set up the result.
        (move result dst)
@@ -1368,10 +1434,7 @@
   ;; register on -SB-THREAD. While this isn't critical for x86-64,
   ;; it's more serious for x86.
   #!+sb-thread
-  (inst cmp (make-ea :qword
-                     :base thread-base-tn
-                     :disp (* thread-stepping-slot n-word-bytes))
-        0)
+  (inst cmp (thread-tls-ea (* thread-stepping-slot n-word-bytes)) 0)
   #!-sb-thread
   (inst cmp (make-ea :byte
                      :disp (+ nil-value (static-symbol-offset

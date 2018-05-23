@@ -250,19 +250,30 @@
 
 ;;;; lvar substitution
 
-(defun update-dependent-casts (new old)
-  (loop for cast in (lvar-dependent-casts old)
-        do (nsubst new old (dependent-cast-deps cast))
-        when (lvar-p new)
-        do
-        (push cast (lvar-dependent-casts new))))
+(defun update-lvar-dependencies (new old)
+  (typecase old
+    (ref
+     (update-lvar-dependencies new (lambda-var-ref-lvar old)))
+    (lvar
+     (when (lvar-p new)
+       (do-uses (node old)
+         (when (exit-p node)
+           ;; Inlined functions will try to use the lvar in the lexenv
+           (loop for block in (lexenv-blocks (node-lexenv node))
+                 for block-lvar = (fourth block)
+                 when (eq old block-lvar)
+                 do (setf (fourth block) new)))))
+     (loop for cast in (lvar-dependent-casts old)
+           do (nsubst new old (dependent-cast-deps cast))
+           when (lvar-p new)
+           do
+           (push cast (lvar-dependent-casts new))))))
 
 ;;; In OLD's DEST, replace OLD with NEW. NEW's DEST must initially be
 ;;; NIL. We do not flush OLD's DEST.
 (defun substitute-lvar (new old)
   (declare (type lvar old new))
   (aver (not (lvar-dest new)))
-  (update-dependent-casts new old)
   (let ((dest (lvar-dest old)))
     (etypecase dest
       ((or ref bind))
@@ -289,23 +300,53 @@
            (type (or lvar null) new)
            (type boolean propagate-dx))
   (cond (new
-         (update-dependent-casts new old)
+         (update-lvar-dependencies new old)
          (do-uses (node old)
            (%delete-lvar-use node)
            (add-lvar-use node new))
          (reoptimize-lvar new)
-         (awhen (and propagate-dx (lvar-dynamic-extent old))
-           (setf (lvar-dynamic-extent old) nil)
-           (unless (lvar-dynamic-extent new)
-             (setf (lvar-dynamic-extent new) it)
-             (setf (cleanup-info it) (subst new old (cleanup-info it)))))
-         (when (lvar-dynamic-extent new)
-           (do-uses (node new)
-             (unless (node-to-be-deleted-p node)
-               (node-ends-block node)))))
+         (propagate-lvar-dx new old propagate-dx))
         (t (flush-dest old)))
 
   (values))
+
+(defun propagate-lvar-dx (new old propagate-dx)
+  (awhen (and propagate-dx (lvar-dynamic-extent old))
+    (setf (lvar-dynamic-extent old) nil)
+    (unless (lvar-dynamic-extent new)
+      (setf (lvar-dynamic-extent new) it)
+      (setf (cleanup-info it) (subst new old (cleanup-info it)))))
+  (when (lvar-dynamic-extent new)
+    (do-uses (node new)
+      (unless (node-to-be-deleted-p node)
+        (node-ends-block node)))))
+
+(defun lexenv-contains-lambda (lambda parent-lexenv)
+  (loop for lexenv = (lambda-call-lexenv lambda)
+        then (let ((lambda (lexenv-lambda lexenv)))
+               (and (lambda-call-lexenv lambda)))
+        while lexenv
+        thereis
+        (loop for parent = lexenv then (lexenv-parent parent)
+              while parent
+              thereis (and (eq parent parent-lexenv)))))
+
+;;; Handle
+;;; (dx-let ((x (let ((m (make-array)))
+;;;               (fill m)
+;;;               m))))
+(defun propagate-ref-dx (new-ref old-lvar old-lambda-var)
+  (let ((dx (lvar-dynamic-extent old-lvar))
+        (new-lambda-var (ref-leaf new-ref)))
+    (when (and dx
+               (lambda-var-p new-lambda-var)
+               ;; Make sure the let inside the dx let
+               (lexenv-contains-lambda (lambda-var-home new-lambda-var)
+                                       (lambda-lexenv (lambda-var-home old-lambda-var))))
+      (let ((new-lvar (lambda-var-ref-lvar new-ref)))
+        (when new-lvar
+          (propagate-lvar-dx new-lvar old-lvar t)
+          t)))))
 
 ;;;; block starting/creation
 
@@ -441,6 +482,7 @@
                 (when (return-p (lvar-dest lvar))
                   (do-uses (use value)
                     (when (and (basic-combination-p use)
+                               (not (node-to-be-deleted-p use))
                                (eq (basic-combination-kind use) :local))
                       (merges use))))
                 (substitute-lvar-uses lvar value
@@ -644,27 +686,55 @@
         (leaf-debug-name leaf))))
 
 (defun note-no-stack-allocation (lvar &key flush)
+  ;; If the target being compiled does not have all 4 of these features,
+  ;; then never warn about failure to stack-allocate. It's only useful to
+  ;; see when a _particular_ allocation can't go on the stack.
+  ;; It's just a distraction otherwise.
+  (declare (ignorable lvar flush))
+
+  #!+(and (host-feature sb-xc-host)
+          (not (and stack-allocatable-closures
+                    stack-allocatable-vectors
+                    stack-allocatable-lists
+                    stack-allocatable-fixed-objects)))
+  (return-from note-no-stack-allocation)
+
   (do-uses (use (principal-lvar lvar))
-    (unless (or
-             ;; Don't complain about not being able to stack allocate constants.
-             (and (ref-p use) (constant-p (ref-leaf use)))
-             ;; If we're flushing, don't complain if we can flush the combination.
-             (and flush (combination-p use) (flushable-combination-p use))
-             ;; Don't report those with homes in :OPTIONAL -- we'd get doubled
-             ;; reports that way.
-             (and (ref-p use) (lambda-var-p (ref-leaf use))
-                  (eq :optional (lambda-kind (lambda-var-home (ref-leaf use))))))
-      ;; FIXME: For the first leg (lambda-bind (lambda-var-home ...))
-      ;; would be a far better description, but since we use
-      ;; *COMPILER-ERROR-CONTEXT* for muffling we can't -- as that node
-      ;; can have different handled conditions.
-      (let ((*compiler-error-context* use))
-        (if (and (ref-p use) (lambda-var-p (ref-leaf use)))
-            (compiler-notify "~@<could~2:I not stack allocate ~S in: ~S~:@>"
-                             (lambda-var-original-name (ref-leaf use))
-                             (find-original-source (node-source-path use)))
-            (compiler-notify "~@<could~2:I not stack allocate: ~S~:@>"
-                             (find-original-source (node-source-path use))))))))
+    (dolist (use (ensure-list (if (cast-p use)
+                                  (principal-lvar-use (cast-value use))
+                                  use)))
+      (unless (or
+               ;; Don't complain about not being able to stack allocate constants.
+               (and (ref-p use) (constant-p (ref-leaf use)))
+               ;; If we're flushing, don't complain if we can flush the combination.
+               (and flush (combination-p use) (flushable-combination-p use))
+               ;; Don't report those with homes in :OPTIONAL -- we'd get doubled
+               ;; reports that way.
+               ;; Also don't report if the home is :EXTERNAL. This allows declaring
+               ;; funargs as dynamic-extent which can inform compilation of callers
+               ;; to this lambda that they can DXify the arg.
+               (and (ref-p use) (lambda-var-p (ref-leaf use))
+                    (member (lambda-kind (lambda-var-home (ref-leaf use)))
+                            '(:optional :external)))
+               ;; Don't complain if the referent is #'SOMEFUN, avoiding a note for
+               ;;  (DEFUN FOO (X &KEY (TEST #'IDENTITY)) ...)
+               ;; where TEST is declared DX, and one possible use of this LVAR is
+               ;; to the supplied arg, and other is essentially constant-like.
+               (and (ref-p use)
+                    (let ((var (ref-leaf use)))
+                      (and (global-var-p var)
+                           (eq (global-var-kind var) :global-function)))))
+        ;; FIXME: For the first leg (lambda-bind (lambda-var-home ...))
+        ;; would be a far better description, but since we use
+        ;; *COMPILER-ERROR-CONTEXT* for muffling we can't -- as that node
+        ;; can have different handled conditions.
+        (let ((*compiler-error-context* use))
+          (if (and (ref-p use) (lambda-var-p (ref-leaf use)))
+              (compiler-notify "~@<could~2:I not stack allocate ~S in: ~S~:@>"
+                               (lambda-var-original-name (ref-leaf use))
+                               (find-original-source (node-source-path use)))
+              (compiler-notify "~@<could~2:I not stack allocate: ~S~:@>"
+                               (find-original-source (node-source-path use)))))))))
 
 (defun use-good-for-dx-p (use dx &optional component)
   ;; FIXME: Can casts point to LVARs in other components?
@@ -810,7 +880,8 @@
                (not (lambda-var-sets var)))
       (let* ((fun (lambda-var-home var))
              (vars (lambda-vars fun))
-             (lvar (ref-lvar (car (lambda-refs fun))))
+             (lvar (and (lambda-refs fun)
+                        (ref-lvar (car (lambda-refs fun)))))
              (combination (and lvar
                                (lvar-dest lvar))))
         (when (combination-p combination)
@@ -1126,12 +1197,69 @@
            (frob if-alternative)
            (when (eq (if-consequent last)
                      (if-alternative last))
-             (reoptimize-component (block-component block) :maybe)))))
+             (reoptimize-component (block-component block) t)))))
       (t
        (unless (memq new (block-succ block))
          (link-blocks block new)))))
 
   (values))
+
+;;; Utility: return T if both argument cblocks are equivalent.  For now,
+;;; detect only blocks that read the same leaf into the same lvar, and
+;;; continue to the same block.
+(defun blocks-equivalent-p (x y)
+  (declare (type cblock x y))
+  (let ((ref-x (single-ref-block-p x))
+        (ref-y (single-ref-block-p y)))
+    (and ref-x
+         ref-y
+         (equal (block-succ x) (block-succ y))
+         (eq (ref-lvar ref-x) (ref-lvar ref-y))
+         (eq (ref-leaf ref-x) (ref-leaf ref-y))
+         (eq (node-enclosing-cleanup ref-x)
+             (node-enclosing-cleanup ref-y)))))
+
+(defun single-ref-block-p (block)
+  (let ((start (block-start block)))
+    (when start
+      (let ((node (ctran-next start)))
+        (and (ref-p node)
+             (eq (block-last block) node)
+             node)))))
+
+;;; If a block consisting of a single ref is equivalent to another
+;;; block with the same ref and the have the same successor it can be
+;;; removed.
+;;;
+;;; Removing more is tricky, debugging will suffer, and code relying
+;;; on constraint propagation will break, e.g.
+;;; (if (simple-vector-p x) (aref x 0) (aref x 0)))
+;;; 344d4d778 contains some code that handles combinations and casts.
+(defun remove-equivalent-blocks (block)
+  (let ((pred (block-pred block)))
+    (when (cdr pred)
+      (loop for (block1 . rest) on pred
+            when (and (not (block-delete-p block1))
+                      (single-ref-block-p block1))
+            do
+            (loop for block2 in rest
+                  when (and (not (block-delete-p block1))
+                            (blocks-equivalent-p block1 block2))
+                  do
+                  (let* ((ref1 (block-start-node block1))
+                         (ref2 (block-start-node block2))
+                         (type1 (node-derived-type ref1))
+                         (type2 (node-derived-type ref2)))
+                    ;; Constraint propagation may have given the
+                    ;; references different types. Join them back.
+                    (unless (eq type1 type2)
+                      (derive-node-type ref1
+                                        (values-type-union type1 type2)
+                                        :from-scratch t)))
+                  (loop for pred in (block-pred block2)
+                        do
+                        (change-block-successor pred block2 block1))
+                  (delete-block block2 t))))))
 
 ;;; Unlink a block from the next/prev chain. We also null out the
 ;;; COMPONENT.
@@ -1316,7 +1444,7 @@
 ;;; that the lambda is unreachable, so that its body may be
 ;;; deleted. We set FUNCTIONAL-KIND to :DELETED and rely on
 ;;; IR1-OPTIMIZE to delete its blocks.
-(defun delete-lambda (clambda)
+(defun delete-lambda (clambda &optional (delete-children t))
   (declare (type clambda clambda))
   (let ((original-kind (functional-kind clambda))
         (bind (lambda-bind clambda)))
@@ -1326,15 +1454,23 @@
     (setf (functional-kind clambda) :deleted)
     (setf (lambda-bind clambda) nil)
 
-    (labels ((delete-children (lambda)
-               (dolist (child (lambda-children lambda))
-                 (cond ((eq (functional-kind child) :deleted)
-                        (delete-children child))
-                       (t
-                        (delete-lambda child))))
-               (setf (lambda-children lambda) nil)
-               (setf (lambda-parent lambda) nil)))
-      (delete-children clambda))
+    (when delete-children
+      (labels ((delete-children (lambda)
+                 (dolist (child (lambda-children lambda))
+                   (cond ((eq (functional-kind child) :deleted)
+                          (delete-children child))
+                         ;; Can happen when all optional entries produce
+                         ;; errors, making the main entry unreachable,
+                         ;; but the XEP should not be deleted, as it can
+                         ;; still be reachable.
+                         ((and (eq (functional-kind child) :external)
+                               (eq (main-entry (functional-entry-fun child)) clambda)))
+                         (t
+                          (delete-lambda child nil)
+                          (delete-children child))))
+                 (setf (lambda-children lambda) nil)
+                 (setf (lambda-parent lambda) nil)))
+        (delete-children clambda)))
 
     ;; (The IF test is (FUNCTIONAL-SOMEWHAT-LETLIKE-P CLAMBDA), except
     ;; that we're using the old value of the KIND slot, not the
@@ -1520,7 +1656,6 @@
              (clambda
               (ecase (functional-kind leaf)
                 ((nil :let :mv-let :assignment :escape :cleanup)
-                 (aver (null (functional-entry-fun leaf)))
                  (delete-lambda leaf))
                 (:external
                  (unless (functional-has-external-references-p leaf)
@@ -2034,6 +2169,7 @@ is :ANY, the function name is not checked."
   (declare (type ref ref) (type leaf leaf))
   (unless (eq (ref-leaf ref) leaf)
     (push ref (leaf-refs leaf))
+    (update-lvar-dependencies leaf ref)
     (delete-ref ref)
     (setf (ref-leaf ref) leaf)
     (setf (leaf-ever-used leaf) t)
@@ -2060,6 +2196,7 @@ is :ANY, the function name is not checked."
 ;;; whether to substitute
 (defun substitute-leaf-if (test new-leaf old-leaf)
   (declare (type leaf new-leaf old-leaf) (type function test))
+  #-sb-xc-host (declare (dynamic-extent test)) ; "unable"
   (dolist (ref (leaf-refs old-leaf))
     (when (funcall test ref)
       (change-ref-leaf ref new-leaf)))
@@ -2373,6 +2510,9 @@ is :ANY, the function name is not checked."
   (declare (type basic-combination call))
   (let ((kind (basic-combination-kind call)))
     (or (eq kind :full)
+        ;; It has an ir2-converter, but needs to behave like a full call.
+        (eq (lvar-fun-name (basic-combination-fun call) t)
+            '%coerce-callable-for-call)
         (and (eq kind :known)
              (let ((info (basic-combination-fun-info call)))
                (and

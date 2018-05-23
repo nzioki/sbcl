@@ -339,7 +339,7 @@
 ;; trivial enough to have an internal error number assigned to them that can be
 ;; used in lieu of OBJECT-NOT-TYPE-ERROR. On x86-64 this saves 16 bytes: 1 word
 ;; for the symbol in the function's constant area, a MOV instruction to load it,
-;; and an sc-offset in the error trap.
+;; and an SC+OFFSET in the error trap.
 (defglobal **type-spec-interr-symbols**
     (let* ((entries
             ;; read-time-eval so that during cold-init we can recreate the
@@ -348,8 +348,11 @@
             #.(map 'vector
                    (lambda (entry)
                      (cons (type-specifier (specifier-type (car entry)))
-                           (cdr entry)))
-                   (remove-if #'stringp sb!c:+backend-internal-errors+
+                           (cadr entry)))
+                   (remove-if (lambda (spec)
+                                (or (stringp spec)
+                                    (typep spec '(cons (eql or)))))
+                              sb!c:+backend-internal-errors+
                               :key #'car)))
            ;; This is effectively a compact read-only binned hashtable.
            (hashtable (make-array (logior (length entries) 1)
@@ -360,11 +363,52 @@
                       (bucket (mod (sxhash canon-type) (length hashtable))))
                  (push entry (svref hashtable bucket))))
              entries)
-        hashtable))
+      hashtable))
+
+(defglobal **type-spec-unions-interr-symbols**
+    #.(map 'vector
+           (lambda (entry)
+             (cons (type-specifier (specifier-type (car entry)))
+                   (cadr entry)))
+           (remove-if-not (lambda (spec)
+                            (typep spec '(cons (eql or))))
+                          sb!c:+backend-internal-errors+
+                          :key #'car)))
+(declaim (simple-vector **type-spec-unions-interr-symbols**))
+
+;;; Different order of elements in (OR ...) specs make the hash-table
+;;; approach inssuficient.
+(defun %interr-symbol-for-union-type-spec (spec)
+  (let* ((spec (cdr spec))
+         (length (length spec))
+         (bit-map (if (> length sb!vm:n-fixnum-bits)
+                      (return-from %interr-symbol-for-union-type-spec)
+                      (1- (ash 1 (truly-the (integer 1 #.sb!vm:n-fixnum-bits)
+                                            length))))))
+    (declare (list spec))
+    (loop for entry across **type-spec-unions-interr-symbols**
+          when
+          (let ((current-map bit-map))
+            ;; Check that each element is present and mark it in the bit map,
+            ;; at the end if the map is zero the specs match.
+            (declare (type fixnum current-map))
+            (loop for element in (cdar entry)
+                  for position = (position element spec :test #'equal)
+                  always position
+                  do
+                  (setf (ldb (byte 1 (truly-the (integer 0 (#.sb!vm:n-fixnum-bits))
+                                                position))
+                             current-map)
+                        0))
+            (zerop current-map))
+          return (cdr entry))))
+
 (defun %interr-symbol-for-type-spec (spec)
   (let ((table **type-spec-interr-symbols**))
-    (cadr (assoc spec (svref table (rem (sxhash spec) (length table)))
-                :test #'equal))))
+    (if (typep spec '(cons (eql or)))
+        (%interr-symbol-for-union-type-spec spec)
+        (cdr (assoc spec (svref table (rem (sxhash spec) (length table)))
+                    :test #'equal)))))
 #+nil ; some meta-analysis to decide what types should be in "generic/interr"
 (progn
   (defvar *checkgen-used-types* (make-hash-table :test 'equal))
@@ -385,7 +429,18 @@
            (%interr-symbol-for-type-spec external-spec)))
     (if interr-symbol
         `(%type-check-error/c ,var ',interr-symbol ',context)
-        `(%type-check-error ,var ',external-spec ',context))))
+        `(%type-check-error
+          ,var
+          ',(typecase type
+              ;; These are already loaded into the constants vector
+              (structure-classoid
+               ;; Can't use CLASSOID-LAYOUT as it may mismatch due to redefinition
+               (info :type :compiler-layout (classoid-name type)))
+              (standard-classoid
+               (find-classoid-cell (classoid-name type) :create t))
+              (t
+               external-spec))
+          ',context))))
 
 ;;; Return a lambda form that we can convert to do a type check
 ;;; of the specified TYPES. TYPES is a list of the format returned by
@@ -398,13 +453,20 @@
 (defun make-type-check-form (types &optional context)
   (let ((temps (make-gensym-list (length types))))
     `(multiple-value-bind ,temps 'dummy
-       ,@(mapcar (lambda (temp type)
-                   (let* ((spec
-                            (let ((*unparse-fun-type-simplify* t))
-                              (type-specifier (second type))))
-                          (test (if (first type) `(not ,spec) spec)))
-                     `(unless (typep ,temp ',test)
-                        ,(internal-type-error-call temp (third type) context))))
+       ,@(mapcar (lambda (temp %type)
+                   (destructuring-bind (not type-to-check
+                                        type-to-report) %type
+                    (let* ((spec
+                             (let ((*unparse-fun-type-simplify* t))
+                               (type-specifier type-to-check)))
+                           (test (if not `(not ,spec) spec)))
+                      `(unless (typep ,temp ',test)
+                         ,(internal-type-error-call temp
+                                                    (if (fun-designator-type-p type-to-report)
+                                                        ;; Simplify
+                                                        (specifier-type 'callable)
+                                                        type-to-report)
+                                                    context)))))
                  temps
                  types)
        (values ,@temps))))

@@ -20,7 +20,7 @@
   "The absolute pathname of the running SBCL runtime.")
 
 ;;; something not EQ to anything we might legitimately READ
-(defglobal *eof-object* (make-symbol "EOF-OBJECT"))
+(define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant max-hash sb!xc:most-positive-fixnum))
@@ -94,6 +94,10 @@
                           (* max-offset sb!vm:n-word-bytes))
                        scale)))
 
+(declaim (inline align-up))
+(defun align-up (value granularity &aux (mask (1- granularity)))
+  (logandc2 (+ value mask) mask))
+
 #!+(or x86 x86-64)
 (defun displacement-bounds (lowtag element-size data-offset)
   (let* ((adjustment (- (* data-offset sb!vm:n-word-bytes) lowtag))
@@ -117,24 +121,6 @@
                                                           element-size
                                                           data-offset)
         `(integer ,min ,max)))))
-
-;;; the default value used for initializing character data. The ANSI
-;;; spec says this is arbitrary, so we use the value that falls
-;;; through when we just let the low-level consing code initialize
-;;; all newly-allocated memory to zero.
-;;;
-;;; KLUDGE: It might be nice to use something which is a
-;;; STANDARD-CHAR, both to reduce user surprise a little and, probably
-;;; more significantly, to help SBCL's cross-compiler (which knows how
-;;; to dump STANDARD-CHARs). Unfortunately, the old CMU CL code is
-;;; shot through with implicit assumptions that it's #\NULL, and code
-;;; in several places (notably both DEFUN MAKE-ARRAY and DEFTRANSFORM
-;;; MAKE-ARRAY) would have to be rewritten. -- WHN 2001-10-04
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; an expression we can use to construct a DEFAULT-INIT-CHAR value
-  ;; at load time (so that we don't need to teach the cross-compiler
-  ;; how to represent and dump non-STANDARD-CHARs like #\NULL)
-  (defparameter *default-init-char-form* '(code-char 0)))
 
 ;;; CHAR-CODE values for ASCII characters which we care about but
 ;;; which aren't defined in section "2.1.3 Standard Characters" of the
@@ -200,12 +186,22 @@
            (recurse x (list x) 0)
            t))))
 
-;;; Is X a (possibly-improper) list of at least N elements?
-(declaim (ftype (function (t index)) list-of-length-at-least-p))
-(defun list-of-length-at-least-p (x n)
-  (or (zerop n) ; since anything can be considered an improper list of length 0
-      (and (consp x)
-           (list-of-length-at-least-p (cdr x) (1- n)))))
+;;; Is LIST a (possibly-improper) list of at least LENGTH elements?
+(declaim (ftype (sfunction (t index) boolean) list-of-length-at-least-p))
+(defun list-of-length-at-least-p (list length)
+  (named-let rec ((rest list) (n length))
+    (declare (type index n))
+    (or (zerop n) ; since anything can be considered an improper list of length 0
+        (and (consp rest) (rec (cdr rest) (1- n))))))
+
+(defun sequence-of-length-at-least-p (sequence length)
+  (etypecase sequence
+    (list
+     (list-of-length-at-least-p sequence length))
+    (vector
+     (>= (length sequence) length))
+    (sequence
+     (>= (length sequence) length))))
 
 ;;; Is X is a positive prime integer?
 (defun positive-primep (x)
@@ -385,18 +381,6 @@
           (t list))))
 
 ;;;; miscellaneous iteration extensions
-
-;;; like Scheme's named LET
-;;;
-;;; (CMU CL called this ITERATE, and commented it as "the ultimate
-;;; iteration macro...". I (WHN) found the old name insufficiently
-;;; specific to remind me what the macro means, so I renamed it.)
-(defmacro named-let (name binds &body body)
-  (dolist (x binds)
-    (unless (proper-list-of-length-p x 2)
-      (error "malformed NAMED-LET variable spec: ~S" x)))
-  `(labels ((,name ,(mapcar #'first binds) ,@body))
-     (,name ,@(mapcar #'second binds))))
 
 (defun filter-dolist-declarations (decls)
   (mapcar (lambda (decl)
@@ -774,7 +758,7 @@ NOTE: This interface is experimental and subject to change."
                  (values ,@result-temps))))))
     `(progn
        (pushnew ',var-name *cache-vector-symbols*)
-       (defglobal ,var-name nil)
+       (define-load-time-global ,var-name nil)
        ,@(when *profile-hash-cache*
            `((declaim (type (simple-array fixnum (3)) ,statistics-name))
              (defvar ,statistics-name)))
@@ -1103,6 +1087,8 @@ NOTE: This interface is experimental and subject to change."
 (defun defprinter-print-space (stream)
   (write-char #\space stream))
 
+(defvar *print-ir-nodes-pretty* nil)
+
 ;;; Define some kind of reasonable PRINT-OBJECT method for a
 ;;; STRUCTURE-OBJECT class.
 ;;;
@@ -1126,27 +1112,30 @@ NOTE: This interface is experimental and subject to change."
 ;;;
 ;;; The structure being printed is bound to STRUCTURE and the stream
 ;;; is bound to STREAM.
+;;;
+;;; If PRETTY-IR-PRINTER is supplied, the form is invoked when
+;;; *PRINT-IR-NODES-PRETTY* is true.
 (defmacro defprinter ((name
                        &key
                        (conc-name (concatenate 'simple-string
                                                (symbol-name name)
                                                "-"))
-                       identity)
+                       identity
+                       pretty-ir-printer)
                       &rest slot-descs)
   (let ((first? t)
         maybe-print-space
-        (reversed-prints nil)
-        (stream (sb!xc:gensym "STREAM")))
+        (reversed-prints nil))
     (flet ((sref (slot-name)
              `(,(symbolicate conc-name slot-name) structure)))
       (dolist (slot-desc slot-descs)
         (if first?
             (setf maybe-print-space nil
                   first? nil)
-            (setf maybe-print-space `(defprinter-print-space ,stream)))
+            (setf maybe-print-space `(defprinter-print-space stream)))
         (cond ((atom slot-desc)
                (push maybe-print-space reversed-prints)
-               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) ,stream)
+               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) stream)
                      reversed-prints))
               (t
                (let ((sname (first slot-desc))
@@ -1159,25 +1148,31 @@ NOTE: This interface is experimental and subject to change."
                                    ,maybe-print-space
                                    ,@(or (stuff)
                                          `((defprinter-prin1
-                                             ',sname ,sname ,stream)))))
+                                             ',sname ,sname stream)))))
                               reversed-prints))
                      (case (first option)
                        (:prin1
                         (stuff `(defprinter-prin1
-                                  ',sname ,(second option) ,stream)))
+                                  ',sname ,(second option) stream)))
                        (:princ
                         (stuff `(defprinter-princ
-                                  ',sname ,(second option) ,stream)))
+                                  ',sname ,(second option) stream)))
                        (:test (setq test (second option)))
                        (t
                         (error "bad option: ~S" (first option)))))))))))
-    `(defmethod print-object ((structure ,name) ,stream)
-       (pprint-logical-block (,stream nil)
-         (print-unreadable-object (structure
-                                   ,stream
-                                   :type t
-                                   :identity ,identity)
-           ,@(nreverse reversed-prints))))))
+    (let ((normal-printer `(pprint-logical-block (stream nil)
+                             (print-unreadable-object (structure
+                                                       stream
+                                                       :type t
+                                                       :identity ,identity)
+                               ,@(nreverse reversed-prints))) ))
+      `(defmethod print-object ((structure ,name) stream)
+         ,(cond (pretty-ir-printer
+                 `(if *print-ir-nodes-pretty*
+                      ,pretty-ir-printer
+                      ,normal-printer))
+                (t
+                 normal-printer))))))
 
 (defun print-symbol-with-prefix (stream symbol &optional colon at)
   "For use with ~/: Write SYMBOL to STREAM as if it is not accessible from
@@ -1217,14 +1212,6 @@ NOTE: This interface is experimental and subject to change."
     (+ digits (floor (1- digits) comma-interval))))
 
 
-;;;; etc.
-
-;;; Given a pathname, return a corresponding physical pathname.
-(defun physicalize-pathname (possibly-logical-pathname)
-  (if (typep possibly-logical-pathname 'logical-pathname)
-      (translate-logical-pathname possibly-logical-pathname)
-      possibly-logical-pathname))
-
 ;;;; Deprecating stuff
 
 (deftype deprecation-state ()
@@ -1559,34 +1546,6 @@ NOTE: This interface is experimental and subject to change."
   (or (not (consp promise))
       (car promise)))
 
-;;; toplevel helper
-(defmacro with-rebound-io-syntax (&body body)
-  `(%with-rebound-io-syntax (lambda () ,@body)))
-
-(defun %with-rebound-io-syntax (function)
-  (declare (type function function))
-  (let ((*package* *package*)
-        (*print-array* *print-array*)
-        (*print-base* *print-base*)
-        (*print-case* *print-case*)
-        (*print-circle* *print-circle*)
-        (*print-escape* *print-escape*)
-        (*print-gensym* *print-gensym*)
-        (*print-length* *print-length*)
-        (*print-level* *print-level*)
-        (*print-lines* *print-lines*)
-        (*print-miser-width* *print-miser-width*)
-        (*print-pretty* *print-pretty*)
-        (*print-radix* *print-radix*)
-        (*print-readably* *print-readably*)
-        (*print-right-margin* *print-right-margin*)
-        (*read-base* *read-base*)
-        (*read-default-float-format* *read-default-float-format*)
-        (*read-eval* *read-eval*)
-        (*read-suppress* *read-suppress*)
-        (*readtable* *readtable*))
-    (funcall function)))
-
 ;;; Bind a few "potentially dangerous" printer control variables to
 ;;; safe values, respecting current values if possible.
 (defmacro with-sane-io-syntax (&body forms)
@@ -1595,9 +1554,11 @@ NOTE: This interface is experimental and subject to change."
 (!defvar *print-vector-length* nil
   "Like *PRINT-LENGTH* but works on strings and bit-vectors.
 Does not affect the cases that are already controlled by *PRINT-LENGTH*")
+(declaim (always-bound *print-vector-length*))
 
 (defun call-with-sane-io-syntax (function)
   (declare (type function function))
+  #-sb-xc-host (declare (dynamic-extent function)) ; "unable"
   (macrolet ((true (sym)
                `(and (boundp ',sym) ,sym)))
     (let ((*print-readably* nil)
@@ -1628,7 +1589,7 @@ Does not affect the cases that are already controlled by *PRINT-LENGTH*")
   "Toggle between different evaluator implementations. If set to :COMPILE,
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
-
+(declaim (always-bound *evaluator-mode*))
 ;; This is not my preferred name for this function, but chosen for harmony
 ;; with everything else that refers to these as 'hash-caches'.
 ;; Hashing is just one particular way of memoizing, and it would have been
@@ -1754,3 +1715,5 @@ to :INTERPRET, an interpreter will be used.")
     (symbol (or (eq x t) (eq (symbol-package x) *keyword-package*)))
     (cons nil)
     (t t)))
+
+(defvar *top-level-form-p* nil)

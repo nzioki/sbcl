@@ -534,7 +534,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(*os_context_pc_addr(context)));
-    int register_offset = code >> 5 & 0x1f;
+    int register_offset = code >> 8 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -566,7 +566,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
     if ((code >> 16) == ((3 << 10) | (6 << 5))) {
         /* twllei reg_ZERO,N will always trap if reg_ZERO = 0 */
-        int trap = code & 0x1f;
+        int trap = code & 0xff;
         handle_trap(context,trap);
         return;
     }
@@ -622,8 +622,12 @@ ppc_flush_icache(os_vm_address_t address, os_vm_size_t length)
  * Insert the necessary jump instructions at the given address.
  */
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
    * Make JMP to function entry.
    *
@@ -676,11 +680,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

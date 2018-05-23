@@ -231,11 +231,11 @@
     ;; FIXME: What about Windows?
     (def-mk*temp mkdtemp "mkdtemp" (* char) null-alien t nil))
   (define-call-internally ioctl-without-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int))
+                          (fd file-descriptor) (cmd unsigned-long))
   (define-call-internally ioctl-with-int-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int) (arg int))
+                          (fd file-descriptor) (cmd unsigned-long) (arg int))
   (define-call-internally ioctl-with-pointer-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int)
+                          (fd file-descriptor) (cmd unsigned-long)
                           (arg alien-pointer-to-anything-or-nil))
   (define-entry-point "ioctl" (fd cmd &optional (arg nil argp))
     (if argp
@@ -342,14 +342,19 @@
 the child process in the parent. Forking while multiple threads are running is
 not supported."
     (tagbody
-       (sb-thread::with-all-threads-lock
-         (when (cdr sb-thread::*all-threads*)
-           (go :error))
-         (let ((pid (posix-fork)))
-           #+darwin
-           (when (= pid 0)
-             (darwin-reinit))
-           (return-from fork pid)))
+       (let ()
+         #+sb-thread
+         (sb-impl::finalizer-thread-stop)
+         (sb-thread::with-all-threads-lock
+           (when (cdr sb-thread::*all-threads*)
+             (go :error))
+           (let ((pid (posix-fork)))
+             #+darwin
+             (when (= pid 0)
+               (darwin-reinit))
+             #+sb-thread
+             (setf sb-impl::*finalizer-thread* t)
+             (return-from fork pid))))
      :error
        (error "Cannot fork with multiple threads running.")))
   (export 'fork :sb-posix)
@@ -816,10 +821,6 @@ not supported."
 
 ;;; environment
 
-(eval-when (:compile-toplevel :load-toplevel)
-  ;; Do this at compile-time as Win32 code below refers to it as
-  ;; sb-posix:getenv.
-  (export 'getenv :sb-posix))
 (defun getenv (name)
   (let ((r (alien-funcall
             (extern-alien "getenv" (function (* char) (c-string :not-null t)))

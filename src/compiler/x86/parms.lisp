@@ -13,6 +13,35 @@
 
 (in-package "SB!VM")
 
+(defconstant sb!assem:assem-scheduler-p nil)
+
+(defconstant +backend-fasl-file-implementation+ :x86)
+(defconstant-eqx +fixup-kinds+ #(:absolute :relative) #'equalp)
+
+;;; KLUDGE: It would seem natural to set this by asking our C runtime
+;;; code for it, but mostly we need it for GENESIS, which doesn't in
+;;; general have our C runtime code running to ask, so instead we set
+;;; it by hand. -- WHN 2001-04-15
+;;;
+;;; Actually any information that we can retrieve C-side would be
+;;; useless in SBCL, since it's possible for otherwise binary
+;;; compatible systems to return different values for getpagesize().
+;;; -- JES, 2007-01-06
+(defconstant +backend-page-bytes+ #!+win32 65536 #!-win32 4096)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
 ;;; insists on calling 16 bit things words and 32 bit things
@@ -155,30 +184,17 @@
 ;;;     And if KVA_PAGES is extended from 1GB to 1.5GB, we can't use
 ;;;     down to around 0xA0000000.
 ;;;     So we use 0x58000000--0x98000000 for dynamic space.
-;;;   * OpenBSD address space changes for W^X as well as malloc()
-;;;     randomization made the old addresses unsafe.
-;;;     ** By default (linked without -Z option):
-;;;        The executable's text segment starts at #x1c000000 and the
-;;;        data segment MAXDSIZ bytes higher, at #x3c000000. Shared
-;;;        library text segments start randomly between #x00002000 and
-;;;        #x10002000, with the data segment MAXDSIZ bytes after that.
-;;;     ** If the -Z linker option is used:
-;;;        The executable's text and data segments simply start at
-;;;        #x08048000, data immediately following text. Shared library
-;;;        text and data is placed as if allocated by malloc().
-;;;     ** In both cases, the randomized range for malloc() starts
-;;;        MAXDSIZ bytes after the end of the data segment (#x48048000
-;;;        with -Z, #x7c000000 without), and extends 256 MB.
-;;;     ** The read only, static, and linkage table spaces should be
-;;;        safe with and without -Z if they are located just before
-;;;        #x1c000000.
-;;;     ** Ideally the dynamic space should be at #x94000000, 64 MB
-;;;        after the end of the highest random malloc() address.
-;;;        Unfortunately the dynamic space must be in the lower half
-;;;        of the address space, where there are no large areas which
-;;;        are unused both with and without -Z. So we break -Z by
-;;;        starting at #x40000000. By only using 512 - 64 MB we can
-;;;        run under the default 512 MB data size resource limit.
+;;;   * For OpenBSD, the following ranges are used:
+;;;     ** Non-PIE executables' text segments start at #x1c000000 and
+;;;        data segments 512MB higher at #x3c000000.
+;;;     ** Shared library text segments are randomly located between
+;;;        #x00002000 and #x10002000, with each data segment located
+;;;        512MB higher.
+;;;     ** OpenBSD 6.3 and earlier place random malloc/mmap
+;;;        allocations in the range starting 1GB after the end of the
+;;;        data segment and extending for 256MB.
+;;;     ** After OpenBSD 6.3, this range starts 128MB after the end of
+;;;        the data segment and extends for 1GB.
 
 ;;; NetBSD configuration used to have this comment regarding the linkage
 ;;; table: "In CMUCL: 0xB0000000->0xB1000000"
@@ -188,7 +204,7 @@
 #!+sunos     (!gencgc-space-setup #x20000000 :dynamic-space-start #x48000000)
 #!+freebsd   (!gencgc-space-setup #x01000000 :dynamic-space-start #x58000000)
 #!+dragonfly (!gencgc-space-setup #x01000000 :dynamic-space-start #x58000000)
-#!+openbsd   (!gencgc-space-setup #x1b000000 :dynamic-space-start #x40000000)
+#!+openbsd   (!gencgc-space-setup #x3d000000 :dynamic-space-start #x8d000000)
 #!+netbsd    (!gencgc-space-setup #x20000000 :dynamic-space-start #x60000000)
 #!+darwin    (!gencgc-space-setup #x04000000 :dynamic-space-start #x10000000)
 
@@ -199,12 +215,10 @@
 ;;; know its value at compile time:
 (defconstant nil-value (+ static-space-start #xb))
 
-;;;; other miscellaneous constants
 
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
@@ -212,7 +226,8 @@
   single-step-before-trap
   memory-fault-emulation-trap
   #!+sb-safepoint global-safepoint-trap
-  #!+sb-safepoint csp-safepoint-trap)
+  #!+sb-safepoint csp-safepoint-trap
+  error-trap)
 
 ;;;; static symbols
 

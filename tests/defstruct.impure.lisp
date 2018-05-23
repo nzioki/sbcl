@@ -10,7 +10,6 @@
 ;;;; more information.
 
 (load "compiler-test-util.lisp")
-(use-package "ASSERTOID")
 
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
 
@@ -1418,3 +1417,11 @@ redefinition."
              ;; RECKLESSLY-CONTINUE is offered.
              '(defstruct redefinable (a nil :type symbol))
              '(defstruct redefinable (a nil :type cons))))))
+
+(test-util:with-test (:name :non-total-satisfies-predicate)
+  ;; This definition is perfectly fine as long as you always pass
+  ;; only numbers to the constructor.
+  ;; In particular, the macroexpander must not test whether a random
+  ;; object (specifically NIL) meets the test for the slot.
+  (assert (macroexpand-1
+           '(defstruct strangestruct (a nil :type (satisfies plusp))))))

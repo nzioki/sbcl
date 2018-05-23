@@ -72,7 +72,7 @@
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block unwind-block-uwp-slot)
     (storew rbp-tn block unwind-block-cfp-slot)
-    (inst lea temp (make-fixup nil :code-object entry-label))
+    (inst lea temp (rip-relative-ea :qword entry-label))
     (storew temp block unwind-block-entry-pc-slot)))
 
 ;;; like MAKE-UNWIND-BLOCK, except that we also store in the specified
@@ -88,7 +88,7 @@
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block catch-block-uwp-slot)
     (storew rbp-tn block catch-block-cfp-slot)
-    (inst lea temp (make-fixup nil :code-object entry-label))
+    (inst lea temp (rip-relative-ea :qword entry-label))
     (storew temp block catch-block-entry-pc-slot)
     (storew tag block catch-block-tag-slot)
     (load-tl-symbol-value temp *current-catch-block*)
@@ -168,7 +168,7 @@
                     (inst mov tn move-temp)))))
              (let ((defaulting-done (gen-label)))
                (emit-label defaulting-done)
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (dolist (default (defaults))
                    (emit-label (car default))
                    (when (cddr default)
@@ -204,7 +204,8 @@
 
     (inst sub rdi n-word-bytes)
     (move rcx count)                    ; fixnum words == bytes
-    (move num rcx)
+    (unless (eq (tn-kind num) :unused)
+      (move num rcx))
     (inst shr rcx n-fixnum-tag-bits)    ; word count for <rep movs>
     ;; If we got zero, we be done.
     (inst jrcxz DONE)
@@ -254,11 +255,11 @@
     (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
     (storew temp block unwind-block-cfp-slot)
 
-    (inst lea temp-reg-tn (make-fixup nil :code-object entry-label))
+    (inst lea temp-reg-tn (rip-relative-ea :qword entry-label))
     (storew temp-reg-tn block unwind-block-entry-pc-slot)
 
     ;; Run any required UWPs.
-    (invoke-asm-routine 'jmp 'unwind vop temp-reg-tn)
+    (invoke-asm-routine 'jmp 'unwind vop)
     ENTRY-LABEL
 
     ;; Move our saved function to where we want it now.

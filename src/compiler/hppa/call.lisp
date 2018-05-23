@@ -11,8 +11,8 @@
 
 (in-package "SB!VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If standard is
 ;;; true, then use the standard (full call) location, otherwise use any legal
@@ -32,7 +32,7 @@
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset descriptor-reg-sc-number ocfp-offset))
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -118,8 +118,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Fix CODE, cause the function object was passed in.
     (let ((entry-point (gen-label)))
@@ -297,7 +296,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (aver defaults)
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label default-stack-vals)
                 (do ((remaining defaults (cdr remaining)))
                     ((null remaining))
@@ -346,7 +345,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (when lra-label
         (inst compute-code-from-lra code-tn lra-label temp code-tn))
@@ -1204,4 +1203,3 @@ default-value-8
     ;; can just use a bare SINGLE-STEP-BEFORE-TRAP as the code.
     (inst break 0 single-step-before-trap)
     DONE))
-

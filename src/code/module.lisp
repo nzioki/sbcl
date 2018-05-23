@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; exported specials
 
@@ -77,7 +77,7 @@
 (defun module-provide-contrib (name)
   "Stringify and downcase NAME, then attempt to load the file
    $SBCL_HOME/name/name"
-  (let* ((filesys-name (string-downcase (string name)))
+  (let* ((filesys-name (string-downcase name))
          (unadorned-path
           (merge-pathnames
            (make-pathname :directory (list :relative "contrib")
@@ -98,6 +98,6 @@
                     (probe-file lisp-path))))
       (when file
         (handler-bind
-            (((or style-warning sb!int:package-at-variance) #'muffle-warning))
+            (((or style-warning package-at-variance) #'muffle-warning))
           (load file))
         t))))

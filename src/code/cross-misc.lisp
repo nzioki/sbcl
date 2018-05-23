@@ -37,6 +37,10 @@
 
 (defmacro define-load-time-global (&rest args) `(defvar ,@args))
 
+;;; Necessary only to placate the host compiler in %COMPILER-DEFGLOBAL.
+(defun set-symbol-global-value (sym val)
+  (error "Can't set symbol-global-value: ~S ~S" sym val))
+
 ;;; The GENESIS function works with fasl code which would, in the
 ;;; target SBCL, work on ANSI-STREAMs (streams which aren't extended
 ;;; Gray streams). In ANSI Common Lisp, an ANSI-STREAM is just a
@@ -208,6 +212,9 @@
 ;;;; in lieu of #+sb-xc-host elsewere which messes up toplevel form numbers.
 (in-package "SB!C")
 
+;;; For macro lambdas that are processed by the host
+(declaim (declaration top-level-form))
+
 ;;; Set of function names whose definition will never be seen in make-host-2,
 ;;; as they are deferred until warm load.
 ;;; The table is populated by compile-cold-sbcl, and not present in the target.
@@ -229,3 +236,13 @@
         (unless (<= 0 code 127)
           (setf code (sb!xc:char-code #\?)))
         (setf (aref a i) code)))))
+
+;;;; Stubs for host
+(defun sb!c:compile-in-lexenv (lambda lexenv &rest rest)
+  (declare (ignore lexenv))
+  (assert (null rest))
+  (compile nil lambda))
+
+(defun eval-tlf (form index &optional lexenv)
+  (declare (ignore index lexenv))
+  (eval form))

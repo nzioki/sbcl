@@ -705,8 +705,7 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
         == access_control_frame_pointer(th)) {
         /* There is a small window during call where the callee's
          * frame isn't built yet. */
-        if (lowtag_of(*os_context_register_addr(context, reg_CODE))
-            == FUN_POINTER_LOWTAG) {
+        if (functionp(*os_context_register_addr(context, reg_CODE))) {
             /* We have called, but not built the new frame, so
              * build it for them. */
             access_control_frame_pointer(th)[0] =
@@ -811,7 +810,7 @@ fake_foreign_function_call(os_context_t *context)
     bind_variable(FREE_INTERRUPT_CONTEXT_INDEX,
                   make_fixnum(context_index + 1),thread);
 
-    thread->interrupt_contexts[context_index] = context;
+    nth_interrupt_context(context_index, thread) = context;
 
 #if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
     /* x86oid targets don't maintain the foreign function call flag at
@@ -833,6 +832,12 @@ undo_fake_foreign_function_call(os_context_t *context)
 
     foreign_function_call_active_p(thread) = 0;
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+    /* garbage_collect_generation may access it in parallel after
+       FREE_INTERRUPT_CONTEXT_INDEX has been updated, stuff a zero to
+       keep it from being confused. */
+    nth_interrupt_context(fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread)) - 1, thread) = NULL;
+#endif
     /* Undo dynamic binding of FREE_INTERRUPT_CONTEXT_INDEX */
     unbind(thread);
 
@@ -1152,7 +1157,7 @@ interrupt_handle_now(int signal, siginfo_t *info, os_context_t *context)
          * support decides to pass on it. */
         lose("no handler for signal %d in interrupt_handle_now(..)\n", signal);
 
-    } else if (lowtag_of(handler.lisp) == FUN_POINTER_LOWTAG) {
+    } else if (functionp(handler.lisp)) {
         /* Once we've decided what to do about contexts in a
          * return-elsewhere world (the original context will no longer
          * be available; should we copy it or was nobody using it anyway?)
@@ -1716,6 +1721,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
 
     if(addr >= CONTROL_STACK_HARD_GUARD_PAGE(th) &&
        addr < CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size) {
+        fake_foreign_function_call(context);
         lose("Control stack exhausted, fault: %p, PC: %p",
              addr, *os_context_pc_addr(context));
     }
@@ -1725,6 +1731,11 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
          * protection so the error handler has some headroom, protect the
          * previous page so that we can catch returns from the guard page
          * and restore it. */
+        if (lose_on_corruption_p || gc_active_p) {
+            fake_foreign_function_call(context);
+            lose("Control stack exhausted, fault: %p, PC: %p",
+                 addr, *os_context_pc_addr(context));
+        }
         if (th->control_stack_guard_page_protected == NIL)
             lose("control_stack_guard_page_protected NIL");
         lower_thread_control_stack_guard_page(th);
@@ -1756,6 +1767,12 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
             addr < BINDING_STACK_GUARD_PAGE(th) + os_vm_page_size) {
         protect_binding_stack_guard_page(0, NULL);
         protect_binding_stack_return_guard_page(1, NULL);
+
+        if (lose_on_corruption_p) {
+            fake_foreign_function_call(context);
+            lose("Binding stack exhausted");
+        }
+
         fprintf(stderr, "INFO: Binding stack guard page unprotected\n");
 
         /* For the unfortunate case, when the binding stack is
@@ -2245,6 +2262,9 @@ unhandled_trap_error(os_context_t *context)
 void
 handle_trap(os_context_t *context, int trap)
 {
+    if (trap >= trap_Error) {
+        trap = trap_Error;
+    }
     switch(trap) {
 #if !(defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD))
     case trap_PendingInterrupt:

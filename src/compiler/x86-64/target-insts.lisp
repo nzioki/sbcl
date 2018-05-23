@@ -49,9 +49,19 @@
   (declare (type reg value) (type disassem-state dstate))
   (if (dstate-getprop dstate +rex-b+) (+ value 8) value))
 
+;; This reader extracts the 'imm' operand in "MOV reg,imm" format.
+;; KLUDGE: the REG instruction format can not define a reader
+;; because it has no field specification and no prefilter.
+;; (It's specified directly in the MOV instruction definition)
+(defun reg-imm-data (dchunk dstate) dchunk
+  (aref (sb!disassem::dstate-filtered-values dstate) 4))
+
+(defun regrm-inst-reg (dchunk dstate)
+  (logior (if (logtest (sb!disassem::dstate-inst-properties dstate) +rex-r+) 8 0)
+          (!regrm-inst-reg dchunk dstate)))
+
 (defstruct (machine-ea (:include sb!disassem::filtered-arg)
                        (:copier nil)
-                       (:predicate nil)
                        (:constructor %make-machine-ea))
   base disp index scale)
 
@@ -131,6 +141,9 @@
 (defun print-sized-reg/mem-default-qword (value stream dstate)
   (print-reg/mem-with-width
    value (inst-operand-size-default-qword dstate) t stream dstate))
+
+(defun print-jmp-ea (value stream dstate)
+  (print-sized-reg/mem-default-qword value stream dstate))
 
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
@@ -275,7 +288,7 @@
                (or (minusp disp)
                    (nth-value 1 (note-code-constant-absolute disp dstate))
                    (maybe-note-assembler-routine disp nil dstate)
-                   ;; Static symbols coming frorm CELL-REF
+                   ;; Static symbols coming from CELL-REF
                    (maybe-note-static-symbol (+ disp (- other-pointer-lowtag
                                                         n-word-bytes))
                                              dstate)))
@@ -320,6 +333,7 @@
                  (note (lambda (stream) (format stream "tls_index: ~S" symbol))
                        dstate))))
             ((and (eql base-reg #.(ash (tn-offset sb!vm::thread-base-tn) -1))
+                  (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
                   (not index-reg) ; no index
                   (typep disp '(integer 0 *))) ; positive displacement
              (let* ((tls-index (ash disp (- n-fixnum-tag-bits)))
@@ -381,7 +395,7 @@
        ;; But ordinarily we get the string. Either way, the r/m arg reveals the
        ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
        ;; because the EA was computed in a prefilter.
-       (print-mem-ref :compute (reg-r/m-inst-r/m-arg dchunk-zero dstate)
+       (print-mem-ref :compute (regrm-inst-r/m dchunk-zero dstate)
                       width stream dstate)
        (setq addr value)
        (when (stringp value) (setq fmt "= ~A"))))
@@ -394,246 +408,39 @@
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (case #!-ud2-breakpoints (byte-imm-code chunk dstate)
-          #!+ud2-breakpoints (word-imm-code chunk dstate)
-      (#.error-trap
-       (nt "error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "breakpoint trap"))
-      (#.pending-interrupt-trap
-       (nt "pending interrupt trap"))
-      (#.halt-trap
-       (nt "halt trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "function end breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "single-step trap (around)"))
-      (#.single-step-before-trap
-       (nt "single-step trap (before)"))
-      (#.invalid-arg-count-trap
-       (nt "Invalid argument count trap")))))
+    (let ((trap #!-ud2-breakpoints (byte-imm-code chunk dstate)
+           #!+ud2-breakpoints (word-imm-code chunk dstate)))
+     (case trap
+       (#.breakpoint-trap
+        (nt "breakpoint trap"))
+       (#.pending-interrupt-trap
+        (nt "pending interrupt trap"))
+       (#.halt-trap
+        (nt "halt trap"))
+       (#.fun-end-breakpoint-trap
+        (nt "function end breakpoint trap"))
+       (#.single-step-around-trap
+        (nt "single-step trap (around)"))
+       (#.single-step-before-trap
+        (nt "single-step trap (before)"))
+       (#.invalid-arg-count-trap
+        (nt "Invalid argument count trap"))
+       (#.cerror-trap
+        (nt "cerror trap")
+        (handle-break-args #'snarf-error-junk trap stream dstate))
+       (t
+        (handle-break-args #'snarf-error-junk trap stream dstate))))))
 
-;;;;
-
-#!+immobile-code
-(progn
-(defun sb!vm::collect-immobile-code-relocs ()
-  (let ((code-components
-         (make-array 20000 :element-type '(unsigned-byte 32)
-                           :fill-pointer 0 :adjustable t))
-        (relocs
-         (make-array 100000 :element-type '(unsigned-byte 32)
-                            :fill-pointer 0 :adjustable t))
-        ;; Look for these three instruction formats.
-        (lea-inst (find-inst #x8D (get-inst-space)))
-        (jmp-inst (find-inst #b11101001 (get-inst-space)))
-        (call-inst (find-inst #b11101000 (get-inst-space)))
-        (seg (sb!disassem::%make-segment
-              :sap-maker (lambda () (error "Bad sap maker")) :virtual-location 0))
-        (dstate (make-dstate nil)))
-    (flet ((scan-function (fun-entry-addr fun-end-addr predicate)
-             (setf (seg-virtual-location seg) fun-entry-addr
-                   (seg-length seg) (- fun-end-addr fun-entry-addr)
-                   (seg-sap-maker seg)
-                   (let ((sap (int-sap fun-entry-addr))) (lambda () sap)))
-             (map-segment-instructions
-              (lambda (dchunk inst)
-                (cond ((and (or (eq inst jmp-inst) (eq inst call-inst))
-                            (funcall predicate
-                                     (+ (near-jump-displacement dchunk dstate)
-                                        (dstate-next-addr dstate))))
-                       (vector-push-extend (dstate-cur-addr dstate) relocs))
-                      ((eq inst lea-inst)
-                       (let ((sap (funcall (seg-sap-maker seg))))
-                         (aver (eql (sap-ref-8 sap (dstate-cur-offs dstate)) #x8D))
-                         (let ((modrm (sap-ref-8 sap (1+ (dstate-cur-offs dstate)))))
-                           (when (and (= (logand modrm #b11000111) #b00000101) ; RIP-relative mode
-                                      (funcall predicate
-                                               (+ (signed-sap-ref-32
-                                                   sap (+ (dstate-cur-offs dstate) 2))
-                                                  (dstate-next-addr dstate))))
-                             (aver (eql (logand (sap-ref-8 sap (1- (dstate-cur-offs dstate))) #xF0)
-                                        #x40)) ; expect a REX prefix
-                             (vector-push-extend (dstate-cur-addr dstate) relocs)))))))
-              seg dstate nil))
-           (finish-component (code start-relocs-index)
-             (when (> (fill-pointer relocs) start-relocs-index)
-               (vector-push-extend (get-lisp-obj-address code) code-components)
-               (vector-push-extend start-relocs-index code-components))))
-
-      ;; Assembler routines contain jumps to immobile code.
-      (let* ((code sb!fasl:*assembler-routines*)
-             (origin (sap-int (code-instructions code)))
-             (relocs-index (fill-pointer relocs)))
-        (dolist (range (sort (loop for range being each hash-value
-                                   of (car (%code-debug-info code)) collect range)
-                             #'< :key #'car))
-          ;; byte range is inclusive bound on both ends
-          (scan-function (+ origin (car range))
-                         (+ origin (cdr range) 1) #'immobile-space-addr-p))
-        (finish-component code relocs-index))
-
-      ;; Immobile space - code components can jump to immobile space,
-      ;; read-only space, and C runtime routines.
-      (sb!vm::map-allocated-objects
-       (lambda (code type size)
-         (declare (ignore size))
-         (when (= type code-header-widetag)
-           (let* ((text-origin (sap-int (code-instructions code)))
-                  (text-end (+ text-origin (%code-code-size code)))
-                  (relocs-index (fill-pointer relocs)))
-             (dotimes (i (code-n-entries code) (finish-component code relocs-index))
-               (let ((fun (%code-entry-point code i)))
-                 (scan-function
-                  (+ (get-lisp-obj-address fun) (- fun-pointer-lowtag)
-                     (ash simple-fun-code-offset word-shift))
-                  (if (< (1+ i) (code-n-entries code))
-                      (- (get-lisp-obj-address (%code-entry-point code (1+ i)))
-                         fun-pointer-lowtag)
-                      text-end)
-                ;; Exclude transfers within this code component
-                  (lambda (jmp-targ-addr)
-                    (not (<= text-origin jmp-targ-addr text-end)))))))))
-       :immobile))
-
-    ;; Write a delimiter into the array passed to C
-    (vector-push-extend 0 code-components)
-    (vector-push-extend (fill-pointer relocs) code-components)
-    (values code-components relocs)))
-
-(defmacro do-immobile-functions ((code-var fun-var addr-var &key (if t)) &body body)
-  ;; Loop over all code objects
-  `(let* ((call (find-inst #xE8 (get-inst-space)))
-          (jmp  (find-inst #xE9 (get-inst-space)))
-          (dstate (make-dstate nil))
-          (sap (int-sap 0))
-          (seg (sb!disassem::%make-segment :sap-maker (lambda () sap))))
-     (sb!vm::map-objects-in-range
-      (lambda (,code-var obj-type obj-size)
-        (declare (ignore obj-size))
-        (when (and (= obj-type code-header-widetag) ,if)
-          ;; Loop over all embedded functions
-          (dotimes (fun-index (code-n-entries ,code-var))
-            (let* ((,fun-var (%code-entry-point ,code-var fun-index))
-                   (,addr-var (+ (get-lisp-obj-address ,fun-var)
-                                 (- fun-pointer-lowtag)
-                                 (ash simple-fun-code-offset word-shift))))
-              (with-pinned-objects (sap) ; Mutate SAP to point to fun
-                (setf (sap-ref-word (int-sap (get-lisp-obj-address sap))
-                                    (- n-word-bytes other-pointer-lowtag))
-                      ,addr-var))
-              (setf (seg-virtual-location seg) ,addr-var
-                    (seg-length seg)
-                    (- (let ((next (%code-entry-point ,code-var (1+ fun-index))))
-                         (if next
-                             (- (get-lisp-obj-address next) fun-pointer-lowtag)
-                             (+ (sap-int (code-instructions ,code-var))
-                                (%code-code-size ,code-var))))
-                       ,addr-var))
-              ,@body))))
-      ;; Slowness here is bothersome, especially for SB!VM::REMOVE-STATIC-LINKS,
-      ;; so skip right over all fixedobj pages.
-      (ash varyobj-space-start (- n-fixnum-tag-bits))
-      (%make-lisp-obj (sap-int *varyobj-space-free-pointer*)))))
-
-(defun sb!vm::statically-link-core (&key callers exclude-callers
-                                         callees exclude-callees
-                                         verbose)
-  (flet ((match-p (name include exclude)
-           (and (not (member name exclude :test 'equal))
-                (or (not include) (member name include :test 'equal))))
-         (ambiguous-name-p (fun funs)
-           ;; Return T if FUN occurs more than once in FUNS
-           (declare (simple-vector funs))
-           (dotimes (i (length funs))
-             (when (eq (svref funs i) fun)
-               (loop (cond ((>= (incf i) (length funs))
-                            (return-from ambiguous-name-p nil))
-                           ((eq (svref funs i) fun)
-                            (return-from ambiguous-name-p t))))))))
-    (do-immobile-functions (code fun addr)
-      (when (match-p (%simple-fun-name fun) callers exclude-callers)
-        (dx-let ((printed-fun-name nil)
-                 (code-header-funs (make-array (code-header-words code))))
-          ;; Collect the called functions
-          (do ((i code-constants-offset (1+ i)))
-              ((= i (length code-header-funs)))
-            (let ((obj (code-header-ref code i)))
-              (when (fdefn-p obj)
-                (setf (aref code-header-funs i) (fdefn-fun obj)))))
-          ;; Loop over function's assembly code
-          (map-segment-instructions
-           (lambda (chunk inst)
-             (when (or (eq inst jmp) (eq inst call))
-               (let ((fdefn (sb!vm::find-called-object
-                             (+ (near-jump-displacement chunk dstate)
-                                (dstate-next-addr dstate)))))
-                 (when (and (fdefn-p fdefn)
-                            (let ((callee (fdefn-fun fdefn)))
-                              (and (immobile-space-obj-p callee)
-                                   (not (sb!vm::fun-requires-simplifying-trampoline-p callee))
-                                   (match-p (%fun-name callee)
-                                            callees exclude-callees)
-                                   (not (ambiguous-name-p callee code-header-funs)))))
-                   (let ((entry (sb!vm::fdefn-call-target fdefn)))
-                     (when verbose
-                       (let ((*print-pretty* nil))
-                         (unless printed-fun-name
-                           (format t "#x~X ~S~%" (get-lisp-obj-address fun) fun)
-                           (setq printed-fun-name t))
-                         (format t "  @~x -> ~s [~x]~%"
-                                 (dstate-cur-addr dstate) (fdefn-name fdefn) entry)))
-                     ;; Set the statically-linked flag
-                     (setf (sb!vm::fdefn-has-static-callers fdefn) 1)
-                     ;; Change the machine instruction
-                     (setf (signed-sap-ref-32 (int-sap (dstate-cur-addr dstate)) 1)
-                           (- entry (dstate-next-addr dstate))))))))
-           seg dstate))))))
-
-;;; While concurrent use of un-statically-link is unlikely, misuse could easily
-;;; cause heap corruption. It's preventable by ensuring that this is atomic
-;;; with respect to GC and other code attempting to change the same fdefn.
-;;; The issue is that if the fdefn loses the pointer to the underlying code
-;;; via (setf fdefn-fun) before we were done removing the static links,
-;;; then there could be no remaining pointers visible to GC.
-;;; The only way to detect the current set of references is to find uses of the
-;;; current jump address, which means we need to fix them *all* before anyone
-;;; else gets an opportunity to change the fdefn-fun of this same fdefn again.
-(defglobal *static-linker-lock* (sb!thread:make-mutex :name "static linker"))
-(defun sb!vm::remove-static-links (fdefn)
-  ; (warn "undoing static linkage of ~S" (fdefn-name fdefn))
-  (sb!thread::with-system-mutex (*static-linker-lock* :without-gcing t)
-    ;; If the jump is to FUN-ENTRY, change it back to FDEFN-ENTRY
-    (let ((fun-entry (sb!vm::fdefn-call-target fdefn))
-          (fdefn-entry (+ (get-lisp-obj-address fdefn)
-                          (ash fdefn-raw-addr-slot word-shift)
-                          (- other-pointer-lowtag))))
-      ;; Examine only those code components which potentially use FDEFN.
-      (do-immobile-functions
-         (code fun addr :if (loop for i downfrom (1- (sb!kernel:code-header-words code))
-                                  to sb!vm:code-constants-offset
-                                  thereis (eq (sb!kernel:code-header-ref code i)
-                                              fdefn)))
-        (map-segment-instructions
-         (lambda (chunk inst)
-           (when (or (eq inst jmp) (eq inst call))
-             ;; TRULY-THE because near-jump-displacement isn't a known fun.
-             (let ((disp (truly-the (signed-byte 32)
-                                    (near-jump-displacement chunk dstate))))
-               (when (= fun-entry (+ disp (dstate-next-addr dstate)))
-                 (let ((new-disp
-                        (the (signed-byte 32)
-                             (- fdefn-entry (dstate-next-addr dstate)))))
-                   ;; CMPXCHG is atomic even when misaligned, and x86-64 promises
-                   ;; that self-modifying code works correctly, so the fetcher
-                   ;; should never see a torn write.
-                   (%primitive sb!vm::signed-sap-cas-32
-                               (int-sap (dstate-cur-addr dstate))
-                               1 disp new-disp))))))
-         seg dstate)))
-    (setf (sb!vm::fdefn-has-static-callers fdefn) 0))) ; Clear static link flag
-) ; end PROGN
+(defun sb!c::convert-alloc-point-fixups (code locs)
+  ;; Find the instruction which jumps over the profiling code,
+  ;; and record the offset, and not the instruction that makes the call
+  ;; to enable the counter. The instructions preceding the call comprise
+  ;; a test, jmp, and long nop. Luckily a long nop encoding never
+  ;; has the byte #xEB in it, so just scan backwards looking for that.
+  (pack-code-fixup-locs
+   (mapcar (lambda (loc)
+             (loop (cond ((zerop (decf loc))
+                          (bug "Failed to find allocation point"))
+                         ((eql (sap-ref-8 (code-instructions code) loc) #xEB)
+                          (return loc)))))
+           locs)))

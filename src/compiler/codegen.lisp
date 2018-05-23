@@ -20,9 +20,8 @@
 (defun component-header-length (&optional
                                 (component *component-being-compiled*))
   (let* ((2comp (component-info component))
-         (constants (ir2-component-constants 2comp))
-         (num-consts (length constants)))
-    (ash (logandc2 (1+ num-consts) 1) sb!vm:word-shift)))
+         (constants (ir2-component-constants 2comp)))
+    (ash (align-up (length constants) code-boxed-words-align) sb!vm:word-shift)))
 
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
@@ -55,28 +54,26 @@
 
 ;;;; noise to emit an instruction trace
 
-(defvar *prev-segment*)
-(defvar *prev-vop*)
-
-(defun trace-instruction (segment vop inst &rest args)
-  (declare (dynamic-extent args))
-  (let ((*standard-output* *compiler-trace-output*))
-    (unless (eq *prev-segment* segment)
-      (format t "in the ~A segment:~%" (sb!assem:segment-type segment))
-      (setf *prev-segment* segment))
-    (unless (eq *prev-vop* vop)
+(defun trace-instruction (section vop inst args state
+                          &aux (*standard-output* *compiler-trace-output*))
+  (macrolet ((prev-section () `(car state))
+             (prev-vop () `(cdr state)))
+    (unless (eq (prev-section) section)
+      (format t "in the ~A section:~%" section)
+      (setf (prev-section) section))
+    (unless (eq (prev-vop) vop)
       (when vop
         (format t "~%VOP ")
         (if (vop-p vop)
             (print-vop vop)
             (format *compiler-trace-output* "~S~%" vop)))
       (terpri)
-      (setf *prev-vop* vop))
+      (setf (prev-vop) vop))
     (case inst
       (:label
-       (format t "~A:~%" (car args)))
+       (format t "~A:~%" args))
       (:align
-       (format t "~0,8T.align~0,8T~A~%" (car args)))
+       (format t "~0,8T.align~0,8T~A~%" args))
       (t
        (format t "~0,8T~A~@[~0,8T~{~A~^, ~}~]~%" inst args))))
   (values))
@@ -85,48 +82,23 @@
 
 ;;; standard defaults for slots of SEGMENT objects
 (defun default-segment-run-scheduler ()
-  (and *assembly-optimize*
-        (policy (lambda-bind
-                 (block-home-lambda
-                  (block-next (component-head *component-being-compiled*))))
-                (or (> speed compilation-speed) (> space compilation-speed)))))
+  (policy (lambda-bind
+           (block-home-lambda
+            (block-next (component-head *component-being-compiled*))))
+          (or (> speed compilation-speed) (> space compilation-speed))))
 (defun default-segment-inst-hook ()
   (and *compiler-trace-output*
        #'trace-instruction))
 
-(defun init-assembler ()
-  (setf *code-segment*
-        (sb!assem:make-segment :type :regular
-                               :run-scheduler (default-segment-run-scheduler)
-                               :inst-hook (default-segment-inst-hook)))
-  #!+sb-dyncount
-  (setf (sb!assem:segment-collect-dynamic-statistics *code-segment*)
-        *collect-dynamic-statistics*)
-  (setf *elsewhere*
-        (sb!assem:make-segment :type :elsewhere
-                               :run-scheduler (default-segment-run-scheduler)
-                               :inst-hook (default-segment-inst-hook)
-                               :alignment 0))
+;;; Return T if and only if there were any constants emitted.
+(defun emit-inline-constants ()
   #!+inline-constants
-  (setf *unboxed-constants* (make-unboxed-constants))
-  (values))
-
-#!+inline-constants
-(defun emit-inline-constants (&aux (constant-holder *unboxed-constants*)
-                                   (vector (constant-vector constant-holder)))
-  (setf *unboxed-constants* nil)
-  (unless (zerop (length vector))
-    (let ((constants (sb!vm:sort-inline-constants vector)))
-      (assemble ((constant-segment constant-holder))
-        (map nil (lambda (constant)
-                   (sb!vm:emit-inline-constant (car constant) (cdr constant)))
-             constants))))
-  ;; Always append the constant segment, because a zero-length vector
-  ;; does not imply absence of unboxed data.
-  ;; In particular the simple-fun offsets are in there.
-  (setf *code-segment* (let ((seg (constant-segment constant-holder)))
-                         (sb!assem:append-segment seg *code-segment*)
-                         seg)))
+  (let* ((asmstream *asmstream*)
+         (sorted (sb!vm:sort-inline-constants
+                  (asmstream-constant-vector asmstream)))
+         (section (asmstream-data-section asmstream)))
+    (dovector (constant sorted (plusp (length sorted)))
+      (sb!vm:emit-inline-constant section (car constant) (cdr constant)))))
 
 ;;; If a constant is already loaded into a register use that register.
 (defun optimize-constant-loads (component)
@@ -140,6 +112,7 @@
           ((null vop))
         (labels ((register-p (tn)
                    (and (tn-p tn)
+                        (not (eq (tn-kind tn) :unused))
                         (eq (sc-sb (tn-sc tn)) register-sb)))
                  (constant-eql-p (a b)
                    (or (eq a b)
@@ -209,31 +182,19 @@
     (format *compiler-trace-output*
             "~|~%assembly code for ~S~2%"
             component))
-  (let ((prev-env nil)
-        (*prev-segment* nil)
-        (*prev-vop* nil)
-        (*fixup-notes* nil))
-    (let ((label (sb!assem:gen-label)))
-      (setf *elsewhere-label* label)
-      (assemble (*elsewhere*)
-        (sb!assem:emit-label label)))
-    ;; Leave space for the unboxed words containing simple-fun offsets.
-    ;; Each offset is a 32-bit integer. On 64-bit platforms, 1 offset
-    ;; is stored in the header word as a 16-bit integer.
-    ;; On 32-bit platforms there is an extra boxed slot in the code oject.
-    (let* ((n-entries (length (ir2-component-entries (component-info component))))
-           (ptrs-per-word (/ sb!vm:n-word-bytes 4)) ; either 1 or 2
-           (n-words (ceiling (1- n-entries) ptrs-per-word)))
-      (emit-skip #!-inline-constants *code-segment*
-                 #!+inline-constants (constant-segment *unboxed-constants*)
-                 ;; Preserve double-word alignment of the unboxed constants
-                 (sb!vm:pad-data-block n-words)))
-    ;;
+  (let* ((prev-env nil)
+         (n-entries (length (ir2-component-entries (component-info component))))
+         (asmstream (make-asmstream))
+         (*asmstream* asmstream))
+
+    (emit (asmstream-elsewhere-section asmstream)
+          (asmstream-elsewhere-label asmstream))
+
     (do-ir2-blocks (block component)
       (let ((1block (ir2-block-block block)))
         (when (and (eq (block-info 1block) block)
                    (block-start 1block))
-          (assemble (*code-segment*)
+          (assemble (:code 'nil) ; bind **CURRENT-VOP** to nil
             ;; Align first emitted block of each loop: x86 and x86-64 both
             ;; like 16 byte alignment, however, since x86 aligns code objects
             ;; on 8 byte boundaries we cannot guarantee proper loop alignment
@@ -255,12 +216,12 @@
               (let ((lab (gen-label)))
                 (setf (ir2-physenv-elsewhere-start (physenv-info env))
                       lab)
-                (emit-label-elsewhere lab))
+                (emit (asmstream-elsewhere-section asmstream) lab))
               (setq prev-env env)))))
       (do ((vop (ir2-block-start-vop block) (vop-next vop)))
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
-          (assemble (*code-segment* vop)
+          (assemble (:code vop)
             (cond ((not gen)
                    (format t
                            "missing generator for ~S~%"
@@ -274,16 +235,59 @@
                    (setf vop (vop-next vop)))
                   (t
                    (funcall gen vop)))))))
-    (append-segment *code-segment* *elsewhere*)
-    (setf *elsewhere* nil)
-    #!+inline-constants
     (emit-inline-constants)
-    (values (finalize-segment *code-segment*)
-            *fixup-notes*)))
-
-(defun emit-label-elsewhere (label)
-  (assemble (*elsewhere*)
-    (emit-label label)))
+    (let ((trailer (sb!assem::make-section)))
+      ;; Build the simple-fun-offset table.
+      ;; The assembler is not capable of emitting the difference between labels,
+      ;; so we'll just leave space and fill them in later
+      (emit trailer `(.align 2)) ; align for uint32_t
+      (dotimes (i n-entries) (emit trailer `(.byte 0 0 0 0)))
+      #!+little-endian
+      (emit trailer `(.byte ,(ldb (byte 8 0) n-entries) ,(ldb (byte 8 8) n-entries)))
+      #!+big-endian
+      (emit trailer `(.byte ,(ldb (byte 8 8) n-entries) ,(ldb (byte 8 0) n-entries)))
+      (let* ((segment
+              (assemble-sections
+               (make-segment :header-skew
+                             (if (and (= code-boxed-words-align 1)
+                                      (oddp (length (ir2-component-constants
+                                                     (component-info component)))))
+                                 sb!vm:n-word-bytes
+                                 0)
+                             :run-scheduler (default-segment-run-scheduler)
+                             :inst-hook (default-segment-inst-hook))
+               (asmstream-data-section asmstream)
+               (asmstream-code-section asmstream)
+               (asmstream-elsewhere-section asmstream)
+               trailer))
+             (size
+              (finalize-segment segment))
+             (buffer
+              (sb!assem::segment-buffer segment)))
+        (flet ((store-ub32 (index val)
+                 (multiple-value-bind (b0 b1 b2 b3)
+                     #!+little-endian
+                     (values (ldb (byte 8  0) val) (ldb (byte 8  8) val)
+                             (ldb (byte 8 16) val) (ldb (byte 8 24) val))
+                     #!+big-endian
+                     (values (ldb (byte 8 24) val) (ldb (byte 8 16) val)
+                             (ldb (byte 8  8) val) (ldb (byte 8  0) val))
+                   (setf (aref buffer (+ index 0)) b0
+                         (aref buffer (+ index 1)) b1
+                         (aref buffer (+ index 2)) b2
+                         (aref buffer (+ index 3)) b3))))
+          (let ((index size))
+            (decf index 2)
+            ;; Assert that we are aligned for storing uint32_t
+            (aver (not (logtest index #b11)))
+            (dolist (entry (reverse (sb!c::ir2-component-entries
+                                     (component-info component))))
+              (store-ub32 (decf index 4)
+                          (label-position (entry-info-offset entry))))))
+        (values segment
+                size
+                (asmstream-elsewhere-label asmstream)
+                (sb!assem::segment-fixup-notes segment))))))
 
 (defun label-elsewhere-p (label-or-posn kind)
   (let ((elsewhere (label-position *elsewhere-label*))
@@ -302,10 +306,12 @@
 #!+inline-constants
 (defun register-inline-constant (&rest constant-descriptor)
   (declare (dynamic-extent constant-descriptor))
-  (let ((constants *unboxed-constants*)
+  (let ((asmstream *asmstream*)
         (constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
     (ensure-gethash
-     constant (constant-table constants)
+     constant
+     (asmstream-constant-table asmstream)
      (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
-       (vector-push-extend (cons constant label) (constant-vector constants))
+       (vector-push-extend (cons constant label)
+                           (asmstream-constant-vector asmstream))
        value))))

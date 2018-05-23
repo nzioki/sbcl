@@ -42,8 +42,7 @@
   (unless (position :not-target flags)
     (let ((srcname (stem-source-path stem))
           (objname (stem-object-path stem flags :target-compile)))
-      (when (or (member :slam-forcibly flags)
-                (not (output-up-to-date-wrt-input-p objname srcname))
+      (when (or (not (output-up-to-date-wrt-input-p objname srcname))
                 ;; Back to our "new-trace-file" case, also build if
                 ;; a trace file is desired but is out-of-date.
                 (and (position :trace-file flags)
@@ -51,9 +50,4 @@
                            (concatenate 'string (stem-remap-target stem)
                                         ".trace")
                            srcname))))
-        (handler-bind ((warning
-                        (lambda (c)
-                          (when (search "reserved by ANSI CL"
-                                        (write-to-string c :escape nil :pretty nil))
-                            (muffle-warning)))))
-          (target-compile-stem stem flags))))))
+        (target-compile-stem stem flags)))))

@@ -17,8 +17,6 @@
 (shadowing-import 'assertoid:assert-error)
 (use-package :sb-thread)
 (use-package :sb-sys)
-(use-package '#:test-util)
-(use-package '#:assertoid)
 
 (setf sb-unix::*on-dangerous-wait* :error)
 
@@ -1358,11 +1356,6 @@
 
 ;;;; BLACK BOX TESTS
 
-(in-package :cl-user)
-(use-package :test-util)
-(use-package "ASSERTOID")
-
-
 (with-test (:name (:parallel defclass))
   (write-line "WARNING, WILL HANG ON FAILURE!")
   (defclass test-1 () ((a :initform :orig-a)))
@@ -1551,7 +1544,7 @@
   (labels ((fp-mode ()
              (let ((reserved-bits #+x86 (ash #b1110000011000000 16)
                                   #-x86 0))
-               (logandc2 (dpb 0 sb-vm::float-sticky-bits (sb-vm:floating-point-modes))
+               (logandc2 (dpb 0 sb-vm:float-sticky-bits (sb-vm:floating-point-modes))
                          reserved-bits)))
            (test ()
              (let* ((fp-mode (fp-mode))
@@ -1566,6 +1559,6 @@
       (test))
     (setf (sb-vm:floating-point-modes)
           (dpb sb-vm:float-divide-by-zero-trap-bit
-               sb-vm::float-traps-byte
+               sb-vm:float-traps-byte
                (sb-vm:floating-point-modes)))
     (test)))

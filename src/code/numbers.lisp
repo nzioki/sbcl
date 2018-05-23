@@ -395,9 +395,7 @@
   (declare (explicit-check))
   (1- number))
 
-(eval-when (:compile-toplevel)
-
-(sb!xc:defmacro two-arg-+/- (name op big-op)
+(defmacro two-arg-+/- (name op big-op)
   `(defun ,name (x y)
      (number-dispatch ((x number) (y number))
        (bignum-cross-fixnum ,op ,big-op)
@@ -438,8 +436,6 @@
                                 (t3 (truncate dy g2))
                                 (nd (if (eql t2 1) t3 (* t2 t3))))
                            (if (eql nd 1) nn (%make-ratio nn nd))))))))))))
-
-) ; EVAL-WHEN
 
 (two-arg-+/- two-arg-+ + add-bignums)
 (two-arg-+/- two-arg-- - subtract-bignum)
@@ -1307,8 +1303,9 @@ and the number of 0 bits if INTEGER is negative."
                        (setq temp (- u v))
                        (when (zerop temp)
                          (let ((res (ash u k)))
-                           (declare (type sb!vm:signed-word res)
-                                    (optimize (inhibit-warnings 3)))
+                           (declare (type sb!vm:signed-word res))
+                           ;; signed word to integer coercion -> return value
+                           (declare (muffle-conditions compiler-note))
                            (return res))))))
                 (declare (type (mod #.sb!vm:n-word-bits) k)
                          (type sb!vm:signed-word u v)))))

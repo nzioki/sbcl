@@ -77,7 +77,8 @@
     (let*
         ((spaces (append `((read-only ,small-space-size)
                            #!+sb-safepoint
-                           (safepoint ,+backend-page-bytes+ gc-safepoint-page-addr)
+                           (safepoint ,(symbol-value '+backend-page-bytes+)
+                                      gc-safepoint-page-addr)
                            (static ,small-space-size))
                          #!+linkage-table
                          `((linkage-table ,small-space-size))
@@ -161,7 +162,6 @@
     *alloc-signal*
     sb!sys:*interrupt-pending*
     #!+sb-thruption sb!sys:*thruption-pending*
-    #!+sb-thruption sb!kernel:*restart-clusters*
     *in-without-gcing*
     *gc-inhibit*
     *gc-pending*
@@ -207,14 +207,12 @@
     ;; Keep in sync with 'compiler/early-backend.lisp':
     ;;  "only PPC uses a separate symbol for the TLS index lock"
     #!+(and sb-thread ppc) *tls-index-lock*
-    ;; memory sanitizer argument-passing shadow bytes
-    msan-param-tls
 
     ;; dynamic runtime linking support
     #!+sb-dynamic-core +required-foreign-symbols+
 
     ;; List of Lisp specials bindings made by create_thread_struct()
-    ;; other than the per-thread-c-interface-symbols.
+    ;; excluding the names in !PER-THREAD-C-INTERFACE-SYMBOLS.
     sb!thread::*thread-initial-bindings*
 
     ;;; The following symbols aren't strictly required to be static
@@ -225,10 +223,10 @@
      ;; arbitrary object that changes after each GC
      sb!kernel::*gc-epoch*
      ;; Dispatch tables for generic array access
-     sb!impl::%%data-vector-reffers%%
-     sb!impl::%%data-vector-reffers/check-bounds%%
-     sb!impl::%%data-vector-setters%%
-     sb!impl::%%data-vector-setters/check-bounds%%))
+     %%data-vector-reffers%%
+     %%data-vector-reffers/check-bounds%%
+     %%data-vector-setters%%
+     %%data-vector-setters/check-bounds%%))
   #'equalp)
 
 ;;; Number of entries in the thread local storage. Limits the number
@@ -244,7 +242,5 @@
   (defconstant +highest-normal-generation+ 5)
   (defconstant +pseudo-static-generation+ 6))
 
-(defun !unintern-symbols ()
-  '("SB-VM"
-    +c-callable-fdefns+
-    +common-static-symbols+))
+(push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
+      sb!impl::*!removable-symbols*)

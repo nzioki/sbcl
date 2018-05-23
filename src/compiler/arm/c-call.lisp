@@ -174,7 +174,7 @@
   (:generator 2
     (let ((fixup-label (gen-label)))
       (inst load-from-label res lip fixup-label)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup-label)
         (inst word (make-fixup foreign-symbol :foreign))))))
 
@@ -192,7 +192,7 @@
     (let ((fixup-label (gen-label)))
       (inst load-from-label res lip fixup-label)
       (inst ldr res (@ res))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup-label)
         (inst word (make-fixup foreign-symbol :foreign-dataref))))))
 
@@ -211,7 +211,7 @@
   (:generator 0
     (let ((call-into-c-fixup (gen-label))
           (cur-nfp (current-nfp-tn vop)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label call-into-c-fixup)
         (inst word (make-fixup "call_into_c" :foreign)))
       (when cur-nfp
@@ -387,7 +387,7 @@
                               1)))))
       (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                  +number-stack-alignment-mask+))
-      (assemble (segment)
+      (assemble (segment 'nil)
         (emit-word segment #xe92d4ff8) ;; stmfd sp!, {r3-r11, lr}
         (move nsp-save-tn nsp-tn)
 

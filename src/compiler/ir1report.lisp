@@ -38,21 +38,62 @@
             (:copier nil))
   ;; a list of the stringified CARs of the enclosing non-original source forms
   ;; exceeding the *enclosing-source-cutoff*
-  (enclosing-source nil :type list)
+  (%enclosing-source nil :type list)
   ;; a list of stringified enclosing non-original source forms
-  (source nil :type list)
-  ;; the stringified form in the original source that expanded into SOURCE
-  (original-source (missing-arg) :type simple-string)
+  (%source nil :type list)
+  (original-form (missing-arg))
+  (original-form-string nil)
   ;; a list of prefixes of "interesting" forms that enclose original-source
   (context nil :type list)
   ;; the FILE-INFO-NAME for the relevant FILE-INFO
   (file-name (missing-arg) :type (or pathname (member :lisp :stream)))
   ;; the file position at which the top level form starts, if applicable
   (file-position nil :type (or index null))
+  path
+  format-args
+  initialized
   ;; the original source part of the source path
   (original-source-path nil :type list)
   ;; the lexenv active at the time
   (lexenv nil :type (or null lexenv)))
+
+;;; Delay computing some source information, since it may not actually be ever used
+(defun compiler-error-context-original-source (context)
+  (let ((source (compiler-error-context-original-form-string context)))
+    (if (stringp source)
+        source
+        (setf (compiler-error-context-original-form-string context)
+              (stringify-form (compiler-error-context-original-form context))))))
+
+(defun compiler-error-context-source (context)
+  (setup-compiler-error-context context)
+  (compiler-error-context-%source context))
+
+(defun compiler-error-context-enclosing-source (context)
+  (setup-compiler-error-context context)
+  (compiler-error-context-%enclosing-source context))
+
+(defun setup-compiler-error-context (context)
+  (unless (compiler-error-context-initialized context)
+    (setf (compiler-error-context-initialized context) t)
+    (let ((path (compiler-error-context-path context))
+          (args (compiler-error-context-format-args context)))
+      (collect ((full nil cons)
+                (short nil cons))
+        (let ((forms (source-path-forms path))
+              (n 0))
+          (dolist (src (if (member (first forms) args)
+                           (rest forms)
+                           forms))
+            (if (>= n *enclosing-source-cutoff*)
+                (short (stringify-form (if (consp src)
+                                           (car src)
+                                           src)
+                                       nil))
+                (full (stringify-form src)))
+            (incf n))
+          (setf (compiler-error-context-%enclosing-source context) (short)
+                (compiler-error-context-%source context) (full)))))))
 
 ;;; If true, this is the node which is used as context in compiler warning
 ;;; messages.
@@ -112,7 +153,7 @@
 (defun source-form-context (form)
   (flet ((get-it (form)
            (cond ((atom form) nil)
-                 ((>= (length form) 2)
+                 ((list-of-length-at-least-p form 2)
                   (let* ((context-fun-default
                            (lambda (x)
                              (declare (ignore x))
@@ -150,8 +191,8 @@
       (let ((form root)
             (current (rest rpath)))
         (loop
-         (when (sb!int:comma-p form)
-           (setf form (sb!int:comma-expr form)))
+         (when (comma-p form)
+           (setf form (comma-expr form)))
          (when (atom form)
             (aver (null current))
             (return))
@@ -172,50 +213,16 @@
                (values '(unable to locate source)
                        '((some strange place)))))))))
 
-(defun map-tree (function tree)
-  (let (seen)
-    (labels ((recurse (tree)
-               (cond ((atom tree)
-                      (funcall function tree))
-                     ((getf seen tree))
-                     (t
-                      (let ((cons (setf (getf seen tree) (list 0))))
-                        (setf (car cons)
-                              (recurse (car tree))
-                              (cdr cons)
-                              (recurse (cdr tree)))
-                        cons)))))
-      (recurse tree))))
-
-(defun hide-ir-nodes (form)
-  (map-tree
-   (lambda (x)
-     (typecase x
-       (functional
-        (let ((name (functional-debug-name x)))
-          `(function
-            ,(if (typep name '(cons (member xep tl-xep)))
-                 (cadr name)
-                 name))))
-       (global-var
-        (let ((name (leaf-source-name x)))
-          (if (eq (global-var-kind x) :global-function)
-              `(function ,name)
-              name)))
-       (t
-        x)))
-   form))
-
 ;;; Convert a source form to a string, suitably formatted for use in
 ;;; compiler warnings.
 (defun stringify-form (form &optional (pretty t))
-  (let ((form (hide-ir-nodes form)))
-    (with-standard-io-syntax
-      (with-compiler-io-syntax
-        (let ((*print-pretty* pretty))
-          (if pretty
-              (format nil "~<~@;  ~S~:>" (list form))
-              (prin1-to-string form)))))))
+  (with-standard-io-syntax
+    (with-compiler-io-syntax
+      (let ((*print-pretty* pretty)
+            (*print-ir-nodes-pretty* t))
+        (if pretty
+            (format nil "~<~@;  ~S~:>" (list form))
+            (prin1-to-string form))))))
 
 ;;; Return a COMPILER-ERROR-CONTEXT structure describing the current
 ;;; error context, or NIL if we can't figure anything out. ARGS is a
@@ -240,38 +247,23 @@
           (if old
               (values old t)
               (when (and *source-info* path)
-                (multiple-value-bind (form src-context) (find-original-source path)
-                  (collect ((full nil cons)
-                            (short nil cons))
-                    (let ((forms (source-path-forms path))
-                          (n 0))
-                      (dolist (src (if (member (first forms) args)
-                                       (rest forms)
-                                       forms))
-                        (if (>= n *enclosing-source-cutoff*)
-                            (short (stringify-form (if (consp src)
-                                                       (car src)
-                                                       src)
-                                                   nil))
-                            (full (stringify-form src)))
-                        (incf n)))
-
-                    (let* ((tlf (source-path-tlf-number path))
-                           (file-info (source-info-file-info *source-info*)))
-                      (values
-                       (make-compiler-error-context
-                        :enclosing-source (short)
-                        :source (full)
-                        :original-source (stringify-form form)
-                        :context src-context
-                        :file-name (file-info-name file-info)
-                        :file-position
-                        (nth-value 1 (find-source-root tlf *source-info*))
-                        :original-source-path (source-path-original-source path)
-                        :lexenv (if context
-                                    (node-lexenv context)
-                                    (if (boundp '*lexenv*) *lexenv* nil)))
-                       nil))))))))))
+                (let ((tlf (source-path-tlf-number path))
+                      (file-info (source-info-file-info *source-info*)))
+                  (multiple-value-bind (form src-context) (find-original-source path)
+                    (values
+                     (make-compiler-error-context
+                      :original-form form
+                      :format-args args
+                      :context src-context
+                      :file-name (file-info-name file-info)
+                      :file-position
+                      (nth-value 1 (find-source-root tlf *source-info*))
+                      :path path
+                      :original-source-path (source-path-original-source path)
+                      :lexenv (if context
+                                  (node-lexenv context)
+                                  (if (boundp '*lexenv*) *lexenv* nil)))
+                     nil)))))))))
 
 ;;;; printing error messages
 
@@ -661,7 +653,7 @@ has written, having proved that it is unreachable."))
     (let ((warning-count (emitted-full-call-count name)))
       (when (and warning-count
                  ;; Warn only if the the compiler did not have the expansion.
-                 (not (info :function :inline-expansion-designator name))
+                 (not (fun-name-inline-expansion name))
                  ;; and if nothing was previously known about inline status
                  ;; so that repeated proclamations don't warn. NIL is a valid
                  ;; value for :inlinep in the globaldb so use the 2nd result.
@@ -704,7 +696,7 @@ and defining the function before its first potential use.~@:>"
   ;; Do nothing if the inline expansion is known - it wasn't used
   ;; because of the expansion limit, which is a different problem.
   (unless (or (logtest 2 (car count-cell)) ; warn at most once per name
-              (info :function :inline-expansion-designator name))
+              (fun-name-inline-expansion name))
     ;; This function is only called by PONDER-FULL-CALL when NAME
     ;; is not lexically NOTINLINE, so therefore if it is globally INLINE,
     ;; there was no local declaration to the contrary.

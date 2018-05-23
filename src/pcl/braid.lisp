@@ -271,15 +271,17 @@
         (funcall set-slot 'source nil)
         (funcall set-slot 'type-name 'standard)
         (funcall set-slot 'options '())
+        (funcall set-slot '%generic-functions (make-hash-table :weakness :key))
         (funcall set-slot '%documentation "The standard method combination.")
         (setq *standard-method-combination* method-combination))
-      ;; Create the OR method combination object.
+      ;; Create an OR method combination object.
       (multiple-value-bind (method-combination set-slot)
           (make-method-combination 'short-method-combination)
         (funcall set-slot 'source 'nil)
         (funcall set-slot 'type-name 'or)
         (funcall set-slot 'operator 'or)
         (funcall set-slot 'identity-with-one-argument t)
+        (funcall set-slot '%generic-functions (make-hash-table :weakness :key))
         (funcall set-slot '%documentation nil)
         (funcall set-slot 'options '(:most-specific-first))
         (setq *or-method-combination* method-combination)))))
@@ -486,7 +488,7 @@
                                      :slot-name slot-name
                                      :object-class class-name
                                      :method-class-function (constantly (find-class accessor-class))
-                                     :definition-source source-location))))))
+                                     'source source-location))))))
 
 (defun !bootstrap-accessor-definitions1 (class-name
                                          slot-name
@@ -615,7 +617,7 @@
 
 (defun !make-class-predicate (class name source-location)
   (let* ((gf (ensure-generic-function name :lambda-list '(object)
-                                      :definition-source source-location))
+                                      'source source-location))
          (mlist (if (eq **boot-state** 'complete)
                     (early-gf-methods gf)
                     (generic-function-methods gf))))

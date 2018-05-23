@@ -46,10 +46,6 @@
 #define thread_mutex_unlock(l) 0
 #endif
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-void os_preinit();
-#endif
-
 void os_link_runtime();
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
@@ -275,6 +271,20 @@ HeaderValue(lispobj obj)
   return obj >> N_WIDETAG_BITS;
 }
 
+static inline int listp(lispobj obj) {
+    return lowtag_of(obj) == LIST_POINTER_LOWTAG;
+}
+static inline int instancep(lispobj obj) {
+    return lowtag_of(obj) == INSTANCE_POINTER_LOWTAG;
+}
+static inline int functionp(lispobj obj) {
+    return lowtag_of(obj) == FUN_POINTER_LOWTAG;
+}
+static inline int simple_vector_p(lispobj obj) {
+    return lowtag_of(obj) == OTHER_POINTER_LOWTAG &&
+           widetag_of(*(lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
+}
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 #define HEADER_VALUE_MASKED(x) (HeaderValue(x) & SHORT_HEADER_MAX_WORDS)
 #else
@@ -284,6 +294,7 @@ static inline uword_t instance_length(lispobj header)
 {
   return HEADER_VALUE_MASKED(header);
 }
+#undef HEADER_VALUE_MASKED
 /* Define an assignable instance_layout() macro taking a native pointer */
 #ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
 # define instance_layout(instance_ptr) (instance_ptr)[1]
@@ -350,20 +361,27 @@ fixnum_value(lispobj n)
     return (sword_t)n >> N_FIXNUM_TAG_BITS;
 }
 
-static inline uword_t
+// Return signed int in case something tries to compute the number of boxed
+// words excluding the header word itself using "code_header_words(header) - 1",
+// which, for a filler needs to come out as negative, not a huge positive.
+static inline sword_t
 code_header_words(lispobj header) // given header = code->header
 {
-  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
+#ifdef LISP_FEATURE_64_BIT
+    return header >> 32;
+#else
+    /* Ignore the MARK_BIT from fullcgc */
+    return HeaderValue(header & ~(1 << 31));
+#endif
 }
 
 #include "align.h"
 static inline sword_t
-code_instruction_words(lispobj n) // given n = code->code_size
+code_unboxed_nwords(lispobj n) // given n = code->code_size
 {
-    /* Convert bytes into words, double-word aligned. */
-    return ALIGN_UP(fixnum_value(n), 2*N_WORD_BYTES) >> WORD_SHIFT;
+    // Return ceiling |N / N_WORD_BYTES|
+    return (fixnum_value(n) + (N_WORD_BYTES-1)) >> WORD_SHIFT;
 }
-#undef HEADER_VALUE_MASKED
 
 #if defined(LISP_FEATURE_WIN32)
 /* KLUDGE: Avoid double definition of boolean by rpcndr.h included via
@@ -461,6 +479,18 @@ extern struct lisp_startup_options lisp_startup_options;
       (__extension__ ({ __typeof__ (x) __x = (x); (void) __x; }))
 #else
 # define ignore_value(x) ((void) (x))
+#endif
+
+#if defined(__GNUC__) && defined(ADDRESS_SANITIZER)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+#if defined(__GNUC__) && defined(MEMORY_SANITIZER)
+#define NO_SANITIZE_MEMORY __attribute__((no_sanitize_memory))
+#else
+#define NO_SANITIZE_MEMORY
 #endif
 
 #endif /* _SBCL_RUNTIME_H_ */

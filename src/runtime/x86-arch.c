@@ -371,11 +371,11 @@ sniff_code_object(struct code *code, os_vm_size_t displacement)
 
     FSHOW((stderr, "/sniffing code: %p, %lu\n", code, displacement));
 
-    ncode_words = code_instruction_words(code->code_size);
-    nheader_words = code_header_words(*(lispobj *)code);
+    ncode_words = code_unboxed_nwords(code->code_size);
+    nheader_words = code_header_words(code->header);
     nwords = ncode_words + nheader_words;
 
-    constants_start_addr = code_addr + 5*N_WORD_BYTES;
+    constants_start_addr = code_addr + offsetof(struct code, constants);
     constants_end_addr = code_addr + nheader_words*N_WORD_BYTES;
     code_start_addr = code_addr + nheader_words*N_WORD_BYTES;
     code_end_addr = code_addr + nwords*N_WORD_BYTES;
@@ -540,8 +540,8 @@ gencgc_apply_code_fixups(struct code *old_code, struct code *new_code)
     os_vm_address_t old_addr = (os_vm_address_t)old_code;
     os_vm_size_t displacement = code_addr - old_addr;
 
-    ncode_words = code_instruction_words(new_code->code_size);
-    nheader_words = code_header_words(*(lispobj *)new_code);
+    ncode_words = code_unboxed_nwords(new_code->code_size);
+    nheader_words = code_header_words(new_code->header);
     nwords = ncode_words + nheader_words;
     /* FSHOW((stderr,
              "/compiled code object at %x: header words = %d, code words = %d\n",
@@ -628,13 +628,13 @@ gencgc_apply_code_fixups(struct code *old_code, struct code *new_code)
 }
 
 #ifdef LISP_FEATURE_LINKAGE_TABLE
-/* FIXME: It might be cleaner to generate these from the lisp side of
- * things.
- */
-
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+    if (datap) {
+        *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+        return;
+    }
     /* Make JMP to function entry. JMP offset is calculated from next
      * instruction.
      */
@@ -650,11 +650,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
     /* write a nop for good measure. */
     *reloc_addr = 0x90;
 }
-
-void
-arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

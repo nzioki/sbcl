@@ -308,28 +308,36 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
 ;;; further split so that the special-case MACROLET processing code in
 ;;; EVAL can likewise make use of it.
 (defun macrolet-definitionize-fun (context lexenv)
-  (flet ((fail (control &rest args)
-           (ecase context
-             (:compile (apply #'compiler-error control args))
-             (:eval (error 'simple-program-error
-                           :format-control control
-                           :format-arguments args)))))
-    (lambda (definition)
-      (unless (list-of-length-at-least-p definition 2)
-        (fail "The list ~S is too short to be a legal local macro definition."
-              definition))
-      (destructuring-bind (name arglist &body body) definition
-        (unless (symbolp name)
-          (fail "The local macro name ~S is not a symbol." name))
-        (when (fboundp name)
-          (program-assert-symbol-home-package-unlocked
-           context name "binding ~A as a local macro"))
-        (unless (listp arglist)
-          (fail "The local macro argument list ~S is not a list."
-                arglist))
-        `(,name macro .
-                ,(compile-in-lexenv (make-macro-lambda nil arglist body 'macrolet name)
-                                    lexenv))))))
+  (let ((signal-via (ecase context
+                      (:compile #'compiler-error)
+                      (:eval #'%program-error))))
+    (flet ((fail (control &rest args)
+             (apply signal-via control args)))
+      (lambda (definition)
+        (unless (list-of-length-at-least-p definition 2)
+          (fail "The list ~S is too short to be a legal local macro definition."
+                definition))
+        (destructuring-bind (name arglist &body body) definition
+          (unless (symbolp name)
+            (fail "The local macro name ~S is not a symbol." name))
+          (when (fboundp name)
+            (program-assert-symbol-home-package-unlocked
+             context name "binding ~A as a local macro"))
+          (unless (listp arglist)
+            (fail "The local macro argument list ~S is not a list."
+                  arglist))
+          `(,name macro .
+                  ,(compile-in-lexenv
+                    (let (#-sb-xc-host
+                          (*macro-policy*
+                            ;; Make sure to save the sources if an
+                            ;; inlined functions closes over this
+                            ;; macro.
+                            (process-optimize-decl
+                             '(optimize (eval-store-source-form 3))
+                             *macro-policy*)))
+                      (make-macro-lambda nil arglist body 'macrolet name))
+                    lexenv)))))))
 
 (defun funcall-in-macrolet-lexenv (definitions fun context)
   (%funcall-in-foomacrolet-lexenv
@@ -351,27 +359,26 @@ destructuring lambda list, and the FORMS evaluate to the expansion."
    :compile))
 
 (defun symbol-macrolet-definitionize-fun (context)
-  (flet ((fail (control &rest args)
-           (ecase context
-             (:compile (apply #'compiler-error control args))
-             (:eval (error 'simple-program-error
-                           :format-control control
-                           :format-arguments args)))))
-    (lambda (definition)
-      (unless (proper-list-of-length-p definition 2)
-        (fail "malformed symbol/expansion pair: ~S" definition))
-      (destructuring-bind (name expansion) definition
-        (unless (symbolp name)
-          (fail "The local symbol macro name ~S is not a symbol." name))
-        (when (or (boundp name) (eq (info :variable :kind name) :macro))
-          (program-assert-symbol-home-package-unlocked
-           context name "binding ~A as a local symbol-macro"))
-        (let ((kind (info :variable :kind name)))
-          (when (member kind '(:special :constant :global))
-            (fail "Attempt to bind a ~(~A~) variable with SYMBOL-MACROLET: ~S"
-                  kind name)))
-        ;; A magical cons that MACROEXPAND-1 understands.
-        `(,name . (macro . ,expansion))))))
+  (let ((signal-via (ecase context
+                      (:compile #'compiler-error)
+                      (:eval #'%program-error))))
+    (flet ((fail (control &rest args)
+             (apply signal-via control args)))
+      (lambda (definition)
+        (unless (proper-list-of-length-p definition 2)
+          (fail "malformed symbol/expansion pair: ~S" definition))
+        (destructuring-bind (name expansion) definition
+          (unless (symbolp name)
+            (fail "The local symbol macro name ~S is not a symbol." name))
+          (when (or (boundp name) (eq (info :variable :kind name) :macro))
+            (program-assert-symbol-home-package-unlocked
+             context name "binding ~A as a local symbol-macro"))
+          (let ((kind (info :variable :kind name)))
+            (when (member kind '(:special :constant :global))
+              (fail "Attempt to bind a ~(~A~) variable with SYMBOL-MACROLET: ~S"
+                    kind name)))
+          ;; A magical cons that MACROEXPAND-1 understands.
+          `(,name . (macro . ,expansion)))))))
 
 (defun funcall-in-symbol-macrolet-lexenv (definitions fun context)
   (%funcall-in-foomacrolet-lexenv
@@ -605,17 +612,17 @@ be a lambda expression."
       (when (legal-fun-name-p name)
         name))))
 
-(defun ensure-source-fun-form (source &optional give-up)
+(defun ensure-source-fun-form (source &key (coercer '%coerce-callable-for-call) give-up)
   (let ((op (when (consp source) (car source))))
-    (cond ((eq op '%coerce-callable-to-fun)
-           (ensure-source-fun-form (second source)))
+    (cond ((memq op '(%coerce-callable-to-fun %coerce-callable-for-call))
+           (ensure-source-fun-form (second source) :coercer coercer))
           ((member op '(function global-function lambda named-lambda))
            (values source nil))
           (t
            (let ((cname (constant-global-fun-name source)))
              (if cname
                  (values `(global-function ,cname) nil)
-                 (values `(%coerce-callable-to-fun ,source) give-up)))))))
+                 (values `(,coercer ,source) give-up)))))))
 
 (defun source-variable-or-else (lvar fallback)
   (let ((uses (principal-lvar-use lvar)) leaf name)
@@ -659,7 +666,8 @@ be a lambda expression."
     (setf (lvar-dest value-lvar) new-cast)
     (use-continuation new-cast next result)))
 
-(defun ensure-lvar-fun-form (lvar lvar-name &optional give-up)
+(defun ensure-lvar-fun-form (lvar lvar-name &key (coercer '%coerce-callable-to-fun)
+                                                 give-up)
   (aver (and lvar-name (symbolp lvar-name)))
   (if (csubtypep (lvar-type lvar) (specifier-type 'function))
       lvar-name
@@ -677,7 +685,7 @@ be a lambda expression."
                 ;; LVAR-NAME is not what to show - if only it were that easy.
                 (source-variable-or-else lvar "callable expression")))
               (t
-               `(%coerce-callable-to-fun ,lvar-name))))))
+               `(,coercer ,lvar-name))))))
 
 ;;;; FUNCALL
 (def-ir1-translator %funcall ((function &rest args) start next result)
@@ -702,14 +710,20 @@ be a lambda expression."
 ;;; directly to %FUNCALL, instead of waiting around for type
 ;;; inference.
 (define-source-transform funcall (function &rest args)
-  `(%funcall ,(ensure-source-fun-form function) ,@args))
+  `(%funcall ,(ensure-source-fun-form function :coercer '%coerce-callable-for-call) ,@args))
 
 (deftransform %coerce-callable-to-fun ((thing) * * :node node)
   "optimize away possible call to FDEFINITION at runtime"
-  (ensure-lvar-fun-form thing 'thing t))
+  (ensure-lvar-fun-form thing 'thing :give-up t))
+
+;;; Bevahes just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
+(deftransform %coerce-callable-for-call ((thing) * * :node node)
+  "optimize away possible call to FDEFINITION at runtime"
+  (ensure-lvar-fun-form thing 'thing :give-up t :coercer '%coerce-callable-for-call))
 
 (define-source-transform %coerce-callable-to-fun (thing)
-  (ensure-source-fun-form thing t))
+  (ensure-source-fun-form thing :give-up t))
+
 
 ;;;; LET and LET*
 ;;;;
@@ -1326,7 +1340,7 @@ values from the first VALUES-FORM making up the first argument, etc."
                    ;; important for simplifying compilation of
                    ;; MV-COMBINATIONS.
                    (make-combination fun-lvar))))
-    (ir1-convert start ctran fun-lvar (ensure-source-fun-form fun))
+    (ir1-convert start ctran fun-lvar (ensure-source-fun-form fun :coercer '%coerce-callable-for-call))
     (setf (lvar-dest fun-lvar) node)
     (collect ((arg-lvars))
       (let ((this-start ctran))

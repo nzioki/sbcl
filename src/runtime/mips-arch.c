@@ -390,7 +390,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(os_context_pc(context)));
-    int register_offset = code >> 11 & 0x1f;
+    int register_offset = code >> 16 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -398,7 +398,7 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 static void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int code = (os_context_insn(context) >> 6) & 0x1f;
+    unsigned int code = (os_context_insn(context) >> 6) & 0xff;
     if (code == trap_PendingInterrupt) {
         /* KLUDGE: is this neccessary or will handle_trap do the same? */
         arch_clear_pseudo_atomic_interrupted(context);
@@ -447,8 +447,12 @@ arch_install_interrupt_handlers(void)
 
 /* Insert the necessary jump instructions at the given address. */
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned int *)reloc_addr = (unsigned int)target_addr;
+    return;
+  }
   /* Make JMP to function entry. The instruction sequence is:
        lui    $25, 0, %hi(addr)
        addiu  $25, $25, %lo(addr)
@@ -467,11 +471,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t)reloc_addr, LINKAGE_TABLE_ENTRY_SIZE);
 }
-
-void
-arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
-{
-    *(unsigned int *)reloc_addr = (unsigned int)target_addr;
-}
-
 #endif

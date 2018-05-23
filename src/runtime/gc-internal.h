@@ -82,14 +82,27 @@ do {                                                                   \
 #define FUN_SELF_FIXNUM_TAGGED 0
 #endif
 
+/* Code component trailer words:
+ *                                                   v code size
+ *      | fun_offset | fun_offset | .... | N-entries |
+ *                                       ^
+ *                 fun_table pointer ---/
+ *
+ * The fun_table pointer is aligned at a 4-byte boundary.
+ */
+static inline unsigned int*
+code_fun_table(struct code* code) {
+  return (unsigned int*)((char*)code
+                         + code_header_words(code->header) * N_WORD_BYTES
+                         + fixnum_value(code->code_size) - sizeof (uint16_t));
+}
 static inline unsigned short
-#ifdef LISP_FEATURE_64_BIT
-code_n_funs(struct code* code) { return ((code)->header >> 32) & 0x7FFF; }
-#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->header >> 48)
-#else
-code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF; }
-#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->n_entries >> 16)
-#endif
+code_n_funs(struct code* code) {
+    // immobile space filler objects appear to be code but have no simple-funs.
+    // Should probably consider changing the widetag to FILLER_WIDETAG.
+    return (code_header_words(code->header) > 2)
+        ? *((unsigned short*)code_fun_table(code)) : 0;
+}
 
 #define is_vector_subtype(header, val) ((HeaderValue(header) & 3) == subtype_##val)
 
@@ -97,26 +110,19 @@ code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF
 // offsets are stored as the number of bytes into the instructions
 // portion of the code object at which the simple-fun object resides.
 // We use bytes, not words, because that's what the COMPUTE-FUN vop expects.
-// But the offsets could be compressed further if we chose to use words,
-// which might allow storing them as (unsigned-byte 16),
-// as long as provision is made for ultra huge simple-funs. (~ .5MB)
-//
-// Note that the second assignment to _offset_ is OK: while it technically
-// oversteps the bounds of the indices of the fun offsets, it can not
-// run off the end of the code.
 #define for_each_simple_fun(index_var,fun_var,code_var,assertp,guts)        \
   { int _nfuns_ = code_n_funs(code_var);                                    \
     if (_nfuns_ > 0) {                                                      \
       char *_insts_ = (char*)(code_var) +                                   \
         (code_header_words((code_var)->header)<<WORD_SHIFT);                \
       int index_var = 0;                                                    \
-      int _offset_ = FIRST_SIMPLE_FUN_OFFSET(code_var);                     \
+      unsigned int* _offsets_ = code_fun_table(code_var) - 1;               \
       do {                                                                  \
-       struct simple_fun* fun_var = (struct simple_fun*)(_insts_+_offset_); \
+       struct simple_fun* fun_var                                           \
+           = (struct simple_fun*)(_insts_ + _offsets_[-index_var]);         \
        if (assertp)                                                         \
          gc_assert(widetag_of(fun_var->header)==SIMPLE_FUN_WIDETAG);        \
        guts ;                                                               \
-       _offset_ = ((unsigned int*)_insts_)[index_var];                      \
       } while (++index_var < _nfuns_);                                      \
   }}
 
@@ -127,10 +133,11 @@ code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF
  * struct page in gencgc-internal.h. These constants are used in gc-common,
  * so they can't easily be made gencgc-only */
 #define FREE_PAGE_FLAG        0
+/* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
 #define BOXED_PAGE_FLAG       1
 #define UNBOXED_PAGE_FLAG     2
 #define OPEN_REGION_PAGE_FLAG 8
-#define CODE_PAGE_ALLOCATED   (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
+#define CODE_PAGE_TYPE        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
 
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \
@@ -208,24 +215,32 @@ extern boolean positive_bignum_logbitp(int,struct bignum*);
 
 extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
 
-#elif defined(LISP_FEATURE_IMMOBILE_SPACE)
-
-static inline lispobj fdefn_callee_lispobj(struct fdefn *fdefn) {
-    extern unsigned int asm_routines_end;
-    return (lispobj)fdefn->raw_addr -
-      ((uword_t)fdefn->raw_addr < (uword_t)asm_routines_end ? 0 : FUN_RAW_ADDR_OFFSET);
-}
-
 #else
 
-static inline boolean points_to_readonly_space(uword_t ptr) {
+static inline lispobj points_to_asm_routine_p(uword_t ptr) {
+# if defined(LISP_FEATURE_IMMOBILE_SPACE)
+    // Lisp assembly routines are in varyobj space, not readonly space
+    extern unsigned int asm_routines_end;
+    return ptr < (uword_t)asm_routines_end;
+# else
     return READ_ONLY_SPACE_START <= ptr && ptr < READ_ONLY_SPACE_END;
+# endif
 }
 static inline lispobj fdefn_callee_lispobj(struct fdefn *fdefn) {
     return (lispobj)fdefn->raw_addr -
-      (points_to_readonly_space((uword_t)fdefn->raw_addr) ? 0 : FUN_RAW_ADDR_OFFSET);
+      (points_to_asm_routine_p((uword_t)fdefn->raw_addr) ? 0 : FUN_RAW_ADDR_OFFSET);
 }
 
+#endif
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#include "genesis/layout.h"
+#define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
+/// First 5 layouts: T, FUNCTION, STRUCTURE-OBJECT, LAYOUT, PACKAGE
+/// (These #defines ought to be emitted by genesis)
+#define LAYOUT_OF_FUNCTION ((FIXEDOBJ_SPACE_START+1*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_LAYOUT   ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_PACKAGE  ((FIXEDOBJ_SPACE_START+4*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
 #endif
 
 #endif /* _GC_INTERNAL_H_ */

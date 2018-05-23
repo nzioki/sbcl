@@ -13,10 +13,6 @@
 
 ;;;; various constants and essentially-constants
 
-(defun fasl-target-features ()
-  #+sb-xc-host sb-cold:*shebang-features*
-  #-sb-xc-host *features*)
-
 ;;; a string which appears at the start of a fasl file header
 ;;;
 ;;; This value is used to identify fasl files. Even though this is not
@@ -37,7 +33,7 @@
 ;;;   against.
 (defglobal *fasl-header-string-start-string* "# FASL")
 
-;;; a list of *(SHEBANG-)FEATURES* flags which affect binary compatibility,
+;;; a list of SB!XC:*FEATURES* flags which affect binary compatibility,
 ;;; i.e. which must be the same between the SBCL which compiled the code
 ;;; and the SBCL which executes the code. This is a property of SBCL executables
 ;;; in the abstract, not of this particular SBCL executable,
@@ -45,14 +41,15 @@
 ;;; in the *FEATURES* list of this particular build.
 (defglobal *features-potentially-affecting-fasl-format*
     (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc
-              :gencgc :msan :sb-safepoint :sb-safepoint-strictly)
+              :gencgc :msan :sb-safepoint :sb-safepoint-strictly
+              :sb-dynamic-core)
             #!+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
 
 ;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
 ;;; which are present in a particular compilation.
 (defun compute-features-affecting-fasl-format ()
   (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
-                                             (fasl-target-features)))
+                                             sb!xc:*features*))
                     #'string< :key #'symbol-name)))
     ;; Stringify the subset of *FEATURES* that affect fasl format.
     ;; A list would be the natural representation choice for this, but a string
@@ -134,6 +131,7 @@
 ;;;     have packages and that sort of native Lisp stuff associated
 ;;;     with them. We can compare them with EQ.
 (defglobal *assembler-routines* nil)
+#-sb-xc-host (declaim (code-component *assembler-routines*))
 
 
 ;;;; the FOP database

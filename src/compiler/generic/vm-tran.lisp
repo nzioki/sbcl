@@ -37,7 +37,7 @@
 (define-source-transform %make-symbol (kind string)
   (declare (ignore kind))
   ;; Set "logically read-only" bit in pname.
-  `(sb!vm::%%make-symbol (set-header-data ,string sb!vm:+vector-shareable+)))
+  `(sb!vm::%%make-symbol (set-header-data ,string ,sb!vm:+vector-shareable+)))
 
 ;;; We don't want to clutter the bignum code.
 #!+(or x86 x86-64)
@@ -195,16 +195,16 @@
     (if (array-type-p ctype)
         ;; the other transform will kick in, so that's OK
         (give-up-ir1-transform)
-        `(etypecase string
-          ((simple-array character (*))
-           (data-vector-set string index new-value))
-          #!+sb-unicode
-          ((simple-array base-char (*))
-           (data-vector-set string index (the* (base-char :context :aref
-                                                          :silent-conflict t)
-                                               new-value)))
-          ((simple-array nil (*))
-           (%type-check-error/c string 'nil-array-accessed-error nil))))))
+        `(typecase string
+           ((simple-array character (*))
+            (data-vector-set string index (the* (character :context :aref) new-value)))
+           #!+sb-unicode
+           ((simple-array base-char (*))
+            (data-vector-set string index (the* (base-char :context :aref
+                                                           :silent-conflict t)
+                                                new-value)))
+           (t
+            (%type-check-error/c string 'nil-array-accessed-error nil))))))
 
 ;;; This and the corresponding -REF transform work equally well on non-simple
 ;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
@@ -609,6 +609,13 @@
               ((simple-unboxed-array (*)) (vector-sap thing)))))
      (declare (inline sapify))
     (with-pinned-objects (dst src)
+      ;; Prevent failure caused by memmove() hitting a write-protected page
+      ;; and the fault handler losing, since it thinks you're not in Lisp.
+      ;; This is wasteful, but better than being randomly broken (lp#1366263).
+      #!+cheneygc
+      (let ((dst (sapify dst)))
+        (setf (sap-ref-8 dst dst-start) (sap-ref-8 dst dst-start)
+              (sap-ref-8 dst (1- dst-end)) (sap-ref-8 dst (1- dst-end))))
       (memmove (sap+ (sapify dst) dst-start)
                (sap+ (sapify src) src-start)
                (- dst-end dst-start)))

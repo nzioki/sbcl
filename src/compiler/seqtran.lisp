@@ -317,6 +317,17 @@
                        (%give-up))))))))))
 
 ;;; MAP-INTO
+(defmacro mapper-from-typecode (typecode)
+  #+sb-xc-host
+  `(svref ,(let ((a (make-array 256)))
+             (dovector (info sb!vm:*specialized-array-element-type-properties* a)
+               (setf (aref a (sb!vm:saetp-typecode info))
+                     (package-symbolicate "SB!IMPL" "VECTOR-MAP-INTO/"
+                                          (sb!vm:saetp-primitive-type-name info)))))
+          ,typecode)
+  #-sb-xc-host
+  `(%fun-name (svref sb!impl::%%vector-map-into-funs%% ,typecode)))
+
 (deftransform map-into ((result fun &rest seqs)
                         (vector * &rest *)
                         * :node node)
@@ -353,22 +364,16 @@
                   :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
                           (setf (aref result index) funcall-result))))
             result))
-      (cond #-sb-xc-host
-            ;; %%vector-map-into-funs%% is not defined in xc
-            ;; if something needs to be faster in the compiler, it
-            ;; should declare the input sequences instead.
-            ((and non-complex-vector-type-p
+      (cond ((and non-complex-vector-type-p
                   (array-type-p result-type)
                   (not (eq (array-type-specialized-element-type result-type)
                            *wild-type*)))
              (let ((saetp (find-saetp-by-ctype (array-type-specialized-element-type result-type))))
                (unless saetp
                  (give-up-ir1-transform "Uknown upgraded array element type of the result"))
-               (let ((mapper (%fun-name (svref sb!impl::%%vector-map-into-funs%%
-                                               (sb!vm:saetp-typecode saetp)))))
-                 `(progn (,mapper result 0 (length result)
-                                  (%coerce-callable-to-fun fun) seqs)
-                         result))))
+               `(progn (,(mapper-from-typecode (sb!vm:saetp-typecode saetp))
+                        result 0 (length result) (%coerce-callable-to-fun fun) seqs)
+                       result)))
             (t
              (%give-up))))))
 
@@ -443,7 +448,7 @@
               (null-type (specifier-type 'null)))
           (cond ((csubtypep key-type null-type)
                  (values nil nil))
-                ((csubtypep null-type key-type)
+                ((types-equal-or-intersect null-type key-type)
                  (values key '(if key
                                (%coerce-callable-to-fun key)
                                #'identity)))
@@ -484,7 +489,9 @@
                      (apply #'ensure-lvar-fun-form args))))
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
-          (cond ((and cp c-list (member name '(assoc rassoc member))
+          (cond ((not (proper-list-p c-list))
+                 (abort-ir1-transform "Argument to ~a is not a proper list." name))
+                ((and cp c-list (member name '(assoc rassoc member))
                       (policy node (>= speed space))
                       (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ,(mapcar (lambda (fun) `(,(second fun) ,(ensure-fun fun))) funs)
@@ -512,7 +519,7 @@
               (null-type (specifier-type 'null)))
           (cond ((csubtypep key-type null-type)
                  (values nil nil))
-                ((csubtypep null-type key-type)
+                ((types-equal-or-intersect null-type key-type)
                  (values key '(if key
                                (%coerce-callable-to-fun key)
                                #'identity)))
@@ -757,8 +764,7 @@
                                   (insert-array-bounds-checks 0)))
                ,(cond #!+x86-64
                       ((type= element-ctype *universal-type*)
-                       '(%primitive sb!vm::fill-vector/t
-                         data item start end))
+                       '(vector-fill/t data item start end))
                       (t
                        `(do ((i start (1+ i)))
                             ((= i end))
@@ -963,9 +969,9 @@
                       ;; SEQ2 must be distinct arrays.
                       ,(eql sequence-type1 sequence-type2)
                       (eq seq1 seq2) (> start1 start2))
-                     (do ((i (truly-the index (+ start1 replace-len -1))
+                     (do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1))
                              (1- i))
-                          (j (truly-the index (+ start2 replace-len -1))
+                          (j (truly-the (or (eql -1) index) (+ start2 replace-len -1))
                              (1- j)))
                          ((< i start1))
                        (declare (optimize (insert-array-bounds-checks 0)))
@@ -1282,7 +1288,9 @@
                                  (length pattern))
                                 (t
                                  (give-up-ir1-transform))))
-             (pattern (if (= (- pattern-end pattern-start) 1)
+             (pattern (if (and (= (- pattern-end pattern-start) 1)
+                               (sequence-of-length-at-least-p pattern
+                                                              (1+ pattern-start)))
                           (elt pattern pattern-start)
                           (give-up-ir1-transform))))
         (macrolet ((maybe-arg (arg &optional (key (keywordicate arg)))

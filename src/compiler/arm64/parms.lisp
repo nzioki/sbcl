@@ -13,6 +13,26 @@
 
 (in-package "SB!VM")
 
+(defconstant sb!assem:assem-scheduler-p nil)
+
+(defconstant +backend-fasl-file-implementation+ :arm64)
+
+  ;; Can be in the range 4K-64K
+(defconstant +backend-page-bytes+ 65536)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 64)
 
@@ -86,10 +106,8 @@
   (defconstant linkage-table-space-end   #x0b000000)
   #!+linux
   (progn
-    (defconstant dynamic-0-space-start #x4f000000)
-    (defconstant dynamic-0-space-end   #x66fff000)
-    (defconstant dynamic-1-space-start #x67000000)
-    (defconstant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
 #!+gencgc
 (!gencgc-space-setup #xF0000000 :dynamic-space-start #x1000000000)
@@ -101,13 +119,13 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  invalid-arg-count-trap)
+  invalid-arg-count-trap
+  error-trap)
 
 ;;;; Static symbols.
 

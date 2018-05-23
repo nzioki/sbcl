@@ -210,9 +210,12 @@ potentially stale even before the function returns, as the thread may exit at
 any time."
   (thread-%alive-p thread))
 
+;; NB: ephemeral threads must terminate strictly before the test of NTHREADS>1
+;; in DEINIT, i.e. this is not a promise that the thread will terminate
+;; just-in-time for the final call out to save, but rather by an earlier time.
 (defun thread-ephemeral-p (thread)
   "Return T if THREAD is `ephemeral', which indicates that this thread is
-used by SBCL for internal purposes, and specifically that it knows how to
+used by SBCL for internal purposes, and specifically that our runtime knows how
 to terminate this thread cleanly prior to core file saving without signalling
 an error in that case."
   (thread-%ephemeral-p thread))
@@ -254,13 +257,13 @@ created and old ones may exit at any time."
 #!-(or sb-fluid sb-thread) (declaim (inline sb!vm::current-thread-offset-sap))
 #!-sb-thread
 (defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (unsigned-byte 27) n))
+  (declare (type (signed-byte 28) n))
   (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
                (* n sb!vm:n-word-bytes)))
 
 #!+sb-thread
 (defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (unsigned-byte 27) n))
+  (declare (type (signed-byte 28) n))
   (sb!vm::current-thread-offset-sap n))
 
 (declaim (inline current-thread-sap))
@@ -458,7 +461,7 @@ HOLDING-MUTEX-P."
   ;; Make sure to get the current value.
   (sb!ext:compare-and-swap (mutex-%owner mutex) nil nil))
 
-(sb!ext:defglobal **deadlock-lock** nil)
+(sb!ext:define-load-time-global **deadlock-lock** nil)
 
 #!+(or (not sb-thread) sb-futex)
 (defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
@@ -547,6 +550,114 @@ HOLDING-MUTEX-P."
         (detect-deadlock origin)
         t))))
 
+;;;; WAIT-FOR -- waiting on arbitrary conditions
+
+(defun %%wait-for (test stop-sec stop-usec)
+  (declare (function test))
+  (declare (dynamic-extent test))
+  (labels ((try ()
+             (declare (optimize (safety 0)))
+             (awhen (funcall test)
+               (return-from %%wait-for it)))
+           (tick (sec usec)
+             (declare (type fixnum sec usec))
+             ;; TICK is microseconds
+             (+ usec (* 1000000 sec)))
+           (get-tick ()
+             (multiple-value-call #'tick
+               (decode-internal-time (get-internal-real-time)))))
+    (let* ((timeout-tick (when stop-sec (tick stop-sec stop-usec)))
+           (start (get-tick))
+           ;; Rough estimate of how long a single attempt takes.
+           (try-ticks (progn
+                        (try) (try) (try)
+                        (max 1 (truncate (- (get-tick) start) 3)))))
+      ;; Scale sleeping between attempts:
+      ;;
+      ;; Start by sleeping for as many ticks as an average attempt
+      ;; takes, then doubling for each attempt.
+      ;;
+      ;; Max out at 0.1 seconds, or the 2 x time of a single try,
+      ;; whichever is longer -- with a hard cap of 10 seconds.
+      ;;
+      ;; FIXME: Maybe the API should have a :MAX-SLEEP argument?
+      (loop with max-ticks = (max 100000 (min (* 2 try-ticks)
+                                              (expt 10 7)))
+            for scale of-type fixnum = 1
+            then (let ((x (logand most-positive-fixnum (* 2 scale))))
+                   (if (> scale x)
+                       most-positive-fixnum
+                       x))
+            do (try)
+               (let* ((now (get-tick))
+                      (sleep-ticks (min (* try-ticks scale) max-ticks))
+                      (sleep
+                        (if timeout-tick
+                            ;; If sleep would take us past the
+                            ;; timeout, shorten it so it's just
+                            ;; right.
+                            (if (>= (+ now sleep-ticks) timeout-tick)
+                                (- timeout-tick now)
+                                sleep-ticks)
+                            sleep-ticks)))
+                 (declare (type fixnum sleep))
+                 (cond ((plusp sleep)
+                        ;; microseconds to seconds and nanoseconds
+                        (multiple-value-bind (sec nsec)
+                            (truncate (* 1000 sleep) (expt 10 9))
+                          (with-interrupts
+                            (sb!unix:nanosleep sec nsec))))
+                       (t
+                        (return-from %%wait-for nil))))))))
+
+(defun %wait-for (test timeout)
+  (declare (function test))
+  (declare (dynamic-extent test))
+  (tagbody
+   :restart
+     (multiple-value-bind (to-sec to-usec stop-sec stop-usec deadlinep)
+         (decode-timeout timeout)
+       (declare (ignore to-sec to-usec))
+       (return-from %wait-for
+         (or (%%wait-for test stop-sec stop-usec)
+             (when deadlinep
+               (signal-deadline)
+               (go :restart)))))))
+
+(defmacro sb!ext:wait-for (test-form &key timeout)
+  "Wait until TEST-FORM evaluates to true, then return its primary value.
+If TIMEOUT is provided, waits at most approximately TIMEOUT seconds before
+returning NIL.
+
+If WITH-DEADLINE has been used to provide a global deadline, signals a
+DEADLINE-TIMEOUT if TEST-FORM doesn't evaluate to true before the
+deadline.
+
+Experimental: subject to change without prior notice."
+  `(dx-flet ((wait-for-test () (progn ,test-form)))
+     (%wait-for #'wait-for-test ,timeout)))
+
+(defmacro with-progressive-timeout ((name &key seconds)
+                                    &body body)
+  "Binds NAME as a local function for BODY. Each time #'NAME is called, it
+returns SECONDS minus the time that has elapsed since BODY was entered, or
+zero if more time than SECONDS has elapsed. If SECONDS is NIL, #'NAME
+returns NIL each time."
+  (with-unique-names (deadline time-left sec)
+    `(let* ((,sec ,seconds)
+            (,deadline
+              (when ,sec
+                (+ (get-internal-real-time)
+                   (round (* ,seconds internal-time-units-per-second))))))
+       (flet ((,name ()
+                (when ,deadline
+                  (let ((,time-left (- ,deadline (get-internal-real-time))))
+                    (if (plusp ,time-left)
+                        (* (coerce ,time-left 'single-float)
+                           (load-time-value (/ 1.0f0 internal-time-units-per-second) t))
+                        0)))))
+         ,@body))))
+
 (defun %try-mutex (mutex new-owner)
   (declare (type mutex mutex) (optimize (speed 3)))
   (barrier (:read))
@@ -573,6 +684,7 @@ HOLDING-MUTEX-P."
 #!+sb-thread
 (defun %%wait-for-mutex (mutex new-owner to-sec to-usec stop-sec stop-usec)
   (declare (type mutex mutex) (optimize (speed 3)))
+  (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
   #!-sb-futex
   (declare (ignore to-sec to-usec))
   #!-sb-futex
@@ -590,7 +702,7 @@ HOLDING-MUTEX-P."
            ;; Check for pending interrupts.
            (with-interrupts nil)))
     (declare (dynamic-extent #'cas))
-    (sb!impl::%%wait-for #'cas stop-sec stop-usec))
+    (%%wait-for #'cas stop-sec stop-usec))
   #!+sb-futex
   ;; This is a fairly direct translation of the Mutex 2 algorithm from
   ;; "Futexes are Tricky" by Ulrich Drepper.
@@ -819,7 +931,7 @@ IF-NOT-OWNER is :FORCE)."
   #!+sb-thread
   (let ((me *current-thread*))
     (barrier (:read))
-    (assert (eq me (mutex-%owner mutex)))
+    (aver (eq me (mutex-%owner mutex)))
     (let ((status :interrupted))
       ;; Need to disable interrupts so that we don't miss grabbing
       ;; the mutex on our way out.
@@ -838,7 +950,7 @@ IF-NOT-OWNER is :FORCE)."
                                       :ok)))
                              (declare (dynamic-extent #'wakeup))
                              (allow-with-interrupts
-                               (sb!impl::%%wait-for #'wakeup stop-sec stop-usec)))
+                               (%%wait-for #'wakeup stop-sec stop-usec)))
                            :timeout)))
                #!+sb-futex
                (with-pinned-objects (queue me)
@@ -1228,7 +1340,7 @@ on this semaphore, then N of them is woken up."
 
 (defmacro with-new-session (args &body forms)
   (declare (ignore args))               ;for extensibility
-  (sb!int:with-unique-names (fb-name)
+  (with-unique-names (fb-name)
     `(labels ((,fb-name () ,@forms))
       (call-with-new-session (function ,fb-name)))))
 
@@ -1274,6 +1386,7 @@ on this semaphore, then N of them is woken up."
             (lambda (c h)
               (sb!debug::debugger-disabled-hook c h :quit nil)
               (abort-thread :allow-exit t)))
+      (sb!impl::finalizer-thread-stop)
       (dolist (thread (list-all-threads))
         (cond ((eq thread current))
               ((main-thread-p thread)
@@ -1389,7 +1502,7 @@ session."
   (first (interactive-threads session)))
 
 (defun make-listener-thread (tty-name)
-  (assert (probe-file tty-name))
+  (aver (probe-file tty-name))
   (let* ((in (sb!unix:unix-open (namestring tty-name) sb!unix:o_rdwr #o666))
          (out (sb!unix:unix-dup in))
          (err (sb!unix:unix-dup in)))
@@ -1412,7 +1525,7 @@ session."
                  (with-new-session ()
                    (unwind-protect
                         (sb!impl::toplevel-repl nil)
-                     (sb!int:flush-standard-output-streams))))))
+                     (flush-standard-output-streams))))))
       (make-thread #'thread-repl))))
 
 
@@ -1514,7 +1627,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
            (real-function (coerce function 'function))
            (arguments     (ensure-list arguments))
            #!+(or win32 darwin)
-           (fp-modes (dpb 0 sb!vm::float-sticky-bits ;; clear accrued bits
+           (fp-modes (dpb 0 sb!vm:float-sticky-bits ;; clear accrued bits
                           (sb!vm:floating-point-modes))))
       (declare (dynamic-extent setup-sem))
       (dx-flet ((initial-thread-function ()
@@ -1595,16 +1708,6 @@ subject to change."
 (declaim (sb!ext:deprecated
           :late ("SBCL" "1.2.15")
           (function destroy-thread :replacement terminate-thread)))
-
-#!+sb-thread
-(defun enter-foreign-callback (index return arguments)
-  (let ((thread (without-gcing
-                  ;; Hold off GCing until *current-thread* is set up
-                  (setf *current-thread*
-                        (make-foreign-thread :name "foreign callback")))))
-    (dx-flet ((enter ()
-                (sb!alien::enter-alien-callback index return arguments)))
-      (initial-thread-function-trampoline thread nil #'enter nil))))
 
 (defmacro with-interruptions-lock ((thread) &body body)
   `(with-system-mutex ((thread-interruptions-lock ,thread))
@@ -1785,26 +1888,22 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
 #!+sb-thread
 (progn
 
-  (sb!ext:defglobal sb!vm::*free-tls-index* 0)
+  (sb!ext:define-load-time-global sb!vm::*free-tls-index* 0)
   ;; Keep in sync with 'compiler/generic/parms.lisp'
   #!+ppc ; only PPC uses a separate symbol for the TLS index lock
-  (!defglobal sb!vm::*tls-index-lock* 0)
+  (!define-load-time-global sb!vm::*tls-index-lock* 0)
 
-(defun %symbol-value-in-thread (symbol thread)
+  (defun %symbol-value-in-thread (symbol thread)
     ;; Prevent the thread from dying completely while we look for the TLS
     ;; area...
     (with-all-threads-lock
       (if (thread-alive-p thread)
-          (let* ((offset (get-lisp-obj-address (symbol-tls-index symbol)))
-                 (obj (sap-ref-lispobj (int-sap (thread-primitive-thread thread)) offset))
-                 (tl-val (get-lisp-obj-address obj)))
-            (cond ((zerop offset)
-                   (values nil :no-tls-value))
-                  ((or (eql tl-val sb!vm:no-tls-value-marker-widetag)
-                       (eql tl-val sb!vm:unbound-marker-widetag))
-                   (values nil :unbound-in-thread))
-                  (t
-                   (values obj :ok))))
+          (let ((val (sap-ref-lispobj (int-sap (thread-primitive-thread thread))
+                                      (get-lisp-obj-address (symbol-tls-index symbol)))))
+            (case (get-lisp-obj-address val)
+              (#.sb!vm:no-tls-value-marker-widetag (values nil :no-tls-value))
+              (#.sb!vm:unbound-marker-widetag (values nil :unbound-in-thread))
+              (t (values val :ok))))
           (values nil :thread-dead))))
 
   (defun %set-symbol-value-in-thread (symbol thread value)
@@ -1822,29 +1921,28 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
                    (values value :ok))))
           (values nil :thread-dead))))
 
-  (define-alien-variable tls-index-start unsigned-int)
-
   ;; Get values from the TLS area of the current thread.
+  ;; Disregard duplicates and immediate objects.
   (defun %thread-local-references ()
     ;; TLS-INDEX-START is a word number relative to thread base.
     ;; *FREE-TLS-INDEX* - which is only manipulated by machine code  - is an
-    ;; offset from thread base to the next usable TLS cell as a raw word
-    ;; manifesting in Lisp as a fixnum. Convert it from byte number to word
-    ;; number before using it as the upper bound for the sequential scan.
-    (loop for index from tls-index-start
-          ;; On x86-64, mask off the sign bit. It is used as a semaphore.
-          below (ash (logand #!+x86-64 most-positive-fixnum
-                             sb!vm::*free-tls-index*)
-                     (+ (- sb!vm:word-shift) sb!vm:n-fixnum-tag-bits))
-          for obj = (sb!kernel:%make-lisp-obj
-                     (sb!sys:sap-int (sb!vm::current-thread-offset-sap index)))
-          unless (or (member (widetag-of obj)
-                             `(,sb!vm:no-tls-value-marker-widetag
-                               ,sb!vm:unbound-marker-widetag))
-                     (typep obj '(or fixnum character))
-                     (memq obj seen))
-          collect obj into seen
-          finally (return seen))))
+    ;; offset from thread base to the next usable TLS cell as a byte offset
+    ;; (raw value) manifesting in Lisp as a fixnum.
+    ;; The sign bit of sb!vm::*free-tls-index* is a semaphore,
+    ;; except on PPC where it isn't, but masking is fine in any case.
+    (do ((index (- (ash (logand sb!vm::*free-tls-index* most-positive-fixnum)
+                        sb!vm:n-fixnum-tag-bits)
+                   sb!vm:n-word-bytes)
+                (- index sb!vm:n-word-bytes))
+         ;; (There's no reason this couldn't work on any thread now.)
+         (sap (int-sap (thread-primitive-thread *current-thread*)))
+         (list))
+        ((< index (ash tls-index-start sb!vm:word-shift)) list)
+      (let ((obj (sap-ref-lispobj sap index)))
+        (when (and obj ; don't bother returning NIL
+                   (sb!vm:is-lisp-pointer (get-lisp-obj-address obj))
+                   (not (memq obj list)))
+          (push obj list))))))
 
 (defun symbol-value-in-thread (symbol thread &optional (errorp t))
   "Return the local value of SYMBOL in THREAD, and a secondary value of T

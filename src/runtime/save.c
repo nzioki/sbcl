@@ -36,13 +36,9 @@
 #include "thread.h"
 #include "arch.h"
 #include "pseudo-atomic.h"
-
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
-
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-# include "immobile-space.h"
-#endif
+#include "immobile-space.h"
 
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
 # include <zlib.h>
@@ -211,18 +207,10 @@ open_core_for_saving(char *filename)
     return fopen(filename, "wb");
 }
 
-static void
-smash_enclosing_state(boolean verbose) {
+void unwind_binding_stack()
+{
+    boolean verbose = !lisp_startup_options.noinform;
     struct thread *th = all_threads;
-
-    // Since SB-IMPL::DEINIT already checked for exactly 1 thread,
-    // losing here probably can't happen.
-    if (th->next)
-        lose("Can't save image with more than one executing thread");
-
-#ifdef LISP_FEATURE_X86_64
-    untune_asm_routines_for_microarch();
-#endif
 
     /* Smash the enclosing state. (Once we do this, there's no good
      * way to go back, which is a sufficient reason that this ends up
@@ -235,17 +223,6 @@ smash_enclosing_state(boolean verbose) {
     write_TLS(CURRENT_CATCH_BLOCK, 0, th); // If set to 0 on start, why here too?
     write_TLS(CURRENT_UNWIND_PROTECT_BLOCK, 0, th);
     if (verbose) printf("done]\n");
-}
-
-void
-do_destructive_cleanup_before_save(lispobj init_function)
-{
-    boolean verbose = !lisp_startup_options.noinform;
-    // Preparing to save.
-    smash_enclosing_state(verbose);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    prepare_immobile_space_for_save(init_function, verbose);
-#endif
 }
 
 boolean
@@ -336,7 +313,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 #ifdef LISP_FEATURE_GENCGC
     {
         extern void gc_store_corefile_ptes(struct corefile_pte*);
-        size_t true_size = last_free_page * sizeof(struct corefile_pte);
+        size_t true_size = next_free_page * sizeof(struct corefile_pte);
         size_t aligned_size = ALIGN_UP(true_size, N_WORD_BYTES);
         char* data = successful_malloc(aligned_size);
         // Zeroize the final few bytes of data that get written out
@@ -345,7 +322,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
         gc_store_corefile_ptes((struct corefile_pte*)data);
         write_lispobj(PAGE_TABLE_CORE_ENTRY_TYPE_CODE, file);
         write_lispobj(5, file); // 5 = # of words in this core header entry
-        write_lispobj(last_free_page, file);
+        write_lispobj(next_free_page, file);
         write_lispobj(aligned_size, file);
         sword_t offset = write_bytes(file, data, aligned_size, core_start_pos,
                                      COMPRESSION_LEVEL_NONE);
@@ -503,6 +480,13 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
     char *runtime_path;
     extern char *saved_runtime_path; // path computed from argv[0]
 
+    // SB-IMPL::DEINIT already checked for exactly 1 thread,
+    // so this really shouldn't happen.
+    if (all_threads->next) {
+        fprintf(stderr, "Can't save image with more than one executing thread");
+        return NULL;
+    }
+
     if (prepend_runtime) {
         runtime_path = os_get_runtime_executable_path(0);
 
@@ -549,7 +533,11 @@ save(char *filename, lispobj init_function, boolean prepend_runtime,
     if (prepend_runtime)
         save_runtime_to_filehandle(file, runtime_bytes, runtime_size, application_type);
 
-    do_destructive_cleanup_before_save(init_function);
+    /* This unwinding is necessary for proper restoration of the
+     * symbol-value slots to their toplevel values, but it occurs
+     * too late to remove old references from the binding stack.
+     * There's probably no safe way to do that from Lisp */
+    unwind_binding_stack();
     return save_to_filehandle(file, filename, init_function, prepend_runtime,
                               save_runtime_options,
                               compressed ? compressed : COMPRESSION_LEVEL_NONE);

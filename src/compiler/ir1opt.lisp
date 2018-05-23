@@ -62,10 +62,7 @@
 ;;; The result value is cached in the LVAR-%DERIVED-TYPE slot. If the
 ;;; slot is true, just return that value, otherwise recompute and
 ;;; stash the value there.
-(eval-when (:compile-toplevel :execute)
-  (#+sb-xc-host cl:defmacro
-   #-sb-xc-host sb!xc:defmacro
-        lvar-type-using (lvar accessor)
+(defmacro lvar-type-using (lvar accessor)
      `(let ((uses (lvar-uses ,lvar)))
         (cond ((null uses) *empty-type*)
               ((listp uses)
@@ -76,7 +73,7 @@
                    ((or (null current) (eq res *wild-type*))
                     res)))
               (t
-               (,accessor uses))))))
+               (,accessor uses)))))
 
 (defun %lvar-derived-type (lvar)
   (lvar-type-using lvar node-derived-type))
@@ -314,6 +311,21 @@
           (reoptimize-lvar lvar)))))
   (values))
 
+
+(defun type-asserted-p (lvar type)
+  (or (values-subtypep (lvar-derived-type lvar) type)
+      ;; Just doing values-subtypep is not enough since it may be an
+      ;; intersection of types. Need to see if there's a cast that
+      ;; actually checks that particular type.
+      (do-uses (node lvar t)
+        (unless
+            (typecase node
+              (cast
+               (values-subtypep (coerce-to-values (cast-asserted-type node)) type))
+              (t
+               (values-subtypep (node-derived-type node) type)))
+          (return)))))
+
 ;;; This is similar to DERIVE-NODE-TYPE, but asserts that it is an
 ;;; error for LVAR's value not to be TYPEP to TYPE. We implement it
 ;;; splitting off DEST a new CAST node; old LVAR will deliver values
@@ -321,7 +333,7 @@
 ;;; guarantee that the new assertion will be checked.
 (defun assert-lvar-type (lvar type policy &optional context)
   (declare (type lvar lvar) (type ctype type))
-  (unless (values-subtypep (lvar-derived-type lvar) type)
+  (unless (type-asserted-p lvar type)
     (let ((internal-lvar (make-lvar))
           (dest (lvar-dest lvar)))
       (substitute-lvar internal-lvar lvar)
@@ -378,7 +390,7 @@
 
                  (unless (join-successor-if-possible block)
                    (return)))
-
+              (remove-equivalent-blocks block)
               (when (and (not fastp) (block-reoptimize block) (block-component block))
                 (aver (not (block-delete-p block)))
                 (ir1-optimize-block block))
@@ -653,21 +665,6 @@
 
 ;;;; IF optimization
 
-;;; Utility: return T if both argument cblocks are equivalent.  For now,
-;;; detect only blocks that read the same leaf into the same lvar, and
-;;; continue to the same block.
-(defun cblocks-equivalent-p (x y)
-  (declare (type cblock x y))
-  (and (ref-p (block-start-node x))
-       (eq (block-last x) (block-start-node x))
-
-       (ref-p (block-start-node y))
-       (eq (block-last y) (block-start-node y))
-
-       (equal (block-succ x) (block-succ y))
-       (eql (ref-lvar (block-start-node x)) (ref-lvar (block-start-node y)))
-       (eql (ref-leaf (block-start-node x)) (ref-leaf (block-start-node y)))))
-
 ;;; Check whether the predicate is known to be true or false,
 ;;; deleting the IF node in favor of the appropriate branch when this
 ;;; is the case.
@@ -689,8 +686,8 @@
                     alternative)
                    ((type= type (specifier-type 'null))
                     consequent)
-                   ((or (eq consequent alternative) ; Can this happen?
-                        (cblocks-equivalent-p alternative consequent))
+                   ((or (eq consequent alternative)
+                        (blocks-equivalent-p alternative consequent))
                     ;; Even if the references are the same they can have
                     ;; different derived types based on the TEST
                     ;; Don't lose the second type when killing it.
@@ -846,11 +843,117 @@
 
 (defun check-important-result (node info)
   (when (and (null (node-lvar node))
-             (ir1-attributep (fun-info-attributes info) important-result))
+             (ir1-attributep (fun-info-attributes info) important-result)
+             (neq (combination-info node) :important-result-discarded))
     (let ((*compiler-error-context* node))
+      (setf (combination-info node) :important-result-discarded)
       (compiler-style-warn
        "The return value of ~A should not be discarded."
        (lvar-fun-name (basic-combination-fun node) t)))))
+
+(defglobal *debug-auto-dx* nil)
+;;; Generalized transform: For each downward funarg, unless it is
+;;; a global var (like #'EQL), or the user already DXified,
+;;; or this transform already ran, then try to wrap in DX-FLET.
+;;; Change the call only if at least one DXable arg is known
+;;; to be a fuction. If no eligible arg is, then do nothing.
+;;; For now this only works on globally named functions.
+(defun dxify-downward-funargs (node dxable-args fun-name)
+  (when *debug-auto-dx*
+    (format t "~&DXifying funargs to ~S~%" fun-name))
+  (let* ((dx-flets)
+         (received-args)
+         (passed-args))
+    ;; Experience shows that users place incorrect DYNAMIC-EXTENT declarations
+    ;; without due consideration and care. Since the declaration was ignored
+    ;; in more contexts than not, it was relatively harmless.
+    ;; In light of that, only make this transform if willing to generate
+    ;; wrong code, or if the declaration can be trusted.
+    ;; [It's seems to be true that users who want this are OK with lack of
+    ;; tail-callability and/or potential stack exhaustion due to the assumption
+    ;; that callers should always use more stack space. You should really
+    ;; only do that if you don't also need an arbitrarily long call chain.
+    ;; MAP and friends are good examples where this pertains]
+    (when #+sb-xc-host t ; always trust our own code
+          #-sb-xc-host
+          (or (package-locked-p ; callee "probably" won't get redefined
+               (symbol-package (fun-name-block-name fun-name)))
+              (policy node (= safety 0)))
+      (dolist (arg-spec dxable-args)
+        (when (symbolp arg-spec)
+          ;; If there are keywords, we had better have a FUN-TYPE
+          (let ((fun-type (lvar-type (combination-fun node))))
+            ;; Can't do anything unless we can ascertain where
+            ;; the keyword arguments start.
+            (when (fun-type-p fun-type)
+              (let* ((keys-index
+                      (+ (length (fun-type-required fun-type))
+                         (length (fun-type-optional fun-type))))
+                     (keywords-supplied
+                      (nthcdr keys-index (combination-args node))))
+                ;; Everything in a keyword position needs to be
+                ;; constant, or else no transform occurs.
+                (loop
+                   (unless (cdr keywords-supplied) (return))
+                   (let ((keyword (car keywords-supplied)))
+                     (unless (constant-lvar-p keyword)
+                       (return))
+                     (when (eq (lvar-value keyword) arg-spec)
+                       ;; Map it to a positional arg
+                       (setq arg-spec (1+ keys-index))
+                       (return))
+                     (setq keywords-supplied (cddr keywords-supplied))
+                     (incf keys-index 2)))))))
+        (when (integerp arg-spec)
+          ;; OK, turn the Nth argument into a dx-flet
+          (let* ((arg (or (nth arg-spec (combination-args node))
+                          (return-from dxify-downward-funargs nil)))
+                 (use (principal-lvar-use arg)))
+            (when (and (ref-p use)
+                       (lambda-p (ref-leaf use))
+                       (neq (leaf-extent (lambda-parent (ref-leaf use)))
+                            :always-dynamic))
+              (unless received-args
+                (setq received-args
+                      (make-gensym-list (length (combination-args node))))
+                (setq passed-args (copy-list received-args)))
+              (let ((tempname (let ((*gensym-counter* (length dx-flets)))
+                                (gensym "LAMBDA")))
+                    (original-lambda
+                     (functional-inline-expansion
+                      (lambda-entry-fun (ref-leaf use)))))
+                (aver (typep original-lambda '(cons (eql lambda))))
+                (let ((original-lambda-list (second original-lambda)))
+                  ;; KISS - the closure that you're passing can have 0 or more
+                  ;; mandatory args and nothing else.
+                  (unless (intersection original-lambda-list lambda-list-keywords)
+                    (push `(,tempname ,original-lambda-list
+                             (%funcall ,(nth arg-spec received-args)
+                                       ,@original-lambda-list))
+                          dx-flets)
+                    (setf (nth arg-spec passed-args) `#',tempname)))))))))
+    (when dx-flets
+      (let ((new
+             `(lambda ,received-args
+                (dx-flet ,(nreverse dx-flets)
+                  (,@(if (symbolp fun-name) `(,fun-name) `(funcall #',fun-name))
+                   ,@passed-args)))))
+        (when *debug-auto-dx*
+          (format t "->~%~S~%" new))
+        new))))
+
+;;; This does not work. The intent was to prepend this transform to the list
+;;; of (FUN-INFO-TRANSFORMS INFO) when applicable, in the known fun case.
+;;; But the reason it doesn't work isn't that the transform doesn't transform
+;;; the code - it does; but compiler doesn't appear to respect the DX-FLET.
+(defglobal *dxify-args-transform*
+  (make-transform :type (specifier-type 'function)
+                  :function (lambda (node)
+                              (or (let ((name (combination-fun-source-name node)))
+                                    (dxify-downward-funargs
+                                     node (fun-name-dx-args name) name))
+                                  (give-up-ir1-transform)))
+                  :note "auto-DX"))
 
 ;;; Do IR1 optimizations on a COMBINATION node.
 (declaim (ftype (function (combination) (values)) ir1-optimize-combination))
@@ -861,7 +964,8 @@
       (return-from ir1-optimize-combination))
     (maybe-terminate-block node nil))
   (let ((args (basic-combination-args node))
-        (info (basic-combination-fun-info node)))
+        (info (basic-combination-fun-info node))
+        (kind (basic-combination-kind node)))
     (flet ((clear-reoptimize-args ()
              (dolist (arg args)
                (when arg
@@ -874,7 +978,7 @@
                    (when res
                      (derive-node-type node (coerce-to-values res))
                      (maybe-terminate-block node nil)))))))
-      (ecase (basic-combination-kind node)
+      (ecase kind
         (:local
          (let ((fun (combination-lambda node)))
            (if (eq (functional-kind fun) :let)
@@ -882,7 +986,7 @@
                (propagate-local-call-args node fun))))
         (:error
          (clear-reoptimize-args))
-        (:full
+        ((:full :unknown-keys)
          (clear-reoptimize-args)
          (cond (info
                 ;; This is a known function marked NOTINLINE
@@ -893,51 +997,70 @@
                        (uses (lvar-uses fun))
                        (leaf (when (ref-p uses) (ref-leaf uses))))
                   (multiple-value-bind (type defined-type)
-                      (if (global-var-p leaf)
-                          (values (leaf-type leaf) (leaf-defined-type leaf))
-                          (values nil nil))
-                    (when (and (not (fun-type-p type)) (fun-type-p defined-type))
-                      (validate-call-type node type leaf)))))))
+                      (cond ((global-var-p leaf)
+                             (values (leaf-type leaf) (leaf-defined-type leaf)))
+                            ((eq kind :unknown-keys)
+                             (values (lvar-fun-type fun) nil))
+                            (t
+                             (values nil nil)))
+                    (when (or (and (eq kind :unknown-keys)
+                                   (fun-type-p type))
+                              (and (fun-type-p defined-type)
+                                   (not (fun-type-p type))))
+                      (validate-call-type node type leaf)))
+                  (binding* ((name (and leaf ;; don't want to transform CASTs
+                                        (lvar-fun-name fun))
+                                   :exit-if-null)
+                             (dxable-args (fun-name-dx-args name) :exit-if-null))
+                    (awhen (dxify-downward-funargs node dxable-args name)
+                      (transform-call node it name)))))))
         (:known
          (aver info)
          (clear-reoptimize-args)
          (process-info)
-         (let ((attr (fun-info-attributes info)))
-           (when (constant-fold-call-p node)
-             (constant-fold-call node)
-             (return-from ir1-optimize-combination))
-           (when (and (ir1-attributep attr commutative)
-                      (= (length args) 2)
-                      (constant-lvar-p (first args))
-                      (not (constant-lvar-p (second args))))
-             (setf (basic-combination-args node) (nreverse args))))
+         (unless (eq (combination-kind node) :error) ;; casued by derive-type
+           (let ((attr (fun-info-attributes info)))
+             (when (constant-fold-call-p node)
+               (constant-fold-call node)
+               (return-from ir1-optimize-combination))
+             (when (and (ir1-attributep attr commutative)
+                        (= (length args) 2)
+                        (constant-lvar-p (first args))
+                        (not (constant-lvar-p (second args))))
+               (setf (basic-combination-args node) (nreverse args))))
 
-         (let ((fun (fun-info-optimizer info)))
-           (unless (and fun (funcall fun node))
-             ;; First give the VM a peek at the call
-             (multiple-value-bind (style transform)
-                 (combination-implementation-style node)
-               (ecase style
-                 (:direct
-                  ;; The VM knows how to handle this.
-                  )
-                 (:transform
-                  ;; The VM mostly knows how to handle this.  We need
-                  ;; to massage the call slightly, though.
-                  (transform-call node transform (combination-fun-source-name node)))
-                 ((:default :maybe)
-                  ;; Let transforms have a crack at it.
-                  (dolist (x (fun-info-transforms info))
-                    #!+sb-show
-                    (when *show-transforms-p*
-                      (let* ((lvar (basic-combination-fun node))
-                             (fname (lvar-fun-name lvar t)))
-                        (/show "trying transform" x (transform-function x) "for" fname)))
-                    (unless (ir1-transform node x)
+           (let ((fun-source-name (combination-fun-source-name node))
+                 (optimizer (fun-info-optimizer info)))
+             (unless (and optimizer (funcall optimizer node))
+               ;; First give the VM a peek at the call
+               (multiple-value-bind (style transform)
+                   (combination-implementation-style node)
+                 (ecase style
+                   (:direct
+                    ;; The VM knows how to handle this.
+                    )
+                   (:transform
+                    ;; The VM mostly knows how to handle this.  We need
+                    ;; to massage the call slightly, though.
+                    (transform-call node transform fun-source-name))
+                   ((:default :maybe)
+                    ;; Let transforms have a crack at it.
+                    ;; We should always try with the dxify-args transform,
+                    ;; but ironically it *does* *not* *work* for any function
+                    ;; that has FUNCTION-DESIGNATOR in its arg signature
+                    ;; (pretty much any CL: function). This is just sad.
+                    ;; Are type checks getting in the way?
+                    (dolist (x (fun-info-transforms info))
                       #!+sb-show
                       (when *show-transforms-p*
-                        (/show "quitting because IR1-TRANSFORM result was NIL"))
-                      (return))))))))))))
+                        (let* ((lvar (basic-combination-fun node))
+                               (fname (lvar-fun-name lvar t)))
+                          (/show "trying transform" x (transform-function x) "for" fname)))
+                      (unless (ir1-transform node x)
+                        #!+sb-show
+                        (when *show-transforms-p*
+                          (/show "quitting because IR1-TRANSFORM result was NIL"))
+                        (return)))))))))))))
   (values))
 
 (defun xep-tail-combination-p (node)
@@ -1020,7 +1143,8 @@
 ;;;
 ;;; We return the leaf referenced (NIL if not a leaf) and the
 ;;; FUN-INFO assigned.
-(defun recognize-known-call (call ir1-converting-not-optimizing-p)
+(defun recognize-known-call (call ir1-converting-not-optimizing-p
+                             &optional unknown-keys)
   (declare (type combination call))
   (let* ((ref (lvar-uses (basic-combination-fun call)))
          (leaf (when (ref-p ref) (ref-leaf ref)))
@@ -1028,61 +1152,64 @@
                       (defined-fun-inlinep leaf)
                       :no-chance)))
     (cond
-     ((eq inlinep :notinline)
-      (let ((info (info :function :info (leaf-source-name leaf))))
-        (when info
-          (setf (basic-combination-fun-info call) info))
-        (values nil nil)))
-     ((not (and (global-var-p leaf)
-                (eq (global-var-kind leaf) :global-function)))
-      (values leaf nil))
-     ((and (ecase inlinep
-             (:inline t)
-             (:no-chance nil)
-             ((nil :maybe-inline) (policy call (zerop space))))
-           (defined-fun-p leaf)
-           (defined-fun-inline-expansion leaf)
-           (inline-expansion-ok call))
-      ;; Inline: if the function has already been converted at another call
-      ;; site in this component, we point this REF to the functional. If not,
-      ;; we convert the expansion.
-      ;;
-      ;; For :INLINE case local call analysis will copy the expansion later,
-      ;; but for :MAYBE-INLINE and NIL cases we only get one copy of the
-      ;; expansion per component.
-      ;;
-      ;; FIXME: We also convert in :INLINE & FUNCTIONAL-KIND case below. What
-      ;; is it for?
-      (with-ir1-environment-from-node call
-        (let ((fun (defined-fun-functional leaf)))
-          (if (or (not fun)
-                  (and (eq inlinep :inline) (functional-kind fun)))
-              ;; Convert.
-              (let* ((name (leaf-source-name leaf))
-                     (res (ir1-convert-inline-expansion
-                           name
-                           (defined-fun-inline-expansion leaf)
-                           leaf
-                           inlinep
-                           (info :function :info name))))
-                ;; Allow backward references to this function from following
-                ;; forms. (Reused only if policy matches.)
-                (push res (defined-fun-functionals leaf))
-                (change-ref-leaf ref res)
-                (unless ir1-converting-not-optimizing-p
-                  (locall-analyze-component *current-component*)))
-              ;; If we've already converted, change ref to the converted
-              ;; functional.
-              (change-ref-leaf ref fun))))
-      (values (ref-leaf ref) nil))
-     (t
-      (let ((info (info :function :info (leaf-source-name leaf))))
-        (if info
-            (values leaf
-                    (progn
-                      (setf (basic-combination-kind call) :known)
-                      (setf (basic-combination-fun-info call) info)))
-            (values leaf nil)))))))
+      (unknown-keys
+       (setf (basic-combination-kind call) :unknown-keys)
+       (values leaf nil))
+      ((eq inlinep :notinline)
+       (let ((info (info :function :info (leaf-source-name leaf))))
+         (when info
+           (setf (basic-combination-fun-info call) info))
+         (values nil nil)))
+      ((not (and (global-var-p leaf)
+                 (eq (global-var-kind leaf) :global-function)))
+       (values leaf nil))
+      ((and (ecase inlinep
+              (:inline t)
+              (:no-chance nil)
+              ((nil :maybe-inline) (policy call (zerop space))))
+            (defined-fun-p leaf)
+            (defined-fun-inline-expansion leaf)
+            (inline-expansion-ok call))
+       ;; Inline: if the function has already been converted at another call
+       ;; site in this component, we point this REF to the functional. If not,
+       ;; we convert the expansion.
+       ;;
+       ;; For :INLINE case local call analysis will copy the expansion later,
+       ;; but for :MAYBE-INLINE and NIL cases we only get one copy of the
+       ;; expansion per component.
+       ;;
+       ;; FIXME: We also convert in :INLINE & FUNCTIONAL-KIND case below. What
+       ;; is it for?
+       (with-ir1-environment-from-node call
+         (let ((fun (defined-fun-functional leaf)))
+           (if (or (not fun)
+                   (and (eq inlinep :inline) (functional-kind fun)))
+               ;; Convert.
+               (let* ((name (leaf-source-name leaf))
+                      (res (ir1-convert-inline-expansion
+                            name
+                            (defined-fun-inline-expansion leaf)
+                            leaf
+                            inlinep
+                            (info :function :info name))))
+                 ;; Allow backward references to this function from following
+                 ;; forms. (Reused only if policy matches.)
+                 (push res (defined-fun-functionals leaf))
+                 (change-ref-leaf ref res)
+                 (unless ir1-converting-not-optimizing-p
+                   (locall-analyze-component *current-component*)))
+               ;; If we've already converted, change ref to the converted
+               ;; functional.
+               (change-ref-leaf ref fun))))
+       (values (ref-leaf ref) nil))
+      (t
+       (let ((info (info :function :info (leaf-source-name leaf))))
+         (if info
+             (values leaf
+                     (progn
+                       (setf (basic-combination-kind call) :known)
+                       (setf (basic-combination-fun-info call) info)))
+             (values leaf nil)))))))
 
 ;;; Check whether CALL satisfies TYPE. If so, apply the type to the
 ;;; call, and do MAYBE-TERMINATE-BLOCK and return the values of
@@ -1096,9 +1223,6 @@
   (let* ((where (when fun (leaf-where-from fun)))
          (same-file-p (eq :defined-here where)))
     (cond ((not (fun-type-p type))
-           (aver (multiple-value-bind (val win)
-                     (csubtypep type (specifier-type 'function))
-                   (or val (not win))))
            ;; Using the defined-type too early is a bit of a waste: during
            ;; conversion we cannot use the untrusted ASSERT-CALL-TYPE, etc.
            (when (and fun (not ir1-converting-not-optimizing-p))
@@ -1120,17 +1244,22 @@
                    (assert-call-type call defined-type nil)
                    (maybe-terminate-block call ir1-converting-not-optimizing-p)))))
            (recognize-known-call call ir1-converting-not-optimizing-p))
-          ((valid-fun-use call type
-                          :argument-test #'always-subtypep
-                          :result-test nil
-                          :lossage-fun #'compiler-warn
-                          :unwinnage-fun #'compiler-notify)
-           (assert-call-type call type)
-           (maybe-terminate-block call ir1-converting-not-optimizing-p)
-           (recognize-known-call call ir1-converting-not-optimizing-p))
           (t
-           (setf (combination-kind call) :error)
-           (values nil nil)))))
+           (multiple-value-bind (valid unwinnage unknown-keys)
+               (valid-fun-use call type
+                              :argument-test #'always-subtypep
+                              :result-test nil
+                              :lossage-fun #'compiler-warn
+                              :unwinnage-fun #'compiler-notify)
+             (declare (ignore unwinnage))
+             (cond (valid
+                    (assert-call-type call type)
+                    (maybe-terminate-block call ir1-converting-not-optimizing-p)
+                    (setf (combination-kind call) :full)
+                    (recognize-known-call call ir1-converting-not-optimizing-p unknown-keys))
+                   (t
+                    (setf (combination-kind call) :error)
+                    (values nil nil))))))))
 
 ;;; This is called by IR1-OPTIMIZE when the function for a call has
 ;;; changed. If the call is local, we try to LET-convert it, and
@@ -1154,8 +1283,7 @@
        (multiple-value-bind (leaf info)
            (let* ((uses (lvar-uses fun-lvar))
                   (leaf (when (ref-p uses) (ref-leaf uses))))
-             (validate-call-type call (or (lvar-fun-type fun-lvar)
-                                          (lvar-type fun-lvar)) leaf))
+             (validate-call-type call (lvar-fun-type fun-lvar) leaf))
          (cond ((functional-p leaf)
                 (convert-call-if-possible
                  (lvar-uses (basic-combination-fun call))
@@ -1841,7 +1969,8 @@
                                          (leaf-type var)))
                      (propagate-to-refs var type)
                      (unless (preserve-single-use-debug-var-p call var)
-                       (update-dependent-casts leaf arg)
+                       (update-lvar-dependencies leaf arg)
+                       (propagate-ref-dx use arg var)
                        (let ((use-component (node-component use)))
                          (substitute-leaf-if
                           (lambda (ref)
@@ -1962,7 +2091,7 @@
                  (setf (lvar-reoptimize arg) nil))
            (when fun-changed
              (setf (lvar-reoptimize fun) nil)
-             (let ((type (lvar-type fun)))
+             (let ((type (lvar-fun-type fun t)))
                (when (fun-type-p type)
                  (derive-node-type node (fun-type-returns type))))
              (maybe-terminate-block node nil)
@@ -2250,8 +2379,12 @@
         (value (cast-value cast)))
     (cond ((not (may-delete-cast cast))
            nil)
-          ((values-subtypep (lvar-derived-type value)
-                            (cast-asserted-type cast))
+          ((or
+            ;; If it's a call (decided by may-delete-cast), it'll do
+            ;; all the aproriate checking
+            (function-designator-cast-p cast)
+            (values-subtypep (lvar-derived-type value)
+                             (cast-asserted-type cast)))
            (delete-cast cast)
            t)
           ((and (listp (lvar-uses value))
@@ -2298,7 +2431,8 @@
             ;; run-time and %CHECK-BOUND ir2-converter will signal at
             ;; compile-time if it survives further stages of ir1
             ;; optimization.
-            ((bound-cast-p cast))
+            ((and (bound-cast-p cast)
+                  (bound-cast-check cast)))
             (t
              (let ((context (node-source-form cast))
                    (detail (lvar-all-sources (cast-value cast))))

@@ -50,12 +50,12 @@
                                 compilation-speed)))
             (if (zerop safety)
                 (if (>= speed eff-space) :fast :small)
-                (if (>= speed eff-space) :fast-safe :safe)))))
+                (if (>= speed eff-space) :fast-safe :small-safe)))))
 
 ;;; Return true if LTN-POLICY is a safe policy.
 (defun ltn-policy-safe-p (ltn-policy)
   (ecase ltn-policy
-    ((:safe :fast-safe) t)
+    ((:safe :fast-safe :small-safe) t)
     ((:small :fast) nil)))
 
 ;;; For possibly-new blocks, make sure that there is an associated
@@ -221,13 +221,12 @@
 ;;; of LVAR's DEST, and called in the order that the lvarss are
 ;;; received. Otherwise the IR2-BLOCK-POPPED and
 ;;; IR2-COMPONENT-VALUES-FOO would get all messed up.
-(defun annotate-unknown-values-lvar (lvar)
+(defun annotate-unknown-values-lvar (lvar &optional unused-count)
   (declare (type lvar lvar))
-
   (aver (not (lvar-dynamic-extent lvar)))
   (let ((2lvar (make-ir2-lvar nil)))
     (setf (ir2-lvar-kind 2lvar) :unknown)
-    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations))
+    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations unused-count))
     (setf (lvar-info lvar) 2lvar))
 
   ;; The CAST chain with corresponding lvars constitute the same
@@ -373,7 +372,7 @@
            (setf (basic-combination-info call) :full)
            (annotate-fun-lvar (basic-combination-fun call) nil)
            (dolist (arg (reverse args))
-             (annotate-unknown-values-lvar arg))
+             (annotate-unknown-values-lvar arg t))
            (flush-full-call-tail-transfer call))))
 
   (values))
@@ -749,10 +748,6 @@
           (when (and (or (not guard) (funcall guard))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
-                     ;; :SAFE is also considered to be :SMALL-SAFE,
-                     ;; while the template cost describes time cost;
-                     ;; so the fact that (< (t-cost try) (t-cost
-                     ;; template)) does not mean that TRY is better
                      (not (and (eq ltn-policy :safe)
                                (eq (template-ltn-policy try) :fast-safe)))
                      (or verbose-p
@@ -877,7 +872,7 @@
     (labels ((unlink (lvar)
                (do-uses (node lvar)
                  (if (cast-p node)
-                     (unlink (cast-value cast))
+                     (unlink (cast-value node))
                      (setf (node-lvar node) nil)))))
       (unlink (cast-value cast))))
   (values))
@@ -927,7 +922,7 @@
       (combination
        (ecase (basic-combination-kind node)
          (:local (ltn-analyze-local-call node))
-         ((:full :error) (ltn-default-call node))
+         ((:full :error :unknown-keys) (ltn-default-call node))
          (:known
           (ltn-analyze-known-call node))))
       (cif (ltn-analyze-if node))

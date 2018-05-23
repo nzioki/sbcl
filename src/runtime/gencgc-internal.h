@@ -97,17 +97,20 @@ struct page {
     // !!! If bit positions are changed, be sure to reflect the changes into
     // page_extensible_p() as well as ALLOCATION-INFORMATION in sb-introspect
     unsigned char
-        /*  000 free
-         *  ?01 boxed data
-         *  ?10 unboxed data
-         *  ?11 code
-         *  1?? open region
-         *
+        /*
+         * The low 4 bits of 'type' are interpreted as:
+         *  0000 free
+         *  ?001 boxed data
+         *  ?010 unboxed data
+         *  ?011 code
+         *  1??? open region
+         * The high bit indicates that the page holds part of or the entirety
+         * of a single object and no other objects.
          * Constants for this field are defined in gc-internal.h, the
          * xxx_PAGE_FLAG definitions.
          *
          * If the page is free, all the following fields are zero. */
-        allocated :4,
+        type :5,
         /* This is set when the page is write-protected. This should
          * always reflect the actual write_protect status of a page.
          * (If the page is written into, we catch the exception, make
@@ -120,11 +123,7 @@ struct page {
         write_protected_cleared :1,
         /* If this page should not be moved during a GC then this flag
          * is set. It's only valid during a GC for allocated pages. */
-        dont_move :1,
-        /* If the page is part of a large object then this flag is
-         * set. No other objects should be allocated to these pages.
-         * This is only valid when the page is allocated. */
-        large_object :1;
+        pinned :1;
 
     /* the generation that this page belongs to. This should be valid
      * for all pages that may have objects allocated, even current
@@ -134,11 +133,11 @@ struct page {
 };
 extern struct page *page_table;
 #ifdef LISP_FEATURE_BIG_ENDIAN
-# define WP_CLEARED_BIT      (1<<2)
-# define WRITE_PROTECTED_BIT (1<<3)
+# define WP_CLEARED_FLAG      (1<<1)
+# define WRITE_PROTECTED_FLAG (1<<2)
 #else
-# define WRITE_PROTECTED_BIT (1<<4)
-# define WP_CLEARED_BIT      (1<<5)
+# define WRITE_PROTECTED_FLAG (1<<5)
+# define WP_CLEARED_FLAG      (1<<6)
 #endif
 
 struct __attribute__((packed)) corefile_pte {
@@ -155,12 +154,12 @@ extern page_index_t page_table_pages;
 /* forward declarations */
 
 void update_dynamic_space_free_pointer(void);
-void gc_close_region(int page_type_flag, struct alloc_region *alloc_region);
-static void inline ensure_region_closed(int page_type_flag,
-                                        struct alloc_region *alloc_region)
+void gc_close_region(struct alloc_region *alloc_region, int page_type_flag);
+static void inline ensure_region_closed(struct alloc_region *alloc_region,
+                                        int page_type_flag)
 {
     if (alloc_region->start_addr)
-        gc_close_region(page_type_flag, alloc_region);
+        gc_close_region(alloc_region, page_type_flag);
 }
 
 static void inline gc_set_region_empty(struct alloc_region *region)
@@ -196,12 +195,14 @@ find_page_index(void *addr)
     return (-1);
 }
 
+#define SINGLE_OBJECT_FLAG (1<<4)
+#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
 #ifdef PIN_GRANULARITY_LISPOBJ
 #ifndef GENCGC_IS_PRECISE
 #error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
 #endif
 #define page_has_smallobj_pins(page) \
-  (page_table[page].dont_move && !page_table[page].large_object)
+  (page_table[page].pinned && !page_single_obj_p(page))
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
@@ -284,7 +285,7 @@ extern struct fixedobj_page *fixedobj_pages;
 #define fixedobj_page_obj_size(i) fixedobj_pages[i].attr.parts.obj_size
 #endif
 
-extern page_index_t last_free_page;
+extern page_index_t next_free_page;
 
 extern uword_t
 walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),

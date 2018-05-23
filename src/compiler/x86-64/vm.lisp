@@ -13,23 +13,6 @@
 
 ;;;; register specs
 
-(defconstant-eqx +byte-register-names+
-    #("AL"  "CL"  "DL"   "BL"   "SPL"  "BPL"  "SIL"  "DIL"
-      "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B")
-  #'equalp)
-(defconstant-eqx +word-register-names+
-    #("AX"  "CX"  "DX"   "BX"   "SP"   "BP"   "SI"   "DI"
-      "R8W" "R9W" "R10W" "R11W" "R12W" "R13W" "R14W" "R15W")
-  #'equalp)
-(defconstant-eqx +dword-register-names+
-    #("EAX" "ECX" "EDX"  "EBX"  "ESP"  "EBP"  "ESI"  "EDI"
-      "R8D" "R9D" "R10D" "R11D" "R12D" "R13D" "R14D" "R15D")
-  #'equalp)
-(defconstant-eqx +qword-register-names+
-    #("RAX" "RCX" "RDX" "RBX" "RSP" "RBP" "RSI" "RDI"
-      "R8"  "R9"  "R10" "R11" "R12" "R13" "R14" "R15")
-  #'equalp)
-
 (macrolet ((defreg (name offset size)
              (declare (ignore size))
              `(eval-when (:compile-toplevel :load-toplevel :execute)
@@ -37,15 +20,47 @@
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
                 (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           ;; FIXME: It looks to me as though DEFREGSET should also
-           ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             ;; FIXME: this would be DEFCONSTANT-EQX were it not
+             ;; for all the style-warnings about earmuffs on a constant.
+             `(defglobal ,name
                   (list ,@(mapcar (lambda (name)
                                     (symbolicate name "-OFFSET"))
-                                  regs))))))
+                                  regs))))
+           ;; Define general-purpose regs in a more concise way, as we seem
+           ;; to (redundantly) want each register's offset for dword and qword
+           ;; even though the value of the constant is the same.
+           ;; We don't need constants for the byte- or word-sized offsets.
+           (define-gprs (want-offsets offsets-list names array)
+             `(progn
+                (defconstant-eqx ,names ,array #'equalp)
+                ;; We need the constants evaluable because of the DEFGLOBAL
+                ;; which is needed because of forms such as #.*qword-regs*
+                (eval-when (:compile-toplevel :load-toplevel :execute)
+                  ,@(when want-offsets
+                      (let ((i 0))
+                        (map 'list
+                             (lambda (x)
+                               `(defconstant ,(symbolicate x "-OFFSET")
+                                  ,(prog1 (* i 2) (incf i))))
+                             array))))
+                (defglobal ,offsets-list
+                    (remove-if (lambda (x)
+                                 (member x `(,r11-offset ; temp reg
+                                             ,r13-offset ; thread base
+                                             ,rsp-offset
+                                             ,rbp-offset)))
+                               (loop for i below 16 collect (* i 2)))))))
 
+  (define-gprs t *qword-regs* +qword-register-names+
+    #("RAX" "RCX" "RDX" "RBX" "RSP" "RBP" "RSI" "RDI"
+      "R8"  "R9"  "R10" "R11" "R12" "R13" "R14" "R15"))
+  (define-gprs t *dword-regs* +dword-register-names+
+    #("EAX" "ECX" "EDX"  "EBX"  "ESP"  "EBP"  "ESI"  "EDI"
+      "R8D" "R9D" "R10D" "R11D" "R12D" "R13D" "R14D" "R15D"))
+  (define-gprs nil *word-regs* +word-register-names+
+    #("AX"  "CX"  "DX"   "BX"   "SP"   "BP"   "SI"   "DI"
+      "R8W" "R9W" "R10W" "R11W" "R12W" "R13W" "R14W" "R15W"))
   ;; byte registers
   ;;
   ;; Note: the encoding here is different than that used by the chip.
@@ -57,92 +72,9 @@
   ;; add special cases into the code generation. The overlap doesn't
   ;; therefore exist anymore, but the numbering hasn't been changed
   ;; to reflect this.
-  (defreg al    0 :byte)
-  (defreg cl    2 :byte)
-  (defreg dl    4 :byte)
-  (defreg bl    6 :byte)
-  (defreg sil  12 :byte)
-  (defreg dil  14 :byte)
-  (defreg r8b  16 :byte)
-  (defreg r9b  18 :byte)
-  (defreg r10b 20 :byte)
-  (defreg r11b 22 :byte)
-  (defreg r12b 24 :byte)
-  (defreg r13b 26 :byte)
-  (defreg r14b 28 :byte)
-  (defreg r15b 30 :byte)
-  (defregset *byte-regs*
-      al cl dl bl sil dil r8b r9b r10b
-      #+nil r11b #+nil r12b r13b r14b r15b)
-
-  ;; word registers
-  (defreg ax 0 :word)
-  (defreg cx 2 :word)
-  (defreg dx 4 :word)
-  (defreg bx 6 :word)
-  (defreg sp 8 :word)
-  (defreg bp 10 :word)
-  (defreg si 12 :word)
-  (defreg di 14 :word)
-  (defreg r8w  16 :word)
-  (defreg r9w  18 :word)
-  (defreg r10w 20 :word)
-  (defreg r11w 22 :word)
-  (defreg r12w 24 :word)
-  (defreg r13w 26 :word)
-  (defreg r14w 28 :word)
-  (defreg r15w 30 :word)
-  (defregset *word-regs* ax cx dx bx si di r8w r9w r10w
-             #+nil r11w #+nil r12w r13w r14w r15w)
-
-  ;; double word registers
-  (defreg eax 0 :dword)
-  (defreg ecx 2 :dword)
-  (defreg edx 4 :dword)
-  (defreg ebx 6 :dword)
-  (defreg esp 8 :dword)
-  (defreg ebp 10 :dword)
-  (defreg esi 12 :dword)
-  (defreg edi 14 :dword)
-  (defreg r8d  16 :dword)
-  (defreg r9d  18 :dword)
-  (defreg r10d 20 :dword)
-  (defreg r11d 22 :dword)
-  (defreg r12d 24 :dword)
-  (defreg r13d 26 :dword)
-  (defreg r14d 28 :dword)
-  (defreg r15d 30 :dword)
-  (defregset *dword-regs* eax ecx edx ebx esi edi r8d r9d r10d
-             #+nil r11d #+nil r12w r13d r14d r15d)
-
-  ;; quadword registers
-  (defreg rax 0 :qword)
-  (defreg rcx 2 :qword)
-  (defreg rdx 4 :qword)
-  (defreg rbx 6 :qword)
-  (defreg rsp 8 :qword)
-  (defreg rbp 10 :qword)
-  (defreg rsi 12 :qword)
-  (defreg rdi 14 :qword)
-  (defreg r8  16 :qword)
-  (defreg r9  18 :qword)
-  (defreg r10 20 :qword)
-  (defreg r11 22 :qword)
-  (defreg r12 24 :qword)
-  (defreg r13 26 :qword)
-  (defreg r14 28 :qword)
-  (defreg r15 30 :qword)
-  ;; for no good reason at the time, r12 and r13 were missed from the
-  ;; list of qword registers.  However
-  ;; <jsnell> r13 is already used as temporary [#lisp irc 2005/01/30]
-  ;; and we're now going to use r12 for the struct thread*
-  ;;
-  ;; Except that now we use r11 instead of r13 as the temporary,
-  ;; since it's got a more compact encoding than r13, and experimentally
-  ;; the temporary gets used more than the other registers that are never
-  ;; wired. -- JES, 2005-11-02
-  (defregset *qword-regs* rax rcx rdx rbx rsi rdi
-             r8 r9 r10 #+nil r11 #+nil r12 r13  r14 r15)
+  (define-gprs nil *byte-regs* +byte-register-names+
+    #("AL"  "CL"  "DL"   "BL"   "SPL"  "BPL"  "SIL"  "DIL"
+      "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B"))
 
   ;; floating point registers
   (defreg float0 0 :float)
@@ -199,8 +131,8 @@
 
 ;;;; SC definitions
 
-(!define-storage-classes
-
+(eval-when (:compile-toplevel :execute)
+(defparameter *storage-class-defs* '(
   ;; non-immediate constants in the constant pool
   (constant constant)
 
@@ -283,8 +215,8 @@
                             #!+sb-unicode #.*qword-regs*
                  #!+sb-unicode #!+sb-unicode
                  :element-size 2
-                 #!-sb-unicode #!-sb-unicode
-                 :reserve-locations (#.al-offset)
+;                 #!-sb-unicode #!-sb-unicode
+;                 :reserve-locations (#.eax-offset)
                  :constant-scs (immediate)
                  :save-p t
                  :alternate-scs (character-stack))
@@ -316,15 +248,12 @@
   ;; temporaries.
   (word-reg registers
             :locations #.*word-regs*
-            :element-size 2
-            )
+            :element-size 2)
   (dword-reg registers
             :locations #.*dword-regs*
-            :element-size 2
-            )
+            :element-size 2)
   (byte-reg registers
-            :locations #.*byte-regs*
-            )
+            :locations #.*byte-regs*)
 
   ;; that can go in the floating point registers
 
@@ -379,9 +308,8 @@
                   :alternate-scs (single-sse-stack))
 
   (catch-block stack :element-size catch-block-size)
-  (unwind-block stack :element-size unwind-block-size))
+  (unwind-block stack :element-size unwind-block-size)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
   '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
 (defparameter *word-sc-names* '(word-reg))
@@ -399,36 +327,56 @@
 (defparameter *complex-sc-names* '(complex-single-reg complex-single-stack
                                    complex-double-reg complex-double-stack))
 #!+sb-simd-pack
+;;; FIXME: there is no SSE-STACK storage class
 (defparameter *oword-sc-names* '(sse-reg int-sse-reg single-sse-reg double-sse-reg
                                  sse-stack int-sse-stack single-sse-stack double-sse-stack))
 ) ; EVAL-WHEN
+(!define-storage-classes
+  . #.(mapcar (lambda (class-spec)
+                (let ((size
+                       (case (car class-spec)
+                         (#.*oword-sc-names*   :oword)
+                         (#.*qword-sc-names*   :qword)
+                         (#.*dword-sc-names*   :dword)
+                         (#.*word-sc-names*    :word)
+                         (#.*byte-sc-names*    :byte)
+                         (#.*float-sc-names*   :float)
+                         (#.*double-sc-names*  :double)
+                         (#.*complex-sc-names* :complex))))
+                  (append class-spec (if size (list :operand-size size)))))
+              *storage-class-defs*))
 
 ;;;; miscellaneous TNs for the various registers
 
-(macrolet ((def-misc-reg-tns (sc-name &rest reg-names)
+(macrolet ((def-gpr-tns (sc-name name-array &aux (i 0))
+             `(progn
+                ,@(map 'list
+                       (lambda (reg-name)
+                         `(define-load-time-global ,(symbolicate reg-name "-TN")
+                              (make-random-tn :kind :normal
+                                              :sc (sc-or-lose ',sc-name)
+                                              :offset ,(prog1 (* i 2) (incf i)))))
+                       (symbol-value name-array))))
+           (def-fpr-tns (sc-name &rest reg-names)
              (collect ((forms))
-                      (dolist (reg-name reg-names)
-                        (let ((tn-name (symbolicate reg-name "-TN"))
-                              (offset-name (symbolicate reg-name "-OFFSET")))
-                          ;; FIXME: It'd be good to have the special
-                          ;; variables here be named with the *FOO*
-                          ;; convention.
-                          (forms `(defglobal ,tn-name
-                                    (make-random-tn :kind :normal
-                                                    :sc (sc-or-lose ',sc-name)
-                                                    :offset
-                                                    ,offset-name)))))
-                      `(progn ,@(forms)))))
-
-  (def-misc-reg-tns unsigned-reg rax rbx rcx rdx rbp rsp rdi rsi
-                    r8 r9 r10 r11 r12 r13 r14 r15)
-  (def-misc-reg-tns dword-reg eax ebx ecx edx ebp esp edi esi
-                    r8d r9d r10d r11d r12d r13d r14d r15d)
-  (def-misc-reg-tns word-reg ax bx cx dx bp sp di si
-                    r8w r9w r10w r11w r12w r13w r14w r15w)
-  (def-misc-reg-tns byte-reg al cl dl bl sil dil r8b r9b r10b
-                    r11b r12b r13b r14b r15b)
-  (def-misc-reg-tns single-reg
+               (dolist (reg-name reg-names `(progn ,@(forms)))
+                 (let ((tn-name (symbolicate reg-name "-TN"))
+                       (offset-name (symbolicate reg-name "-OFFSET")))
+                   (forms `(define-load-time-global ,tn-name
+                               (make-random-tn :kind :normal
+                                               :sc (sc-or-lose ',sc-name)
+                                               :offset ,offset-name))))))))
+  (def-gpr-tns unsigned-reg +qword-register-names+)
+  (def-gpr-tns dword-reg +dword-register-names+)
+  (def-gpr-tns word-reg +word-register-names+)
+  (def-gpr-tns byte-reg +byte-register-names+)
+  ;; RIP is not an addressable register, but this global var acts as
+  ;; a moniker for it in an effective address so that the EA structure
+  ;; does not need to accept a symbol (such as :RIP) for the base reg.
+  ;; Because there is no :OFFSET, unanticipated use will be caught.
+  (define-load-time-global rip-tn
+      (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)))
+  (def-fpr-tns single-reg
       float0 float1 float2 float3 float4 float5 float6 float7
       float8 float9 float10 float11 float12 float13 float14 float15))
 
@@ -439,30 +387,28 @@
                          (:byte 'byte-reg)
                          (:word 'word-reg)
                          (:dword 'dword-reg)
-                         (:qword 'unsigned-reg)
-                         ;; PC inside immobile code can fit into 32 bits
-                         (:immobile-code-pc
-                          (cond #!+immobile-code
-                                (sb!c::*code-is-immobile*
-                                 'dword-reg)
-                                (t
-                                 'unsigned-reg)))))
+                         (:qword 'unsigned-reg)))
                   :offset (tn-offset tn)))
 
 ;; A register that's never used by the code generator, and can therefore
 ;; be used as an assembly temporary in cases where a VOP :TEMPORARY can't
 ;; be used.
-(defglobal temp-reg-tn r11-tn)
+(define-symbol-macro temp-reg-tn r11-tn)
 
 ;;; TNs for registers used to pass arguments
-(defparameter *register-arg-tns*
+;;; This can't be a DEFCONSTANT-EQX, for a similar reason to above, but worse.
+;;; Among the problems, RECEIVE-UNKNOWN-VALUES uses (FIRST *REGISTER-ARG-TNS*)
+;;; and so the compiler knows that the object is constant and wants to dump it
+;;; as such; it has no name, so it's not even reasonable to expect it to
+;;; use the corresponding object in RDX-TN.
+(define-load-time-global *register-arg-tns*
   (mapcar (lambda (register-arg-name)
             (symbol-value (symbolicate register-arg-name "-TN")))
           *register-arg-names*))
 
-(defglobal thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                  :offset r12-offset))
+;; r13 is preferable to r12 because 12 is an alias of 4 in ModRegRM, which
+;; implies use of a SIB byte with no index register for fixed displacement.
+(define-symbol-macro thread-base-tn r13-tn)
 
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
@@ -570,22 +516,18 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (let* ((sc-name (sc-name sc))
-              (index (ash offset -1))
-              (name-vec (cond ((member sc-name *byte-sc-names*)
-                               +byte-register-names+)
-                              ((member sc-name *word-sc-names*)
-                               +word-register-names+)
-                              ((member sc-name *dword-sc-names*)
-                               +dword-register-names+)
-                              ((member sc-name *qword-sc-names*)
-                               +qword-register-names+))))
+       (let ((index (ash offset -1))
+             (name-vec (case (sb!c:sc-operand-size sc)
+                         (:byte  +byte-register-names+)
+                         (:word  +word-register-names+)
+                         (:dword +dword-register-names+)
+                         (:qword +qword-register-names+))))
          (or (and name-vec
                   (evenp offset)
                   (< -1 index (length name-vec))
                   (svref name-vec index))
              ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
+             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
       (float-registers (format nil "FLOAT~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))

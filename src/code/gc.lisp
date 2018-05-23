@@ -87,7 +87,7 @@
 ;;; ever allocated by adding this to the number of bytes currently
 ;;; allocated and never freed.)
 (declaim (type unsigned-byte *n-bytes-freed-or-purified*))
-(defglobal *n-bytes-freed-or-purified* 0)
+(define-load-time-global *n-bytes-freed-or-purified* 0)
 (defun gc-reinit ()
   (setq *gc-inhibit* nil)
   (gc)
@@ -272,7 +272,7 @@ statistics are appended to it."
   ;; another GC. FIXME: it can potentially exceed maximum interrupt
   ;; nesting by triggering GCs.
   ;;
-  ;; Can that be avoided by having the finalizers and hooks run only
+  ;; Can that be avoided by having the hooks run only
   ;; from the outermost SUB-GC? If the nested GCs happen in interrupt
   ;; handlers that's not enough.
   ;;
@@ -285,13 +285,26 @@ statistics are appended to it."
   ;;    don't want to run user code in such a case.
   ;;
   ;; The long-term solution will be to keep a separate thread for
-  ;; finalizers and after-gc hooks.
+  ;; after-gc hooks.
+  ;; Finalizers are in a separate thread (usually),
+  ;; but it's not permissible to invoke CONDITION-NOTIFY from a
+  ;; dying thread, so we still need the guard for that, but not
+  ;; the guard for whether interupts are enabled.
   (when (sb!thread:thread-alive-p sb!thread:*current-thread*)
-    (when *allow-with-interrupts*
-      (sb!thread::without-thread-waiting-for ()
-        (with-interrupts
-          (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))))
+    (let ((threadp #!+sb-thread (%instancep sb!impl::*finalizer-thread*)))
+      (when threadp
+        ;; It's OK to frob a condition variable regardless of
+        ;; *allow-with-interrupts*, and probably OK to start a thread.
+        ;; For consistency with the previous behavior, we delay finalization
+        ;; if there is no finalizer thread and interrupts are disabled.
+        ;; That's my excuse anyway, not having looked more in-depth.
+        (run-pending-finalizers))
+      (when *allow-with-interrupts*
+        (sb!thread::without-thread-waiting-for ()
+         (with-interrupts
+           (unless threadp
+             (run-pending-finalizers))
+           (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))))
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
@@ -470,3 +483,8 @@ Experimental: interface subject to change."
     (alien-funcall (extern-alien "generation_average_age"
                                  (function double generation-index-t))
                    generation))
+
+(declaim (inline sb!vm:is-lisp-pointer))
+(defun sb!vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
+  #!-64-bit (oddp addr)
+  #!+64-bit (not (logtest (logxor addr 3) 3)))

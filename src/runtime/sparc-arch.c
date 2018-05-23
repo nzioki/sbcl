@@ -249,7 +249,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(*os_context_pc_addr(context)));
-    int register_offset = code >> 5 & 0x1f;
+    int register_offset = code >> 8 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -326,7 +326,7 @@ static void sigill_handler(int signal, siginfo_t *siginfo,
         unsigned int* pc = (unsigned int*) siginfo->si_addr;
 
         inst = *pc;
-        trap = inst & 0x1f;
+        trap = inst & 0xff;
         handle_trap(context,trap);
     }
     else if ((siginfo->si_code) == ILL_ILLTRP
@@ -388,8 +388,12 @@ void arch_install_interrupt_handlers()
  * Insert the necessary jump instructions at the given address.
  */
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
    * Make JMP to function entry.
    *
@@ -440,11 +444,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

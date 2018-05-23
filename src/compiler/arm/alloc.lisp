@@ -13,9 +13,9 @@
 
 (define-vop (list-or-list*)
   (:args (things :more t :scs (control-stack)))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (any-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:info num)
@@ -70,17 +70,16 @@
 ;;;; Special purpose inline allocators.
 #!-gencgc
 (define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
+  ;; BOXED is a count of words as a fixnum; it is therefore also a byte count
+  ;; as a raw value because n-fixnum-tag-bits = word-shift.
+  (:args (boxed :scs (any-reg))
          (unboxed-arg :scs (any-reg)))
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:temporary (:scs (non-descriptor-reg)) size)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:generator 100
-    (inst add boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst bic boxed boxed lowtag-mask)
     (inst mov unboxed (lsr unboxed-arg word-shift))
     (inst add unboxed unboxed lowtag-mask)
     (inst bic unboxed unboxed lowtag-mask)
@@ -108,7 +107,7 @@
         (storew name result fdefn-name-slot other-pointer-lowtag)
         (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
         (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label undefined-tramp-fixup)
         (inst word (make-fixup 'undefined-tramp :assembly-routine))))))
 
@@ -160,7 +159,7 @@
   (:generator 1
     (let ((fixup (gen-label)))
       (inst load-from-label result lip fixup)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup)
         (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine))))))
 

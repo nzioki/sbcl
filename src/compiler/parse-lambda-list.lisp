@@ -9,8 +9,6 @@
 
 (in-package "SB!C")
 
-(/show0 "parse-lambda-list.lisp 12")
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defconstant-eqx lambda-list-parser-states
     #(:required &optional &rest &more &key &aux &environment &whole
@@ -1161,14 +1159,21 @@
           (append whole env (ds-lambda-list-variables parse nil)))
     ;; Maybe kill docstring, but only under the cross-compiler.
     #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq docstring nil)
+    ;; Note that we *NEVER* declare macro lambdas as a toplevel named lambda.
+    ;; Code such as:
+    ;;  `(setf (symbol-function ',myfun) ,(make-macro-lambda whatever))
+    ;; with the intent to render MYFUN as having status as a known global function
+    ;; ("known" in the sense of existing at all, and preventing an "undefined"
+    ;; warning, _not_ "known" in the sense of 'fndb' knowing about it specially),
+    ;; then that code is misguided.  Macro-like objects can not cause global
+    ;; function names to be defined. Only DEFUN can do that.
     (values `(,@(if lambda-name `(named-lambda ,lambda-name) '(lambda))
-                  (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
+                (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
               ,@(when (and docstring (eq doc-string-allowed :internal))
                   (prog1 (list docstring) (setq docstring nil)))
               ;; MACROLET doesn't produce an object capable of reflection,
               ;; so don't bother inserting a different lambda-list.
               ,@(unless (eq kind 'macrolet)
-
                   `((declare ,declared-lambda-list)))
               ,@(if outer-decls (list outer-decls))
               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
@@ -1212,5 +1217,3 @@
          ;; It is harmful to the space-saving effect of this function
          ;; if reconstituting the list results in an unnecessary copy.
          (if (equal new lambda-list) lambda-list new))))))
-
-(/show0 "parse-lambda-list.lisp end of file")

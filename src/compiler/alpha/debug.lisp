@@ -97,7 +97,7 @@
         (inst subq temp (- other-pointer-lowtag lowtag) temp))
       (inst subq thing temp code)
       (emit-label done)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label bogus)
         (move null-tn code)
         (inst br zero-tn done)))))
@@ -122,7 +122,7 @@
 (define-vop (get-lisp-obj-address)
   (:policy :fast-safe)
   (:translate get-lisp-obj-address)
-  (:args (thing :scs (descriptor-reg) :target result))
+  (:args (thing :scs (descriptor-reg any-reg) :target result))
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 1

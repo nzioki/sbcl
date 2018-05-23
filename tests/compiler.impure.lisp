@@ -25,8 +25,6 @@
   (sb-ext:exit :code 104))
 
 (load "compiler-test-util.lisp")
-(use-package "TEST-UTIL")
-(use-package "ASSERTOID")
 
 ;;; Old CMU CL code assumed that the names of "keyword" arguments are
 ;;; necessarily self-evaluating symbols, but ANSI Common Lisp allows
@@ -2852,3 +2850,45 @@
 (defun blah (x) (- x))
 (with-test (:name :foldable-wild-args-fun)
   (assert (eql (funcall (checked-compile '(lambda () (blah (+ 1 2))))) -3)))
+
+
+(declaim (ftype (function * (values cons &optional)) safety-zero-return-checking)
+         (inline safety-zero-return-checking))
+(defun safety-zero-return-checking (x)
+  x)
+
+(with-test (:name :safety-zero-return-checking)
+  (assert (nth-value 1 (checked-compile `(lambda ()
+                                           (declare (optimize (safety 0)))
+                                           (safety-zero-return-checking 1))
+                                        :allow-warnings t))))
+
+(with-test (:name :inline-macrolet-debug-0)
+  (let* ((fun (gensym "FUN"))
+         (fun (eval
+               `(locally (declare (optimize (debug 0)))
+                  (macrolet ((macro () 10))
+                    (proclaim '(inline ,fun))
+                    (defun ,fun () (macro)))
+                  (lambda () (,fun))))))
+    (assert (= (funcall fun) 10))))
+
+(with-test (:name :substitute-lvar-updating-lvar-dependenceis)
+  (let ((name (gensym)))
+    (proclaim `(ftype (function * (values number &optional))
+                      ,name))
+    (checked-compile-and-assert
+     ()
+     `(sb-int:named-lambda ,name (x fun)
+        (block nil
+          (labels
+              ((snoop ()
+                 (return
+                   (funcall fun))))
+            (declare (inline snoop))
+            (when (plusp x)
+              (snoop))
+            (when (plusp x)
+              (snoop))
+            33)))
+     ((10 (constantly 131)) 131))))

@@ -24,8 +24,9 @@
             sb!vm::zero-tn
             sb!vm::zero-offset sb!vm::null-offset sb!vm::alloc-offset)))
 
+(defconstant +disassem-inst-alignment-bytes+ sb!vm:n-word-bytes)
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf *assem-scheduler-p* t)
   (setf *assem-max-locations* 100))
 
 ;;; Constants, types, conversion functions, some disassembler stuff.

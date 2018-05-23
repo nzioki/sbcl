@@ -674,7 +674,7 @@
 
 #!-sb-fluid (declaim (inline ansi-stream-fresh-line))
 (defun ansi-stream-fresh-line (stream)
-  (when (/= (or (charpos stream) 1) 0)
+  (unless (eql (charpos stream) 0)
     (funcall (ansi-stream-out stream) stream #\newline)
     t))
 
@@ -789,6 +789,8 @@
      (force-output stream))
     (:finish-output
      (finish-output stream))
+    (:clear-output
+     (clear-output stream))
     (:element-type
      (stream-element-type stream))
     (:element-mode
@@ -2272,15 +2274,18 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
 
 (defun write-sequence (seq stream &key (start 0) (end nil))
   "Write the elements of SEQ bounded by START and END to STREAM."
-  (declare (type sequence seq)
-           (type stream stream)
-           (type index start)
-           (type sequence-end end)
-           (values sequence))
-  (if (ansi-stream-p stream)
-      (ansi-stream-write-sequence seq stream start end)
-      ;; must be Gray-streams FUNDAMENTAL-STREAM
-      (stream-write-sequence stream seq start end)))
+  (cond ((typep stream 'broadcast-stream)
+         (let* ((length (length seq))
+                (end (or end length)))
+           (unless (<= start end length)
+             (sequence-bounding-indices-bad-error seq start end))
+           (dolist (s (broadcast-stream-streams stream) seq)
+             (write-sequence seq s :start start :end end))))
+        ((ansi-stream-p stream)
+         (ansi-stream-write-sequence seq stream start end))
+        (t
+         ;; must be Gray-streams FUNDAMENTAL-STREAM
+         (stream-write-sequence stream seq start end))))
 
 ;;; This macro allows sharing code between
 ;;; WRITE-SEQUENCE/WRITE-FUNCTION and SB-GRAY:STREAM-WRITE-STRING.

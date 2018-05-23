@@ -653,7 +653,7 @@ void* os_dlsym_default(char* name)
    started before _any_ TLS slot is allocated by libraries, and
    some C compiler vendors rely on this fact. */
 
-void os_preinit()
+int os_preinit(char *argv[], char *envp[])
 {
 #ifdef LISP_FEATURE_X86
     DWORD slots[TLS_MINIMUM_AVAILABLE];
@@ -680,6 +680,7 @@ void os_preinit()
              "(last TlsAlloc() returned %u)",key);
     }
 #endif
+    return 0;
 }
 #endif  /* LISP_FEATURE_SB_THREAD */
 
@@ -833,20 +834,20 @@ os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
         return 0;
 
     if ((mem_info.State == MEM_RESERVE) && (mem_info.RegionSize >=len)) {
-      /* It would be correct to return here. However, support for Wine
-       * is beneficial, and Wine has a strange behavior in this
-       * department. It reports all memory below KERNEL32.DLL as
-       * reserved, but disallows MEM_COMMIT.
-       *
-       * Let's work around it: reserve the region we need for a second
-       * time. The second reservation is documented to fail on normal NT
-       * family, but it will succeed on Wine if this region is
-       * actually free.
-       */
-      VirtualAlloc(addr, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-      /* If it is wine, the second call has succeded, and now the region
-       * is really reserved. */
-      return addr;
+        /* It would be correct to return here. However, support for Wine
+         * is beneficial, and Wine has a strange behavior in this
+         * department. It reports all memory below KERNEL32.DLL as
+         * reserved, but disallows MEM_COMMIT.
+         *
+         * Let's work around it: reserve the region we need for a second
+         * time. The second reservation is documented to fail on normal NT
+         * family, but it will succeed on Wine if this region is
+         * actually free.
+         */
+        VirtualAlloc(addr, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        /* If it is wine, the second call has succeded, and now the region
+         * is really reserved. */
+        return addr;
     }
 
     if (mem_info.State == MEM_RESERVE) {
@@ -856,11 +857,12 @@ os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
          * provision for MEM_RESERVE in the following code, I suppose: */
     }
 
-    if (!AVERLAX(VirtualAlloc(addr, len, (mem_info.State == MEM_RESERVE)?
-                              MEM_COMMIT: MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
-        return 0;
+    os_vm_address_t actual;
 
-    return addr;
+    if (!AVERLAX(actual = VirtualAlloc(addr, len, (mem_info.State == MEM_RESERVE)?
+                                       MEM_COMMIT: MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+        return 0;
+    return actual;
 }
 
 /*
@@ -1006,9 +1008,7 @@ static boolean is_some_thread_local_addr(os_vm_address_t addr);
 boolean
 gc_managed_addr_p(lispobj addr)
 {
-    if(in_range_p(addr, READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE) ||
-       in_range_p(addr, STATIC_SPACE_START   , STATIC_SPACE_SIZE) ||
-       in_range_p(addr, DYNAMIC_SPACE_START  , dynamic_space_size) ||
+    if(gc_managed_heap_space_p(addr) ||
        is_some_thread_local_addr((os_vm_address_t)addr))
         return 1;
     return 0;
@@ -1224,6 +1224,13 @@ handle_access_violation(os_context_t *ctx,
                               MEM_COMMIT, PAGE_EXECUTE_READWRITE));
         }
         return 0;
+    } else {
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        extern int immobile_space_handle_wp_violation(void*);
+        if (immobile_space_handle_wp_violation(fault_address)) {
+            return 0;
+        }
+#endif
     }
 
     if (fault_address == undefined_alien_address)

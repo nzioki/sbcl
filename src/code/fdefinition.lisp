@@ -16,9 +16,8 @@
 
 ;; This variable properly belongs in 'target-hash-table',
 ;; but it's compiled after this file is.
-(!defglobal *user-hash-table-tests* nil)
+(!define-load-time-global *user-hash-table-tests* nil)
 
-(sb!int::/show0 "fdefinition.lisp 22")
 
 ;;;; fdefinition (fdefn) objects
 
@@ -202,6 +201,10 @@
     (function callable)
     (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
 
+;;; Bevahes just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
+(%defun '%coerce-callable-for-call
+        #'%coerce-callable-to-fun)
+
 
 ;;;; definition encapsulation
 
@@ -242,14 +245,6 @@
             (named-lambda encapsulation (&rest args)
               (apply function (encapsulation-info-definition info)
                      args))))))
-
-;;; This is like FIND-IF, except that we do it on a compiled closure's
-;;; environment.
-(defun find-if-in-closure (test closure)
-  (declare (closure closure))
-  (do-closure-values (value closure)
-    (when (funcall test value)
-      (return value))))
 
 ;;; Find the encapsulation info that has been closed over.
 (defun encapsulation-info (fun)

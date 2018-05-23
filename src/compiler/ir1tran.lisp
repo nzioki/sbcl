@@ -531,8 +531,8 @@
                    `(progn
                       (when (atom subform) (return))
                       (let ((fm (car subform)))
-                        (when (sb!int:comma-p fm)
-                          (setf fm (sb!int:comma-expr fm)))
+                        (when (comma-p fm)
+                          (setf fm (comma-expr fm)))
                         (cond ((consp fm)
                                ;; If it's a cons, recurse.
                                (sub-find-source-paths fm (cons pos path)))
@@ -654,7 +654,7 @@
                         (let ((functional (defined-fun-functional leaf)))
                           (when (and functional (not (functional-kind functional)))
                             (maybe-reanalyze-functional functional))))
-                   (when (and (lambda-p leaf)
+                   (when (and (functional-p leaf)
                               (memq (functional-kind leaf)
                                     '(nil :optional)))
                      (maybe-reanalyze-functional leaf))
@@ -1721,6 +1721,7 @@
                                       it))
                     (setq explicit-check (or (cdr spec) t)
                           allow-explicit-check nil)) ; at most one of this decl
+                   ((equal spec '(top-level-form))) ; ignore
                    (t
                     (multiple-value-bind (new-env new-qualities)
                         (process-1-decl spec lexenv vars fvars

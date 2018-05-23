@@ -63,8 +63,6 @@
   (once-only ((n-target target)
               (n-source source)
               (n-offset offset))
-    ;; FIXME: although I don't understand entirely, I'm going to do
-    ;; what whn does in x86/macros.lisp -- Christophe
     (ecase *backend-byte-order*
       (:little-endian
        `(inst ldub ,n-target ,n-source ,n-offset))
@@ -160,7 +158,7 @@
       ;; space.
 
       ;; Make sure the temp-tn is a non-descriptor register!
-      (assert (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
+      (aver (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
 
       ;; temp-tn is csp-tn rounded up to a multiple of 8 (lispobj size)
       (align-csp ,temp-tn)
@@ -288,15 +286,15 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst unimp kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst unimp tramp-number)))
     (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (apply #'error-call vop error-code values)

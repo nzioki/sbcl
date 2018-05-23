@@ -127,13 +127,14 @@
   (:translate get-closure-length)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
+  (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 6
     (let ((res (reg-in-size res :dword)))
-      (inst mov res (make-ea-for-object-slot-half x 0 fun-pointer-lowtag))
-      (inst shr res n-widetag-bits)
-      (inst and res short-header-max-words))))
+      (inst movzx res
+            (make-ea :word :base x :disp (1+ (- fun-pointer-lowtag))))
+      (inst btr res 15) ; Clear the NAMEDP header bit
+      (inst shl res n-fixnum-tag-bits))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -206,20 +207,6 @@
   (:generator 1
     (load-binding-stack-pointer int)))
 
-(defknown (setf binding-stack-pointer-sap)
-    (system-area-pointer) system-area-pointer ())
-
-(define-vop (set-binding-stack-pointer-sap)
-  (:args (new-value :scs (sap-reg) :target int))
-  (:arg-types system-area-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate (setf binding-stack-pointer-sap))
-  (:policy :fast-safe)
-  (:generator 1
-    (store-binding-stack-pointer new-value)
-    (move int new-value)))
-
 (define-vop (control-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -237,9 +224,8 @@
   (:results (sap :scs (sap-reg) :from (:argument 0)))
   (:result-types system-area-pointer)
   (:generator 10
-    (zeroize sap)
-    (inst mov (reg-in-size sap :word)
-              (make-ea :word :base code :disp (- 1 other-pointer-lowtag)))
+    (inst mov (reg-in-size sap :dword)
+              (make-ea :dword :base code :disp (- 4 other-pointer-lowtag)))
     (inst lea sap (make-ea :byte :base code :index sap
                            :scale n-word-bytes
                            :disp (- other-pointer-lowtag)))))
@@ -250,9 +236,8 @@
   (:arg-types * positive-fixnum)
   (:results (func :scs (descriptor-reg) :from (:argument 0)))
   (:generator 10
-    (zeroize func)
-    (inst mov (reg-in-size func :word)
-              (make-ea :word :base code :disp (- 1 other-pointer-lowtag)))
+    (inst mov (reg-in-size func :dword)
+              (make-ea :dword :base code :disp (- 4 other-pointer-lowtag)))
     (inst lea func
           (make-ea :byte :base offset :index func
                    :scale n-word-bytes
@@ -277,10 +262,18 @@
                             (* simple-fun-code-offset n-word-bytes))))))
 
 ;;;; symbol frobbing
+(defun load-symbol-info-vector (result symbol temp)
+  (loadw result symbol symbol-info-slot other-pointer-lowtag)
+  ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
+  ;; This CMOV safely reads from memory when it does not move, because if
+  ;; there is an info-vector in the slot, it has at least one element.
+  ;; This would compile to almost the same code without a VOP,
+  ;; but using a jmp around a mov instead.
+  (inst lea temp (make-ea :dword :base result :disp (- list-pointer-lowtag)))
+  (inst test (reg-in-size temp :byte) lowtag-mask)
+  (inst cmov :e result
+        (make-ea-for-object-slot result cons-cdr-slot list-pointer-lowtag)))
 
-;; only define if the feature is enabled to test building without it
-#!+symbol-info-vops
-(progn
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -288,16 +281,8 @@
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset rax-offset) rax)
   (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    ;; This CMOV safely reads from memory when it does not move, because if
-    ;; there is an info-vector in the slot, it has at least one element.
-    ;; This would compile to almost the same code without a VOP,
-    ;; but using a jmp around a mov instead.
-    (inst lea rax (make-ea :dword :base res :disp (- list-pointer-lowtag)))
-    (inst test (reg-in-size rax :byte) lowtag-mask)
-    (inst cmov :e res
-          (make-ea-for-object-slot res cons-cdr-slot list-pointer-lowtag))))
+    (load-symbol-info-vector res x rax)))
+
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)
@@ -311,7 +296,7 @@
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
     (inst test (reg-in-size res :byte) fixnum-tag-mask)
-    (inst cmov :e res temp))))
+    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -323,10 +308,10 @@
     (inst break pending-interrupt-trap)))
 
 #!+sb-thread
-;; 28 unsigned bits is the max before shifting left by 3 that fits in the
-;; 'displacement' of an EA. This is hugely generous. The largest offset
-;; you'd ever supply is THREAD-NONPOINTER-DATA-SLOT + interrupt depth.
-(defknown current-thread-offset-sap ((unsigned-byte 28))
+;; 29 signed bits is the max before shifting left by 3 that fits in the
+;; 'displacement' of an EA. This is hugely generous.
+;; We need negative indices to reference the interrupt contexts
+(defknown current-thread-offset-sap ((signed-byte 29))
   system-area-pointer (flushable))
 
 #!+sb-thread
@@ -336,10 +321,10 @@
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
   (:info n)
-  (:arg-types (:constant unsigned-byte))
+  (:arg-types (:constant signed-byte))
   (:policy :fast-safe)
   (:generator 1
-    (inst mov sap (make-ea :qword :base thread-base-tn :disp (ash n 3)))))
+    (inst mov sap (thread-tls-ea (ash n 3)))))
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -355,16 +340,6 @@
 (define-vop (halt)
   (:generator 1
     (inst break halt-trap)))
-
-(defknown float-wait () (values))
-(define-vop (float-wait)
-  (:policy :fast-safe)
-  (:translate float-wait)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 1
-    (note-next-instruction vop :internal-error)
-    (inst wait)))
 
 ;;;; Miscellany
 
@@ -440,32 +415,27 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;; Memory barrier support
 
-#!+memory-barrier-vops
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
   (:translate %memory-barrier)
   (:generator 3
     (inst mfence)))
 
-#!+memory-barrier-vops
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
@@ -476,76 +446,6 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:policy :fast-safe)
   (:generator 0
     (inst pause)))
-
-;;;;
-
-(defknown %cons-cas-pair (cons t t t t) (values t t))
-;; These unsafely permits cmpxchg on any kind of vector, boxed or unboxed
-;; and the same goes for instances.
-(defknown %vector-cas-pair (simple-array index t t t t) (values t t))
-(defknown %instance-cas-pair (instance index t t t t) (values t t))
-
-;; 32-bit register names here are not an accident - it's a deliberate attempt
-;; to keep this exactly in sync with 32-bit code in the hope that somebody
-;; will invent a way to share things in common.
-(macrolet
-    ((define-cmpxchg-vop (name memory-operand more-stuff &optional index-arg)
-       `(define-vop (,name)
-          (:policy :fast)
-          ,@more-stuff
-          (:args (data :scs (descriptor-reg) :to :eval)
-                 ,@index-arg
-                 (expected-old-lo :scs (descriptor-reg any-reg) :target eax)
-                 (expected-old-hi :scs (descriptor-reg any-reg) :target edx)
-                 (new-lo :scs (descriptor-reg any-reg) :target ebx)
-                 (new-hi :scs (descriptor-reg any-reg) :target ecx))
-          (:results (result-lo :scs (descriptor-reg any-reg))
-                    (result-hi :scs (descriptor-reg any-reg)))
-          (:temporary (:sc unsigned-reg :offset eax-offset
-                       :from (:argument 2) :to (:result 0)) eax)
-          (:temporary (:sc unsigned-reg :offset edx-offset
-                       :from (:argument 3) :to (:result 0)) edx)
-          (:temporary (:sc unsigned-reg :offset ebx-offset
-                       :from (:argument 4) :to (:result 0)) ebx)
-          (:temporary (:sc unsigned-reg :offset ecx-offset
-                       :from (:argument 5) :to (:result 0)) ecx)
-          (:generator 7
-           (move eax expected-old-lo)
-           (move edx expected-old-hi)
-           (move ebx new-lo)
-           (move ecx new-hi)
-           (inst cmpxchg16b ,memory-operand :lock)
-           ;; EDX:EAX  hold the actual old contents of memory.
-           ;; Manually analyze result lifetimes to avoid clobbering.
-           (cond ((and (location= result-lo edx) (location= result-hi eax))
-                  (inst xchg eax edx)) ; unlikely, but possible
-                 ((location= result-lo edx) ; result-hi is not eax
-                  (move result-hi edx) ; move high part first
-                  (move result-lo eax))
-                 (t                    ; result-lo is not edx
-                  (move result-lo eax) ; move low part first
-                  (move result-hi edx)))))))
-  (define-cmpxchg-vop compare-and-exchange-pair
-      (make-ea :dword :base data :disp (- list-pointer-lowtag))
-      ((:translate %cons-cas-pair)))
-  (define-cmpxchg-vop compare-and-exchange-pair-indexed
-      (make-ea :dword :base data :disp offset :index index
-                      :scale (ash n-word-bytes (- n-fixnum-tag-bits)))
-      ((:variant-vars offset))
-      ((index :scs (descriptor-reg any-reg) :to :eval))))
-
-;; The CPU requires 16-byte alignment for the memory operand.
-;; A vector's data portion starts on a 16-byte boundary,
-;; so any even numbered index is OK.
-(define-vop (%vector-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %vector-cas-pair)
-  (:variant (- (* n-word-bytes vector-data-offset) other-pointer-lowtag)))
-
-;; Here you specify an odd numbered slot, otherwise get a bus error.
-;; An instance's first user-visible slot at index 1 is 16-byte-aligned.
-(define-vop (%instance-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %instance-cas-pair)
-  (:variant (- (* n-word-bytes instance-slots-offset) instance-pointer-lowtag)))
 
 (defknown %cpu-identification ((unsigned-byte 32) (unsigned-byte 32))
     (values (unsigned-byte 32) (unsigned-byte 32)

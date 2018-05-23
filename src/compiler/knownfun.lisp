@@ -396,7 +396,11 @@
 
 ;;; Return MAX MIN
 (defun sequence-lvar-dimensions (lvar)
-  (if (not (constant-lvar-p lvar))
+  (if (constant-lvar-p lvar)
+      (let ((value (lvar-value lvar)))
+        (and (proper-sequence-p value)
+             (let ((length (length value)))
+               (values length length))))
       (let ((max 0) (min array-total-size-limit))
         (block nil
           (labels ((max-dim (type)
@@ -424,11 +428,7 @@
             ;; However that's probably not an important use, so the above
             ;; logic restricts itself to simple arrays.
             (max-dim (lvar-type lvar))
-            (values max min))))
-      (let ((value (lvar-value lvar)))
-        (and (typep value 'sequence)
-             (let ((length (length value)))
-               (values length length))))))
+            (values max min))))))
 
 (defun position-derive-type (call)
   (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
@@ -445,28 +445,29 @@
 ;;; assertion that may not get eliminated and requires extra work.
 (defun array-call-type-deriver (call trusted &optional set)
   (let* ((fun (combination-fun call))
-         (type (lvar-type fun))
+         (type (lvar-fun-type fun))
          (policy (lexenv-policy (node-lexenv call)))
-         (args (combination-args call))
-         (required (fun-type-required type)))
-    (flet ((assert-type (arg type &optional set)
-             (when (if set
-                       (assert-modifying-lvar-type arg type
-                                                   (lvar-fun-name fun)
-                                                   policy)
-                       (assert-lvar-type arg type policy))
-               (unless trusted (reoptimize-lvar arg)))))
-      (when set
-        (assert-type (pop args)
-                     (pop required)))
-      (assert-type (pop args)
-                   (type-intersection
-                    (pop required)
-                    (specifier-type `(array * ,(length args))))
-                   set)
-      (loop for type in required
-            do (assert-type (pop args) type))
-      (loop for type in (fun-type-optional type)
-            do (assert-type (pop args) type))
-      (loop for subscript in args
-            do (assert-type subscript (fun-type-rest type))))))
+         (args (combination-args call)))
+    (when (fun-type-p type)
+      (flet ((assert-type (arg type &optional set)
+               (when (if set
+                         (assert-modifying-lvar-type arg type
+                                                     (lvar-fun-name fun)
+                                                     policy)
+                         (assert-lvar-type arg type policy))
+                 (unless trusted (reoptimize-lvar arg)))))
+        (let ((required (fun-type-required type)))
+          (when set
+            (assert-type (pop args)
+                         (pop required)))
+          (assert-type (pop args)
+                       (type-intersection
+                        (pop required)
+                        (specifier-type `(array * ,(length args))))
+                       set)
+          (loop for type in required
+                do (assert-type (pop args) type))
+          (loop for type in (fun-type-optional type)
+                do (assert-type (pop args) type))
+          (loop for subscript in args
+                do (assert-type subscript (fun-type-rest type))))))))

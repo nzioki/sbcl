@@ -32,7 +32,7 @@
          (list* (car options) (cadr options)
                 (remove-keywords (cddr options) keywords)))))
 
-(def!struct (prim-object-slot
+(defstruct (prim-object-slot
              (:constructor make-slot (name rest-p offset special options))
              (:copier nil)
              (:conc-name slot-))
@@ -44,18 +44,16 @@
   ;; referenced as special variables, this slot holds the name of that variable.
   (special nil :type symbol :read-only t))
 
-(def!struct (primitive-object (:copier nil))
+(defstruct (primitive-object (:copier nil))
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
   (options nil :type list :read-only t)
   (slots nil :type list :read-only t)
-  (size 0 :type fixnum :read-only t)
+  (length 0 :type fixnum :read-only t)
   (variable-length-p nil :type (member t nil) :read-only t))
 
 (declaim (freeze-type prim-object-slot primitive-object))
-(!set-load-form-method prim-object-slot (:host :xc))
-(!set-load-form-method primitive-object (:host :xc))
 
 (defvar *primitive-objects* nil)
 
@@ -70,7 +68,8 @@
 (defvar *!late-primitive-object-forms* nil)
 
 (defmacro !define-primitive-object
-          ((name &key lowtag widetag alloc-trans (type t))
+          ((name &key lowtag widetag alloc-trans (type t)
+                      (size (symbolicate name "-SIZE")))
            &rest slot-specs)
   (collect ((slots) (specials) (constants) (forms) (inits))
     (let ((offset (if widetag 1 0))
@@ -103,11 +102,11 @@
               (setf length 2))
             (when (oddp offset)
               (incf offset)))
-          (slots (make-slot slot-name rest-p offset special
-                            (remove-keywords options '(:rest-p :length))))
+          (slots `(make-slot ',slot-name ,rest-p ,offset ',special
+                             ',(remove-keywords options '(:rest-p :length))))
           (let ((offset-sym (symbolicate name "-" slot-name
                                          (if rest-p "-OFFSET" "-SLOT"))))
-            (constants `(def!constant ,offset-sym ,offset))
+            (constants `(defconstant ,offset-sym ,offset))
             (when special
               (specials `(defvar ,special))))
           #-c-headers-only
@@ -141,7 +140,7 @@
             (setf variable-length-p t))
           (incf offset length)))
       (unless variable-length-p
-        (constants `(def!constant ,(symbolicate name "-SIZE") ,offset)))
+        (constants `(defconstant ,size ,offset)))
       #-c-headers-only
       (when alloc-trans
         (forms `(def-alloc ,alloc-trans ,offset
@@ -149,17 +148,16 @@
                   ,widetag
                   ,lowtag ',(inits))))
       `(progn
-         (eval-when (:compile-toplevel :load-toplevel :execute)
-           (setf (info :type :source-location ',name) (source-location))
-           (!%define-primitive-object
-            ',(make-primitive-object :name name
-                                     :widetag widetag
-                                     :lowtag lowtag
-                                     :slots (slots)
-                                     :size offset
-                                     :variable-length-p variable-length-p))
-           ,@(constants)
-           ,@(specials))
+         (setf (info :type :source-location ',name) (source-location))
+         (!%define-primitive-object
+            (make-primitive-object :name ',name
+                                   :widetag ',widetag
+                                   :lowtag ',lowtag
+                                   :slots (list ,@(slots))
+                                   :length ,offset
+                                   :variable-length-p ,variable-length-p))
+         ,@(constants)
+         ,@(specials)
          (setf *!late-primitive-object-forms*
                (append *!late-primitive-object-forms*
                        ',(forms)))))))
@@ -179,10 +177,29 @@
                (let* ((sc-number (or (cdr (assoc sc-name fixed-numbers))
                                      (1- (incf index))))
                       (constant-name (symbolicate sc-name "-SC-NUMBER")))
-                 `((define-storage-class ,sc-name ,sc-number
+                 `((!define-storage-class ,sc-name ,sc-number
                      ,sb-name ,@args)
                    (defconstant ,constant-name ,sc-number))))))
       `(progn ,@(mapcan #'process-class classes)))))
+
+;;;; some general constant definitions
+
+;;; The maximum number of storage classes and offsets within a given
+;;; storage class. Applies to all backends.
+(defconstant sc-number-limit 62)
+(defconstant sc-number-bits (integer-length (1- sc-number-limit)))
+(def!type sb!c::sc-number () `(integer 0 (,sc-number-limit)))
+
+(defconstant sc-offset-limit (ash 1 21))
+(defconstant sc-offset-bits (integer-length (1- sc-offset-limit)))
+(deftype sc-offset () `(integer 0 (,sc-offset-limit)))
+
+(defconstant finite-sc-offset-limit
+  #!-(or sparc alpha hppa) 32
+  #!+(or sparc alpha hppa) 64)
+(defconstant finite-sc-offset-bits
+  (integer-length (1- finite-sc-offset-limit)))
+(deftype finite-sc-offset () `(integer 0 (,finite-sc-offset-limit)))
 
 ;;;; stuff for defining reffers and setters
 
@@ -203,15 +220,6 @@
 ;;; references to structure slot setters because ANSI in its wisdom
 ;;; allows the xc host CL to implement structure slot setters as SETF
 ;;; expanders instead of SETF functions. -- WHN 2002-02-09
-
-;;;; some general constant definitions
-
-;;; FIXME: SC-NUMBER-LIMIT should probably be exported from SB!C
-;;; or SB!VM so that we don't need to do this extra IN-PACKAGE.
-(in-package "SB!C")
-
-;;; the maximum number of SCs in any implementation
-(def!constant sc-number-limit 62)
 
 ;;; Modular functions
 

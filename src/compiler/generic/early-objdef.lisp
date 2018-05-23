@@ -85,7 +85,7 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(def!constant nil-value
+(defconstant nil-value
     (+ static-space-start n-word-bytes other-pointer-lowtag))
 
 (defconstant-eqx fixnum-lowtags
@@ -292,7 +292,7 @@
 ;; often the print-name of a symbol, or was a literal in source code
 ;; and loaded from a fasl, or used in a few others situations
 ;; which warrant sharing.
-(def!constant +vector-shareable+ #x100)
+(defconstant +vector-shareable+ #x100)
 
 ;; A vector tagged as +VECTOR-SHAREABLE-NONSTD+ is logically readonly,
 ;; and *not* technically permitted by the standard to be shared.
@@ -315,7 +315,8 @@
 
   ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
   ;; low half of a closure header to form the full header word.
-  #-sb-xc-host (defglobal function-layout 0) ; set by genesis
+  #!+(and (not (host-feature sb-xc-host)) (not sb-thread))
+  (defglobal function-layout 0)         ; set by genesis
 
   ;; The cross-compiler stores FUNCTION-LAYOUT in a more obvious way.
   #+sb-xc-host
@@ -331,7 +332,7 @@
                          :direction :output :if-exists :supersede)
       (let* ((target-features
               (if (find-package "SB-COLD")
-                  (symbol-value (find-symbol "*SHEBANG-FEATURES*" "SB-COLD"))
+                  (symbol-value (find-symbol "*FEATURES*" "SB!XC"))
                   *features*))
              (feature-bits
               (+ (if (= n-word-bits 64) 1 0)

@@ -191,20 +191,15 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst gentrap kind)
-    (inst byte code)
-    (with-adjustable-vector (vector)
-      (dolist (tn values)
-        (write-var-integer
-         (make-sc-offset (sc-number (tn-sc tn)) (tn-offset tn)) vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i))))
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst gentrap tramp-number)))
     (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (apply #'error-call vop error-code values)

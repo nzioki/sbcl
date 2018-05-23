@@ -44,7 +44,8 @@
 #!+immobile-space
 (progn
 
-(defglobal *immobile-space-mutex* (sb!thread:make-mutex :name "Immobile space"))
+(define-load-time-global *immobile-space-mutex*
+    (sb!thread:make-mutex :name "Immobile space"))
 
 (eval-when (:compile-toplevel)
   (assert (eql code-code-size-slot 1))
@@ -63,7 +64,7 @@
 ;;; A better structure would be just a sorted array of sizes
 ;;; with each entry pointing to the holes which are threaded through
 ;;; some bytes in the storage itself rather than through cons cells.
-(!defglobal *immobile-freelist* nil)
+(!define-load-time-global *immobile-freelist* nil)
 
 ;;; Return the zero-based index within the varyobj subspace of immobile space.
 (defun varyobj-page-index (address)
@@ -80,8 +81,9 @@
 
 (declaim (inline hole-p))
 (defun hole-p (raw-address)
-  (eql (sap-ref-32 (int-sap raw-address) 0)
-       (logior (ash 2 n-widetag-bits) code-header-widetag)))
+  ;; A code header with 0 boxed words is a hole.
+  ;; See also CODE-OBJ-IS-FILLER-P
+  (eql (sap-ref-64 (int-sap raw-address) 0) code-header-widetag))
 
 (defun freed-hole-p (address)
   (and (hole-p address)
@@ -94,13 +96,16 @@
 
 (declaim (inline hole-size))
 (defun hole-size (hole-address) ; in bytes
-  (+ (sap-ref-lispobj (int-sap hole-address) (ash code-code-size-slot word-shift))
-     (ash 2 word-shift))) ; add 2 boxed words
+  (the (and fixnum unsigned-byte)
+    (sap-ref-lispobj (int-sap hole-address) (ash code-code-size-slot word-shift))))
 
 (declaim (inline (setf hole-size)))
 (defun (setf hole-size) (new-size hole) ; NEW-SIZE is in bytes
-  (setf (sap-ref-lispobj (int-sap hole) (ash code-code-size-slot word-shift))
-        (- new-size (ash 2 word-shift)))) ; account for 2 boxed words
+  ;; FIXME: (SETF SET-REF-LISPOBJ) does not accept a fixnum
+  ;; because 'any-reg' is not an allowed storage class.
+  (setf (sap-ref-word (int-sap hole) (ash code-code-size-slot word-shift))
+        ;; 0 boxed words, so %CODE-CODE-SIZE covers everything.
+        (ash new-size n-fixnum-tag-bits)))
 
 (declaim (inline hole-end-address))
 (defun hole-end-address (hole-address)
@@ -248,14 +253,13 @@
           (setf hole-end (hole-end-address successor))
           (remove-from-freelist successor)))
       ;; The hole must be an integral number of doublewords.
-      (aver (zerop (rem (- hole-end hole) 16)))
+      (aver (not (logtest (- hole-end hole) lowtag-mask)))
       (setf (hole-size hole) (- hole-end hole))))
   (add-to-freelist hole))
 
 (defun allocate-immobile-bytes (n-bytes word0 word1 lowtag)
   (declare (type (and fixnum unsigned-byte) n-bytes))
-  (setq n-bytes (logandc2 (+ n-bytes (1- (* 2 n-word-bytes)))
-                          (1- (* 2 n-word-bytes))))
+  (setq n-bytes (align-up n-bytes (* 2 n-word-bytes)))
   ;; Can't allocate fewer than 4 words due to min hole size.
   (aver (>= n-bytes (* 4 n-word-bytes)))
   (sb!thread::with-system-mutex (*immobile-space-mutex* :without-gcing t)
@@ -283,7 +287,7 @@
                          (when found
                            (let* ((actual-size (hole-size found))
                                   (remaining (- actual-size n-bytes)))
-                             (aver (zerop (rem actual-size 16)))
+                             (aver (not (logtest actual-size lowtag-mask)))
                              (setf (hole-size found) remaining) ; Shorten the lower piece
                              (add-to-freelist found)
                              (+ found remaining)))))) ; Consume the upper piece
@@ -293,6 +297,7 @@
                      (limit (+ varyobj-space-start varyobj-space-size)))
                 (when (> free-ptr limit)
                   (format t "~&Immobile space exhausted~%")
+                  (sb!debug:print-backtrace)
                   (sb!impl::%halt))
                 (set-varyobj-space-free-pointer free-ptr)
                 addr))))
@@ -353,20 +358,18 @@
 
 ;;; This is called when we're already inside WITHOUT-GCing
 (defun allocate-immobile-code (n-boxed-words n-unboxed-bytes)
-  (let* ((unrounded-header-n-words (+ code-constants-offset n-boxed-words))
-         (rounded-header-words (* 2 (ceiling unrounded-header-n-words 2)))
-         (total-bytes (+ (* rounded-header-words n-word-bytes)
-                         (logandc2 (+ n-unboxed-bytes lowtag-mask) lowtag-mask)))
+  (let* ((total-bytes (align-up (+ (* n-boxed-words n-word-bytes) n-unboxed-bytes)
+                                (* 2 n-word-bytes)))
          (code (allocate-immobile-bytes
                 total-bytes
-                (logior (ash rounded-header-words n-widetag-bits) code-header-widetag)
+                (make-code-header-word n-boxed-words)
                 (ash n-unboxed-bytes n-fixnum-tag-bits)
                 other-pointer-lowtag)))
     (setf (%code-debug-info code) nil)
     code))
 
 (defun alloc-immobile-symbol ()
-  (values (%primitive alloc-fixedobj other-pointer-lowtag symbol-size
+  (values (%primitive alloc-immobile-fixedobj other-pointer-lowtag symbol-size
                       (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag)
                       nil)))
 (defun make-immobile-symbol (name)
@@ -382,12 +385,14 @@
     symbol))
 
 (defun alloc-immobile-fdefn ()
-  (values (%primitive alloc-fixedobj other-pointer-lowtag fdefn-size
+  (values (%primitive alloc-immobile-fixedobj other-pointer-lowtag fdefn-size
                       (logior (ash (1- fdefn-size) n-widetag-bits) fdefn-widetag)
                       nil)))
 
+#!+immobile-code
+(progn
 (defun alloc-immobile-gf ()
-  (values (%primitive alloc-fixedobj fun-pointer-lowtag 6 ; kludge
+  (values (%primitive alloc-immobile-fixedobj fun-pointer-lowtag 6 ; kludge
                       (logior (ash 5 n-widetag-bits) funcallable-instance-widetag)
                       nil)))
 (defun make-immobile-gf (layout slot-vector)
@@ -404,8 +409,8 @@
     gf))
 
 (defun alloc-immobile-trampoline ()
-  (values (%primitive alloc-fixedobj other-pointer-lowtag 6
-                      (logior (ash 4 n-widetag-bits) code-header-widetag)
+  (values (%primitive alloc-immobile-fixedobj other-pointer-lowtag 6
+                      #.(make-code-header-word 4) ; boxed word count
                       (ash (* 2 n-word-bytes) n-fixnum-tag-bits))))
-
+) ; end PROGN
 ) ; end PROGN
