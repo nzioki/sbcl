@@ -86,7 +86,9 @@ extern void *return_from_lisp_stub;
 
 /* SIGINT handler that invokes the monitor (for when Lisp isn't up to it) */
 static void
-sigint_handler(int signal, siginfo_t *info, os_context_t *context)
+sigint_handler(int __attribute__((unused)) signal,
+               siginfo_t __attribute__((unused)) *info,
+               os_context_t *context)
 {
     lose("\nSIGINT hit at 0x%08lX\n",
          (unsigned long) *os_context_pc_addr(context));
@@ -432,7 +434,7 @@ static void print_environment(int argc, char *argv[])
 extern void write_protect_immobile_space();
 struct lisp_startup_options lisp_startup_options;
 int
-main(int argc, char *argv[], char *envp[])
+sbcl_main(int argc, char *argv[], char *envp[])
 {
 #ifdef LISP_FEATURE_WIN32
     /* Exception handling support structure. Evil Win32 hack. */

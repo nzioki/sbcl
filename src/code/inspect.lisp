@@ -13,10 +13,6 @@
 
 (defparameter *inspect-length* 10)
 
-;;; When *INSPECT-UNBOUND-OBJECT-MARKER* occurs in a parts list, it
-;;; indicates that that a slot is unbound.
-(defvar *inspect-unbound-object-marker* (gensym "INSPECT-UNBOUND-OBJECT-"))
-
 (defun inspector (object input-stream output-stream)
   (declare (ignore input-stream))
   (catch 'quit-inspect
@@ -34,7 +30,7 @@
 (defun inspect (object)
   (funcall *inspect-fun* object *standard-input* *standard-output*))
 
-(defvar *help-for-inspect*
+(defconstant-eqx +help-for-inspect+
   "
 help for INSPECT:
   Q, E        -  Quit the inspector.
@@ -46,7 +42,7 @@ help for INSPECT:
 Within the inspector, the special variable SB-EXT:*INSPECTED* is bound
 to the current inspected object, so that it can be referred to in
 evaluated expressions.
-")
+" #'equal)
 
 (defun %inspect (*inspected* s)
   (named-let redisplay () ; "LAMBDA, the ultimate GOTO":-|
@@ -74,7 +70,7 @@ evaluated expressions.
                (cond ((< -1 command elements-length)
                       (let* ((element (nth command elements))
                              (value (if named-p (cdr element) element)))
-                        (cond ((eq value *inspect-unbound-object-marker*)
+                        (cond ((eq value sb-pcl:+slot-unbound+)
                                (format s "~%That slot is unbound.~%")
                                (return-from %inspect (reread)))
                               (t
@@ -99,7 +95,7 @@ evaluated expressions.
                (:r
                 (return-from %inspect (redisplay)))
                ((:h :? :help)
-                (write-string *help-for-inspect* s)
+                (write-string +help-for-inspect+ s)
                 (return-from %inspect (reread)))
                (t
                 (eval-for-inspect command s)
@@ -129,7 +125,7 @@ evaluated expressions.
                   (values (cdr element) (car element))
                   element)
             (format stream "~W. ~@[~A: ~]~W~%"
-                    index name (if (eq value *inspect-unbound-object-marker*)
+                    index name (if (eq value sb-pcl:+slot-unbound+)
                                    "unbound"
                                    value))))))
 
@@ -161,10 +157,10 @@ evaluated expressions.
                 (cons "Package" (symbol-package object))
                 (cons "Value" (if (boundp object)
                                   (symbol-value object)
-                                  *inspect-unbound-object-marker*))
+                                  sb-pcl:+slot-unbound+))
                 (cons "Function" (if (fboundp object)
                                      (symbol-function object)
-                                     *inspect-unbound-object-marker*))
+                                     sb-pcl:+slot-unbound+))
                 (cons "Plist" (symbol-plist object)))))
 
 (defun inspected-structure-elements (object)
@@ -189,7 +185,7 @@ evaluated expressions.
       (let* ((slot-name (slot-value class-slot 'sb-pcl::name))
              (slot-value (if (slot-boundp object slot-name)
                              (slot-value object slot-name)
-                             *inspect-unbound-object-marker*)))
+                             sb-pcl:+slot-unbound+)))
         (push (cons slot-name slot-value) reversed-elements)))))
 
 (defmethod inspected-parts ((object standard-object))
@@ -225,22 +221,9 @@ evaluated expressions.
              (list
               (cons "Closed over values" (%closure-values object)))))))
 
-#+sb-eval
-(defmethod inspected-parts ((object sb-eval:interpreted-function))
-  (multiple-value-bind (defn closurep name) (function-lambda-expression object)
-    (declare (ignore closurep))
-    (values (format nil "The object is an interpreted function named ~S.~%" name)
-            t
-            ;; Defined-from stuff used to be here. Someone took
-            ;; it out. FIXME: We should make it easy to get
-            ;; to DESCRIBE from the inspector.
-            (list
-             (cons "Lambda-list" (sb-eval:interpreted-function-lambda-list object))
-             (cons "Definition" defn)
-             (cons "Documentation" (sb-eval:interpreted-function-documentation object))))))
-
-#+sb-fasteval
-(defmethod inspected-parts ((object sb-interpreter:interpreted-function))
+#+(or sb-eval sb-fasteval)
+(defmethod inspected-parts ((object #+sb-fasteval sb-interpreter:interpreted-function
+                                    #+sb-eval sb-eval:interpreted-function))
   (multiple-value-bind (defn closurep name) (function-lambda-expression object)
     (declare (ignore closurep))
     (values (format nil "The object is an interpreted function named ~S.~%" name)
@@ -251,7 +234,7 @@ evaluated expressions.
             (list
              (cons "Lambda-list" (%fun-lambda-list object))
              (cons "Definition" defn)
-             (cons "Documentation" (%fun-doc object))))))
+             (cons "Documentation" (documentation object t))))))
 
 (defmethod inspected-parts ((object vector))
   (values (format nil

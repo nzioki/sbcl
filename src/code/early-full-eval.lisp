@@ -27,12 +27,11 @@
  ;; function -- so DEFMACRO can set them to more informative values.
  :slot-names (name debug-name lambda-list debug-lambda-list env
                    declarations documentation body source-location)
- :boa-constructor %make-interpreted-function
+ :constructor %make-interpreted-function
  :superclass-name function
  :metaclass-name static-classoid
  :metaclass-constructor make-static-classoid
- :dd-type funcallable-structure
- :runtime-type-checks-p nil)
+ :dd-type funcallable-structure)
 
 ;; INTERPRETED-FUNCTION can not subclassed at runtime.
 ;; For one, DEFSTRUCT-WITH-ALTERNATE-METACLASS does not exist in the target,
@@ -49,7 +48,7 @@
     (let ((function (%make-interpreted-function
                      name name lambda-list debug-lambda-list env
                      declarations documentation body source-location)))
-      (setf (funcallable-instance-fun function)
+      (setf (%funcallable-instance-fun function)
             #'(lambda (&rest args)
                 (interpreted-apply function args)))
       function))

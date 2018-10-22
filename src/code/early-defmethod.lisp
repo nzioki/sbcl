@@ -11,7 +11,10 @@
 
 ;;;; Rudimentary DEFMETHOD
 
-(sb!xc:defmacro defmethod (name lambda-list &rest body &aux qualifier)
+(sb!xc:defmacro defmethod (&whole form name lambda-list &rest body
+                           &aux qualifier)
+  (when (member name '((setf documentation) documentation) :test 'equal)
+    (return-from defmethod `(push ',form *!documentation-methods*)))
   (when (keywordp lambda-list)
     ;; Allow an :AFTER method in 'condition.lisp'.
     ;; It's ignored during cold-init, but eventually takes effect.
@@ -49,11 +52,12 @@
                            '(slot-boundp slot-value %set-slot-value call-next-method))
           (flet (((setf slot-value) (&rest args) `(%set-slot-value ,@args)))
             (declare (inline (setf slot-value)))
-            ,@forms)))
+            (block ,name ,@forms))))
       ;; Why is SOURCE-LOC needed? Lambdas should know their location.
       (sb!c::source-location))))
 
-(defvar *!trivial-methods* '())
+(defvar *!trivial-methods* '()) ; necessary methods for system startup
+(defvar *!documentation-methods* nil) ; saved up for after PCL bootstrap
 (defun !trivial-defmethod (name specializer qualifier lambda-list lambda source-loc)
   (let ((gf (assoc name *!trivial-methods*)))
     ;; Append the method but don't bother finding a predicate for it.
@@ -75,7 +79,9 @@
                 :test (lambda (arg method &aux (guard (car method)))
                         (and (or (functionp guard) (fboundp guard))
                              (funcall guard arg))))))
-    (assert applicable-method)
+    (unless applicable-method
+      (error "No applicable method for ~S on ~S~%" gf-name
+             (type-of specialized-arg)))
     ;; The "method" is a list: (GUARD LAMBDA . OTHER-STUFF)
     ;; Call using no permutation-vector / no precomputed next method.
     (apply (cadr applicable-method) nil nil specialized-arg rest)))

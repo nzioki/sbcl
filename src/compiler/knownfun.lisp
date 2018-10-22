@@ -179,13 +179,17 @@
           (labels ((annotation-p (x)
                      (typep x '(or (cons (member function function-designator modifying
                                           inhibit-flushing))
-                                (member type-specifier))))
+                                (member type-specifier proper-sequence proper-list
+                                 proper-or-dotted-list proper-or-circular-list))))
                    (strip-annotation (x)
                      (if (consp x)
                          (ecase (car x)
                            ((function function-designator) (car x))
                            ((modifying inhibit-flushing) (cadr x)))
-                         x))
+                         (case x
+                           (proper-sequence 'sequence)
+                           ((proper-list proper-or-dotted-list proper-or-circular-list) 'list)
+                           (t x))))
                    (process-positional (type)
                      (incf i)
                      (cond ((annotation-p type)
@@ -443,31 +447,53 @@
 ;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
 ;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
 ;;; assertion that may not get eliminated and requires extra work.
-(defun array-call-type-deriver (call trusted &optional set)
+(defun array-call-type-deriver (call trusted &optional set row-major-aref)
   (let* ((fun (combination-fun call))
          (type (lvar-fun-type fun))
          (policy (lexenv-policy (node-lexenv call)))
          (args (combination-args call)))
     (when (fun-type-p type)
-      (flet ((assert-type (arg type &optional set)
-               (when (if set
-                         (assert-modifying-lvar-type arg type
-                                                     (lvar-fun-name fun)
-                                                     policy)
-                         (assert-lvar-type arg type policy))
+      (flet ((assert-type (arg type &optional set index)
+               (when (cond (index
+                            (assert-array-index-lvar-type arg type policy))
+                           (t
+                            (when set
+                              (add-annotation arg
+                                              (make-lvar-modified-annotation :caller (lvar-fun-name fun))))
+                            (assert-lvar-type arg type policy)))
                  (unless trusted (reoptimize-lvar arg)))))
         (let ((required (fun-type-required type)))
           (when set
             (assert-type (pop args)
                          (pop required)))
           (assert-type (pop args)
-                       (type-intersection
-                        (pop required)
-                        (specifier-type `(array * ,(length args))))
+                       (if row-major-aref
+                           (pop required)
+                           (type-intersection
+                            (pop required)
+                            (specifier-type `(array * ,(length args)))))
                        set)
           (loop for type in required
-                do (assert-type (pop args) type))
+                do
+                (assert-type (pop args) type nil (or (not (and set row-major-aref))
+                                                     args)))
           (loop for type in (fun-type-optional type)
-                do (assert-type (pop args) type))
+                do (assert-type (pop args) type nil t))
           (loop for subscript in args
-                do (assert-type subscript (fun-type-rest type))))))))
+                do (assert-type subscript (fun-type-rest type) nil t)))))))
+
+(defun append-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call))
+         (list-type (specifier-type 'list)))
+    ;; All but the last argument should be proper lists
+    (loop for (arg next) on args
+          while next
+          do
+          (add-annotation
+           arg
+           (make-lvar-proper-sequence-annotation
+            :kind 'proper-list))
+          (when (and (assert-lvar-type arg list-type policy)
+                     (not trusted))
+            (reoptimize-lvar arg)))))

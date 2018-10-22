@@ -20,6 +20,7 @@
 
 ;;; Bind this to a stream to capture various internal debugging output.
 (defvar *compiler-trace-output* nil)
+(defvar *compile-trace-targets* '(:ir1 :ir2 :vop :disassemble))
 
 ;;; The current block compilation state. These are initialized to the
 ;;; :BLOCK-COMPILE and :ENTRY-POINTS arguments that COMPILE-FILE was
@@ -40,6 +41,7 @@
 
 ;;; The current non-macroexpanded toplevel form as printed when
 ;;; *compile-print* is true.
+;;; FIXME: should probably have no value outside the compiler.
 (defvar *top-level-form-noted* nil)
 
 (defvar sb!xc:*compile-verbose* t
@@ -100,11 +102,6 @@
 ;; Used during compilation to keep track of with source paths have been
 ;; instrumented in which blocks.
 (defun code-coverage-blocks (x) (cdr x))
-;; Stores the code coverage instrumentation results. Keys are namestrings, the
-;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
-;; for a path that has not been visited, and T for one that has.
-(defvar *code-coverage-info* (make-hash-table :test 'equal))
-
 
 ;;;; WITH-COMPILATION-UNIT and WITH-COMPILATION-VALUES
 
@@ -373,7 +370,6 @@ Examples:
                      `(make-finite-sb
                        :conflicts (make-array ,size :initial-element #())
                        :always-live (make-array ,size :initial-element #*)
-                       :always-live-count (make-array ,size :initial-element 0)
                        :live-tns (make-array ,size :initial-element nil)))))))
      (unwind-protect
          (let ((*warnings-p* nil)
@@ -481,17 +477,6 @@ necessary, since type inference may take arbitrarily long to converge.")
 
 (defparameter *constraint-propagate* t)
 
-;;; KLUDGE: This was bumped from 5 to 10 in a DTC patch ported by MNA
-;;; from CMU CL into sbcl-0.6.11.44, the same one which allowed IR1
-;;; transforms to be delayed. Either DTC or MNA or both didn't explain
-;;; why, and I don't know what the rationale was. -- WHN 2001-04-28
-;;;
-;;; FIXME: It would be good to document why it's important to have a
-;;; large value here, and what the drawbacks of an excessively large
-;;; value are; and it might also be good to make it depend on
-;;; optimization policy.
-(defparameter *reoptimize-after-type-check-max* 10)
-
 (defevent reoptimize-maxed-out
   "*REOPTIMIZE-AFTER-TYPE-CHECK-MAX* exceeded.")
 
@@ -508,72 +493,87 @@ necessary, since type inference may take arbitrarily long to converge.")
       (maybe-mumble ".")))
   (values))
 
+(defparameter *reoptimize-limit* 10)
+
+(defun ir1-optimize-phase-1 (component)
+  (let ((loop-count 0))
+    (loop
+     (ir1-optimize-until-done component)
+     (when (or (component-new-functionals component)
+               (component-reanalyze-functionals component))
+       (maybe-mumble "locall ")
+       (locall-analyze-component component))
+     (dfo-as-needed component)
+     (when *constraint-propagate*
+       (maybe-mumble "constraint ")
+       (constraint-propagate component))
+     (when (retry-delayed-ir1-transforms :constraint)
+       (setf loop-count 0) ;; otherwise nothing may get retried
+       (maybe-mumble "Rtran "))
+     (unless (or (component-reoptimize component)
+                 (component-reanalyze component)
+                 (component-new-functionals component)
+                 (component-reanalyze-functionals component))
+       (return))
+     (when (> loop-count *reoptimize-limit*)
+       (maybe-mumble "[reoptimize limit]")
+       (event reoptimize-maxed-out)
+       (return))
+     (incf loop-count))))
+
 ;;; Do all the IR1 phases for a non-top-level component.
 (defun ir1-phases (component)
   (declare (type component component))
   (aver-live-component component)
-  (let ((*constraint-universe* (make-array 64 ; arbitrary, but don't
-                                              ;make this 0.
+  (let ((*constraint-universe* (make-array 64 ; arbitrary, but don't make this 0
                                            :fill-pointer 0 :adjustable t))
-        (loop-count 1)
         (*delayed-ir1-transforms* nil))
     (declare (special *constraint-universe* *delayed-ir1-transforms*))
-    (loop
-      (ir1-optimize-until-done component)
-      (when (or (component-new-functionals component)
-                (component-reanalyze-functionals component))
-        (maybe-mumble "locall ")
-        (locall-analyze-component component))
-      (dfo-as-needed component)
-      (when *constraint-propagate*
-        (maybe-mumble "constraint ")
-        (constraint-propagate component))
-      (when (retry-delayed-ir1-transforms :constraint)
-        (maybe-mumble "Rtran "))
-      (flet ((want-reoptimization-p ()
-               (or (component-reoptimize component)
-                   (component-reanalyze component)
-                   (component-new-functionals component)
-                   (component-reanalyze-functionals component))))
-        (unless (and (want-reoptimization-p)
-                     ;; We delay the generation of type checks until
-                     ;; the type constraints have had time to
-                     ;; propagate, else the compiler can confuse itself.
-                     (< loop-count (- *reoptimize-after-type-check-max* 4)))
-          (maybe-mumble "type ")
-          (generate-type-checks component)
-          (unless (want-reoptimization-p)
-            (return))))
-      (when (>= loop-count *reoptimize-after-type-check-max*)
-        (maybe-mumble "[reoptimize limit]")
-        (event reoptimize-maxed-out)
-        (return))
-      (incf loop-count)))
+    (ir1-optimize-phase-1 component)
+    (loop while (generate-type-checks component)
+          do
+          (ir1-optimize-phase-1 component))
+    ;; Join the blocks that were generated by GENERATE-TYPE-CHECKS
+    ;; now that all the blocks have the same TYPE-CHECK attribute
+    (join-blocks-if-possible component))
 
   (ir1-finalize component)
   (values))
 
+#!-immobile-code
+(defun component-mem-space (component)
+  (component-%mem-space component))
+
 #!+immobile-code
 (progn
-  (declaim (type (member :immobile :dynamic)
-                 *compile-to-memory-space*
-                 *compile-file-to-memory-space*))
+  (declaim (type (member :immobile :dynamic :auto) *compile-to-memory-space*)
+           (type (member :immobile :dynamic) *compile-file-to-memory-space*))
   ;; COMPILE-FILE puts all nontoplevel code in immobile space, but COMPILE
   ;; offers a choice. Because the collector does not run often enough (yet),
   ;; COMPILE usually places code in the dynamic space managed by our copying GC.
   ;; Change this variable if your application always demands immobile code.
-  ;; The real default is set to :DYNAMIC in make-target-2-load.lisp
+  ;; The value is changed to :AUTO in make-target-2-load.lisp
+  ;; which does not perform any codegen optimizations for immobile space,
+  ;; but nonetheless prefers to allocate the code there, falling back to
+  ;; dynamic space if there is no room left in immobile space.
   (defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
   (defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
+  (defun component-mem-space (component)
+    (or (component-%mem-space component)
+        (setf (component-%mem-space component)
+              (if (fasl-output-p *compile-object*)
+                  (and (eq *compile-file-to-memory-space* :immobile)
+                       (neq (component-kind component) :toplevel)
+                       :immobile)
+                      *compile-to-memory-space*))))
   (defun code-immobile-p (thing)
-    (if (fasl-output-p *compile-object*)
-        (and (eq *compile-file-to-memory-space* :immobile)
-             (neq (component-kind (typecase thing
-                                    (vop  (node-component (vop-node thing)))
-                                    (node (node-component thing))
-                                    (t    thing)))
-                  :toplevel))
-        (eq *compile-to-memory-space* :immobile))))
+    #+sb-xc-host (declare (ignore thing)) #+sb-xc-host t
+    #-sb-xc-host
+    (let ((component (typecase thing
+                       (vop  (node-component (vop-node thing)))
+                       (node (node-component thing))
+                       (t    thing))))
+      (eq (component-mem-space component) :immobile))))
 
 (defun %compile-component (component)
   (let ((*adjustable-vectors* nil)) ; Needed both by codegen and fasl writer
@@ -641,32 +641,46 @@ necessary, since type inference may take arbitrarily long to converge.")
           (ir2-optimize-jumps component)
           (optimize-constant-loads component)
           (when *compiler-trace-output*
-            (describe-component component *compiler-trace-output*)
-            (describe-ir2-component component *compiler-trace-output*))
+            (when (memq :ir1 *compile-trace-targets*)
+              (describe-component component *compiler-trace-output*))
+            (when (memq :ir2 *compile-trace-targets*)
+             (describe-ir2-component component *compiler-trace-output*)))
 
           (maybe-mumble "code ")
-
-          (multiple-value-bind (segment code-length elsewhere-label fixup-notes)
-              (let (#!+immobile-code
-                    (*code-is-immobile* (code-immobile-p component)))
+          (multiple-value-bind (segment text-length fun-table
+                                elsewhere-label fixup-notes)
+              (let ((*compiler-trace-output*
+                      (and (memq :vop *compile-trace-targets*)
+                           *compiler-trace-output*)))
                 (generate-code component))
 
-            #-sb-xc-host
-            (when *compiler-trace-output*
-              (format *compiler-trace-output*
-                      "~|~%disassembly of code for ~S~2%" component)
-              (sb!disassem:disassemble-assem-segment segment
-                                                     *compiler-trace-output*))
-
-            (let ((object *compile-object*)
+            (let ((bytes (sb!assem:segment-contents-as-vector segment))
+                  (object *compile-object*)
                   (*elsewhere-label* elsewhere-label)) ; KLUDGE
+
+              (when (and *compiler-trace-output*
+                         (memq :disassemble *compile-trace-targets*))
+                (let ((ranges
+                        (maplist (lambda (list)
+                                   (cons (+ (car list)
+                                            (ash sb!vm:simple-fun-code-offset
+                                                 sb!vm:word-shift))
+                                         (or (cadr list) text-length)))
+                                 fun-table)))
+                  (declare (ignorable ranges))
+                  (format *compiler-trace-output*
+                          "~|~%disassembly of code for ~S~2%" component)
+                  #-sb-xc-host
+                  (sb!disassem:disassemble-assem-segment
+                   bytes ranges *compiler-trace-output*)))
+
               (funcall (etypecase object
-                        (fasl-output (maybe-mumble "fasl") #'fasl-dump-component)
-                        #-sb-xc-host ; no compiling to core
-                        (core-object (maybe-mumble "core") #'make-core-component)
-                        (null (lambda (&rest dummies)
-                                (declare (ignore dummies)))))
-                       component segment code-length fixup-notes
+                         (fasl-output (maybe-mumble "fasl") #'fasl-dump-component)
+                         #-sb-xc-host   ; no compiling to core
+                         (core-object (maybe-mumble "core") #'make-core-component)
+                         (null (lambda (&rest dummies)
+                                 (declare (ignore dummies)))))
+                       component segment (length bytes) fixup-notes
                        object))))))
 
   ;; We're done, so don't bother keeping anything around.
@@ -1248,27 +1262,9 @@ necessary, since type inference may take arbitrarily long to converge.")
               #-sb-xc-host
               (let ((store-source
                      (policy (lambda-bind fun)
-                             (> eval-store-source-form 0))))
+                             (> store-source-form 0))))
                 (fix-core-source-info *source-info* object
-                                      (and store-source result))
-                ;; FIXME: here on down the logic probably belongs in
-                ;; MAKE-CORE-COMPONENT, but to do that we'd want to pass in
-                ;; the EVAL-STORE-SOURCE policy
-                (when store-source
-                  ;; Store each simple-fun's lambda expression
-                  (dohash ((entry simple-fun) entry-table)
-                    (let ((info (entry-info-info entry)))
-                      (sb!impl::set-simple-fun-info
-                         simple-fun
-                         (entry-info-lexpr entry)
-                         ;; SET-SIMPLE-FUN-INFO expects all 3 thingies that we might
-                         ;; save (any can be NIL) so extract the existing docstring
-                         (cond ((listp info) (car info))
-                               ((stringp info) info))
-                         ;; ... and the existing xrefs
-                         (cond ((listp info) (cdr info))
-                               ((simple-vector-p info) info))))))))
-
+                                      (and store-source result))))
             (mapc #'clear-ir1-info components-from-dfo)
             result))))))
 
@@ -1594,29 +1590,25 @@ necessary, since type inference may take arbitrarily long to converge.")
   (locall-analyze-clambdas-until-done lambdas)
 
   (maybe-mumble "IDFO ")
-  (multiple-value-bind (components top-components hairy-top)
+  (multiple-value-bind (components top-components)
       (find-initial-dfo lambdas)
-    (let ((all-components (append components top-components)))
-      (when *check-consistency*
-        (maybe-mumble "[check]~%")
-        (check-ir1-consistency all-components))
+    (when *check-consistency*
+      (maybe-mumble "[check]~%")
+      (check-ir1-consistency (append components top-components)))
 
-      (dolist (component (append hairy-top top-components))
-        (pre-physenv-analyze-toplevel component))
+    (dolist (component components)
+      (compile-component component)
+      (replace-toplevel-xeps component))
 
-      (dolist (component components)
-        (compile-component component)
-        (replace-toplevel-xeps component))
+    (when *check-consistency*
+      (maybe-mumble "[check]~%")
+      (check-ir1-consistency (append components top-components)))
 
-      (when *check-consistency*
-        (maybe-mumble "[check]~%")
-        (check-ir1-consistency all-components))
+    (if load-time-value-p
+        (compile-load-time-value-lambda lambdas)
+        (compile-toplevel-lambdas lambdas))
 
-      (if load-time-value-p
-          (compile-load-time-value-lambda lambdas)
-          (compile-toplevel-lambdas lambdas))
-
-      (mapc #'clear-ir1-info components)))
+    (mapc #'clear-ir1-info components))
   (values))
 
 ;;; Actually compile any stuff that has been queued up for block
@@ -1635,7 +1627,9 @@ necessary, since type inference may take arbitrarily long to converge.")
          (let ((ctxt *compiler-error-context*))
            (lexenv-handled-conditions
             (etypecase ctxt
-             (node (node-lexenv ctxt))
+              (node (node-lexenv ctxt))
+              (lvar-annotation
+               (lvar-annotation-lexenv ctxt))
              (compiler-error-context
               (let ((lexenv (compiler-error-context-lexenv ctxt)))
                 (aver lexenv)
@@ -1724,7 +1718,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                   ;; Dump the code coverage records into the fasl.
                    (with-source-paths
                     (fopcompile `(record-code-coverage
-                                  ',(namestring *compile-file-pathname*)
+                                  ',(namestring sb!xc:*compile-file-pathname*)
                                   ',(let (list)
                                       (maphash (lambda (k v)
                                                  (declare (ignore k))
@@ -1777,11 +1771,12 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defun print-compile-start-note (source-info)
   (declare (type source-info source-info))
   (let ((file-info (source-info-file-info source-info)))
-    (compiler-mumble #+sb-xc-host "~&; ~A file ~S (written ~A):~%"
-                     #+sb-xc-host (if sb-cold::*compile-for-effect-only*
-                                      "preloading"
-                                      "cross-compiling")
-                     #-sb-xc-host "~&; compiling file ~S (written ~A):~%"
+    #+sb-xc-host
+    (compiler-mumble "~&; ~Aing file ~S:~%"
+                     (if sb-cold::*compile-for-effect-only* "load" "x-compil")
+                     (namestring (file-info-name file-info)))
+    #-sb-xc-host
+    (compiler-mumble "~&; compiling file ~S (written ~A):~%"
                      (namestring (file-info-name file-info))
                      (sb!int:format-universal-time nil
                                                    (file-info-write-date
@@ -1925,12 +1920,12 @@ SPEED and COMPILATION-SPEED optimization values, and the
         (setq output-file-name
               (pathname (fasl-output-stream fasl-output)))
         (when (and (not abort-p) sb!xc:*compile-verbose*)
-          (compiler-mumble "~2&; ~A written~%" (namestring output-file-name))))
+          (compiler-mumble "~2&; wrote ~A~%" (namestring output-file-name))))
 
       (when cfasl-output
         (close-fasl-output cfasl-output abort-p)
         (when (and (not abort-p) sb!xc:*compile-verbose*)
-          (compiler-mumble "; ~A written~%" (namestring coutput-file-name))))
+          (compiler-mumble "; wrote ~A~%" (namestring coutput-file-name))))
 
       (when sb!xc:*compile-verbose*
         (print-compile-end-note source-info (not abort-p)))

@@ -268,20 +268,18 @@
   complex-array-widetag                     ;  F2   FD  EA   F5
 ))
 
-(defconstant-eqx +fun-header-widetags+
+(defconstant-eqx +function-widetags+
     '#.(list funcallable-instance-widetag simple-fun-widetag closure-widetag)
   #'equal)
 
-;;; Don't use these. They're for Slime, ltk, Conium, hu.dwim.debug
-;;; and who-knows-what-else.
-(defconstant simple-fun-header-widetag simple-fun-widetag)
-(defconstant closure-header-widetag closure-widetag)
-
-;;; the different vector subtypes
-(defenum ()
-  vector-normal-subtype
-  vector-unused-subtype
-  vector-valid-hashing-subtype)
+;;; the different vector subtypes - these are flag bits, not an enumeration
+(defconstant vector-normal-subtype  0)
+;; If vector is weak but NOT a hash-table backing vector
+(defconstant vector-weak-subtype 1)
+(defconstant vector-weak-visited-subtype 2) ; weak + GC bit
+;; a valid-hashing vector might also be weak,
+;; but we set ONLY the hashing bit when it backs a hash-table
+(defconstant vector-valid-hashing-subtype 4)
 
 ;;; These next two constants must not occupy the same byte of a
 ;;; vector header word as the values in the preceding defenum.
@@ -305,6 +303,7 @@
 
 ;;; This is so that COMPILE-FILE knows that things like :ALLOW-OTHER-KEYS
 ;;; can be immediate constants.
+;;; Note also that sb-fasteval uses 2 bits of the symbol header.
 #!+(and immobile-space (not immobile-symbols))
 (defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
 
@@ -321,7 +320,7 @@
   ;; The cross-compiler stores FUNCTION-LAYOUT in a more obvious way.
   #+sb-xc-host
   (defconstant function-layout ; kludge - verified by genesis
-    (logior (+ fixedobj-space-start layout-align) instance-pointer-lowtag)))
+    (logior (+ fixedobj-space-start (* 3 layout-align)) instance-pointer-lowtag)))
 
 #|
 ;; Run this in the SB-VM or SB!VM package once for each target feature combo.

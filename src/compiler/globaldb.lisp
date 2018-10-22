@@ -143,7 +143,7 @@
                      +fdefn-info-num+)
                 #+sb-xc (meta-info-number (meta-info category kind)))))
 ;; It's an external symbol of SB-INT so wouldn't be removed automatically
-(push '("SB-INT" define-info-type) sb!impl::*!removable-symbols*)
+(push '("SB-INT" define-info-type) *!removable-symbols*)
 
 
 (macrolet ((meta-info-or-lose (category kind)
@@ -281,6 +281,11 @@
   :default
   #+sb-xc-host nil
   #-sb-xc-host (lambda (name) (if (fboundp name) :function nil)))
+
+;;; The deferred mode processor for fasteval special operators.
+;;; Immediate processors are hung directly off symbols in a dedicated slot.
+#!+sb-fasteval
+(define-info-type (:function :interpreter) :type-spec (or function null))
 
 ;;; Indicates whether the function is deprecated.
 (define-info-type (:function :deprecated)

@@ -13,14 +13,11 @@
 
 (in-package "SB!IMPL")
 
-(defvar *core-pathname* nil
+(defglobal *core-pathname* nil
   "The absolute pathname of the running SBCL core.")
 
-(defvar *runtime-pathname* nil
+(defglobal *runtime-pathname* nil
   "The absolute pathname of the running SBCL runtime.")
-
-;;; something not EQ to anything we might legitimately READ
-(define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant max-hash sb!xc:most-positive-fixnum))
@@ -357,6 +354,16 @@
                  (rplacd splice (cdr x))))
             (t (setq splice x)))))) ; Move splice along to include element.
 
+;;; Delete just one item
+(defun delq1 (item list)
+  (do ((prev nil x)
+       (x list (cdr x)))
+      ((null x) list)
+    (when (eq item (car x))
+      (if (null prev)
+          (return (cdr x))
+          (rplacd prev (cdr x)))
+      (return list))))
 
 ;;; like (POSITION .. :TEST #'EQ):
 ;;;   Return the position of the first element EQ to ITEM.
@@ -581,7 +588,7 @@ NOTE: This interface is experimental and subject to change."
 ;;;   a fixnum with at least (* 2 <hash-bits>) of information in it.
 ;;; :VALUES <n>
 ;;;   the number of return values cached for each function call
-(defvar *cache-vector-symbols* nil)
+(define-load-time-global *cache-vector-symbols* nil)
 
 (defun drop-all-hash-caches ()
   (dolist (name *cache-vector-symbols*)
@@ -1174,6 +1181,14 @@ NOTE: This interface is experimental and subject to change."
                 (t
                  normal-printer))))))
 
+;;; When cross-compiling, there is nothing out of the ordinary
+;;; about compilling a DEFUN wrapped in PRESERVING-HOST-FUNCTION,
+;;; so just remove the decoration.
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (sb!xc:defmacro sb-cold:preserving-host-function (form) form))
+
+(sb-cold:preserving-host-function
 (defun print-symbol-with-prefix (stream symbol &optional colon at)
   "For use with ~/: Write SYMBOL to STREAM as if it is not accessible from
   the current package."
@@ -1182,9 +1197,10 @@ NOTE: This interface is experimental and subject to change."
   ;; keywords are always printed with colons, so this guarantees that the
   ;; symbol will not be printed without a prefix.
   (let ((*package* *keyword-package*))
-    (write symbol :stream stream :escape t)))
+    (write symbol :stream stream :escape t))))
 
 (declaim (special sb!pretty:*pprint-quote-with-syntactic-sugar*))
+(sb-cold:preserving-host-function
 (defun print-type-specifier (stream type-specifier &optional colon at)
   (declare (ignore colon at))
   ;; Binding *PPRINT-QUOTE-WITH-SYNTACTIC-SUGAR* prevents certain
@@ -1200,10 +1216,11 @@ NOTE: This interface is experimental and subject to change."
   ;; specifiers.
   (let ((sb!pretty:*pprint-quote-with-syntactic-sugar* nil)
         (*package* *cl-package*))
-    (prin1 type-specifier stream)))
+    (prin1 type-specifier stream))))
 
+(sb-cold:preserving-host-function
 (defun print-type (stream type &optional colon at)
-  (print-type-specifier stream (type-specifier type) colon at))
+  (print-type-specifier stream (type-specifier type) colon at)))
 
 (declaim (ftype (sfunction (index &key (:comma-interval (and (integer 1) index))) index)
                 decimal-with-grouped-digits-width))
@@ -1392,23 +1409,25 @@ NOTE: This interface is experimental and subject to change."
 ;;; - SB-C::STACK-ALLOCATE-VECTOR (policy)         since 1.0.19.7            -> Final: anytime
 ;;; - SB-C::STACK-ALLOCATE-VALUE-CELLS (policy)    since 1.0.19.7            -> Final: anytime
 
+(sb-cold:preserving-host-function
 (defun print-deprecation-replacements (stream replacements &optional colonp atp)
   (declare (ignore colonp atp))
   ;; I don't think this is callable during cross-compilation, is it?
+  ;; Anyway, the format string tokenizer can not handle APPLY on its own.
   (apply #'format stream
-         "~#[~;~
+         (sb!format:tokens "~#[~;~
              Use ~/sb-ext:print-symbol-with-prefix/ instead.~;~
              Use ~/sb-ext:print-symbol-with-prefix/ or ~
              ~/sb-ext:print-symbol-with-prefix/ instead.~:;~
              Use~@{~#[~; or~] ~
              ~/sb-ext:print-symbol-with-prefix/~^,~} instead.~
-           ~]"
-         replacements))
+           ~]")
+         replacements)))
 
 (defun print-deprecation-message (namespace name software version
                                   &optional replacements stream)
   (format stream
-           "The ~(~A~) ~/sb!impl:print-symbol-with-prefix/ has been ~
+           "The ~(~A~) ~/sb!ext:print-symbol-with-prefix/ has been ~
             deprecated as of ~@[~A ~]version ~A.~
             ~@[~2%~/sb!impl::print-deprecation-replacements/~]"
           namespace name software version replacements))

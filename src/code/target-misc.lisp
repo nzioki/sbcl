@@ -14,7 +14,13 @@
 
 ;;; various environment inquiries
 
-(!defvar *features* '#.sb!xc:*features*
+(!defvar *features*
+   ;; GCC_TLS is not a Lisp feature- it's just freeloading off the means
+   ;; by which additional #defines get into "genesis/config.h".
+   ;; Literally nothing except C code tests for it.
+   '#.(remove-if (lambda (x)
+                   (member x '(:gcc-tls)))
+                 sb!xc:*features*)
   "a list of symbols that describe features provided by the
    implementation")
 
@@ -40,9 +46,9 @@ are running on, or NIL if we can't find any useful information."
 ;;; for Conforming Implementations" it is kosher to add a SETF function for
 ;;; a symbol in COMMON-LISP..
 (declaim (type (or null string) *short-site-name* *long-site-name*))
-(defvar *short-site-name* nil
+(define-load-time-global *short-site-name* nil
   "The value of SHORT-SITE-NAME.")
-(defvar *long-site-name* nil
+(define-load-time-global *long-site-name* nil
   "The value of LONG-SITE-NAME.")
 (defun short-site-name ()
   "Return a string with the abbreviated site name, or NIL if not known."
@@ -132,7 +138,7 @@ the file system."
 (defun %defglobal (name value boundp doc docp source-location)
   (%compiler-defglobal name :always-bound value (not boundp))
   (when docp
-    (setf (fdocumentation name 'variable) doc))
+    (setf (documentation name 'variable) doc))
   (when source-location
     (setf (info :source-location :variable name) source-location))
   name)
@@ -141,7 +147,7 @@ the file system."
   (%compiler-defvar var)
   (set var val)
   (when docp
-    (setf (fdocumentation var 'variable) doc))
+    (setf (documentation var 'variable) doc))
   (when source-location
     (setf (info :source-location :variable var) source-location))
   var)
@@ -152,7 +158,7 @@ the file system."
              (not (boundp var)))
     (set var val))
   (when docp
-    (setf (fdocumentation var 'variable) doc))
+    (setf (documentation var 'variable) doc))
   (when source-location
     (setf (info :source-location :variable var) source-location))
   var)
@@ -240,3 +246,9 @@ version 1[.0.0...] or greater."
                or later is required)."
               (lisp-implementation-version)
               subversions))))
+
+(!defvar sb!pcl::*!docstrings* nil)
+(defun (setf documentation) (string name doc-type)
+  (declare (type (or null string) string))
+  (push (list string name doc-type) sb!pcl::*!docstrings*)
+  string)

@@ -14,6 +14,7 @@
 ;;; The case for caching is to speed up out-of-line calls that use a fixed
 ;;; control string in a loop, not to avoid re-tokenizing all strings that
 ;;; happen to be STRING= to that string.
+;;; (Might we want to bypass the cache when compile-time tokenizing?)
 (defun-cached (tokenize-control-string
                :hash-bits 7
                :hash-function #+sb-xc-host
@@ -23,9 +24,17 @@
     ;; even though the hash is address-based.
     ((string string=))
   (declare (simple-string string))
-  (let ((index 0)
-        (end (length string))
-        (result nil)
+  (combine-directives
+   (%tokenize-control-string string 0 (length string) nil)
+   t))
+
+;;; If at some point I can figure out how to *CORRECTLY* utilize
+;;; non-simple strings, then the INDEX and END will bound the parse.
+;;; [Tokenization is the easy part, it's the substring extraction
+;;; and processing, and error reporting, that become very complicated]
+(defun %tokenize-control-string (string index end symbols)
+  (declare (simple-string string))
+  (let ((result nil)
         ;; FIXME: consider rewriting this 22.3.5.2-related processing
         ;; using specials to maintain state and doing the logic inside
         ;; the directive expanders themselves.
@@ -34,24 +43,25 @@
         (semicolon)
         (justification-semicolon))
     (loop
-      (let ((next-directive (or (position #\~ string :start index) end)))
+      (let ((next-directive (or (position #\~ string :start index :end end) end)))
         (when (> next-directive index)
-          (push (subseq string index next-directive) result))
+          (push (possibly-base-stringize (subseq string index next-directive))
+                result))
         (when (= next-directive end)
           (return))
-        (let* ((directive (parse-directive string next-directive))
-               (char (format-directive-character directive)))
+        (let* ((directive (parse-directive string next-directive symbols))
+               (char (directive-character directive)))
           ;; this processing is required by CLHS 22.3.5.2
           (cond
             ((char= char #\<) (push directive block))
-            ((and block (char= char #\;) (format-directive-colonp directive))
+            ((and block (char= char #\;) (directive-colonp directive))
              (setf semicolon directive))
             ((char= char #\>)
              (unless block
                (format-error-at string next-directive
                                 "~~> without a matching ~~<"))
              (cond
-               ((format-directive-colonp directive)
+               ((directive-colonp directive)
                 (unless pprint
                   (setf pprint (car block)))
                 (setf semicolon nil))
@@ -63,15 +73,17 @@
             ((not block)
              (case char
                ((#\W #\I #\_) (unless pprint (setf pprint directive)))
-               (#\T (when (and (format-directive-colonp directive)
+               (#\T (when (and (directive-colonp directive)
                                (not pprint))
                       (setf pprint directive))))))
           (push directive result)
-          (setf index (format-directive-end directive)))))
+          (when (char= (directive-character directive) #\/)
+            (pop symbols))
+          (setf index (directive-end directive)))))
     (when (and pprint justification-semicolon)
-      (let ((pprint-offset (1- (format-directive-end pprint)))
+      (let ((pprint-offset (1- (directive-end pprint)))
             (justification-offset
-             (1- (format-directive-end justification-semicolon))))
+             (1- (directive-end justification-semicolon))))
         (format-error-at*
          string (min pprint-offset justification-offset)
          "Misuse of justification and pprint directives" '()
@@ -81,7 +93,8 @@
          :references '((:ansi-cl :section (22 3 5 2))))))
     (nreverse result)))
 
-(defun parse-directive (string start)
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+(defun parse-directive (string start symbols)
   (let ((posn (1+ start)) (params nil) (colonp nil) (atsignp nil)
         (end (length string)))
     (flet ((get-char ()
@@ -167,17 +180,91 @@
                 (setf posn closing-slash)
                 (format-error-at string posn "No matching closing slash"))))
         (make-format-directive
-         :string string :start start :end (1+ posn)
-         :character (char-upcase char)
-         :colonp colonp :atsignp atsignp
-         :params (nreverse params))))))
+         string start (1+ posn)
+         (nreverse params) colonp atsignp (char-upcase char)
+         (when (eql char #\/) (car symbols))))))))
+
+;;; Make a few simplifications to the directive list in INPUT,
+;;; including translation of ~% to literal newline.
+;;; I think that this does not have implications on conditional newlines
+;;; vis a vis "When a line break is inserted by any type of conditional
+;;; newline, any blanks that immediately precede the conditional newline
+;;; are omitted". i.e. one could argue that nonliteral blanks are not
+;;; quite the same as literal blanks, i.e. not subject to removal,
+;;; but I don't think that's true, and in fact that is the source of
+;;; an extremely subtle bug that writing the #\space character as a
+;;; physical space character followed by a conditional newline is,
+;;; if taken literally, supposed to remove the desired output.
+(defun combine-directives (input literalize-tilde)
+  (let (output)
+    (flet ((concat (string)
+             (let ((first (car output)))
+               (cond ((not (stringp first))
+                      (push string output))
+                     ;; STRING was already handed to POSSIBLY-BASE-STRINGIZE
+                     ;; by %TOKENIZE-CONTROL-STRING so we don't need to do that again.
+                     ;; i.e. the result is base-string if and only if
+                     ;; both FIRST and STRING are base-strings.
+                     ((and (typep first 'base-string)
+                           (typep string 'base-string))
+                      (rplaca output (concatenate 'base-string first string)))
+                     (t
+                      (rplaca output (concatenate 'string first string)))))))
+      (loop
+        (unless input (return (nreverse output)))
+        (let ((item (pop input)))
+          (etypecase item
+            (string
+             (concat item))
+            ;;  - Handle tilde-newline immediately
+            ;;  - Turn "~%" into literal newline (for parameter N <=127)
+            ;;  - Unless x-compiling, turn "~|" into literal form-feed (ditto)
+            ;;  - Optionally turn "~~" into literal tilde (ditto)
+            (format-directive
+             (let ((params (directive-params item))
+                   (colon (directive-colonp item))
+                   (atsign (directive-atsignp item))
+                   (char (directive-character item)))
+               (block nil
+                 (case char
+                   (#\Newline
+                    ;; tilde newline wants no params, and not both colon+atsign
+                    (when (and (not params) (not (and colon atsign)))
+                      (when atsign
+                        (concat #.(make-string 1 :initial-element #\Newline)))
+                      (when (and (not colon) (stringp (car input)))
+                        (concat (string-left-trim
+                                 ;; #\Tab is a nonstandard char
+                                 `(#-sb-xc-host ,(sb!xc:code-char tab-char-code)
+                                   #\space #\newline)
+                                 (pop input))))
+                      (return)))
+                   ((#\% #\~ #-sb-xc-host #\|) ; #\Page is a nonstandard char
+                    (let ((n (or (cdar params) 1)))
+                      (when (and (not (or colon atsign))
+                                 (or (null params) (singleton-p params))
+                                 (typep n '(mod 128))
+                                 ;; Don't insert literal tilde when parsing/
+                                 ;; unparsing to create a FMT-CONTROL instance.
+                                 (or (not (eql char #\~)) literalize-tilde))
+                        (when (plusp n)
+                          (let ((char (case char
+                                        (#\% #\Newline)
+                                        (#\| (sb!xc:code-char form-feed-char-code))
+                                        (t char))))
+                            (concat (make-string n :initial-element char))))
+                        (return)))))
+                 (push item output))))))))))
 
 ;;;; FORMATTER stuff
 
 (sb!xc:defmacro formatter (control-string)
   `#',(%formatter control-string))
 
-(defun %formatter (control-string &optional (arg-count 0) (need-retval t))
+(defun %formatter (control-string &optional (arg-count 0) (need-retval t)
+                                  &aux (lambda-name
+                                        (possibly-base-stringize
+                                         (concatenate 'string "fmt$" control-string))))
   ;; ARG-COUNT is supplied only when the use of this formatter is in a literal
   ;; call to FORMAT, in which case we can possibly elide &optional parsing.
   ;; But we can't in general, because FORMATTER may be called by users
@@ -200,7 +287,7 @@
                  (push `(,(car arg)
                          (args-exhausted ,control-string ,(cdr arg)))
                        optional))))
-        (return `(named-lambda ,control-string
+        (return `(named-lambda ,lambda-name
                          (stream ,@required
                                  ,@(if optional '(&optional)) ,@optional
                                  &rest args)
@@ -209,7 +296,7 @@
                    ,(and need-retval 'args)))))
     (let ((*orig-args-available* t)
           (*only-simple-args* nil))
-      `(lambda (stream &rest orig-args)
+      `(named-lambda ,lambda-name (stream &rest orig-args)
          (declare (ignorable stream))
          (let ((args orig-args))
            ,(expand-control-string control-string)
@@ -243,9 +330,17 @@
                            (cdr remaining-directives))
        (flet ((merge-string (string)
                 (cond (previous
-                       (let ((concat (concatenate 'string
-                                                  (string previous)
-                                                  (string string))))
+                       ;; It would be nice if (CONCATENTE 'STRING)
+                       ;; could return the "smallest" string type
+                       ;; able to hold the result. Or at least if we
+                       ;; had a better interface than wrapping
+                       ;; it with POSSIBLY-BASE-STRINGIZE since that
+                       ;; conses two new strings usually.
+                       (let ((concat
+                              (possibly-base-stringize
+                               (concatenate 'string
+                                            (string previous)
+                                            (string string)))))
                          (setf previous concat)
                          (setf (car results)
                                `(write-string ,concat stream))))
@@ -254,7 +349,7 @@
                        (push form results)))))
          (cond ((not form))
                ((typep form '(cons (member write-string write-char)
-                              (cons (or string character))))
+                                   (cons (or string character))))
                 (merge-string (second form)))
                ((typep form '(cons (eql terpri)))
                 (merge-string #\Newline))
@@ -268,22 +363,16 @@
   (etypecase directive
     (format-directive
      (let ((expander
-            (let ((char (format-directive-character directive)))
-              (typecase char
-                (base-char
-                 (aref *format-directive-expanders* (sb!xc:char-code char))))))
+            (aref *format-directive-expanders* (directive-code directive)))
            (*default-format-error-offset*
-            (1- (format-directive-end directive))))
-       (declare (type (or null function) expander))
-       (if expander
+            (1- (directive-end directive))))
+       (if (functionp expander)
            (funcall expander directive more-directives)
            (format-error "Unknown directive ~@[(character: ~A)~]"
-                         (char-name (format-directive-character directive))))))
+                         (directive-char-name directive)))))
     ((simple-string 1)
      (values `(write-char ,(schar directive 0) stream)
              more-directives))
-    ((simple-string 0)
-     (values nil more-directives))
     (simple-string
      (values `(write-string ,directive stream)
              more-directives))))
@@ -346,8 +435,7 @@
 
 ;;;; format directive machinery
 
-(eval-when (:compile-toplevel :execute)
-(#+sb-xc-host defmacro #-sb-xc-host sb!xc:defmacro def-complex-format-directive (char lambda-list &body body)
+(defmacro def-complex-format-directive (char lambda-list &body body)
   (let ((defun-name (intern (format nil
                                     "~:@(~:C~)-FORMAT-DIRECTIVE-EXPANDER"
                                     char)))
@@ -358,15 +446,14 @@
          ,@(if lambda-list
                `((let ,(mapcar (lambda (var)
                                  `(,var
-                                   (,(symbolicate "FORMAT-DIRECTIVE-" var)
-                                    ,directive)))
+                                   (,(symbolicate "DIRECTIVE-" var) ,directive)))
                                (butlast lambda-list))
                    ,@body))
                `((declare (ignore ,directive ,directives))
                  ,@body)))
        (%set-format-directive-expander ,char #',defun-name))))
 
-(#+sb-xc-host defmacro #-sb-xc-host sb!xc:defmacro def-format-directive (char lambda-list &body body)
+(defmacro def-format-directive (char lambda-list &body body)
   (let ((directives (sb!xc:gensym "DIRECTIVES"))
         (declarations nil)
         (body-without-decls body))
@@ -380,25 +467,17 @@
        ,@declarations
        (values (progn ,@body-without-decls)
                ,directives))))
-) ; EVAL-WHEN
-
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 
 (defun %set-format-directive-expander (char fn)
   (let ((code (sb!xc:char-code (char-upcase char))))
     (setf (aref *format-directive-expanders* code) fn))
   char)
 
-(defun %set-format-directive-interpreter (char fn)
-  (let ((code (sb!xc:char-code (char-upcase char))))
-    (setf (aref *format-directive-interpreters* code) fn))
-  char)
-
 (defun find-directive (directives kind stop-at-semi)
   (if directives
       (let ((next (car directives)))
         (if (format-directive-p next)
-            (let ((char (format-directive-character next)))
+            (let ((char (directive-character next)))
               (if (or (char= kind char)
                       (and stop-at-semi (char= char #\;)))
                   (car directives)
@@ -416,8 +495,6 @@
                             (t directives))))
                    kind stop-at-semi)))
             (find-directive (cdr directives) kind stop-at-semi)))))
-
-) ; EVAL-WHEN
 
 ;;;; format directives for simple output
 
@@ -618,20 +695,12 @@
            (write-char #\~ stream)))
       '(write-char #\~ stream)))
 
+;;; We'll only get here when the directive usage is illegal.
+;;; COMBINE-DIRECTIVES would have handled a legal directive.
 (def-complex-format-directive #\newline (colonp atsignp params directives)
-  ;; FIXME: this is not an error!
   (check-modifier '("colon" "at-sign") (and colonp atsignp))
-  (values (expand-bind-defaults () params
-            (if atsignp
-                '(write-char #\newline stream)
-                nil))
-          (if (and (not colonp)
-                   directives
-                   (simple-string-p (car directives)))
-              (cons (string-left-trim *format-whitespace-chars*
-                                      (car directives))
-                    (cdr directives))
-              directives)))
+  (values (expand-bind-defaults () params)
+          (bug "Unreachable ~S" directives)))
 
 ;;;; format directives for tabs and simple pretty printing
 
@@ -795,10 +864,10 @@
               (posn (position close-or-semi remaining)))
          (push (subseq remaining 0 posn) sublists)
          (setf remaining (nthcdr (1+ posn) remaining))
-         (when (char= (format-directive-character close-or-semi) #\])
+         (when (char= (directive-character close-or-semi) #\])
            (return))
          (setf last-semi-with-colon-p
-               (format-directive-colonp close-or-semi))))
+               (directive-colonp close-or-semi))))
     (values sublists last-semi-with-colon-p remaining)))
 
 (defun expand-maybe-conditional (sublist)
@@ -896,7 +965,7 @@
 (def-complex-format-directive #\{ (colonp atsignp params string end directives)
   (let* ((close (or (find-directive directives #\} nil)
                     (format-error "No corresponding close brace")))
-         (closed-with-colon (format-directive-colonp close))
+         (closed-with-colon (directive-colonp close))
          (posn (position close directives)))
     (labels
         ((compute-insides ()
@@ -971,34 +1040,33 @@
 
 ;;;; format directives and support functions for justification
 
-(defparameter *illegal-inside-justification*
-  (mapcar (lambda (x) (parse-directive x 0))
-          '("~W" "~:W" "~@W" "~:@W"
-            "~_" "~:_" "~@_" "~:@_"
-            "~:>" "~:@>"
-            "~I" "~:I" "~@I" "~:@I"
-            "~:T" "~:@T")))
+(defconstant-eqx !illegal-inside-justification
+  (mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
+          '("~:>" "~:@>"
+            "~:T" "~:@T"))
+  #'equal)
 
+;;; Reject ~W, ~_, ~I and certain other specific values of modifier+character.
 (defun illegal-inside-justification-p (directive)
-  (member directive *illegal-inside-justification*
-          :test (lambda (x y)
-                  (and (format-directive-p x)
-                       (format-directive-p y)
-                       (eql (format-directive-character x) (format-directive-character y))
-                       (eql (format-directive-colonp x) (format-directive-colonp y))
-                       (eql (format-directive-atsignp x) (format-directive-atsignp y))))))
+  (and (format-directive-p directive)
+       (if (or (member (directive-bits directive) !illegal-inside-justification)
+               (member (directive-character directive) '(#\W #\I #\_)))
+           t
+           nil)))
 
 (def-complex-format-directive #\< (colonp atsignp params string end directives)
   (multiple-value-bind (segments first-semi close remaining)
       (parse-format-justification directives)
     (values
-     (if (format-directive-colonp close) ; logical block vs. justification
+     (if (directive-colonp close) ; logical block vs. justification
          (multiple-value-bind (prefix per-line-p insides suffix)
              (parse-format-logical-block segments colonp first-semi
                                          close params string end)
            (expand-format-logical-block prefix per-line-p insides
                                         suffix atsignp))
-         (let ((count (reduce #'+ (mapcar (lambda (x) (count-if #'illegal-inside-justification-p x)) segments))))
+         (let ((count (reduce #'+ (mapcar (lambda (x)
+                                            (count-if #'illegal-inside-justification-p x))
+                                          segments))))
            (when (> count 0)
              ;; ANSI specifies that "an error is signalled" in this
              ;; situation.
@@ -1009,9 +1077,9 @@
            ;; ANSI does not explicitly say that an error should be
            ;; signalled, but the @ modifier is not explicitly allowed
            ;; for ~> either.
-           (when (format-directive-atsignp close)
+           (when (directive-atsignp close)
              (format-error-at*
-              nil (1- (format-directive-end close))
+              nil (1- (directive-end close))
               "@ modifier not allowed in close directive of ~
                justification block (i.e. ~~<...~~@>."
               '()
@@ -1035,7 +1103,7 @@
                  (let ((directive (find-if #'format-directive-p list)))
                    (if directive
                        (format-error-at*
-                        nil (1- (format-directive-end directive))
+                        nil (1- (directive-end directive))
                         "Cannot include format directives inside the ~
                          ~:[suffix~;prefix~] segment of ~~<...~~:>"
                         (list prefix-p)
@@ -1051,15 +1119,15 @@
                      (extract-string (caddr segments) nil)))
           (t
            (format-error "Too many segments for ~~<...~~:>")))))
-    (when (format-directive-atsignp close)
+    (when (directive-atsignp close)
       (setf insides
             (add-fill-style-newlines insides
                                      string
                                      (if first-semi
-                                         (format-directive-end first-semi)
+                                         (directive-end first-semi)
                                          end))))
     (values prefix
-            (and first-semi (format-directive-atsignp first-semi))
+            (and first-semi (directive-atsignp first-semi))
             insides
             suffix)))
 
@@ -1071,9 +1139,8 @@
          ((simple-string-p directive)
           (let* ((non-space (position #\Space directive :test #'char/=))
                  (newlinep (and last-directive
-                                (char=
-                                 (format-directive-character last-directive)
-                                 #\Newline))))
+                                (char= (directive-character last-directive)
+                                       #\Newline))))
             (cond
               ((and newlinep non-space)
                (nconc
@@ -1094,7 +1161,7 @@
           (cons directive
                 (add-fill-style-newlines
                  (cdr list) string
-                 (format-directive-end directive) directive))))))
+                 (directive-end directive) directive))))))
     (t nil)))
 
 (defun add-fill-style-newlines-aux (literal string offset)
@@ -1111,9 +1178,8 @@
                                end)))
             (results (subseq literal posn non-blank))
             (results (make-format-directive
-                      :string string :character #\_
-                      :start (+ offset non-blank) :end (+ offset non-blank)
-                      :colonp t :atsignp nil :params nil))
+                      string (+ offset non-blank) (+ offset non-blank)
+                      nil t nil #\_ nil)) ; params,colon,atsign,char,symbol
             (setf posn non-blank))
           (when (= posn end)
             (return))))
@@ -1130,8 +1196,7 @@
            (let ((posn (position close-or-semi remaining)))
              (segments (subseq remaining 0 posn))
              (setf remaining (nthcdr (1+ posn) remaining)))
-           (when (char= (format-directive-character close-or-semi)
-                        #\>)
+           (when (char= (directive-character close-or-semi) #\>)
              (setf close close-or-semi)
              (return))
            (unless first-semi
@@ -1168,7 +1233,7 @@
 (defun expand-format-justification (segments colonp atsignp first-semi params)
   (let ((newline-segment-p
          (and first-semi
-              (format-directive-colonp first-semi))))
+              (directive-colonp first-semi))))
     (expand-bind-defaults
         ((mincol 0) (colinc 1) (minpad 0) (padchar #\space))
         params
@@ -1185,7 +1250,7 @@
                  ,(expand-bind-defaults
                       ((extra 0)
                        (line-len '(or (sb!impl::line-length stream) 72)))
-                      (format-directive-params first-semi)
+                      (directive-params first-semi)
                     `(setf extra-space ,extra line-len ,line-len))))
            ,@(mapcar (lambda (segment)
                        `(push (with-simple-output-to-string (stream)
@@ -1218,31 +1283,96 @@
                   ,@(param-names))))))
 
 (defun extract-user-fun-name (string start end)
+  ;; Searching backwards avoids finding the wrong slash in a funky string
+  ;; such as "~'/,'//fun/" which passes #\/ twice to FUN as parameters.
   (let* ((slash (or (position #\/ string :start start :end (1- end)
                               :from-end t)
                     (format-error "Malformed ~~/ directive")))
-         (name (string-upcase (let ((foo string))
-                                ;; HACK: This is to keep the compiler
-                                ;; quiet about deleting code inside
-                                ;; the subseq expansion.
-                                (subseq foo (1+ slash) (1- end)))))
+         (name (nstring-upcase (subseq string (1+ slash) (1- end))))
          (first-colon (position #\: name))
          (second-colon (if first-colon (position #\: name :start (1+ first-colon))))
+         (symbol
+          (cond ((and second-colon (= second-colon (1+ first-colon)))
+                 (subseq name (1+ second-colon)))
+                (first-colon
+                 (subseq name (1+ first-colon)))
+                (t name)))
          (package
             (if (not first-colon)
                 (load-time-value (find-package "COMMON-LISP-USER") t)
                 (let ((package-name (subseq name 0 first-colon)))
+
+                  ;; Hack the package-name into a bang package.
+                  ;; This is horrible, but it will go away soon.
+                  #+sb-xc-host
+                  (when (member symbol '("PRINT-SYMBOL-WITH-PREFIX"
+                                         "PRINT-DEPRECATION-REPLACEMENTS"
+                                         "PRINT-TYPE"
+                                         "PRINT-TYPE-SPECIFIER"
+                                         "FORMAT-MILLISECONDS"
+                                         "FORMAT-MICROSECONDS")
+                                :test #'string=)
+                    (setf (char package-name 2) #\!))
+
                   (or (find-package package-name)
                       ;; FIXME: should be PACKAGE-ERROR? Could we just
                       ;; use FIND-UNDELETED-PACKAGE-OR-LOSE?
                       (format-error "No package named ~S" package-name))))))
-    (intern (cond
-              ((and second-colon (= second-colon (1+ first-colon)))
-               (subseq name (1+ second-colon)))
-              (first-colon
-               (subseq name (1+ first-colon)))
-              (t name))
-            package)))
+    (intern symbol package)))
+
+(defun extract-user-fun-directives (string)
+  (let* ((tokens (handler-case
+                     (combine-directives
+                      (%tokenize-control-string string 0 (length string) nil)
+                      nil)
+                   (error (e)
+                     (declare (ignore e))
+                     (return-from extract-user-fun-directives (values nil nil)))))
+         (max-len (loop for token in tokens
+                        sum (if (format-directive-p token)
+                                (- (directive-end token) (directive-start token))
+                                (length token))))
+         (new-string
+          (make-array max-len :element-type 'character :fill-pointer 0))
+         (symbols))
+    (dolist (token tokens)
+      (cond ((stringp token)
+             (aver (not (find #\~ token)))
+             (let ((new-start (fill-pointer new-string)))
+               (incf (fill-pointer new-string) (length token))
+               (replace new-string token :start1 new-start)))
+            (t
+             (let* ((start (directive-start token))
+                    (end (directive-end token))
+                    (len (- end start))
+                    (new-start (fill-pointer new-string)))
+               (cond ((eql (directive-character token) #\/)
+                      (push (handler-case (extract-user-fun-name string start end)
+                              (error (e)
+                                (declare (ignore e))
+                                (return-from extract-user-fun-directives
+                                  (values nil nil))))
+                            symbols)
+                      ;; Don't copy past the first slash. Scan backwards for it
+                      ;; exactly as is done in EXTRACT-USER-FUN-NAME above.
+                      (setq end (1+ (position #\/ string :start start :end (1- end)
+                                                         :from-end t)))
+                      ;; compute new length to copy, +1 is for trailing slash
+                      (incf (fill-pointer new-string) (1+ (- end start)))
+                      (setf (char new-string (1- (fill-pointer new-string))) #\/))
+                     (t
+                      (incf (fill-pointer new-string) len)))
+               (replace new-string string :start1 new-start
+                                          :start2 start :end2 end)))))
+    (values (nreverse symbols)
+            (possibly-base-stringize new-string))))
+
+(sb!xc:defmacro tokens (string)
+  (declare (string string))
+  (multiple-value-bind (symbols new-string) (extract-user-fun-directives string)
+    (if symbols
+        `(load-time-value (make-fmt-control ,new-string ',symbols) t)
+        (possibly-base-stringize string))))
 
 ;;; compile-time checking for argument mismatch.  This code is
 ;;; inspired by that of Gerd Moellmann, and comes decorated with
@@ -1272,21 +1402,21 @@
           ((walk-justification (justification directives args)
              (declare (ignore args))
              (let ((*default-format-error-offset*
-                    (1- (format-directive-end justification))))
+                    (1- (directive-end justification))))
                (multiple-value-bind (segments first-semi close remaining)
                    (parse-format-justification directives)
                  (declare (ignore segments first-semi))
                  (cond
-                   ((not (format-directive-colonp close))
+                   ((not (directive-colonp close))
                     (values 0 0 directives))
-                   ((format-directive-atsignp justification)
+                   ((directive-atsignp justification)
                     (values 0 sb!xc:call-arguments-limit directives))
                    ;; FIXME: here we could assert that the
                    ;; corresponding argument was a list.
                    (t (values 1 1 remaining))))))
            (walk-conditional (conditional directives args)
              (let ((*default-format-error-offset*
-                    (1- (format-directive-end conditional))))
+                    (1- (directive-end conditional))))
                (multiple-value-bind (sublists last-semi-with-colon-p remaining)
                    (parse-conditional-directive directives)
                  (declare (ignore last-semi-with-colon-p))
@@ -1295,9 +1425,9 @@
                               maximize (nth-value
                                         1 (walk-directive-list s args)))))
                    (cond
-                     ((format-directive-atsignp conditional)
+                     ((directive-atsignp conditional)
                       (values 1 (max 1 sub-max) remaining))
-                     ((loop for p in (format-directive-params conditional)
+                     ((loop for p in (directive-params conditional)
                             thereis (or (integerp (cdr p))
                                         (memq (cdr p) '(:remaining :arg))))
                       (values 0 sub-max remaining))
@@ -1307,14 +1437,14 @@
            (walk-iteration (iteration directives args)
              (declare (ignore args))
              (let ((*default-format-error-offset*
-                    (1- (format-directive-end iteration))))
+                    (1- (directive-end iteration))))
                (let* ((close (find-directive directives #\} nil))
                       (posn (or (position close directives)
                                 (format-error "No corresponding close brace")))
                       (remaining (nthcdr (1+ posn) directives)))
                  ;; FIXME: if POSN is zero, the next argument must be
                  ;; a format control (either a function or a string).
-                 (if (format-directive-atsignp iteration)
+                 (if (directive-atsignp iteration)
                      (values (if (zerop posn) 1 0)
                              sb!xc:call-arguments-limit
                              remaining)
@@ -1329,14 +1459,14 @@
                   (when (null directive)
                     (return (values min (min max sb!xc:call-arguments-limit))))
                   (when (format-directive-p directive)
-                    (incf-both (count :arg (format-directive-params directive)
+                    (incf-both (count :arg (directive-params directive)
                                       :key #'cdr))
-                    (let ((c (format-directive-character directive)))
+                    (let ((c (directive-character directive)))
                       (cond
                         ((find c "ABCDEFGORSWX$/")
                          (incf-both))
                         ((char= c #\P)
-                         (unless (format-directive-colonp directive)
+                         (unless (directive-colonp directive)
                            (incf-both)))
                         ((or (find c "IT%&|_();>~") (char= c #\Newline)))
                         ;; FIXME: check correspondence of ~( and ~)
@@ -1350,7 +1480,7 @@
                          ;; FIXME: the argument corresponding to this
                          ;; directive must be a format control.
                          (cond
-                           ((format-directive-atsignp directive)
+                           ((directive-atsignp directive)
                             (incf min)
                             (setq max sb!xc:call-arguments-limit))
                            (t (incf-both 2))))
@@ -1425,41 +1555,3 @@
 
   (sb!c:define-source-transform write-to-string (object &rest keys)
     (expand 'write-to-string object keys)))
-
-;;; A long as we're processing ERROR strings to remove "SB!" packages,
-;;; we might as well squash out tilde-newline-whitespace too.
-;;; This might even be robust enough to keep in the target image,
-;;; but, FIXME: this punts on ~newline with {~@,~:,~@:} modifiers
-#+sb-xc-host
-(defun sb!impl::!xc-preprocess-format-control (string)
-  (let (pieces ltrim)
-    ;; Tokenizing is the correct way to deal with "~~/foo/"
-    ;; without mistaking it for an occurrence of the "~/" directive.
-    (dolist (piece (tokenize-control-string string)
-                   (let ((new (apply 'concatenate 'string (nreverse pieces))))
-                     (if (string/= new string) new string)))
-      (etypecase piece
-        (string
-         (if ltrim
-             (let ((p (position-if
-                       (lambda (x) (and (not (eql x #\Space)) (graphic-char-p x)))
-                       piece)))
-               (when p
-                 (push (subseq piece p) pieces)))
-             (push piece pieces))
-         (setq ltrim nil))
-        (format-directive
-         (setq ltrim nil)
-         (let ((text (subseq string
-                             (format-directive-start piece)
-                             (format-directive-end piece)))
-               (processed nil))
-           (cond ((and (eql (format-directive-character piece) #\Newline)
-                       (not (format-directive-colonp piece))
-                       (not (format-directive-atsignp piece)))
-                  (setq ltrim t processed t))
-                 ((eql (format-directive-character piece) #\/)
-                  (when (string-equal text "~/sb!" :end1 5)
-                    (setq text (concatenate 'string "~/sb-" (subseq text 5))))))
-           (unless processed
-             (push text pieces))))))))

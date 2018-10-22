@@ -12,21 +12,11 @@
 (in-package "SB!VM")
 
 
-;; If chopping X to 32 bits and sign-extending is equal to the original X,
-;; return the chopped X, which the CPU will always treat as signed.
-;; Notably this allows MOST-POSITIVE-WORD to be an immediate constant.
-(defun immediate32-p (x)
-  (typecase x
-    ((signed-byte 32) x)
-    ((integer #.(- (expt 2 64) (expt 2 31)) #.most-positive-word)
-     (sb!c::mask-signed-field 32 x))
-    (t nil)))
-
-;; If 'immediate32-p' is true, use it; otherwise use a RIP-relative constant.
+;; If 'plausible-signed-imm32-operand-p' is true, use it; otherwise use a RIP-relative constant.
 ;; I couldn't think of a more accurate name for this other than maybe
 ;; 'signed-immediate32-or-rip-relativize' which is just too awful.
 (defun constantize (x)
-  (or (immediate32-p x)
+  (or (plausible-signed-imm32-operand-p x)
       (register-inline-constant :qword x)))
 
 ;;;; unary operations
@@ -180,8 +170,14 @@
                   (:translate ,translate)
                   (:generator 1
                    ,@(or c/fixnum=>fixnum
-                         `((move r x)
-                           (inst ,op r (constantize (fixnumize y)))))))
+                         `((cond
+                             ,@(and (eq op 'sub)
+                                    `(((and (not (location= r x))
+                                            (typep (- (fixnumize y)) '(signed-byte 32)))
+                                       (inst lea r (ea (- (fixnumize y)) x)))))
+                             (t
+                              (move r x)
+                              (inst ,op r (constantize (fixnumize y)))))))))
                 (define-vop (,(symbolicate "FAST-" translate "/SIGNED=>SIGNED")
                              fast-signed-binop)
                   (:translate ,translate)
@@ -192,7 +188,14 @@
                   (:translate ,translate)
                   (:generator ,untagged-penalty
                    ,@(or c/signed=>signed
-                         `((move r x) (inst ,op r (constantize y))))))
+                         `((cond
+                             ,@(and (eq op 'sub)
+                                    `(((and (not (location= r x))
+                                            (typep (- y) '(signed-byte 32)))
+                                       (inst lea r (ea (- y) x)))))
+                             (t
+                              (move r x)
+                              (inst ,op r (constantize y))))))))
                 (define-vop (,(symbolicate "FAST-"
                                            translate
                                            "/UNSIGNED=>UNSIGNED")
@@ -207,7 +210,14 @@
                   (:translate ,translate)
                   (:generator ,untagged-penalty
                    ,@(or c/unsigned=>unsigned
-                         `((move r x) (inst ,op r (constantize y)))))))))
+                         `((cond
+                             ,@(and (eq op 'sub)
+                                    `(((and (not (location= r x))
+                                            (typep (- y) '(signed-byte 32)))
+                                       (inst lea r (ea (- y) x)))))
+                             (t
+                              (move r x)
+                              (inst ,op r (constantize y)))))))))))
 
   ;;(define-binop + 4 add)
   (define-binop - 4 sub)
@@ -227,7 +237,7 @@
   (define-binop logior 2 or
     :c/unsigned=>unsigned
     ((let ((y (constantize y)))
-       (cond ((and (register-p r) (eql y -1)) ; special-case "OR reg, all-ones"
+       (cond ((and (gpr-tn-p r) (eql y -1)) ; special-case "OR reg, all-ones"
               ;; I have yet to elicit this case. Can it happen?
               (inst mov r -1))
              (t
@@ -288,7 +298,7 @@
   (:generator 2
     (cond ((and (sc-is x any-reg) (sc-is y any-reg) (sc-is r any-reg)
                 (not (location= x r)))
-           (inst lea r (make-ea :qword :base x :index y :scale 1)))
+           (inst lea r (ea x y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -305,7 +315,7 @@
     (let ((y (fixnumize y)))
       (cond ((and (not (location= x r))
                   (typep y '(signed-byte 32)))
-             (inst lea r (make-ea :qword :base x :disp y)))
+             (inst lea r (ea y x)))
             (t
              (move r x)
              (inst add r (constantize y)))))))
@@ -328,7 +338,7 @@
   (:generator 5
     (cond ((and (sc-is x signed-reg) (sc-is y signed-reg) (sc-is r signed-reg)
                 (not (location= x r)))
-           (inst lea r (make-ea :qword :base x :index y :scale 1)))
+           (inst lea r (ea x y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -380,7 +390,7 @@
     (cond ((and (sc-is x signed-reg) (sc-is r signed-reg)
                 (not (location= x r))
                 (typep y '(signed-byte 32)))
-           (inst lea r (make-ea :qword :base x :disp y)))
+           (inst lea r (ea y x)))
           (t
            (move r x)
            (cond ((= y 1)
@@ -407,7 +417,7 @@
   (:generator 5
     (cond ((and (sc-is x unsigned-reg) (sc-is y unsigned-reg)
                 (sc-is r unsigned-reg) (not (location= x r)))
-           (inst lea r (make-ea :qword :base x :index y :scale 1)))
+           (inst lea r (ea x y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -428,7 +438,7 @@
     (cond ((and (sc-is x unsigned-reg) (sc-is r unsigned-reg)
                 (not (location= x r))
                 (typep y '(unsigned-byte 31)))
-           (inst lea r (make-ea :qword :base x :disp y)))
+           (inst lea r (ea y x)))
           (t
            (move r x)
            (cond ((= y 1)
@@ -569,9 +579,8 @@
     (if (location= quo eax)
         (inst shl eax n-fixnum-tag-bits)
         (if (= n-fixnum-tag-bits 1)
-            (inst lea quo (make-ea :qword :base eax :index eax))
-            (inst lea quo (make-ea :qword :index eax
-                                   :scale (ash 1 n-fixnum-tag-bits)))))
+            (inst lea quo (ea eax eax))
+            (inst lea quo (ea nil eax (ash 1 n-fixnum-tag-bits)))))
     (move rem edx)))
 
 (define-vop (fast-truncate-c/fixnum=>fixnum fast-safe-arith-op)
@@ -598,9 +607,8 @@
     (if (location= quo eax)
         (inst shl eax n-fixnum-tag-bits)
         (if (= n-fixnum-tag-bits 1)
-            (inst lea quo (make-ea :qword :base eax :index eax))
-            (inst lea quo (make-ea :qword :index eax
-                                   :scale (ash 1 n-fixnum-tag-bits)))))
+            (inst lea quo (ea eax eax))
+            (inst lea quo (ea nil eax (ash 1 n-fixnum-tag-bits)))))
     (move rem edx)))
 
 (define-vop (fast-truncate/unsigned=>unsigned fast-safe-arith-op)
@@ -727,11 +735,11 @@
   (:variant-vars modularp)
   (:generator 2
     (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (make-ea :qword :base number :index number)))
+           (inst lea result (ea number number)))
           ((and (= amount 2) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 4)))
+           (inst lea result (ea nil number 4)))
           ((and (= amount 3) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 8)))
+           (inst lea result (ea nil number 8)))
           (t
            (move result number)
            (cond ((< -64 amount 64)
@@ -793,11 +801,11 @@ constant shift greater than word length")))
   (:note "inline ASH")
   (:generator 3
     (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (make-ea :qword :base number :index number)))
+           (inst lea result (ea number number)))
           ((and (= amount 2) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 4)))
+           (inst lea result (ea nil number 4)))
           ((and (= amount 3) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 8)))
+           (inst lea result (ea nil number 8)))
           (t
            (move result number)
            (cond ((plusp amount) (inst shl result amount))
@@ -820,11 +828,11 @@ constant shift greater than word length")))
   (:note "inline ASH")
   (:generator 3
     (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (make-ea :qword :base number :index number)))
+           (inst lea result (ea number number)))
           ((and (= amount 2) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 4)))
+           (inst lea result (ea nil number 4)))
           ((and (= amount 3) (not (location= number result)))
-           (inst lea result (make-ea :qword :index number :scale 8)))
+           (inst lea result (ea nil number 8)))
           (t
            (move result number)
            (cond ((< -64 amount 64) ;; XXXX
@@ -987,6 +995,7 @@ constant shift greater than word length")))
   integer
   (foldable flushable movable))
 
+;;; FIXME: arg order should be (DISP BASE INDEX SCALE) to match EA constructor
 (defun %lea (base index scale disp)
   (+ base (* index scale) disp))
 
@@ -1004,8 +1013,7 @@ constant shift greater than word length")))
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 5
-    (inst lea r (make-ea :qword :base base :index index
-                         :scale scale :disp disp))))
+    (inst lea r (ea disp base index scale))))
 
 (define-vop (%lea/signed=>signed)
   (:translate %lea)
@@ -1019,8 +1027,7 @@ constant shift greater than word length")))
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:generator 4
-    (inst lea r (make-ea :qword :base base :index index
-                         :scale scale :disp disp))))
+    (inst lea r (ea disp base index scale))))
 
 (define-vop (%lea/fixnum=>fixnum)
   (:translate %lea)
@@ -1034,8 +1041,7 @@ constant shift greater than word length")))
   (:results (r :scs (any-reg)))
   (:result-types tagged-num)
   (:generator 3
-    (inst lea r (make-ea :qword :base base :index index
-                         :scale scale :disp disp))))
+    (inst lea r (ea disp base index scale))))
 
 ;;; FIXME: before making knowledge of this too public, it needs to be
 ;;; fixed so that it's actually _faster_ than the non-CMOV version; at
@@ -1225,21 +1231,21 @@ constant shift greater than word length")))
                     (sc-is y immediate))
            (setf y (tn-value y)))
          (when (integerp y)
-           (acond ((immediate32-p y)
+           (acond ((plausible-signed-imm32-operand-p y)
                    (return-from ensure-not-mem+mem (values x it)))
                   ((typep y '(unsigned-byte 32))
                    ;; Rather than a RIP-relative constant, load a dword (w/o sign-extend)
-                   (inst mov (reg-in-size temp-reg-tn :dword) y)
+                   (inst mov :dword temp-reg-tn y)
                    (return-from ensure-not-mem+mem (values x temp-reg-tn))))
            (setq y (register-inline-constant :qword y)))
-         (cond ((or (gpr-p x) (gpr-p y))
+         (cond ((or (gpr-tn-p x) (gpr-tn-p y))
                 (values x y))
                (t
                 (inst mov temp-reg-tn x)
                 (values temp-reg-tn y))))))
 
 (defun immediate-operand-smallest-nbits (x)
-  (declare (word x))
+  (declare (type word x))
   (typecase x
     ((unsigned-byte  8)  8)
     ((unsigned-byte 16) 16)
@@ -1280,24 +1286,21 @@ constant shift greater than word length")))
     (cond ((not size)
            ;; Ensure that both operands are acceptable
            ;; by possibly loading one into TEMP-REG-TN
-           (multiple-value-setq (x y) (ensure-not-mem+mem x y)))
+           (multiple-value-setq (x y) (ensure-not-mem+mem x y))
+           (inst test :qword x y))
           ((sc-is x control-stack unsigned-stack signed-stack)
            ;; Otherwise, when using an immediate operand smaller
            ;; than 64 bits, narrow the reg/mem operand to match.
            (let ((disp (frame-byte-offset (tn-offset x))))
              (when reducible-to-byte-p
                (setq size :byte disp (1+ disp) y (ash y -8)))
-             (setq x (make-ea size :base rbp-tn :disp disp))))
+             (inst test size (ea disp rbp-tn) y)))
           (t
-           (aver (gpr-p x))
-           (if (and reducible-to-byte-p (<= (tn-offset x) 6)) ; 0, 2, 4, 6
-               ;; Use upper byte of word reg (AX -> AH, BX -> BX ...)
-               (setq x (make-random-tn :kind :normal
-                                       :sc (sc-or-lose 'byte-reg)
-                                       :offset (1+ (tn-offset x)))
-                     y (ash y -8))
-               (setq x (reg-in-size x size))))))
-  (inst test x y))
+           (aver (gpr-tn-p x))
+           (if (and reducible-to-byte-p (<= (tn-offset x) rbx-offset))
+               ;; Use upper byte of word reg {A,C,D,B}X -> {A,C,D,B}H
+               (inst test :byte `(,x . :high-byte) (ash y -8))
+               (inst test size x y))))))
 
 ;; Stolen liberally from the x86 32-bit implementation.
 (macrolet ((define-logtest-vops ()
@@ -1351,7 +1354,7 @@ constant shift greater than word length")))
   (:arg-types tagged-num (:constant (integer 0 #.(- 63 n-fixnum-tag-bits))))
   (:generator 4
     (let ((bit (+ y n-fixnum-tag-bits)))
-      (inst bt (if (<= bit 31) (reg-in-size x :dword) x) bit))))
+      (inst bt (if (<= bit 31) :dword :qword) x bit))))
 
 (define-vop (fast-logbitp/signed fast-conditional/signed)
   (:args (x :scs (signed-reg signed-stack))
@@ -1384,7 +1387,7 @@ constant shift greater than word length")))
     (inst bt x y)))
 
 (defun emit-optimized-cmp (x y)
-  (if (and (gpr-p x) (eql y 0))
+  (if (and (gpr-tn-p x) (eql y 0))
       ;; Amazingly (to me), use of TEST in lieu of CMP produces all the correct
       ;; flag bits for inequality comparison as well as EQL comparison.
       ;; You'd think that the Jxx instruction should examine _only_ the S flag,
@@ -1996,7 +1999,7 @@ constant shift greater than word length")))
   (:info mask)
   (:result-types unsigned-num)
   (:generator 4
-     (cond ((or (immediate32-p mask)
+     (cond ((or (plausible-signed-imm32-operand-p mask)
                 (location= x r))
             (loadw r x bignum-digits-offset other-pointer-lowtag)
             (unless (or (eql mask -1)
@@ -2009,51 +2012,47 @@ constant shift greater than word length")))
                                                  other-pointer-lowtag))))))
 
 ;; Specialised mask-signed-field VOPs.
-(define-vop (mask-signed-field-word/c)
-  (:translate sb!c::mask-signed-field)
-  (:policy :fast-safe)
-  (:args (x :scs (signed-reg unsigned-reg) :target r))
-  (:arg-types (:constant (integer 0 64)) untagged-num)
-  (:results (r :scs (signed-reg)))
-  (:result-types signed-num)
-  (:info width)
-  (:generator 3
-    (cond ((zerop width)
-           (zeroize r))
-          ((= width 64)
-           (move r x))
-          ((member width '(32 16 8))
-           (inst movsx r (reg-in-size x (bits->size width))))
-          (t
-           (move r x)
-           (let ((delta (- n-word-bits width)))
-             (inst shl r delta)
-             (inst sar r delta))))))
+(flet ((shift-unshift (reg width)
+         (let ((shift (- n-word-bits width)))
+           ;; Shift of 64 is effectively a shift of 0 due to masking by the CPU.
+           ;; It can't happen, because size = 0 was dealt with in IR1
+           (aver (/= shift 64))
+           (unless (= shift 0)
+             (inst shl reg shift)
+             (inst sar reg shift)))))
+ (define-vop (mask-signed-field-word/c)
+   (:translate sb!c::mask-signed-field)
+   (:policy :fast-safe)
+   (:args (x :scs (signed-reg unsigned-reg) :target r))
+   (:arg-types (:constant (integer 0 64)) untagged-num)
+   (:results (r :scs (signed-reg)))
+   (:result-types signed-num)
+   (:info width)
+   (:generator 3
+     (case width
+       ((8 16 32)
+        (inst movsx `(,(bits->size width) :qword) r x))
+       (t
+        (move r x)
+        (shift-unshift r width)))))
 
-(define-vop (mask-signed-field-bignum/c)
-  (:translate sb!c::mask-signed-field)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target r))
-  (:arg-types (:constant (integer 0 64)) bignum)
-  (:results (r :scs (signed-reg)))
-  (:result-types signed-num)
-  (:info width)
-  (:generator 4
-    (cond ((zerop width)
-           (zeroize r))
-          ((member width '(8 16 32 64))
-           (ecase width
-             (64 (loadw r x bignum-digits-offset other-pointer-lowtag))
-             ((32 16 8)
-              (inst movsx r (make-ea (bits->size width)
-                                     :base x
-                                     :disp (- (* bignum-digits-offset n-word-bytes)
-                                              other-pointer-lowtag))))))
-          (t
-           (loadw r x bignum-digits-offset other-pointer-lowtag)
-           (let ((delta (- n-word-bits width)))
-             (inst shl r delta)
-             (inst sar r delta))))))
+ (define-vop (mask-signed-field-bignum/c)
+   (:translate sb!c::mask-signed-field)
+   (:policy :fast-safe)
+   (:args (x :scs (descriptor-reg) :target r))
+   (:arg-types (:constant (integer 0 64)) bignum)
+   (:results (r :scs (signed-reg)))
+   (:result-types signed-num)
+   (:info width)
+   (:generator 4
+     (case width
+       ((8 16 32)
+        (inst movsx `(,(bits->size width) :qword)
+              r
+              (ea (- (* bignum-digits-offset n-word-bytes) other-pointer-lowtag) x)))
+       (t
+        (loadw r x bignum-digits-offset other-pointer-lowtag)
+        (shift-unshift r width))))))
 
 (define-vop (mask-signed-field-fixnum)
   (:translate sb!c::mask-signed-field)
@@ -2098,7 +2097,7 @@ constant shift greater than word length")))
         DONE
         (unless (or fixnum-mask-p
                     (= mask most-positive-word))
-          (inst and r (or (immediate32-p mask)
+          (inst and r (or (plausible-signed-imm32-operand-p mask)
                           (constantize mask))))))))
 
 (in-package "SB!C")

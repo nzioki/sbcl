@@ -12,9 +12,8 @@
 
 (in-package "SB!VM")
 
-(defun symbol-slot-ea (symbol slot &optional (size :qword))
-  (make-ea size :disp
-           (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
+(defun symbol-slot-ea (symbol slot)
+  (ea (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
              (if (static-symbol-p symbol)
                  (+ nil-value (static-symbol-offset symbol) offset)
                  (make-fixup symbol :immobile-object offset)))))
@@ -28,8 +27,8 @@
                               ;; immobile-object fixups must fit in 32 bits
                               (eq (fixup-flavor bits) :immobile-object)
                               bits)
-                         (immediate32-p bits))
-                     (inst mov ea it))
+                         (plausible-signed-imm32-operand-p bits))
+                     (inst mov :qword ea it))
                     (t
                      (inst mov temp-reg-tn bits)
                      (inst mov ea temp-reg-tn)))
@@ -48,7 +47,7 @@
              (inst mov result bits)
              (inst mov ea result)
              (return-from gen-cell-set)))))
-  (inst mov ea value)
+  (inst mov :qword ea value) ; specify the size for when VALUE is an integer
   (when result
     ;; Ideally we would skip this move if RESULT is unused hereafter,
     ;; but unfortunately (NOT (TN-READS RESULT)) isn't equivalent
@@ -153,16 +152,14 @@
                (inst jmp :nz err)
                (if const
                    (cond ((typep const '(signed-byte 32))
-                          (inst lea newval
-                                (make-ea :qword :base rax :disp const)))
+                          (inst lea newval (ea const rax)))
                          (t
                           (inst mov newval const)
                           (inst add newval rax)))
                    ,(if (eq inherit 'cell-xsub)
                         `(progn (move newval rax)
                                 (inst sub newval delta))
-                        `(inst lea newval
-                               (make-ea :qword :base rax :index delta))))
+                        `(inst lea newval (ea rax delta))))
                (inst cmpxchg
                      (make-ea-for-object-slot cell ,slot list-pointer-lowtag)
                      newval :lock)

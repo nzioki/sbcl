@@ -334,7 +334,7 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
                             ;; inlined functions closes over this
                             ;; macro.
                             (process-optimize-decl
-                             '(optimize (eval-store-source-form 3))
+                             '(optimize (store-source-form 3))
                              *macro-policy*)))
                       (make-macro-lambda nil arglist body 'macrolet name))
                     lexenv)))))))
@@ -634,38 +634,6 @@ be a lambda expression."
              name)
         fallback)))
 
-(def-ir1-translator global-function-preserve-cast
-    ((name original-lvar) start next result)
-  (let* ((cast (lvar-use original-lvar))
-         (value-ctran (make-ctran))
-         (value-lvar (make-lvar))
-         (new-cast (etypecase cast
-                     (function-designator-cast
-                      (make-function-designator-cast
-                       :%type-check  (cast-%type-check cast)
-                       :asserted-type (cast-asserted-type cast)
-                       :type-to-check (cast-type-to-check cast)
-                       :value value-lvar
-                       :derived-type (values-specifier-type '(values function &optional))
-                       :deps (function-designator-cast-deps cast)
-                       :arg-specs (function-designator-cast-arg-specs cast)
-                       :result-specs (function-designator-cast-result-specs cast)
-                       :caller (function-designator-cast-caller cast)
-                       :source-path (cast-source-path cast)))
-                     (cast
-                      (%make-cast
-                       :%type-check (cast-%type-check cast)
-                       :asserted-type (cast-asserted-type cast)
-                       :type-to-check (cast-type-to-check cast)
-                       :value value-lvar
-                       :derived-type (values-specifier-type '(values function &optional))
-                       :source-path (cast-source-path cast))))))
-    (with-fun-name-leaf (leaf name start :global-function t)
-      (reference-leaf start value-ctran value-lvar leaf))
-    (link-node-to-previous-ctran new-cast value-ctran)
-    (setf (lvar-dest value-lvar) new-cast)
-    (use-continuation new-cast next result)))
-
 (defun ensure-lvar-fun-form (lvar lvar-name &key (coercer '%coerce-callable-to-fun)
                                                  give-up)
   (aver (and lvar-name (symbolp lvar-name)))
@@ -673,10 +641,9 @@ be a lambda expression."
       lvar-name
       (let ((cname (lvar-constant-global-fun-name lvar)))
         (cond (cname
-               ;; Don't lose type restrictions
-               (if (and (cast-p (lvar-uses lvar))
-                        (fun-type-p (cast-asserted-type (lvar-use lvar))))
-                   `(global-function-preserve-cast ,cname ,lvar)
+               (if (lvar-annotations lvar)
+                   `(with-annotations ,(lvar-annotations lvar)
+                      (global-function ,cname))
                    `(global-function ,cname)))
               (give-up
                (give-up-ir1-transform
@@ -979,8 +946,10 @@ other."
                     ((compiler-values-specifier-type type))
                     (t
                      (ir1-convert start next result
-                                  `(error "Bad type specifier: ~a"
-                                          ,type))
+                                  `(progn
+                                     ,value
+                                     (error "Bad type specifier: ~a"
+                                            ',type)))
                      (return-from the-in-policy)))))
     (cond ((or (eq type *wild-type*)
                (eq type *universal-type*)
@@ -1045,33 +1014,26 @@ care."
 
 ;;; THE with some options for the CAST
 (def-ir1-translator the* (((value-type &key context silent-conflict
-                                       truly
-                                       modifying) form)
+                                       truly) form)
                           start next result)
   (let* ((policy (lexenv-policy *lexenv*))
          (value-type (values-specifier-type value-type))
-         (cast (if modifying
-                   (let* ((value-ctran (make-ctran))
-                          (value-lvar (make-lvar))
-                          (cast (make-modifying-cast
-                                 :asserted-type value-type
-                                 :type-to-check (maybe-weaken-check value-type
-                                                                    (if truly
-                                                                        **zero-typecheck-policy**
-                                                                        policy))
-                                 :value value-lvar
-                                 :derived-type (coerce-to-values value-type)
-                                 :caller modifying)))
-                     (ir1-convert start value-ctran value-lvar form)
-                     (link-node-to-previous-ctran cast value-ctran)
-                     (setf (lvar-dest value-lvar) cast)
-                     (use-continuation cast next result)
-                     cast)
-                   (the-in-policy value-type form policy start next result))))
+         (cast (the-in-policy value-type form (if truly
+                                                  **zero-typecheck-policy**
+                                                  policy)
+                              start next result)))
     (when cast
-
       (setf (cast-context cast) context)
       (setf (cast-silent-conflict cast) silent-conflict))))
+
+(def-ir1-translator with-annotations ((annotations form)
+                                      start next result)
+  (ir1-convert start next result form)
+  (when result
+    (loop for annotation in annotations
+          do (add-annotation
+              result
+              annotation))))
 
 (def-ir1-translator bound-cast ((array bound index) start next result)
   (let ((check-bound-tran (make-ctran))
@@ -1095,6 +1057,7 @@ care."
                                   :derived derived
                                   :array array
                                   :bound bound)))
+      (push cast (lvar-dependent-casts array))
       (link-node-to-previous-ctran cast index-ctran)
       (setf (lvar-dest index-lvar) cast)
       (use-continuation cast next result))))
@@ -1302,7 +1265,7 @@ due to normal completion or a non-local exit such as THROW)."
    (with-unique-names (cleanup-fun drop-thru-tag exit-tag next start count)
      `(flet ((,cleanup-fun ()
                ,@cleanup
-               nil))
+               (values)))
         ;; FIXME: If we ever get DYNAMIC-EXTENT working, then
         ;; ,CLEANUP-FUN should probably be declared DYNAMIC-EXTENT,
         ;; and something can be done to make %ESCAPE-FUN have
@@ -1319,6 +1282,41 @@ due to normal completion or a non-local exit such as THROW)."
             (declare (optimize (insert-debug-catch 0)))
             (,cleanup-fun)
             (%continue-unwind ,next ,start ,count)))))))
+
+(def-ir1-translator inspect-unwinding
+    ((protected inspect-fun) start next result)
+  (ir1-convert
+   start next result
+   (with-unique-names (drop-thru-tag exit-tag next start count)
+     `(block ,drop-thru-tag
+        (multiple-value-bind (,next ,start ,count)
+            (block ,exit-tag
+              (%within-cleanup
+               :unwind-protect
+               (%unwind-protect (%escape-fun ,exit-tag)
+                                nil)
+               (return-from ,drop-thru-tag ,protected)))
+          (declare (optimize (insert-debug-catch 0)))
+          (funcall ,inspect-fun ,next)
+          (%continue-unwind ,next ,start ,count))))))
+
+;;; Evaluate CLEANUP iff PROTECTED does a non-local exit.
+(def-ir1-translator nlx-protect
+    ((protected &body cleanup) start next result)
+  (ir1-convert
+   start next result
+   (with-unique-names (drop-thru-tag exit-tag next start count)
+     `(block ,drop-thru-tag
+        (multiple-value-bind (,next ,start ,count)
+            (block ,exit-tag
+              (%within-cleanup
+               :unwind-protect
+               (%unwind-protect (%escape-fun ,exit-tag)
+                                nil)
+               (return-from ,drop-thru-tag ,protected)))
+          (declare (optimize (insert-debug-catch 0)))
+          ,@cleanup
+          (%continue-unwind ,next ,start ,count))))))
 
 ;;;; multiple-value stuff
 

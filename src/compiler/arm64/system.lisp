@@ -114,15 +114,14 @@
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
 
-
 (define-vop (pointer-hash)
   (:translate pointer-hash)
   (:args (ptr :scs (any-reg descriptor-reg)))
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst and res ptr (bic-mask lowtag-mask))
-    (inst lsr res res 1)))
+    (inst and res ptr (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
+                                    n-fixnum-tag-bits) 0))))
 
 ;;;; Allocation
 
@@ -227,9 +226,6 @@
 
 #!+sb-thread
 (progn
-  (defknown current-thread-offset-sap (word)
-      system-area-pointer (flushable))
-
   (defun ldr-str-word-offset-encodable (x)
     (ldr-str-offset-encodable (ash x word-shift)))
 
@@ -247,8 +243,8 @@
     (:results (sap :scs (sap-reg)))
     (:result-types system-area-pointer)
     (:translate current-thread-offset-sap)
-    (:args (n :scs (unsigned-reg) :target sap))
-    (:arg-types unsigned-num)
+    (:args (n :scs (signed-reg) :target sap))
+    (:arg-types signed-num)
     (:policy :fast-safe)
     (:generator 2
                 (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))

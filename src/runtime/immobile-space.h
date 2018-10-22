@@ -28,6 +28,8 @@ extern void write_protect_immobile_space(void);
 extern unsigned int immobile_scav_queue_count;
 typedef int low_page_index_t;
 
+extern unsigned int* varyobj_page_touched_bits;
+
 static inline void *
 fixedobj_page_address(low_page_index_t page_num)
 {
@@ -76,9 +78,13 @@ static inline boolean immobile_space_p(lispobj obj)
     return !(immobile_range_1_max_offset <= offset
              && offset < immobile_range_2_min_offset);
 }
+
+extern boolean immobile_card_protected_p(void*);
+
 #else
 
 static inline boolean immobile_space_p(lispobj obj) { return 0; }
+#define immobile_obj_gen_bits(dummy) 0
 #define prepare_immobile_space_for_final_gc()
 #define prepare_immobile_space_for_save(dummy1,dummy2)
 #define immobile_space_preserve_pointer(dummy)
@@ -88,6 +94,7 @@ static inline boolean immobile_space_p(lispobj obj) { return 0; }
 #define update_immobile_nursery_bits()
 #define write_protect_immobile_space()
 #define immobile_scav_queue_count 0
+#define immobile_card_protected_p(dummy) (0)
 
 #endif
 

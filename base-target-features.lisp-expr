@@ -196,49 +196,10 @@
  ;; from 4% to 8% in typical applications. (Your mileage may vary).
  ; :compact-instance-header
 
- ;; Enabled automatically for platforms which implement complex arithmetic
- ;; VOPs. Such platforms should implement real-complex, complex-real and
- ;; complex-complex addition and subtractions (for complex-single-float
- ;; and complex-double-float). They should also also implement complex-real
- ;; and real-complex multiplication, complex-real division, and
- ;; sb!vm::swap-complex, which swaps the real and imaginary parts.
- ;; Finally, they should implement conjugate and complex-real, real-complex
- ;; and complex-complex CL:= (complex-complex EQL would usually be a good
- ;; idea).
- ;;
- ; :complex-float-vops
-
  ;; Enabled automatically for platforms which implement VOPs for EQL
  ;; of single and double floats.
  ;;
  ; :float-eql-vops
-
- ;; Enabled automatically for platform that can implement inline constants.
- ;;
- ;; Such platform must implement 5 functions, in SB!VM:
- ;; * canonicalize-inline-constant: converts a constant descriptor (list) into
- ;;    a canonical description, to be used as a key in an EQUAL hash table
- ;;    and to guide the generation of the constant itself.
- ;; * inline-constant-value: given a canonical constant descriptor, computes
- ;;    two values:
- ;;     1. A label that will be used to emit the constant (usually a
- ;;         sb!assem:label)
- ;;     2. A value that will be returned to code generators referring to
- ;;         the constant (on x86oids, an EA object)
- ;; * sort-inline-constants: Receives a vector of unique constants;
- ;;    the car of each entry is the constant descriptor, and the cdr the
- ;;    corresponding label. Destructively returns a vector of constants
- ;;    sorted in emission order. It could actually perform arbitrary
- ;;    modifications to the vector, e.g. to fuse constants of different
- ;;    size.
- ;; * emit-inline-constant: receives a constant descriptor and its associated
- ;;    label. Emits the constant.
- ;;
- ;; Implementing this features lets VOP generators use sb!c:register-inline-constant
- ;; to get handles (as returned by sb!vm:inline-constant-value) from constant
- ;; descriptors.
- ;;
- ; :inline-constants
 
  ;; Peter Van Eynde's increase-bulletproofness code for CMU CL
  ;;
@@ -311,11 +272,6 @@
  ;; This doesn't affect the build at all, merely declares how things are.
  :package-local-nicknames
 
- ;; This affects the definition of a lot of things in bignum.lisp. It
- ;; doesn't seem to be documented anywhere what systems it might apply
- ;; to. It doesn't seem to be needed for X86 systems anyway.
- ; :32x16-divide
-
  ;; This is set in classic CMU CL, and presumably there it means
  ;; that the floating point arithmetic implementation
  ;; conforms to IEEE's standard. Here it definitely means that the
@@ -351,12 +307,6 @@
  ;; foreign code that uses a 32-bit off_t.
  ; :largefile
 
- ;; Enabled automatically on platforms that have VOPs to compute the
- ;; high half of a full word-by-word multiplication.  When disabled,
- ;; SB-KERNEL:%MULTIPLY-HIGH is implemented in terms of
- ;; SB-BIGNUM:%MULTIPLY.
- ; :multiply-high-vops
-
  ;; SBCL has optional support for zlib-based compressed core files.  Enable
  ;; this feature to compile it in.  Obviously, doing so adds a dependency
  ;; on zlib.
@@ -381,9 +331,6 @@
  ;; can replace its use of setitimer with a background thread.
  ;; (Replaces use of SIGALRM.)
  ; :sb-wtimer
-
- ;; This platform implements VOPs for %ash/right, variable-width shift right
- ; :ash-right-vops
 
  ;;
  ;; miscellaneous notes on other things which could have special significance
@@ -477,10 +424,6 @@
  ;;   :compare-and-swap-vops
  ;;     The backend implements compare-and-swap VOPs.
  ;;
- ;;   :memory-barrier-vops
- ;;     Memory barriers (for multi-threaded synchronization) have been
- ;;     implemented for this platform.
- ;;
  ;; operating system features:
  ;;   :unix       = We're intended to run under some Unix-like OS. (This is not
  ;;                 exclusive with the features which indicate which particular
@@ -497,8 +440,6 @@
  ;;   :sunos      = We're intended to run under Solaris user environment
  ;;                 with the SunOS kernel.
  ;;   :hpux       = We're intended to run under HP-UX 11.11 or later
- ;;   :osf1       = We're intended to run under Tru64 (aka Digital Unix
- ;;                 aka OSF/1).
  ;;   :win32      = We're intended to under some version of Microsoft Windows.
  ;; (No others are supported by SBCL as of 1.0.8, but :hpux or :irix
  ;; support could be ported from CMU CL if anyone is sufficiently

@@ -207,13 +207,7 @@
   (:results (res :scs (signed-reg)))
   (:result-types fixnum)
   (:generator 1
-   (inst movsxd res
-         (make-random-tn :kind :normal
-                         :sc (sc-or-lose (ecase size
-                                           (8 'byte-reg)
-                                           (16 'word-reg)
-                                           (32 'dword-reg)))
-                         :offset (tn-offset val)))))
+    (inst movsx `(,(ecase size (8 :byte) (16 :word) (32 :dword)) :qword) res val)))
 
 #-sb-xc-host
 (defun sign-extend (x size)
@@ -297,17 +291,17 @@
   ;; GC understands
   #!+sb-safepoint
   (let ((label (gen-label)))
-    (inst lea rax (rip-relative-ea :qword label))
+    (inst lea rax (rip-relative-ea label))
     (emit-label label)
     (move pc-save rax))
   (when sb!c::*msan-unpoison*
-    (inst mov rax (thread-tls-ea (ash thread-msan-param-tls-slot word-shift)))
+    (inst mov rax (thread-slot-ea thread-msan-param-tls-slot))
     ;; Unpoison parameters
     (do ((n 0 (+ n n-word-bytes))
          (arg args (tn-ref-across arg)))
         ((null arg))
       ;; KLUDGE: assume all parameters are 8 bytes or less
-      (inst mov (make-ea :qword :base rax :disp n) 0)))
+      (inst mov :qword (ea n rax) 0)))
   #!-win32
   ;; ABI: AL contains amount of arguments passed in XMM registers
   ;; for vararg calls.
@@ -329,7 +323,7 @@
 
   (inst call (cond ((tn-p fun) fun)
                    ((sb!c::code-immobile-p vop) (make-fixup fun :foreign))
-                   (t (make-ea :qword :disp (make-fixup fun :foreign 8)))))
+                   (t (ea (make-fixup fun :foreign 8)))))
   ;; For the undefined alien error
   (note-this-location vop :internal-error)
   #!+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
@@ -362,7 +356,7 @@
       (aver (not (location= result rsp-tn)))
       (unless (zerop amount)
         (let ((delta (align-up amount 8)))
-          (inst sub (alien-stack-ptr) delta)))
+          (inst sub :qword (alien-stack-ptr) delta)))
       (inst mov result (alien-stack-ptr)))))
 
 ;;; not strictly part of the c-call convention, but needed for the
@@ -399,7 +393,7 @@
            (rsp rsp-tn)
            #!+(and win32 sb-thread) (r8 r8-tn)
            (xmm0 float0-tn)
-           ([rsp] (make-ea :qword :base rsp :disp 0))
+           ([rsp] (ea rsp))
            ;; How many arguments have been copied
            (arg-count 0)
            ;; How many arguments have been copied from the stack
@@ -419,16 +413,11 @@
                 ;; A TN pointing to the stack location where the
                 ;; current argument should be stored for the purposes
                 ;; of ENTER-ALIEN-CALLBACK.
-                (target-tn (make-ea :qword :base rsp
-                                   :disp (* arg-count
-                                            n-word-bytes)))
+                (target-tn (ea (* arg-count n-word-bytes) rsp))
                 ;; A TN pointing to the stack location that contains
                 ;; the next argument passed on the stack.
-                (stack-arg-tn (make-ea :qword :base rsp
-                                       :disp (* (+ 1
-                                                   (length argument-types)
-                                                   stack-argument-count)
-                                                n-word-bytes))))
+                (stack-arg-tn (ea (* (+ 1 (length argument-types) stack-argument-count)
+                                     n-word-bytes) rsp)))
             (incf arg-count)
             (cond (integerp
                    (let ((gpr (pop gprs)))
@@ -462,7 +451,7 @@
         #!-sb-thread
         (progn
           ;; arg0 to FUNCALL3 (function)
-          (inst mov rdi (make-ea :qword :disp (static-fdefn-fun-addr 'enter-alien-callback)))
+          (inst mov rdi (ea (static-fdefn-fun-addr 'enter-alien-callback)))
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
           (inst mov rsi (fixnumize index))
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)

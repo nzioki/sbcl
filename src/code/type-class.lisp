@@ -200,7 +200,7 @@
 ;; Each CTYPE instance (incl. subtypes thereof) has a random opaque hash value.
 ;; Hashes are mixed together to form a lookup key in the memoization wrappers
 ;; for most operations in CTYPES. This works because CTYPEs are immutable.
-;; But some bits are "stolen" from the hash as flag bits.
+;; But some bits are "stolen" from the HASH-VALUE slot as flag bits.
 ;; The sign bit indicates that the object is the *only* object representing
 ;; its type-specifier - it is an "interned" object.
 ;; The next highest bit indicates that the object, if compared for TYPE=
@@ -218,8 +218,19 @@
 ;;; Represent an index into *SPECIALIZED-ARRAY-ELEMENT-TYPE-PROPERTIES*
 ;;; if applicable. For types which are not array specializations,
 ;;; the bits are arbitrary.
+(defconstant +ctype-saetp-index-bits+ 5)
 (defmacro !ctype-saetp-index (x)
-  `(ldb (byte 5 ,(- sb!vm:n-positive-fixnum-bits 6)) (type-hash-value ,x)))
+  `(ldb (byte +ctype-saetp-index-bits+
+              ,(- sb!vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
+        (type-hash-value ,x)))
+
+;;; Generate a random hash value for use in memoization
+;;; CMUCL used address-based tables, but we store a few intelligent bits
+;;; in the hash, as well as the pseudorandom bits
+(defun new-type-hash ()
+   #+sb-xc-host (ctype-random +ctype-hash-mask+)
+   #-sb-xc-host (sb!impl::quasi-random-address-based-hash
+                 *ctype-hash-state* +ctype-hash-mask+))
 
 (def!struct (ctype (:conc-name type-)
                    (:constructor nil)
@@ -243,46 +254,59 @@
   ;;   implementation of RANDOM)
   ;; - in the target, use scrambled bits from the allocation pointer
   ;;   instead.
-  (hash-value
-   #+sb-xc-host (ctype-random +ctype-hash-mask+)
-   #-sb-xc-host (sb!impl::quasi-random-address-based-hash
-                 *ctype-hash-state* +ctype-hash-mask+)
+  (hash-value (new-type-hash)
               :type (signed-byte #.sb!vm:n-fixnum-bits)
-              ;; FIXME: is there a better way to initialize the hash value
-              ;; and its flag bit simultaneously rather than have it
-              ;; be a read/write slot?
-              :read-only nil))
+              ;; This is logically read-only, but because the host can not
+              ;; calculate target hash values - it would need the identical
+              ;; string hash algorithm and some other things - the hash is
+              ;; reset during cold-init using low-level tricks.
+              :read-only t))
 
-;;; The "interned" bit indicates uniqueness of the internal representation of
-;;; any specifier that parses to this object.
-;;; Not all interned types admit TYPE= optimization. As one example:
-;;; (type= (specifier-type '(array (unsigned-byte 6) (*)))
-;;;        (specifier-type '(array (unsigned-byte 7) (*)))) => T and T
-;;; because we preserve the difference in spelling of the two types.
-(defun mark-ctype-interned (obj)
-  (setf (type-hash-value obj)
-        (logior sb!xc:most-negative-fixnum
-                (if (eq (type-class-name (type-class-info obj)) 'array)
-                    0
-                    +type-admits-type=-optimization+)
-                (type-hash-value obj)))
-  obj)
-
-;; For cold-init: improve the randomness of the hash.
-;; (The host uses at most 21 bits of randomness. See CTYPE-RANDOM)
-#+sb-xc
-(defun !fix-ctype-hash (obj)
-  (let ((saetp-index (!ctype-saetp-index obj)))
-    ;; Preserve the interned-p and type=-optimization bits
-    ;; by flipping only the bits under the hash-mask.
-    (setf (type-hash-value obj)
-          (logxor (logand (sb!impl::quasi-random-address-based-hash
-                           *ctype-hash-state* +ctype-hash-mask+))
-                   (type-hash-value obj)))
-    ;; Except that some of those "non-intelligent" bits contain
-    ;; critical information, if this type is an array specialization.
-    (setf (!ctype-saetp-index obj) saetp-index))
-  obj)
+;;; Classoids and named types can use the name as the source of the hash.
+;;; A string's hash is stable across builds which is a nice aspect.
+(defun interned-type-hash (&optional symbol (metatype 'classoid) saetp-index)
+  (declare (ignorable symbol metatype))
+  (let ((hash
+         ;; When cross-compiling, the goal is to produce deterministic fasls
+         ;; regardless of the host. So we must not use SXHASH.
+         #+sb-xc-host (ctype-random +ctype-hash-mask+)
+         ;; In the target, pick the hash based on the symbol
+         ;; to try to produce repeatable cores across rebuilds.
+         #-sb-xc-host
+         ;; the named-type NIL can use a string-based (deterministic) hash,
+         ;; whereas classoids with no name should get a pseudo-random hash
+         (if (or symbol (eq metatype 'named))
+             ;; symbol hashes don't use the package so  mix that in too
+             (let* ((pkg-hash (acond ((symbol-package symbol)
+                                      (sxhash (sb!impl::package-%name it)))
+                                     (t 0)))
+                    (mixed (logxor pkg-hash (sxhash (symbol-name symbol)))))
+               (logand (ecase metatype
+                         ;; Hash two different ways in case a classoid
+                         ;; and named type share the symbol (like T)
+                         (classoid mixed)
+                         (named    (lognot mixed)))
+                       +ctype-hash-mask+))
+             ;; anonymous classoid (do we support those?) or other metatype
+             (sb!impl::quasi-random-address-based-hash
+              *ctype-hash-state* +ctype-hash-mask+))))
+    (when saetp-index
+      (setf (ldb (byte +ctype-saetp-index-bits+
+                       (- sb!vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
+                 hash)
+            saetp-index))
+    (logior sb!xc:most-negative-fixnum       ; "interned" bit
+            ;; All metatypes of interned ctypes except for ARRAY allow
+            ;; the TYPE= optimization that two instances of the type
+            ;; which are not EQ are not TYPE=. With arrays it is possible
+            ;; for TYPE= to return T given two non-EQ ctypes both of which
+            ;; are interned objects, e.g.
+            ;; (type= (specifier-type '(array (unsigned-byte 6) (*)))
+            ;;        (specifier-type '(array (unsigned-byte 7) (*)))) => T, T
+            (if (eq metatype 'array)
+                0
+                +type-admits-type=-optimization+)
+            hash)))
 
 (declaim (inline type-might-contain-other-types-p))
 (defun type-might-contain-other-types-p (ctype)
@@ -340,6 +364,19 @@
                   (cons method more-methods)))
        ',name)))
 
+(defmacro get-dsd-index (type-name slot-name)
+  ;; Declare DD-SLOTS explicitly notinline, to avoid a warning, as its source
+  ;; appears later, in early-classoid. However CCL would warn that this
+  ;; declaration pertains to an unknown function, so only do this for us.
+  ;; You'd think we should also warn about DSD-INDEX, but the comment near
+  ;; that function says that it can't be inlined due to reasons.
+  ;; In make-host-2 everything is fine, because of DEF!STRUCT magic.
+  ;; And finally, we are prevented from writing "#+sbcl" here, for reasons.
+  #!+(host-feature sbcl) (declare (notinline dd-slots)) ; forward reference
+  (dsd-index (find slot-name
+                   (dd-slots (find-defstruct-description type-name))
+                   :key #'dsd-name)))
+
 (defmacro !define-type-class (name &key inherits
                                      (enumerable (unless inherits (must-supply-this))
                                                  enumerable-supplied-p)
@@ -374,13 +411,7 @@
     ;; which avoids a bootstrap problem: it's tricky to dump a type-class.
     #+sb-xc
     (let ((type-class-index
-           (position name *type-classes* :key #'type-class-name))
-          (slot-index
-           ;; KLUDGE: silence bogus warning that FIND "certainly" returns NIL
-           (locally (declare (notinline find))
-             (dsd-index (find 'class-info
-                              (dd-slots (find-defstruct-description 'ctype))
-                              :key #'dsd-name)))))
+           (position name *type-classes* :key #'type-class-name)))
       `(!cold-init-forms
         (let* ((backpatch-list (svref *type-classes* ,type-class-index))
                (type-class ,make-it))
@@ -393,8 +424,9 @@
           (dolist (instance backpatch-list)
             ;; Fixup the class first, in case fixing the hash needs the class.
             ;; (It doesn't currently, but just in case it does)
-            (setf (%instance-ref instance ,slot-index) type-class)
-            (!fix-ctype-hash instance)))))))
+            (setf (%instance-ref instance ,(get-dsd-index ctype class-info))
+                  type-class)
+            (!improve-ctype-hash instance ',name)))))))
 
 ;;; Define the translation from a type-specifier to a type structure for
 ;;; some particular type. Syntax is identical to DEFTYPE.
@@ -538,6 +570,7 @@
 ;;; "Decision Procedure for SUBTYPEP" paper.
 (defstruct (named-type (:include ctype
                                  (class-info (type-class-or-lose 'named)))
+                       (:constructor !make-named-type (hash-value name))
                        (:copier nil))
   (name nil :type symbol :read-only t))
 
@@ -545,9 +578,13 @@
 ;;; bother with this at this level because MEMBER types are fairly
 ;;; important and union and intersection are well defined.
 (defstruct (member-type (:include ctype
-                                  (class-info (type-class-or-lose 'member)))
+                         (hash-value (logior +type-admits-type=-optimization+
+                                             (new-type-hash)))
+                         (class-info (type-class-or-lose 'member)))
                         (:copier nil)
                         (:constructor %make-member-type (xset fp-zeroes))
+                        (:constructor !make-interned-member-type
+                            (hash-value xset fp-zeroes))
                         #-sb-xc-host (:pure nil))
   (xset nil :type xset :read-only t)
   (fp-zeroes nil :type list :read-only t))
@@ -558,6 +595,9 @@
                                  (class-info (type-class-or-lose 'array)))
                        (:constructor %make-array-type
                         (dimensions complexp element-type
+                                    specialized-element-type))
+                       (:constructor !make-interned-array-type
+                        (hash-value dimensions complexp element-type
                                     specialized-element-type))
                        (:copier nil))
   ;; the dimensions of the array, or * if unspecified. If a dimension
@@ -574,6 +614,7 @@
             (:include ctype
                       (class-info (type-class-or-lose 'character-set)))
             (:constructor %make-character-set-type (pairs))
+            (:constructor !make-interned-character-set-type (hash-value pairs))
             (:copier nil))
   (pairs (missing-arg) :type list :read-only t))
 
@@ -639,7 +680,9 @@
 ;;; A NUMERIC-TYPE represents any numeric type, including things
 ;;; such as FIXNUM.
 (defstruct (numeric-type (:include ctype
-                                   (class-info (type-class-or-lose 'number)))
+                          (hash-value (logior +type-admits-type=-optimization+
+                                              (new-type-hash)))
+                          (class-info (type-class-or-lose 'number)))
                          (:constructor %make-numeric-type)
                          (:copier nil))
   ;; Formerly defined in every CTYPE, but now just in the ones
@@ -679,9 +722,9 @@
 
 ;;; A CONS-TYPE is used to represent a CONS type.
 (defstruct (cons-type (:include ctype (class-info (type-class-or-lose 'cons)))
-                      (:constructor
-                       %make-cons-type (car-type
-                                        cdr-type))
+                      (:constructor %make-cons-type (car-type cdr-type))
+                      (:constructor !make-interned-cons-type
+                          (hash-value car-type cdr-type))
                       (:copier nil))
   ;; the CAR and CDR element types (to support ANSI (CONS FOO BAR) types)
   (car-type (missing-arg) :type ctype :read-only t)
@@ -738,7 +781,10 @@
                      (:copier nil)
                      (:constructor
                       %make-fun-type (required optional rest
-                                      keyp keywords allowp wild-args returns)))
+                                      keyp keywords allowp wild-args returns))
+                     (:constructor !make-interned-fun-type
+                         (hash-value required optional rest keyp keywords
+                          allowp wild-args returns)))
   ;; true if the arguments are unrestrictive, i.e. *
   (wild-args nil :type boolean :read-only t)
   ;; type describing the return values. This is a values type

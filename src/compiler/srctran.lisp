@@ -150,6 +150,13 @@
 
 (deftransform %make-list ((length item) ((constant-arg (eql 0)) t)) nil)
 
+(define-source-transform copy-list (list &environment env)
+  ;; If speed is more important than space, or cons profiling is wanted,
+  ;; then inline the whole copy loop.
+  (if (policy env (or (> speed space) (> instrument-consing 1)))
+      (once-only ((list `(the list ,list))) `(copy-list-macro ,list))
+      (values nil t))) ; give up
+
 (define-source-transform append (&rest lists)
   (case (length lists)
     (0 nil)
@@ -173,28 +180,22 @@
     (return-from derive-append-type (specifier-type 'null)))
   (let* ((cons-type (specifier-type 'cons))
          (null-type (specifier-type 'null))
-         (list-type (specifier-type 'list))
          (last (lvar-type (car (last args)))))
     ;; Derive the actual return type, assuming that all but the last
     ;; arguments are LISTs (otherwise, APPEND/NCONC doesn't return).
     (loop with all-nil = t       ; all but the last args are NIL?
           with some-cons = nil   ; some args are conses?
           for (arg next) on args
-          for lvar-type = (type-approx-intersection2 (lvar-type arg)
-                                                     list-type)
+          for lvar-type = (lvar-type arg)
           while next
-          do (multiple-value-bind (typep definitely)
-                 (ctypep nil lvar-type)
-               (cond ((type= lvar-type *empty-type*)
-                      ;; type mismatch! insert an inline check that'll cause
-                      ;; compile-time warnings.
-                      (assert-lvar-type arg list-type
-                                        (lexenv-policy *lexenv*)))
-                     (some-cons) ; we know result's a cons -- nothing to do
-                     ((and (not typep) definitely) ; can't be NIL
-                      (setf some-cons t))          ; must be a CONS
-                     (all-nil
-                      (setf all-nil (csubtypep lvar-type null-type)))))
+          do
+          (multiple-value-bind (typep definitely)
+              (ctypep nil lvar-type)
+            (cond (some-cons) ; we know result's a cons -- nothing to do
+                  ((and (not typep) definitely) ; can't be NIL
+                   (setf some-cons t))          ; must be a CONS
+                  (all-nil
+                   (setf all-nil (csubtypep lvar-type null-type)))))
           finally
              ;; if some of the previous arguments are CONSes so is the result;
              ;; if all the previous values are NIL, we're a fancy identity;
@@ -1123,22 +1124,28 @@
              (union-type
               (union-type-types arg))
              (t
-              (list arg)))))
+              (list arg))))
+         (ignore-hairy-type (type)
+           (if (and (intersection-type-p type)
+                    (find-if #'hairy-type-p (intersection-type-types type)))
+               (find-if-not #'hairy-type-p (intersection-type-types type))
+               type)))
     (unless (eq arg *empty-type*)
       ;; Make sure all args are some type of numeric-type. For member
       ;; types, convert the list of members into a union of equivalent
       ;; single-element member-type's.
       (let ((new-args nil))
         (dolist (arg (listify arg))
-          (if (member-type-p arg)
-              ;; Run down the list of members and convert to a list of
-              ;; member types.
-              (mapc-member-type-members
-               (lambda (member)
-                 (push (if (numberp member) (make-eql-type member) *empty-type*)
-                       new-args))
-               arg)
-              (push arg new-args)))
+          (let ((arg (ignore-hairy-type arg)))
+            (if (member-type-p arg)
+                ;; Run down the list of members and convert to a list of
+                ;; member types.
+                (mapc-member-type-members
+                 (lambda (member)
+                   (push (if (numberp member) (make-eql-type member) *empty-type*)
+                         new-args))
+                 arg)
+                (push arg new-args))))
         (unless (member *empty-type* new-args)
           new-args)))))
 
@@ -1251,11 +1258,7 @@
 ;;; we didn't do this, we wouldn't be able to tell.
 (defun two-arg-derive-type (arg1 arg2 derive-fun fun)
   (declare (type function derive-fun fun))
-  (labels ((ignore-hairy-type (type)
-             (if (intersection-type-p type)
-                 (find-if-not #'hairy-type-p (intersection-type-types type))
-                 type))
-           (deriver (x y same-arg)
+  (labels ((deriver (x y same-arg)
              (cond ((and (member-type-p x) (member-type-p y))
                     (let* ((x (first (member-type-members x)))
                            (y (first (member-type-members y)))
@@ -1277,39 +1280,34 @@
                     (funcall derive-fun x (convert-member-type y) same-arg))
                    ((and (numeric-type-p x) (numeric-type-p y))
                     (funcall derive-fun x y same-arg))
-                   ;; Ignore hairy types in intersections
-                   ((and (or (intersection-type-p x)
-                             (intersection-type-p y))
-                         (let ((x (ignore-hairy-type x))
-                               (y (ignore-hairy-type y)))
-                           (and x y
-                                (deriver x y same-arg)))))
                    (t
-                    *universal-type*))))
-    (let ((same-arg (same-leaf-ref-p arg1 arg2))
-          (a1 (prepare-arg-for-derive-type (lvar-type arg1)))
-          (a2 (prepare-arg-for-derive-type (lvar-type arg2))))
-      (when (and a1 a2)
-        (let ((results nil))
-          (if same-arg
-              ;; Since the args are the same LVARs, just run down the
-              ;; lists.
-              (dolist (x a1)
-                (let ((result (deriver x x same-arg)))
-                  (if (listp result)
-                      (setf results (append results result))
-                      (push result results))))
-              ;; Try all pairwise combinations.
-              (dolist (x a1)
-                (dolist (y a2)
-                  (let ((result (or (deriver x y same-arg)
-                                    (numeric-contagion x y))))
-                    (if (listp result)
-                        (setf results (append results result))
-                        (push result results))))))
-          (if (rest results)
-              (make-derived-union-type results)
-              (first results)))))))
+                    *universal-type*)))
+           (derive (type1 type2 same-arg)
+             (let ((a1 (prepare-arg-for-derive-type type1))
+                   (a2 (prepare-arg-for-derive-type type2)))
+              (when (and a1 a2)
+                (let ((results nil))
+                  (if same-arg
+                      ;; Since the args are the same LVARs, just run down the
+                      ;; lists.
+                      (dolist (x a1)
+                        (let ((result (deriver x x same-arg)))
+                          (if (listp result)
+                              (setf results (append results result))
+                              (push result results))))
+                      ;; Try all pairwise combinations.
+                      (dolist (x a1)
+                        (dolist (y a2)
+                          (let ((result (or (deriver x y same-arg)
+                                            (numeric-contagion x y))))
+                            (if (listp result)
+                                (setf results (append results result))
+                                (push result results))))))
+                  (if (rest results)
+                      (make-derived-union-type results)
+                      (first results)))))))
+    (derive (lvar-type arg1) (lvar-type arg2)
+            (same-leaf-ref-p arg1 arg2))))
 
 #+sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
@@ -2688,7 +2686,12 @@
         *universal-type*)))
 
 ;;; Rightward ASH
-#!+ash-right-vops
+
+;;; Assert correctness of build order. (Need not be exhaustive)
+#!-(vop-translates sb!kernel:%ash/right)
+(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %ASH/RIGHT vop"))
+
+#!+(vop-translates sb!kernel:%ash/right)
 (progn
   (defun %ash/right (integer amount)
     (ash integer (- amount)))
@@ -2808,34 +2811,6 @@
 ;;; (ldb (byte s 0) (foo (ldb (byte s 0) x) y ...))
 ;;;
 ;;; and similar for other arguments.
-
-(defun make-modular-fun-type-deriver (prototype kind width signedp)
-  (declare (ignore kind))
-  #!-sb-fluid
-  (binding* ((info (info :function :info prototype) :exit-if-null)
-             (fun (fun-info-derive-type info) :exit-if-null)
-             (mask-type (specifier-type
-                         (ecase signedp
-                             ((nil) (let ((mask (1- (ash 1 width))))
-                                      `(integer ,mask ,mask)))
-                             ((t) `(signed-byte ,width))))))
-    (lambda (call)
-      (let ((res (funcall fun call)))
-        (when res
-          (if (eq signedp nil)
-              (logand-derive-type-aux res mask-type))))))
-  #!+sb-fluid
-  (lambda (call)
-    (binding* ((info (info :function :info prototype) :exit-if-null)
-               (fun (fun-info-derive-type info) :exit-if-null)
-               (res (funcall fun call) :exit-if-null)
-               (mask-type (specifier-type
-                           (ecase signedp
-                             ((nil) (let ((mask (1- (ash 1 width))))
-                                      `(integer ,mask ,mask)))
-                             ((t) `(signed-byte ,width))))))
-      (if (eq signedp nil)
-          (logand-derive-type-aux res mask-type)))))
 
 ;;; Try to recursively cut all uses of LVAR to WIDTH bits.
 ;;;
@@ -3355,9 +3330,13 @@
                `(ash (%multiply-high (logandc2 x ,(1- (ash 1 shift1))) ,m)
                      ,(- (+ shift1 shift2)))))))))
 
-#!-multiply-high-vops
+#!-(vop-translates sb!kernel:%multiply-high)
+(progn
+;;; Assert correctness of build order. (Need not be exhaustive)
+(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %MULTIPLY-HIGH vop"))
 (define-source-transform %multiply-high (x y)
   `(values (sb!bignum:%multiply ,x ,y)))
+)
 
 ;;; If the divisor is constant and both args are positive and fit in a
 ;;; machine word, replace the division by a multiplication and possibly
@@ -3419,10 +3398,11 @@
 (deftransform mask-signed-field ((size x) ((constant-arg t) *) *)
   "fold identity operation"
   (let ((size (lvar-value size)))
-    (when (= size 0) (give-up-ir1-transform))
-    (unless (csubtypep (lvar-type x) (specifier-type `(signed-byte ,size)))
-      (give-up-ir1-transform))
-    'x))
+    (cond ((= size 0) 0)
+          ((csubtypep (lvar-type x) (specifier-type `(signed-byte ,size)))
+           'x)
+          (t
+           (give-up-ir1-transform)))))
 
 (deftransform logior ((x y) (* (constant-arg integer)) *)
   "fold identity operation"
@@ -3697,28 +3677,30 @@
 
 ;;;; equality predicate transforms
 
-;;; Return true if X and Y are lvars whose only use is a
-;;; reference to the same leaf, and the value of the leaf cannot
-;;; change.
-(defun same-leaf-ref-p (x y)
-  (declare (type lvar x y))
-  (let ((x-use (principal-lvar-use x))
-        (y-use (principal-lvar-use y)))
-    (and (ref-p x-use)
-         (ref-p y-use)
-         (eq (ref-leaf x-use) (ref-leaf y-use))
-         (constant-reference-p x-use))))
-
 ;;; If X and Y are the same leaf, then the result is true. Otherwise,
 ;;; if there is no intersection between the types of the arguments,
 ;;; then the result is definitely false.
 (deftransforms (eq char=) ((x y) * *)
   "Simple equality transform"
-  (cond
-    ((same-leaf-ref-p x y) t)
-    ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
-     nil)
-    (t (give-up-ir1-transform))))
+  (let ((use (lvar-uses x)) arg)
+    (declare (ignorable use arg))
+    (cond
+      ((same-leaf-ref-p x y) t)
+      ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
+       nil)
+      #!+(vop-translates sb!kernel:%instance-ref-eq)
+      ;; Reduce (eq (%instance-ref x i) a-constant) to 1 instruction
+      ;; if possible, but do not defer the memory load unless doing
+      ;; so can have no effect, i.e. Y is a constant or provably not
+      ;; effectful. For now, just handle constant Y.
+      ((and (constant-lvar-p y)
+            (combination-p use)
+            (eql '%instance-ref (lvar-fun-name (combination-fun use)))
+            (constant-lvar-p (setf arg (second (combination-args use))))
+            (typep (lvar-value arg) '(unsigned-byte 16)))
+       (splice-fun-args x '%instance-ref 2)
+       `(lambda (obj i val) (%instance-ref-eq obj i val)))
+      (t (give-up-ir1-transform)))))
 
 ;;; Can't use the above thing, since TYPES-EQUAL-OR-INTERSECT is case sensitive.
 (deftransform two-arg-char-equal ((x y) * *)
@@ -3961,10 +3943,10 @@
                     (csubtypep y-type (specifier-type 'float)))
                (and (csubtypep x-type (specifier-type '(complex float)))
                     (csubtypep y-type (specifier-type '(complex float))))
-               #!+complex-float-vops
+               #!+(vop-named sb!vm::=/complex-single-float)
                (and (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
                     (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
-               #!+complex-float-vops
+               #!+(vop-named sb!vm::=/complex-double-float)
                (and (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
                     (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
            ;; They are both floats. Leave as = so that -0.0 is
@@ -4326,6 +4308,7 @@
   (source-transform-transitive 'logxor args 0 'integer))
 (define-source-transform logand (&rest args)
   (source-transform-transitive 'logand args -1 'integer))
+#!-(or arm arm64 hppa mips x86 x86-64) ; defined in compiler/target/arith.lisp
 (define-source-transform logeqv (&rest args)
   (source-transform-transitive 'logeqv args -1 'integer))
 (define-source-transform gcd (&rest args)
@@ -4547,33 +4530,107 @@
 ;;; instance, ~{ ... ~} requires a list argument, so if the lvar-type
 ;;; of a corresponding argument is known and does not intersect the
 ;;; list type, a warning could be signalled.
-(defun check-format-args (string args fun)
-  (declare (type string string))
-  (multiple-value-bind (min max)
-      (handler-case (sb!format:%compiler-walk-format-string string args)
-        (sb!format:format-error (c)
-          (compiler-warn "~A" c)))
-    (when min
-      (let ((nargs (length args)))
-        (cond
-          ((< nargs min)
-           (warn 'format-too-few-args-warning
-                 :format-control
-                 "Too few arguments (~D) to ~S ~S: requires at least ~D."
-                 :format-arguments (list nargs fun string min)))
-          ((> nargs max)
-           (warn 'format-too-many-args-warning
-                 :format-control
-                 "Too many arguments (~D) to ~S ~S: uses at most ~D."
-                 :format-arguments (list nargs fun string max))))))))
+(defun check-format-args (node fun arg-n verify-arg-count
+                          &aux (combination-args (basic-combination-args node)))
+  ;; ARG-N is the index into COMBINATION-ARGS of a format control string,
+  ;; usually 0 or 1.
+  (flet ((maybe-replace (control)
+           (binding* ((string (lvar-value control))
+                      ((symbols new-string)
+                       (sb!format::extract-user-fun-directives string)))
+             (when (or symbols (and new-string (string/= string new-string)))
+               (change-ref-leaf
+                (lvar-use control)
+                (find-constant
+                 (cond ((not symbols) new-string)
+                       ((fasl-output-p *compile-object*)
+                        (sb!format::make-fmt-control-proxy new-string symbols))
+                       #-sb-xc-host ; no such object as a FMT-CONTROL
+                       (t
+                        (sb!format::make-fmt-control new-string symbols)))))))))
+    (when (list-of-length-at-least-p combination-args (1+ arg-n))
+      (let* ((args (nthcdr arg-n combination-args))
+             (control (pop args)))
+        (when (and (constant-lvar-p control) (stringp (lvar-value control)))
+          (when verify-arg-count
+            (binding* ((string (lvar-value control))
+                       (*compiler-error-context* node)
+                       ((min max)
+                        (handler-case (sb!format:%compiler-walk-format-string
+                                       string args)
+                          (sb!format:format-error (c)
+                            (compiler-warn "~A" c)))
+                        :exit-if-null)
+                       (nargs (length args)))
+             (cond
+              ((< nargs min)
+               (warn 'format-too-few-args-warning
+                     :format-control
+                     "Too few arguments (~D) to ~S ~S: requires at least ~D."
+                     :format-arguments (list nargs fun string min)))
+              ((> nargs max)
+               (warn 'format-too-many-args-warning
+                     :format-control
+                     "Too many arguments (~D) to ~S ~S: uses at most ~D."
+                     :format-arguments (list nargs fun string max))))))
+          ;; Now possibly replace the control string
+          (maybe-replace control)
+          (return-from check-format-args)))
+      ;; Look for a :FORMAT-CONTROL and possibly replace that. Always do that
+      ;; when cross-compiling, but in the target, cautiously skip this step
+      ;; if the first argument is not known to be a symbol. Why?
+      ;; Well if the first argument is a string (or function), then that object
+      ;; is *arbitrary* format-control, and the arguments that follow it do not
+      ;; necessarily comprise a keyword/value pair list as they would for
+      ;; constructing a condition instance. Moreover, in that case you could
+      ;; randomly have a symbol named :FORMAT-CONTROL as an argument, randomly
+      ;; followed by a string that is not actually a format-control!
+      ;; But when the first argument is a symbol, then the following arguments
+      ;; must be a plist passed to MAKE-CONDITION. [See COERCE-TO-CONDITION]
+      ;;
+      ;; In this cross-compiler, this processing is not only always right, but
+      ;; in fact mandatory, to make our format strings agnostic of package names.
+      (when (and (member fun '(error warn style-warn
+                               compiler-warn compiler-style-warn))
+                 ;; Hmm, should we additionally require that this symbol be
+                 ;; known to designate a subtype of SIMPLE-CONDITION? Perhaps.
+                 #-sb-xc-host
+                 (csubtypep (lvar-type (car combination-args))
+                            (specifier-type 'symbol)))
+        (let ((keywords (cdr combination-args)))
+          (loop
+            (unless (and keywords (constant-lvar-p (car keywords))) (return))
+            (when (eq (lvar-value (car keywords)) :format-control)
+              (let ((control (cadr keywords)))
+                (when (and (constant-lvar-p control) (stringp (lvar-value control)))
+                  (maybe-replace control)))
+              (return))
+            (setq keywords (cddr keywords))))))))
 
-(defoptimizer (format optimizer) ((dest control &rest args) node)
-  (declare (ignore dest))
-  (when (constant-lvar-p control)
-    (let ((x (lvar-value control)))
-      (when (stringp x)
-        (let ((*compiler-error-context* node))
-         (check-format-args x args 'format))))))
+;;; FORMAT control string best-effort sanity checker and compactor
+(dolist (fun (append '(format error warn style-warn %program-error)
+                     #+sb-xc-host ; No need for these after self-build
+                     '(bug compiler-mumble compiler-notify
+                       compiler-style-warn compiler-warn compiler-error
+                       maybe-compiler-notify
+                       note-lossage note-unwinnage)))
+  (setf (fun-info-optimizer (fun-info-or-lose fun))
+        (let ((arg-n (if (eq fun 'format) 1 0))
+              ;; in some Lisps, DOLIST uses SETQ instead of LET on the iteration
+              ;; variable, so the closures would all share one binding of FUN,
+              ;; which is not as intended. An extra LET solves that.
+              (fun fun))
+          (lambda (node) (check-format-args node fun arg-n t)))))
+
+;; Can these appear in the expansion of FORMATTER?
+#+sb-xc-host
+(dolist (fun '(sb!format::format-error
+               sb!format::format-error-at
+               sb!format::format-error-at*))
+  (setf (fun-info-optimizer (fun-info-or-lose fun))
+        (let ((arg-n (if (eq fun 'sb!format::format-error) 0 2))
+              (fun fun))
+          (lambda (node) (check-format-args node fun arg-n nil)))))
 
 (defoptimizer (format derive-type) ((dest control &rest args))
   (declare (ignore control args))
@@ -4640,21 +4697,11 @@
          always
          (or (stringp directive)
              (and (sb!format::format-directive-p directive)
-                  (let ((char (sb!format::format-directive-character directive))
-                        (params (sb!format::format-directive-params directive)))
-                    (or
-                     (and
-                      (char-equal char #\a)
-                      (null params)
-                      (pop args))
-                     (and
-                      (or (eql char #\~)
-                          (eql char #\%))
-                      (null (sb!format::format-directive-colonp directive))
-                      (null (sb!format::format-directive-atsignp directive))
-                      (or (null params)
-                          (typep params
-                                 '(cons (cons (eql 1) unsigned-byte) null)))))))))
+                  (let ((char (sb!format::directive-character directive))
+                        (params (sb!format::directive-params directive)))
+                     (and (char= char #\A)
+                          (null params)
+                          (pop args))))))
    (null args)))
 
 (deftransform format ((stream control &rest args) (null (constant-arg string) &rest string))
@@ -4671,69 +4718,21 @@
                   (ignorable ,@arg-names))
          (concatenate
           'string
-          ,@(let ((strings
-                    (loop for directive in tokenized
-                          for char = (and (not (stringp directive))
-                                          (sb!format::format-directive-character directive))
-                          when
-                          (cond ((not char)
-                                 directive)
-                                ((char-equal char #\a)
-                                 (let ((arg (pop args))
-                                       (arg-name (pop arg-names)))
-                                   (if
-                                    (constant-lvar-p arg)
-                                    (lvar-value arg)
-                                    arg-name)))
-                                (t
-                                 (let ((n (or (cdar (sb!format::format-directive-params directive))
-                                              1)))
-                                   (and (plusp n)
-                                        (make-string n
-                                                     :initial-element
-                                                     (if (eql char #\%)
-                                                         #\Newline
-                                                         char))))))
-                          collect it)))
-              ;; Join adjacent constant strings
-              (loop with concat
-                    for (string . rest) on strings
-                    when (stringp string)
-                    do (setf concat
-                             (if concat
-                                 (concatenate 'string concat string)
-                                 string))
-                    else
-                    when concat collect (shiftf concat nil) end
-                    and collect string
-                    when (and concat (not rest))
-                    collect concat)))))))
+          ,@(mapcar (lambda (directive)
+                      (if (stringp directive)
+                          directive
+                          (let ((arg (pop args))
+                                (arg-name (pop arg-names)))
+                            (if (constant-lvar-p arg)
+                                (lvar-value arg)
+                                arg-name))))
+                    tokenized))))))
 
 (deftransform pathname ((pathspec) (pathname) *)
   'pathspec)
 
 (deftransform pathname ((pathspec) (string) *)
   '(values (parse-namestring pathspec)))
-
-(macrolet
-    ((def (name)
-         `(defoptimizer (,name optimizer) ((control &rest args) node)
-            (when (constant-lvar-p control)
-              (let ((x (lvar-value control)))
-                (when (stringp x)
-                  (let ((*compiler-error-context* node))
-                    (check-format-args x args ',name))))))))
-  (def error)
-  (def warn)
-  #+sb-xc-host ; Only we should be using these
-  (progn
-    (def style-warn)
-    (def compiler-error)
-    (def compiler-warn)
-    (def compiler-style-warn)
-    (def compiler-notify)
-    (def maybe-compiler-notify)
-    (def bug)))
 
 (defoptimizer (cerror optimizer) ((report control &rest args))
   (when (and (constant-lvar-p control)

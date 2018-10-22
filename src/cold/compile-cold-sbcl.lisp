@@ -1,7 +1,6 @@
 ;;;; Compile the fundamental system sources (not CLOS, and possibly
 ;;;; not some other warm-load-only stuff like DESCRIBE) to produce
-;;;; object files. Also set *TARGET-OBJECT-FILES* to all of their
-;;;; names.
+;;;; object files.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -30,6 +29,7 @@
          . muffle-warning)))
 
 (defun proclaim-target-optimization ()
+  (sb!c::init-xc-policy #+cons-profiling '((sb!c::instrument-consing 2)))
   (let ((debug (if (position :sb-show sb!xc:*features*) 2 1)))
     (sb!xc:proclaim
      `(optimize
@@ -49,6 +49,33 @@
        ;; save FP and PC for alien calls -- or not
        (sb!c:alien-funcall-saves-fp-and-pc #!+x86 3 #!-x86 0)))))
 
+;;; A note about CLISP compatibility:
+;;; CLISP uses *READTABLE* when loading '.fas' files, and so we shouldn't put
+;;; too much of our junk in the readtable. I'm not sure of the full extent
+;;; to which it uses our macros, but it definitely was using our #\" reader.
+;;; As such, it would signal warnings about strings that it wrote by its own
+;;; choice, where we specifically avoided using non-standard char literals.
+;;; This would happen when building + loading the cross-compiler, and CLISP
+;;; compiled a format call such as this one from 'src/compiler/codegen':
+;;;   (FORMAT *COMPILER-TRACE-OUTPUT* "~|~%assembly code for ~S~2%" ...))
+;;; which placed into its '.fas' a quoted string containing a byte for the
+;;; the literal #\Page character (and literal #\Newline, which is fine).
+;;; We should not print a warning for that. We should, however, warn
+;;; if we see those characters in strings as read directly from source.
+;;;
+;;; In case there is doubt as to the veracity of this observation, a simple
+;;; experiment proves that the warnings were not exactly our fault:
+;;; Given file "foo.lisp" containing (DEFUN F (S) (FORMAT S "x~|y"))
+;;; Then:
+;;; * (set-macro-character #\"
+;;;    (let ((f (get-macro-character #\")))
+;;;     (lambda (strm ch &aux (string (funcall f strm ch)))
+;;;       (format t "Read ~S from ~S~%" string strm)
+;;;       string)))
+;;; * (load "foo.fas") shows:
+;;;   ;; Loading file foo.fas ...
+;;;   Read "x^Ly" from #<INPUT BUFFERED FILE-STREAM CHARACTER #P"/tmp/foo.fas" @11>
+;;;
 (defun in-target-cross-compilation-mode (fun)
   "Call FUN with everything set up appropriately for cross-compiling
    a target file."
@@ -67,6 +94,10 @@
     ;; instead of host code.
     (set-macro-character #\` #'sb!impl::backquote-charmacro)
     (set-macro-character #\, #'sb!impl::comma-charmacro)
+
+    ;; Warn about presence of #\Tab or #\Page in our quoted strings.
+    ;; This is done here and not more broadly, per the comment above.
+    (set-macro-character #\" (make-quote-reader (get-macro-character #\" nil)))
 
     (set-dispatch-macro-character #\# #\+ #'she-reader)
     (set-dispatch-macro-character #\# #\- #'she-reader)
@@ -211,15 +242,12 @@
             sb!impl::unencapsulate-generic-function)))
   (setf (gethash sym sb!c::*undefined-fun-whitelist*) t))
 
-(defvar *target-object-file-names*)
-
-#+#.(cl:if (cl:find-package "SB-POSIX") '(and) '(or))
+#+#.(cl:if (cl:find-package "HOST-SB-POSIX") '(and) '(or))
 (defun parallel-make-host-2 (max-jobs)
-  (let ((reversed-target-object-file-names nil)
-        (subprocess-count 0)
+  (let ((subprocess-count 0)
         (subprocess-list nil))
     (flet ((wait ()
-             (multiple-value-bind (pid status) (sb-posix:wait)
+             (multiple-value-bind (pid status) (host-sb-posix:wait)
                (format t "~&; Subprocess ~D exit status ~D~%"  pid status)
                (setq subprocess-list (delete pid subprocess-list)))
              (decf subprocess-count)))
@@ -227,7 +255,7 @@
         (unless (position :not-target flags)
           (when (>= subprocess-count max-jobs)
             (wait))
-          (let ((pid (sb-posix:fork)))
+          (let ((pid (host-sb-posix:fork)))
             (when (zerop pid)
               (target-compile-stem stem flags)
               ;; FIXME: convey exit code based on COMPILE result.
@@ -237,22 +265,19 @@
           ;; Cause the compile-time effects from this file
           ;; to appear in subsequently forked children.
           (let ((*compile-for-effect-only* t))
-            (target-compile-stem stem flags))
-          (unless (find :not-genesis flags)
-            (push (stem-object-path stem flags :target-compile)
-                  reversed-target-object-file-names))))
+            (target-compile-stem stem flags))))
       (loop (if (plusp subprocess-count) (wait) (return)))
-      (nreverse reversed-target-object-file-names))))
+      (values))))
 
 ;;; Actually compile
-(setf *target-object-file-names*
-      (if (make-host-2-parallelism)
-          (parallel-make-host-2 (make-host-2-parallelism))
-          (let ((reversed-target-object-file-names nil))
-            (do-stems-and-flags (stem flags)
-              (unless (position :not-target flags)
-                (let ((filename (target-compile-stem stem flags)))
-                  (unless (position :not-genesis flags)
-                    (push filename reversed-target-object-file-names)))
-                #!+sb-show (warn-when-cl-snapshot-diff *cl-snapshot*)))
-            (nreverse reversed-target-object-file-names))))
+(if (make-host-2-parallelism)
+    (parallel-make-host-2 (make-host-2-parallelism))
+    (let ((total
+           (count-if (lambda (x) (not (find :not-target (cdr x))))
+                     (get-stems-and-flags)))
+          (n 0)
+          (sb!xc:*compile-verbose* nil))
+      (do-stems-and-flags (stem flags)
+        (unless (position :not-target flags)
+          (format t "~&[~D/~D] ~A" (incf n) total (stem-remap-target stem))
+          (target-compile-stem stem flags)))))

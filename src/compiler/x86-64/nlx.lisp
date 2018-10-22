@@ -17,13 +17,11 @@
 
 (defun catch-block-ea (tn)
   (aver (sc-is tn catch-block))
-  (make-ea :qword :base rbp-tn
-           :disp (frame-byte-offset (+ -1 (tn-offset tn) catch-block-size))))
+  (ea (frame-byte-offset (+ -1 (tn-offset tn) catch-block-size)) rbp-tn))
 
 (defun unwind-block-ea (tn)
   (aver (sc-is tn unwind-block))
-  (make-ea :qword :base rbp-tn
-                  :disp (frame-byte-offset (+ -1 (tn-offset tn) unwind-block-size))))
+  (ea (frame-byte-offset (+ -1 (tn-offset tn) unwind-block-size)) rbp-tn))
 
 ;;;; Save and restore dynamic environment.
 ;;;;
@@ -72,8 +70,12 @@
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block unwind-block-uwp-slot)
     (storew rbp-tn block unwind-block-cfp-slot)
-    (inst lea temp (rip-relative-ea :qword entry-label))
-    (storew temp block unwind-block-entry-pc-slot)))
+    (inst lea temp (rip-relative-ea entry-label))
+    (storew temp block unwind-block-entry-pc-slot)
+    (load-binding-stack-pointer temp)
+    (storew temp block unwind-block-bsp-slot)
+    (load-tl-symbol-value temp *current-catch-block*)
+    (storew temp block unwind-block-current-catch-slot)))
 
 ;;; like MAKE-UNWIND-BLOCK, except that we also store in the specified
 ;;; tag, and link the block into the CURRENT-CATCH list
@@ -88,21 +90,21 @@
     (load-tl-symbol-value temp *current-unwind-protect-block*)
     (storew temp block catch-block-uwp-slot)
     (storew rbp-tn block catch-block-cfp-slot)
-    (inst lea temp (rip-relative-ea :qword entry-label))
+    (inst lea temp (rip-relative-ea entry-label))
     (storew temp block catch-block-entry-pc-slot)
     (storew tag block catch-block-tag-slot)
     (load-tl-symbol-value temp *current-catch-block*)
     (storew temp block catch-block-previous-catch-slot)
-    (store-tl-symbol-value block *current-catch-block*)))
+    (store-tl-symbol-value block *current-catch-block*)
+    (load-binding-stack-pointer temp)
+    (storew temp block catch-block-bsp-slot)))
 
-;;; Just set the current unwind-protect to TN's address. This instantiates an
+;;; Just set the current unwind-protect to UWP. This instantiates an
 ;;; unwind block as an unwind-protect.
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:sc unsigned-reg) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (inst lea new-uwp (unwind-block-ea tn))
-    (store-tl-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-tl-symbol-value uwp *current-unwind-protect-block*)))
 
 (define-vop (unlink-catch-block)
   (:temporary (:sc unsigned-reg) block)
@@ -178,16 +180,15 @@
     (inst mov rsp-tn sp)))
 
 (define-vop (nlx-entry-multiple)
-  (:args (top)
-         (source)
+  (:args (top :target result)
+         (source :to :save)
          (count :target rcx))
   ;; Again, no SC restrictions for the args, 'cause the loading would
   ;; happen before the entry label.
   (:info label)
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 2)) rcx)
-  (:temporary (:sc unsigned-reg :offset rsi-offset) rsi)
-  (:temporary (:sc unsigned-reg :offset rdi-offset) rdi)
-  (:results (result :scs (any-reg) :from (:argument 0))
+  (:temporary (:sc unsigned-reg) loop-index temp)
+  (:results (result :scs (any-reg))
             (num :scs (any-reg control-stack)))
   (:save-p :force-to-stack)
   (:vop-var vop)
@@ -195,28 +196,26 @@
     (emit-label label)
     (note-this-location vop :non-local-entry)
 
-    (inst lea rsi (make-ea :qword :base source :disp (- n-word-bytes)))
     ;; The 'top' arg contains the %esp value saved at the time the
     ;; catch block was created and points to where the thrown values
     ;; should sit.
-    (move rdi top)
-    (move result rdi)
+    (move result top)
 
-    (inst sub rdi n-word-bytes)
-    (move rcx count)                    ; fixnum words == bytes
     (unless (eq (tn-kind num) :unused)
-      (move num rcx))
-    (inst shr rcx n-fixnum-tag-bits)    ; word count for <rep movs>
-    ;; If we got zero, we be done.
+      (move num count))
+    (move rcx count)
     (inst jrcxz DONE)
-    ;; Copy them down.
-    (inst std)
-    (inst rep)
-    (inst movs :qword)
-    (inst cld)
+    (zeroize loop-index)
+    LOOP
+    (inst sub loop-index n-word-bytes)
+    (inst mov temp (ea source loop-index))
+    (inst mov (ea result loop-index) temp)
+
+    (inst sub rcx (fixnumize 1))
+    (inst jmp :nz LOOP)
     DONE
     ;; Reset the CSP at last moved arg.
-    (inst lea rsp-tn (make-ea :qword :base rdi :disp n-word-bytes))))
+    (inst lea rsp-tn (ea result loop-index))))
 
 
 ;;; This VOP is just to force the TNs used in the cleanup onto the stack.
@@ -233,8 +232,10 @@
 (define-vop (unwind-to-frame-and-call)
     (:args (ofp :scs (descriptor-reg))
            (uwp :scs (descriptor-reg))
-           (function :scs (descriptor-reg) :to :load :target saved-function))
-  (:arg-types system-area-pointer system-area-pointer t)
+           (function :scs (descriptor-reg) :to :load :target saved-function)
+           (bsp :scs (any-reg descriptor-reg))
+           (catch-block :scs (any-reg descriptor-reg)))
+  (:arg-types system-area-pointer system-area-pointer t t t)
   (:temporary (:sc sap-reg) temp)
   (:temporary (:sc descriptor-reg :offset rbx-offset) saved-function)
   (:temporary (:sc unsigned-reg :offset rax-offset) block)
@@ -255,8 +256,10 @@
     (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
     (storew temp block unwind-block-cfp-slot)
 
-    (inst lea temp-reg-tn (rip-relative-ea :qword entry-label))
+    (inst lea temp-reg-tn (rip-relative-ea entry-label))
     (storew temp-reg-tn block unwind-block-entry-pc-slot)
+    (storew bsp block unwind-block-bsp-slot)
+    (storew catch-block block unwind-block-current-catch-slot)
 
     ;; Run any required UWPs.
     (invoke-asm-routine 'jmp 'unwind vop)
@@ -269,14 +272,11 @@
     (zeroize rcx-tn)
 
     ;; Clear the stack
-    (inst lea rsp-tn
-          (make-ea :qword :base rbp-tn
-                   :disp (* (- sp->fp-offset 3) n-word-bytes)))
+    (inst lea rsp-tn (ea (* (- sp->fp-offset 3) n-word-bytes) rbp-tn))
 
     ;; Push the return-pc so it looks like we just called.
     (pushw rbp-tn (frame-word-offset return-pc-save-offset))
 
     ;; Call it
-    (inst jmp (make-ea :qword :base block
-                       :disp (- (* closure-fun-slot n-word-bytes)
-                                fun-pointer-lowtag)))))
+    (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
+                  block))))

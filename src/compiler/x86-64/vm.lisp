@@ -38,11 +38,10 @@
                 ;; which is needed because of forms such as #.*qword-regs*
                 (eval-when (:compile-toplevel :load-toplevel :execute)
                   ,@(when want-offsets
-                      (let ((i 0))
+                      (let ((i -1))
                         (map 'list
                              (lambda (x)
-                               `(defconstant ,(symbolicate x "-OFFSET")
-                                  ,(prog1 (* i 2) (incf i))))
+                               `(defconstant ,(symbolicate x "-OFFSET") ,(incf i)))
                              array))))
                 (defglobal ,offsets-list
                     (remove-if (lambda (x)
@@ -50,7 +49,7 @@
                                              ,r13-offset ; thread base
                                              ,rsp-offset
                                              ,rbp-offset)))
-                               (loop for i below 16 collect (* i 2)))))))
+                               (loop for i below 16 collect i))))))
 
   (define-gprs t *qword-regs* +qword-register-names+
     #("RAX" "RCX" "RDX" "RBX" "RSP" "RBP" "RSI" "RDI"
@@ -61,20 +60,13 @@
   (define-gprs nil *word-regs* +word-register-names+
     #("AX"  "CX"  "DX"   "BX"   "SP"   "BP"   "SI"   "DI"
       "R8W" "R9W" "R10W" "R11W" "R12W" "R13W" "R14W" "R15W"))
-  ;; byte registers
-  ;;
-  ;; Note: the encoding here is different than that used by the chip.
-  ;; We use this encoding so that the compiler thinks that AX (and
-  ;; EAX) overlap AL and AH instead of AL and CL.
-  ;;
-  ;; High-byte are registers disabled on AMD64, since they can't be
-  ;; encoded for an op that has a REX-prefix and we don't want to
-  ;; add special cases into the code generation. The overlap doesn't
-  ;; therefore exist anymore, but the numbering hasn't been changed
-  ;; to reflect this.
+  ;; High-byte ("h") registers are not generally used on AMD64,
+  ;; since they can't be encoded in an instruction that has a REX-prefix,
+  ;; but we can sometimes use them.
   (define-gprs nil *byte-regs* +byte-register-names+
     #("AL"  "CL"  "DL"   "BL"   "SPL"  "BPL"  "SIL"  "DIL"
-      "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B"))
+      "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B"
+      "AH" "CH" "DH" "BH"))
 
   ;; floating point registers
   (defreg float0 0 :float)
@@ -111,14 +103,8 @@
 
 ;;;; SB definitions
 
-;;; There are 16 registers really, but we consider them 32 in order to
-;;; describe the overlap of byte registers. The only thing we need to
-;;; represent is what registers overlap. Therefore, we consider bytes
-;;; to take one unit, and [dq]?words to take two. We don't need to
-;;; tell the difference between [dq]?words, because you can't put two
-;;; words in a dword register.
 (!define-storage-bases
-(define-storage-base registers :finite :size 32)
+(define-storage-base registers :finite :size 16)
 
 (define-storage-base float-registers :finite :size 16)
 
@@ -160,7 +146,6 @@
   (control-stack stack)                 ; may be pointers, scanned by GC
 
   ;; the non-descriptor stacks
-  ;; XXX alpha backend has :element-size 2 :alignment 2 in these entries
   (signed-stack stack)                  ; (signed-byte 64)
   (unsigned-stack stack)                ; (unsigned-byte 64)
   (character-stack stack)               ; non-descriptor characters.
@@ -195,7 +180,6 @@
   ;; bad will happen if they are. (fixnums, characters, header values, etc).
   (any-reg registers
            :locations #.*qword-regs*
-           :element-size 2 ; I think this is for the al/ah overlap thing
            :constant-scs (immediate)
            :save-p t
            :alternate-scs (control-stack))
@@ -203,20 +187,13 @@
   ;; pointer descriptor objects -- must be seen by GC
   (descriptor-reg registers
                   :locations #.*qword-regs*
-                  :element-size 2
-;                 :reserve-locations (#.eax-offset)
                   :constant-scs (constant immediate)
                   :save-p t
                   :alternate-scs (control-stack))
 
   ;; non-descriptor characters
   (character-reg registers
-                 :locations #!-sb-unicode #.*byte-regs*
-                            #!+sb-unicode #.*qword-regs*
-                 #!+sb-unicode #!+sb-unicode
-                 :element-size 2
-;                 #!-sb-unicode #!-sb-unicode
-;                 :reserve-locations (#.eax-offset)
+                 :locations #.*qword-regs*
                  :constant-scs (immediate)
                  :save-p t
                  :alternate-scs (character-stack))
@@ -224,8 +201,6 @@
   ;; non-descriptor SAPs (arbitrary pointers into address space)
   (sap-reg registers
            :locations #.*qword-regs*
-           :element-size 2
-;          :reserve-locations (#.eax-offset)
            :constant-scs (immediate)
            :save-p t
            :alternate-scs (sap-stack))
@@ -233,29 +208,14 @@
   ;; non-descriptor (signed or unsigned) numbers
   (signed-reg registers
               :locations #.*qword-regs*
-              :element-size 2
               :constant-scs (immediate)
               :save-p t
               :alternate-scs (signed-stack))
   (unsigned-reg registers
                 :locations #.*qword-regs*
-                :element-size 2
                 :constant-scs (immediate)
                 :save-p t
                 :alternate-scs (unsigned-stack))
-
-  ;; miscellaneous objects that must not be seen by GC. Used only as
-  ;; temporaries.
-  (word-reg registers
-            :locations #.*word-regs*
-            :element-size 2)
-  (dword-reg registers
-            :locations #.*dword-regs*
-            :element-size 2)
-  (byte-reg registers
-            :locations #.*byte-regs*)
-
-  ;; that can go in the floating point registers
 
   ;; non-descriptor SINGLE-FLOATs
   (single-reg float-registers
@@ -310,14 +270,10 @@
   (catch-block stack :element-size catch-block-size)
   (unwind-block stack :element-size unwind-block-size)))
 
-(defparameter *byte-sc-names*
-  '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
-(defparameter *word-sc-names* '(word-reg))
-(defparameter *dword-sc-names* '(dword-reg))
 (defparameter *qword-sc-names*
   '(any-reg descriptor-reg sap-reg signed-reg unsigned-reg control-stack
     signed-stack unsigned-stack sap-stack single-stack
-    #!+sb-unicode character-reg #!+sb-unicode character-stack constant))
+    character-reg character-stack constant))
 ;;; added by jrd. I guess the right thing to do is to treat floats
 ;;; as a separate size...
 ;;;
@@ -337,9 +293,6 @@
                        (case (car class-spec)
                          (#.*oword-sc-names*   :oword)
                          (#.*qword-sc-names*   :qword)
-                         (#.*dword-sc-names*   :dword)
-                         (#.*word-sc-names*    :word)
-                         (#.*byte-sc-names*    :byte)
                          (#.*float-sc-names*   :float)
                          (#.*double-sc-names*  :double)
                          (#.*complex-sc-names* :complex))))
@@ -348,14 +301,14 @@
 
 ;;;; miscellaneous TNs for the various registers
 
-(macrolet ((def-gpr-tns (sc-name name-array &aux (i 0))
+(macrolet ((def-gpr-tns (sc-name name-array &aux (i -1))
              `(progn
                 ,@(map 'list
                        (lambda (reg-name)
                          `(define-load-time-global ,(symbolicate reg-name "-TN")
                               (make-random-tn :kind :normal
                                               :sc (sc-or-lose ',sc-name)
-                                              :offset ,(prog1 (* i 2) (incf i)))))
+                                              :offset ,(incf i))))
                        (symbol-value name-array))))
            (def-fpr-tns (sc-name &rest reg-names)
              (collect ((forms))
@@ -367,9 +320,6 @@
                                                :sc (sc-or-lose ',sc-name)
                                                :offset ,offset-name))))))))
   (def-gpr-tns unsigned-reg +qword-register-names+)
-  (def-gpr-tns dword-reg +dword-register-names+)
-  (def-gpr-tns word-reg +word-register-names+)
-  (def-gpr-tns byte-reg +byte-register-names+)
   ;; RIP is not an addressable register, but this global var acts as
   ;; a moniker for it in an effective address so that the EA structure
   ;; does not need to accept a symbol (such as :RIP) for the base reg.
@@ -380,15 +330,14 @@
       float0 float1 float2 float3 float4 float5 float6 float7
       float8 float9 float10 float11 float12 float13 float14 float15))
 
-(defun reg-in-size (tn size)
-  (make-random-tn :kind :normal
-                  :sc (sc-or-lose
-                       (ecase size
-                         (:byte 'byte-reg)
-                         (:word 'word-reg)
-                         (:dword 'dword-reg)
-                         (:qword 'unsigned-reg)))
-                  :offset (tn-offset tn)))
+;;; Return true if THING is a general-purpose register TN.
+(defun gpr-tn-p (thing)
+  (and (tn-p thing)
+       (eq (sb-name (sc-sb (tn-sc thing))) 'registers)))
+;;; Return true if THING is an XMM register TN.
+(defun xmm-tn-p (thing)
+  (and (tn-p thing)
+       (eq (sb-name (sc-sb (tn-sc thing))) 'float-registers)))
 
 ;; A register that's never used by the code generator, and can therefore
 ;; be used as an assembly temporary in cases where a VOP :TEMPORARY can't
@@ -502,8 +451,6 @@
 (defun frame-byte-offset (index)
   (* (frame-word-offset index) n-word-bytes))
 
-(defconstant lra-save-offset return-pc-save-offset) ; ?
-
 ;;; This is used by the debugger.
 (defconstant single-value-return-byte-offset 3)
 
@@ -515,19 +462,7 @@
          (sb (sb-name (sc-sb sc)))
          (offset (tn-offset tn)))
     (ecase sb
-      (registers
-       (let ((index (ash offset -1))
-             (name-vec (case (sb!c:sc-operand-size sc)
-                         (:byte  +byte-register-names+)
-                         (:word  +word-register-names+)
-                         (:dword +dword-register-names+)
-                         (:qword +qword-register-names+))))
-         (or (and name-vec
-                  (evenp offset)
-                  (< -1 index (length name-vec))
-                  (svref name-vec index))
-             ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
+      (registers (reg-name (tn-reg tn)))
       (float-registers (format nil "FLOAT~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))

@@ -272,9 +272,13 @@ code to be loaded.
 ;;; While in theory we might want to include all of them,
 ;;; in practice it seems silly to allow "for x arithmetic-error in ..."
 (defun std-atom-type-specifier-p (symbol)
-  (and (eq (symbol-package symbol) *cl-package*)
-       ;; Check for primitiveness of the type, since some symbols in the CL
-       ;; package are private-use typedefs (e.g. ARRAY-RANK, CHAR-CODE).
+  ;; The check for symbols in CL is an optimization that skips calling INFO on
+  ;; most atoms. The real test is whether type = :PRIMITIVE, as there are CL
+  ;; symbols naming types which are not standard builtin type specifiers, e.g.
+  ;; ARRAY-RANK, CHAR-CODE. (One almost wonders if that is technically wrong).
+  ;; At any rate, in the cross-compiler, we must not rely on the host's idea
+  ;; of SYMBOL-PACKAGE as it does not accurately model the target per se.
+  (and #-sb-xc-host (eq (symbol-package symbol) *cl-package*)
        (or (eq (info :type :kind symbol) :primitive)
            ;; allow certain :instance types, but not all of them
            (member symbol '(hash-table package pathname random-state readtable)))
@@ -1345,30 +1349,21 @@ code to be loaded.
     (multiple-value-bind (vector-form constantp vector-value)
         (loop-constant-fold-if-possible val 'vector)
       (loop-make-var
-        vector-var vector-form
-        (if (and (consp vector-form) (eq (car vector-form) 'the))
-            (cadr vector-form)
-            'vector))
+       vector-var vector-form
+       (if (and (consp vector-form) (eq (car vector-form) 'the))
+           (cadr vector-form)
+           'vector))
       (loop-make-var index-var 0 'fixnum)
-      (let* ((length 0)
-             (length-form (cond ((not constantp)
-                                 (let ((v (gensym "LOOP-ACROSS-LIMIT-")))
-                                   (push `(setq ,v (length ,vector-var))
-                                         (prologue *loop*))
-                                   (loop-make-var v 0 'fixnum)))
-                                (t (setq length (length vector-value)))))
-             (first-test `(>= ,index-var ,length-form))
-             (other-test first-test)
+      (let* ((length-form (if constantp
+                              (length vector-value)
+                              (let ((v (gensym "LOOP-ACROSS-LIMIT-")))
+                                   (push `(let ((,v (length ,vector-var))))
+                                         (wrappers *loop*))
+                                   v)))
+             (test `(>= ,index-var ,length-form))
              (step `(,var (aref ,vector-var ,index-var)))
              (pstep `(,index-var (1+ ,index-var))))
-        (declare (fixnum length))
-        (when constantp
-          (setq first-test (= length 0))
-          (when (<= length 1)
-            (setq other-test t)))
-        `(,other-test ,step () ,pstep
-          ,@(and (neq first-test other-test)
-                 `(,first-test ,step () ,pstep)))))))
+        `(,test ,step () ,pstep)))))
 
 ;;;; list iteration
 
@@ -1427,7 +1422,7 @@ code to be loaded.
       (loop-constant-fold-if-possible val)
     (let ((listvar (gensym "LOOP-LIST-")))
       (loop-make-var var nil data-type)
-      (loop-make-var listvar list 'list)
+      (loop-make-var listvar list t)
       (let ((list-step (loop-list-step listvar)))
         (let* ((first-endtest `(endp ,listvar))
                (other-endtest first-endtest)
@@ -1596,7 +1591,8 @@ code to be loaded.
          (limit-given nil) ; T when prep phrase has specified end
          (limit-constantp nil)
          (limit-value nil))
-     #+ccl (progn start-constantp start-value) ; bogus "Unused" warnings
+     ;; Work around some "Unused" (rather, assigned-but-never-set) warnings
+     #+(or ccl clisp) (declare (ignorable start-constantp start-value))
      (flet ((assert-index-for-arithmetic (index)
               (unless (atom index)
                 (loop-error "Arithmetic index must be an atom."))))

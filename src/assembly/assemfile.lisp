@@ -22,13 +22,9 @@
 ;;; COMPILE-FILE, but in fact it's arguably more like LOAD, even down
 ;;; to the return convention. It LOADs a file, then writes out any
 ;;; assembly code created by the process.
-(defun assemble-file (name
-                      &key
-                      (output-file (make-pathname :defaults name
-                                                  :type "assem")))
+(defun assemble-file (name &key (output-file (error "Missing keyword")))
   (when sb-cold::*compile-for-effect-only*
     (return-from assemble-file t))
-  ;; FIXME: Consider nuking the filename defaulting logic here.
   (let* ((*emit-assembly-code-not-vops-p* t)
          (name (pathname name))
          ;; the fasl file currently being output to
@@ -37,11 +33,16 @@
          (won nil)
          (asmstream (make-asmstream))
          (*asmstream* asmstream)
-         (*adjustable-vectors* nil)
-         #!+immobile-code (*code-is-immobile* t))
+         (*adjustable-vectors* nil))
     (unwind-protect
         (let ((*features* (cons :sb-assembling *features*)))
           (load (merge-pathnames name (make-pathname :type "lisp")))
+          ;; Leave room for the indirect call table. relocate_heap() in
+          ;; 'coreparse' finds the end with a 0 word so add 1 extra word.
+          #!+(or x86 x86-64)
+          (emit (asmstream-data-section asmstream)
+                `(.skip ,(* (align-up (1+ (length *entry-points*)) 2)
+                            sb!vm:n-word-bytes)))
           (when (emit-inline-constants)
             ;; Ensure alignment to double-Lispword in case a raw constant
             ;; causes misalignment, as actually happens on ARM64.
@@ -60,7 +61,7 @@
                   (asmstream-code-section asmstream)
                   (asmstream-elsewhere-section asmstream))))
             (dump-assembler-routines segment
-                                     (finalize-segment segment)
+                                     (segment-buffer segment)
                                      (sb!assem::segment-fixup-notes segment)
                                      *entry-points*
                                      lap-fasl-output))
@@ -132,7 +133,7 @@
                         :offset ,(reg-spec-offset reg))))
                    regs)
        ,@(decls)
-       (assemble (:code ',name)
+       (assemble (:code 'nil)
          ,@(expand-align-option (cadr (assoc :align options)))
          ,name
          (push (list ',name ,name 0) *entry-points*)

@@ -23,7 +23,7 @@
 (defvar *readtable*)
 (declaim (type readtable *readtable*))
 
-(setf (fdocumentation '*readtable* 'variable)
+(setf (documentation '*readtable* 'variable)
       "Variable bound to current readtable.")
 
 ;;; A standard Lisp readtable (once cold-init is through). This is for
@@ -680,7 +680,7 @@ standard Lisp readtable when NIL."
 ;;; On the other hand, it's probably very very seldom a problem in practice.
 ;;; On the third hand, it might be just as easy to use a hash table,
 ;;; so maybe we should. -- WHN 19991202
-(defvar *sharp-equal* ())
+(defvar *sharp-equal*)
 
 (declaim (ftype (sfunction (t t) (values bit t)) read-maybe-nothing))
 

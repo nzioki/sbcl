@@ -117,16 +117,14 @@
                 (not (location= ptr res)))
            (sc-case offset
              (signed-reg
-              (inst lea res (make-ea :qword :base ptr :index offset :scale 1)))
+              (inst lea res (ea ptr offset)))
              (immediate
               (let ((value (tn-value offset)))
-                (cond ((typep value '(or (signed-byte 32) (unsigned-byte 31)))
-                       (inst lea res (make-ea :qword :base ptr :disp value)))
+                (cond ((typep value '(signed-byte 32))
+                       (inst lea res (ea value ptr)))
                       (t
                        (inst mov temp value)
-                       (inst lea res (make-ea :qword :base ptr
-                                              :index temp
-                                              :scale 1))))))))
+                       (inst lea res (ea ptr temp))))))))
           (t
            (move res ptr)
            (sc-case offset
@@ -134,7 +132,7 @@
               (inst add res offset))
              (immediate
               (let ((value (tn-value offset)))
-                (cond ((typep value '(or (signed-byte 32) (unsigned-byte 31)))
+                (cond ((typep value '(signed-byte 32))
                        (inst add res (tn-value offset)))
                       (t
                        (inst mov temp value)
@@ -167,12 +165,10 @@
         (inst add sap offset))
       (inst mov temp-reg-tn msan-mem-to-shadow-xor-const)
       (inst xor temp-reg-tn sap)
-      (inst mov (make-ea size :base temp-reg-tn) 0)
+      (inst mov size (ea 0 temp-reg-tn) 0)
       (unless (eql offset 0) ; restore SAP as if nothing happened
         (inst sub sap offset))))
-  (inst mov
-        (make-ea size :base sap :index ea-index :disp ea-disp)
-        (reg-in-size value size))
+  (inst mov size (ea ea-disp sap ea-index) value)
   (move result value))
 
 (macrolet ((def-system-ref-and-set (ref-name
@@ -182,7 +178,8 @@
                                     type
                                     size)
              (let ((ref-name-c (symbolicate ref-name "-C"))
-                   (set-name-c (symbolicate set-name "-C")))
+                   (set-name-c (symbolicate set-name "-C"))
+                   (modifier (if (eq ref-insn 'mov) size `(,size :qword))))
                `(progn
                   (define-vop (,ref-name)
                     (:translate ,ref-name)
@@ -193,8 +190,7 @@
                     (:results (result :scs (,sc)))
                     (:result-types ,type)
                     (:generator 5
-                      (inst ,ref-insn result
-                            (make-ea ,size :base sap :index offset))))
+                      (inst ,ref-insn ',modifier result (ea sap offset))))
                   (define-vop (,ref-name-c)
                     (:translate ,ref-name)
                     (:policy :fast-safe)
@@ -205,8 +201,7 @@
                     (:results (result :scs (,sc)))
                     (:result-types ,type)
                     (:generator 4
-                      (inst ,ref-insn result
-                            (make-ea ,size :base sap :disp offset))))
+                      (inst ,ref-insn ',modifier result (ea offset sap))))
                   (define-vop (,set-name)
                     (:translate ,set-name)
                     (:policy :fast-safe)
@@ -237,9 +232,9 @@
     unsigned-reg positive-fixnum :word)
   (def-system-ref-and-set signed-sap-ref-16 %set-signed-sap-ref-16 movsx
     signed-reg tagged-num :word)
-  (def-system-ref-and-set sap-ref-32 %set-sap-ref-32 movzxd
+  (def-system-ref-and-set sap-ref-32 %set-sap-ref-32 movzx
     unsigned-reg unsigned-num :dword)
-  (def-system-ref-and-set signed-sap-ref-32 %set-signed-sap-ref-32 movsxd
+  (def-system-ref-and-set signed-sap-ref-32 %set-signed-sap-ref-32 movsx
     signed-reg signed-num :dword)
   (def-system-ref-and-set sap-ref-64 %set-sap-ref-64 mov
     unsigned-reg unsigned-num :qword)
@@ -261,7 +256,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 5
-     (inst movsd result (make-ea :qword :base sap :index offset))))
+     (inst movsd result (ea sap offset))))
 
 (define-vop (sap-ref-double-c)
   (:translate sap-ref-double)
@@ -272,7 +267,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 4
-     (inst movsd result (make-ea :qword :base sap :disp offset))))
+     (inst movsd result (ea offset sap))))
 
 (define-vop (%set-sap-ref-double)
   (:translate %set-sap-ref-double)
@@ -284,7 +279,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 5
-    (inst movsd (make-ea :qword :base sap :index offset) value)
+    (inst movsd (ea sap offset) value)
     (move result value)))
 
 (define-vop (%set-sap-ref-double-c)
@@ -297,7 +292,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 4
-    (inst movsd (make-ea :qword :base sap :disp offset) value)
+    (inst movsd (ea offset sap) value)
     (move result value)))
 
 ;;;; SAP-REF-SINGLE
@@ -311,7 +306,7 @@
   (:results (result :scs (single-reg)))
   (:result-types single-float)
   (:generator 5
-     (inst movss result (make-ea :dword :base sap :index offset))))
+     (inst movss result (ea sap offset))))
 
 (define-vop (sap-ref-single-c)
   (:translate sap-ref-single)
@@ -322,7 +317,7 @@
   (:results (result :scs (single-reg)))
   (:result-types single-float)
   (:generator 4
-     (inst movss result (make-ea :dword :base sap :disp offset))))
+     (inst movss result (ea offset sap))))
 
 (define-vop (%set-sap-ref-single)
   (:translate %set-sap-ref-single)
@@ -334,7 +329,7 @@
   (:results (result :scs (single-reg)))
   (:result-types single-float)
   (:generator 5
-    (inst movss (make-ea :dword :base sap :index offset) value)
+    (inst movss (ea sap offset) value)
     (move result value)))
 
 (define-vop (%set-sap-ref-single-c)
@@ -347,7 +342,7 @@
   (:results (result :scs (single-reg)))
   (:result-types single-float)
   (:generator 4
-    (inst movss (make-ea :dword :base sap :disp offset) value)
+    (inst movss (ea offset sap) value)
     (move result value)))
 
 
@@ -363,7 +358,7 @@
     (let ((disp (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
       (if (location= sap vector)
           (inst add sap disp)
-          (inst lea sap (make-ea :qword :base vector :disp disp))))))
+          (inst lea sap (ea disp vector))))))
 
 ;;; Compare and swap
 (define-vop (signed-sap-cas-32)
@@ -372,14 +367,13 @@
          (offset :scs (signed-reg) :to (:eval 0))
          (oldval :scs (signed-reg) :target eax)
          (newval :scs (signed-reg) :to (:eval 0)))
-  (:temporary (:sc dword-reg :offset eax-offset
+  (:temporary (:sc unsigned-reg :offset eax-offset
                    :from (:argument 2) :to (:result 0)) eax)
   (:arg-types system-area-pointer signed-num signed-num signed-num)
   (:results (result :scs (signed-reg)))
   (:result-types signed-num)
   (:generator 5
-    (inst mov eax (reg-in-size oldval :dword))
-    (inst cmpxchg (make-ea :dword :base sap :index offset)
-          (reg-in-size newval :dword) :lock)
-    (inst mov (reg-in-size result :dword) eax)))
+    (inst mov :dword eax oldval)
+    (inst cmpxchg :dword (ea sap offset) newval :lock)
+    (inst movsx '(:dword :qword) result eax)))
 

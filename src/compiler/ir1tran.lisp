@@ -84,8 +84,6 @@
   to optimize code which uses those definitions? Setting this true
   gives non-ANSI, early-CMU-CL behavior. It can be useful for improving
   the efficiency of stable code.")
-
-(defvar *post-binding-variable-lexenv* nil)
 
 ;;;; namespace management utilities
 
@@ -944,18 +942,6 @@
 
 ;;;; code coverage
 
-;;; Used as the CDR of the code coverage instrumentation records
-;;; (instead of NIL) to ensure that any well-behaving user code will
-;;; not have constants EQUAL to that record. This avoids problems with
-;;; the records getting coalesced with non-record conses, which then
-;;; get mutated when the instrumentation runs. Note that it's
-;;; important for multiple records for the same location to be
-;;; coalesced. -- JES, 2008-01-02
-;;; Use of #. mandates :COMPILE-TOPLEVEL for several Lisps
-;;; even though for us it's immediately accessible to EVAL.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%))
-
 ;;; Check the policy for whether we should generate code coverage
 ;;; instrumentation. If not, just return the original START
 ;;; ctran. Otherwise insert code coverage instrumentation after
@@ -984,9 +970,13 @@
                                    (cons path +code-coverage-unmarked+)))
                   (next (make-ctran))
                   (*allow-instrumenting* nil))
+              #!+(or x86-64 x86) (declare (ignore store)) ; eval'd for side-effect only
               (push (ctran-block start)
                     (gethash path (code-coverage-blocks metadata)))
               (ir1-convert start next nil
+                           #!+(or x86-64 x86)
+                           `(%primitive mark-covered ',path)
+                           #!-(or x86-64 x86)
                            `(locally
                                 (declare (optimize speed
                                                    (safety 0)
@@ -1013,26 +1003,6 @@
           (when *current-path*
             (instrument-coverage start nil form))))
       start))
-
-(defun record-code-coverage (info cc)
-  (setf (gethash info *code-coverage-info*) cc))
-
-(defun clear-code-coverage ()
-  (clrhash *code-coverage-info*))
-
-(defun reset-code-coverage ()
-  (maphash (lambda (info cc)
-             (declare (ignore info))
-             (dolist (cc-entry cc)
-               (setf (cdr cc-entry) +code-coverage-unmarked+)))
-           *code-coverage-info*))
-
-(defun code-coverage-record-marked (record)
-  (aver (consp record))
-  (ecase (cdr record)
-    ((#.+code-coverage-unmarked+) nil)
-    ((t) t)))
-
 
 ;;;; converting combinations
 
@@ -1349,9 +1319,14 @@
 
 ;;; Process a special declaration, returning a new LEXENV. A non-bound
 ;;; special declaration is instantiated by throwing a special variable
-;;; into the variables if BINDING-FORM-P is NIL, or otherwise into
-;;; *POST-BINDING-VARIABLE-LEXENV*.
-(defun process-special-decl (spec res vars binding-form-p context)
+;;; into the variables if POST-BINDING-LEXENV is NIL,
+;;; or by mutating POST-BINDING-LEXENV if non-nil.
+;;; Note that POST-BINDING-LEXENV is not actually a lexenv - it is only
+;;; the contents of the 'vars' slot of a LEXENV, and moreover, as supplied
+;;; to this function, it has a dummy cons in front which is later removed.
+;;; The dummy cons serves a double purpose - as an indicator that this decl
+;;; occurs in a LET/LET* form, and facilitating pass by reference of the list.
+(defun process-special-decl (spec res vars post-binding-lexenv context)
   (declare (list spec vars) (type lexenv res))
   (collect ((new-venv nil cons))
     (dolist (name (cdr spec))
@@ -1388,9 +1363,9 @@
           (null
            (unless (or (assoc name (new-venv) :test #'eq))
              (new-venv (cons name (specvar-for-binding name))))))))
-    (cond (binding-form-p
-           (setf *post-binding-variable-lexenv*
-                 (append (new-venv) *post-binding-variable-lexenv*))
+    (cond (post-binding-lexenv
+           (setf (cdr post-binding-lexenv)
+                 (append (new-venv) (cdr post-binding-lexenv)))
            res)
           ((new-venv)
            (make-lexenv :default res :vars (new-venv)))
@@ -1600,7 +1575,7 @@
 ;;; Process a single declaration spec, augmenting the specified LEXENV
 ;;; RES. Return RES and result type. VARS and FVARS are as described
 ;;; PROCESS-DECLS.
-(defun process-1-decl (raw-spec res vars fvars binding-form-p context)
+(defun process-1-decl (raw-spec res vars fvars post-binding-lexenv context)
   (declare (type list raw-spec vars fvars))
   (declare (type lexenv res))
   (let ((spec (canonized-decl-spec raw-spec))
@@ -1617,7 +1592,8 @@
        ((ignore ignorable)
         (process-ignore-decl spec vars fvars res)
         res)
-       (special (process-special-decl spec res vars binding-form-p context))
+       (special
+        (process-special-decl spec res vars post-binding-lexenv context))
        (ftype
         (unless (cdr spec)
           (compiler-error "no type specified in FTYPE declaration: ~S" spec))
@@ -1683,7 +1659,7 @@
         (allow-explicit-check allow-lambda-list)
         (lambda-list (if allow-lambda-list :unspecified nil))
         (optimize-qualities)
-        (*post-binding-variable-lexenv* nil))
+        (post-binding-lexenv (if binding-form-p (list nil)))) ; dummy cell
     (flet ((process-it (spec decl)
              (cond ((atom spec)
                     (compiler-error "malformed declaration specifier ~S in ~S"
@@ -1725,7 +1701,7 @@
                    (t
                     (multiple-value-bind (new-env new-qualities)
                         (process-1-decl spec lexenv vars fvars
-                                        binding-form-p context)
+                                        post-binding-lexenv context)
                       (setq lexenv new-env
                             optimize-qualities
                             (nconc new-qualities optimize-qualities)))))))
@@ -1737,7 +1713,7 @@
               ;; Kludge: EVAL calls this function to deal with LOCALLY.
               (process-it spec decl)))))
     (warn-repeated-optimize-qualities (lexenv-policy lexenv) optimize-qualities)
-    (values lexenv result-type *post-binding-variable-lexenv*
+    (values lexenv result-type (cdr post-binding-lexenv)
             lambda-list explicit-check)))
 
 (defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
@@ -1759,8 +1735,7 @@
 (defmacro processing-decls ((decls vars fvars ctran lvar
                                    &optional post-binding-lexenv)
                             &body forms)
-  (check-type ctran symbol)
-  (check-type lvar symbol)
+  (declare (symbol ctran lvar))
   (let ((post-binding-lexenv-p (not (null post-binding-lexenv)))
         (post-binding-lexenv (or post-binding-lexenv (sb!xc:gensym "LEXENV"))))
     `(%processing-decls ,decls ,vars ,fvars ,ctran ,lvar

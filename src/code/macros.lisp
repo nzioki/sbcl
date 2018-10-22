@@ -203,8 +203,6 @@ invoked. In that case it will store into PLACE and start over."
 
 ;;;; CASE, TYPECASE, and friends
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
 ;;; Make this a full warning during SBCL build.
 (define-condition duplicate-case-key-warning (#-sb-xc-host style-warning #+sb-xc-host warning)
   ((key :initarg :key
@@ -235,6 +233,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;; of the ordinary clauses. When PROCEEDP, it is an error to
 ;;; omit ERRORP, and the ERROR form generated is executed within a
 ;;; RESTART-CASE allowing KEYFORM to be set and retested.
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 (defun case-body (name keyform cases multi-p test errorp proceedp needcasesp)
   (unless (or cases (not needcasesp))
     (warn "no clauses in ~S" name))
@@ -524,15 +523,18 @@ invoked. In that case it will store into PLACE and start over."
                specs)))
 
 ;; Avoid unknown return values in emitted code for PRINT-UNREADABLE-OBJECT
-(declaim (ftype (sfunction (t t t t &optional t) null)
-                %print-unreadable-object))
+(sb!xc:proclaim '(ftype (sfunction (t t t &optional t) null)
+                        %print-unreadable-object))
 (sb!xc:defmacro print-unreadable-object ((object stream &key type identity)
                                              &body body)
   "Output OBJECT to STREAM with \"#<\" prefix, \">\" suffix, optionally
   with object-type prefix and object-identity suffix, and executing the
   code in BODY to provide possible further output."
   ;; Note: possibly out-of-order keyword argument evaluation.
-  (let ((call `(%print-unreadable-object ,object ,stream ,type ,identity)))
+  ;; But almost always the :TYPE and :IDENTITY are each literal T or NIL,
+  ;; and so the LOGIOR expression reduces to a fixed value from 0 to 3.
+  (let ((call `(%print-unreadable-object
+                ,object ,stream (logior (if ,type 1 0) (if ,identity 2 0)))))
     (if body
         (let ((fun (make-symbol "THUNK")))
           `(dx-flet ((,fun () ,@body)) (,@call #',fun)))
@@ -554,3 +556,28 @@ invoked. In that case it will store into PLACE and start over."
     (let ((fn-sym (sb!xc:gensym))) ; for ONCE-ONLY-ish purposes
       (values `((,fn-sym (%coerce-callable-to-fun ,funarg)))
               `(sb!c::%funcall ,fn-sym . ,arg-forms)))))
+
+;;; Ordinarily during self-build, nothing would need this macro except the
+;;; calls in src/code/list, and src/code/seq.
+;;; However, if cons profiling is enbled, then all calls to COPY-LIST
+;;; transform into the macro, so it must be available early.
+(sb!xc:defmacro copy-list-macro (input &key check-proper-list)
+  ;; Unless CHECK-PROPER-LIST is true, the list is copied correctly
+  ;; even if the list is not terminated by NIL. The new list is built
+  ;; by CDR'ing SPLICE which is always at the tail of the new list.
+  (with-unique-names (orig copy splice cell)
+    ;; source transform gave input the ONCE-ONLY treatment already.
+    `(when ,input
+       (let ((,copy (list (car ,input))))
+         (do ((,orig (cdr ,input) (cdr ,orig))
+              (,splice ,copy
+                       (let ((,cell (list (car ,orig))))
+                         (rplacd (truly-the cons ,splice) ,cell)
+                         ,cell)))
+           (,@(if check-proper-list
+                  `((endp ,orig))
+                  `((atom ,orig)
+                    ;; always store the CDR even if NIL. A blind write
+                    ;; is cheaper than a branch around a write.
+                    (rplacd (truly-the cons ,splice) ,orig)))
+            ,copy))))))

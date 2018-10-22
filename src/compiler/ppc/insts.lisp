@@ -22,8 +22,6 @@
             sb!vm::zero-tn sb!vm::lip-tn
             sb!vm::zero-offset sb!vm::null-offset)))
 
-(defconstant +disassem-inst-alignment-bytes+ sb!vm:n-word-bytes)
-
 ;;; needs a little more work in the assembler, to realise that the
 ;;; delays requested here are not mandatory, so that the assembler
 ;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
@@ -230,7 +228,8 @@
        ;; stick a nop in the long branch and then we will be
        ;; preserving 8 byte alignment
        segment 8 2 ; 2^2 is 4 byte alignment.  I think
-       #'(lambda (segment posn magic-value)
+       #'(lambda (segment chooser posn magic-value)
+           (declare (ignore chooser))
            (let ((delta (ash (- (label-position target posn magic-value) posn)
                              -2)))
              (when (typep delta '(signed-byte 14))
@@ -544,9 +543,6 @@
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-i-form-inst 32
   (byte 6 26) (byte 24 2) (byte 1 1) (byte 1 0))
@@ -1755,10 +1751,6 @@
   (define-instruction-macro not. (ra rs)
     `(inst nor. ,ra ,rs ,rs))
 
-
-  (defun emit-nop (segment)
-                           (emit-word segment #x60000000))
-
   (define-instruction-macro extlwi (ra rs n b)
     `(inst rlwinm ,ra ,rs ,b 0 (1- ,n)))
 
@@ -1971,13 +1963,6 @@
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
@@ -1985,12 +1970,9 @@
   (:emitter
    (emit-byte segment byte)))
 
-(define-bitfield-emitter emit-header-object 32
-  (byte 24 8) (byte 8 0))
-
 (defun emit-header-data (segment type)
   (emit-back-patch
-   segment 4
+   segment n-word-bytes
    #'(lambda (segment posn)
        (emit-word segment
                   (logior type
@@ -2015,7 +1997,8 @@
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   #'(lambda (segment posn delta-if-after)
+   #'(lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
          (when (<= (- (ash 1 15)) delta (1- (ash 1 15)))
            (emit-back-patch segment 4

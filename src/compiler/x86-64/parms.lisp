@@ -14,6 +14,7 @@
 (in-package "SB!VM")
 
 (defconstant sb!assem:assem-scheduler-p nil)
+(defconstant sb!assem:+inst-alignment-bytes+ 1)
 
 (defconstant +backend-fasl-file-implementation+ :x86-64)
 (defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
@@ -43,7 +44,7 @@
 ;;; This must be a multiple of the OS page size.
 (defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
-#!+immobile-space (defconstant immobile-card-bytes 4096)
+(defconstant immobile-card-bytes 4096)
 
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
@@ -131,9 +132,16 @@
 ;;; would be possible, but probably not worth the time and code bloat
 ;;; it would cause. -- JES, 2005-12-11
 
+#!+linux
+(!gencgc-space-setup #x50000000
+                     :fixedobj-space-size #.(* 30 1024 1024)
+                     :varyobj-space-size #.(* 130 1024 1024)
+                     :dynamic-space-start #x1000000000)
+
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
 ;;; run under the default 512M data size limit.
 
+#!-linux
 (!gencgc-space-setup #x20000000
                      :dynamic-space-start #x1000000000
                      #!+openbsd :dynamic-space-size #!+openbsd #x1bcf0000)
@@ -176,7 +184,8 @@
     #!-sb-thread *alien-stack-pointer*    ; a thread slot if #!+sb-thread
      ;; interrupt handling
     #!-sb-thread *pseudo-atomic-bits*     ; ditto
-    #!-sb-thread *binding-stack-pointer*) ; ditto
+    #!-sb-thread *binding-stack-pointer* ; ditto
+    *cpuid-fn1-ecx*)
   #'equalp)
 
 ;;; FIXME: with #!+immobile-space, this should be the empty list,
@@ -201,4 +210,4 @@
   #'equalp)
 
 #!+sb-simd-pack
-(defvar *simd-pack-element-types* '(integer single-float double-float))
+(defglobal *simd-pack-element-types* '(integer single-float double-float))

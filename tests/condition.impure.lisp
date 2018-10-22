@@ -559,3 +559,54 @@
     (assert (= (funcall (checked-compile '(lambda (&key abc) (1+ abc)))
                         :bogus 30 :abc 20)
                21))))
+
+(define-condition allocation-class-default-initargs ()
+  ((a :initarg :a :initform :initform :allocation :class))
+  (:default-initargs :a :default-initarg))
+
+(with-test (:name :allocation-class-default-initargs)
+  (assert (eql (slot-value (make-condition 'allocation-class-default-initargs) 'a)
+               :default-initarg))
+  (assert (eql (slot-value (make-condition 'allocation-class-default-initargs :a 10) 'a)
+               10)))
+
+(define-condition allocation-class-unbound ()
+  ((a :initarg :a :allocation :class)))
+
+(with-test (:name :allocation-class-unbound)
+  (assert-error (slot-value (make-condition 'allocation-class-unbound) 'a)))
+
+(define-condition allocation-class-initarg-order ()
+  ((a :initarg :a :initarg :b :allocation :class)))
+
+(with-test (:name :allocation-class-initarg-order)
+  (assert (eql (slot-value (make-condition 'allocation-class-initarg-order :a 10 :b 20) 'a)
+               10))
+  (assert (eql (slot-value (make-condition 'allocation-class-initarg-order :b 10 :a 20) 'a)
+               10)))
+
+(defvar *ggg*)
+(declaim (integer *ggg*))
+(defun ggg+1 () (1+ *ggg*))
+
+(with-test (:name :restart-unbound-variable
+                  :skipped-on (not (and :x86-64 :sb-thread)))
+  (let ((success nil))
+    (handler-bind
+        ((unbound-variable
+          (lambda (e)
+            ;; This is kinda whacky, I'd have preferred to
+            ;; see a TYPE-ERROR here, but instead we signal
+            ;; RETRY-UNBOUND-VARIABLE which is a system-internal
+            ;; type name, and a format control describing the problem
+            ;; Apparently I don't understand anything anyway,
+            ;; because why is this *same* handler still accessible?
+            (cond ((typep e 'sb-kernel::retry-unbound-variable)
+                   (when (search ":NOPE is not of type INTEGER"
+                                 (write-to-string e :escape nil))
+                     (setq success t))
+                   (invoke-restart 'use-value 1))
+                  (t
+                   (invoke-restart 'store-value :nope))))))
+      (ggg+1)
+      (assert success))))

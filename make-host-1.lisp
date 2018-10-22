@@ -1,10 +1,3 @@
-;;; (We want to have some limit on print length and print level during
-;;; bootstrapping because PRINT-OBJECT only gets set up rather late,
-;;; and running without PRINT-OBJECT it's easy to fall into printing
-;;; enormous (or infinitely circular) low-level representations of
-;;; things.)
-(setf *print-level* 5 *print-length* 5)
-
 (progn
   (load "src/cold/shared.lisp")
   (load "tools-for-build/ldso-stubs.lisp")
@@ -38,22 +31,19 @@
     ;; exit of SUMMARIZE-COMPILATION-UNIT. So we set up a handler for that.
     `(let (in-summary fail)
        (handler-bind (((and simple-warning (not style-warning))
-                       (lambda (c)
+                       (lambda (c &aux (fc (simple-condition-format-control c)))
                          ;; hack for PPC. See 'build-order.lisp-expr'
                          ;; Ignore the warning, and the warning about the warning.
-                         (unless (or (search "not allowed by the operand type"
-                                             (simple-condition-format-control c))
-                                     (search "ignoring FAILURE-P return"
-                                             (simple-condition-format-control c)))
+                         (unless (and (stringp fc)
+                                      (or (search "not allowed by the operand type" fc)
+                                          (search "ignoring FAILURE-P return" fc)))
                            (setq fail 'warning))))
                       ;; Prevent regressions on a couple platforms
                       ;; that are known to build cleanly.
                       #!+(or x86 x86-64 arm64)
                       (sb-int:simple-style-warning
-                       (lambda (c)
-                         (when (and in-summary
-                                    (search "undefined"
-                                            (simple-condition-format-control c)))
+                       (lambda (c &aux (fc (simple-condition-format-control c)))
+                         (when (and in-summary (stringp fc) (search "undefined" fc))
                            (unless (eq fail 'warning)
                              (setq fail 'style-warning))))))
          (with-compilation-unit ()
@@ -69,28 +59,28 @@
   (set-dispatch-macro-character #\# #\+ #'she-reader)
   (set-dispatch-macro-character #\# #\- #'she-reader))
 
-(maybe-with-compilation-unit
- (load-or-cload-xcompiler #'host-cload-stem)
+;;; Build the unicode database now. It depends on nothing in the cross-compiler
+;;; (and let's keep it that way). This code is slow to run, so compile it.
+(let ((object (compile-file "tools-for-build/ucd.lisp")))
+  (load object :verbose t)
+  (delete-file object))
+(dolist (s '(sb-cold::slurp-ucd sb-cold::slurp-proplist sb-cold::output))
+  (funcall s))
 
-;;; Let's check that the type system, and various other things, are
-;;; reasonably sane. (It's easy to spend a long time wandering around
-;;; confused trying to debug cross-compilation if it isn't.)
+(maybe-with-compilation-unit
+ (let ((*feature-evaluation-results* nil))
+  (load-or-cload-xcompiler #'host-cload-stem)
+  (write-feature-eval-results))
+
+ ;; Let's check that the type system, and various other things, are
+ ;; reasonably sane. (It's easy to spend a long time wandering around
+ ;; confused trying to debug cross-compilation if it isn't.)
  (load "tests/type.before-xc.lisp")
  (load "tests/info.before-xc.lisp")
  (load "tests/vm.before-xc.lisp")
-;; When building on a slow host using a slow Lisp,
-;; the wait time in slurp-ucd seems interminable - over a minute.
-;; Compiling seems to help a bit, but maybe it's my imagination.
- (let ((object (compile-file "tools-for-build/ucd.lisp")))
-   (load object)
-   (delete-file object))
 
-;;; Generate character database tables.
- (dolist (s '(sb-cold::slurp-ucd sb-cold::slurp-proplist sb-cold::output))
-   (funcall s))
-
-;;; propagate structure offset and other information to the C runtime
-;;; support code.
+ ;; propagate structure offset and other information to the C runtime
+ ;; support code.
  (load "tools-for-build/corefile.lisp" :verbose nil)
  (host-cload-stem "src/compiler/generic/genesis" nil)
 ) ; END with-compilation-unit

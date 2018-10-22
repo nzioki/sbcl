@@ -75,10 +75,12 @@
                 (increment `(the sb!vm:finite-sc-offset ,(or increment 1))))
       (labels ((make-block (start end)
                  `(loop named #:noname
-                        for ,location of-type (integer 0 ,sb!vm:finite-sc-offset-limit)
+                        for ,location
                         from ,start below ,end by ,increment
                         when (logbitp ,location ,locations)
-                          do ,@body))
+                        do (locally (declare (type sb!vm:finite-sc-offset
+                                              ,location))
+                             ,@body)))
                (make-guarded-block (start end)
                  (unless (and (numberp limit) (<= limit start))
                    (let ((mask (dpb -1 (byte mid start) 0)))
@@ -383,13 +385,11 @@
   (name "<not computed>" :type (or simple-string list symbol))
   ;; the argument list that the function was defined with.
   (arguments nil :type list)
-  ;; the entire lambda expression defining this function
-  (lexpr nil)
   ;; a function type specifier representing the arguments and results
   ;; of this function
   (type 'function :type (or list (member function)))
-  ;; docstring and/or xref information for the XEP
-  (info nil :type (or null simple-vector string (cons string simple-vector))))
+  ;; source form and/or docstring and/or xref information for the XEP
+  (form/doc/xrefs nil :type (or null simple-vector string cons)))
 
 ;;; An IR2-PHYSENV is used to annotate non-LET LAMBDAs with their
 ;;; passing locations. It is stored in the PHYSENV-INFO.
@@ -463,7 +463,8 @@
   (count (missing-arg) :type (or index (member :unknown)))
   ;; If count isn't :UNKNOWN, then this is a list of the
   ;; primitive-types of each value.
-  (types () :type list)
+  (primitive-types () :type list)
+  (types nil :type list)
   ;; If kind is :FIXED, then this is the list of the TNs that we
   ;; return the values in.
   (locations () :type list))
@@ -480,10 +481,13 @@
   ;; unwind-block, so we leave this slot null.
   (home nil :type (or tn null))
   ;; the saved control stack pointer
-  (save-sp (missing-arg) :type tn)
+  (save-sp nil :type (or tn null))
   ;; the list of dynamic state save TNs
-  (dynamic-state (list* (make-stack-pointer-tn)
+
+  (dynamic-state #!-x86-64
+                 (list* (make-stack-pointer-tn)
                         (make-dynamic-state-tns))
+                 #!+x86-64 nil
                  :type list)
   ;; the target label for NLX entry
   (target (gen-label) :type label))
@@ -554,7 +558,9 @@
   ;; vice-versa.
   (target nil :type (or null tn-ref))
   ;; the load TN allocated for this operand, if any
-  (load-tn nil :type (or tn null)))
+  (load-tn nil :type (or tn null))
+  ;; The type of the LVAR the TN of this TN-REF is used for.
+  (type nil :type (or ctype null)))
 
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
@@ -806,7 +812,6 @@
   ;; is set, then the location is in use somewhere in the block, and
   ;; thus has a conflict for always-live TNs.
   (always-live '#() :type simple-vector)
-  (always-live-count '#() :type simple-vector)
   ;; a vector containing the TN currently live in each location in the
   ;; SB, or NIL if the location is unused. This is used during load-tn pack.
   (live-tns '#() :type simple-vector)
@@ -814,7 +819,8 @@
   ;; might not be virgin, and thus must be reinitialized when PACK
   ;; starts. Less then the length of those vectors when not all of the
   ;; length was used on the previously packed component.
-  (last-block-count 0 :type index))
+  (last-block-count 0 :type index)
+  (wired-map 0 :type sb!vm:finite-sc-offset-map))
 (declaim (freeze-type storage-base finite-sb-template finite-sb))
 
 ;;; Give this a toplevel value so that it can be declaimed ALWAYS-BOUND.
@@ -838,8 +844,9 @@
   `(fsb-conflicts (svref *finite-sbs* (finite-sb-index ,sb))))
 (defmacro finite-sb-always-live (sb)
   `(fsb-always-live (svref *finite-sbs* (finite-sb-index ,sb))))
-(defmacro finite-sb-always-live-count (sb)
-  `(fsb-always-live-count (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-wired-map (sb)
+  `(fsb-wired-map (svref *finite-sbs* (finite-sb-index ,sb))))
+
 (defmacro finite-sb-live-tns (sb)
   `(fsb-live-tns (svref *finite-sbs* (finite-sb-index ,sb))))
 (defmacro finite-sb-last-block-count (sb)
@@ -991,6 +998,12 @@
   ;; the primitive-type for this TN's value. Null in restricted or
   ;; wired TNs.
   (primitive-type nil :type (or primitive-type null))
+  ;; The type of the LVAR this TN is used for.
+  ;; Meaningless after copy-propagate or other optimizations are performed
+  ;; and TN-REF-TYPE should be used instead.
+  ;; The only purpose of this slot is for REFERENCE-TN to populate
+  ;; TN-REF-TYPE.
+  (type nil :type (or ctype null))
   ;; If this TN represents a variable or constant, then this is the
   ;; corresponding LEAF.
   (leaf nil :type (or leaf null))
@@ -1046,8 +1059,6 @@
   ;; If a :ENVIRONMENT or :DEBUG-ENVIRONMENT TN, this is the
   ;; physical environment that the TN is live throughout.
   (physenv nil :type (or physenv null))
-  ;; The depth of the deepest loop that this TN is used in.
-  (loop-depth 0 :type fixnum)
   ;; Used by pack-iterative
   vertex)
 

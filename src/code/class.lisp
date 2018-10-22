@@ -37,16 +37,28 @@
 ;;; cdr is the layout itself.
 (defvar *!initial-layouts*)
 
+;;; a generator for random values suitable for the CLOS-HASH slots of
+;;; LAYOUTs. We use our own RANDOM-STATE here because we'd like
+;;; pseudo-random values to come the same way in the target even when
+;;; we make minor changes to the system, in order to reduce the
+;;; mysteriousness of possible CLOS bugs.
+(define-load-time-global *layout-clos-hash-random-state*
+    (make-random-state))
+
 ;;; a table mapping class names to layouts for classes we have
 ;;; referenced but not yet loaded. This is initialized from an alist
 ;;; created by genesis describing the layouts that genesis created at
 ;;; cold-load time.
-(defvar *forward-referenced-layouts*)
+(define-load-time-global *forward-referenced-layouts*
+    ;; FIXME: why is the test EQUAL and not EQ? Aren't the keys all symbols?
+    (make-hash-table :test 'equal))
 (!cold-init-forms
-  ;; Protected by *WORLD-LOCK*
-  (setq *forward-referenced-layouts* (make-hash-table :test 'equal))
+  ;; *forward-referenced-layouts* is protected by *WORLD-LOCK*
+  ;; so it does not need a :synchronized option.
   #-sb-xc-host (progn
                  (/show0 "processing *!INITIAL-LAYOUTS*")
+                 (setq *forward-referenced-layouts* (make-hash-table :test 'equal))
+                 (setq *layout-clos-hash-random-state* (make-random-state))
                  (dovector (x *!initial-layouts*)
                    (setf (layout-clos-hash (cdr x)) (random-layout-clos-hash))
                    (setf (gethash (car x) *forward-referenced-layouts*)
@@ -54,10 +66,6 @@
                  (/show0 "done processing *!INITIAL-LAYOUTS*")))
 
 ;;; The LAYOUT structure itself is defined in 'early-classoid.lisp'
-
-(declaim (inline layout-for-std-class-p))
-(defun layout-for-std-class-p (x)
-  (logtest (layout-%flags x) +pcl-object-layout-flag+))
 
 (defmethod print-object ((layout layout) stream)
   (print-unreadable-object (layout stream :type t :identity t)
@@ -72,12 +80,6 @@
 
 ;;;; support for the hash values used by CLOS when working with LAYOUTs
 
-;;; a generator for random values suitable for the CLOS-HASH slots of
-;;; LAYOUTs. We use our own RANDOM-STATE here because we'd like
-;;; pseudo-random values to come the same way in the target even when
-;;; we make minor changes to the system, in order to reduce the
-;;; mysteriousness of possible CLOS bugs.
-(defvar *layout-clos-hash-random-state*)
 (defun random-layout-clos-hash ()
   ;; FIXME: I'm not sure why this expression is (1+ (RANDOM FOO)),
   ;; returning a strictly positive value. I copied it verbatim from
@@ -90,10 +92,7 @@
   ;; an explanation is provided in Kiczales and Rodriguez, "Efficient
   ;; Method Dispatch in PCL", 1990.  -- CSR, 2005-11-30
   (1+ (random (1- layout-clos-hash-limit)
-              (if (boundp '*layout-clos-hash-random-state*)
-                  *layout-clos-hash-random-state*
-                  (setf *layout-clos-hash-random-state*
-                        (make-random-state))))))
+              *layout-clos-hash-random-state*)))
 
 ;;; If we can't find any existing layout, then we create a new one
 ;;; storing it in *FORWARD-REFERENCED-LAYOUTS*. In classic CMU CL, we
@@ -500,9 +499,10 @@ between the ~A definition and the ~A definition"
 ;;; don't have a corresponding class.
 (def!struct (structure-classoid (:include classoid)
                                 (:copier nil)
-                                (:constructor %make-structure-classoid)))
+                                (:constructor %make-structure-classoid
+                                    (hash-value name))))
 (defun make-structure-classoid (&key name)
-  (mark-ctype-interned (%make-structure-classoid :name name)))
+  (%make-structure-classoid (interned-type-hash name) name))
 
 ;;;; classoid namespace
 
@@ -551,7 +551,7 @@ between the ~A definition and the ~A definition"
                      ~/sb!impl:print-type-specifier/." name))
             (:defined
              (warn "redefining DEFTYPE type to be a class: ~
-                    ~/sb!impl::print-symbol-with-prefix/" name)
+                    ~/sb!ext:print-symbol-with-prefix/" name)
              (clear-info :type :expander name)
              (clear-info :type :source-location name)))
 
@@ -1118,15 +1118,15 @@ between the ~A definition and the ~A definition"
                     (t
                      (setf (classoid-cell-classoid
                             (find-classoid-cell name :create t))
-                           (mark-ctype-interned
-                            (make-built-in-classoid
+                           (!make-built-in-classoid
+                             :hash-value (interned-type-hash name)
                              :name name
                              :translation (if trans-p :initializing nil)
                              :direct-superclasses
                              (if (eq name t)
                                  nil
                                  (mapcar #'find-classoid
-                                         direct-superclasses)))))))))
+                                         direct-superclasses))))))))
         (setf (info :type :kind name) :primitive)
         (unless trans-p
           (setf (info :type :builtin name) classoid))
@@ -1214,21 +1214,21 @@ between the ~A definition and the ~A definition"
   #-sb-xc-host (/show0 "about to set *BUILT-IN-CLASS-CODES*")
   (setq **built-in-class-codes**
         (let* ((initial-element (classoid-layout (find-classoid 'random-class)))
-               (res (make-array 256 :initial-element initial-element)))
-          (dolist (x *!built-in-classes* res)
+               (table (make-array 256 :initial-element initial-element)))
+          (dolist (x *!built-in-classes*)
             (destructuring-bind (name &key codes &allow-other-keys)
                                 x
               (let ((layout (classoid-layout (find-classoid name))))
                 (dolist (code codes)
-                  (setf (svref res code) layout)))))))
-  #!+immobile-space
-  (let ((table **built-in-class-codes**))
-    (loop with layout = (aref table sb!vm:list-pointer-lowtag)
-          for i from sb!vm:list-pointer-lowtag by 16 below 256
-          do (setf (aref table i) layout))
-    (loop with layout = (aref table sb!vm:even-fixnum-lowtag)
-          for i from sb!vm:even-fixnum-lowtag by (ash 1 sb!vm:n-fixnum-tag-bits) below 256
-          do (setf (aref table i) layout)))
-  #-sb-xc-host (/show0 "done setting *BUILT-IN-CLASS-CODES*"))
+                  (setf (svref table code) layout)))))
+          (loop with layout = (aref table sb!vm:list-pointer-lowtag)
+                for i from sb!vm:list-pointer-lowtag by (* 2 sb!vm:n-word-bytes)
+                below 256
+                do (setf (aref table i) layout))
+          (loop with layout = (aref table sb!vm:even-fixnum-lowtag)
+                for i from sb!vm:even-fixnum-lowtag by (ash 1 sb!vm:n-fixnum-tag-bits)
+                below 256
+                do (setf (aref table i) layout))
+          table)))
 
 (!defun-from-collected-cold-init-forms !classes-cold-init)

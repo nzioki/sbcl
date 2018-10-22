@@ -146,7 +146,9 @@
                                  (lvar-value result-type-arg)))
                             (if (null result-type-arg-value)
                                 'null
-                                result-type-arg-value)))))
+                                result-type-arg-value))))
+         (result-ctype (ir1-transform-specifier-type
+                        result-type)))
     `(lambda (result-type-arg fun ,@seq-names)
        (truly-the ,result-type
          ,(cond ((policy node (< safety 3))
@@ -158,25 +160,23 @@
                  `(sequence-of-checked-length-given-type ,bare
                                                          result-type-arg))
                 (t
-                 (let ((result-ctype (ir1-transform-specifier-type
-                                      result-type)))
-                   (if (array-type-p result-ctype)
-                       (let ((dims (array-type-dimensions result-ctype)))
-                         (unless (singleton-p dims)
-                           (give-up-ir1-transform "invalid sequence type"))
-                         (let ((dim (first dims)))
-                           (if (eq dim '*)
-                               bare
-                               `(vector-of-checked-length-given-length ,bare
-                                                                       ,dim))))
-                       ;; FIXME: this is wrong, as not all subtypes of
-                       ;; VECTOR are ARRAY-TYPEs [consider, for
-                       ;; example, (OR (VECTOR T 3) (VECTOR T
-                       ;; 4))]. However, it's difficult to see what we
-                       ;; should put here... maybe we should
-                       ;; GIVE-UP-IR1-TRANSFORM if the type is a
-                       ;; subtype of VECTOR but not an ARRAY-TYPE?
-                       bare))))))))
+                 (if (array-type-p result-ctype)
+                     (let ((dims (array-type-dimensions result-ctype)))
+                       (unless (singleton-p dims)
+                         (give-up-ir1-transform "invalid sequence type"))
+                       (let ((dim (first dims)))
+                         (if (eq dim '*)
+                             bare
+                             `(vector-of-checked-length-given-length ,bare
+                                                                     ,dim))))
+                     ;; FIXME: this is wrong, as not all subtypes of
+                     ;; VECTOR are ARRAY-TYPEs [consider, for
+                     ;; example, (OR (VECTOR T 3) (VECTOR T
+                     ;; 4))]. However, it's difficult to see what we
+                     ;; should put here... maybe we should
+                     ;; GIVE-UP-IR1-TRANSFORM if the type is a
+                     ;; subtype of VECTOR but not an ARRAY-TYPE?
+                     bare)))))))
 
 ;;; Return a DO loop, mapping a function FUN to elements of
 ;;; sequences. SEQS is a list of lvars, SEQ-NAMES - list of variables,
@@ -548,7 +548,9 @@
                         ,(open-code (cdr tail))))))
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
-          (cond ((and cp c-list (policy node (>= speed space))
+          (cond ((and cp c-list
+                      (proper-list-p c-list)
+                      (policy node (>= speed space))
                       (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ((pred ,pred-expr)
                         ,@(when key `((key ,key-form))))
@@ -1276,7 +1278,9 @@
   (if key
       (give-up-ir1-transform)
       (let* ((pattern (lvar-value pattern))
-             (pattern-start (cond ((constant-lvar-p start1)
+             (pattern-start (cond ((not (proper-sequence-p pattern))
+                                   (give-up-ir1-transform))
+                                  ((constant-lvar-p start1)
                                    (lvar-value start1))
                                   ((not start1)
                                    0)
@@ -1598,6 +1602,7 @@
                 (loop for var in vars
                       for lvar in lvars
                       collect (if (and (constant-lvar-p lvar)
+                                       (proper-sequence-p (lvar-value lvar))
                                        (every #'characterp (lvar-value lvar)))
                                   (coerce (lvar-value lvar) 'string)
                                   var))))
@@ -1713,7 +1718,9 @@
              ;; unknown type.
              (loop for var in vars
                    for lvar in lvars
-                   collect (if (constant-lvar-p lvar)
+                   collect (if (and (constant-lvar-p lvar)
+                                    (proper-sequence-p (lvar-value lvar))
+                                    (not (typep (lvar-value lvar) type)))
                                `',(coerce (lvar-value lvar) type)
                                var))))
 
@@ -1920,34 +1927,36 @@
                                                             element
                                                             done-p-expr)
   (with-unique-names (offset block index n-sequence sequence end)
-    `(let* ((,n-sequence ,sequence-arg))
-       (with-array-data ((,sequence ,n-sequence :offset-var ,offset)
-                         (,start ,start)
-                         (,end ,end-arg)
-                         :check-fill-pointer t)
-         (block ,block
-           (macrolet ((maybe-return ()
-                        ;; WITH-ARRAY-DATA has already performed bounds
-                        ;; checking, so we can safely elide the checks
-                        ;; in the inner loop.
-                        '(let ((,element (locally (declare (optimize (insert-array-bounds-checks 0)))
-                                           (aref ,sequence ,index))))
-                          (when ,done-p-expr
-                            (return-from ,block
-                              (values ,element
-                                      (- ,index ,offset)))))))
-             (if ,from-end
-                 (loop for ,index
-                       ;; (If we aren't fastidious about declaring that
-                       ;; INDEX might be -1, then (FIND 1 #() :FROM-END T)
-                       ;; can send us off into never-never land, since
-                       ;; INDEX is initialized to -1.)
-                       of-type index-or-minus-1
-                       from (1- ,end) downto ,start do
-                       (maybe-return))
-                 (loop for ,index of-type index from ,start below ,end do
-                          (maybe-return))))
-           (values nil nil))))))
+    (let ((maybe-return
+            ;; WITH-ARRAY-DATA has already performed bounds
+            ;; checking, so we can safely elide the checks
+            ;; in the inner loop.
+            `(let ((,element (locally (declare (optimize (insert-array-bounds-checks 0)))
+                               (aref ,sequence ,index))))
+               (when ,done-p-expr
+                 (return-from ,block
+                   (values ,element
+                           (- ,index ,offset)))))))
+     `(let* ((,n-sequence ,sequence-arg))
+        (with-array-data ((,sequence ,n-sequence :offset-var ,offset)
+                          (,start ,start)
+                          (,end ,end-arg)
+                          :check-fill-pointer t)
+          (block ,block
+            (if ,from-end
+                (loop for ,index
+                      ;; (If we aren't fastidious about declaring that
+                      ;; INDEX might be -1, then (FIND 1 #() :FROM-END T)
+                      ;; can send us off into never-never land, since
+                      ;; INDEX is initialized to -1.)
+                      of-type index-or-minus-1
+                      from (1- ,end) downto ,start
+                      do
+                      ,maybe-return)
+                (loop for ,index of-type index from ,start below ,end
+                      do
+                      ,maybe-return))
+            (values nil nil)))))))
 
 (sb!xc:defmacro %find-position-vector-macro (item sequence
                                              from-end start end key test)

@@ -28,6 +28,7 @@
 
 (defpackage :sb-introspect
   (:use "CL" "SB-KERNEL")
+  (:import-from "SB-VM" "PRIMITIVE-OBJECT-SIZE")
   (:export "ALLOCATION-INFORMATION"
            "FUNCTION-ARGLIST"
            "FUNCTION-LAMBDA-LIST"
@@ -117,7 +118,7 @@ FBOUNDP."
 receives the object and its size as arguments.  SPACES should be a
 list of the symbols :dynamic, :static, :read-only, or :immobile on
 #+immobile-space"
-  (apply #'sb-vm::map-allocated-objects
+  (apply #'sb-vm:map-allocated-objects
      (lambda (obj header size)
        (when (= sb-vm:code-header-widetag header)
          (funcall fn obj size)))
@@ -175,20 +176,23 @@ constant pool."
       (sb-c::fun-info-templates fun-info))))
 
 (defun find-vop-source (name)
-  (let* ((vop (gethash name sb-c::*backend-template-names*))
+  (let* ((vop (gethash name sb-c::*backend-parsed-vops*))
          (translating (vops-translating-fun name))
          (vops (if vop
                    (cons vop (remove vop translating))
                    translating)))
     (loop for vop in vops
-          for name = (sb-c::vop-info-name vop)
-          for loc = (sb-c::vop-parse-source-location
-                     (gethash name sb-c::*backend-parsed-vops*))
+          for vop-parse = (if (typep vop 'sb-c::vop-parse)
+                              vop
+                              (gethash (sb-c::vop-info-name vop)
+                                       sb-c::*backend-parsed-vops*))
+          for name = (sb-c::vop-parse-name vop-parse)
+          for loc = (sb-c::vop-parse-source-location vop-parse)
           when loc
           collect (let ((source (translate-source-location loc)))
                     (setf (definition-source-description source)
-                          (if (sb-c::vop-info-note vop)
-                              (list name (sb-c::vop-info-note vop))
+                          (if (sb-c::vop-parse-note vop-parse)
+                              (list name (sb-c::vop-parse-note vop-parse))
                               (list name)))
                     source))))
 
@@ -325,20 +329,19 @@ If an unsupported TYPE is requested, the function will return NIL.
               (find-definition-source package)))))
        ;; TRANSFORM and OPTIMIZER handling from swank-sbcl
        ((:transform)
-        (when (symbolp name)
-          (let ((fun-info (sb-int:info :function :info name)))
-            (when fun-info
-              (loop for xform in (sb-c::fun-info-transforms fun-info)
-                    for source = (find-definition-source
-                                  (sb-c::transform-function xform))
-                    for typespec = (type-specifier
-                                    (sb-c::transform-type xform))
-                    for note = (sb-c::transform-note xform)
-                    do (setf (definition-source-description source)
-                             (if (consp typespec)
-                                 (list (second typespec) note)
-                                 (list note)))
-                    collect source)))))
+        (let ((fun-info (sb-int:info :function :info name)))
+          (when fun-info
+            (loop for xform in (sb-c::fun-info-transforms fun-info)
+                  for source = (find-definition-source
+                                (sb-c::transform-function xform))
+                  for typespec = (type-specifier
+                                  (sb-c::transform-type xform))
+                  for note = (sb-c::transform-note xform)
+                  do (setf (definition-source-description source)
+                           (if (consp typespec)
+                               (list (second typespec) note)
+                               (list note)))
+                  collect source))))
        ((:optimizer)
         (let ((fun-info (and (symbolp name)
                              (sb-int:info :function :info name))))
@@ -399,12 +402,10 @@ If an unsupported TYPE is requested, the function will return NIL.
 (defun find-definition-source (object)
   (typecase object
     ((or sb-pcl::condition-class sb-pcl::structure-class)
-     (let ((classoid (sb-impl::find-classoid (class-name object))))
+     (let ((classoid (sb-pcl::class-classoid object)))
        (when classoid
-         (let ((layout (sb-impl::classoid-layout classoid)))
-           (when layout
-             (translate-source-location
-              (sb-kernel::layout-source-location layout)))))))
+         (translate-source-location
+          (sb-kernel::classoid-source-location classoid)))))
     (method-combination
      (car
       (find-definition-sources-by-name
@@ -804,7 +805,7 @@ Experimental: interface subject to change."
                          ;; bits are packed in the opposite order. And thankfully,
                          ;; this fix seems not to depend on whether the numbering
                          ;; scheme is MSB 0 or LSB 0, afaict.
-                         (let* ((index (sb-vm::find-page-index addr))
+                         (let* ((index (sb-vm:find-page-index addr))
                                 (flags (sb-alien:slot page 'sb-vm::flags))
                                 .
                                 ;; The unused WP-CLR is for ease of counting
@@ -885,8 +886,9 @@ Experimental: interface subject to change."
                  (funcall fun part))))
       (when ext
         (let ((table sb-pcl::*eql-specializer-table*))
-          (call (sb-int:with-locked-system-table (table)
-                  (gethash object table)))))
+          (multiple-value-bind (value foundp)
+              (sb-int:with-locked-system-table (table) (gethash object table))
+            (when foundp (call value)))))
       (sb-vm:do-referenced-object (object call)
         (cons
          :extend
@@ -934,22 +936,28 @@ Experimental: interface subject to change."
          :extend
          (loop for i below (code-n-entries object)
                do (call (%code-entry-point object i))))
-        (simple-fun
+        (function ; excluding CLOSURE and FUNCALLABLE-INSTANCE
          :override
-         (call (fun-code-header object))
+         (unless simple
+           (call (fun-code-header object)))
          (call (%simple-fun-name object))
          (call (%simple-fun-arglist object))
          (call (%simple-fun-type object))
          (call (%simple-fun-info object)))
         (symbol
+         ;; We use :override here because (apparently) the intent is
+         ;; to avoid calling FUNCTION on the SYMBOL-PACKAGE
+         ;; when SIMPLE is NIL (the default). And we skip SYMBOL-EXTRA for
+         ;; the same reason that we don't call FUNCTION on SYMBOL-INFO
+         ;; (logically it's "system" data, not for user consumption).
+         ;; Frankly this entire function is a confusing mishmash that is not
+         ;; accurate for computing a true graph of objects starting from a
+         ;; certain point, given all the special cases that it implements.
          :override
          (when ext
            (dolist (thread (sb-thread:list-all-threads))
              (call (sb-thread:symbol-value-in-thread object thread nil))))
-         (handler-case
-             ;; We don't have GLOBAL-BOUNDP, and there's no ERRORP arg.
-             (call (sb-ext:symbol-global-value object))
-           (unbound-variable ()))
+         (call (sb-sys:%primitive sb-c:fast-symbol-global-value object))
          ;; These first two are probably unnecessary.
          ;; The functoid values, if present, are in SYMBOL-INFO
          ;; which is traversed whether or not EXT was true.
@@ -975,14 +983,12 @@ Experimental: interface subject to change."
   object)
 
 (defun object-size (object)
-  (+ (sb-vm::primitive-object-size object)
+  (+ (primitive-object-size object)
      (typecase object
        (sb-mop:funcallable-standard-object
-        (sb-vm::primitive-object-size
-         (sb-pcl::standard-funcallable-instance-clos-slots object)))
+        (primitive-object-size (sb-pcl::fsc-instance-slots object)))
        (standard-object
-        (sb-vm::primitive-object-size
-         (sb-pcl::standard-instance-slots object)))
+        (primitive-object-size (sb-pcl::std-instance-slots object)))
        (t 0))))
 
 ;;; Print a distribution of object sizes in SPACE.
@@ -999,7 +1005,7 @@ Experimental: interface subject to change."
   (let* ((n-bins (+ (length size-bins) 2))
          (counts (make-array n-bins :initial-element 0))
          (size-totals (make-array n-bins :initial-element 0)))
-    (sb-vm::map-allocated-objects
+    (sb-vm:map-allocated-objects
      (lambda (obj type size)
        (declare (ignore type))
        (cond ((consp obj)
@@ -1029,3 +1035,45 @@ Experimental: interface subject to change."
                                (or (not prev-bin-size)
                                    (= this-bin-size (+ prev-bin-size 2)))
                                this-bin-size))))))))
+
+(defun largest-objects (&key (threshold #+gencgc sb-vm:gencgc-card-bytes
+                                        #-gencgc sb-c:+backend-page-bytes+)
+                             (sort :size))
+  (declare (type (member :address :size) sort))
+  (flet ((show-obj (obj)
+           #-gencgc
+           (format t "~10x ~7x ~s~%"
+                     (get-lisp-obj-address obj)
+                     (primitive-object-size obj)
+                     (type-of obj))
+           #+gencgc
+           (let* ((gen (generation-of obj))
+                  (page (sb-vm::find-page-index (sb-kernel:get-lisp-obj-address obj)))
+                  (flags (if (>= page 0)
+                             (sb-alien:slot (sb-alien:deref sb-vm:page-table page)
+                                            'sb-vm::flags))))
+             (format t "~10x ~7x ~a ~:[        ~;~:*~8b~] ~s~%"
+                     (get-lisp-obj-address obj)
+                     (primitive-object-size obj)
+                     (if gen gen #\?)
+                     flags
+                     (type-of obj)))))
+    (case sort
+     (:address
+      (sb-vm:map-allocated-objects
+       (lambda (obj widetag size)
+         (declare (ignore widetag))
+         (when (>= size threshold)
+           (show-obj obj)))
+       :all))
+     (:size
+      (let (list)
+         (sb-vm:map-allocated-objects
+          (lambda (obj widetag size)
+            (declare (ignore widetag))
+            (when (>= size threshold)
+              (push obj list)))
+          :all)
+         (mapc #'show-obj
+               (stable-sort list #'> :key #'primitive-object-size))
+         nil)))))

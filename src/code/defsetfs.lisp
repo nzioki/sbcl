@@ -42,7 +42,12 @@
 (defsetf %instance-ref %instance-set)
 
 (defsetf %raw-instance-ref/word %raw-instance-set/word)
-#!+raw-signed-word
+;; The *FEATURE* formerly known as :RAW-SIGNED-WORD
+;; This condition would be better as
+;;   (vop-translates sb!kernel:%raw-instance-ref/signed-word)
+;; however the defknown is only executed if the raw slot type exists.
+;; (See compiler/generic/vm-fndb where it maps over *raw-slot-data*)
+#!+(vop-named sb!vm::raw-instance-ref/signed-word)
 (defsetf %raw-instance-ref/signed-word %raw-instance-set/signed-word)
 (defsetf %raw-instance-ref/single %raw-instance-set/single)
 (defsetf %raw-instance-ref/double %raw-instance-set/double)
@@ -346,3 +351,18 @@ with bits from the corresponding position in the new value.")
 ;;; Additionally (setf (logbitp N x) t) is extremely stupid- it first clears
 ;;; and then sets the bit, though it does manage to pre-shift the constants.
    (%defsetf 'logbitp (info :setf :expander 'ldb))))
+
+;;; Rather than have a bunch of SB-PCL::FAST-METHOD function names all point
+;;; to one that is randomly chosen - and therefore looks confusing -
+;;; use these trivial do-nothing functions which are compiled asap.
+;;; The selection is deterministic since ties are broken by serial number.
+(export '(0-arg-nil 1-arg-nil 2-arg-nil 3-arg-nil n-arg-nil
+          1-arg-t n-arg-t)
+        "SB-IMPL") ; export to prevent death by tree-shaker
+(defun n-arg-nil () (declare (optimize (sb!c::verify-arg-count 0))) nil)
+(defun n-arg-t   () (declare (optimize (sb!c::verify-arg-count 0))) t)
+(defun 0-arg-nil () nil)
+(defun 1-arg-nil (a) (declare (ignore a)) nil)
+(defun 1-arg-t   (a) (declare (ignore a)) t)
+(defun 2-arg-nil (a b) (declare (ignore a b)) nil)
+(defun 3-arg-nil (a b c) (declare (ignore a b c)) nil)

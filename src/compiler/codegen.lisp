@@ -90,15 +90,54 @@
   (and *compiler-trace-output*
        #'trace-instruction))
 
+;;; Some platforms support unboxed constants immediately following the boxed
+;;; code header. Such platform must implement supporting 4 functions:
+;;; * CANONICALIZE-INLINE-CONSTANT: converts a constant descriptor (list) into
+;;;    a canonical description, to be used as a key in an EQUAL hash table
+;;;    and to guide the generation of the constant itself.
+;;; * INLINE-CONSTANT-VALUE: given a canonical constant descriptor, computes
+;;;    two values:
+;;;     1. A label that will be used to emit the constant (usually a
+;;;         sb!assem:label)
+;;;     2. A value that will be returned to code generators referring to
+;;;         the constant (on x86oids, an EA object)
+;;; * SORT-INLINE-CONSTANTS: Receives a vector of unique constants;
+;;;    the car of each entry is the constant descriptor, and the cdr the
+;;;    corresponding label. Destructively returns a vector of constants
+;;;    sorted in emission order. It could actually perform arbitrary
+;;;    modifications to the vector, e.g. to fuse constants of different
+;;;    size.
+;;; * EMIT-INLINE-CONSTANT: receives a constant descriptor and its associated
+;;;    label. Emits the constant.
+;;;
+;;; Implementing this feature lets VOP generators use sb!c:register-inline-constant
+;;; to get handles (as returned by sb!vm:inline-constant-value) from constant
+;;; descriptors.
+;;;
+#!+(or x86 x86-64 arm64)
+(defun register-inline-constant (&rest constant-descriptor)
+  (declare (dynamic-extent constant-descriptor))
+  (let ((asmstream *asmstream*)
+        (constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
+    (ensure-gethash
+     constant
+     (asmstream-constant-table asmstream)
+     (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
+       (vector-push-extend (cons constant label)
+                           (asmstream-constant-vector asmstream))
+       value))))
+#!-(or x86 x86-64 arm64)
+(progn (defun sb!vm:sort-inline-constants (constants) constants)
+       (defun sb!vm:emit-inline-constant (&rest args)
+         (error "EMIT-INLINE-CONSTANT called with ~S" args)))
 ;;; Return T if and only if there were any constants emitted.
 (defun emit-inline-constants ()
-  #!+inline-constants
   (let* ((asmstream *asmstream*)
-         (sorted (sb!vm:sort-inline-constants
-                  (asmstream-constant-vector asmstream)))
+         (constants (asmstream-constant-vector asmstream))
          (section (asmstream-data-section asmstream)))
-    (dovector (constant sorted (plusp (length sorted)))
-      (sb!vm:emit-inline-constant section (car constant) (cdr constant)))))
+    (when (plusp (length constants))
+      (dovector (constant (sb!vm:sort-inline-constants constants) t)
+        (sb!vm:emit-inline-constant section (car constant) (cdr constant))))))
 
 ;;; If a constant is already loaded into a register use that register.
 (defun optimize-constant-loads (component)
@@ -177,13 +216,16 @@
             (t
              (remove-written-tns))))))))
 
+;; Collect "static" count of number of times each vop is employed.
+;; (as opposed to "dynamic" - how many times its code is hit at runtime)
+(defglobal *static-vop-usage-counts* nil)
+
 (defun generate-code (component)
   (when *compiler-trace-output*
     (format *compiler-trace-output*
             "~|~%assembly code for ~S~2%"
             component))
   (let* ((prev-env nil)
-         (n-entries (length (ir2-component-entries (component-info component))))
          (asmstream (make-asmstream))
          (*asmstream* asmstream))
 
@@ -221,6 +263,9 @@
       (do ((vop (ir2-block-start-vop block) (vop-next vop)))
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
+          (awhen *static-vop-usage-counts*
+            (let ((name (vop-info-name (vop-info vop))))
+              (incf (gethash name it 0))))
           (assemble (:code vop)
             (cond ((not gen)
                    (format t
@@ -235,19 +280,28 @@
                    (setf vop (vop-next vop)))
                   (t
                    (funcall gen vop)))))))
+
+    ;; Truncate the final assembly code buffer to length
+    (sb!assem::truncate-section-to-length (asmstream-code-section asmstream))
+
+    (coverage-mark-lowering-pass component asmstream)
+
     (emit-inline-constants)
-    (let ((trailer (sb!assem::make-section)))
-      ;; Build the simple-fun-offset table.
-      ;; The assembler is not capable of emitting the difference between labels,
-      ;; so we'll just leave space and fill them in later
-      (emit trailer `(.align 2)) ; align for uint32_t
-      (dotimes (i n-entries) (emit trailer `(.byte 0 0 0 0)))
-      #!+little-endian
-      (emit trailer `(.byte ,(ldb (byte 8 0) n-entries) ,(ldb (byte 8 8) n-entries)))
-      #!+big-endian
-      (emit trailer `(.byte ,(ldb (byte 8 8) n-entries) ,(ldb (byte 8 0) n-entries)))
-      (let* ((segment
-              (assemble-sections
+    (let* ((fun-table)
+           (end-text (gen-label))
+           (start-fun-table (gen-label))
+           (n-entries (length (ir2-component-entries (component-info component))))
+           (fun-table-section
+            (let ((section (sb!assem::make-section)))
+              ;; Create space for the simple-fun offset table:
+              ;;  1 uint32 * N simple-funs
+              ;;  1 uint16 for the number of simple-funs
+              (emit section
+                    end-text `(.align 2) start-fun-table
+                    `(.skip ,(+ (* n-entries 4) 2)))
+              section))
+           (segment
+            (assemble-sections
                (make-segment :header-skew
                              (if (and (= code-boxed-words-align 1)
                                       (oddp (length (ir2-component-constants
@@ -259,12 +313,20 @@
                (asmstream-data-section asmstream)
                (asmstream-code-section asmstream)
                (asmstream-elsewhere-section asmstream)
-               trailer))
-             (size
-              (finalize-segment segment))
-             (buffer
-              (sb!assem::segment-buffer segment)))
-        (flet ((store-ub32 (index val)
+               fun-table-section))
+           (octets
+            (segment-buffer segment))
+           (index
+            (label-position start-fun-table)))
+      (flet ((store-ub16 (index val)
+                 (multiple-value-bind (b0 b1)
+                     #!+little-endian
+                     (values (ldb (byte 8 0) val) (ldb (byte 8 8) val))
+                     #!+big-endian
+                     (values (ldb (byte 8 8) val) (ldb (byte 8 0) val))
+                   (setf (aref octets (+ index 0)) b0
+                         (aref octets (+ index 1)) b1)))
+             (store-ub32 (index val)
                  (multiple-value-bind (b0 b1 b2 b3)
                      #!+little-endian
                      (values (ldb (byte 8  0) val) (ldb (byte 8  8) val)
@@ -272,22 +334,27 @@
                      #!+big-endian
                      (values (ldb (byte 8 24) val) (ldb (byte 8 16) val)
                              (ldb (byte 8  8) val) (ldb (byte 8  0) val))
-                   (setf (aref buffer (+ index 0)) b0
-                         (aref buffer (+ index 1)) b1
-                         (aref buffer (+ index 2)) b2
-                         (aref buffer (+ index 3)) b3))))
-          (let ((index size))
-            (decf index 2)
-            ;; Assert that we are aligned for storing uint32_t
-            (aver (not (logtest index #b11)))
-            (dolist (entry (reverse (sb!c::ir2-component-entries
-                                     (component-info component))))
-              (store-ub32 (decf index 4)
-                          (label-position (entry-info-offset entry))))))
-        (values segment
-                size
-                (asmstream-elsewhere-label asmstream)
-                (sb!assem::segment-fixup-notes segment))))))
+                   (setf (aref octets (+ index 0)) b0
+                         (aref octets (+ index 1)) b1
+                         (aref octets (+ index 2)) b2
+                         (aref octets (+ index 3)) b3))))
+        (let ((padding (- index (label-position end-text))))
+          (unless (and (typep n-entries '(unsigned-byte 12))
+                       (typep padding '(unsigned-byte 4)))
+            (bug "Oversized code component?"))
+          ;; Assert that we are aligned for storing uint32_t
+          (aver (not (logtest index #b11)))
+          (dolist (entry (sb!c::ir2-component-entries
+                          (component-info component)))
+            (let ((val (label-position (entry-info-offset entry))))
+              (push val fun-table)
+              (store-ub32 index val)
+              (incf index 4)))
+          (store-ub16 index (logior (ash n-entries 4) padding)))
+        (aver (= (+ index 2) (length octets))))
+      (values segment (label-position end-text) fun-table
+              (asmstream-elsewhere-label asmstream)
+              (sb!assem::segment-fixup-notes segment)))))
 
 (defun label-elsewhere-p (label-or-posn kind)
   (let ((elsewhere (label-position *elsewhere-label*))
@@ -303,15 +370,57 @@
         (< elsewhere label)
         (<= elsewhere label))))
 
-#!+inline-constants
-(defun register-inline-constant (&rest constant-descriptor)
-  (declare (dynamic-extent constant-descriptor))
-  (let ((asmstream *asmstream*)
-        (constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
-    (ensure-gethash
-     constant
-     (asmstream-constant-table asmstream)
-     (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
-       (vector-push-extend (cons constant label)
-                           (asmstream-constant-vector asmstream))
-       value))))
+;;; Translate .COVERAGE-MARK pseudo-op into machine assembly language,
+;;; combining any number of consecutive operations with no intervening
+;;; control flow into a single operation.
+;;; FIXME: this pass runs even if no coverage instrumentation was generated.
+(defun coverage-mark-lowering-pass (component asmstream)
+  (declare (ignorable component asmstream))
+  #!+(or x86-64 x86)
+  (let ((label (gen-label))
+        ;; vector of lists of original source paths covered
+        (src-paths (make-array 10 :fill-pointer 0))
+        (previous-mark))
+    (dolist (buffer (reverse (sb!assem::section-buf-chain
+                              (asmstream-code-section asmstream))))
+      (dotimes (i (length buffer))
+        (let ((item (svref buffer i)))
+          (typecase item
+           (label
+            (when (label-usedp item) ; control can transfer to here
+              (setq previous-mark nil)))
+           (function ; this can do anything, who knows
+            (setq previous-mark nil))
+           (t
+            (let ((mnemonic (first item)))
+              (when (vop-p mnemonic)
+                (pop item)
+                (setq mnemonic (first item)))
+              (cond ((branch-opcode-p mnemonic) ; control flow kills mark combining
+                     (setq previous-mark nil))
+                    ((eq mnemonic '.coverage-mark)
+                     (let ((path (second item)))
+                       (cond ((not previous-mark) ; record a new path
+                              (let ((mark-index
+                                     (vector-push-extend (list path) src-paths)))
+                                ;; have the backend lower it into a real instruction
+                                (replace-coverage-instruction buffer i label mark-index))
+                              (setq previous-mark t))
+                             (t ; record that the already-emitted mark pertains
+                                ; to an additional source path
+                              (push path (elt src-paths (1- (fill-pointer src-paths))))
+                              ;; turn this line into a (virtual) no-op
+                              (rplaca item '.comment))))))))))))
+    ;; Allocate space in the data section for coverage marks
+    (let ((mark-index (length src-paths)))
+      (when (plusp mark-index)
+        (setf (label-usedp label) t)
+        (let ((v (ir2-component-constants (component-info component))))
+          ;; Nothing depends on the length of the constant vector at this
+          ;; phase (codegen has not made use of component-header-length),
+          ;; so extending can be done with impunity.
+          (vector-push-extend
+           (make-constant (cons 'coverage-map
+                                (coerce src-paths 'simple-vector)))
+           v))
+        (emit (asmstream-data-section asmstream) label `(.skip ,mark-index))))))

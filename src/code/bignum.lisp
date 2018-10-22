@@ -205,7 +205,6 @@
   (declare (fixnum x))
   (logand x (1- (ash 1 digit-size))))
 
-#!-32x16-divide
 ;;; This takes three digits and returns the FLOOR'ed result of
 ;;; dividing the first two as a 2*digit-size integer by the third.
 ;;;
@@ -663,7 +662,7 @@
 
 ;; When the larger number is less than this many bignum digits long, revert
 ;; to old algorithm.
-(defparameter *accelerated-gcd-cutoff* 3)
+(define-load-time-global *accelerated-gcd-cutoff* 3)
 
 ;;; Alternate between k-ary reduction with the help of
 ;;; REDUCED-RATIO-MOD and digit modulus reduction via DMOD. Once the
@@ -1882,13 +1881,6 @@
                     (if (typep rem 'fixnum)
                         rem
                         (%normalize-bignum rem (%bignum-length rem))))))))))
-
-
-;;;; There used to be a pile of code for implementing division for bignum digits
-;;;; for machines that don't have a 2*digit-size by digit-size divide instruction.
-;;;; This happens to be most machines, but all the SBCL ports seem to be content
-;;;; to implement SB-BIGNUM:%BIGFLOOR as a VOP rather than using the code here.
-;;;; So it's been deleted.  --njf, 2007-02-04
 
 ;;;; general utilities
 

@@ -84,7 +84,7 @@ provide bindings for printer control variables.")
           (> *debug-command-level* 1)
           *debug-command-level*))
 
-(defparameter *debug-help-string*
+(define-load-time-global *debug-help-string*
 "The debug prompt is square brackets, with number(s) indicating the current
   control stack level and, if you've entered the debugger recursively, how
   deeply recursed you are.
@@ -206,9 +206,6 @@ backtraces. Possible values are :MINIMAL, :NORMAL, and :FULL.
 
    In the this case arguments may include values internal to SBCL's method
    dispatch machinery.")
-
-(define-deprecated-variable :late "1.1.4.9" *show-entry-point-details*
-  :value nil)
 
 (define-deprecated-function :early "1.2.15" backtrace (print-backtrace)
     (&optional (count *backtrace-frame-count*) (stream *debug-io*))
@@ -1169,9 +1166,13 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
   (declare (type stream stream))
   (let* ((eof-marker (cons nil nil))
          (form (read stream nil eof-marker)))
-    (if (eq form eof-marker)
-        (invoke-restart eof-restart)
-        form)))
+    (cond ((eq form eof-marker)
+           ;; So that the REPL starts on a new line, because the
+           ;; debugger is using *DEBUG-IO* and the REPL STDIN/STDOUT.
+           (fresh-line stream)
+           (invoke-restart eof-restart))
+          (t
+           form))))
 
 (defun debug-loop-fun ()
   (let* ((*debug-command-level* (1+ *debug-command-level*))
@@ -1427,7 +1428,7 @@ forms that explicitly control this kind of evaluation.")
 
 ;;;; machinery for definition of debug loop commands
 
-(defvar *debug-commands* nil)
+(define-load-time-global *debug-commands* nil)
 
 ;;; Interface to *DEBUG-COMMANDS*. No required arguments in args are
 ;;; permitted.
@@ -1766,13 +1767,14 @@ forms that explicitly control this kind of evaluation.")
     ;;   * The catch block that should be active after the unwind
     ;;   * The values that the binding stack pointer should have after the
     ;;     unwind.
-    (let ((block (sap-int/fixnum (find-enclosing-catch-block frame)))
+    (let ((catch-block (sap-int/fixnum (find-enclosing-catch-block frame)))
           (unbind-to (find-binding-stack-pointer frame)))
       ;; This VOP will run the neccessary cleanup forms, reset the fp, and
       ;; then call the supplied function.
       (sb!vm::%primitive sb!vm::unwind-to-frame-and-call
                          (sb!di::frame-pointer frame)
                          (find-enclosing-uwp frame)
+                         #!-x86-64
                          (lambda ()
                            ;; Before calling the user-specified
                            ;; function, we need to restore the binding
@@ -1780,8 +1782,11 @@ forms that explicitly control this kind of evaluation.")
                            ;; is taken care of by the VOP.
                            (sb!vm::%primitive sb!vm::unbind-to-here
                                               unbind-to)
-                           (setf sb!vm::*current-catch-block* block)
-                           (funcall thunk)))))
+                           (setf sb!vm::*current-catch-block* catch-block)
+                           (funcall thunk))
+                         #!+x86-64 thunk
+                         #!+x86-64 unbind-to
+                         #!+x86-64 catch-block)))
   #!-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))
     (replace-frame-catch-tag frame

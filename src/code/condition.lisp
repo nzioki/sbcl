@@ -110,24 +110,31 @@
 ;;;; slots of CONDITION objects
 
 (defun find-slot-default (class slot)
-  (let ((initargs (condition-slot-initargs slot))
-        (cpl (condition-classoid-cpl class)))
+  (multiple-value-bind (value found) (find-slot-default-initarg class slot)
     ;; When CLASS or a superclass has a default initarg for SLOT, use
     ;; that.
+    (cond (found
+           value)
+          ;; Otherwise use the initform of SLOT, if there is one.
+          ((condition-slot-initform-p slot)
+           (let ((initfun (condition-slot-initfunction slot)))
+             (aver (functionp initfun))
+             (funcall initfun)))
+          (t
+           (error "Unbound condition slot: ~S" (condition-slot-name slot))))))
+
+(defun find-slot-default-initarg (class slot)
+  (let ((initargs (condition-slot-initargs slot))
+        (cpl (condition-classoid-cpl class)))
     (dolist (class cpl)
       (let ((direct-default-initargs
               (condition-classoid-direct-default-initargs class)))
         (dolist (initarg initargs)
           (let ((initfunction (third (assoc initarg direct-default-initargs))))
             (when initfunction
-              (return-from find-slot-default (funcall initfunction)))))))
-
-    ;; Otherwise use the initform of SLOT, if there is one.
-    (if (condition-slot-initform-p slot)
-        (let ((initfun (condition-slot-initfunction slot)))
-          (aver (functionp initfun))
-          (funcall initfun))
-        (error "unbound condition slot: ~S" (condition-slot-name slot)))))
+              (return-from find-slot-default-initarg
+                (values (funcall initfunction) t)))))))
+    (values nil nil)))
 
 (defun find-condition-class-slot (condition-class slot-name)
   (dolist (sclass
@@ -162,7 +169,10 @@
                                              (condition-slot-initargs slot))
                                  (return (%instance-ref condition (1+ i))))))))
             (when (eq (condition-slot-name cslot) name)
-              (return (car (condition-slot-cell cslot))))))
+              (let ((value (car (condition-slot-cell cslot))))
+                (if (unbound-marker-p value)
+                    (error "Unbound condition slot: ~S" (condition-slot-name cslot))
+                    (return value))))))
         val)))
 
 ;;;; MAKE-CONDITION
@@ -176,7 +186,7 @@
              ;; avoid direct reference to INITARGS as a list
              ;; so that it is not reified unless we reach here.
              (do-rest-arg ((arg) initargs) (push arg list))
-             (nreverse list))))
+             (list (nreverse list)))))
   ;; I am going to assume that people are not somehow getting to here
   ;; with a CLASSOID, which is not strictly legal as a designator,
   ;; but which is accepted because it is actually the desired thing.
@@ -195,8 +205,7 @@
                                            2 ; ASSIGNED-SLOTS and HASH
                                            (length initargs))))) ; rest
           (setf (%instance-layout instance) (classoid-layout classoid)
-                (condition-assigned-slots instance) nil
-                (condition-hash instance) (sb!impl::new-instance-hash-code))
+                (condition-assigned-slots instance) nil)
           (do-rest-arg ((val index) initargs)
             (setf (%instance-ref instance (+ sb!vm:instance-data-start index 2)) val))
           (values instance classoid))
@@ -221,10 +230,15 @@
 
     ;; Set any class slots with initargs present in this call.
     (dolist (cslot (condition-classoid-class-slots classoid))
-      (dolist (initarg (condition-slot-initargs cslot))
-        (let ((val (getf initargs initarg sb!pcl:+slot-unbound+)))
-          (unless (unbound-marker-p val)
-            (setf (car (condition-slot-cell cslot)) val)))))
+      (loop for (key value) on initargs by #'cddr
+            when (memq key (condition-slot-initargs cslot))
+            do (setf (car (condition-slot-cell cslot)) value)
+               (return)
+            finally
+            (multiple-value-bind (value found)
+                (find-slot-default-initarg classoid cslot)
+              (when found
+                (setf (car (condition-slot-cell cslot)) value)))))
 
     ;; Default any slots with non-constant defaults now.
     (dolist (hslot (condition-classoid-hairy-slots classoid))
@@ -296,7 +310,7 @@
          t
          `(condition-slot-writer ,name))))
 
-(!defvar *define-condition-hooks* nil)
+(!define-load-time-global *define-condition-hooks* nil)
 
 (defun %set-condition-report (name report)
   (setf (condition-classoid-report (find-classoid name))
@@ -309,12 +323,12 @@
    'condition name
    (lambda ()
      (%%compiler-define-condition name parent-types layout all-readers all-writers)
-     (when source-location
-       (setf (layout-source-location layout) source-location))
      (let ((classoid (find-classoid name)))
+       (when source-location
+         (setf (classoid-source-location classoid) source-location))
        (setf (condition-classoid-slots classoid) slots
              (condition-classoid-direct-default-initargs classoid) direct-default-initargs
-             (fdocumentation name 'type) documentation)
+             (documentation name 'type) documentation)
 
        (dolist (slot slots)
          ;; Set up reader and writer functions.
@@ -465,12 +479,16 @@
       ;; Maybe kill docstring, but only under the cross-compiler.
       #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq documentation nil)
       `(progn
-         (eval-when (:compile-toplevel)
-           (%compiler-define-condition ',name ',parent-types ',layout
-                                       ',(all-readers) ',(all-writers)))
+         ,@(when *top-level-form-p*
+             ;; Avoid dumping uninitialized layouts, for sb-fasl::dump-layout
+             `((eval-when (:compile-toplevel)
+                 (%compiler-define-condition ',name ',parent-types ,layout
+                                             ',(all-readers) ',(all-writers)))))
          (%define-condition ',name
                             ',parent-types
-                            ',layout
+                            ,(if *top-level-form-p*
+                                 layout
+                                 `(find-condition-layout ',name ',parent-types))
                             (list ,@(slots))
                             (list ,@direct-default-initargs)
                             ',(all-readers)
@@ -854,12 +872,12 @@
 
 (define-condition constant-modified (reference-condition warning)
   ((fun-name :initarg :fun-name :reader constant-modified-fun-name)
-   (value :initarg :value :reader constant-modified-value))
+   (values :initform nil :initarg :values :reader constant-modified-values))
   (:report (lambda (c s)
              (format s "~@<Destructive function ~S called on ~
-                        constant data: ~s.~@:>"
+                        constant data: ~{~s~^, ~}~:>"
                      (constant-modified-fun-name c)
-                     (constant-modified-value c))))
+                     (constant-modified-values c))))
   (:default-initargs :references '((:ansi-cl :special-operator quote)
                                    (:ansi-cl :section (3 2 2 3)))))
 
@@ -1229,13 +1247,17 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
    "Signaled when an operation in the context of a deadline takes
 longer than permitted by the deadline."))
 
+;;; DEFINE-CONDITION captures the initargs literally. It does no good
+;;; to have the TOKENS macro insert the literal string within the expression
+;;; when the entire point is to AVOID inserting that exact string.
+(define-load-time-global *decl-type-conflict-error-reporter*
+    (sb!format:tokens "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
+     be both the name of a type and the name of a declaration"))
 (define-condition declaration-type-conflict-error (reference-condition
                                                    simple-error)
   ()
   (:default-initargs
-   :format-control  "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
-                     be both the name of a type and the name of a ~
-                     declaration"
+   :format-control *decl-type-conflict-error-reporter*
    :references '((:ansi-cl :section (3 8 21)))))
 
 ;;; Single stepping conditions
@@ -1246,7 +1268,7 @@ longer than permitted by the deadline."))
 STEP-CONDITION-FORM holds a string representation of the form being
 stepped."))
 
-(setf (fdocumentation 'step-condition-form 'function)
+(setf (documentation 'step-condition-form 'function)
       "Form associated with the STEP-CONDITION.")
 
 (define-condition step-form-condition (step-condition)
@@ -1273,7 +1295,7 @@ STEP-NEXT, and STEP-CONTINUE."))
 (define-condition step-result-condition (step-condition)
   ((result :initarg :result :reader step-condition-result)))
 
-(setf (fdocumentation 'step-condition-result 'function)
+(setf (documentation 'step-condition-result 'function)
       "Return values associated with STEP-VALUES-CONDITION as a list,
 or the variable value associated with STEP-VARIABLE-CONDITION.")
 
@@ -1566,7 +1588,7 @@ the usual naming convention (names like *FOO*) for special variables"
    (lambda (condition stream)
      (format stream
              "~@<The new ~A proclamation for~@[ ~A~] ~
-               ~/sb!impl:print-symbol-with-prefix/~
+               ~/sb!ext:print-symbol-with-prefix/~
                ~@:_~2@T~/sb!impl:print-type-specifier/~@:_~
                does not match the old ~4:*~A~3* proclamation~
                ~@:_~2@T~/sb!impl:print-type-specifier/~@:>"

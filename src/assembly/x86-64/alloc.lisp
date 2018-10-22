@@ -83,17 +83,17 @@
      (:res result (unsigned-reg) rax-offset))
   (let* ((scratch-reg rcx-tn) ; RCX gets callee-saved, not declared as a temp
          ;; The free-index and lock are in the low and high halves of 1 qword.
-         (free-tls-index-ea (make-ea-for-symbol-value *free-tls-index*))
+         (free-tls-index-ea (static-symbol-value-ea '*free-tls-index*))
          (lock-bit 63) ; the qword's sign bit (any bit > 31 would work fine)
          (tls-full (gen-label)))
     ;; A pseudo-atomic section avoids bad behavior if the current thread were
     ;; to receive an interrupt causing it to do a slow operation between
     ;; acquisition and release of the spinlock. Preventing GC is irrelevant,
     ;; but would not be if we recycled tls indices of garbage symbols.
-    (pseudo-atomic
+    (pseudo-atomic ()
      (assemble () ; for conversion of tagbody-like labels to assembler labels
      RETRY
-       (inst bts free-tls-index-ea lock-bit :lock)
+       (inst bts :qword free-tls-index-ea lock-bit :lock)
        (inst jmp :nc got-tls-index-lock)
        (inst pause) ; spin loop hint
        ;; TODO: yielding the CPU here might be a good idea
@@ -101,36 +101,36 @@
      GOT-TLS-INDEX-LOCK
        ;; Now we hold the spinlock. With it held, see if the symbol's
        ;; tls-index has been set in the meantime.
-       (inst cmp (tls-index-of symbol) 0)
+       (inst cmp :dword (tls-index-of symbol) 0)
        (inst jmp :e new-tls-index)
        ;; CMP against memory showed the tls-index to be valid, so clear the lock
        ;; and re-read the memory (safe because transition can only occur to
        ;; a nonzero value), then jump out to end the PA section.
-       (inst btr free-tls-index-ea lock-bit :lock)
-       (inst mov (reg-in-size symbol :dword) (tls-index-of symbol))
+       (inst btr :qword free-tls-index-ea lock-bit :lock)
+       (inst mov :dword symbol (tls-index-of symbol))
        (inst jmp done)
      NEW-TLS-INDEX
        ;; Allocate a new tls-index.
        (inst push scratch-reg)
        (inst mov scratch-reg free-tls-index-ea)
        ;; Must ignore the semaphore bit in the register's high half.
-       (inst cmp (reg-in-size scratch-reg :dword) (* tls-size n-word-bytes))
+       (inst cmp :dword scratch-reg (* tls-size n-word-bytes))
        (inst jmp :ae tls-full)
        ;; scratch-reg goes into symbol's TLS and into the arg/result reg.
-       (inst mov (tls-index-of symbol) (reg-in-size scratch-reg :dword))
-       (inst mov (reg-in-size result :dword) (reg-in-size scratch-reg :dword))
+       (inst mov :dword (tls-index-of symbol) scratch-reg)
+       (inst mov :dword result scratch-reg)
        ;; Load scratch-reg with a constant that clears the lock bit
        ;; and bumps the free index in one go.
        (inst mov scratch-reg (+ (- (ash 1 lock-bit)) n-word-bytes))
-       (inst add free-tls-index-ea scratch-reg :lock)
+       (inst add :qword free-tls-index-ea scratch-reg :lock)
        (inst pop scratch-reg)
      DONE)) ; end PSEUDO-ATOMIC
     (inst ret)
     (emit-label tls-full)
     ;; The disassembly of this code looks nicer when the failure path
     ;; immediately follows the ordinary path vs. being in *ELSEWHERE*.
-    (inst pop (reg-in-size scratch-reg :qword)) ; balance the stack
-    (inst btr free-tls-index-ea lock-bit :lock)
+    (inst pop scratch-reg) ; balance the stack
+    (inst btr :qword free-tls-index-ea lock-bit :lock)
     (%clear-pseudo-atomic)
     ;; There's a spurious RET instruction auto-inserted, but no matter.
     (error-call nil 'tls-exhausted-error)))

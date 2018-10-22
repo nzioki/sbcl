@@ -304,36 +304,30 @@
   (let* ((lvar (node-lvar cast))
          (dest (and lvar (lvar-dest lvar))))
     (and (combination-p dest)
-         (or
-          ;; Special case, %CHECK-BOUND tests both for fixnum and
-          ;; bound, which is equivalent to testing for INDEX.
-          (and (equal (combination-fun-debug-name dest) '(lambda-inlined check-bound))
-               (values-subtypep (values-specifier-type  '(values index &optional))
-                                (cast-type-to-check cast)))
-          ;; The theory is that the type assertion is from a declaration on the
-          ;; callee, so the callee should be able to do the check. We want to
-          ;; let the callee do the check, because it is possible that by the
-          ;; time of call that declaration will be changed and we do not want
-          ;; to make people recompile all calls to a function when they were
-          ;; originally compiled with a bad declaration.
-          ;;
-          ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
-          ;; that occur before nodes that can cause observable side effects --
-          ;; most commonly other non-external casts: so the order in which
-          ;; possible type errors are signalled matches with the evaluation
-          ;; order.
-          ;;
-          ;; FIXME: We should let more cases be handled by the callee then we
-          ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
-          ;; This is not fixable quite here, though, because flow-analysis has
-          ;; deleted the LVAR of the cast by the time we get here, so there is
-          ;; no destination. Perhaps we should mark cases inserted by
-          ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
-          ;; deemed unreachable?
-          (and
-           (almost-immediately-used-p lvar cast)
-           (values (values-subtypep (lvar-externally-checkable-type lvar)
-                                    (cast-type-to-check cast))))))))
+         ;; The theory is that the type assertion is from a declaration on the
+         ;; callee, so the callee should be able to do the check. We want to
+         ;; let the callee do the check, because it is possible that by the
+         ;; time of call that declaration will be changed and we do not want
+         ;; to make people recompile all calls to a function when they were
+         ;; originally compiled with a bad declaration.
+         ;;
+         ;; ALMOST-IMMEDIATELY-USED-P ensures that we don't delegate casts
+         ;; that occur before nodes that can cause observable side effects --
+         ;; most commonly other non-external casts: so the order in which
+         ;; possible type errors are signalled matches with the evaluation
+         ;; order.
+         ;;
+         ;; FIXME: We should let more cases be handled by the callee then we
+         ;; currently do, see: https://bugs.launchpad.net/sbcl/+bug/309104
+         ;; This is not fixable quite here, though, because flow-analysis has
+         ;; deleted the LVAR of the cast by the time we get here, so there is
+         ;; no destination. Perhaps we should mark cases inserted by
+         ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
+         ;; deemed unreachable?
+         (and
+          (almost-immediately-used-p lvar cast)
+          (values (values-subtypep (lvar-externally-checkable-type lvar)
+                                   (cast-type-to-check cast)))))))
 
 ;; Type specifiers handled by the general-purpose MAKE-TYPE-CHECK-FORM are often
 ;; trivial enough to have an internal error number assigned to them that can be
@@ -450,25 +444,28 @@
 ;;; unsupplied. Such checking is impossible to efficiently do at the
 ;;; source level because our fixed-values conventions are optimized
 ;;; for the common MV-BIND case.
-(defun make-type-check-form (types &optional context)
+(defun make-type-check-form (types cast)
   (let ((temps (make-gensym-list (length types))))
     `(multiple-value-bind ,temps 'dummy
-       ,@(mapcar (lambda (temp %type)
-                   (destructuring-bind (not type-to-check
-                                        type-to-report) %type
-                    (let* ((spec
-                             (let ((*unparse-fun-type-simplify* t))
-                               (type-specifier type-to-check)))
-                           (test (if not `(not ,spec) spec)))
-                      `(unless (typep ,temp ',test)
-                         ,(internal-type-error-call temp
-                                                    (if (fun-designator-type-p type-to-report)
-                                                        ;; Simplify
-                                                        (specifier-type 'callable)
-                                                        type-to-report)
-                                                    context)))))
-                 temps
-                 types)
+       ,@(mapcar
+          (lambda (temp %type)
+            (destructuring-bind (not type-to-check
+                                 type-to-report) %type
+              (let* ((spec
+                       (let ((*unparse-fun-type-simplify* t))
+                         (type-specifier type-to-check)))
+                     (test (if not `(not ,spec) spec)))
+                `(unless
+                     ,(with-ir1-environment-from-node cast ;; it performs its own inlining of SATISFIES
+                        (%source-transform-typep temp test))
+                   ,(internal-type-error-call temp
+                                              (if (fun-designator-type-p type-to-report)
+                                                  ;; Simplify
+                                                  (specifier-type 'callable)
+                                                  type-to-report)
+                                              (cast-context cast))))))
+          temps
+          types)
        (values ,@temps))))
 
 ;;; Splice in explicit type check code immediately before CAST. This
@@ -476,28 +473,9 @@
 ;;; checks the type(s) of the value(s), then passes them further.
 (defun convert-type-check (cast types)
   (declare (type cast cast) (type list types))
-  (let ((value (cast-value cast))
-        (length (length types)))
-    (filter-lvar value (make-type-check-form types
-                                             (cast-context cast)))
-    (reoptimize-lvar (cast-value cast))
-    (setf (cast-type-to-check cast) *wild-type*)
-    (setf (cast-%type-check cast) nil)
-    (let* ((atype (cast-asserted-type cast))
-           (atype (cond ((not (values-type-p atype))
-                         atype)
-                        ((= length 1)
-                         (single-value-type atype))
-                        (t
-                         (make-values-type
-                          :required (values-type-in atype length)))))
-           (dtype (node-derived-type cast))
-           (dtype (make-values-type
-                   :required (values-type-in dtype length))))
-      (setf (cast-asserted-type cast) atype)
-      (setf (node-derived-type cast) dtype)))
-
-  (values))
+  (filter-lvar (cast-value cast)
+               (make-type-check-form types cast))
+  (setf (cast-%type-check cast) nil))
 
 ;;; Check all possible arguments of CAST and emit type warnings for
 ;;; those with type errors. If the value of USE is being used for a
@@ -572,36 +550,38 @@
 ;;; which may lead to inappropriate template choices due to the
 ;;; modification of argument types.
 (defun generate-type-checks (component)
-  (collect ((casts))
-    (do-blocks (block component)
-      (when (and (block-type-check block)
-                 (not (block-delete-p block)))
-        ;; CAST-EXTERNALLY-CHECKABLE-P wants the backward pass
-        (do-nodes-backwards (node nil block)
-          (when (and (cast-p node)
-                     (cast-type-check node))
-            (cast-check-uses node)
-            (cond ((cast-externally-checkable-p node)
-                   (setf (cast-%type-check node) :external))
-                  (t
-                   ;; it is possible that NODE was marked :EXTERNAL by
-                   ;; the previous pass
-                   (setf (cast-%type-check node) t)
-                   (casts node)))))
-        (setf (block-type-check block) nil)))
-    (dolist (cast (casts))
-      (unless (bound-cast-p cast)
-        (multiple-value-bind (check types) (cast-check-types cast)
-          (ecase check
-            (:simple
-             (convert-type-check cast types))
-            (:too-hairy
-             (let ((*compiler-error-context* cast))
-               (when (policy cast (>= safety inhibit-warnings))
-                 (compiler-notify
-                  "type assertion too complex to check:~%~
+  (let (generated)
+    (collect ((casts))
+      (do-blocks (block component)
+        (when (and (block-type-check block)
+                   (not (block-delete-p block)))
+          ;; CAST-EXTERNALLY-CHECKABLE-P wants the backward pass
+          (do-nodes-backwards (node nil block)
+            (when (and (cast-p node)
+                       (cast-type-check node))
+              (cast-check-uses node)
+              (cond ((cast-externally-checkable-p node)
+                     (setf (cast-%type-check node) :external))
+                    (t
+                     ;; it is possible that NODE was marked :EXTERNAL by
+                     ;; the previous pass
+                     (setf (cast-%type-check node) t)
+                     (casts node)))))
+          (setf (block-type-check block) nil)))
+      (dolist (cast (casts))
+        (unless (bound-cast-p cast)
+          (multiple-value-bind (check types) (cast-check-types cast)
+            (ecase check
+              (:simple
+               (convert-type-check cast types)
+               (setf generated t))
+              (:too-hairy
+               (let ((*compiler-error-context* cast))
+                 (when (policy cast (>= safety inhibit-warnings))
+                   (compiler-notify
+                    "type assertion too complex to check:~%~
                     ~/sb!impl:print-type/."
-                  (coerce-to-values (cast-asserted-type cast)))))
-             (setf (cast-type-to-check cast) *wild-type*)
-             (setf (cast-%type-check cast) nil)))))))
-  (values))
+                    (coerce-to-values (cast-asserted-type cast)))))
+               (setf (cast-type-to-check cast) *wild-type*)
+               (setf (cast-%type-check cast) nil)))))))
+    generated))

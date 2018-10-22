@@ -6,11 +6,6 @@
 ;;;;   * the standard, non-SBCL-specific packages COMMON-LISP,
 ;;;;     COMMON-LISP-USER, and KEYWORD.
 ;;;;
-;;;; The packages are named SB!FOO here and elsewhere in
-;;;; cross-compilation, in order to avoid collision with possible
-;;;; corresponding SB-FOO packages in the cross-compilation host.
-;;;; They're renamed to SB-FOO later, after we've departed from the xc
-;;;; mothership and the danger of namespace collision is past.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -44,13 +39,13 @@
 ;;;; definition of the FINISH-SYMBOLS function.
 
 (#s(sb-cold:package-data
-    :name "SB!ALIEN"
+    :name "SB-ALIEN"
     :doc "public: the ALIEN foreign function interface (If you're
 porting CMU CL code, note that this package corresponds roughly to a union
 of the packages ALIEN and C-CALL at the time of the SBCL fork. SB-C-CALL
 is a deprecated nickname to help ease the transition from older versions
 of SBCL which maintained the CMU-CL-style split into two packages.)"
-    :use ("CL" "SB!EXT" "SB!INT" "SB!SYS" "SB!ALIEN-INTERNALS")
+    :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-ALIEN-INTERNALS")
     :reexport ("ARRAY"
                "BOOLEAN" "CHAR" "DOUBLE-FLOAT"
                "FLOAT" "FUNCTION" "INTEGER" "LONG-FLOAT"
@@ -86,7 +81,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
              "WITH-ALIEN"))
 
    #s(sb-cold:package-data
-      :name "SB!ALIEN-INTERNALS"
+      :name "SB-ALIEN-INTERNALS"
       :doc "private: stuff for implementing ALIENs and friends"
       :use ("CL")
       :export ("%ALIEN-VALUE"
@@ -94,7 +89,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "%DEREF-ADDR" "%HEAP-ALIEN" "%HEAP-ALIEN-ADDR"
                "%LOCAL-ALIEN-ADDR" "%LOCAL-ALIEN-FORCED-TO-MEMORY-P" "%SAP-ALIEN"
                "%SET-DEREF" "%SET-HEAP-ALIEN" "%SET-LOCAL-ALIEN" "%SET-SLOT"
-               "%SLOT-ADDR" "*SAVED-FP-AND-PCS*" "*VALUES-TYPE-OKAY*"
+               "%SLOT-ADDR" "*SAVED-FP*" "*VALUES-TYPE-OKAY*"
                "ALIEN-ARRAY-TYPE"
                "ALIEN-ARRAY-TYPE-DIMENSIONS" "ALIEN-ARRAY-TYPE-ELEMENT-TYPE"
                "ALIEN-ARRAY-TYPE-P" "ALIEN-BOOLEAN-TYPE" "ALIEN-BOOLEAN-TYPE-P"
@@ -130,10 +125,9 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "DEFINE-ALIEN-TYPE-METHOD" "DEFINE-ALIEN-TYPE-TRANSLATOR"
                "DEPORT" "DEPORT-ALLOC"
                "ENTER-ALIEN-CALLBACK"
-               "FIND-SAVED-FP-AND-PC"
                "HEAP-ALIEN-INFO" "HEAP-ALIEN-INFO-P" "HEAP-ALIEN-INFO-SAP-FORM"
                "HEAP-ALIEN-INFO-TYPE" "INVOKE-ALIEN-TYPE-METHOD"
-               "INVOKE-WITH-SAVED-FP-AND-PC" "LOCAL-ALIEN"
+               "INVOKE-WITH-SAVED-FP" "LOCAL-ALIEN"
                "LOCAL-ALIEN-INFO" "LOCAL-ALIEN-INFO-FORCE-TO-MEMORY-P"
                "LOCAL-ALIEN-INFO-P" "LOCAL-ALIEN-INFO-TYPE"
                "MAKE-ALIEN-FUN-TYPE" "MAKE-ALIEN-POINTER-TYPE"
@@ -143,11 +137,12 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "PARSE-ALIEN-TYPE" "UNPARSE-ALIEN-TYPE"))
 
    #s(sb-cold:package-data
-      :name "SB!ASSEM"
+      :name "SB-ASSEM"
       :doc "private: the assembler, used by the compiler"
-      :use ("CL" "SB!EXT" "SB!INT")
+      :use ("CL" "SB-EXT" "SB-INT")
       :export ("ASSEMBLY-UNIT"
                "ASSEMBLY-UNIT-BITS"
+               "+INST-ALIGNMENT-BYTES+"
 
                "ASSEM-SCHEDULER-P"
                "*ASSEM-MAX-LOCATIONS*"
@@ -161,15 +156,19 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "ASMSTREAM-CONSTANT-VECTOR"
                "JOIN-SECTIONS" "ASSEMBLE-SECTIONS"
                "EMIT" ".ALIGN" ".BYTE" ".SKIP"
+               ".COVERAGE-MARK" ".COMMENT"
                "EMIT-ALIGNMENT" "EMIT-BYTE" "EMIT-BACK-PATCH"
                "EMIT-CHOOSER" "DEFINE-BITFIELD-EMITTER"
                "DEFINE-INSTRUCTION" "DEFINE-INSTRUCTION-MACRO"
                "EMIT-POSTIT"
+               "ANY-ALIGNMENT-BETWEEN-P"
 
                "MAKE-SEGMENT" "SEGMENT-ORIGIN" "ASSEMBLE"
+               "SEGMENT-BUFFER"
+               "SEGMENT-ENCODER-STATE"
                "SEGMENT-HEADER-SKEW"
                "INST" "LABEL" "LABEL-P" "GEN-LABEL"
-               "EMIT-LABEL" "LABEL-POSITION"
+               "EMIT-LABEL" "LABEL-POSITION" "LABEL-USEDP"
                "FINALIZE-SEGMENT"
                "SEGMENT-CONTENTS-AS-VECTOR" "WRITE-SEGMENT-CONTENTS"
                "READS" "WRITES" "SEGMENT"
@@ -185,9 +184,9 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "BRANCH"  "FLUSHABLE"))
 
    #s(sb-cold:package-data
-      :name "SB!BIGNUM"
+      :name "SB-BIGNUM"
       :doc "private: bignum implementation"
-      :use ("CL" "SB!KERNEL" "SB!INT" "SB!EXT")
+      :use ("CL" "SB-KERNEL" "SB-INT" "SB-EXT")
       :export ("%ADD-WITH-CARRY"
                "%ALLOCATE-BIGNUM" "%ASHL" "%ASHR"
                "%BIGNUM-LENGTH" "%BIGNUM-REF" "%BIGNUM-REF-WITH-OFFSET"
@@ -215,19 +214,19 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "%RANDOM-BIGNUM" "SUBTRACT-BIGNUM" "SXHASH-BIGNUM"))
 
    #s(sb-cold:package-data
-      :name "SB!C"
+      :name "SB-C"
       :doc "private: implementation of the compiler"
       ;; (It seems strange to have the compiler USE SB-ALIEN-INTERNALS,
       ;; but the point seems to be to be able to express things like
-      ;; SB!C:DEFTRANSFORM SB-ALIEN-INTERNALS:MAKE-LOCAL-ALIEN without
+      ;; SB-C:DEFTRANSFORM SB-ALIEN-INTERNALS:MAKE-LOCAL-ALIEN without
       ;; having to use a bunch of package prefixes, by putting them
       ;; in the SB-C package. Maybe it'd be tidier to define an SB-ALIEN-COMP
       ;; package for this? But it seems like a fairly low priority.)
       ;; (Probably the same considerations also explain why BIGNUM is
       ;;in the USE list.)
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM"
-                 #!+sb-dyncount "SB-DYNCOUNT" "SB!EXT" "SB!FASL" "SB!INT"
-                 "SB!KERNEL" "SB!SYS")
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM"
+                 #!+sb-dyncount "SB-DYNCOUNT" "SB-EXT" "SB-FASL" "SB-INT"
+                 "SB-KERNEL" "SB-SYS")
       :reexport ("SLOT" "CODE-INSTRUCTIONS" "FLUSHABLE")
       :export ("%ALIEN-FUNCALL"
                "%CATCH-BREAKUP" "%CONTINUE-UNWIND"
@@ -354,7 +353,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "READ-VAR-INTEGER" "READ-VAR-INTEGERF"
                "SAP-READ-VAR-INTEGER" "SAP-READ-VAR-INTEGERF"
                "READ-VAR-STRING"
-               #!+inline-constants "REGISTER-INLINE-CONSTANT"
+               "REGISTER-INLINE-CONSTANT"
                "RESET-STACK-POINTER" "RESTORE-DYNAMIC-STATE"
                "RETURN-MULTIPLE" "SAVE-DYNAMIC-STATE" "STORAGE-BASE"
                "SB-ALLOCATED-SIZE" "SB-NAME" "SB-OR-LOSE"
@@ -367,13 +366,14 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "SOURCE-LOCATION"
                "SPECIFY-SAVE-TN"
                "STATIC-CALL-NAMED" "STATIC-MULTIPLE-CALL-NAMED" "STATIC-TAIL-CALL-NAMED"
-               "STORE-COVERAGE-DATA"
+               "STORE-COVERAGE-DATA" "STORE-SOURCE-FORM"
                "TAIL-CALL" "TAIL-CALL-NAMED"
                "TAIL-CALL-VARIABLE" "TEMPLATE-OR-LOSE"
                "TN" "TN-OFFSET" "TN-P" "TN-REF" "TN-REF-ACROSS" "TN-REF-LOAD-TN"
                "TN-REF-NEXT" "TN-REF-NEXT-REF" "TN-REF-P" "TN-REF-TARGET"
-               "TN-REF-TN" "TN-REF-VOP" "TN-REF-WRITE-P" "TN-SC" "TN-KIND" "TN-VALUE"
-               "TYPE-CHECK-ERROR" "UNBIND" "UNBIND-TO-HERE"
+               "TN-REF-TN" "TN-REF-TYPE" "TN-REF-VOP" "TN-REF-WRITE-P" "TN-SC"
+               "TN-KIND" "TN-VALUE"
+               "TYPE-CHECK-ERROR" "UNBIND" "UNBIND-N" "UNBIND-TO-HERE"
                "UNSAFE" "UNSAFELY-FLUSHABLE" "UNWIND" "UWP-ENTRY"
                "UNPACK-CODE-FIXUP-LOCS"
                "VERIFY-ARG-COUNT" "WRITE-PACKED-BIT-VECTOR"
@@ -445,13 +445,13 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                ))
 
    #s(sb-cold:package-data
-      :name "SB!DEBUG"
+      :name "SB-DEBUG"
       :doc
       "sorta public: Eventually this should become the debugger interface, with
 basic stuff like BACKTRACE and ARG. For now, the actual supported interface
 is still mixed indiscriminately with low-level internal implementation stuff
 like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
-      :use ("CL" "SB!EXT" "SB!INT" "SB!SYS" "SB!KERNEL" "SB!DI")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL" "SB-DI")
       :reexport ("*DEBUG-PRINT-VARIABLE-ALIST*")
       :export ("*BACKTRACE-FRAME-COUNT*"
                "*DEBUG-BEGINNER-HELP-P*"
@@ -467,21 +467,22 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "FRAME-HAS-DEBUG-TAG-P"
                "UNWIND-TO-FRAME-AND-CALL"
                ;; Deprecated
-               "BACKTRACE" "BACKTRACE-AS-LIST" "*SHOW-ENTRY-POINT-DETAILS*"
+               "BACKTRACE" "BACKTRACE-AS-LIST"
                ;; Replaced by
                "PRINT-BACKTRACE" "LIST-BACKTRACE"))
 
    #s(sb-cold:package-data
-      :name "SB!DI"
+      :name "SB-DI"
       :doc "private: primitives used to write debuggers"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL" "SB!SYS" "SB!VM")
-      :import-from (("SB!C"
-                     "DEBUG-SOURCE-FORM" "DEBUG-SOURCE-NAMESTRING"
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL" "SB-SYS" "SB-VM")
+      :import-from (("SB-C"
+                     "DEBUG-SOURCE-NAMESTRING"
                      "DEBUG-SOURCE-CREATED" "DEBUG-SOURCE-COMPILED"
                      "MAKE-DEBUG-SOURCE"
-                     "DEBUG-SOURCE" "DEBUG-SOURCE-P"))
-      :reexport ("DEBUG-SOURCE-FORM"
-                 "DEBUG-SOURCE-NAMESTRING"
+                     "DEBUG-SOURCE" "DEBUG-SOURCE-P"
+                     "CORE-DEBUG-SOURCE" "CORE-DEBUG-SOURCE-P"
+                     "CORE-DEBUG-SOURCE-FORM"))
+      :reexport ("DEBUG-SOURCE-NAMESTRING"
                  "DEBUG-SOURCE-CREATED" "DEBUG-SOURCE-COMPILED"
                  "DEBUG-SOURCE" "DEBUG-SOURCE-P")
       :export ("ACTIVATE-BREAKPOINT"
@@ -523,11 +524,10 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "CODE-LOCATION-KIND" "FLUSH-FRAMES-ABOVE"))
 
    #s(sb-cold:package-data
-      :name "SB!DISASSEM"
+      :name "SB-DISASSEM"
       :doc "private: stuff related to the implementation of the disassembler"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!SYS" "SB!KERNEL" "SB!DI")
-      :export ("+DISASSEM-INST-ALIGNMENT-BYTES+"
-               "*DISASSEM-NOTE-COLUMN*" "*DISASSEM-OPCODE-COLUMN-WIDTH*"
+      :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL" "SB-DI")
+      :export ("*DISASSEM-NOTE-COLUMN*" "*DISASSEM-OPCODE-COLUMN-WIDTH*"
                "*DISASSEM-LOCATION-COLUMN-WIDTH*"
                "ALIGN" ;;  prevent it from being removed, older Slime versions are using it
                "ARG-VALUE" "DISASSEM-STATE"
@@ -576,10 +576,10 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
 
    #!+sb-dyncount
    #s(sb-cold:package-data
-      :name "SB!DYNCOUNT"
+      :name "SB-DYNCOUNT"
       :doc "private: some somewhat-stale code for collecting runtime statistics"
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!BIGNUM"
-                 "SB!EXT" "SB!INT" "SB!KERNEL" "SB!ASSEM" "SB!SYS")
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-BIGNUM"
+                 "SB-EXT" "SB-INT" "SB-KERNEL" "SB-ASSEM" "SB-SYS")
       :export ("*COLLECT-DYNAMIC-STATISTICS*"
                "COUNT-ME"
                "DYNCOUNT-INFO-COUNTS" "DYNCOUNT-INFO-COSTS"
@@ -587,11 +587,11 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DYNCOUNT-INFO" "DYNCOUNT-INFO-P"))
 
    #s(sb-cold:package-data
-      :name "SB!FASL"
+      :name "SB-FASL"
       :doc "private: stuff related to FASL load/dump logic (and GENESIS)"
-      :use ("CL" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM" "SB!C"
-                 "SB!EXT" "SB!INT" "SB!KERNEL" "SB!SYS")
-      :import-from (("SB!VM" "+FIXUP-KINDS+"))
+      :use ("CL" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM" "SB-C"
+                 "SB-EXT" "SB-INT" "SB-KERNEL" "SB-SYS")
+      :import-from (("SB-VM" "+FIXUP-KINDS+"))
       :export ("*ASSEMBLER-ROUTINES*"
                "GET-ASM-ROUTINE"
                "+BACKEND-FASL-FILE-IMPLEMENTATION+"
@@ -617,16 +617,17 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
 
    ;; This package is a grab bag for things which used to be internal
    ;; symbols in package COMMON-LISP. Lots of these symbols are accessed
-   ;; with explicit SB!IMPL:: prefixes in the code. It would be nice to
+   ;; with explicit SB-IMPL:: prefixes in the code. It would be nice to
    ;; reduce the use of this practice, so if symbols from here which are
    ;; accessed that way are found to belong more appropriately in an
-   ;; existing package (e.g. SB!KERNEL or SB!SYS or SB!EXT or SB!FASL),
+   ;; existing package (e.g. SB-KERNEL or SB-SYS or SB-EXT or SB-FASL),
    ;; I (WHN 19990223) encourage maintainers to move them there..
    #s(sb-cold:package-data
-      :name "SB!IMPL"
+      :name "SB-IMPL"
       :doc "private: a grab bag of implementation details"
-      :import-from (("SB!KERNEL" "*PACKAGE-NAMES*"))
+      :import-from (("SB-KERNEL" "*PACKAGE-NAMES*"))
       :export ("FORMAT-MICROSECONDS" "FORMAT-MILLISECONDS" ; for ~/fmt/
+               "PRINT-TYPE" "PRINT-TYPE-SPECIFIER"
                ;; symbols used by sb-simple-streams
                "ANSI-STREAM-CLEAR-INPUT"
                "ANSI-STREAM-FRESH-LINE" "ANSI-STREAM-LISTEN"
@@ -638,13 +639,13 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "TOKEN-DELIMITERP" "WHITESPACE[2]P" "WITH-READ-BUFFER"
                ;; other
                "%MAKUNBOUND")
-      :use ("CL" "SB!ALIEN" "SB!BIGNUM" "SB!DEBUG" "SB!EXT"
-                 "SB!FASL" "SB!GRAY" "SB!INT" "SB!KERNEL" "SB!SYS"))
+      :use ("CL" "SB-ALIEN" "SB-BIGNUM" "SB-DEBUG" "SB-EXT"
+                 "SB-FASL" "SB-GRAY" "SB-INT" "SB-KERNEL" "SB-SYS"))
 
    #s(sb-cold:package-data
-      :name "SB!EXT"
+      :name "SB-EXT"
       :doc "public: miscellaneous supported extensions to the ANSI Lisp spec"
-      :use ("CL" "SB!ALIEN" "SB!INT" "SB!SYS" "SB!GRAY")
+      :use ("CL" "SB-ALIEN" "SB-INT" "SB-SYS" "SB-GRAY")
       :export ( ;; Information about how the program was invoked is
                ;; nonstandard but very useful.
                "*POSIX-ARGV*" "*CORE-PATHNAME*" "*RUNTIME-PATHNAME*"
@@ -820,6 +821,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DESCRIBE-COMPILER-POLICY"
                "RESTRICT-COMPILER-POLICY"
                "SET-MACRO-POLICY"
+               "FOLD-IDENTICAL-CODE" ; this is a verb, not a compiler policy
 
                ;; a special form for breaking out of our "declarations
                ;; are assertions" default
@@ -845,6 +847,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "WEAK-POINTER"
                "WEAK-POINTER-P"
                "WEAK-POINTER-VALUE"
+               "MAKE-WEAK-VECTOR"
+               "WEAK-VECTOR-P"
 
                ;; Hash table extensions
                "DEFINE-HASH-TABLE-TEST"
@@ -895,7 +899,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "SET-SBCL-SOURCE-LOCATION"
                "*DISASSEMBLE-ANNOTATE*"
                "PRINT-SYMBOL-WITH-PREFIX"
-               "PRINT-TYPE-SPECIFIER" "PRINT-TYPE"
                "*PRINT-VECTOR-LENGTH*"
                "DECIMAL-WITH-GROUPED-DIGITS-WIDTH"
                ;;"OBJECT-SIZE"
@@ -954,17 +957,17 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "UNKNOWN-KEYWORD-ARGUMENT-NAME"))
 
    #s(sb-cold:package-data
-      :name "SB!FORMAT"
+      :name "SB-FORMAT"
       :doc "private: implementation of FORMAT and friends"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
-      :export ("%COMPILER-WALK-FORMAT-STRING" "FORMAT-ERROR"))
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
+      :export ("%COMPILER-WALK-FORMAT-STRING" "FORMAT-ERROR" "TOKENS"))
 
    #s(sb-cold:package-data
-      :name "SB!GRAY"
+      :name "SB-GRAY"
       :doc
       "public: an implementation of the stream-definition-by-user
 Lisp extension proposal by David N. Gray"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("FUNDAMENTAL-BINARY-STREAM"
                "FUNDAMENTAL-BINARY-INPUT-STREAM"
                "FUNDAMENTAL-BINARY-OUTPUT-STREAM" "FUNDAMENTAL-CHARACTER-STREAM"
@@ -983,12 +986,12 @@ Lisp extension proposal by David N. Gray"
                "STREAM-WRITE-STRING"))
 
    #s(sb-cold:package-data
-      :name "SB!INT"
+      :name "SB-INT"
       :doc
       "private: miscellaneous unsupported extensions to the ANSI spec. Much of
 the stuff in here originated in CMU CL's EXTENSIONS package and is retained,
 possibly temporarily, because it might be used internally."
-      :use ("CL" "SB!ALIEN" "SB!GRAY" "SB!FASL" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-GRAY" "SB-FASL" "SB-SYS")
       :export (;; lambda list keyword extensions
                "&MORE"
 
@@ -1120,7 +1123,7 @@ possibly temporarily, because it might be used internally."
                "TWO-ARG-CHAR-LESSP" "TWO-ARG-CHAR-NOT-LESSP"
                "TWO-ARG-CHAR-GREATERP" "TWO-ARG-CHAR-NOT-GREATERP"
                "CHAR-EQUAL-CONSTANT" "CHAR-CASE-INFO"
-               ;; FIXME: potential SB!EXT exports
+               ;; FIXME: potential SB-EXT exports
                "CHARACTER-CODING-ERROR"
                "CHARACTER-DECODING-ERROR" "CHARACTER-DECODING-ERROR-OCTETS"
                "CHARACTER-ENCODING-ERROR" "CHARACTER-ENCODING-ERROR-CODE"
@@ -1141,6 +1144,7 @@ possibly temporarily, because it might be used internally."
                "!DEFINE-LOAD-TIME-GLOBAL"
                "!DEFPARAMETER" "!DEFVAR"
                "!DEFINE-THREAD-LOCAL"
+               "*!REMOVABLE-SYMBOLS*"
 
                ;; bootstrapping macro whose effect is to delay until warm load.
                "DEF*METHOD"
@@ -1180,7 +1184,7 @@ possibly temporarily, because it might be used internally."
                "LOADER-DEPRECATION-WARN"
 
                ;; miscellaneous non-standard but handy user-level functions..
-               "ASSQ" "DELQ" "MEMQ" "POSQ" "NEQ"
+               "ASSQ" "DELQ" "DELQ1" "MEMQ" "POSQ" "NEQ"
                "ADJUST-LIST"
                "ALIGN-UP"
                "%FIND-PACKAGE-OR-LOSE" "FIND-UNDELETED-PACKAGE-OR-LOSE"
@@ -1210,6 +1214,7 @@ possibly temporarily, because it might be used internally."
 
                ;; ..and macros..
                "COLLECT"
+               "COPY-LIST-MACRO"
                "DO-ANONYMOUS" "DOVECTOR" "DOHASH" "DOPLIST"
                "ENSURE-GETHASH"
                "NAMED-LET"
@@ -1335,7 +1340,7 @@ possibly temporarily, because it might be used internally."
 
                ;; misc. utilities used internally
                "ADDRESS-BASED-COUNTER-VAL"
-               "DEFINE-FUNCTION-NAME-SYNTAX" "VALID-FUNCTION-NAME-P" ; should be SB!EXT?
+               "DEFINE-FUNCTION-NAME-SYNTAX" "VALID-FUNCTION-NAME-P" ; should be SB-EXT?
                "LEGAL-VARIABLE-NAME-P"
                "LEGAL-FUN-NAME-P" "LEGAL-FUN-NAME-OR-TYPE-ERROR"
                "FUN-NAME-BLOCK-NAME"
@@ -1370,7 +1375,12 @@ possibly temporarily, because it might be used internally."
                "DESCRIPTOR-SAP"
                "DO-PACKED-VARINTS"
 
-               ;; These could be moved back into SB!EXT if someone has
+               "CLOSURE-EXTRA-VALUES"
+               "PACK-CLOSURE-EXTRA-VALUES"
+               "SET-CLOSURE-EXTRA-VALUES"
+               "+CLOSURE-NAME-INDEX+"
+
+               ;; These could be moved back into SB-EXT if someone has
                ;; compelling reasons, but hopefully we can get by
                ;; without supporting them, at least not as publicly
                ;; accessible things with fixed interfaces.
@@ -1420,7 +1430,7 @@ possibly temporarily, because it might be used internally."
                "!SPECIALIZED-ARRAY-ELEMENT-TYPE"
 
                ;; hooks for contrib/ stuff we're insufficiently sure
-               ;; about to add to SB!EXT
+               ;; about to add to SB-EXT
                "*REPL-PROMPT-FUN*"
                "*REPL-READ-FORM-FUN*"
 
@@ -1453,8 +1463,8 @@ possibly temporarily, because it might be used internally."
    ;; FIXME: This package is awfully huge. It'd probably be good to
    ;; split it. There's at least one natural way to split it: the
    ;; implementation of the Lisp type system (e.g. TYPE-INTERSECTION and
-   ;; SPECIFIER-TYPE) could move to a separate package SB!TYPE. (There's
-   ;; lots of stuff which currently uses the SB!KERNEL package which
+   ;; SPECIFIER-TYPE) could move to a separate package SB-TYPE. (There's
+   ;; lots of stuff which currently uses the SB-KERNEL package which
    ;; doesn't actually use the type system stuff.) And maybe other
    ;; possible splits too:
    ;;   * Pull GC stuff (*GC-INHIBIT*, *GC-PENDING*, etc.)
@@ -1475,13 +1485,13 @@ possibly temporarily, because it might be used internally."
    ;;     for the ~18 errors that are _not_ object-not-<x>, stop naming them.
    ;;     C just needs a map from number -> string-to-show.
    #s(sb-cold:package-data
-      :name "SB!KERNEL"
+      :name "SB-KERNEL"
       :doc
       "private: Theoretically this 'hides state and types used for package
 integration' (said CMU CL architecture.tex) and that probably was and
 is a good idea, but see SB-SYS re. blurring of boundaries."
-      :use ("CL" "SB!ALIEN" "SB!ALIEN-INTERNALS" "SB!BIGNUM"
-                 "SB!EXT" "SB!FASL" "SB!INT" "SB!SYS" "SB!GRAY")
+      :use ("CL" "SB-ALIEN" "SB-ALIEN-INTERNALS" "SB-BIGNUM"
+                 "SB-EXT" "SB-FASL" "SB-INT" "SB-SYS" "SB-GRAY")
       :reexport (#!+sb-simd-pack("SIMD-PACK"
                                  "SIMD-PACK-P"
                                  "%MAKE-SIMD-PACK-UB32"
@@ -1510,9 +1520,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%ARRAY-DIMENSION" "%ARRAY-DISPLACED-P"
                "%ARRAY-DISPLACED-FROM"
                "%ARRAY-DISPLACEMENT" "%ARRAY-FILL-POINTER"
-               "%ARRAY-FILL-POINTER-P" "%ARRAY-RANK"
+               "%ARRAY-FILL-POINTER-P" "%ARRAY-RANK" "%ARRAY-RANK="
                "%ARRAY-ATOMIC-INCF/WORD"
-               #!+ash-right-vops "%ASH/RIGHT"
+               "%ASH/RIGHT"
                "%ASSOC"
                "%ASSOC-EQ"
                "%ASSOC-IF"
@@ -1670,7 +1680,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "ALWAYS-SUBTYPEP"
                "ARGS-TYPE" "ARGS-TYPE-ALLOWP" "ARGS-TYPE-KEYP"
                "ARGS-TYPE-KEYWORDS" "ARGS-TYPE-OPTIONAL" "ARGS-TYPE-P"
-               "ARGS-TYPE-REQUIRED" "ARGS-TYPE-REST" "ARRAY-HEADER-P"
+               "ARGS-TYPE-REQUIRED" "ARGS-TYPE-REST"
+               "ARRAY-HEADER-P" "SIMPLE-ARRAY-HEADER-P"
                "ARRAY-TYPE" "ARRAY-TYPE-COMPLEXP"
                "ARRAY-TYPE-DIMENSIONS" "ARRAY-TYPE-ELEMENT-TYPE"
                "ARRAY-TYPE-P" "ARRAY-TYPE-SPECIALIZED-ELEMENT-TYPE"
@@ -1738,7 +1749,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "EVAL-WHEN-COMPILE-TOPLEVEL"
                "EXTENDED-CHAR-P" "EXTERNAL-FORMAT-DESIGNATOR"
                "FAST-&REST-NTH"
-               "FDOCUMENTATION" "FILENAME"
+               "FILENAME"
                "FILL-ARRAY"
                "FILL-DATA-VECTOR"
                "FIND-AND-INIT-OR-CHECK-LAYOUT"
@@ -1759,7 +1770,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "GENERIC-ABSTRACT-TYPE-FUNCTION"
                "GET-CLOSURE-LENGTH" "GET-HEADER-DATA"
                "GET-LISP-OBJ-ADDRESS" "GENERATION-OF"
-               "LOWTAG-OF" "WIDETAG-OF"
+               "LOWTAG-OF" "WIDETAG-OF" "WIDETAG="
                "HAIRY-DATA-VECTOR-REF"
                "HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS"  "HAIRY-DATA-VECTOR-SET"
                "HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
@@ -1814,9 +1825,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "MAKE-DOUBLE-FLOAT" "MAKE-FUN-TYPE" "MAKE-KEY-INFO"
                "MAKE-LISP-OBJ"
                #!+long-float "MAKE-LONG-FLOAT"
-               "MAKE-MEMBER-TYPE" "MAKE-NAMED-TYPE" "MAKE-NULL-LEXENV"
+               "MAKE-MEMBER-TYPE" "MAKE-NULL-LEXENV"
                "MAKE-EQL-TYPE" "MEMBER-TYPE-FROM-LIST"
-               "MAKE-NEGATION-TYPE"
+               "MAKE-NEGATION-TYPE" "TYPE-NEGATION"
                "MAKE-NUMERIC-TYPE"
                "MAKE-SINGLE-FLOAT"
                "MAKE-UNBOUND-MARKER"
@@ -1836,6 +1847,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "NEGATE" "NEGATION-TYPE" "NEGATION-TYPE-TYPE"
                "NIL-ARRAY-ACCESSED-ERROR"
                "NIL-FUN-RETURNED-ERROR"
+               "NON-NULL-SYMBOL-P"
                "NUMERIC-CONTAGION" "NUMERIC-TYPE"
                "NUMERIC-TYPE-CLASS" "NUMERIC-TYPE-COMPLEXP"
                "NUMERIC-TYPE-EQUAL" "NUMERIC-TYPE-FORMAT"
@@ -1990,7 +2002,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "SYMEVAL"
                "SYM-GLOBAL-VAL"
                "%INSTANCE-LENGTH"
-               "%INSTANCE-REF"
+               "%INSTANCE-REF" "%INSTANCE-REF-EQ"
                "%INSTANCE-SET"
                "TESTABLE-TYPE-P"
                "TLS-EXHAUSTED-ERROR"
@@ -2086,12 +2098,14 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SIMPLE-FUN-ARGLIST"
                "%SIMPLE-FUN-DOC"
                "%SIMPLE-FUN-INFO"
+               "%SIMPLE-FUN-LEXPR"
                "%SIMPLE-FUN-NAME"
                "%SIMPLE-FUN-NEXT" ; FIXME: remove
                "%SIMPLE-FUN-SELF" ; FIXME: don't export
                "%SIMPLE-FUN-TEXT-LEN"
                "%SIMPLE-FUN-TYPE"
                "%SIMPLE-FUN-XREFS"
+               "SET-SIMPLE-FUN-INFO"
 
                ;; CLOSURE type and accessors
                "CLOSURE"
@@ -2102,7 +2116,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%CLOSURE-VALUES"
 
                ;; Abstract function accessors
-               "%FUN-DOC"
                "%FUN-FUN"
                "%FUN-LAMBDA-LIST"
                "%FUN-NAME"
@@ -2129,6 +2142,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "CLASSOID-LAYOUT" "CLASSOID-NAME" "CLASSOID-P"
                "DD-RAW-LENGTH" "NOTE-NAME-DEFINED"
                "%CODE-CODE-SIZE" "%CODE-TEXT-SIZE"
+               "%CODE-SERIALNO"
                "DD-SLOTS" "DD-INCLUDE" "SLOT-SETTER-LAMBDA-FORM"
                "SLOT-ACCESS-TRANSFORM"
                "%IMAGPART" "DSD-ACCESSOR-NAME" "%CODE-DEBUG-INFO"
@@ -2139,7 +2153,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SET-INSTANCE-LAYOUT"
                "DD-CONSTRUCTORS" "DD-DEFAULT-CONSTRUCTOR"
                "LAYOUT-OF" "%REALPART"
-               "STRUCTURE-CLASSOID-P" "DSD-INDEX" "STRUCTURE-CLASSOID"
+               "STRUCTURE-CLASSOID" "STRUCTURE-CLASSOID-P"
+               "DSD-INDEX" "GET-DSD-INDEX"
                "%INSTANCE-LAYOUT" "LAYOUT-CLOS-HASH"
                "PROCLAIM-AS-FUN-NAME" "BECOME-DEFINED-FUN-NAME"
                "%NUMERATOR" "CLASSOID-TYPEP" "DSD-READ-ONLY"
@@ -2172,13 +2187,13 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "BUILT-IN-CLASSOID-DIRECT-SUPERCLASSES"
                "BUILT-IN-CLASSOID-TRANSLATION" "RANDOM-LAYOUT-CLOS-HASH"
                "CLASSOID-PCL-CLASS" "FUNCALLABLE-STRUCTURE"
-               "FUNCALLABLE-INSTANCE-FUN" "%FUNCALLABLE-INSTANCE-LAYOUT"
+               "%FUNCALLABLE-INSTANCE-LAYOUT"
                "%SET-FUNCALLABLE-INSTANCE-LAYOUT"
                "REGISTER-LAYOUT"
                "FUNCALLABLE-INSTANCE"
                "MAKE-STATIC-CLASSOID"
                "%MAKE-SYMBOL"
-               "%FUNCALLABLE-INSTANCE-FUNCTION" "SYMBOL-HASH"
+               "%FUNCALLABLE-INSTANCE-FUN" "SYMBOL-HASH"
                "SYMBOL-INFO" "SYMBOL-INFO-VECTOR"
 
                "EXTENDED-SEQUENCE" "*EXTENDED-SEQUENCE-TYPE*"
@@ -2284,10 +2299,10 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                ;; internal symbols in package "CL" imported
                ;; into package "C", as opposed to what we're
                ;; doing here, defining them as external symbols
-               ;; in a package which is used by both "SB!C" and
-               ;; "SB!IMPL". (SBCL's "SB!C" is directly
+               ;; in a package which is used by both "SB-C" and
+               ;; "SB-IMPL". (SBCL's "SB-C" is directly
                ;; analogous to CMU CL's "C"; and for this
-               ;; purpose, SBCL's "SB!IMPL" is analogous to CMU
+               ;; purpose, SBCL's "SB-IMPL" is analogous to CMU
                ;; CL's "CL".) As far as I know there's nothing
                ;; special about them, so they could be merged
                ;; into the same order as everything else in the
@@ -2301,8 +2316,8 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "WITH-SIMPLE-OUTPUT-TO-STRING"))
 
    #s(sb-cold:package-data
-      :name "SB!THREAD"
-      :use ("CL" "SB!ALIEN" "SB!INT" "SB!SYS" "SB!KERNEL")
+      :name "SB-THREAD"
+      :use ("CL" "SB-ALIEN" "SB-INT" "SB-SYS" "SB-KERNEL")
       :doc "public (but low-level): native thread support"
       :export ("*CURRENT-THREAD*"
                "DESTROY-THREAD"
@@ -2374,13 +2389,13 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "SEMAPHORE-NOTIFICATION-STATUS"))
 
    #s(sb-cold:package-data
-      :name "SB!LOOP"
+      :name "SB-LOOP"
       :doc "private: implementation details of LOOP"
-      :use ("CL" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-INT" "SB-KERNEL")
       :export ())
 
    #s(sb-cold:package-data
-      :name "SB!MOP"
+      :name "SB-MOP"
       :doc
       "public: the MetaObject Protocol interface, as defined by
 The Art of the Metaobject Protocol, by Kiczales, des Rivieres and Bobrow:
@@ -2481,20 +2496,20 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                "WRITER-METHOD-CLASS"))
 
    #s(sb-cold:package-data
-      :name "SB!REGALLOC"
+      :name "SB-REGALLOC"
       :doc "private: implementation of the compiler's register allocator"
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM"
-                 #!+sb-dyncount "SB-DYNCOUNT" "SB!EXT" "SB!FASL" "SB!INT"
-                 "SB!KERNEL" "SB!SYS"
-                 "SB!C")
-      :import-from (("SB!C"
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM"
+                 #!+sb-dyncount "SB-DYNCOUNT" "SB-EXT" "SB-FASL" "SB-INT"
+                 "SB-KERNEL" "SB-SYS"
+                 "SB-C")
+      :import-from (("SB-C"
                      "*LOOP-ANALYZE*"
                      "BLOCK-INFO" "BLOCK-LAST" "BLOCK-LOOP" "BLOCK-NEXT"
                      "CLEAR-BIT-VECTOR" "COMPONENT-HEAD" "COMPONENT-TAIL"
                      "DEFEVENT" "DELETE-VOP" "DO-IR2-BLOCKS" "DO-LIVE-TNS"
                      "EMIT-LOAD-TEMPLATE" "EVENT" "FIND-IN"
                      "FINITE-SB" "FINITE-SB-ALWAYS-LIVE"
-                     "FINITE-SB-ALWAYS-LIVE-COUNT" "FINITE-SB-CONFLICTS"
+                     "FINITE-SB-WIRED-MAP" "FINITE-SB-CONFLICTS"
                      "FINITE-SB-CURRENT-SIZE" "FINITE-SB-LAST-BLOCK-COUNT"
                      "FINITE-SB-LAST-OFFSET" "FINITE-SB-LIVE-TNS"
                      "FINITE-SB-SIZE-ALIGNMENT" "FINITE-SB-SIZE-INCREMENT"
@@ -2529,7 +2544,7 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                      "TEMPLATE-NAME"
                      "TN" "TN-COST" "TN-GLOBAL-CONFLICTS" "TN-KIND" "TN-LEAF"
                      "TN-LOCAL" "TN-LOCAL-CONFLICTS" "TN-LOCAL-NUMBER"
-                     "TN-LOOP-DEPTH" "TN-NEXT" "TN-NUMBER" "TN-PRIMITIVE-TYPE"
+                     "TN-NEXT" "TN-NUMBER" "TN-PRIMITIVE-TYPE"
                      "TN-READS" "TN-SAVE-TN" "TN-VERTEX" "TN-WRITES"
                      "TNS-CONFLICT" "TNS-CONFLICT-GLOBAL-GLOBAL"
                      "TNS-CONFLICT-LOCAL-GLOBAL"
@@ -2545,14 +2560,14 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                "*TN-WRITE-COST*" "*TN-LOOP-DEPTH-MULTIPLIER*"))
 
    #s(sb-cold:package-data
-      :name "SB!PCL"
+      :name "SB-PCL"
       :doc
       "semi-public: This package includes useful meta-object protocol
 extensions, but even they are not guaranteed to be present in later
 versions of SBCL, and the other stuff in here is definitely not
 guaranteed to be present in later versions of SBCL.  Use of this
 package is deprecated in favour of SB-MOP."
-      :use ("CL" "SB!MOP" "SB!INT" "SB!EXT" "SB!WALKER" "SB!KERNEL")
+      :use ("CL" "SB-MOP" "SB-INT" "SB-EXT" "SB-WALKER" "SB-KERNEL")
       ;; experimental SBCL-only (for now) symbols
       :export ("SYSTEM-CLASS"
 
@@ -2664,9 +2679,9 @@ package is deprecated in favour of SB-MOP."
                  "WRITER-METHOD-CLASS"))
 
    #s(sb-cold:package-data
-      :name "SB!PRETTY"
+      :name "SB-PRETTY"
       :doc "private: implementation of pretty-printing"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("OUTPUT-PRETTY-OBJECT"
                "PRETTY-STREAM" "PRETTY-STREAM-P"
                "PPRINT-DISPATCH-TABLE"
@@ -2674,13 +2689,13 @@ package is deprecated in favour of SB-MOP."
                "!PPRINT-COLD-INIT"))
 
    #s(sb-cold:package-data
-      :name "SB!PROFILE"
+      :name "SB-PROFILE"
       :doc "public: the interface to the profiler"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("PROFILE" "REPORT" "RESET" "UNPROFILE"))
 
    #s(sb-cold:package-data
-      :name "SB!SEQUENCE"
+      :name "SB-SEQUENCE"
       :doc "semi-public: implements something which might eventually
 be submitted as a CDR"
       :use ()
@@ -2717,7 +2732,7 @@ be submitted as a CDR"
                "SORT" "STABLE-SORT" "MERGE"))
 
    #s(sb-cold:package-data
-      :name "SB!SYS"
+      :name "SB-SYS"
       :doc
       "private: In theory, this \"contains functions and information
 necessary for system interfacing\" (said cmu-user.tex at the time
@@ -2726,10 +2741,10 @@ practice, the distinctions between this package and SB-KERNEL
 and even SB-VM seem to have become somewhat blurred over the years.
 Some anomalies (e.g. FIND-IF-IN-CLOSURE being in SB-SYS instead of
 SB-KERNEL) have been undone, but probably more remain."
-      :use ("CL" "SB!EXT" "SB!INT")
+      :use ("CL" "SB-EXT" "SB-INT")
       :export (;; FIXME: %PRIMITIVE shouldn't be here. (I now know that %SYS
                ;; is for OS-dependent stuff. %PRIMITIVE should probably be in
-               ;; SB!KERNEL.)
+               ;; SB-KERNEL.)
                "%PRIMITIVE"
                "%STANDARD-CHAR-P"
                "*EXIT-ERROR-HANDLER*"
@@ -2788,9 +2803,11 @@ SB-KERNEL) have been undone, but probably more remain."
                "MACRO" "MAKE-FD-STREAM"
                "MEMORY-FAULT-ERROR"
                "MEMMOVE"
+               "NLX-PROTECT"
                "OS-EXIT"
                "OS-COLD-INIT-OR-REINIT" "OS-DEINIT"
                "OS-CONTEXT-T" "OUTPUT-RAW-BYTES"
+               "READ-CYCLE-COUNTER" "ELAPSED-CYCLES"
                "READ-N-BYTES"
                "REMOVE-FD-HANDLER"
                "REOPEN-SHARED-OBJECTS"
@@ -2808,7 +2825,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "SERVE-EVENT"
                "SIGNED-SAP-REF-16" "SIGNED-SAP-REF-32"
                "SIGNED-SAP-REF-64" "SIGNED-SAP-REF-WORD" "SIGNED-SAP-REF-8"
-               ;; FIXME: STRUCTURE!OBJECT stuff probably belongs in SB!KERNEL.
+               ;; FIXME: STRUCTURE!OBJECT stuff probably belongs in SB-KERNEL.
                "STRUCTURE!OBJECT" "STRUCTURE!OBJECT-MAKE-LOAD-FORM"
                "SYSTEM-AREA-POINTER" "SYSTEM-AREA-POINTER-P"
                "SYSTEM-CONDITION" "SYSTEM-CONDITION-ADDRESS"
@@ -2826,9 +2843,9 @@ SB-KERNEL) have been undone, but probably more remain."
                "WITH-INTERRUPT-BINDINGS"))
 
    #s(sb-cold:package-data
-      :name "SB!UNICODE"
+      :name "SB-UNICODE"
       :doc "public: algorithms for Unicode data"
-      :use ("CL" "SB!INT")
+      :use ("CL" "SB-INT")
       :export ("GENERAL-CATEGORY"
                "BIDI-CLASS"
                "COMBINING-CLASS"
@@ -2878,7 +2895,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "CONFUSABLE-P"))
 
    #s(sb-cold:package-data
-      :name "SB!UNIX"
+      :name "SB-UNIX"
       :doc
       "private: a wrapper layer for SBCL itself to use when talking
 with an underlying Unix-y operating system.
@@ -2888,7 +2905,7 @@ stable Unix interface suitable for the end user.
 This package only tries to implement what happens to be
 needed by the current implementation of SBCL, and makes
 no guarantees of interface stability."
-      :use ("CL" "SB!ALIEN" "SB!EXT" "SB!INT" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-EXT" "SB-INT" "SB-SYS")
       :reexport ("OFF-T"
                  "SIZE-T")
       :export ( ;; wrappers around Unix stuff to give just what Lisp needs
@@ -3007,12 +3024,12 @@ no guarantees of interface stability."
                 "EUNATCH" "EUSERS" "EWOULDBLOCK" "EXFULL")))
 
    #s(sb-cold:package-data
-      :name "SB!VM"
+      :name "SB-VM"
       :doc
       "internal: the default place to hide information about the hardware and data
 structure representations"
-      :use ("CL" "SB!ALIEN" "SB!ALIEN-INTERNALS" "SB!ASSEM" "SB!C"
-                 "SB!EXT" "SB!FASL" "SB!INT" "SB!KERNEL" "SB!SYS" "SB!UNIX")
+      :use ("CL" "SB-ALIEN" "SB-ALIEN-INTERNALS" "SB-ASSEM" "SB-C"
+                 "SB-EXT" "SB-FASL" "SB-INT" "SB-KERNEL" "SB-SYS" "SB-UNIX")
       :reexport ("WORD")
       :export ("*ALLOC-SIGNAL*"
                "*PRIMITIVE-OBJECTS*"
@@ -3040,7 +3057,6 @@ structure representations"
                "CATCH-BLOCK-SC-NUMBER" "CATCH-BLOCK-SIZE"
                "CATCH-BLOCK-TAG-SLOT" "CERROR-TRAP"
                "CLOSURE-FUN-SLOT"
-               "CLOSURE-HEADER-WIDETAG" ; don't use
                "CLOSURE-WIDETAG"
                "CLOSURE-INFO-OFFSET"
                "CODE-COMPONENT-SIZE"
@@ -3112,25 +3128,27 @@ structure representations"
                "FUNCALLABLE-INSTANCE-INFO-OFFSET"
                "SIMPLE-FUN-ARGLIST-SLOT" "SIMPLE-FUN-CODE-OFFSET"
                "FUN-END-BREAKPOINT-TRAP"
-               "SIMPLE-FUN-HEADER-WIDETAG" ; don't use
                "SIMPLE-FUN-WIDETAG"
                "SIMPLE-FUN-NAME-SLOT"
+               "SIMPLE-FUN-ENTRY-SAP"
                "FUN-POINTER-LOWTAG"
                "FUNCTION-LAYOUT"
+               "SIMPLE-FUN-INFO-SLOT"
                "SIMPLE-FUN-SELF-SLOT"
                "SIMPLE-FUN-TYPE-SLOT"
                "GENCGC-CARD-BYTES"
                "GENCGC-ALLOC-GRANULARITY"
                "GENCGC-RELEASE-GRANULARITY"
-               #!+(or arm64 ppc sparc) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
-               #!+(or arm64 ppc sparc) "PSEUDO-ATOMIC-FLAG"
+               #!+(or arm64 ppc ppc64 sparc) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
+               #!+(or arm64 ppc ppc64 sparc) "PSEUDO-ATOMIC-FLAG"
                #!+sb-safepoint "GLOBAL-SAFEPOINT-TRAP"
                "HALT-TRAP" "IGNORE-ME-SC-NUMBER"
                "IMMEDIATE-SC-NUMBER"
-               #!+inline-constants("CANONICALIZE-INLINE-CONSTANT"
-                                   "INLINE-CONSTANT-VALUE"
-                                   "SORT-INLINE-CONSTANTS"
-                                   "EMIT-INLINE-CONSTANT")
+               ("CANONICALIZE-INLINE-CONSTANT"
+                "INLINE-CONSTANT-VALUE"
+                "SORT-INLINE-CONSTANTS"
+                "EMIT-INLINE-CONSTANT")
+               "HEXDUMP"
                "INSTANCE-DATA-START"
                "INSTANCE-WIDETAG" "INSTANCE-POINTER-LOWTAG"
                "INSTANCE-SLOTS-OFFSET" "INSTANCE-USAGE"
@@ -3154,6 +3172,7 @@ structure representations"
                              "LONG-STACK-SC-NUMBER")
                "LOWTAG-LIMIT" "LOWTAG-MASK"
                "LRA-SAVE-OFFSET"
+               "MAP-ALLOCATED-OBJECTS"
                "MAX-INTERRUPTS"
                #!+c-stack-is-control-stack "MEMORY-FAULT-EMULATION-TRAP"
                "MEMORY-USAGE"
@@ -3199,6 +3218,7 @@ structure representations"
                "SC-NUMBER-LIMIT" "SC-NUMBER-BITS" ; SC-NUMBER in package "SB-C"
                "SC-OFFSET-LIMIT" "SC-OFFSET-BITS" "SC-OFFSET"
                "FINITE-SC-OFFSET-LIMIT" "FINITE-SC-OFFSET-BITS" "FINITE-SC-OFFSET"
+               "FINITE-SC-OFFSET-MAP"
                "SHORT-HEADER-MAX-WORDS"
                "SIGFPE-HANDLER" "SIGNED-REG-SC-NUMBER" "SIGNED-STACK-SC-NUMBER"
                "SIGNED-WORD"
@@ -3251,6 +3271,7 @@ structure representations"
                "SYMBOL-HASH-SLOT" "SYMBOL-WIDETAG" "SYMBOL-NAME-SLOT"
                "SYMBOL-PACKAGE-SLOT" "SYMBOL-INFO-SLOT"
                "SYMBOL-SIZE" "SYMBOL-VALUE-SLOT" "SYMBOL-TLS-INDEX-SLOT"
+               "EXTENDED-SYMBOL-SIZE"
                "*BINDING-STACK-START*"
                "*CONTROL-STACK-START*" "*CONTROL-STACK-END*"
                "CONTROL-STACK-POINTER-VALID-P"
@@ -3282,6 +3303,8 @@ structure representations"
                "UNWIND-BLOCK-SIZE" "VALUE-CELL-WIDETAG" "VALUE-CELL-SIZE"
                "VALUE-CELL-VALUE-SLOT" "VECTOR-DATA-OFFSET" "VECTOR-LENGTH-SLOT"
                "VECTOR-NORMAL-SUBTYPE"
+               "VECTOR-WEAK-SUBTYPE"
+               "VECTOR-WEAK-VISITED-SUBTYPE"
                "VECTOR-VALID-HASHING-SUBTYPE"
                "WEAK-POINTER-NEXT-SLOT"
                "WEAK-POINTER-SIZE" "WEAK-POINTER-WIDETAG"
@@ -3292,15 +3315,15 @@ structure representations"
                "ZERO-SC-NUMBER"))
 
    #s(sb-cold:package-data
-      :name "SB!WALKER"
+      :name "SB-WALKER"
       :doc "internal: a code walker used by PCL"
-      :use ("CL" "SB!INT" "SB!EXT"))
+      :use ("CL" "SB-INT" "SB-EXT"))
 
    #!+sb-eval
    #s(sb-cold:package-data
-      :name "SB!EVAL"
+      :name "SB-EVAL"
       :doc "internal: the evaluator implementation used to execute code without compiling it."
-      :use ("CL" "SB!KERNEL" "SB!EXT")
+      :use ("CL" "SB-KERNEL" "SB-EXT")
       :reexport ("*EVAL-CALLS*")
       :export ("INTERPRETED-FUNCTION"
                "INTERPRETED-FUNCTION-P"
@@ -3320,9 +3343,9 @@ structure representations"
 
    #!+sb-fasteval
    #s(sb-cold:package-data
-      :name "SB!INTERPRETER"
+      :name "SB-INTERPRETER"
       :doc "internal: a new EVAL implementation with semantic preprocessing."
-      :use ("CL" "SB!KERNEL" "SB!EXT" "SB!INT")
+      :use ("CL" "SB-KERNEL" "SB-EXT" "SB-INT")
       :export ("BASIC-ENV"
                "ENV-POLICY"
                "EVAL-IN-ENVIRONMENT"
@@ -3342,19 +3365,20 @@ structure representations"
                "PROTO-FN-NAME"
                "PROTO-FN-PRETTY-ARGLIST"
                "TYPE-CHECK")
-      :import-from (("SB!C"
+      :import-from (("SB-C"
                      "PARSE-EVAL-WHEN-SITUATIONS"
                      "MAKE-GLOBAL-VAR" "MAKE-LAMBDA-VAR"
                      "*LEXENV*")
-                    ("SB!ALIEN" "%HEAP-ALIEN" "ALIEN-VALUE")
-                    ("SB!KERNEL" "%%TYPEP")))
+                    ("SB-VM" "SYMBOL-EXTRA-SLOT-P" "SYMBOL-EXTRA")
+                    ("SB-ALIEN" "%HEAP-ALIEN" "ALIEN-VALUE")
+                    ("SB-KERNEL" "%%TYPEP")))
 
    #!+win32
    #s(sb-cold:package-data
-      :name "SB!WIN32"
+      :name "SB-WIN32"
       :doc "private: a wrapper layer for Win32 functions needed by
 SBCL itself"
-      :use ("CL" "SB!ALIEN" "SB!EXT" "SB!INT" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-EXT" "SB-INT" "SB-SYS")
       :export ("BOOL"
                "CLOSE-HANDLE"
                "CREATE-FILE"

@@ -99,10 +99,6 @@
 (defvar *allow-instrumenting*)
 
 ;;; miscellaneous forward declarations
-;; FIXME: this is a kludge due to the absence of a 'vop' argument
-;; to ALLOCATION-TRAMP in the x86-64 backend.
-#!+immobile-code
-(defvar *code-is-immobile*)
 #!+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
 (defvar *compiler-error-context*)
@@ -118,7 +114,6 @@
 #!+sb-dyncount
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere-label*)
-(defvar *event-info*)
 (defvar *event-note-threshold*)
 (defvar *failure-p*)
 (defvar *source-info*)
@@ -237,8 +232,8 @@ the stack without triggering overflow protection.")
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
 (defvar *debug-name-punt*)
-(defvar *debug-name-sharp*)
-(defvar *debug-name-ellipsis*)
+(define-load-time-global *debug-name-sharp* (make-debug-name-marker))
+(define-load-time-global *debug-name-ellipsis* (make-debug-name-marker))
 
 (defmethod make-load-form ((marker debug-name-marker) &optional env)
   (declare (ignore env))
@@ -262,9 +257,6 @@ the stack without triggering overflow protection.")
          (write-string "..." stream))
         (t
          (write-string "???" stream))))
-
-(setf *debug-name-sharp* (make-debug-name-marker)
-      *debug-name-ellipsis* (make-debug-name-marker))
 
 (declaim (ftype (sfunction () list) name-context))
 (defun debug-name (type thing &optional context)
@@ -332,7 +324,28 @@ the stack without triggering overflow protection.")
 
 ;;; The allocation quantum for boxed code header words.
 ;;; 2 implies an even length boxed header; 1 implies no restriction.
-(defvar code-boxed-words-align (+ 2 #!+(or x86-64) -1))
+(defconstant code-boxed-words-align (+ 2 #!+(or x86 x86-64) -1))
+
+;;; Used as the CDR of the code coverage instrumentation records
+;;; (instead of NIL) to ensure that any well-behaving user code will
+;;; not have constants EQUAL to that record. This avoids problems with
+;;; the records getting coalesced with non-record conses, which then
+;;; get mutated when the instrumentation runs. Note that it's
+;;; important for multiple records for the same location to be
+;;; coalesced. -- JES, 2008-01-02
+(defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%)
+
+;;; Stores the code coverage instrumentation results.
+;;; The CAR is a hashtable. The CDR is a list of weak pointers to code objects
+;;; having coverage marks embedded in the unboxed constants.
+;;; Keys in the hashtable are namestrings, the
+;;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
+;;; for a path that has not been visited, and T for one that has.
+#-sb-xc-host
+(progn
+  (define-load-time-global *code-coverage-info*
+    (list (make-hash-table :test 'equal :synchronized t)))
+  (declaim (type (cons hash-table) *code-coverage-info*)))
 
 (in-package "SB!ALIEN")
 

@@ -171,6 +171,14 @@
                     (make-array (list x) :fill-pointer 0)))
                :allow-warnings t))))
 
+(with-test (:name (make-array :dimensions :unraveling-list))
+  (assert
+   (nth-value 1
+              (checked-compile
+               `(lambda (x)
+                  (make-array (list (list 10)) :adjustable x))
+               :allow-warnings t))))
+
 (with-test (:name :&rest-ref-bad-n)
   (assert
    (nth-value 1
@@ -329,7 +337,8 @@
   (assert (nth-value 3
                      (checked-compile
                       '(lambda () (position 0 '(1 2 0 5 . 5)))
-                      :allow-style-warnings t))))
+                      :allow-style-warnings t
+                      :allow-warnings t))))
 
 (with-test (:name :source-form-context-dotted-list)
   (assert (nth-value 1
@@ -359,3 +368,69 @@
   (checked-compile
    '(lambda (a)
      (search '(0 1 0 2) a :start1 4 :end1 5))))
+
+(with-test (:name :bound-mismatch-union-types)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (x)
+                        (declare ((or (simple-string 10) (simple-string 15)) x))
+                        (aref x 100))
+                      :allow-warnings t))))
+
+(with-test (:name :uses-with-bad-types)
+  (assert (nth-value 3
+                     (checked-compile
+                      '(lambda (x)
+                        (the integer (if x 10)))
+                      :allow-style-warnings t))))
+
+(with-test (:name :constant-modification-local-function)
+  (assert (= (length (nth-value 2
+                                (checked-compile
+                                 '(lambda ()
+                                   (flet ((z (a)
+                                            (setf (aref a 0) 10)))
+                                     (z #(10))
+                                     (z #(a))))
+                                 :allow-warnings t)))
+             2)))
+
+(with-test (:name :improper-list)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (x) (concatenate 'string x '(#\a . #\b)))
+                      :allow-warnings t)))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (x) (concatenate 'list x '(1 2 . 3)))
+                      :allow-warnings t)))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (x) (concatenate 'vector x '(1 2 . 3)))
+                      :allow-warnings t))))
+
+(with-test (:name :improper-list.2)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (member-if #'(lambda (x) (evenp x)) '(1 2 3 . 4)))
+                      :allow-warnings t)))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (x)
+                        (search '(a . b) x))
+                      :allow-warnings t))))
+
+(with-test (:name :call-nil)
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (funcall nil))
+   (() (condition 'undefined-function)))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (if x
+          10
+          (funcall x)))
+   ((nil) (condition 'undefined-function))))

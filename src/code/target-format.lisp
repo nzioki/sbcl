@@ -13,6 +13,66 @@
 
 ;;;; FORMAT
 
+;;; This funcallable instance is used only as plain-old-data (conveying
+;;; just its slots, not the funcallable nature). Being a function, it
+;;; satisfies the type for the format-control argument of FORMAT, ERROR etc.
+;;; Also note that (DEFTYPE FORMAT-CONTROL) = (OR STRING FUNCTION).
+;;; And it's possible that we could decide to install a closure as
+;;; the fin-fun but I don't think that's necessary.
+(sb!kernel::!defstruct-with-alternate-metaclass fmt-control
+  :slot-names (string symbols memo)
+  :constructor %make-fmt-control
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
+
+(declaim (freeze-type fmt-control))
+
+(defmethod print-object ((self fmt-control) stream)
+  (print-unreadable-object (self stream :type t)
+    (write-string (unparse-fmt-control self) stream)))
+
+(defmethod print-object ((x format-directive) stream)
+  (print-unreadable-object (x stream)
+    (let ((fun (directive-function x)))
+      (write-string (directive-string x)
+                    stream
+                    :start (directive-start x)
+                    :end (- (directive-end x) (if fun 1 0)))
+      (when fun
+        (print-symbol-with-prefix stream fun)
+        (write-char #\/ stream)))))
+
+(defun dummy (&rest args) (error "Should not be called: ~S~%" args))
+
+(defun make-fmt-control (string symbols)
+  (let ((f (%make-fmt-control string symbols nil)))
+    (setf (%funcallable-instance-fun f) #'dummy)
+    f))
+
+(defun unparse-fmt-control (fmt)
+  (with-simple-output-to-string (s)
+    (write-char #\" s)
+    (let ((symbols (fmt-control-symbols fmt)))
+      (dolist (piece (tokenize-control-string (fmt-control-string fmt)))
+        (cond ((stringp piece)
+               (if (find #\Newline piece)
+                   (dovector (c piece)
+                     (if (char= c #\newline) (write-string "~%" s) (write-char c s)))
+                   (write-string piece s)))
+              (t
+               (let* ((userfun (eql (directive-character piece) #\/))
+                      (end (- (directive-end piece) (if userfun 1 0))))
+                 (write-string (directive-string piece)
+                               s
+                               :start (directive-start piece)
+                               :end end)
+                 (when userfun
+                   (print-symbol-with-prefix s (pop symbols))
+                   (write-char #\/ s)))))))
+    (write-char #\" s)))
+
 (defun format (destination control-string &rest format-arguments)
   "Provides various facilities for formatting output.
   CONTROL-STRING contains a string to be output, possibly with embedded
@@ -53,53 +113,56 @@
      nil)))
 
 (defun %format (stream string-or-fun orig-args &optional (args orig-args))
-  (if (functionp string-or-fun)
+  (if (and (functionp string-or-fun) (not (typep string-or-fun 'fmt-control)))
       (apply string-or-fun stream args)
       (catch 'up-and-out
         (let* ((string (etypecase string-or-fun
                          (simple-string
                           string-or-fun)
                          (string
-                          (coerce string-or-fun 'simple-string))))
+                          (coerce string-or-fun 'simple-string))
+                         (fmt-control
+                          (fmt-control-string string-or-fun))))
                (*default-format-error-control-string* string)
-               (*logical-block-popper* nil))
-          (interpret-directive-list stream (tokenize-control-string string)
-                                    orig-args args)))))
+               (*logical-block-popper* nil)
+               (tokens
+                (if (functionp string-or-fun)
+                    (or (fmt-control-memo string-or-fun)
+                        ;; Memoize the parse back into the object
+                        (setf (fmt-control-memo string-or-fun)
+                              (%tokenize-control-string
+                               string 0 (length string)
+                               (fmt-control-symbols string-or-fun))))
+                    (tokenize-control-string string))))
+          (interpret-directive-list stream tokens orig-args args)))))
 
 (defun interpret-directive-list (stream directives orig-args args)
-  (if directives
-      (let ((directive (car directives)))
-        (etypecase directive
-          (simple-string
-           (write-string directive stream)
-           (interpret-directive-list stream (cdr directives) orig-args args))
-          (format-directive
-           (multiple-value-bind (new-directives new-args)
-               (let* ((character (format-directive-character directive))
-                      (function
-                       (typecase character
-                         (base-char
-                          (svref *format-directive-interpreters* (char-code character)))))
-                      (*default-format-error-offset*
-                       (1- (format-directive-end directive))))
-                 (unless function
-                   (format-error "Unknown format directive ~@[(character: ~A)~]"
-                                 (char-name character)))
-                 (multiple-value-bind (new-directives new-args)
-                     (funcall function stream directive
-                              (cdr directives) orig-args args)
-                   (values new-directives new-args)))
-             (interpret-directive-list stream new-directives
-                                       orig-args new-args)))))
-      args))
+  (loop
+   (unless directives
+     (return args))
+   (let ((directive (car directives)))
+     (etypecase directive
+      (simple-string
+       (pop directives)
+       (write-string directive stream))
+      (format-directive
+       (let ((function (svref *format-directive-interpreters*
+                              (directive-code directive))))
+         (multiple-value-setq
+          (directives args)
+          (let ((*default-format-error-offset*
+                 (1- (directive-end directive))))
+            (if (functionp function)
+                (funcall function stream directive
+                         (cdr directives) orig-args args)
+                (format-error "Unknown format directive ~@[(character: ~A)~]"
+                              (directive-char-name directive)))))))))))
 
 ;;;; FORMAT directive definition macros and runtime support
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; This macro is used to extract the next argument from the current arg list.
 ;;; This is the version used by format directive interpreters.
-(sb!xc:defmacro next-arg (&optional offset)
+(defmacro next-arg (&optional offset)
   `(progn
      (when (null args)
        (,@(if offset
@@ -110,34 +173,33 @@
        (funcall *logical-block-popper*))
      (pop args)))
 
-(sb!xc:defmacro def-complex-format-interpreter (char lambda-list &body body)
+(defmacro def-complex-format-interpreter (char lambda-list &body body)
   (let ((defun-name
             (intern (format nil
                             "~:@(~:C~)-FORMAT-DIRECTIVE-INTERPRETER"
                             char)))
-        (directive (sb!xc:gensym "DIRECTIVE"))
+        (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (sb!xc:gensym "DIRECTIVES"))))
-    `(progn
-       (defun ,defun-name (stream ,directive ,directives orig-args args)
+    `(setf
+       (aref *format-directive-interpreters* (sb!xc:char-code (char-upcase ,char)))
+       (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
          (declare (ignorable stream orig-args args))
          ,@(if lambda-list
                `((let ,(mapcar (lambda (var)
                                  `(,var
-                                   (,(symbolicate "FORMAT-DIRECTIVE-" var)
-                                    ,directive)))
+                                   (,(symbolicate "DIRECTIVE-" var) ,directive)))
                                (butlast lambda-list))
                    (values (progn ,@body) args)))
                `((declare (ignore ,directive ,directives))
-                 ,@body)))
-       (%set-format-directive-interpreter ,char #',defun-name))))
+                 ,@body))))))
 
-(sb!xc:defmacro def-format-interpreter (char lambda-list &body body)
+(defmacro def-format-interpreter (char lambda-list &body body)
   (let ((directives (sb!xc:gensym "DIRECTIVES")))
     `(def-complex-format-interpreter ,char (,@lambda-list ,directives)
        ,@body
        ,directives)))
 
-(sb!xc:defmacro interpret-bind-defaults (specs params &body body)
+(defmacro interpret-bind-defaults (specs params &body body)
   (once-only ((params params))
     (collect ((bindings))
       (dolist (spec specs)
@@ -156,8 +218,6 @@
             nil (caar ,params)
             "Too many parameters, expected no more than ~W" ,(length specs)))
          ,@body))))
-
-) ; EVAL-WHEN
 
 ;;;; format interpreters and support functions for simple output
 
@@ -288,8 +348,7 @@
                    :start2 src :end2 (+ src commainterval)))
         new-string))))
 
-(eval-when (:compile-toplevel :execute)
-(sb!xc:defmacro interpret-format-integer (base)
+(defmacro interpret-format-integer (base)
   `(if (or colonp atsignp params)
        (interpret-bind-defaults
            ((mincol 0) (padchar #\space) (commachar #\,) (commainterval 3))
@@ -299,7 +358,6 @@
        (let ((*print-base* ,base)
              (*print-radix* nil))
          (princ (next-arg) stream))))
-) ; EVAL-WHEN
 
 (def-format-interpreter #\D (colonp atsignp params)
   (interpret-format-integer 10))
@@ -332,50 +390,50 @@
                   (format-print-ordinal stream arg)
                   (format-print-cardinal stream arg)))))))
 
-(define-load-time-global *cardinal-ones*
+(defconstant +cardinal-ones+
   #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"))
 
-(define-load-time-global *cardinal-tens*
+(defconstant +cardinal-tens+
   #(nil nil "twenty" "thirty" "forty"
         "fifty" "sixty" "seventy" "eighty" "ninety"))
 
-(define-load-time-global *cardinal-teens*
+(defconstant +cardinal-teens+
   #("ten" "eleven" "twelve" "thirteen" "fourteen"  ;;; RAD
     "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
 
-(define-load-time-global *cardinal-periods*
+(defconstant +cardinal-periods+
   #("" " thousand" " million" " billion" " trillion" " quadrillion"
     " quintillion" " sextillion" " septillion" " octillion" " nonillion"
     " decillion" " undecillion" " duodecillion" " tredecillion"
     " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
     " octodecillion" " novemdecillion" " vigintillion"))
 
-(define-load-time-global *ordinal-ones*
+(defconstant +ordinal-ones+
   #(nil "first" "second" "third" "fourth"
         "fifth" "sixth" "seventh" "eighth" "ninth"))
 
-(define-load-time-global *ordinal-tens*
+(defconstant +ordinal-tens+
   #(nil "tenth" "twentieth" "thirtieth" "fortieth"
         "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 
 (defun format-print-small-cardinal (stream n)
   (multiple-value-bind (hundreds rem) (truncate n 100)
     (when (plusp hundreds)
-      (write-string (svref *cardinal-ones* hundreds) stream)
+      (write-string (svref +cardinal-ones+ hundreds) stream)
       (write-string " hundred" stream)
       (when (plusp rem)
         (write-char #\space stream)))
     (when (plusp rem)
       (multiple-value-bind (tens ones) (truncate rem 10)
         (cond ((< 1 tens)
-              (write-string (svref *cardinal-tens* tens) stream)
+              (write-string (svref +cardinal-tens+ tens) stream)
               (when (plusp ones)
                 (write-char #\- stream)
-                (write-string (svref *cardinal-ones* ones) stream)))
+                (write-string (svref +cardinal-ones+ ones) stream)))
              ((= tens 1)
-              (write-string (svref *cardinal-teens* ones) stream))
+              (write-string (svref +cardinal-teens+ ones) stream))
              ((plusp ones)
-              (write-string (svref *cardinal-ones* ones) stream)))))))
+              (write-string (svref +cardinal-ones+ ones) stream)))))))
 
 (defun format-print-cardinal (stream n)
   (cond ((minusp n)
@@ -396,7 +454,7 @@
       (unless (zerop beyond)
         (write-char #\space stream))
       (format-print-small-cardinal stream here)
-      (write-string (svref *cardinal-periods* period) stream))))
+      (write-string (svref +cardinal-periods+ period) stream))))
 
 (defun format-print-ordinal (stream n)
   (when (minusp n)
@@ -410,16 +468,16 @@
       (multiple-value-bind (tens ones) (truncate bot 10)
         (cond ((= bot 12) (write-string "twelfth" stream))
               ((= tens 1)
-               (write-string (svref *cardinal-teens* ones) stream);;;RAD
+               (write-string (svref +cardinal-teens+ ones) stream);;;RAD
                (write-string "th" stream))
               ((and (zerop tens) (plusp ones))
-               (write-string (svref *ordinal-ones* ones) stream))
+               (write-string (svref +ordinal-ones+ ones) stream))
               ((and (zerop ones)(plusp tens))
-               (write-string (svref *ordinal-tens* tens) stream))
+               (write-string (svref +ordinal-tens+ tens) stream))
               ((plusp bot)
-               (write-string (svref *cardinal-tens* tens) stream)
+               (write-string (svref +cardinal-tens+ tens) stream)
                (write-char #\- stream)
-               (write-string (svref *ordinal-ones* ones) stream))
+               (write-string (svref +ordinal-ones+ ones) stream))
               ((plusp number)
                (write-string "th" stream))
               (t
@@ -771,18 +829,12 @@
     (dotimes (i count)
       (write-char #\~ stream))))
 
+;;; We'll only get here when the directive usage is illegal.
+;;; COMBINE-DIRECTIVES would have handled a legal directive.
 (def-complex-format-interpreter #\newline (colonp atsignp params directives)
   (check-modifier '("colon" "at-sign") (and colonp atsignp))
-  (interpret-bind-defaults () params
-    (when atsignp
-      (write-char #\newline stream)))
-  (if (and (not colonp)
-           directives
-           (simple-string-p (car directives)))
-      (cons (string-left-trim *format-whitespace-chars*
-                              (car directives))
-            (cdr directives))
-      directives))
+  (interpret-bind-defaults () params)
+  (bug "Unreachable ~S" directives))
 
 ;;;; format interpreters and support functions for tabs and simple pretty
 ;;;; printing
@@ -983,7 +1035,7 @@
   (let ((close (or (find-directive directives #\} nil)
                    (format-error "No corresponding close brace"))))
     (interpret-bind-defaults ((max-count nil)) params
-      (let* ((closed-with-colon (format-directive-colonp close))
+      (let* ((closed-with-colon (directive-colonp close))
              (posn (position close directives))
              (insides (if (zerop posn)
                           (next-arg)
@@ -1040,7 +1092,7 @@
   (multiple-value-bind (segments first-semi close remaining)
       (parse-format-justification directives)
     (setf args
-          (if (format-directive-colonp close) ; logical block vs. justification
+          (if (directive-colonp close) ; logical block vs. justification
               (multiple-value-bind (prefix per-line-p insides suffix)
                   (parse-format-logical-block segments colonp first-semi
                                               close params string end)
@@ -1058,9 +1110,9 @@
                 ;; ANSI does not explicitly say that an error should
                 ;; be signalled, but the @ modifier is not explicitly
                 ;; allowed for ~> either.
-                (when (format-directive-atsignp close)
+                (when (directive-atsignp close)
                   (format-error-at*
-                   nil (1- (format-directive-end close))
+                   nil (1- (directive-end close))
                    "@ modifier not allowed in close directive of ~
                     justification block (i.e. ~~<...~~@>."
                    '()
@@ -1081,11 +1133,11 @@
           (line-len 0))
       (setf args
             (catch 'up-and-out
-              (when (and first-semi (format-directive-colonp first-semi))
+              (when (and first-semi (directive-colonp first-semi))
                 (interpret-bind-defaults
                     ((extra 0)
                      (len (or (sb!impl::line-length stream) 72)))
-                    (format-directive-params first-semi)
+                    (directive-params first-semi)
                   (setf newline-string
                         (with-simple-output-to-string (stream)
                           (setf args
@@ -1163,7 +1215,8 @@
 ;;;; format interpreter and support functions for user-defined method
 
 (def-format-interpreter #\/ (string start end colonp atsignp params)
-  (let ((symbol (the symbol (extract-user-fun-name string start end))))
+  (let ((symbol (or (directive-function .directive)
+                    (the symbol (extract-user-fun-name string start end)))))
     (collect ((args))
       (dolist (param-and-offset params)
         (let ((param (cdr param-and-offset)))
@@ -1172,3 +1225,10 @@
             (:remaining (args (length args)))
             (t (args param)))))
       (apply symbol stream (next-arg) colonp atsignp (args)))))
+
+(push '("SB-FORMAT"
+        def-format-directive def-complex-format-directive
+        def-format-interpreter def-complex-format-interpreter
+        interpret-bind-defaults interpret-format-integer next-arg
+        %set-format-directive-expander)
+      *!removable-symbols*)

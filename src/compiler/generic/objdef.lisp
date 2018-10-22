@@ -149,9 +149,11 @@
   ;; This is the size of instructions in bytes, not aligned.
   ;; Adding the size from the header and aligned code-size will yield
   ;; the total size of the code-object.
+  ;; The upper 4 bytes in 8-byte words can be used for ancillary data.
   (code-size :type index
              :ref-known (flushable movable)
-             :ref-trans %code-code-size)
+             :ref-trans #!+64-bit %%code-code-size ; serialno + size
+                        #!-64-bit %code-code-size)
   (debug-info :type t
               :ref-known (flushable)
               :ref-trans %code-debug-info
@@ -215,12 +217,6 @@
         :ref-known (flushable)
         :set-trans (setf %simple-fun-info)
         :set-known ())
-  ;; the SB!C::DEBUG-FUN object corresponding to this object, or NIL for none
-  #+nil ; FIXME: doesn't work (gotcha, lowly maintenoid!) See notes on bug 137.
-  (debug-fun :ref-known (flushable)
-             :ref-trans %simple-fun-debug-fun
-             :set-known ()
-             :set-trans (setf %simple-fun-debug-fun))
   (code :rest-p t :c-type "unsigned char"))
 
 #!-(or x86 x86-64)
@@ -249,8 +245,9 @@
   ;; the CLOS slot vector will be in the word 5 bytes past the tagged pointer.
   ;; This shouldn't be too hard to arrange, since nothing needs to know where
   ;; the tagged function lives except the funcallable instance trampoline.
-  (function :ref-known (flushable) :ref-trans %funcallable-instance-function
-            :set-known () :set-trans (setf %funcallable-instance-function))
+  (function :type function
+            :ref-known (flushable) :ref-trans %funcallable-instance-fun
+            :set-known () :set-trans (setf %funcallable-instance-fun))
   (info :rest-p t))
 
 (!define-primitive-object (value-cell :lowtag other-pointer-lowtag
@@ -288,8 +285,11 @@
   (cfp :c-type #!-alpha "lispobj *" #!+alpha "u32")
   #!-(or x86 x86-64) code
   entry-pc
-  #!+win32 next-seh-frame
-  #!+win32 seh-frame-handler)
+  #!+(and win32 x86) next-seh-frame
+  #!+(and win32 x86) seh-frame-handler
+  #!+x86-64 bsp
+  #!+x86-64
+  current-catch)
 
 (!define-primitive-object (catch-block)
   (uwp :c-type #!-alpha "struct unwind_block *" #!+alpha "u32")
@@ -298,8 +298,9 @@
   entry-pc
   #!+(and win32 x86) next-seh-frame
   #!+(and win32 x86) seh-frame-handler
-  tag
-  (previous-catch :c-type #!-alpha "struct catch_block *" #!+alpha "u32"))
+  #!+x86-64 bsp
+  (previous-catch :c-type #!-alpha "struct catch_block *" #!+alpha "u32")
+  tag)
 
 ;;;; symbols
 
@@ -407,14 +408,22 @@
   (stepping)
   ;; END of slots to keep near the beginning.
 
+  ;; TODO: these slots should be accessible using (SIGNED-BYTE 8) displacement
+  ;; from the thread base. We've nearly exhausted small positive indices
+  ;; so the slots will have to precede 'struct thread' in memory.
+  (varyobj-space-addr)
+  (varyobj-card-count)
+  (varyobj-card-marks)
+  (dynspace-addr)
+  (dynspace-card-count)
+  (dynspace-pte-base)
+
   ;; These aren't accessed (much) from Lisp, so don't really care
   ;; if it takes a 4-byte displacement.
   (alien-stack-start :c-type "lispobj *" :pointer t)
   (binding-stack-start :c-type "lispobj *" :pointer t
                        :special *binding-stack-start*)
 
-  #!+sb-thread
-  (os-attr :c-type "pthread_attr_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
   (state-sem :c-type "os_sem_t *" :pointer t)
   #!+(and sb-thread (not sb-safepoint))
@@ -475,16 +484,7 @@
 ;;; that does not map onto a thread slot.
 ;;; Given N thread slots, the tls indices are 0..N-1 scaled by word-shift.
 ;;; This constant is the index prior to scaling.
-(defconstant sb!thread::tls-index-start
-  (+ primitive-thread-object-length
-     ;; x86-64 interrupt contexts precede 'struct thread' so that TLS indices
-     ;; continue without a gap from the offset of the last primitive thread slot
-     ;; up until the TLS-SIZE'th slot (at which point exhaustion occurs).
-     ;;
-     ;; Other backends that haven't been converted over to use that thread memory
-     ;; layout have the interrupt contexts array intruding into the TLS area.
-     ;; That array must be skipped over when computing the next available index.
-     #!-x86-64 (1+ sb!vm:max-interrupts)))
+(defconstant sb!thread::tls-index-start primitive-thread-object-length)
 
 (defmacro make-code-header-word (boxed-nwords)
   `(logior (ash ,boxed-nwords #!+64-bit 32 #!-64-bit n-widetag-bits)

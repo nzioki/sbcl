@@ -565,9 +565,9 @@
                      arg
                      (make-short-values-type
                       (and vars
-                       (loop repeat (nth-value 1 (values-types
+                       (loop for var in vars
+                             repeat (nth-value 1 (values-types
                                                   (lvar-derived-type arg)))
-                             for var in vars
                              collect (leaf-type var))))
                      (lexenv-policy (node-lexenv call)))))))))
   (values))
@@ -987,7 +987,11 @@
     ;; CLAMBDA no longer has an independent existence as an entity
     ;; which calls things or has DFO dependencies.
     (setf (lambda-calls-or-closes clambda) nil)
-
+    ;; Make sure the exits that are no longer non-local are deleted
+    (loop for entry in (lambda-entries home)
+          do (loop for exit in (entry-exits entry)
+                   when (eq (node-home-lambda entry) home)
+                   do (reoptimize-node exit)))
     ;; All of CLAMBDA's ENTRIES belong to HOME now.
     (setf (lambda-entries home)
           (nconc (lambda-entries clambda)
@@ -1024,6 +1028,7 @@
           (derive-node-type use call-type)))
       (substitute-lvar-uses lvar result
                             (and lvar (eq (lvar-uses lvar) call)))))
+
   (values))
 
 ;;; We are converting FUN to be a LET when the call is in a non-tail
@@ -1207,6 +1212,8 @@
              ((csubtypep (single-value-type (node-derived-type use))
                          (leaf-type var))
               (let ((use-component (node-component use)))
+                (propagate-lvar-annotations-to-refs arg var)
+                (update-lvar-dependencies leaf arg)
                 (substitute-leaf-if
                  (lambda (ref)
                    (when (eq (node-component ref) use-component)

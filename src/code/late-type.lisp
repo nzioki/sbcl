@@ -57,28 +57,42 @@
         (funcall method type2 type1)
         (hierarchical-intersection2 type1 type2))))
 
+(defun map-type (function ctype)
+  (labels ((%map (type)
+             (typecase type
+               (compound-type
+                (mapc #'%map (compound-type-types type)))
+               (negation-type (%map (negation-type-type type)))
+               (cons-type
+                (%map (cons-type-car-type type))
+                (%map (cons-type-cdr-type type)))
+               (array-type
+                (%map (array-type-element-type type)))
+               (args-type
+                (mapc #'%map (args-type-required type))
+                (mapc #'%map (args-type-optional type))
+                (when (args-type-rest type)
+                  (%map (args-type-rest type)))
+                (mapc (lambda (x) (%map (key-info-type x)))
+                      (args-type-keywords type))
+                (when (fun-type-p type)
+                  (%map (fun-type-returns type))))
+               (t
+                (funcall function type)))))
+    (%map ctype)
+    nil))
+
 (defun contains-unknown-type-p (ctype)
-  (typecase ctype
-   (unknown-type t)
-   (compound-type (some #'contains-unknown-type-p (compound-type-types ctype)))
-   (negation-type (contains-unknown-type-p (negation-type-type ctype)))
-   (cons-type (or (contains-unknown-type-p (cons-type-car-type ctype))
-                  (contains-unknown-type-p (cons-type-cdr-type ctype))))
-   (array-type (contains-unknown-type-p (array-type-element-type ctype)))
-   (args-type
-    (or (some #'contains-unknown-type-p (args-type-required ctype))
-        (some #'contains-unknown-type-p (args-type-optional ctype))
-        (acond ((args-type-rest ctype) (contains-unknown-type-p it)))
-        (some (lambda (x) (contains-unknown-type-p (key-info-type x)))
-              (args-type-keywords ctype))
-        (and (fun-type-p ctype)
-             (contains-unknown-type-p (fun-type-returns ctype)))))))
+  (map-type (lambda (type)
+              (when (unknown-type-p type)
+                (return-from contains-unknown-type-p t)))
+            ctype))
 
 (defun contains-hairy-type-p (ctype)
-  (typecase ctype
-    (hairy-type t)
-    (compound-type (some #'contains-hairy-type-p (compound-type-types ctype)))
-    (negation-type (contains-hairy-type-p (negation-type-type ctype)))))
+  (map-type (lambda (type)
+              (when (hairy-type-p type)
+                (return-from contains-hairy-type-p t)))
+            ctype))
 
 (defun replace-hairy-type (type)
   (if (contains-hairy-type-p type)
@@ -92,27 +106,27 @@
          (let ((new (replace-hairy-type (negation-type-type type))))
            (if (eq new *universal-type*)
                new
-               (type-negation new)))))
+               (type-negation new))))
+        (t
+         *universal-type*))
       type))
 
 ;; Similar to (NOT CONTAINS-UNKNOWN-TYPE-P), but report that (SATISFIES F)
 ;; is not a testable type unless F is currently bound.
 (defun testable-type-p (ctype)
-  (typecase ctype
-    (unknown-type nil) ; must precede HAIRY because an unknown is HAIRY
-    (hairy-type
-     (let ((spec (hairy-type-specifier ctype)))
-       ;; Anything other than (SATISFIES ...) is testable
-       ;; because there's no reason to suppose that it isn't.
-       (or (neq (car spec) 'satisfies) (fboundp (cadr spec)))))
-    (compound-type (every #'testable-type-p (compound-type-types ctype)))
-    (negation-type (testable-type-p (negation-type-type ctype)))
-    (cons-type (and (testable-type-p (cons-type-car-type ctype))
-                    (testable-type-p (cons-type-cdr-type ctype))))
-    ;; This case could be too strict. I think an array type is testable
-    ;; if the upgraded type is testable. Probably nobody cares though.
-    (array-type (testable-type-p (array-type-element-type ctype)))
-    (t t)))
+  (map-type
+   (lambda (ctype)
+     (typecase ctype
+       (unknown-type
+        (return-from testable-type-p nil)) ; must precede HAIRY because an unknown is HAIRY
+       (hairy-type
+        (let ((spec (hairy-type-specifier ctype)))
+          ;; Anything other than (SATISFIES ...) is testable
+          ;; because there's no reason to suppose that it isn't.
+          (unless (or (neq (car spec) 'satisfies) (fboundp (cadr spec)))
+            (return-from testable-type-p nil))))))
+   ctype)
+  t)
 
 ;;; This is used by !DEFINE-SUPERCLASSES to define the SUBTYPE-ARG1
 ;;; method. INFO is a list of conses
@@ -1445,10 +1459,11 @@
                  (classoid-inherits-from type1 'sequence))
             type2)))
     ((eq type2 *instance-type*)
-     (cond ((not (classoid-p type1)) nil)
-           ((and (not (classoid-non-instance-p type1))
-                 (not (classoid-inherits-from type1 'function)))
-            type2)))
+     (when (and (classoid-p type1)
+                (neq type1 (specifier-type 'function))
+                (not (classoid-non-instance-p type1))
+                (not (classoid-inherits-from type1 'function)))
+       type2))
     ((eq type2 *funcallable-instance-type*)
      (cond ((not (classoid-p type1)) nil)
            ((classoid-non-instance-p type1) nil)
@@ -3234,6 +3249,7 @@ used for a COMPLEX component.~:@>"
          (let ((types (copy-list (union-type-types string-ctype))))
            (and (loop for type in (union-type-types ctype)
                       for matching = (and (array-type-p type)
+                                          (neq (array-type-complexp type) t)
                                           (find type types
                                                 :test #'csubtypep))
                       always matching
@@ -3707,62 +3723,9 @@ used for a COMPLEX component.~:@>"
 
 
 ;;; Return the type that describes all objects that are in X but not
-;;; in Y. If we can't determine this type, then return NIL.
-;;;
-;;; For now, we only are clever dealing with union and member types.
-;;; If either type is not a union type, then we pretend that it is a
-;;; union of just one type. What we do is remove from X all the types
-;;; that are a subtype any type in Y. If any type in X intersects with
-;;; a type in Y but is not a subtype, then we give up.
-;;;
-;;; We must also special-case any member type that appears in the
-;;; union. We remove from X's members all objects that are TYPEP to Y.
-;;; If Y has any members, we must be careful that none of those
-;;; members are CTYPEP to any of Y's non-member types. We give up in
-;;; this case, since to compute that difference we would have to break
-;;; the type from X into some collection of types that represents the
-;;; type without that particular element. This seems too hairy to be
-;;; worthwhile, given its low utility.
+;;; in Y.
 (defun type-difference (x y)
-  (if (and (numeric-type-p x) (numeric-type-p y))
-      ;; Numeric types are easy. Are there any others we should handle like this?
-      (type-intersection x (type-negation y))
-      (let ((x-types (if (union-type-p x) (union-type-types x) (list x)))
-            (y-types (if (union-type-p y) (union-type-types y) (list y))))
-        (collect ((res))
-          (dolist (x-type x-types)
-            (if (member-type-p x-type)
-                (let ((xset (alloc-xset))
-                      (fp-zeroes nil))
-                  (mapc-member-type-members
-                   (lambda (elt)
-                     (multiple-value-bind (ok sure) (ctypep elt y)
-                       (unless sure
-                         (return-from type-difference nil))
-                       (unless ok
-                         (if (fp-zero-p elt)
-                             (pushnew elt fp-zeroes)
-                             (add-to-xset elt xset)))))
-                   x-type)
-                  (unless (and (xset-empty-p xset) (not fp-zeroes))
-                    (res (make-member-type xset fp-zeroes))))
-                (dolist (y-type y-types (res x-type))
-                  (multiple-value-bind (val win) (csubtypep x-type y-type)
-                    (unless win (return-from type-difference nil))
-                    (when val (return))
-                    (when (types-equal-or-intersect x-type y-type)
-                      (return-from type-difference nil))))))
-          (let ((y-mem (find-if #'member-type-p y-types)))
-            (when y-mem
-              (dolist (x-type x-types)
-                (unless (member-type-p x-type)
-                  (mapc-member-type-members
-                   (lambda (member)
-                     (multiple-value-bind (ok sure) (ctypep member x-type)
-                       (when (or (not sure) ok)
-                         (return-from type-difference nil))))
-                   y-mem)))))
-          (apply #'type-union (res))))))
+  (type-intersection x (type-negation y)))
 
 (!def-type-translator array ((:context context)
                              &optional (element-type '*)
@@ -3822,8 +3785,10 @@ used for a COMPLEX component.~:@>"
 
   (!define-type-method (simd-pack :simple-=) (type1 type2)
      (declare (type simd-pack-type type1 type2))
-     (null (set-exclusive-or (simd-pack-type-element-type type1)
-                             (simd-pack-type-element-type type2))))
+     (values
+      (null (set-exclusive-or (simd-pack-type-element-type type1)
+                              (simd-pack-type-element-type type2)))
+      t))
 
   (!define-type-method (simd-pack :simple-subtypep) (type1 type2)
      (declare (type simd-pack-type type1 type2))

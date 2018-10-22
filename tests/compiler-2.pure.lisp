@@ -145,7 +145,7 @@
   (ctu:assert-no-consing (sb-vm:%space-bounds :static))
   (ctu:assert-no-consing (sb-vm:space-bytes :static)))
 
-(with-test (:name (sb-vm::map-allocated-objects :no-consing)
+(with-test (:name (sb-vm:map-allocated-objects :no-consing)
                   :fails-on :cheneygc
                   :skipped-on :interpreter)
   (let ((n 0))
@@ -153,7 +153,7 @@
                        (declare (ignore obj type size))
                        (incf n)))
       (ctu:assert-no-consing
-       (sb-vm::map-allocated-objects #'f :dynamic)
+       (sb-vm:map-allocated-objects #'f :dynamic)
        5))))
 
 (with-test (:name :pack-varints-as-bignum)
@@ -161,7 +161,7 @@
     (let* ((random-numbers (loop repeat (+ (random 20) 3)
                                  collect (1+ (random 4000))))
            (test-list (sort (delete-duplicates random-numbers) #'<))
-           (packed-int (sb-c::pack-code-fixup-locs test-list))
+           (packed-int (sb-c::pack-code-fixup-locs test-list nil))
            (result (make-array 1 :element-type 'sb-ext:word)))
       ;; The packer intrinsically self-checks the packing
       ;; so we don't need to assert anything about that.
@@ -771,6 +771,19 @@
                           `(lambda (x)
                              (declare (optimize (debug 2)))
                              (let ((m "abc"))
+                               (delete x m)))
+                          :allow-warnings 'sb-int:constant-modified)))
+      1)))
+
+(with-test (:name (debug :constant-modification.2))
+  (assert
+   (= (length (nth-value 2
+                         (checked-compile
+                          `(lambda (x)
+                             (declare (optimize (debug 2)))
+                             (let ((m (if x
+                                          "abc"
+                                          "fgh")))
                                (delete x m)))
                           :allow-warnings 'sb-int:constant-modified)))
       1)))
@@ -1413,12 +1426,18 @@
 
 (with-test (:name :type-derivation-hairy-types)
   (checked-compile-and-assert
-      ()
-      `(lambda (n s)
-         (declare (fixnum n))
-         (ash (the (satisfies eval) n)
-              (the (integer * 0) s)))
-    ((1234 -4) 77)))
+   ()
+   `(lambda (n s)
+      (declare (fixnum n))
+      (ash (the (satisfies eval) n)
+           (the (integer * 0) s)))
+   ((1234 -4) 77))
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+      (declare (type (member #c(0.5d0 4.0d0) #c(0 -1)) p))
+      (/ (the (satisfies eval) p)))
+   ((#c(0 -1)) #C(0 1))))
 
 (with-test (:name :assert-lvar-type-intersection)
   (checked-compile-and-assert
@@ -1431,3 +1450,255 @@
   (checked-compile
    '(lambda (x) (declare (optimize speed)) (typep x '(or bignum single-float)))
    :allow-notes nil))
+
+
+(with-test (:name :vertices-best-color/general-default-value)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (declare ((simple-array (complex double-float)) a))
+         (* (aref a 0)
+            (let ((z (aref a 0)))
+              (complex (realpart z) (imagpart z)))))))
+
+(with-test (:name :copy-list-inlined)
+  (let ((f (checked-compile
+            `(lambda (x) (declare (optimize speed)) (copy-list x)))))
+    ;; Should not have a call to COPY-LIST (or anything)
+    (assert (not (ctu:find-code-constants f :type 'sb-kernel:fdefn)))))
+
+(with-test (:name :move-from-fixnum+-1)
+  (checked-compile-and-assert
+   (:allow-notes nil)
+   `(lambda (x)
+      (declare (fixnum x))
+      (1- x))
+   ((0) -1)
+   ((most-positive-fixnum) (1- most-positive-fixnum))
+   ((most-negative-fixnum) (1- most-negative-fixnum)))
+  (checked-compile-and-assert
+   (:allow-notes nil)
+   `(lambda (x)
+      (declare (fixnum x))
+      (1+ x))
+   ((0) 1)
+   ((most-positive-fixnum) (1+ most-positive-fixnum))
+   ((most-negative-fixnum) (1+ most-negative-fixnum)))
+  (checked-compile-and-assert
+   (:allow-notes nil)
+   `(lambda (a x)
+      (declare (fixnum x))
+      (if a
+          10
+          (1+ x)))
+   ((nil 0) 1)
+   ((t 0) 10)
+   ((nil most-positive-fixnum) (1+ most-positive-fixnum))
+   ((nil most-negative-fixnum) (1+ most-negative-fixnum))))
+
+(with-test (:name :coalesce-more-ltn-numbers-constants)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (list 1 1 ,@(make-list 100 :initial-element 'x)))
+    ((1) (make-list 102 :initial-element 1) :test #'equal)))
+
+(with-test (:name (:lambda-var-ref-lvar :multiple-refs))
+  (checked-compile-and-assert
+   ()
+   `(lambda (vector index)
+      (labels ((update (index)
+                 (let ((old (svref vector index)))
+                   (if (eq old 10)
+                       (update index)
+                       old)))
+               (wrap (index)
+                 (update index)))
+        (wrap index)))
+   ((#(1 2 3) 1) 2)))
+
+(with-test (:name :string-type-unparsing)
+  (checked-compile-and-assert
+      ()
+      `(lambda (s)
+         (declare (type (string 1) s))
+         (the (or simple-array (member 1/2 "ba" 0 #\3)) s))
+    ((#1="a") #1#)))
+
+(with-test (:name :primitive-type-function)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (funcall (the (and atom (not null)) x))
+         )
+    ((#'list) nil)
+    (('list) nil)))
+
+(with-test (:name :copyprop-sc-mismatch-between-moves
+            :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (f x)
+              (let ((x (the double-float x)))
+                (values (funcall f x) (> x 1d0)))))))
+    (ctu:assert-no-consing (funcall f #'identity 1d0))))
+
+(with-test (:name :infer-iteration-var-type)
+  (let ((f (checked-compile
+            '(lambda (s)
+              (declare ((integer 1 2) s))
+              (let ((r 16))
+                (loop for i from 16 below 32 by s
+                      do (setf r i))
+                r)))))
+    (assert (equal (sb-impl::%simple-fun-type f)
+                   '(function ((integer 1 2)) (values (integer 16 31) &optional))))))
+
+(with-test (:name :delay-transform-until-constraint-loop)
+  (checked-compile-and-assert
+      ()
+      `(lambda (str)
+         (declare (string str))
+         (when (plusp (length str))
+           (make-array (1- (length str))
+                       :element-type (array-element-type str)
+                       :displaced-to str)))
+    (("abc") "ab" :test #'equal)))
+
+(with-test (:name :lambda-var-ref-lvar-loop)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (labels ((z (a)
+                    (when (>= 0 (the integer a))
+                      (values #'z a))))))
+    (() nil)))
+
+(with-test (:name :vector-length-fill-pointer-type-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (s)
+         (= (length (the (string 1) s)) 1))
+    (((make-array 1 :element-type 'character :fill-pointer 0)) nil)))
+
+(with-test (:name :function-designator-loop)
+  (checked-compile-and-assert
+      ()
+      `(lambda (p1 p3 p4)
+         (declare (type (or (eql #.#'oddp)
+                            (satisfies eval)) p1))
+         (find-if-not p1 nil p3 p4))
+       ((#'oddp :from-end t) nil)))
+
+(with-test (:name :lvar-constants-nested-funs)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (labels ((f (x &optional result)
+                    (if x
+                        (f x result)
+                        (nreverse result))))
+           (f x)))
+      ((nil) nil)))
+
+(with-test (:name :nested-indirect-var-fp-coalescence)
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (let ((x 1)
+            (j 2))
+        (labels ((m ()
+                   (incf x 32)
+                   (incf j 44)
+                   (let ((z 1))
+                     (labels ((m ()
+                                (incf x 32)
+                                (incf z)))
+                       (declare (notinline m))
+                       (m)
+                       (incf j z)))))
+          (declare (notinline m))
+          (m)
+          (values x j))))
+    (() (values 65 48))))
+
+(with-test (:name :non-returning-functions-conflict)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x) (map nil #'error x))
+    ((nil) nil)))
+
+(with-test (:name :array-typep-other-pointer-widetag)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (typep x '(and base-string (not simple-array))))
+    ((10) nil)
+    (((make-array 10 :element-type 'base-char :adjustable t)) t)))
+
+(with-test (:name :constraint-after-checkgen)
+  (let ((v #(10 20)))
+    (checked-compile-and-assert
+        ()
+        `(lambda (p1 p2 p3 p4)
+           (declare (type (satisfies eval) p2)
+                    (type (member :from-end 2) p3))
+           (position p1
+                     (the (member ,v 3) p2)
+                     (the (member 1 :from-end) p3) nil
+                     :test-not p4))
+      ((20 v :from-end #'/=) 1))))
+
+(with-test (:name :cast-multiple-uses-no-dest)
+  (checked-compile-and-assert
+      (:allow-style-warnings t)
+      `(lambda (x)
+         (the integer
+              (when x
+                (if (> x 0) 1 2)))
+         (the integer x))
+    ((23) 23))
+  (checked-compile-and-assert
+      (:allow-style-warnings t)
+      `(lambda (a b)
+         (declare (optimize (debug 1)))
+         (logand
+          (when b
+            (if (> (the integer a) 0) 10 20))
+          0)
+         (the integer b))
+    ((24 23) 23)))
+
+
+(with-test (:name :maybe-delete-exit-after-let-conversion)
+  (checked-compile-and-assert
+      ()
+      `(lambda (m)
+         (flet ((out ()
+                  (flet ((in (a)
+                           (dotimes (i 3 a)
+                             (if m
+                                 (return-from out)
+                                 (return-from out)))
+                           (labels ((f (&optional (a m))
+                                      a
+                                      m)))))
+                    (in (in 10)))))
+
+           (out)
+           33))
+    ((t) 33))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (unwind-protect
+              (flet ((f (a b &optional c)
+                       (values a b c)))
+                (f 1 2 (f 0 0)))))
+    (() (values 1 2 0))))
+
+(with-test (:name :make-array-hairy-cons)
+  (checked-compile-and-assert
+      ()
+      `(lambda (type)
+         (make-array 4 :element-type type))
+    (('(or (cons (satisfies eval)) atom)) #(0 0 0 0) :test #'equalp)))

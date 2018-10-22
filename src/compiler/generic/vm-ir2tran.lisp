@@ -9,7 +9,7 @@
 
 (in-package "SB!C")
 
-(def-alloc %make-structure-instance 1 :structure-alloc
+(def-alloc '%make-structure-instance 1 :structure-alloc
            sb!vm:instance-widetag sb!vm:instance-pointer-lowtag
            nil)
 
@@ -68,6 +68,11 @@
          res)
     (move-lvar-result node block locs lvar)))
 
+(eval-when (:compile-toplevel)
+  ;; Assert correctness of build order. (Need not be exhaustive)
+  #!+(and x86-64 (not (vop-named sb!vm::raw-instance-init/word)))
+  (error "Expected raw-instance-init vops"))
+
 (defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
@@ -106,7 +111,7 @@
                                    (vop ,(sb!kernel::raw-slot-data-init-vop rsd)
                                         node block object arg-tn slot)))
                                (symbol-value rsd-list)))))
-                    (make-case #!+raw-instance-init-vops
+                    (make-case #!+(vop-named sb!vm::raw-instance-init/word)
                                sb!kernel::*raw-slot-data*))))))
            (:dd
             (vop init-slot node block object
@@ -426,3 +431,14 @@
                               :key 'primitive-object-name)))
                '(fill-pointer fill-pointer-p elements data
                  displacement displaced-p displaced-from dimensions)))
+
+(defun emit-gc-barrier-store-p (fun-name)
+  (and (listp fun-name)
+       (eq (car fun-name) 'setf)
+       (member (cadr fun-name)
+               '(%code-debug-info
+                 %code-fixups
+                 %simple-fun-name
+                 %simple-fun-arglist
+                 %simple-fun-type
+                 %simple-fun-info))))

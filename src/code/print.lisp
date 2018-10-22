@@ -248,11 +248,12 @@ variable: an unreadable object representing the error is printed instead.")
       o)))
 
 ;;; guts of PRINT-UNREADABLE-OBJECT
-(defun %print-unreadable-object (object stream type identity &optional body)
+(defun %print-unreadable-object (object stream flags &optional body)
   (declare (type (or null function) body))
   (if *print-readably*
       (print-not-readable-error object stream)
-      (flet ((print-description ()
+      (flet ((print-description (&aux (type (logbitp 0 (truly-the (mod 4) flags)))
+                                      (identity (logbitp 1 flags)))
                (when type
                  (write (type-of object) :stream stream :circle nil
                                          :level nil :length nil)
@@ -457,7 +458,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; fixnum with bits set corresponding to attributes that the
 ;;; character has. At characters have at least one bit set, so we can
 ;;; search for any character with a positive test.
-(defvar *character-attributes*
+(define-load-time-global *character-attributes*
   (make-array 160 ; FIXME
               :element-type '(unsigned-byte 16)
               :initial-element 0))
@@ -492,7 +493,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; lowest base in which that character is a digit.
 (declaim (type (simple-array (unsigned-byte 8) (128)) ; FIXME: range?
                *digit-bases*))
-(defvar *digit-bases*
+(define-load-time-global *digit-bases*
   (make-array 128 ; FIXME
               :element-type '(unsigned-byte 8)))
 
@@ -1531,21 +1532,20 @@ variable: an unreadable object representing the error is printed instead.")
          (%output-integer-in-base exp 10 stream))))
 
 (defun output-float-infinity (x stream)
-  (declare (float x) (stream stream))
-  (cond (*read-eval*
-         (write-string "#." stream))
-        (*print-readably*
-         (return-from output-float-infinity
-           (print-not-readable-error x stream)))
-        (t
-         (write-string "#<" stream)))
-  (write-string "SB-EXT:" stream)
-  (write-string (symbol-name (float-format-name x)) stream)
-  (write-string (if (plusp x) "-POSITIVE-" "-NEGATIVE-")
-                stream)
-  (write-string "INFINITY" stream)
-  (unless *read-eval*
-    (write-string ">" stream)))
+  (declare (stream stream))
+  (let ((symbol (etypecase x
+                  (single-float (if (minusp x)
+                                    'single-float-negative-infinity
+                                    'single-float-positive-infinity))
+                  (double-float (if (minusp x)
+                                    'double-float-negative-infinity
+                                    'double-float-positive-infinity)))))
+    (cond (*read-eval*
+           (write-string "#." stream)
+           (output-symbol symbol (symbol-package symbol) stream))
+          (t
+           (print-unreadable-object (x stream)
+             (output-symbol symbol (symbol-package symbol) stream))))))
 
 (defun output-float-nan (x stream)
   (print-unreadable-object (x stream)
@@ -1622,7 +1622,9 @@ variable: an unreadable object representing the error is printed instead.")
             ((functionp dinfo)
              (format stream "trampoline ~S" dinfo))
             (t
-             (format stream "code object [~D]" (code-n-entries component))
+             (format stream "code~@[ id=~x~] [~D]"
+                     (%code-serialno component)
+                     (code-n-entries component))
              (let ((fun-name (awhen (%code-entry-point component 0)
                                (%simple-fun-name it))))
                (when fun-name
@@ -1717,44 +1719,38 @@ variable: an unreadable object representing the error is printed instead.")
 (defun lowtag-of (x) (logand (get-lisp-obj-address x) sb!vm:lowtag-mask))
 
 (defmethod print-object ((object t) stream)
-  (flet ((output-it (stream)
-          (when (eq object sb!pcl:+slot-unbound+)
-            (print-unreadable-object (object stream)
-              ;; If specifically the unbound marker with 0 data,
-              ;; as opposed to any other unbound marker.
-              (write-string "unbound" stream))
-            (return-from output-it))
-           (print-unreadable-object (object stream :identity t)
-             (let ((lowtag (lowtag-of object)))
-               (case lowtag
-                 (#.sb!vm:other-pointer-lowtag
-                  (let ((widetag (widetag-of object)))
-                    (case widetag
-                      (#.sb!vm:value-cell-widetag
-                       (write-string "value cell " stream)
-                       (output-object (value-cell-ref object) stream))
-                      (#.sb!vm:filler-widetag
-                       (write-string "pad " stream)
-                       (write (1+ (get-header-data object)) :stream stream)
-                       (write-string "w" stream)) ; words
-                      (t
-                       (write-string "unknown pointer object, widetag=" stream)
-                       (output-integer widetag stream 16 t)))))
-                 ((#.sb!vm:fun-pointer-lowtag
-                   #.sb!vm:instance-pointer-lowtag
-                   #.sb!vm:list-pointer-lowtag)
-                  (write-string "unknown pointer object, lowtag=" stream)
-                  (output-integer lowtag stream 16 t))
-                (t
-                 (case (widetag-of object)
-                   (#.sb!vm:unbound-marker-widetag
-                    (write-string "unbound marker" stream))
-                   (t
-                    (write-string "unknown immediate object, lowtag=" stream)
-                    (output-integer lowtag stream 2 t)
-                    (write-string ", widetag=" stream)
-                    (output-integer (widetag-of object) stream 16 t)))))))))
-    (if *print-pretty*
-      ;; This block might not be necessary. Not sure, probably can't hurt.
-        (pprint-logical-block (stream nil) (output-it stream))
-        (output-it stream))))
+  (when (eq object sb!pcl:+slot-unbound+)
+    ;; If specifically the unbound marker with 0 data,
+    ;; as opposed to any other unbound marker.
+    (print-unreadable-object (object stream) (write-string "unbound" stream))
+    (return-from print-object))
+  (print-unreadable-object (object stream :identity t)
+    (let ((lowtag (lowtag-of object)))
+      (case lowtag
+        (#.sb!vm:other-pointer-lowtag
+         (let ((widetag (widetag-of object)))
+           (case widetag
+             (#.sb!vm:value-cell-widetag
+              (write-string "value cell " stream)
+              (output-object (value-cell-ref object) stream))
+             (#.sb!vm:filler-widetag
+              (write-string "pad " stream)
+              (write (1+ (get-header-data object)) :stream stream)
+              (write-string "w" stream)) ; words
+             (t
+              (write-string "unknown pointer object, widetag=" stream)
+              (output-integer widetag stream 16 t)))))
+        ((#.sb!vm:fun-pointer-lowtag
+          #.sb!vm:instance-pointer-lowtag
+          #.sb!vm:list-pointer-lowtag)
+         (write-string "unknown pointer object, lowtag=" stream)
+         (output-integer lowtag stream 16 t))
+        (t
+         (case (widetag-of object)
+           (#.sb!vm:unbound-marker-widetag
+            (write-string "unbound marker" stream))
+           (t
+            (write-string "unknown immediate object, lowtag=" stream)
+            (output-integer lowtag stream 2 t)
+            (write-string ", widetag=" stream)
+            (output-integer (widetag-of object) stream 16 t))))))))

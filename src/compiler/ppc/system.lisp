@@ -196,16 +196,12 @@
     (inst unimp pending-interrupt-trap)))
 
 #!+sb-thread
-(defknown current-thread-offset-sap ((unsigned-byte 64))
-  system-area-pointer (flushable))
-
-#!+sb-thread
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (unsigned-reg) :target sap))
-  (:arg-types unsigned-num)
+  (:args (n :scs (signed-reg) :target sap))
+  (:arg-types signed-num)
   (:policy :fast-safe)
   (:generator 2
     (inst slwi n n word-shift)

@@ -232,7 +232,10 @@
 (define-vop (xep-allocate-frame)
   (:info start-lab)
   (:generator 1
-    (emit-alignment n-lowtag-bits)
+    (let ((nop-kind
+           (shiftf (sb!assem::asmstream-inter-function-padding sb!assem:*asmstream*)
+                   :nop)))
+      (emit-alignment n-lowtag-bits (if (eq nop-kind :nop) #x90 0)))
     (emit-label start-lab)
     ;; Skip space for the function header.
     (inst simple-fun-header-word)
@@ -1333,7 +1336,7 @@
       (inst mov result nil-value)
       (inst jecxz done)
       (inst lea dst (make-ea :dword :base ecx :index ecx))
-      (maybe-pseudo-atomic stack-allocate-p
+      (pseudo-atomic (:elide-if stack-allocate-p)
        (allocation dst dst node stack-allocate-p list-pointer-lowtag)
        ;; Set decrement mode (successive args at lower addresses)
        (inst std)
@@ -1383,8 +1386,7 @@
     (move count supplied)
     ;; SP at this point points at the last arg pushed.
     ;; Point to the first more-arg, not above it.
-    (inst lea context (make-ea :dword :base esp-tn
-                               :index count :scale 1
+    (inst lea context (make-ea :dword :base esp-tn :index count
                                :disp (- (+ (fixnumize fixed) n-word-bytes))))
     (unless (zerop fixed)
       (inst sub count (fixnumize fixed)))))

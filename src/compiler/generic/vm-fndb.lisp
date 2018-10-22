@@ -26,6 +26,7 @@
            #!+sb-unicode character-string-p
            #!+sb-unicode simple-character-string-p
            array-header-p
+           simple-array-header-p
            sequencep extended-sequence-p
            simple-array-p simple-array-nil-p vector-nil-p
            simple-array-unsigned-byte-2-p
@@ -67,8 +68,9 @@
            sb!vm::unbound-marker-p
            simple-fun-p
            closurep
-           funcallable-instance-p)
-  (t) boolean (movable foldable flushable))
+           funcallable-instance-p
+           non-null-symbol-p)
+    (t) boolean (movable foldable flushable))
 
 (defknown #.(loop for (name) in *vector-without-complex-typecode-infos*
                   collect name)
@@ -151,11 +153,15 @@
 (defknown sb!vm::cas-header-data-high
     (t (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32)))
 
-(defknown %array-dimension (t index) index
+(defknown %array-dimension (array index) index
   (flushable))
-(defknown %set-array-dimension (t index index) index
+(defknown %set-array-dimension (array index index) index
   ())
-(defknown %array-rank (t) array-rank
+(defknown %array-rank (array) array-rank
+  (flushable))
+
+#!+x86-64
+(defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
 (defknown sb!kernel::check-array-shape (simple-array list)
@@ -179,6 +185,8 @@
   (foldable flushable))
 (defknown %instance-cas (instance index t t) t ())
 (defknown %instance-ref (instance index) t
+  (flushable always-translatable))
+(defknown (%instance-ref-eq) (instance index t) boolean
   (flushable always-translatable))
 (defknown %instance-set (instance index t) t
   (always-translatable)
@@ -308,19 +316,16 @@
 
 ;;;; debugger support
 
-(defknown current-sp () system-area-pointer (movable flushable))
-(defknown current-fp () system-area-pointer (movable flushable))
+(defknown sb!vm::current-thread-offset-sap (fixnum)
+  system-area-pointer (flushable))
+(defknown (current-sp current-fp) () system-area-pointer (movable flushable))
+(defknown current-fp-fixnum () fixnum (movable flushable))
 (defknown stack-ref (system-area-pointer index) t (flushable))
 (defknown %set-stack-ref (system-area-pointer index t) t ())
 (defknown lra-code-header (t) t (movable flushable))
 (defknown fun-code-header (t) t (movable flushable))
 (defknown %make-lisp-obj (sb!vm:word) t (movable flushable))
 (defknown get-lisp-obj-address (t) sb!vm:word (movable flushable))
-(defknown fun-word-offset (function)
-    (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits
-                        ;; Exclude the layout
-                        #!+(and 64-bit immobile-space) 32))
-    (movable flushable))
 
 ;;;; 32-bit logical operations
 
@@ -448,7 +453,7 @@
 (defknown code-header-ref (t index) t (flushable))
 (defknown code-header-set (t index t) t ())
 
-(defknown fun-subtype (function) (member . #.sb!vm::+fun-header-widetags+)
+(defknown fun-subtype (function) (member . #.sb!vm::+function-widetags+)
   (flushable))
 
 (defknown make-fdefn (t) fdefn (flushable movable))
@@ -489,3 +494,82 @@
                                  (foldable flushable))
 
 (defknown restart-point (t) t ())
+
+;;; formerly in 'float-tran'
+
+(defknown %single-float (real) single-float (movable foldable))
+(defknown %double-float (real) double-float (movable foldable))
+
+(defknown make-single-float ((signed-byte 32)) single-float
+  (movable flushable))
+
+(defknown make-double-float ((signed-byte 32) (unsigned-byte 32)) double-float
+  (movable flushable))
+
+(defknown single-float-bits (single-float) (signed-byte 32)
+  (movable foldable flushable))
+
+(defknown double-float-high-bits (double-float) (signed-byte 32)
+  (movable foldable flushable))
+
+(defknown double-float-low-bits (double-float) (unsigned-byte 32)
+  (movable foldable flushable))
+
+(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %tan-quick)
+          (double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%sin %cos %tanh %sin-quick %cos-quick)
+  (double-float) (double-float -1.0d0 1.0d0)
+  (movable foldable flushable))
+
+(defknown (%asin %atan)
+  (double-float)
+  (double-float #.(coerce (- (/ pi 2)) 'double-float)
+                #.(coerce (/ pi 2) 'double-float))
+  (movable foldable flushable))
+
+(defknown (%acos)
+  (double-float) (double-float 0.0d0 #.(coerce pi 'double-float))
+  (movable foldable flushable))
+
+(defknown (%cosh)
+  (double-float) (double-float 1.0d0)
+  (movable foldable flushable))
+
+(defknown (%acosh %exp %sqrt)
+  (double-float) (double-float 0.0d0)
+  (movable foldable flushable))
+
+(defknown %expm1
+  (double-float) (double-float -1d0)
+  (movable foldable flushable))
+
+(defknown (%hypot)
+  (double-float double-float) (double-float 0d0)
+  (movable foldable flushable))
+
+(defknown (%pow)
+  (double-float double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%atan2)
+  (double-float double-float)
+  (double-float #.(coerce (- pi) 'double-float)
+                #.(coerce pi 'double-float))
+  (movable foldable flushable))
+
+(defknown (%scalb)
+  (double-float double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%scalbn)
+  (double-float (signed-byte 32)) double-float
+  (movable foldable flushable))
+
+(defknown (%log1p)
+  (double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%unary-truncate %unary-round) (real) integer
+  (movable foldable flushable))

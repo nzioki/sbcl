@@ -38,6 +38,26 @@
              ;; check for EQL types and singleton numeric types
              (values (type-singleton-p type))))))
 
+;;; Are all the uses constant?
+(defun constant-lvar-uses-p (thing)
+  (declare (type (or lvar null) thing))
+  (and (lvar-p thing)
+       (let* ((type (lvar-type thing))
+              (principal-lvar (principal-lvar thing))
+              (uses (lvar-uses principal-lvar))
+              leaf)
+         (when (consp uses)
+           (loop for use in uses
+                 always
+                 (and (ref-p use)
+                      (constant-p (setf leaf (ref-leaf use)))
+                      ;; LEAF may be a CONSTANT behind a cast that will
+                      ;; later turn out to be of the wrong type.
+                      ;; And ir1-transforms suffer from this because
+                      ;; they expect LVAR-VALUE to be of a restricted type.
+                      (or (not (lvar-reoptimize principal-lvar))
+                          (ctypep (constant-value leaf) type))))))))
+
 ;;; Return the constant value for an LVAR whose only use is a constant
 ;;; node.
 (declaim (ftype (function (lvar) t) lvar-value))
@@ -52,6 +72,12 @@
           (unless constantp
             (error "~S used on non-constant LVAR ~S" 'lvar-value lvar))
           value))))
+
+(defun lvar-uses-values (lvar)
+  (let ((uses (principal-lvar-use lvar)))
+    (loop for use in uses
+          for leaf = (ref-leaf use)
+          collect (constant-value leaf))))
 
 ;;;; interface for obtaining results of type inference
 
@@ -63,17 +89,17 @@
 ;;; slot is true, just return that value, otherwise recompute and
 ;;; stash the value there.
 (defmacro lvar-type-using (lvar accessor)
-     `(let ((uses (lvar-uses ,lvar)))
-        (cond ((null uses) *empty-type*)
-              ((listp uses)
-               (do ((res (,accessor (first uses))
-                         (values-type-union (,accessor (first current))
-                                            res))
-                    (current (rest uses) (rest current)))
-                   ((or (null current) (eq res *wild-type*))
-                    res)))
-              (t
-               (,accessor uses)))))
+  `(let ((uses (lvar-uses ,lvar)))
+     (cond ((null uses) *empty-type*)
+           ((listp uses)
+            (do ((res (,accessor (first uses))
+                      (values-type-union (,accessor (first current))
+                                         res))
+                 (current (rest uses) (rest current)))
+                ((or (null current) (eq res *wild-type*))
+                 res)))
+           (t
+            (,accessor uses)))))
 
 (defun %lvar-derived-type (lvar)
   (lvar-type-using lvar node-derived-type))
@@ -256,17 +282,20 @@
           (setf (block-reoptimize block) t)
           (reoptimize-component component :maybe))
         (loop for cast in (lvar-dependent-casts lvar)
-              do (setf (node-reoptimize cast) t))))
-    (do-uses (node lvar)
-      (setf (block-type-check (node-block node)) t)))
+              unless (or (not (node-p cast))
+                         (node-deleted cast))
+              do
+              (setf (node-reoptimize cast) t)
+              (setf (block-reoptimize (node-block cast)) t)
+              (reoptimize-component (node-component cast) :maybe)))))
   (values))
 
-(defun reoptimize-lvar-uses (lvar)
-  (declare (type lvar lvar))
-  (do-uses (use lvar)
-    (setf (node-reoptimize use) t)
-    (setf (block-reoptimize (node-block use)) t)
-    (reoptimize-component (node-component use) :maybe)))
+(defun reoptimize-node (node)
+  (let* ((block (node-block node))
+         (component (block-component block)))
+    (setf (node-reoptimize node) t)
+    (reoptimize-component component t)
+    (setf (block-reoptimize block) t)))
 
 ;;; Annotate NODE to indicate that its result has been proven to be
 ;;; TYPEP to RTYPE. After IR1 conversion has happened, this is the
@@ -357,6 +386,7 @@
         for last-block = block
         until (eq block tail)
         do (cond
+             ((not (block-type-check block)))
              ;; We delete blocks when there is either no predecessor or the
              ;; block is in a lambda that has been deleted. These blocks
              ;; would eventually be deleted by DFO recomputation, but doing
@@ -454,83 +484,6 @@
 
   (values))
 
-;;; Try to join with a successor block. If we succeed, we return true,
-;;; otherwise false.
-(defun join-successor-if-possible (block)
-  (declare (type cblock block))
-  (let ((next (first (block-succ block))))
-    (when (block-start next)  ; NEXT is not an END-OF-COMPONENT marker
-      (cond ( ;; We cannot combine with a successor block if:
-             (or
-              ;; the successor has more than one predecessor;
-              (rest (block-pred next))
-              ;; the successor is the current block (infinite loop);
-              (eq next block)
-              ;; the next block has a different cleanup, and thus
-              ;; we may want to insert cleanup code between the
-              ;; two blocks at some point;
-              (not (eq (block-end-cleanup block)
-                       (block-start-cleanup next)))
-              ;; the next block has a different home lambda, and
-              ;; thus the control transfer is a non-local exit.
-              (not (eq (block-home-lambda block)
-                       (block-home-lambda next)))
-              ;; Stack analysis phase wants ENTRY to start a block...
-              (entry-p (block-start-node next))
-              (let ((last (block-last block)))
-                (and (valued-node-p last)
-                     (awhen (node-lvar last)
-                       (or
-                        ;; ... and a DX-allocator to end a block.
-                        (lvar-dynamic-extent it)
-                        ;; ... and for there to be no chance of there
-                        ;; being two successive USEs of the same
-                        ;; multi-valued LVAR in the same block (since
-                        ;; we can only insert cleanup code at block
-                        ;; boundaries, but need to discard
-                        ;; multi-valued LVAR contents before they are
-                        ;; overwritten).
-                        (and (consp (lvar-uses it))
-                             (not (lvar-single-value-p it))))))))
-             nil)
-            (t
-             (join-blocks block next)
-             t)))))
-
-;;; Join together two blocks. The code in BLOCK2 is moved into BLOCK1
-;;; and BLOCK2 is deleted from the DFO. We combine the optimize flags
-;;; for the two blocks so that any indicated optimization gets done.
-(defun join-blocks (block1 block2)
-  (declare (type cblock block1 block2))
-  (let* ((last1 (block-last block1))
-         (last2 (block-last block2))
-         (succ (block-succ block2))
-         (start2 (block-start block2)))
-    (do ((ctran start2 (node-next (ctran-next ctran))))
-        ((not ctran))
-      (setf (ctran-block ctran) block1))
-
-    (unlink-blocks block1 block2)
-    (dolist (block succ)
-      (unlink-blocks block2 block)
-      (link-blocks block1 block))
-
-    (setf (ctran-kind start2) :inside-block)
-    (setf (node-next last1) start2)
-    (setf (ctran-use start2) last1)
-    (setf (block-last block1) last2))
-
-  (setf (block-flags block1)
-        (attributes-union (block-flags block1)
-                          (block-flags block2)))
-
-  (let ((next (block-next block2))
-        (prev (block-prev block2)))
-    (setf (block-next prev) next)
-    (setf (block-prev next) prev))
-
-  (values))
-
 ;;; Delete any nodes in BLOCK whose value is unused and which have no
 ;;; side effects. We can delete sets of lexical variables when the set
 ;;; variable has no references.
@@ -574,10 +527,12 @@
                         (null (leaf-refs var)))
                (flush-dest (set-value node))
                (setf (basic-var-sets var)
-                     (delq node (basic-var-sets var)))
+                     (delq1 node (basic-var-sets var)))
                (unlink-node node))))
           (cast
-           (unless (cast-type-check node)
+           (unless (or (cast-type-check node)
+                       (and (bound-cast-p node)
+                            (bound-cast-check node)))
              (flush-dest (cast-value node))
              (unlink-node node)))))))
 
@@ -829,7 +784,7 @@
         (entry (exit-entry node)))
     (when (and entry
                (eq (node-home-lambda node) (node-home-lambda entry)))
-      (setf (entry-exits entry) (delq node (entry-exits entry)))
+      (setf (entry-exits entry) (delq1 node (entry-exits entry)))
       (if value
           (delete-filter node (node-lvar node) value)
           (unlink-node node)))))
@@ -1008,12 +963,14 @@
                               (and (fun-type-p defined-type)
                                    (not (fun-type-p type))))
                       (validate-call-type node type leaf)))
-                  (binding* ((name (and leaf ;; don't want to transform CASTs
-                                        (lvar-fun-name fun))
-                                   :exit-if-null)
-                             (dxable-args (fun-name-dx-args name) :exit-if-null))
-                    (awhen (dxify-downward-funargs node dxable-args name)
-                      (transform-call node it name)))))))
+                  (if (neq (basic-combination-kind node) kind)
+                      (ir1-optimize-combination node)
+                      (binding* ((name (and leaf ;; don't want to transform CASTs
+                                            (lvar-fun-name fun))
+                                       :exit-if-null)
+                                 (dxable-args (fun-name-dx-args name) :exit-if-null))
+                        (awhen (dxify-downward-funargs node dxable-args name)
+                          (transform-call node it name))))))))
         (:known
          (aver info)
          (clear-reoptimize-args)
@@ -1572,86 +1529,95 @@
 ;;; If there is more than one value, then we transform the call into a
 ;;; VALUES form.
 (defun constant-fold-call (call)
-  (let* ((fun-name (lvar-fun-name (combination-fun call) t))
-         (type (info :function :type fun-name))
-         (args (mapcar (lambda (lvar)
-                         (if (lvar-p lvar)
-                             (let ((name (lvar-fun-name lvar t)))
-                               (if name
-                                   (fdefinition name)
-                                   (lvar-value lvar)))
-                             lvar))
-                       (let ((args (combination-args call)))
-                         (if (fun-type-p type)
-                             (resolve-key-args args type)
-                             args)))))
-    (multiple-value-bind (values win)
-        (careful-call fun-name
-                      args
-                      call
-                      ;; Note: CMU CL had COMPILER-WARN here, and that
-                      ;; seems more natural, but it's probably not.
-                      ;;
-                      ;; It's especially not while bug 173 exists:
-                      ;; Expressions like
-                      ;;   (COND (END
-                      ;;          (UNLESS (OR UNSAFE? (<= END SIZE)))
-                      ;;            ...))
-                      ;; can cause constant-folding TYPE-ERRORs (in
-                      ;; #'<=) when END can be proved to be NIL, even
-                      ;; though the code is perfectly legal and safe
-                      ;; because a NIL value of END means that the
-                      ;; #'<= will never be executed.
-                      ;;
-                      ;; Moreover, even without bug 173,
-                      ;; quite-possibly-valid code like
-                      ;;   (COND ((NONINLINED-PREDICATE END)
-                      ;;          (UNLESS (<= END SIZE))
-                      ;;            ...))
-                      ;; (where NONINLINED-PREDICATE is something the
-                      ;; compiler can't do at compile time, but which
-                      ;; turns out to make the #'<= expression
-                      ;; unreachable when END=NIL) could cause errors
-                      ;; when the compiler tries to constant-fold (<=
-                      ;; END SIZE).
-                      ;;
-                      ;; So, with or without bug 173, it'd be
-                      ;; unnecessarily evil to do a full
-                      ;; COMPILER-WARNING (and thus return FAILURE-P=T
-                      ;; from COMPILE-FILE) for legal code, so we we
-                      ;; use a wimpier COMPILE-STYLE-WARNING instead.
-                      #-sb-xc-host #'compiler-style-warn
-                      ;; On the other hand, for code we control, we
-                      ;; should be able to work around any bug
-                      ;; 173-related problems, and in particular we
-                      ;; want to be alerted to calls to our own
-                      ;; functions which aren't being folded away; a
-                      ;; COMPILER-WARNING is butch enough to stop the
-                      ;; SBCL build itself in its tracks.
-                      #+sb-xc-host #'compiler-warn
-                      "constant folding")
-      (cond ((not win)
-             (setf (combination-kind call) :error))
-            ((and (proper-list-of-length-p values 1))
-             (with-ir1-environment-from-node call
-               (let* ((lvar (node-lvar call))
-                      (prev (node-prev call))
-                      (intermediate-ctran (make-ctran)))
-                 (%delete-lvar-use call)
-                 (setf (ctran-next prev) nil)
-                 (setf (node-prev call) nil)
-                 (reference-constant prev intermediate-ctran lvar
-                                     (first values))
-                 (link-node-to-previous-ctran call intermediate-ctran)
-                 (reoptimize-lvar lvar)
-                 (flush-combination call))))
-            (t (let ((dummies (make-gensym-list (length args))))
-                 (transform-call
-                  call
-                  `(lambda ,dummies
-                     (declare (ignore ,@dummies))
-                     (values ,@(mapcar (lambda (x) `',x) values)))
-                  fun-name))))))
+  (flet ((value (lvar)
+           (if (lvar-p lvar)
+               (let ((name (lvar-fun-name lvar t)))
+                 (if name
+                     (fdefinition name)
+                     (lvar-value lvar)))
+               lvar)))
+   (let* ((fun-name (lvar-fun-name (combination-fun call) t))
+          (type (info :function :type fun-name))
+          (lvar-args (let ((args (combination-args call)))
+                       (if (fun-type-p type)
+                           (resolve-key-args args type)
+                           args)))
+          (args (mapcar #'value lvar-args)))
+     (multiple-value-bind (values win)
+         (careful-call fun-name
+                       args
+                       call
+                       ;; Note: CMU CL had COMPILER-WARN here, and that
+                       ;; seems more natural, but it's probably not.
+                       ;;
+                       ;; It's especially not while bug 173 exists:
+                       ;; Expressions like
+                       ;;   (COND (END
+                       ;;          (UNLESS (OR UNSAFE? (<= END SIZE)))
+                       ;;            ...))
+                       ;; can cause constant-folding TYPE-ERRORs (in
+                       ;; #'<=) when END can be proved to be NIL, even
+                       ;; though the code is perfectly legal and safe
+                       ;; because a NIL value of END means that the
+                       ;; #'<= will never be executed.
+                       ;;
+                       ;; Moreover, even without bug 173,
+                       ;; quite-possibly-valid code like
+                       ;;   (COND ((NONINLINED-PREDICATE END)
+                       ;;          (UNLESS (<= END SIZE))
+                       ;;            ...))
+                       ;; (where NONINLINED-PREDICATE is something the
+                       ;; compiler can't do at compile time, but which
+                       ;; turns out to make the #'<= expression
+                       ;; unreachable when END=NIL) could cause errors
+                       ;; when the compiler tries to constant-fold (<=
+                       ;; END SIZE).
+                       ;;
+                       ;; So, with or without bug 173, it'd be
+                       ;; unnecessarily evil to do a full
+                       ;; COMPILER-WARNING (and thus return FAILURE-P=T
+                       ;; from COMPILE-FILE) for legal code, so we we
+                       ;; use a wimpier COMPILE-STYLE-WARNING instead.
+                       #-sb-xc-host #'compiler-style-warn
+                       ;; On the other hand, for code we control, we
+                       ;; should be able to work around any bug
+                       ;; 173-related problems, and in particular we
+                       ;; want to be alerted to calls to our own
+                       ;; functions which aren't being folded away; a
+                       ;; COMPILER-WARNING is butch enough to stop the
+                       ;; SBCL build itself in its tracks.
+                       #+sb-xc-host #'compiler-warn
+                       "constant folding")
+       (cond ((not win)
+              (setf (combination-kind call) :error))
+             ((and (proper-list-of-length-p values 1))
+              (with-ir1-environment-from-node call
+                (let* ((lvar (node-lvar call))
+                       (prev (node-prev call))
+                       (intermediate-ctran (make-ctran)))
+                  (%delete-lvar-use call)
+                  (setf (ctran-next prev) nil)
+                  (setf (node-prev call) nil)
+                  (reference-constant prev intermediate-ctran lvar
+                                      (first values))
+                  (link-node-to-previous-ctran call intermediate-ctran)
+                  (reoptimize-lvar lvar)
+                  (flush-combination call))))
+             (t (let ((dummies (make-gensym-list (length args))))
+                  (transform-call
+                   call
+                   `(lambda ,dummies
+                      (declare (ignore ,@dummies))
+                      (values ,@(mapcar (lambda (x)
+                                          (let ((lvar
+                                                  (find x lvar-args :key #'value)))
+                                            ;; Don't lose any annotations
+                                            (if (and lvar
+                                                     (lvar-annotations lvar))
+                                                `(with-annotations ,(lvar-annotations lvar) ',x)
+                                                `',x)))
+                                        values)))
+                   fun-name)))))))
   (values))
 
 ;;;; local call optimization
@@ -1778,8 +1744,7 @@
 ;;; the union of the INITIAL-TYPE and the types of all the set
 ;;; values and to a PROPAGATE-TO-REFS with this type.
 (defun propagate-from-sets (var initial-type)
-  (let ((changes (not (csubtypep (lambda-var-last-initial-type var) initial-type)))
-        (types nil))
+  (let ((types nil))
     (dolist (set (lambda-var-sets var))
       (let ((type (lvar-type (set-value set))))
         (push type types)
@@ -1787,14 +1752,11 @@
           (let ((old-type (node-derived-type set)))
             (unless (values-subtypep old-type type)
               (derive-node-type set (make-single-value-type type))
-              (maybe-terminate-block set nil)
-              (setf changes t)))
+              (maybe-terminate-block set nil)))
           (setf (node-reoptimize set) nil))))
-    (when changes
-      (setf (lambda-var-last-initial-type var) initial-type)
-      (let ((res-type (or (maybe-infer-iteration-var-type var initial-type)
-                          (apply #'type-union initial-type types))))
-        (propagate-to-refs var res-type))))
+    (let ((res-type (or (maybe-infer-iteration-var-type var initial-type)
+                        (apply #'type-union initial-type types))))
+      (propagate-to-refs var res-type)))
   (values))
 
 ;;; If a LET variable, find the initial value's type and do
@@ -1848,10 +1810,20 @@
              (dest (lvar-dest lvar))
              (dest-lvar (when (valued-node-p dest) (node-lvar dest))))
     (when (and
-           ;; Think about (LET ((A ...)) (IF ... A ...)): two
-           ;; LVAR-USEs should not be met on one path. Another problem
-           ;; is with dynamic-extent.
-           (eq (lvar-uses lvar) ref)
+           ;; Consider
+           ;; (let ((x (the integer x))
+           ;;       (y (the integer y)))
+           ;;   (print (if c x y)))
+           ;; If both substituted X and Y will write to the same LVAR
+           ;; before C is checked.
+           (or (eq (lvar-uses lvar) ref)
+               ;; Handle a trivial exception when the REF is executed
+               ;; at the very beginning, this helps with optimizing
+               ;; nested IFs.
+               (let* ((next-ctran (node-next (lambda-bind (lambda-var-home var))))
+                      (next-node (and next-ctran
+                                      (ctran-next next-ctran))))
+                 (eq next-node ref)))
            (not (block-delete-p (node-block ref)))
            ;; If the destinatation is dynamic extent, don't substitute unless
            ;; the source is as well.
@@ -1925,7 +1897,7 @@
     (setf (lambda-bind clambda) nil))
   (setf (functional-kind clambda) :zombie)
   (let ((home (lambda-home clambda)))
-    (setf (lambda-lets home) (delete clambda (lambda-lets home))))
+    (setf (lambda-lets home) (delq1 clambda (lambda-lets home))))
   (values))
 
 ;;; This function is called when one of the arguments to a LET
@@ -1967,6 +1939,7 @@
                                          ;; (NODE-DERIVED-TYPE USE) would
                                          ;; be better -- APD, 2003-05-15
                                          (leaf-type var)))
+                     (propagate-lvar-annotations-to-refs arg var)
                      (propagate-to-refs var type)
                      (unless (preserve-single-use-debug-var-p call var)
                        (update-lvar-dependencies leaf arg)
@@ -1986,7 +1959,7 @@
              (not (preserve-single-use-debug-var-p call var))
              (substitute-single-use-lvar arg var)))
        (t
-        (propagate-to-refs var type))))
+         (propagate-to-refs var type))))
    call
    :reoptimize t)
 
@@ -2291,7 +2264,8 @@
   (let ((value (cast-value cast))
         (lvar (cast-lvar cast)))
     (when (and (bound-cast-p cast)
-               (bound-cast-check cast))
+               (bound-cast-check cast)
+               (not (node-deleted (bound-cast-check cast))))
       (flush-combination (bound-cast-check cast))
       (setf (bound-cast-check cast) nil))
     (delete-filter cast lvar value)
@@ -2305,17 +2279,6 @@
   #+sb-xc-host context
   #-sb-xc-host (source-to-string context))
 
-(defun may-delete-function-designator-cast (cast)
-  ;; If the destination is a combination-fun that means the function
-  ;; is called here and not passed somewhere else, there's no longer a
-  ;; need to check the function type, the arguments to the call will
-  ;; do the same job.
-  (let* ((lvar (cast-lvar cast))
-         (dest (and lvar
-                    (lvar-dest lvar))))
-    (and (basic-combination-p dest)
-         (eq (basic-combination-fun dest) lvar))))
-
 (defun may-delete-bound-cast (cast)
   (when (bound-cast-check cast)
     (when (constant-lvar-p (bound-cast-bound cast))
@@ -2327,50 +2290,12 @@
       (setf (bound-cast-check cast) nil)))
   (bound-cast-derived cast))
 
-(defun may-delete-modifying-cast (cast)
-  (or (not (modifying-cast-caller cast)) ;; already warned
-      (let* ((value (cast-value cast))
-             (uses (lvar-uses value))
-             (lvar (or (and (ref-p uses)
-                            (lambda-var-ref-lvar uses))
-                       value)))
-        (when (constant-lvar-p lvar)
-          (let ((*compiler-error-context* cast)
-                (value (lvar-value lvar)))
-            (unless (or (and
-                         (not (consp value))
-                         (not (arrayp value))
-                         (not (type= (cast-asserted-type cast)
-                                     (specifier-type 'hash-table))))
-                        (typep value '(vector * 0)))
-              (warn 'constant-modified
-                    :fun-name (shiftf (modifying-cast-caller cast) nil) ;; warn once
-                    :value value)
-              t))))))
-
-(defun may-delete-cast-with-hook (cast)
-  (or (not (cast-with-hook-hook cast)) ;; run once
-      (let ((value (cast-value cast)))
-        (when (constant-lvar-p value)
-          (let ((*compiler-error-context* cast))
-            (funcall (cast-with-hook-hook cast)
-                     (lvar-value value))
-            ;; Run once
-            (setf (cast-with-hook-hook cast) nil))
-          t))))
-
 (defun may-delete-cast (cast)
   (typecase cast
     (vestigial-exit-cast
      nil)
-    (function-designator-cast
-     (may-delete-function-designator-cast cast))
     (bound-cast
      (may-delete-bound-cast cast))
-    (modifying-cast
-     (may-delete-modifying-cast cast))
-    (cast-with-hook
-     (may-delete-cast-with-hook cast))
     (t t)))
 
 ;;; Delete or move around casts when possible
@@ -2379,21 +2304,17 @@
         (value (cast-value cast)))
     (cond ((not (may-delete-cast cast))
            nil)
-          ((or
-            ;; If it's a call (decided by may-delete-cast), it'll do
-            ;; all the aproriate checking
-            (function-designator-cast-p cast)
-            (values-subtypep (lvar-derived-type value)
-                             (cast-asserted-type cast)))
+          ((values-subtypep (lvar-derived-type value)
+                            (cast-asserted-type cast))
            (delete-cast cast)
            t)
-          ((and (listp (lvar-uses value))
-                lvar)
-           ;; Turn (the vector (if x y #()) into
+          ((listp (lvar-uses value))
+           ;; Turn (the vector (if x y #())) into
            ;; (if x (the vector y) #())
            (let ((atype (cast-asserted-type cast))
                  (ctran (node-next cast))
-                 (dest (lvar-dest lvar))
+                 (dest (and lvar
+                            (lvar-dest lvar)))
                  next-block)
              (collect ((merges))
                (do-uses (use value)
@@ -2409,6 +2330,9 @@
                    (add-lvar-use use lvar)
                    (unlink-blocks (node-block use) (node-block cast))
                    (link-blocks (node-block use) next-block)
+                   ;; At least one use is good, downgrade any possible
+                   ;; type conflicts to style warnings.
+                   (setf (cast-silent-conflict cast) :style-warning)
                    (when (and (return-p dest)
                               (basic-combination-p use)
                               (eq (basic-combination-kind use) :local))
@@ -2448,6 +2372,13 @@
                 (if (cast-silent-conflict cast)
                     (let ((dummy-sym (gensym)))
                       `(let ((,dummy-sym 'dummy))
+                         ,@(and (eq (cast-silent-conflict cast) :style-warning)
+                                `((%compile-time-type-style-warn ,dummy-sym
+                                                                 ',(type-specifier atype)
+                                                                 ',(type-specifier value-type)
+                                                                 ',detail
+                                                                 ',(compile-time-type-error-context context)
+                                                                 ',(cast-context cast))))
                          ,(internal-type-error-call dummy-sym atype
                                                     (cast-context cast))
                          ,dummy-sym))

@@ -58,7 +58,6 @@ extern int kill_safely(os_thread_t os_thread, int signal);
 struct nonpointer_thread_data
 {
 #ifdef LISP_FEATURE_SB_THREAD
-    pthread_attr_t os_attr;
 #ifndef LISP_FEATURE_SB_SAFEPOINT
     os_sem_t state_sem;
     os_sem_t state_not_running_sem;
@@ -202,29 +201,15 @@ extern __thread struct thread *current_thread;
 #define ALT_STACK_SIZE 32 * SIGSTKSZ
 #endif
 
-#ifdef LISP_FEATURE_X86_64
-  #define THREAD_MEMORY_LAYOUT_NEW 1
-  /* Referring to the "old" and "new" pictures in the comment at
-   * create_thread_struct(), observe that in the old scheme the interrupt
-   * contexts are accounted for in dynamic_values_bytes (4K words by default).
-   * In the new, they aren't, so sum them separately in THREAD_STRUCT_SIZE */
-  #define INTERRUPT_CONTEXTS_SIZE (MAX_INTERRUPTS*sizeof(os_context_t*))
-  /* context 0 is the word immediately before the thread struct, and so on.
-   * Pointer subtraction is well-defined in C, but negative indexing is not,
-   * despite the equivalence of *(a+j) and a[j], or so I'm led to believe. */
-  #define nth_interrupt_context(n,thread) *((os_context_t**)thread - 1 - THREAD_CSP_PAGE_SIZE / N_WORD_BYTES - (n))
-#else
-  #define THREAD_MEMORY_LAYOUT_NEW 0
-  #define INTERRUPT_CONTEXTS_SIZE 0
-  // context 0 is the word following the entire thread struct, and so on
-  #define nth_interrupt_context(n,thread) ((os_context_t**)(thread+1))[n]
-#endif
+/* context 0 is the word immediately before the thread struct, and so on. */
+#define nth_interrupt_context(n,thread) \
+      ((os_context_t**)((char*)thread - THREAD_CSP_PAGE_SIZE))[-(n+1)]
 
 #define THREAD_STRUCT_SIZE (thread_control_stack_size + BINDING_STACK_SIZE + \
                             ALIEN_STACK_SIZE +                          \
                             sizeof(struct nonpointer_thread_data) +     \
+                            (MAX_INTERRUPTS*sizeof(os_context_t*)) +    \
                             dynamic_values_bytes +                      \
-                            INTERRUPT_CONTEXTS_SIZE +                   \
                             ALT_STACK_SIZE +                            \
                             THREAD_ALIGNMENT_BYTES +                    \
                             THREAD_CSP_PAGE_SIZE)
@@ -237,13 +222,15 @@ static inline void* calc_altstack_base(struct thread* thread) {
     return ((char*) thread) + dynamic_values_bytes
         + ALIGN_UP(sizeof (struct nonpointer_thread_data), N_WORD_BYTES);
 }
+static inline void* calc_altstack_end(struct thread* thread) {
+    return (char*)thread->os_address + THREAD_STRUCT_SIZE;
+}
 static inline int calc_altstack_size(struct thread* thread) {
     // 'end' is calculated as exactly the end address we got from the OS.
     // The usually ends up making the stack slightly larger than ALT_STACK_SIZE
     // bytes due to the addition of THREAD_ALIGNMENT_BYTES of padding.
     // If the memory was as aligned as we'd like, the padding is ours to keep.
-    char *thread_memory_end = (char*)thread->os_address + THREAD_STRUCT_SIZE;
-    return thread_memory_end - (char*)calc_altstack_base(thread);
+    return (char*)calc_altstack_end(thread) - (char*)calc_altstack_base(thread);
 }
 #if defined(LISP_FEATURE_WIN32)
 static inline struct thread* arch_os_get_current_thread()
@@ -297,7 +284,7 @@ static inline struct thread *arch_os_get_current_thread(void)
 #endif
 }
 
-inline static int lisp_thread_p(os_context_t *context) {
+inline static int lisp_thread_p(os_context_t __attribute__((unused)) *context) {
 #ifdef LISP_FEATURE_SB_THREAD
     return pthread_getspecific(lisp_thread) != NULL;
 #elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)

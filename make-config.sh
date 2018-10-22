@@ -44,7 +44,8 @@ bad_option() {
 
 WITH_FEATURES=""
 WITHOUT_FEATURES=""
-FANCY_FEATURES=":sb-core-compression :sb-xref-for-internals :sb-after-xc-core"
+FANCY_FEATURES=":sb-core-compression :sb-xref-for-internals"
+BUILD_FEATURES=""
 
 fancy=false
 some_options=false
@@ -59,7 +60,7 @@ do
         optarg=`expr "X$option" : '[^=]*=\(.*\)'` || optarg_ok=false
         option=`expr "X$option" : 'X\([^=]*=\).*'`
         ;;
-      --with*)
+      --with*|--build*)
         optarg=`expr "X$option" : 'X--[^-]*-\(.*\)'` \
             || bad_option "Malformed feature toggle: $option"
         option=`expr "X$option" : 'X\(--[^-]*\).*'`
@@ -98,8 +99,12 @@ do
 	;;
       --fancy)
         WITH_FEATURES="$WITH_FEATURES $FANCY_FEATURES"
+        BUILD_FEATURES="$BUILD_FEATURES :sb-after-xc-core"
         # Lower down we add :sb-thread for platforms where it can be built.
         fancy=true
+        ;;
+      --build)
+        BUILD_FEATURES="$BUILD_FEATURES :$optarg"
         ;;
       -*)
         bad_option "Unknown command-line option to $0: \"$option\""
@@ -278,12 +283,6 @@ case `uname` in
     Linux)
         sbcl_os="linux"
         ;;
-    OSF1)
-        # it's changed name twice since it was called OSF/1: clearly
-        # the marketers forgot to tell the engineers about Digital Unix
-        # _or_ OSF/1 ...
-        sbcl_os="osf1"
-        ;;
     *BSD)
         case `uname` in
             FreeBSD)
@@ -444,6 +443,13 @@ else
     esac
 fi
 
+bf=`pwd`/build-features.lisp-expr
+echo //initializing $bf
+echo ';;;; This is a machine-generated file.' > $bf
+echo ';;;; Please do not edit it by hand.' >> $bf
+echo ';;;; See make-config.sh.' >> $bf
+echo "($BUILD_FEATURES)" >> $bf
+
 ltf=`pwd`/local-target-features.lisp-expr
 echo //initializing $ltf
 echo ';;;; This is a machine-generated file.' > $ltf
@@ -454,14 +460,6 @@ echo "(lambda (features) (set-difference (union features (list$WITH_FEATURES " >
 printf ":%s" "$sbcl_arch" >> $ltf
 
 echo //setting up OS-dependent information
-# Under Darwin x86-64, guess whether Darwin 9+ or below.
-if [ "$sbcl_os" = "darwin" ] && [ "$sbcl_arch" = "x86-64" ]; then
-    darwin_version=`uname -r`
-    darwin_version_major=${DARWIN_VERSION_MAJOR:-${darwin_version%%.*}}
-    if (( 8 < $darwin_version_major )); then
-	printf ' :inode64 :darwin9-or-better' >> $ltf
-    fi
-fi
 
 original_dir=`pwd`
 cd ./src/runtime/
@@ -500,14 +498,6 @@ case "$sbcl_os" in
         link_or_copy Config.$sbcl_arch-linux Config
         link_or_copy $sbcl_arch-linux-os.h target-arch-os.h
         link_or_copy linux-os.h target-os.h
-        ;;
-    osf1)
-        printf ' :unix' >> $ltf
-        printf ' :elf' >> $ltf
-        printf ' :osf1' >> $ltf
-        link_or_copy Config.$sbcl_arch-osf1 Config
-        link_or_copy $sbcl_arch-osf1-os.h target-arch-os.h
-        link_or_copy osf1-os.h target-os.h
         ;;
     hpux)
         printf ' :unix' >> $ltf
@@ -575,6 +565,12 @@ case "$sbcl_os" in
         fi
         if [ $sbcl_arch = "x86-64" ]; then
             printf ' :mach-exception-handler :ud2-breakpoints' >> $ltf
+            darwin_version=`uname -r`
+            darwin_version_major=${DARWIN_VERSION_MAJOR:-${darwin_version%%.*}}
+    
+            if (( 8 < $darwin_version_major )); then
+	        printf ' :inode64' >> $ltf
+            fi
         fi
         link_or_copy $sbcl_arch-darwin-os.h target-arch-os.h
         link_or_copy bsd-os.h target-os.h
@@ -651,12 +647,11 @@ cd "$original_dir"
 # similar with :STACK-GROWS-FOOWARD, too. -- WHN 2002-03-03
 if [ "$sbcl_arch" = "x86" ]; then
     printf ' :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack' >> $ltf
-    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop :raw-instance-init-vops' >> $ltf
+    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :alien-callbacks :cycle-counter :inline-constants' >> $ltf
-    printf ' :memory-barrier-vops :multiply-high-vops :ash-right-vops :symbol-info-vops' >> $ltf
-    printf ' :fp-and-pc-standard-save :raw-signed-word' >> $ltf
+    printf ' :alien-callbacks :cycle-counter' >> $ltf
+    printf ' :fp-and-pc-standard-save' >> $ltf
     case "$sbcl_os" in
     linux | freebsd | gnu-kfreebsd | netbsd | openbsd | sunos | darwin | win32 | dragonfly)
         printf ' :linkage-table' >> $ltf
@@ -672,13 +667,13 @@ if [ "$sbcl_arch" = "x86" ]; then
     fi
 elif [ "$sbcl_arch" = "x86-64" ]; then
     printf ' :64-bit :64-bit-registers :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack :linkage-table' >> $ltf
-    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop :raw-instance-init-vops' >> $ltf
-    printf ' :fp-and-pc-standard-save :unbind-n-vop' >> $ltf
+    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop' >> $ltf
+    printf ' :fp-and-pc-standard-save' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :alien-callbacks :cycle-counter :complex-float-vops :raw-signed-word' >> $ltf
-    printf ' :float-eql-vops :integer-eql-vop :inline-constants :memory-barrier-vops' >> $ltf
-    printf ' :multiply-high-vops :sb-simd-pack :ash-right-vops :symbol-info-vops' >> $ltf
+    printf ' :alien-callbacks :cycle-counter' >> $ltf
+    printf ' :float-eql-vops :integer-eql-vop' >> $ltf
+    printf ' :sb-simd-pack' >> $ltf
     printf ' :undefined-fun-restarts :call-symbol' >> $ltf
     case "$sbcl_os" in
     linux | darwin | *bsd)
@@ -692,8 +687,8 @@ elif [ "$sbcl_arch" = "mips" ]; then
 elif [ "$sbcl_arch" = "ppc" ]; then
     printf ' :gencgc :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :linkage-table :raw-instance-init-vops :memory-barrier-vops' >> $ltf
-    printf ' :compare-and-swap-vops :multiply-high-vops :alien-callbacks' >> $ltf
+    printf ' :linkage-table' >> $ltf
+    printf ' :compare-and-swap-vops :alien-callbacks' >> $ltf
     if [ "$sbcl_os" = "linux" ]; then
         # Use a C program to detect which kind of glibc we're building on,
         # to bandage across the break in source compatibility between
@@ -713,6 +708,16 @@ elif [ "$sbcl_arch" = "ppc" ]; then
             exit 1
 	fi
     fi
+elif [ "$sbcl_arch" = "ppc64" ]; then
+    printf ' :64-bit :64-bit-registers' >> $ltf
+    printf ' :gencgc :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
+    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
+    printf ' :linkage-table' >> $ltf
+    printf ' :compare-and-swap-vops :alien-callbacks' >> $ltf
+    # there is no glibc bug that requires the 'where-is-mcontext' hack.
+    # (Sufficiently new glibc uses the correct definition, which is the same as
+    # 2.3.1, so define our constant for that)
+    echo '#define GLIBC231_STYLE_UCONTEXT 1' > src/runtime/ppc-linux-mcontext.h
 elif [ "$sbcl_arch" = "sparc" ]; then
     # Test the compiler in order to see if we are building on Sun
     # toolchain as opposed to GNU binutils, and write the appropriate
@@ -749,19 +754,17 @@ elif [ "$sbcl_arch" = "arm" ]; then
     # possibly VFPv2 and higher only), but we'll leave the obvious
     # hooks in for someone to add the support later.
     printf ' :arm-vfp :arm-vfpv2' >> $ltf
-    printf ' :ash-right-vops :multiply-high-vops :symbol-info-vops' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
     printf ' :unwind-to-frame-and-call-vop' >> $ltf
     printf ' :fp-and-pc-standard-save' >> $ltf
 elif [ "$sbcl_arch" = "arm64" ]; then
     printf ' :64-bit :64-bit-registers :gencgc :linkage-table :fp-and-pc-standard-save' >> $ltf
-    printf ' :alien-callbacks :inline-constants' >> $ltf
-    printf ' :ash-right-vops :multiply-high-vops :symbol-info-vops' >> $ltf
+    printf ' :alien-callbacks' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
-    printf ' :unbind-n-vop :unwind-to-frame-and-call-vop :raw-signed-word' >> $ltf
-    printf ' :compare-and-swap-vops :memory-barrier-vops :undefined-fun-restarts' >> $ltf
+    printf ' :unwind-to-frame-and-call-vop' >> $ltf
+    printf ' :compare-and-swap-vops :undefined-fun-restarts' >> $ltf
 else
     # Nothing need be done in this case, but sh syntax wants a placeholder.
     echo > /dev/null

@@ -164,8 +164,6 @@
   (bitmap +layout-all-tagged+ :type layout-bitmap)
   ;; Per-slot comparator for implementing EQUALP.
   (equalp-tests #() :type simple-vector)
-  ;; Definition location
-  (source-location nil)
   ;; If this layout is for an object of metatype STANDARD-CLASS,
   ;; these are the EFFECTIVE-SLOT-DEFINITION metaobjects.
   (slot-list nil :type list)
@@ -174,6 +172,10 @@
   ;; See MAKE-SLOT-TABLE in pcl/slots-boot.lisp for further details.
   (slot-table #(1 nil) :type simple-vector))
 (declaim (freeze-type layout))
+
+(declaim (inline layout-for-std-class-p))
+(defun layout-for-std-class-p (x)
+  (logtest (layout-%flags x) +pcl-object-layout-flag+))
 
 #!+(and immobile-space (host-feature sb-xc))
 (macrolet ((def-layout-maker ()
@@ -230,6 +232,9 @@
   (state nil :type (member nil :read-only :sealed))
   ;; direct superclasses of this class. Always NIL for CLOS classes.
   (direct-superclasses () :type list)
+  ;; Definition location
+  ;; Not used for standard-classoid, because pcl has its own mechanism.
+  (source-location nil)
   ;; representation of all of the subclasses (direct or indirect) of
   ;; this class. This is NIL if no subclasses or not initalized yet;
   ;; otherwise, it's an EQ hash-table mapping CLASSOID objects to the
@@ -240,6 +245,32 @@
   ;; we don't just call it the CLASS slot) object for this class, or
   ;; NIL if none assigned yet
   (pcl-class nil))
+
+;;; A helper to make classoid (and named-type) hash values stable.
+;;; For other ctypes, generally improve the randomness of the hash.
+;;; (The host uses at most 21 bits of randomness. See CTYPE-RANDOM)
+#+sb-xc
+(defun !improve-ctype-hash (obj type-class-name)
+  (let ((hash (case type-class-name
+                (named
+                 (interned-type-hash (named-type-name obj) 'named))
+                (classoid
+                 (interned-type-hash (classoid-name obj)))
+                (t
+                 (interned-type-hash))))
+        ;; Preserve the interned-p and type=-optimization bits
+        ;; by affecting only bits under the ctype-hash-mask.
+        ;; Upper 5 hash bits might be an index into SAETP array
+        ;; (if this ctype is exactly a type to which upgrade occurs)
+        (nbits (- (integer-length +ctype-hash-mask+)
+                  +ctype-saetp-index-bits+)))
+    (macrolet ((slot-index ()
+                 (let* ((dd (find-defstruct-description 'ctype))
+                        (dsd (find 'hash-value (dd-slots dd) :key #'dsd-name)))
+                   (dsd-index dsd))))
+      (setf (%instance-ref obj (slot-index))
+            (dpb hash (byte nbits 0) (type-hash-value obj)))))
+  obj)
 
 ;;;; object types to represent classes
 
@@ -262,7 +293,7 @@
 ;;; translated classes, only their translation.
 (def!struct (built-in-classoid (:include classoid)
                                (:copier nil)
-                               (:constructor make-built-in-classoid))
+                               (:constructor !make-built-in-classoid))
   ;; the type we translate to on parsing. If NIL, then this class
   ;; stands on its own; or it can be set to :INITIALIZING for a period
   ;; during cold-load.
@@ -270,7 +301,8 @@
 
 (def!struct (condition-classoid (:include classoid)
                                 (:copier nil)
-                                (:constructor make-condition-classoid))
+                                (:constructor %make-condition-classoid
+                                    (hash-value name)))
   ;; list of CONDITION-SLOT structures for the direct slots of this
   ;; class
   (slots nil :type list)
@@ -294,6 +326,8 @@
   ;; Values for these slots must be computed in the dynamic
   ;; environment of MAKE-CONDITION.
   (hairy-slots nil :type list))
+(defun make-condition-classoid (&key name)
+  (%make-condition-classoid (interned-type-hash name) name))
 
 ;;;; classoid namespace
 
@@ -346,7 +380,8 @@
 ;;; FUNCALLABLE-STANDARD-CLASS.
 (def!struct (standard-classoid (:include classoid)
                                (:copier nil)
-                               (:constructor make-standard-classoid)))
+                               (:constructor make-standard-classoid))
+  old-layouts)
 ;;; a metaclass for classes which aren't standardlike but will never
 ;;; change either.
 (def!struct (static-classoid (:include classoid)

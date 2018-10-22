@@ -98,7 +98,7 @@ means to wait indefinitely.")
 (declaim (inline split-ratio-for-sleep))
 (defun split-ratio-for-sleep (seconds)
   (declare (ratio seconds)
-           (muffle-conditions t))
+           (muffle-conditions compiler-note))
   (multiple-value-bind (quot rem) (truncate (numerator seconds)
                                             (denominator seconds))
     (values quot
@@ -109,7 +109,7 @@ means to wait indefinitely.")
                      '(* 10 (truncate 100000000 (denominator seconds))))))))
 
 (defun split-seconds-for-sleep (seconds)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   ;; KLUDGE: This whole thing to avoid consing floats
   (flet ((split-float ()
            (let ((whole-seconds (truly-the fixnum (%unary-truncate seconds))))
@@ -635,7 +635,14 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
             ;; odd. But maybe there *is* a valid reason in some
             ;; circumstances? perhaps some deadlock issue when being driven
             ;; by another process or something...)
-            (force-output *standard-output*))
+            (force-output *standard-output*)
+            (let ((real (maybe-resolve-synonym-stream *standard-output*)))
+              ;; Because by default *standard-output* is not
+              ;; *terminal-io* but STDOUT the column is not reset
+              ;; after pressing enter. Reduce confusion by resetting
+              ;; the column to 0
+              (when (fd-stream-p real)
+                (setf (fd-stream-output-column real) 0))))
           (let* ((form (funcall *repl-read-form-fun*
                                 *standard-input*
                                 *standard-output*))

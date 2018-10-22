@@ -53,7 +53,8 @@
 ;;;     ((:or :macro (:match "$EARLY-") (:match "$BOOT-"))
 ;;;     (declare (optimize (speed 0))))))
 ;;;
-(let ((sources (with-open-file (f "build-order.lisp-expr")
+(let ((sources (with-open-file (f (merge-pathnames "../../build-order.lisp-expr"
+                                                   *load-pathname*))
                  (let ((*features* (cons :warm-build-phase *features*)))
                    (read f))))
       (sb-c::*handled-conditions* sb-c::*handled-conditions*))
@@ -71,12 +72,10 @@
                 (output
                   (compile-file-pathname stem
                    :output-file
-                   ;; Specifying the directory name for :OUTPUT-FILE is enough.
-                   ;; It does the right thing. (Does it work on Windows? I hope so)
-                   (concatenate
+                   (merge-pathnames
+                    (concatenate
                      'string sb-fasl::*!target-obj-prefix*
-                     ;; OR: (namestring (make-pathname :directory (pathname-directory stem)))
-                     (subseq stem 0 (1+ (position #\/ stem :from-end t)))))))
+                     (subseq stem 0 (1+ (position #\/ stem :from-end t))))))))
            (flet ((report-recompile-restart (stream)
                     (format stream "Recompile file ~S" stem))
                   (report-continue-restart (stream)

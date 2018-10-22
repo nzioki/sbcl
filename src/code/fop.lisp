@@ -60,35 +60,22 @@
                  (error ,(format nil "Not-host fop invoked: ~A" name)))))
        (!%define-fop ',name ,fop-code ,(length operands) ,(if pushp 1 0)))))
 
-(defun !%define-fop (name base-opcode n-operands pushp)
+(defun !%define-fop (name opcode n-operands pushp)
   (declare (type (mod 4) n-operands))
-  ;; If at least one non-stack operand is present, the same fop function
-  ;; appears in 4 consecutive cells in the fop table, with the low 2 bits
-  ;; of the fopcode determining the number of additional bytes to read
-  ;; for the first operand. The second and third operands are varint-encoded.
-  (let ((n-slots (if (plusp n-operands) 4 1)))
-    (unless (zerop (mod base-opcode n-slots))
-      (error "Opcode for fop ~S must be a multiple of ~D" name n-slots))
-    (loop for opcode from base-opcode below (+ base-opcode n-slots)
-          for function = (svref **fop-funs** opcode)
-          when (functionp function)
-          do (let ((oname (nth-value 2 (function-lambda-expression function))))
-               (when (and oname (not (eq oname name)))
-                 (error "fop ~S with opcode ~D conflicts with fop ~S."
-                        name opcode oname))))
+  (let ((function (svref **fop-funs** opcode)))
+    (when (functionp function)
+      (let ((oname (nth-value 2 (function-lambda-expression function))))
+        (when (and oname (not (eq oname name)))
+          (error "fop ~S with opcode ~D conflicts with fop ~S."
+                 name opcode oname))))
     (let ((existing-opcode (get name 'opcode)))
-      (when (and existing-opcode (/= existing-opcode base-opcode))
+      (when (and existing-opcode (/= existing-opcode opcode))
         (error "multiple codes for fop name ~S: ~D and ~D"
-               name base-opcode existing-opcode)))
-    (setf (get name 'opcode) base-opcode)
-    ;; The low 2 bits of the opcode comprise the length modifier if there is
-    ;; at least one non-stack integer operand.
-    ;; If there is more than 1, they follow, using varint encoding.
-    (dotimes (j n-slots)
-      (let ((opcode (+ base-opcode j)))
-        (setf (svref **fop-funs** opcode) (symbol-function name)
-              (aref (car **fop-signatures**) opcode) n-operands
-              (sbit (cdr **fop-signatures**) opcode) pushp))))
+               name opcode existing-opcode)))
+    (setf (get name 'opcode) opcode
+          (svref **fop-funs** opcode) (symbol-function name)
+          (aref (car **fop-signatures**) opcode) n-operands
+          (sbit (cdr **fop-signatures**) opcode) pushp))
   name)
 
 ;;; a helper function for reading string values from FASL files: sort
@@ -295,7 +282,8 @@
 ;;; Load a signed integer LENGTH bytes long from FASL-INPUT-STREAM.
 (defun load-s-integer (length fasl-input-stream)
   (declare (fixnum length)
-           (optimize speed))
+           (optimize speed)
+           #-sb-xc-host (muffle-conditions compiler-note))
   (with-fast-read-byte ((unsigned-byte 8) fasl-input-stream)
     (do* ((index length (1- index))
           (byte 0 (fast-read-byte))
@@ -547,15 +535,16 @@
 ;;; fasl file header.)
 
 ;; Cold-load calls COLD-LOAD-CODE instead
-(!define-fop #xE0 :not-host (fop-load-code ((:operands n-code-bytes n-boxed-words)))
+(!define-fop #xE0 :not-host (fop-load-code ((:operands immobile-p
+                                                       n-boxed-words
+                                                       n-code-bytes)))
   (let ((n-constants (- n-boxed-words sb!vm:code-constants-offset)))
-    ;; stack has (at least) N-CONSTANTS words plus 2 more: toplevel-p and debug-info
-    (with-fop-stack ((stack (operand-stack)) ptr (+ n-constants 2))
+    ;; stack has (at least) N-CONSTANTS words plus debug-info
+    (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
       (let* ((debug-info-index (+ ptr n-constants))
-             (immobile-p (svref stack (1+ debug-info-index)))
              (n-boxed-words (+ sb!vm:code-constants-offset n-constants))
              (code (sb!c:allocate-code-object
-                    immobile-p
+                    (if (eql immobile-p 1) :immobile :dynamic)
                     (align-up n-boxed-words sb!c::code-boxed-words-align)
                     n-code-bytes)))
         (setf (%code-debug-info code) (svref stack debug-info-index))
@@ -565,6 +554,11 @@
         (with-pinned-objects (code)
           (read-n-bytes (fasl-input-stream) (code-instructions code) 0 n-code-bytes)
           (sb!c::apply-fasl-fixups stack code))
+        #-sb-xc-host
+        (when (typep (code-header-ref code (1- n-boxed-words))
+                     '(cons (eql sb!c::coverage-map)))
+          ;; Record this in the global list of coverage-instrumented code.
+          (atomic-push (make-weak-pointer code) (cdr *code-coverage-info*)))
         code))))
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
@@ -589,7 +583,7 @@
     (setf (%simple-fun-name fun) name)
     (setf (%simple-fun-arglist fun) arglist)
     (setf (%simple-fun-type fun) type)
-    (setf (%simple-fun-info fun) info)
+    (apply #'set-simple-fun-info fun info)
     fun))
 
 ;;;; Some Dylan FOPs used to live here. By 1 November 1998 the code

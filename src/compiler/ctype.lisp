@@ -56,7 +56,6 @@
 (defvar *unwinnage-detected*)
 
 ;;; Signal a warning if appropriate and set *FOO-DETECTED*.
-(declaim (ftype (function (string &rest t) (values)) note-lossage note-unwinnage))
 (defun note-lossage (format-string &rest format-args)
   (setq *lossage-detected* t)
   (when *lossage-fun*
@@ -859,8 +858,7 @@ and no value was provided for it." name))))))))))
                         (when (and unwinnage-fun
                                    (not (csubtypep (leaf-type var) type)))
                           (funcall unwinnage-fun
-                                   #.(#+sb-xc sb!impl::!xc-preprocess-format-control
-                                      #-sb-xc identity
+                                   (sb!format:tokens
                                       "Assignment to argument: ~S~%  ~
                                        prevents use of assertion from function ~
                                        type ~A:~% ~/sb!impl:print-type/~%")
@@ -994,33 +992,16 @@ and no value was provided for it." name))))))))))
                    unknown-keys)
           (funcall unknown-keys-fun))))))
 
-(defun assert-modifying-lvar-type (lvar type caller policy)
+(defun assert-array-index-lvar-type (lvar type policy)
   (let ((internal-lvar (make-lvar))
         (dest (lvar-dest lvar)))
     (substitute-lvar internal-lvar lvar)
     (with-ir1-environment-from-node dest
-      (let ((cast (make-modifying-cast
+      (let ((cast (make-array-index-cast
                    :asserted-type type
                    :type-to-check (maybe-weaken-check type policy)
                    :value lvar
-                   :derived-type (coerce-to-values type)
-                   :caller caller)))
-        (%insert-cast-before dest cast)
-        (use-lvar cast internal-lvar)
-        t))))
-
-(defun assert-cast-with-hook (lvar type policy
-                              hook)
-  (let ((internal-lvar (make-lvar))
-        (dest (lvar-dest lvar)))
-    (substitute-lvar internal-lvar lvar)
-    (with-ir1-environment-from-node dest
-      (let ((cast (make-cast-with-hook
-                   :asserted-type type
-                   :type-to-check (maybe-weaken-check type policy)
-                   :value lvar
-                   :derived-type (coerce-to-values type)
-                   :hook hook)))
+                   :derived-type (coerce-to-values type))))
         (%insert-cast-before dest cast)
         (use-lvar cast internal-lvar)
         t))))
@@ -1028,19 +1009,27 @@ and no value was provided for it." name))))))))))
 (defun apply-type-annotation (fun-name arg type lvars policy &optional annotation)
   (case (car annotation)
     (function-designator
-     (assert-function-designator fun-name lvars arg (cdr annotation))
+     (assert-function-designator fun-name lvars arg (cdr annotation) policy)
      t)
-    (modifying
-     (if (policy policy (> check-constant-modification 0))
-         (assert-modifying-lvar-type arg type fun-name policy)
-         (assert-lvar-type arg type policy)))
-    (type-specifier
-     (assert-cast-with-hook arg type policy
-                            (lambda (value)
-                              (unless (and (eql value :default)
-                                           (eq fun-name 'open))
-                                (compiler-specifier-type value)))))
     (t
+     (case (car annotation)
+       (modifying
+        (when (policy policy (> check-constant-modification 0))
+          (add-annotation arg
+                          (make-lvar-modified-annotation :caller fun-name))))
+       (type-specifier
+        (add-annotation arg
+                        (make-lvar-type-spec-annotation
+                         :hook
+                         (lambda (value)
+                           (unless (and (eql value :default)
+                                        (eq fun-name 'open))
+                             (compiler-specifier-type value))))))
+       ((proper-list proper-sequence
+                     proper-or-circular-list proper-or-dotted-list)
+        (add-annotation arg
+                        (make-lvar-proper-sequence-annotation
+                         :kind (car annotation)))))
      (assert-lvar-type arg type policy))))
 
 ;;; Assert that CALL is to a function of the specified TYPE. It is
@@ -1180,7 +1169,7 @@ and no value was provided for it." name))))))))))
                        :format-control
                        "~@<Constant ~2I~_~S ~Iconflicts with its ~
                             asserted type ~
-                            ~2I~_~/sb!impl::print-type-specifier/.~@:>"
+                            ~2I~_~/sb!impl:print-type-specifier/.~@:>"
                        :format-arguments (list (constant-form-value detail) atype))
                  (warn condition
                        :format-control
@@ -1212,3 +1201,16 @@ and no value was provided for it." name))))))))))
                                  (lvar-value detail)
                                  :cast-context (lvar-value cast-context))
   (ir2-convert-full-call node block))
+
+(defoptimizer (%compile-time-type-style-warn ir2-convert)
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context block))
+  ;; Remove %COMPILE-TIME-TYPE-ERROR bits
+  (setf (node-source-path node)
+        (cddr (node-source-path node)))
+  (%compile-time-type-error-warn node
+                                 (lvar-value atype)
+                                 (lvar-value dtype)
+                                 (lvar-value detail)
+                                 :cast-context (lvar-value cast-context)
+                                 :condition 'type-style-warning))

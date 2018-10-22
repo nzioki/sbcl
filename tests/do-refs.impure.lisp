@@ -33,7 +33,7 @@
 (test-util:with-test (:name :walk-slots-numbers
                       :fails-on :interpreter)
   (let ((c #c(45d0 33d0)))
-    (walk-slots-test c '(45d0 33d0)))
+    (walk-slots-test c nil))
   (let ((r 22/7))
     (walk-slots-test r '(22 7))))
 
@@ -110,14 +110,13 @@
   (let* ((slot-vals '("A" "B" "C" "D" "E" "F"))
          (f (apply (compile nil '(lambda (&rest args)
                                   (let ((ctor (apply #'sb-pcl::%make-ctor args)))
-                                    (setf (%funcallable-instance-function ctor) #'error)
+                                    (setf (%funcallable-instance-fun ctor) #'error)
                                     ctor)))
                    slot-vals)))
     (walk-slots-test f `(,(find-layout 'sb-pcl::ctor) ,#'error ,@slot-vals))))
 
 #+sb-fasteval
-(test-util:with-test (:name :walk-slots-interpreted-fun
-                      :fails-on :interpreter)
+(test-util:with-test (:name :walk-slots-interpreted-fun)
   (let ((f (let ((sb-ext:*evaluator-mode* :interpret))
              (eval '(lambda (x y z))))))
     (funcall f 1 2 3) ; compute the digested slots
@@ -168,3 +167,12 @@
     (assert (= tot-bytes (* 16 n-word-bytes)))
     ;; 2 conses and 1 bit-vector
     (assert (= n-kids 3))))
+
+(defvar *some-symbol* 'a)
+(test-util:with-test (:name :symbol-refs
+                      :fails-on :interpreter)
+  (sb-int:collect ((results))
+    (let ((*some-symbol* 'b))
+      (do-referenced-object ('*some-symbol* results)))
+    (assert (eq (first (results)) #+sb-thread 'a
+                                  #-sb-thread 'b))))

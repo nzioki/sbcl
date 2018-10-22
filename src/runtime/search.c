@@ -10,6 +10,7 @@
  */
 
 #include <string.h>
+#include <ctype.h>
 
 #include "sbcl.h"
 #include "runtime.h"
@@ -42,40 +43,31 @@ search_static_space(void *pointer)
     return gc_search_space(start, pointer);
 }
 
-boolean search_for_type(int type, lispobj **start, int *count)
+static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, unsigned char* b,
+                                                     boolean ignore_case)
 {
-    lispobj obj;
-
-    while ((*count == -1 || (*count > 0)) &&
-           gc_managed_addr_p((lispobj)*start)) {
-        obj = **start;
-        if (*count != -1)
-            *count -= 2;
-
-        if (widetag_of(obj) == type)
-            return 1;
-
-        (*start) += 2;
-    }
-    return 0;
-}
-
-static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, char* b)
-{
-  int i = 0;
+    int i = 0;
 
   // Lisp terminates UCS4 strings with NULL bytes - probably to no avail
   // since null-terminated UCS4 isn't a common convention for any foreign ABI -
   // but length has been pre-checked, so hitting an ASCII null is a win.
-  while (a[i] == ((unsigned char*)b)[i])
-    if (b[i] == 0)
-      return 0;
-    else
-      ++i;
-  return a[i] - b[i]; // same return convention as strcmp()
+    if (ignore_case) {
+        while (toupper(a[i]) == toupper(b[i]))
+            if (b[i] == 0)
+                return 0;
+            else
+                ++i;
+    } else {
+        while (a[i] == b[i])
+            if (b[i] == 0)
+                return 0;
+            else
+                ++i;
+    }
+    return a[i] - b[i]; // same return convention as strcmp()
 }
 
-lispobj* search_for_symbol(char *name, lispobj start, lispobj end)
+lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignore_case)
 {
     lispobj* where = (lispobj*)start;
     lispobj* limit = (lispobj*)end;
@@ -84,17 +76,18 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end)
 
     while (where < limit) {
         lispobj word = *where;
-        if (widetag_of(word) == SYMBOL_WIDETAG &&
+        if (header_widetag(word) == SYMBOL_WIDETAG &&
             lowtag_of((symbol = (struct symbol *)where)->name) == OTHER_POINTER_LOWTAG) {
             struct vector *symbol_name = VECTOR(symbol->name);
             if (gc_managed_addr_p((lispobj)symbol_name) &&
-                ((widetag_of(symbol_name->header) == SIMPLE_BASE_STRING_WIDETAG
+                ((widetag_of(&symbol_name->header) == SIMPLE_BASE_STRING_WIDETAG
                   && symbol_name->length == namelen
-                  && !strcmp((char *)symbol_name->data, name))
+                  && !(ignore_case ? strcasecmp : strcmp)((char *)symbol_name->data, name))
 #ifdef LISP_FEATURE_SB_UNICODE
-                 || (widetag_of(symbol_name->header) == SIMPLE_CHARACTER_STRING_WIDETAG
+                 || (widetag_of(&symbol_name->header) == SIMPLE_CHARACTER_STRING_WIDETAG
                      && symbol_name->length == namelen
-                     && !strcmp_ucs4_ascii((uint32_t*)symbol_name->data, name))
+                     && !strcmp_ucs4_ascii((uint32_t*)symbol_name->data,
+                                           (unsigned char*)name, ignore_case))
 #endif
                  ))
                 return where;
@@ -118,7 +111,7 @@ struct symbol* lisp_symbol_from_tls_index(lispobj tls_index)
     while (1) {
         while (where < end) {
             lispobj header = *where;
-            int widetag = widetag_of(header);
+            int widetag = header_widetag(header);
             if (widetag == SYMBOL_WIDETAG &&
                 tls_index_of(((struct symbol*)where)) == tls_index)
                 return (struct symbol*)where;
@@ -136,7 +129,7 @@ struct symbol* lisp_symbol_from_tls_index(lispobj tls_index)
 static boolean sym_stringeq(lispobj sym, const char *string, int len)
 {
     struct vector* name = VECTOR(SYMBOL(sym)->name);
-    return widetag_of(name->header) == SIMPLE_BASE_STRING_WIDETAG
+    return widetag_of(&name->header) == SIMPLE_BASE_STRING_WIDETAG
         && name->length == make_fixnum(len)
         && !memcmp(name->data, string, len);
 }
@@ -151,9 +144,9 @@ static lispobj* search_package_symbols(lispobj package, char* symbol_name,
     for (iteration = 1; iteration <= 2; ++iteration) {
         struct instance* symbols = (struct instance*)
           native_pointer(table_selector ? pkg->external_symbols : pkg->internal_symbols);
-        gc_assert(widetag_of(symbols->header) == INSTANCE_WIDETAG);
+        gc_assert(widetag_of(&symbols->header) == INSTANCE_WIDETAG);
         struct vector* cells = VECTOR(symbols->slots[INSTANCE_DATA_START]);
-        gc_assert(widetag_of(cells->header) == SIMPLE_VECTOR_WIDETAG);
+        gc_assert(widetag_of(&cells->header) == SIMPLE_VECTOR_WIDETAG);
         lispobj namelen = strlen(symbol_name);
         int cells_length = fixnum_value(cells->length);
         int index = *hint >> 1;
@@ -163,7 +156,7 @@ static lispobj* search_package_symbols(lispobj package, char* symbol_name,
         do {
             lispobj thing = cells->data[index];
             if (lowtag_of(thing) == OTHER_POINTER_LOWTAG
-                && widetag_of(SYMBOL(thing)->header) == SYMBOL_WIDETAG
+                && widetag_of(&SYMBOL(thing)->header) == SYMBOL_WIDETAG
                 && sym_stringeq(thing, symbol_name, namelen)) {
                 *hint = (index << 1) | table_selector;
                 return (lispobj*)SYMBOL(thing);
@@ -199,7 +192,7 @@ lispobj* find_symbol(char* symbol_name, char* package_name, unsigned int* hint)
         lispobj element = cells->data[LFHASH_KEY_OFFSET+i];
         if (is_lisp_pointer(element)) {
             struct vector* string = (struct vector*)native_pointer(element);
-            if (widetag_of(string->header) == SIMPLE_BASE_STRING_WIDETAG
+            if (widetag_of(&string->header) == SIMPLE_BASE_STRING_WIDETAG
                 && string->length == make_fixnum(namelen)
                 && !memcmp(string->data, package_name, namelen)) {
                 element = cells->data[LFHASH_KEY_OFFSET+n+i];

@@ -19,16 +19,13 @@
     (#.sb!vm:closure-widetag
      (%closure-fun function))
     (#.sb!vm:funcallable-instance-widetag
-     ;; %FUNCALLABLE-INSTANCE-FUNCTION is not known to return a FUNCTION.
-     ;; Is that right? Shouldn't we always initialize to something
-     ;; that is a function, such as an error-signaling trampoline?
-     (%fun-fun (%funcallable-instance-function function)))
+     (%fun-fun (%funcallable-instance-fun function)))
     (t function)))
 
-(define-load-time-global **closure-names**
+(define-load-time-global **closure-extra-values**
     (make-hash-table :test 'eq :weakness :key :synchronized t))
 
-(macrolet ((namedp-bit () #x800000)
+(macrolet ((extendedp-bit () #x800000)
            (%closure-index-set (closure index val)
              ;; Use the identical convention as %CLOSURE-INDEX-REF for the index.
              ;; There are no closure slot setters, and in fact SLOT-SET
@@ -42,21 +39,21 @@
              `(sap-ref-word (int-sap (get-lisp-obj-address ,closure))
                             (- sb!vm:fun-pointer-lowtag))))
 
-  ;;; Assign CLOSURE a NEW-NAME and return the closure (NOT the new name!).
-  ;;; If PERMIT-COPY is true, this function may return a copy of CLOSURE
+  ;;; Assign CLOSURE a new name and/or docstring in VALUES, and return the
+  ;;; closure. If PERMIT-COPY is true, this function may return a copy of CLOSURE
   ;;; to avoid using a global hashtable. We prefer to store the name in the
   ;;; closure itself, which is possible in two cases:
   ;;; (1) if the closure has a padding slot due to alignment constraints,
   ;;;     the padding slot holds the name.
   ;;; (2) if it doesn't, but the caller does not care about identity,
   ;;;     then a copy of the closure with extra slots reduces to case (1).
-  (defun set-closure-name (closure permit-copy new-name)
+  (defun set-closure-extra-values (closure permit-copy data)
     (declare (closure closure))
     (let ((payload-len (get-closure-length (truly-the function closure)))
-          (namedp (logtest (with-pinned-objects (closure)
-                             (closure-header-word closure))
-                           (namedp-bit))))
-      (when (and (not namedp) permit-copy (oddp payload-len))
+          (extendedp (logtest (with-pinned-objects (closure)
+                                (closure-header-word closure))
+                              (extendedp-bit))))
+      (when (and (not extendedp) permit-copy (oddp payload-len))
         ;; PAYLOAD-LEN includes the trampoline, so the number of slots we would
         ;; pass to %COPY-CLOSURE is 1 less than that, were it not for
         ;; the fact that we actually want to create 1 additional slot.
@@ -83,10 +80,10 @@
                                     sb!vm::thread-function-layout-slot))
                           #!+(and immobile-space 64-bit (not sb-thread))
                           (get-lisp-obj-address sb!vm:function-layout)
-                          (namedp-bit)
+                          (extendedp-bit)
                           (closure-header-word copy)))
             ;; We copy only if there was no padding, which means that adding 1 slot
-            ;; physically added 2 slots. You might think that the name goes in the
+            ;; physically adds 2 slots. You might think that the added data go in the
             ;; first new slot, followed by padding. Nope! Take an example of a
             ;; closure header specifying 3 words, which we increase to 4 words,
             ;; which is 5 with the header, which is 6 aligned to a doubleword:
@@ -96,36 +93,81 @@
             ;;   word 3: 00000000203AA51F = #<thing2> ] 4 payload slots.
             ;;   word 4: 0000000000000000 = 0         ]
             ;;   word 5: 00000010019E2B9F = NAME    <-- name goes here
-            ;; This makes CLOSURE-NAME consistent (which is to say, work at all).
-            (%closure-index-set copy payload-len new-name)
-            (return-from set-closure-name copy))))
+            ;; CLOSURE-EXTRA-VALUES always reads 1 word past the stated payload size
+            ;; regardless of whether the closure really captured the implied
+            ;; number of closure values.
+            (%closure-index-set copy payload-len data)
+            (return-from set-closure-extra-values copy))))
       (unless (with-pinned-objects (closure)
-                (unless namedp ; Set the header bit
+                (unless extendedp ; Set the header bit
                   (setf (closure-header-word closure)
-                        (logior (namedp-bit) (closure-header-word closure))))
+                        (logior (extendedp-bit) (closure-header-word closure))))
                 (when (evenp payload-len)
-                  (%closure-index-set closure (1- payload-len) new-name)
+                  (%closure-index-set closure (1- payload-len) data)
                   t))
-        (setf (gethash closure **closure-names**) new-name)))
+        (setf (gethash closure **closure-extra-values**) data)))
     closure)
-
-  ;;; Access the name of CLOSURE. Secondary value is whether it had a name.
-  ;;; Following the convention established by SET-CLOSURE-NAME,
-  ;;; an even-length payload takes the last slot for the name,
-  ;;; and an odd-length payload uses the global hashtable.
-  (defun closure-name (closure)
+  (defun pack-closure-extra-values (name docstring)
+    ;; Return one of:
+    ;;   (a) Just a name => NAME
+    ;;   (b) Just a docstring => DOCSTRING
+    ;;   (c) Both => (NAME . DOCSTRING)
+    ;; Always choose to store both if (a) or (b) would be ambiguous.
+    ;; The reason for carefully distinguishing between NIL and unbound is that
+    ;; if exactly one part is present, the generalized accessor for the other
+    ;; part should report whatever the underlying simple-fun does.
+    ;; i.e. setting docstring does not cause (%FUN-NAME CLOSURE) to be NIL.
+    (cond ((or (and (not (unbound-marker-p name))
+                    (not (unbound-marker-p docstring)))
+               (typep name '(or string null (cons t (or string null)))))
+           (cons name docstring))
+          ((unbound-marker-p docstring) name)
+          (t docstring)))
+  (defun closure-extra-values (closure &aux (unbound (make-unbound-marker)))
+    ;; Return name and documentation of closure as two values.
+    ;; Either or both can be the unbound marker.
+    ;; Following the convention established by SET-CLOSURE-EXTRA-VALUES,
+    ;; an even-length payload takes the last slot for the name,
+    ;; and an odd-length payload uses the global hashtable.
     (declare (closure closure))
     (with-pinned-objects (closure)
-      (if (not (logtest (closure-header-word closure) (namedp-bit)))
-          (values nil nil)
+      (if (not (logtest (closure-header-word closure) (extendedp-bit)))
+          (values unbound unbound)
           ;; CLOSUREP doesn't imply FUNCTIONP, so GET-CLOSURE-LENGTH
           ;; issues an additional check. Silly.
-          (let ((len (get-closure-length (truly-the function closure))))
-            ;; GET-CLOSURE-LENGTH counts the 'fun' slot in the length,
-            ;; but %CLOSURE-INDEX-REF starts indexing from the value slots.
-            (if (oddp len)
-                (gethash closure **closure-names**) ; returns name and T
-                (values (%closure-index-ref closure (1- len)) t)))))))
+          (let* ((len (get-closure-length (truly-the function closure)))
+                 (data
+                  ;; GET-CLOSURE-LENGTH counts the 'fun' slot in the length,
+                  ;; but %CLOSURE-INDEX-REF starts indexing from the value slots.
+                  (if (oddp len)
+                      (gethash closure **closure-extra-values** 0)
+                      (%closure-index-ref closure (1- len)))))
+            ;; There can be a concurrency glitch, because the 'extended' flag is
+            ;; toggled to indicate that extra data are present before the data
+            ;; are written; so there's a window where NAME looks like 0. That could
+            ;; be fixed in the setter, or caught here, but it shouldn't matter.
+            (typecase data
+             ((cons t (or string null (satisfies unbound-marker-p)))
+              (values (car data) (cdr data)))
+             ;; NIL represents an explicit docstring of NIL, not the name.
+             ((or string null) (values unbound data))
+             (t (values data unbound)))))))
+  ;; Return T if and only if CLOSURE has extra values that are physically
+  ;; in the object, not in the external hash-table.
+  (defun closure-has-extra-values-slot-p (closure)
+    (declare (closure closure))
+    (with-pinned-objects (closure)
+      (and (logtest (closure-header-word closure) (extendedp-bit))
+           (evenp (get-closure-length (truly-the function closure)))))))
+
+(defconstant +closure-name-index+ 0)
+(defconstant +closure-doc-index+ 1)
+;; Preserve absence of value in the other extra "slot" when setting either.
+(defun set-closure-name (closure permit-copy name)
+  (set-closure-extra-values
+   closure permit-copy
+   (pack-closure-extra-values
+    name (nth-value +closure-doc-index+ (closure-extra-values closure)))))
 
 ;;; a SETFable function to return the associated debug name for FUN
 ;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
@@ -133,9 +175,9 @@
 (defun %fun-name (function)
   (case (fun-subtype function)
     (#.sb!vm:closure-widetag
-     (multiple-value-bind (name namedp) (closure-name (truly-the closure function))
-       (when namedp
-         (return-from %fun-name name))))
+     (let ((val (nth-value +closure-name-index+ (closure-extra-values function))))
+       (unless (unbound-marker-p val)
+         (return-from %fun-name val))))
     (#.sb!vm:funcallable-instance-widetag
      (typecase (truly-the funcallable-instance function)
        (generic-function
@@ -289,40 +331,6 @@
              (bug "bogus INFO for ~S: ~S" simple-fun info)))))
   doc)
 
-(defun %fun-doc (function)
-  (typecase function
-    #!+sb-fasteval
-    (sb!interpreter:interpreted-function
-     (sb!interpreter:proto-fn-docstring (sb!interpreter:fun-proto-fn function)))
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (sb!eval:interpreted-function-documentation function))
-    (t
-     (when (closurep function)
-       (multiple-value-bind (name namedp) (closure-name function)
-         (when namedp
-           (return-from %fun-doc (random-documentation name 'function)))))
-     (%simple-fun-doc (%fun-fun function)))))
-
-(defun (setf %fun-doc) (new-value function)
-  (declare (type (or null string) new-value))
-  (typecase function
-    #!+sb-fasteval
-    (sb!interpreter:interpreted-function
-     (setf (sb!interpreter:proto-fn-docstring
-            (sb!interpreter:fun-proto-fn function)) new-value))
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (setf (sb!eval:interpreted-function-documentation function) new-value))
-    ((or simple-fun closure)
-     (when (closurep function)
-       (multiple-value-bind (name namedp) (closure-name function)
-         (when namedp
-           (return-from %fun-doc
-             (setf (random-documentation name 'function) new-value)))))
-     (setf (%simple-fun-doc (%fun-fun function)) new-value)))
-  new-value)
-
 (defun %simple-fun-next (simple-fun) ; DO NOT USE IN NEW CODE
   (%code-entry-point (fun-code-header simple-fun)
                      (1+ (%simple-fun-index simple-fun))))
@@ -344,7 +352,8 @@
 
 (declaim (inline code-header-words))
 (defun code-header-words (code)
-  (ash (get-header-data code) (+ #!+64-bit -24)))
+  #!+64-bit (ash (get-header-data code) -24)
+  #!-64-bit (ldb (byte 22 0) (get-header-data code)))
 
 (defun %code-entry-points (code-obj) ; DO NOT USE IN NEW CODE
   (%code-entry-point code-obj 0))
@@ -355,24 +364,23 @@
   ;; and filler_obj_p() in the C code
   (eql (code-header-words code-obj) 0))
 
+;;; The fun-table-trailer-word is a uint16_t at the end of the unboxed bytes
+;;; containing two subfields:
+;;;  12 bits for the number of simple-funs in the code component
+;;;   4 bits for the number of pad bytes added to align the fun-offset-table
+;;;     (this is strictly more bits than needed to represent the padding)
+(declaim (inline code-fun-table-trailer-word))
+(defun code-fun-table-trailer-word (code-obj)
+  (with-pinned-objects (code-obj)
+    (sap-ref-16 (code-instructions code-obj) (- (%code-code-size code-obj) 2))))
+
 ;;; Return the number of simple-funs in CODE-OBJ
+;;; Keep in sync with C function code_n_funs()
 (defun code-n-entries (code-obj)
   (declare (type code-component code-obj))
   (if (code-obj-is-filler-p code-obj)
       0
-      (with-pinned-objects (code-obj)
-        (sap-ref-16 (code-instructions code-obj)
-                    (- (%code-code-size code-obj) 2)))))
-
-;;; Subtract from %CODE-CODE-SIZE the number of trailing data bytes which aren't
-;;; machine instructions. It's generally ok to use either accessor if searching
-;;; for a function that encloses a given program counter, since the PC won't be
-;;; in the data range. But all the same, it looks nicer in disassemblies to avoid
-;;; examining bytes that aren't instructions.
-(declaim (inline %code-text-size))
-(defun %code-text-size (code-obj)
-  ;; There are N-ENTRIES uint32_t integers, and a uint16_t
-  (- (%code-code-size code-obj) (+ (* 4 (code-n-entries code-obj)) 2)))
+      (ash (code-fun-table-trailer-word code-obj) -4)))
 
 ;;; Return the offset in bytes from (CODE-INSTRUCTIONS CODE-OBJ)
 ;;; to its FUN-INDEXth function.
@@ -384,6 +392,20 @@
   ;; the last fun-index, so subtract an extra uint32_t as well.
   (sap-ref-32 (code-instructions code-obj)
               (- (%code-code-size code-obj) (* 4 (1+ fun-index)) 2)))
+
+;;; Subtract from %CODE-CODE-SIZE the number of trailing data bytes which aren't
+;;; machine instructions. It's generally ok to use either accessor if searching
+;;; for a function that encloses a given program counter, since the PC won't be
+;;; in the data range. But all the same, it looks nicer in disassemblies to avoid
+;;; examining bytes that aren't instructions.
+(declaim (inline %code-text-size))
+(defun %code-text-size (code-obj)
+  (- (%code-code-size code-obj)
+     ;; There are N-ENTRIES uint32_t integers, and a uint16_t
+     (+ 2 (* 4 (code-n-entries code-obj)))
+     ;; Subtract between 0 and 15 bytes of padding
+     (logand (code-fun-table-trailer-word code-obj) #xf)))
+
 (defun %code-entry-point (code-obj fun-index)
   (declare (type (unsigned-byte 16) fun-index))
   (when (< fun-index (code-n-entries code-obj))
@@ -418,6 +440,42 @@
                      ((> guess offset) (setq max (1- index)))
                      (t (return index)))
                (aver (<= min max)))))))))
+
+;;; Return the starting address of FUN's code as a SAP.
+;;; FUN must be pinned.
+(declaim (inline sb!vm:simple-fun-entry-sap))
+(defun sb!vm:simple-fun-entry-sap (fun)
+  #!-(or x86 x86-64)
+  (int-sap (+ (get-lisp-obj-address fun)
+              (- sb!vm:fun-pointer-lowtag)
+              (ash sb!vm:simple-fun-code-offset sb!vm:word-shift)))
+  ;; The preceding case would actually work, but I'm anticipating a change
+  ;; in which simple-fun headers are all contiguous in their code component,
+  ;; followed by all the machine instructions for all the simple-funs.
+  ;; If that change is done, then you must indirect through the SELF pointer
+  ;; in order to get the correct starting address.
+  ;; (Such change would probably be confined to x86[-64])
+  #!+(or x86 x86-64)
+  (sap-ref-sap (int-sap (- (get-lisp-obj-address fun) sb!vm:fun-pointer-lowtag))
+               (ash sb!vm:simple-fun-self-slot sb!vm:word-shift)))
+
+;;; Return the simple-fun within CODE whose entrypoint is ADDRESS,
+;;; or NIL if ADDRESS does not point to any function in CODE.
+(defun sb!vm::%simple-fun-from-entrypoint (code address)
+  (let ((min 0) (max (code-n-entries code)) (sap (int-sap address)))
+    (declare ((unsigned-byte 16) min max))
+    (unless (zerop max)
+      (decf max)
+      ;; Don't need to pin CODE here because it must have been pinned
+      ;; by the caller, or else ADDRESS as supplied could be bogus already.
+      (loop
+        (when (< max min) (return nil))
+        (let* ((index (floor (+ min max) 2))
+               (fun (%code-entry-point code index))
+               (guess (sb!vm:simple-fun-entry-sap fun)))
+          (cond ((sap< guess sap) (setq min (1+ index)))
+                ((sap> guess sap) (setq max (1- index)))
+                (t (return fun))))))))
 
 ;;; Return the number of bytes of instructions in SIMPLE-FUN,
 ;;; i.e. to the distance to the next simple-fun or end of code component.
@@ -454,9 +512,7 @@
 
 ;;; Set (SYMBOL-FUNCTION SYMBOL) to a closure that signals an error,
 ;;; preventing funcall/apply of macros and special operators.
-(defun sb!c::install-guard-function (symbol fun-name docstring)
-  (when docstring
-    (setf (random-documentation symbol 'function) docstring))
+(defun sb!c::install-guard-function (symbol fun-name)
   ;; (SETF SYMBOL-FUNCTION) goes out of its way to disallow this closure,
   ;; but we can trivially replicate its low-level effect.
   (let ((fdefn (find-or-create-fdefn symbol))
@@ -490,11 +546,17 @@
 
 ;;;; Iterating over closure values
 
-(defmacro do-closure-values ((value closure) &body body)
+(defmacro do-closure-values ((value closure &key include-extra-values) &body body)
   (with-unique-names (i nclosure)
     `(let ((,nclosure ,closure))
        (declare (closure ,nclosure))
-       (dotimes (,i (- (1+ (get-closure-length ,nclosure)) sb!vm:closure-info-offset))
+       (dotimes (,i (- (+ (get-closure-length ,nclosure)
+                          1
+                          ,@(and include-extra-values
+                                 `((if (closure-has-extra-values-slot-p ,nclosure)
+                                       1
+                                       0))))
+                       sb!vm:closure-info-offset))
          (let ((,value (%closure-index-ref ,nclosure ,i)))
            ,@body)))))
 

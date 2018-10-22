@@ -195,13 +195,29 @@
   (call-count nil :type (or null integer)))
 
 (defun node-all-callers (node)
-  (labels ((rec (seen current)
-             (if (or (eq current node)
-                     (find current seen :test #'eq))
-                 seen
-                 (reduce #'rec (node-callers current)
-                         :initial-value (list* current seen)))))
-    (reduce #'rec (node-callers node) :initial-value '())))
+  (let ((seen   (make-hash-table :test #'eq))
+        (result '()))
+    (labels ((rec (current)
+               (unless (or (eq current node)
+                           (gethash current seen))
+                 (setf (gethash current seen) t)
+                 (push current result)
+                 (map nil #'rec (node-callers current)))))
+      (map nil #'rec (node-callers node)))
+    result))
+
+(defun in-caller-closure-p (caller called)
+  (let ((seen (make-hash-table :test #'eq)))
+    (labels ((rec (current)
+               (cond ((eq current caller)
+                      (return-from in-caller-closure-p t))
+                     ((or (eq current called)
+                          (gethash current seen)))
+                     (t
+                      (setf (gethash current seen) t)
+                      (map nil #'rec (node-callers current))))))
+      (map nil #'rec (node-callers called)))
+    nil))
 
 (defmethod print-object ((node node) stream)
   (print-unreadable-object (node stream :type t :identity t)
@@ -334,16 +350,15 @@
                 (when (> depth max-depth)
                   (return-from calls))
                 (let ((callee (lookup-node debug-info)))
-                  (when callee
-                    (when caller
-                      (let ((call (find callee (node-edges caller)
-                                        :key #'call-vertex)))
-                        (pushnew caller (node-callers callee))
-                        (if call
-                            (unless (member caller visited-nodes)
-                              (incf (call-count call)))
-                            (push (make-call callee)
-                                  (node-edges caller))))))
+                  (when (and callee caller)
+                    (let ((call (find callee (node-edges caller)
+                                      :key #'call-vertex)))
+                      (pushnew caller (node-callers callee))
+                      (if call
+                          (unless (member caller visited-nodes)
+                            (incf (call-count call)))
+                          (push (make-call callee)
+                                (node-edges caller)))))
                   (when (and caller (not (member caller visited-nodes
                                                  :test #'eq)))
                     (incf (node-accrued-count caller))

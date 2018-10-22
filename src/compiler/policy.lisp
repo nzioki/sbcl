@@ -73,6 +73,7 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
   (name nil :type symbol :read-only t)
   (expression nil :read-only t)
   (getter nil :read-only t)
+  (documentation nil :read-only t)
   (values-documentation nil :read-only t))
 
 ;;; names of recognized optimization policy qualities
@@ -165,30 +166,33 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
 ;;; also be called again later in cold init in order to reset default
 ;;; optimization policy back to default values after toplevel PROCLAIM
 ;;; OPTIMIZE forms have messed with it.
+#-sb-xc-host
 (defun !policy-cold-init-or-resanify ()
+  (macrolet ((init (policy-symbol) ; Act like MAKE-LOAD-FORM essentially
+               (let ((policy (symbol-value policy-symbol)))
+                 `(setq ,policy-symbol
+                        (make-policy ,(policy-primary-qualities policy)
+                                     ,(policy-presence-bits policy)
+                                     ,(policy-dependent-qualities policy))))))
+    (init **baseline-policy**)
+    (init **zero-typecheck-policy**)
+    (setq *policy* (copy-policy **baseline-policy**))))
+
+#+sb-xc-host
+(defun init-xc-policy (&optional baseline-qualities)
+  ;; ANSI says that 1 is the initial value for all policy qualities
+  ;; so we establish that as both the baseline and the active default.
   (setq **baseline-policy**
-        (let ((policy
-               (make-policy (loop for i below n-policy-primary-qualities
-                                  sum (ash #b01 (* i 2))))))
-          ;; If :CONS-PROFILING was requested, then add it to the baseline policy.
-          (when (member :cons-profiling sb!xc:*features*)
-            (alter-policy policy
-                          #-sb-xc (policy-quality-name-p 'instrument-consing)
-                          #+sb-xc #.(policy-quality-name-p 'instrument-consing)
-                          2))
-          policy)
-
-        **zero-typecheck-policy**
-        (alter-policy (copy-policy **baseline-policy**)
-                      #-sb-xc (policy-quality-name-p 'type-check)
-                      ;; Eval in the host since cold-init won't have
-                      ;; executed any forms in 'policies.lisp'
-                      #+sb-xc #.(policy-quality-name-p 'type-check)
-                      0))
-
-  ;; CMU CL didn't use 1 as the default for everything,
-  ;; but since ANSI says 1 is the ordinary value, we do.
-  (setf *policy* (copy-policy **baseline-policy**)))
+        (make-policy (loop for i below n-policy-primary-qualities
+                           sum (ash #b01 (* i 2))))
+        *policy* (copy-policy **baseline-policy**))
+  (when baseline-qualities
+    (sb!xc:proclaim `(optimize ,@baseline-qualities))
+    ;; Copy altered policy back as the baseline policy
+    (setq **baseline-policy** (copy-policy *policy*)))
+  (let ((*policy* *policy*))
+    (sb!xc:proclaim '(optimize (type-check 0)))
+    (setq **zero-typecheck-policy** *policy*)))
 
 ;;; Look up a named optimization quality in POLICY. This is only
 ;;; called by compiler code for known-valid QUALITY-NAMEs, e.g. SPEED;
@@ -224,14 +228,16 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
                                        (policy-dependent-qualities policy))
                                   1))))))
            (define-getter (name &body body)
-             `(defun ,name (policy index)
-                (declare (type policy policy)
+             `(progn
+                (declaim (ftype (sfunction (policy fixnum) (unsigned-byte 2)) ,name))
+                (defun ,name (policy index)
+                  (declare (type policy policy)
                          (type (integer
                                 #.(- n-policy-primary-qualities)
                                 #.(- max-policy-qualities
                                      n-policy-primary-qualities 1))
                                index))
-                ,@body)))
+                  ,@body))))
 
   ;; Return the value for quality INDEX in POLICY, using *POLICY-MIN/MAX*
   ;; Primary qualities are assumed to exist, however policy-restricting functions
@@ -303,6 +309,7 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
                   ;; DESCRIBE-COMPILER-POLICY uses the getter
                   :getter (named-lambda ,(string name) (policy)
                             (policy policy ,expression))
+                  :documentation ',documentation
                   :values-documentation ',values-documentation)))
        (if number
            (setf (svref **policy-dependent-qualities** number) item)
@@ -315,9 +322,13 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
              (setf **policy-dependent-qualities**
                    (replace (make-array size :initial-element item)
                             **policy-dependent-qualities**)))))
-     #-sb-xc-host
-     ,@(when documentation `((setf (fdocumentation ',name 'optimize) ,documentation)))
      ',name))
+
+#-sb-xc-host
+(defmethod documentation ((x symbol) (doc-type (eql 'optimize)))
+  (awhen (find x **policy-dependent-qualities**
+               :key #'policy-dependent-quality-name)
+    (policy-dependent-quality-documentation it)))
 
 ;;; Return a new POLICY containing the policy information represented
 ;;; by the optimize declaration SPEC. Any parameters not specified are

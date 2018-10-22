@@ -97,7 +97,8 @@
 
 ;;; If true, this is the node which is used as context in compiler warning
 ;;; messages.
-(declaim (type (or null compiler-error-context node) *compiler-error-context*))
+(declaim (type (or null compiler-error-context node
+                   lvar-annotation) *compiler-error-context*))
 (defvar *compiler-error-context* nil)
 
 ;;; a plist mapping macro names to source context parsers. Each parser
@@ -237,8 +238,12 @@
   (let ((context *compiler-error-context*))
     (if (compiler-error-context-p context)
         (values context t)
-        (let* ((path (or (and (node-p context) (node-source-path context))
-                         (and (boundp '*current-path*) *current-path*)))
+        (let* ((path (cond ((node-p context)
+                            (node-source-path context))
+                           ((lvar-annotation-p context)
+                            (lvar-annotation-source-path context))
+                           ((boundp '*current-path*)
+                            *current-path*)))
                (old
                 (find (when path (source-path-original-source path))
                       (remove-if #'null old-contexts)
@@ -260,9 +265,12 @@
                       (nth-value 1 (find-source-root tlf *source-info*))
                       :path path
                       :original-source-path (source-path-original-source path)
-                      :lexenv (if context
-                                  (node-lexenv context)
-                                  (if (boundp '*lexenv*) *lexenv* nil)))
+                      :lexenv (cond ((node-p context)
+                                     (node-lexenv context))
+                                    ((lvar-annotation-p context)
+                                     (lvar-annotation-lexenv context))
+                                    ((boundp '*lexenv*)
+                                     *lexenv*)))
                      nil)))))))))
 
 ;;;; printing error messages
@@ -433,7 +441,7 @@ has written, having proved that it is unreachable."))
      ;; Grammar note - starting a sentence with a numeral is wrong.
      (format stream
               "~@<~@(~D~) call~:P to ~
-               ~/sb!impl:print-symbol-with-prefix/ ~
+               ~/sb!ext:print-symbol-with-prefix/ ~
                ~2:*~[~;was~:;were~] compiled before a compiler-macro ~
                was defined for it. A declaration of NOTINLINE at the ~
                call site~:P will eliminate this warning, as will ~
@@ -485,7 +493,6 @@ has written, having proved that it is unreachable."))
 ;;; such like. We clear the current error context so that we know that
 ;;; it needs to be reprinted, and we also FORCE-OUTPUT so that the
 ;;; message gets seen right away.
-(declaim (ftype (function (string &rest t) (values)) compiler-mumble))
 (defun compiler-mumble (control &rest args)
   (let ((stream *standard-output*))
     (note-message-repeats stream)
@@ -665,7 +672,7 @@ has written, having proved that it is unreachable."))
         (compiler-warn
          'inlining-dependency-failure
          :format-control
-         "~@<Proclaiming ~/sb!impl:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
+         "~@<Proclaiming ~/sb!ext:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
 ~:*~[~;was~:;were~] previously compiled. A declaration of NOTINLINE ~
 at the call site~:P will eliminate this warning, as will proclaiming ~
 and defining the function before its first potential use.~@:>"
@@ -718,14 +725,16 @@ and defining the function before its first potential use.~@:>"
        'inlining-dependency-failure
        :format-control
        (if (info :function :assumed-type name)
-           "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because no definition ~
-for it was seen prior to its first use.~:@>"
+           (sb!format:tokens "~@<Call to ~/sb!ext:print-symbol-with-prefix/ ~
+                              could not be inlined because no definition !
+                              for it was seen prior to its first use.~:@>")
          ;; This message sort of implies that source form is the
          ;; only reasonable representation in which an inline definition
          ;; could have been saved, which isn't in general true - it could
          ;; be saved as a parsed AST - but I don't really know how else to
          ;; phrase this. And it happens to be true in SBCL, so it's not wrong.
-           "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because its source code ~
-was not saved. A global INLINE or SB-EXT:MAYBE-INLINE proclamation must be ~
-in effect to save function definitions for inlining.~:@>")
+           (sb!format:tokens "~@<Call to ~/sb!ext:print-symbol-with-prefix/ could ~
+not be inlined because its source code was not saved. A global INLINE ~
+or SB-EXT:MAYBE-INLINE proclamation must be ~
+in effect to save function definitions for inlining.~:@>"))
        :format-arguments (list name)))))

@@ -41,8 +41,6 @@
     (error "~S isn't a floating-point register." tn))
   (tn-offset tn))
 
-(defconstant +disassem-inst-alignment-bytes+ 4)
-
 (defvar *disassem-use-lisp-reg-names* t)
 
 (defun location-number (loc)
@@ -305,9 +303,6 @@
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-immediate-inst 32
   (byte 6 26) (byte 5 21) (byte 5 16) (byte 16 0))
@@ -620,8 +615,8 @@
 (defun emit-relative-branch (segment opcode r1 r2 target)
   (emit-chooser
    segment 20 2
-      #'(lambda (segment posn magic-value)
-          (declare (ignore magic-value))
+      #'(lambda (segment chooser posn magic-value)
+          (declare (ignore chooser magic-value))
           (let ((delta (ash (- (label-position target) (+ posn 4)) -2)))
             (when (typep delta '(signed-byte 16))
               (emit-back-patch segment 4
@@ -1116,14 +1111,6 @@
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:cost 0)
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
@@ -1161,7 +1148,8 @@
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   #'(lambda (segment posn delta-if-after)
+   #'(lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
           (when (typep delta '(signed-byte 16))
             (emit-back-patch segment 4

@@ -127,12 +127,13 @@
 ;;; Type is either CTOR, for MAKE-INSTANCE, or ALLOCATOR, for ALLOCATE-INSTANCE
 (!defstruct-with-alternate-metaclass ctor
   :slot-names (type class-or-name class initargs state safe-p)
-  :boa-constructor %make-ctor
+  :constructor %make-ctor
   :superclass-name function
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
-  :dd-type funcallable-structure
-  :runtime-type-checks-p nil)
+  :dd-type funcallable-structure)
+
+(declaim (freeze-type ctor))
 
 ;;; All defined ctors.
 (defglobal *all-ctors* (make-hash-table :test #'equal
@@ -148,7 +149,7 @@
   (when (or force-p (ctor-class ctor))
     (setf (ctor-class ctor) nil
           (ctor-state ctor) 'initial)
-    (setf (funcallable-instance-fun ctor)
+    (setf (%funcallable-instance-fun ctor)
           (ecase (ctor-type ctor)
             (ctor
              (lambda (&rest args)
@@ -238,6 +239,15 @@
 (declaim (inline sxhash-symbol-or-class))
 (defun sxhash-symbol-or-class (x)
   (cond ((symbolp x) (sxhash x))
+        ;; FIXME: if we could ensure that metaobjects (or at least just CLASS
+        ;; metaobjects) always have a precomputed hash, then instead of calling
+        ;; STD-INSTANCE-HASH which might have to compute and install the hash,
+        ;; a faster variant of this can assume that the hash is definitely nonzero.
+        ;; We could go back to always computing hashes for all standard instances,
+        ;; but I don't like that, because it will cause great pain for trying
+        ;; to generate deterministic core images. Since GFs usually have names
+        ;; (and classes do too), but instances in general don't, if you stay away
+        ;; from anonymous objects, reproducibility is an attainable goal.
         ((std-instance-p x) (sb-impl::std-instance-hash x))
         ((fsc-instance-p x) (sb-impl::fsc-instance-hash x))
         (t
@@ -551,7 +561,7 @@
                :test #'eq :key #'weak-pointer-value)
       (multiple-value-bind (form locations names optimizedp)
           (constructor-function-form ctor)
-        (setf (funcallable-instance-fun ctor)
+        (setf (%funcallable-instance-fun ctor)
               (apply
                (let ((*compiling-optimized-constructor* t))
                  (handler-bind ((compiler-note #'muffle-warning))
@@ -579,7 +589,7 @@
                :test #'eq :key #'weak-pointer-value)
       (multiple-value-bind (form optimizedp)
           (allocator-function-form ctor)
-        (setf (funcallable-instance-fun ctor)
+        (setf (%funcallable-instance-fun ctor)
               (let ((*compiling-optimized-constructor* t))
                 (handler-bind ((compiler-note #'muffle-warning))
                   (compile nil form)))
@@ -793,11 +803,14 @@
            (setf (std-instance-slots .instance.) .slots.)
            ,body
            .instance.)
-        `(let* ((.instance. (,allocation-function ,wrapper))
-                (.slots. (,slots-fetcher .instance.)))
-           (declare (ignorable .slots.))
-           ,body
-           .instance.))))
+        (let ((more
+               (when (eq allocation-function 'allocate-standard-funcallable-instance)
+                 '(nil))))
+          `(let* ((.instance. (,allocation-function ,wrapper ,@more))
+                  (.slots. (,slots-fetcher .instance.)))
+             (declare (ignorable .slots.))
+             ,body
+             .instance.)))))
 
 ;;; Return a form for invoking METHOD with arguments from ARGS.  As
 ;;; can be seen in METHOD-FUNCTION-FROM-FAST-FUNCTION, method

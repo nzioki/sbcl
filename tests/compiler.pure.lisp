@@ -962,7 +962,7 @@
 ;;; MISC.101 and MISC.103: FLUSH-DEST did not mark the USE's block for
 ;;; type check regeneration
 (with-test (:name (compile :flush-dest :use :regenerate-type-check :misc.101))
-  (checked-compile-and-assert (:allow-warnings 'sb-int:type-warning)
+  (checked-compile-and-assert (:allow-style-warnings 'sb-int:type-style-warning)
       '(lambda (a c)
          (declare (type (integer 185501219873 303014665162) a))
          (declare (type (integer -160758 255724) c))
@@ -975,7 +975,7 @@
                   (min v8 v6)))))
     ((259448422916 173715) 259448422916)))
 (with-test (:name (compile :flush-dest :use :regenerate-type-check :misc.103))
-  (checked-compile-and-assert (:allow-warnings 'sb-int:type-warning)
+  (checked-compile-and-assert (:allow-style-warnings 'sb-int:type-style-warning)
       '(lambda (a b)
         (min -80
          (abs
@@ -990,7 +990,7 @@
 
 ;;; various MISC.*, related to NODEs/LVARs with derived type NIL
 (with-test (:name (compile :node/lvar :derive-type :misc.1))
-  (checked-compile-and-assert (:allow-warnings t)
+  (checked-compile-and-assert (:allow-style-warnings 'sb-int:type-style-warning)
       '(lambda (c)
          (declare (type (integer -3924 1001809828) c))
          (min 47 (if (ldb-test (byte 2 14) c)
@@ -1018,7 +1018,7 @@
                b))))
     ((2950453607 -4) -815145134)))
 (with-test (:name (compile :node/lvar :derive-type :misc.4))
-  (checked-compile-and-assert (:allow-warnings 'sb-int:type-warning)
+  (checked-compile-and-assert (:allow-style-warnings 'sb-int:type-style-warning)
       '(lambda (b c)
          (declare (type (integer -29742055786 23602182204) b))
          (declare (type (integer -7409 -2075) c))
@@ -1030,7 +1030,7 @@
             (%f2))))
     ((22992834060 -5833) (values 82674 0))))
 (with-test (:name (compile :node/lvar :derive-type :misc.5))
-  (checked-compile-and-assert (:allow-warnings 'sb-int:type-warning)
+  (checked-compile-and-assert (:allow-style-warnings 'sb-int:type-style-warning)
       '(lambda (a)
          (declare (type (integer -944 -472) a))
          (round
@@ -1607,9 +1607,9 @@
                                  (if (/= 0 a)
                                      c
                                      (ignore-errors
-                                       (progn (if (ldb-test (byte 0 0) (rational (throw 'ct7 0))) 0 0) 0))))
+                                      (progn (if (ldb-test (byte 0 0) (rational (throw 'ct7 0))) 0 0) 0))))
                         0 0)))
-                   :allow-warnings 'sb-int:type-warning)
+                   :allow-style-warnings 'sb-int:type-style-warning)
                   391833530 -32785211))))
 
 ;;; efficiency notes for ordinary code
@@ -2088,7 +2088,7 @@
   (let ((notes (nth-value
                 4 (checked-compile '(lambda (x)
                                      (declare (optimize (speed 3)))
-                                     (1+ x))))))
+                                     (+ x 2))))))
     ;; forced-to-do GENERIC-+, etc, possible word -> bignum conversion note
     (assert (> (length notes) 1)))
 
@@ -2096,7 +2096,7 @@
                 4 (checked-compile '(lambda (x)
                                      (declare (optimize (speed 3)))
                                      (check-type x fixnum)
-                                     (1+ x))))))
+                                     (+ x 2))))))
     ;; Only the posssible word -> bignum conversion note
     (assert (= (length notes) 1))))
 
@@ -3399,13 +3399,14 @@
              ;; but it works. Unless FLOAT-ACCURACY is zero, we leave the
              ;; addition in to catch SNaNs.
              #+x86
-             (assert (and (search "FADD" disassembly1)
-                          (not (search "FADD" disassembly2))))
+             (progn
+               (assert (search "FADD" disassembly1))
+               (assert (not (search "FADD" disassembly2))))
              #+x86-64
              (let ((inst (if (typep result 'double-float)
                              "ADDSD" "ADDSS")))
-               (assert (and (search inst disassembly1)
-                            (not (search inst disassembly2)))))
+               (assert (search inst disassembly1))
+               (assert (not (search inst disassembly2))))
              (assert (eql result (funcall fun1 arg)))
              (assert (eql result (funcall fun2 arg))))))
     (test `(lambda (x) (declare (single-float x)) (+ x 0)) 123.45)
@@ -4761,8 +4762,9 @@
     (assert warnings)
     (assert (notany (lambda (condition)
                       (search "Constant "
-                              (simple-condition-format-control
-                               condition)))
+                              (sb-format::unparse-fmt-control
+                               (simple-condition-format-control
+                                condition))))
                     warnings))))
 
 (with-test (:name (compile :multiple-use-lvar-interpreted-as-NIL catch))
@@ -5234,12 +5236,13 @@
              (assert (eq (and (= n-dimensions 1) (not adjustable-p))
                          (typep a '(simple-array * (*)))))))))))
 
-(with-test (:name :array-subtype-tests
-            :skipped-on (:not (:or :x86 :x86-64)))
+(with-test (:name :typep-empty-vector-or-string-simple-vector)
   (checked-compile-and-assert ()
       `(lambda ()
          (typep #() '(or simple-vector simple-string)))
-    (() t))
+    (() t)))
+(with-test (:name :array-subtype-tests
+            :skipped-on (:not (:or :x86 :x86-64)))
   (flet ((approx-lines-of-assembly-code (type-expr)
            (count #\Newline
                   (with-output-to-string (s)
@@ -5891,7 +5894,7 @@
    (not (funcall (checked-compile
                   '(lambda (x)
                     (eql (car (nreverse (the (cons (eql 10)) x))) 10)))
-                 '(10 20)))))
+                 (list 10 20)))))
 
 (with-test (:name :subseq-derive-type)
   (assert
@@ -6292,9 +6295,7 @@
          (logbitp (the (eql 1) p1) (the fixnum p2)))
     ((1 2) t)))
 
-(with-test (:name :reducing-constants
-                  ;; x86 delays FPE signalling
-                  :fails-on :x86)
+(with-test (:name :reducing-constants)
   (checked-compile-and-assert ()
       `(lambda (x) (* 4.457268f31 4 x -46253801283659))
     ((5.0f-9) -4.123312f37))
@@ -6302,9 +6303,7 @@
       `(lambda (x) (* #C(4.457268f31 0.0) 4 x -46253801283659))
     ((5.0f-9) #C(-4.123312f37 -0.0))))
 
-(with-test (:name :reducing-constants.2
-                  ;; x86 delays FPE signalling
-                  :fails-on :x86)
+(with-test (:name :reducing-constants.2)
   (checked-compile-and-assert (:allow-style-warnings t)
       `(lambda () (*  1.0 2 (expt 2 127)))
     (() #-(or arm64 arm) (condition 'floating-point-overflow)
@@ -6469,7 +6468,15 @@
     (() (values 0 0))))
 
 #+sb-unicode
-(with-test (:name :base-char-weakinging)
+(with-test (:name :base-char-weakening)
   (checked-compile-and-assert (:optimize :safe)
       `(lambda (x) (the base-char x))
     (((code-char 252)) (condition 'type-error))))
+
+(with-test (:name (logandc1 :constant-second-arg))
+  (checked-compile-and-assert ()
+    `(lambda (p1 p2)
+       (declare (type (integer ,(- (expt 2 31)) ,(1- (expt 2 31))) p1)
+                (type (eql -1) p2))
+       (logandc1 p1 p2))
+    ((-3 -1) 2)))

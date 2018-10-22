@@ -15,6 +15,8 @@
 #include "gencgc-private.h"
 #include "genesis/gc-tables.h"
 #include "genesis/closure.h"
+#include "genesis/cons.h"
+#include "genesis/vector.h"
 #include "genesis/layout.h"
 #include "genesis/hash-table.h"
 #include "immobile-space.h"
@@ -167,9 +169,9 @@ static inline int pointer_survived_gc_yet(lispobj pointer)
     if (listp(pointer))
         return cons_markedp(pointer);
     lispobj header = *native_pointer(pointer);
-    if (widetag_of(header) == BIGNUM_WIDETAG)
+    if (header_widetag(header) == BIGNUM_WIDETAG)
         return (header & BIGNUM_MARK_BIT) != 0;
-    if (embedded_obj_p(widetag_of(header)))
+    if (embedded_obj_p(header_widetag(header)))
         header = *fun_code_header(native_pointer(pointer));
     return (header & MARK_BIT) != 0;
 }
@@ -182,11 +184,11 @@ void __mark_obj(lispobj pointer)
     if (!listp(pointer)) {
         lispobj* base = native_pointer(pointer);
         lispobj header = *base;
-        if (widetag_of(header) == BIGNUM_WIDETAG) {
+        if (header_widetag(header) == BIGNUM_WIDETAG) {
             *base |= BIGNUM_MARK_BIT;
             return; // don't enqueue - no pointers
         } else {
-            if (embedded_obj_p(widetag_of(header))) {
+            if (embedded_obj_p(header_widetag(header))) {
                 base = fun_code_header(base);
                 pointer = make_lispobj(base, OTHER_POINTER_LOWTAG);
                 header = *base;
@@ -200,7 +202,7 @@ void __mark_obj(lispobj pointer)
                 return; // already marked
             *base |= MARK_BIT;
         }
-        if (unboxed_obj_widetag_p(widetag_of(header)))
+        if (unboxed_obj_widetag_p(header_widetag(header)))
             return;
     } else {
         uword_t key = compute_page_key(pointer);
@@ -241,7 +243,7 @@ void gc_mark_range(lispobj* where, long count) {
 static void trace_object(lispobj* where)
 {
     lispobj header = *where;
-    int widetag = widetag_of(header);
+    int widetag = header_widetag(header);
     sword_t scan_from = 1;
     sword_t scan_to = sizetab[widetag](where);
     sword_t i;
@@ -298,6 +300,10 @@ static void trace_object(lispobj* where)
             }
             return;
         }
+        if (is_vector_subtype(header, VectorWeak)) {
+            add_to_weak_vector_list(where, header);
+            return;
+        }
         break;
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     /* on x86[-64], closure->fun is a fixnum-qua-pointer. Convert it to a lisp
@@ -321,7 +327,7 @@ static void trace_object(lispobj* where)
     case WEAK_POINTER_WIDETAG:
         weakptr = (struct weak_pointer*)where;
         if (is_lisp_pointer(weakptr->value) && interesting_pointer_p(weakptr->value))
-            add_to_weak_pointer_list(weakptr);
+            add_to_weak_pointer_chain(weakptr);
         return;
     default:
         if (unboxed_obj_widetag_p(widetag)) return;
@@ -363,7 +369,7 @@ void execute_full_mark_phase()
     while (where < end) {
         lispobj obj = compute_lispobj(where);
         gc_enqueue(obj);
-        where += listp(obj) ? 2 : sizetab[widetag_of(*where)](where);
+        where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
     do {
         lispobj ptr = gc_dequeue();
@@ -392,19 +398,32 @@ void execute_full_mark_phase()
 static void smash_weak_pointers()
 {
     struct weak_pointer *wp, *next_wp;
-    for (wp = weak_pointers, next_wp = NULL; wp != NULL; wp = next_wp) {
-        gc_assert(widetag_of(wp->header)==WEAK_POINTER_WIDETAG);
-
+    for (wp = weak_pointer_chain; wp != WEAK_POINTER_CHAIN_END; wp = next_wp) {
+        gc_assert(widetag_of(&wp->header) == WEAK_POINTER_WIDETAG);
         next_wp = wp->next;
         wp->next = NULL;
-        if (next_wp == wp) /* gencgc uses a ref to self for end of list */
-            next_wp = NULL;
-
         lispobj pointee = wp->value;
         gc_assert(is_lisp_pointer(pointee));
         if (!pointer_survived_gc_yet(pointee))
             wp->value = UNBOUND_MARKER_WIDETAG;
     }
+    weak_pointer_chain = WEAK_POINTER_CHAIN_END;
+
+    struct cons* vectors = weak_vectors;
+    while (vectors) {
+        struct vector* vector = (struct vector*)vectors->car;
+        vectors = (struct cons*)vectors->cdr;
+        UNSET_WEAK_VECTOR_VISITED(vector);
+        sword_t len = fixnum_value(vector->length);
+        sword_t i;
+        for (i = 0; i<len; ++i) {
+            lispobj obj = vector->data[i];
+            // Ignore non-pointers
+            if (is_lisp_pointer(obj) && !pointer_survived_gc_yet(obj))
+                vector->data[i] = NIL;
+        }
+    }
+    weak_vectors = 0;
 }
 
 __attribute__((unused)) static char *fillerp(lispobj* where)
@@ -478,9 +497,9 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                 }
             }
         } else {
-            nwords = sizetab[widetag_of(header)](where);
+            nwords = sizetab[header_widetag(header)](where);
             lispobj markbit =
-              widetag_of(header) != BIGNUM_WIDETAG ? MARK_BIT : BIGNUM_MARK_BIT;
+              header_widetag(header) != BIGNUM_WIDETAG ? MARK_BIT : BIGNUM_MARK_BIT;
             if (header & markbit)
                 *where = header ^ markbit;
             else {
@@ -555,9 +574,11 @@ void execute_full_sweep_phase()
 
     page_index_t first_page, last_page;
     for (first_page = 0; first_page < next_free_page; ++first_page)
-        if (page_table[first_page].write_protected) {
+        if (page_table[first_page].write_protected
+            && protection_mode(first_page) == PHYSICAL) {
             last_page = first_page;
-            while (page_table[last_page+1].write_protected)
+            while (page_table[last_page+1].write_protected
+                   && protection_mode(last_page+1) == PHYSICAL)
                 ++last_page;
             os_protect(page_address(first_page),
                        (last_page - first_page + 1) * GENCGC_CARD_BYTES,

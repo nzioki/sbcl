@@ -133,10 +133,6 @@ collect_garbage(generation_index_t ignore)
     }
     new_space_free_pointer = new_space;
 
-    /* Initialize the weak pointer list. */
-    weak_pointers = (struct weak_pointer *) NULL;
-
-
     /* Scavenge all of the roots. */
 #ifdef PRINTNOISE
     printf("Scavenging interrupt contexts ...\n");
@@ -316,13 +312,13 @@ print_garbage(lispobj *from_space, lispobj *from_space_free_pointer)
             case OTHER_POINTER_LOWTAG:
                 pointer = native_pointer(object);
                 header = *pointer;
-                type = widetag_of(header);
+                type = header_widetag(header);
                 nwords = (sizetab[type])(pointer);
                 break;
             default: nwords=1;  /* shut yer whinging, gcc */
             }
         } else {
-            type = widetag_of(object);
+            type = header_widetag(object);
             nwords = (sizetab[type])(start);
             total_words_not_copied += nwords;
             printf("%4d words not copied at 0x%16lx; ",
@@ -465,4 +461,22 @@ cheneygc_handle_wp_violation(os_context_t *context, void *addr)
 void gc_show_pte(lispobj obj)
 {
     printf("unimplemented\n");
+}
+
+sword_t scav_code_header(lispobj *where, lispobj header)
+{
+    struct code *code = (struct code *) where;
+    sword_t n_header_words = code_header_words(header);
+
+    /* Scavenge the boxed section of the code data block. */
+    scavenge(where + 2, n_header_words - 2);
+
+    /* Scavenge the boxed section of each function object in the
+     * code data block. */
+    for_each_simple_fun(i, function_ptr, code, 1, {
+        scavenge(SIMPLE_FUN_SCAV_START(function_ptr),
+                 SIMPLE_FUN_SCAV_NWORDS(function_ptr));
+    })
+
+    return ALIGN_UP(n_header_words + code_unboxed_nwords(code->code_size), 2);
 }

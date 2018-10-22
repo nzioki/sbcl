@@ -81,11 +81,27 @@
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
-  (def %code-code-size)
+  ;; %code-code-size is an inline fun on 64-bit
+  #-64-bit (def %code-code-size)
   (def %code-debug-info)
   #+(or x86 immobile-space) (def sb-vm::%code-fixups)
+
+  ;; instances
+  (def %make-instance) ; Allocate a new instance with X data slots.
+  (def %instance-length) ; Given an instance, return its length.
+  (def %instance-layout)
+  (def %set-instance-layout (instance new-value))
+  ; (def %instance-ref (instance index)) ; defined in 'target-defstruct'
+  (def %instance-set (instance index new-value))
+  ;; funcallable instances
+  (def %make-funcallable-instance)
   (def %funcallable-instance-layout)
-  (def %set-funcallable-instance-layout (x new-value))
+  (def %set-funcallable-instance-layout (fin new-value))
+  (def %funcallable-instance-function)
+  (def (setf %funcallable-instance-function) (fin new-value))
+  (def %funcallable-instance-info (fin i))
+  (def %set-funcallable-instance-info (fin i new-value))
+
   #+sb-simd-pack
   (def* (%make-simd-pack (tag low high))
         (%make-simd-pack-single (x y z w))
@@ -94,8 +110,23 @@
         (%simd-pack-tag)
         (%simd-pack-low)
         (%simd-pack-high))
-  )
+  #+sb-thread (def sb-vm::current-thread-offset-sap)
+  (def current-sp ())
+  (def current-fp ())
+  (def stack-ref (s n))
+  (def %set-stack-ref (s n value))
+  (def fun-code-header)
+  (def sb-vm::symbol-extra)
+  #-(or x86 x86-64) (def lra-code-header)
+  (def %make-lisp-obj)
+  (def get-lisp-obj-address))
 
 (defun spin-loop-hint ()
   "Hints the processor that the current thread is spin-looping."
   (spin-loop-hint))
+
+
+(defun %other-pointer-subtype-p (x choices)
+  (and (%other-pointer-p x)
+       (member (%other-pointer-widetag x) choices)
+       t))

@@ -760,8 +760,11 @@
   (assert-no-consing (make-array-on-stack-10))
   (assert-no-consing (make-array-on-stack-11)))
 
-(with-test (:name (:no-consing :dx-raw-instances) :skipped-on (or (not :raw-instance-init-vops)
-                                                                   (not (and :gencgc :c-stack-is-control-stack))))
+(when (gethash 'sb-vm::raw-instance-init/word sb-c::*backend-parsed-vops*)
+  (pushnew :raw-instance-init-vops *features*))
+(with-test (:name (:no-consing :dx-raw-instances)
+            :skipped-on (or (not :raw-instance-init-vops)
+                            (not (and :gencgc :c-stack-is-control-stack))))
   (let (a b)
     (setf a 1.24 b 1.23d0)
     (assert-no-consing (make-foo2-on-stack a b)))
@@ -1445,7 +1448,7 @@
                   :skipped-on (not :stack-allocatable-closures))
   (assert-no-consing
    (let ((ct 0))
-     (sb-vm::map-allocated-objects
+     (sb-vm:map-allocated-objects
       (lambda (obj type size)
         (declare (ignore obj type size))
         (incf ct))

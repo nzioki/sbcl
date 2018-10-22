@@ -94,8 +94,60 @@
   (dynamic-extent nil :type (or null cleanup))
   ;; something or other that the back end annotates this lvar with
   (info nil)
-  (dependent-casts nil))
+  (dependent-casts nil)
+  (annotations nil)
+  (dependent-annotations nil))
 (!set-load-form-method lvar (:xc :target) :ignore-it)
+
+;;; These are used for annottating a LVAR with information that can't
+;;; be expressed using types.
+;;; Right now it's basically used for tracking constants and checking
+;;; them for things like proper sequence, or valid type specifier.
+(defstruct lvar-annotation
+  (source-path nil :type list)
+  lexenv
+  fired)
+
+(defprinter (lvar-annotation)
+  fired)
+
+(defstruct (lvar-modified-annotation
+            (:include lvar-annotation)
+            (:copier nil))
+  caller)
+
+(defstruct (lvar-hook
+            (:include lvar-annotation)
+            (:copier nil))
+  (hook #'missing-arg :type function))
+
+(defstruct (lvar-type-spec-annotation
+            (:include lvar-hook)
+            (:copier nil)))
+
+(defstruct (lvar-proper-sequence-annotation
+            (:include lvar-annotation)
+            (:copier nil))
+  (kind 'proper-sequence :type (member proper-list proper-sequence
+                                       proper-or-circular-list proper-or-dotted-list)))
+
+(defstruct (lvar-dependent-annotation
+             (:include lvar-annotation)
+             (:copier nil))
+    (deps nil :type list))
+
+(defstruct (lvar-function-designator-annotation
+             (:include lvar-dependent-annotation)
+             (:copier nil))
+  (caller nil :type symbol)
+  (arg-specs nil :type list)
+  (result-specs nil :type list)
+  type)
+
+(defstruct (lvar-function-annotation
+             (:include lvar-annotation)
+             (:copier nil))
+  type)
 
 (defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
@@ -289,13 +341,13 @@
                     (:copier nil)
                     (:conc-name block-)
                     (:predicate block-p))
-  ;; a list of all the blocks that are predecessors/successors of this
-  ;; block. In well-formed IR1, most blocks will have one successor.
-  ;; The only exceptions are:
-  ;;  1. component head blocks (any number)
-  ;;  2. blocks ending in an IF (1 or 2)
-  ;;  3. blocks with DELETE-P set (zero)
-  (pred nil :type list)
+    ;; a list of all the blocks that are predecessors/successors of this
+    ;; block. In well-formed IR1, most blocks will have one successor.
+    ;; The only exceptions are:
+    ;;  1. component head blocks (any number)
+    ;;  2. blocks ending in an IF (1 or 2)
+    ;;  3. blocks with DELETE-P set (zero)
+    (pred nil :type list)
   (succ nil :type list)
   ;; the ctran which heads this block (a :BLOCK-START), or NIL when we
   ;; haven't made the start ctran yet (and in the dummy component head
@@ -384,7 +436,7 @@
   ;; During make-host-2, the solution to this is the same hack
   ;; as for everything else: use DEF!STRUCT for IR2-COMPONENT.
   #!+(and (host-feature sb-xc-host) (host-feature sbcl))
-  (declare (sb-ext:muffle-conditions style-warning))
+  (declare (host-sb-ext:muffle-conditions style-warning))
 (def!struct (component (:copier nil)
                        (:constructor
                         make-component
@@ -394,6 +446,10 @@
                          (outer-loop (make-loop :kind :outer :head head)))))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
+  ;; space where this component will be allocated in
+  ;; :auto won't make any codegen optimizations pertinent to immobile space,
+  ;; but will place the code there given sufficient available space.
+  (%mem-space nil :type (member nil :dynamic :immobile :auto))
   ;; the kind of component
   ;;
   ;; (The terminology here is left over from before
@@ -1291,8 +1347,6 @@
   (eql-var-constraints     nil :type (or null (array t 1)))
   (inheritable-constraints nil :type (or null (array t 1)))
   (private-constraints     nil :type (or null (array t 1)))
-  ;; Initial type of a LET variable as last seen by PROPAGATE-FROM-SETS.
-  (last-initial-type *universal-type* :type ctype)
   ;; The FOP handle of the lexical variable represented by LAMBDA-VAR
   ;; in the fopcompiler.
   (fop-value nil))
@@ -1333,7 +1387,9 @@
   ;; CONSTANT nodes are always anonymous, since we wish to coalesce named and
   ;; unnamed constants that are equivalent, we need to keep track of the
   ;; reference name for XREF.
-  (%source-name (missing-arg) :type symbol :read-only t))
+  (%source-name (missing-arg) :type symbol :read-only t)
+  ;; Constraints that cannot be expressed as NODE-DERIVED-TYPE
+  constraints)
 (defprinter (ref :identity t)
   #!+sb-show id
   (%source-name :test (neq %source-name '.anonymous.))
@@ -1489,7 +1545,7 @@
   (context nil)
   ;; Avoid compile time type conflict warnings.
   ;; Used by things that expand into ETYPECASE.
-  (silent-conflict nil :type boolean))
+  (silent-conflict nil :type (or boolean (eql :style-warning))))
 (defprinter (cast :identity t)
   %type-check
   value
@@ -1519,32 +1575,8 @@
   (array (missing-arg) :type lvar)
   (bound (missing-arg) :type lvar))
 
-(def!struct (dependent-cast (:include cast) (:copier nil))
-  ;; Either LVARs or LEAFs
-  (deps nil :type list))
-
-(def!struct (function-designator-cast (:include dependent-cast)
-                                      (:copier nil))
-  (caller nil :type symbol)
-  (arg-specs nil :type list)
-  (result-specs nil :type list))
-(defprinter (function-designator-cast :identity t)
-  %type-check
-  value
-  asserted-type
-  (deps :test deps)
-  (caller :test caller)
-  (arg-specs :test arg-specs)
-  (result-specs :test result-specs))
-
-;;; Something will modify this value, warn if it's a constant
-(def!struct (modifying-cast (:include cast) (:copier nil))
-  ;; NIL after a warning has been issued
-  caller)
-
-;;; The hook is called when the value becomes constant
-(def!struct (cast-with-hook (:include cast) (:copier nil))
-  (hook #'missing-arg :type (or null function)))
+;;; Inserted by ARRAY-CALL-TYPE-DERIVER so that it can be later deleted
+(def!struct (array-index-cast (:include cast) (:copier nil)))
 
 ;;;; non-local exit support
 ;;;;

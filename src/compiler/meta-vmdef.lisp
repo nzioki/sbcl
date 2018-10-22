@@ -202,10 +202,9 @@
        (sb!assem:assemble ()
          ,@body))))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *sc-vop-slots*
+(defglobal *sc-vop-slots*
     '((:move . sc-move-vops)
-      (:move-arg . sc-move-arg-vops))))
+      (:move-arg . sc-move-arg-vops)))
 
 ;;;; primitive type definition
 
@@ -340,7 +339,9 @@
   (save-p nil :type (member t nil :compute-only :force-to-stack))
   ;; info about how to emit MOVE-ARG VOPs for the &MORE operand in
   ;; call/return VOPs
-  (move-args nil :type (member nil :local-call :full-call :known-return)))
+  (move-args nil :type (member nil :local-call :full-call :known-return))
+  (args-var '.args. :type symbol)
+  (results-var '.results. :type symbol))
 (defprinter (vop-parse)
   name
   (inherits :test inherits)
@@ -367,9 +368,9 @@
 ;;; The list of slots in the structure, not including the OPERANDS slot.
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
-    '(arg-types args body conditional-p cost guard ignores info-args inherits
+    '(arg-types args args-var body conditional-p cost guard ignores info-args inherits
       ltn-policy more-args more-results move-args name node-var note result-types
-      results save-p source-location temps translate variant variant-vars vop-var))
+      results results-var save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
 ;; get this far in cross-compilaion. So it's probably not worth much.
 (eval-when (#+sb-xc :compile-toplevel)
@@ -660,8 +661,7 @@
         (load-tn (operand-parse-load-tn op)))
     (if funs
         (let* ((tn `(tn-ref-tn ,(operand-parse-temp op)))
-               (n-vop (or (vop-parse-vop-var parse)
-                          (setf (vop-parse-vop-var parse) '.vop.)))
+               (n-vop (vop-parse-vop-var parse))
                (form (if (rest funs)
                          `(sc-case ,tn
                             ,@(mapcar (lambda (x)
@@ -722,6 +722,8 @@
 (defun make-generator-function (parse)
   (declare (type vop-parse parse))
   (let ((n-vop (vop-parse-vop-var parse))
+        (n-args (vop-parse-args-var parse))
+        (n-results (vop-parse-results-var parse))
         (operands (vop-parse-operands parse))
         (n-info (gensym)) (n-variant (gensym)))
     (collect ((binds)
@@ -746,13 +748,14 @@
           ((:more-argument :more-result))))
 
       `(named-lambda (vop ,(vop-parse-name parse)) (,n-vop)
-         (declare (ignorable ,n-vop))
-         (let* (,@(access-operands (vop-parse-args parse)
+         (let* ((,n-args (vop-args ,n-vop))
+                (,n-results (vop-results ,n-vop))
+                ,@(access-operands (vop-parse-args parse)
                                    (vop-parse-more-args parse)
-                                   `(vop-args ,n-vop))
+                                   n-args)
                   ,@(access-operands (vop-parse-results parse)
                                      (vop-parse-more-results parse)
-                                     `(vop-results ,n-vop))
+                                     n-results)
                   ,@(access-operands (vop-parse-temps parse) nil
                                      `(vop-temps ,n-vop))
                   ,@(when (vop-parse-info-args parse)
@@ -766,7 +769,8 @@
                   ,@(when (vop-parse-node-var parse)
                       `((,(vop-parse-node-var parse) (vop-node ,n-vop))))
                   ,@(binds))
-           (declare (ignore ,@(vop-parse-ignores parse)))
+           (declare (ignore ,@(vop-parse-ignores parse))
+                    (ignorable ,n-args ,n-results))
            ,@(loads)
            (assemble ()
              ,@(vop-parse-body parse))
@@ -985,8 +989,12 @@
                  (make-list (length vars) :initial-element nil))))
         (:variant-cost
          (setf (vop-parse-cost parse) (vop-spec-arg spec 'unsigned-byte)))
-        (:vop-var
+        ((:vop-var :args-ref-var :results-ref-var)
          (setf (vop-parse-vop-var parse) (vop-spec-arg spec 'symbol)))
+        (:args-var
+         (setf (vop-parse-args-var parse) (vop-spec-arg spec 'symbol)))
+        (:results-var
+         (setf (vop-parse-results-var parse) (vop-spec-arg spec 'symbol)))
         (:move-args
          (setf (vop-parse-move-args parse)
                (vop-spec-arg spec '(member nil :local-call :full-call
@@ -1073,18 +1081,20 @@
 
     (values costs load-scs)))
 
-(defparameter *no-costs*
-  (make-array sb!vm:sc-number-limit :initial-element 0))
+(defconstant-eqx +no-costs+
+    (make-array sb!vm:sc-number-limit :initial-element 0)
+  #'equalp)
 
-(defparameter *no-loads*
-  (make-array sb!vm:sc-number-limit :initial-element t))
+(defconstant-eqx +no-loads+
+    (make-array sb!vm:sc-number-limit :initial-element t)
+  #'equalp)
 
 ;;; Pick off the case of operands with no restrictions.
 (defun compute-loading-costs-if-any (op load-p)
   (declare (type operand-parse op))
   (if (operand-parse-scs op)
       (compute-loading-costs op load-p)
-      (values *no-costs* *no-loads*)))
+      (values +no-costs+ +no-loads+)))
 
 (defun compute-costs-and-restrictions-list (ops load-p)
   (declare (list ops))

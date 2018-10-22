@@ -214,8 +214,8 @@
 ;;; ignore TYPE-CHECK-ERROR because we don't want the possibility of
 ;;; error to bias the result. Notes are suppressed for T-C-E as well,
 ;;; since we don't need to worry about the efficiency of that case.
-(defparameter *ignore-cost-vops* '(set type-check-error))
-(defparameter *suppress-note-vops* '(type-check-error))
+(define-load-time-global *ignore-cost-vops* '(set type-check-error))
+(define-load-time-global *suppress-note-vops* '(type-check-error))
 
 ;;; We special-case the move VOP, since using this costs for the
 ;;; normal MOVE would spuriously encourage descriptor representations.
@@ -448,25 +448,31 @@
          (vop (tn-ref-vop op))
          (node (vop-node vop))
          (block (vop-block vop)))
-    (flet ((check-sc (scn sc)
-             (when (sc-allowed-by-primitive-type sc ptype)
-               (let ((res (find-move-vop op-tn write-p sc ptype
-                                         #'sc-move-vops)))
-                 (when res
-                   (when (>= (vop-info-cost res)
-                             *efficiency-note-cost-threshold*)
-                     (maybe-emit-coerce-efficiency-note res op dest-tn))
-                   (let ((temp (make-representation-tn ptype scn)))
-                     (change-tn-ref-tn op temp)
-                     (cond
-                       ((not write-p)
-                        (emit-move-template node block res op-tn temp before))
-                       ((and (null (tn-reads op-tn))
-                             (eq (tn-kind op-tn) :normal)))
-                       (t
-                        (emit-move-template node block res temp op-tn
-                                            before))))
-                   t)))))
+    (labels ((emit-move (vop x y)
+               (when (>= (vop-info-cost vop)
+                         *efficiency-note-cost-threshold*)
+                 (maybe-emit-coerce-efficiency-note vop op dest-tn))
+               (emit-move-template node block vop x y before))
+             (check-sc (scn sc)
+               (when (sc-allowed-by-primitive-type sc ptype)
+                 (let ((res (find-move-vop op-tn write-p sc ptype
+                                           #'sc-move-vops)))
+                   (when res
+                     (let ((temp (make-representation-tn ptype scn)))
+                       (change-tn-ref-tn op temp)
+                       (cond
+                         ((not write-p)
+                          (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
+                                                                    op)
+                                         res)
+                                     op-tn temp))
+                         ((and (null (tn-reads op-tn))
+                               (eq (tn-kind op-tn) :normal)))
+                         (t
+                          (emit-move (or (maybe-move-from-fixnum+-1 temp op-tn op)
+                                         res)
+                                     temp op-tn))))
+                     t)))))
       ;; Search the non-stack load SCs first.
       (dotimes (scn sb!vm:sc-number-limit)
         (let ((sc (svref *backend-sc-numbers* scn)))
@@ -575,6 +581,21 @@
                                 after)))))
   (values))
 
+(defun maybe-move-from-fixnum+-1 (x y &optional x-tn-ref)
+  (when (and (sc-is y sb!vm::descriptor-reg)
+             (sc-is x sb!vm::signed-reg sb!vm::unsigned-reg))
+    (let ((type (tn-ref-type x-tn-ref)))
+      (cond ((not type)
+             nil)
+            ((csubtypep type
+                        (specifier-type `(integer ,sb!xc:most-negative-fixnum
+                                                  ,(1+ sb!xc:most-positive-fixnum))))
+             (template-or-lose 'sb!vm::move-from-fixnum+1))
+            ((csubtypep type
+                        (specifier-type `(integer ,(1- sb!xc:most-negative-fixnum)
+                                                  ,sb!xc:most-positive-fixnum)))
+             (template-or-lose 'sb!vm::move-from-fixnum-1))))))
+
 ;;; Scan the IR2 looking for move operations that need to be replaced
 ;;; with special-case VOPs and emitting coercion VOPs for operands of
 ;;; normal VOPs. We delete moves to TNs that are never read at this
@@ -589,28 +610,33 @@
           (node (vop-node vop))
           (block (vop-block vop)))
       (cond
-       ((eq (vop-info-name info) 'move)
-        (let* ((args (vop-args vop))
-               (x (tn-ref-tn args))
-               (y (tn-ref-tn (vop-results vop)))
-               (res (find-move-vop x nil (tn-sc y) (tn-primitive-type y)
-                                   #'sc-move-vops)))
-          (cond ((and (null (tn-reads y))
-                      (eq (tn-kind y) :normal))
-                 (delete-vop vop))
-                ((eq res info))
-                (res
-                 (when (>= (vop-info-cost res)
-                           *efficiency-note-cost-threshold*)
-                   (maybe-emit-coerce-efficiency-note res args y))
-                 (emit-move-template node block res x y vop)
-                 (delete-vop vop))
-                (t
-                 (coerce-vop-operands vop)))))
-       ((vop-info-move-args info)
-        (emit-arg-moves vop))
-       (t
-        (coerce-vop-operands vop))))))
+        ((eq (vop-info-name info) 'move)
+         (let* ((args (vop-args vop))
+                (x (tn-ref-tn args))
+                (y (tn-ref-tn (vop-results vop)))
+                (res (find-move-vop x nil (tn-sc y) (tn-primitive-type y)
+                                    #'sc-move-vops)))
+
+           (cond ((and (null (tn-reads y))
+                       (eq (tn-kind y) :normal))
+                  (delete-vop vop))
+                 ((eq res info))
+                 (res
+
+                  (let ((res (or (maybe-move-from-fixnum+-1 x y
+                                                            args)
+                                 res)))
+                    (when (>= (vop-info-cost res)
+                              *efficiency-note-cost-threshold*)
+                      (maybe-emit-coerce-efficiency-note res args y))
+                    (emit-move-template node block res x y vop)
+                    (delete-vop vop)))
+                 (t
+                  (coerce-vop-operands vop)))))
+        ((vop-info-move-args info)
+         (emit-arg-moves vop))
+        (t
+         (coerce-vop-operands vop))))))
 
 ;;; If TN is in a number stack SC, make all the right annotations.
 ;;; Note that this should be called after TN has been referenced,

@@ -44,12 +44,11 @@
 (sb!kernel::!defstruct-with-alternate-metaclass
  interpreted-function
  :slot-names (%proto-fn env frame cookie)
- :boa-constructor %make-interpreted-function
+ :constructor %make-interpreted-function
  :superclass-name function
  :metaclass-name static-classoid
  :metaclass-constructor make-static-classoid
- :dd-type funcallable-structure
- :runtime-type-checks-p nil)
+ :dd-type funcallable-structure)
 
 (declaim (freeze-type interpreted-function))
 

@@ -322,7 +322,7 @@ all_signals_blocked_p(sigset_t *sigset, sigset_t *sigset2,
     if (has_blocked && has_unblocked) {
         char buf[3*64]; // assuming worst case 64 signals present in sigset
         sigset_tostring(sigset, buf, sizeof buf);
-        lose("%s signals partially blocked: {%s}\n", name);
+        lose("%s signals partially blocked: {%s}\n", name, buf);
     }
     if (has_blocked)
         return 1;
@@ -363,7 +363,7 @@ sigaddset_blockable(sigset_t *sigset)
 }
 
 void
-sigaddset_gc(sigset_t *sigset)
+sigaddset_gc(sigset_t __attribute__((unused)) *sigset)
 {
 #ifdef THREADS_USING_GCSIGNAL
     sigaddset(sigset,SIG_STOP_FOR_GC);
@@ -592,7 +592,7 @@ maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset)
  * enabled, without the protection of *GC-INHIBIT* T and there is gc
  * (or stop for gc) pending, but we haven't trapped yet? */
 int
-in_leaving_without_gcing_race_p(struct thread *thread)
+in_leaving_without_gcing_race_p(struct thread __attribute__((unused)) *thread)
 {
     return ((read_TLS(IN_WITHOUT_GCING,thread) != NIL) &&
             (read_TLS(INTERRUPTS_ENABLED,thread) != NIL) &&
@@ -688,7 +688,8 @@ check_interrupt_context_or_lose(os_context_t *context)
  */
 
 static void
-build_fake_control_stack_frames(struct thread *th,os_context_t *context)
+build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
+                                os_context_t __attribute__((unused)) *context)
 {
 #ifndef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 
@@ -824,7 +825,7 @@ fake_foreign_function_call(os_context_t *context)
  * the usual signal mask will be restored from the context when the handler
  * finishes.  Otherwise, be careful */
 void
-undo_fake_foreign_function_call(os_context_t *context)
+undo_fake_foreign_function_call(os_context_t __attribute__((unused)) *context)
 {
     struct thread *thread=arch_os_get_current_thread();
     /* Block all blockable signals. */
@@ -1079,7 +1080,7 @@ interrupt_handle_pending(os_context_t *context)
          * an interrupt arrived during GC (POST-GC, really) it was
          * handled. */
         if (original_pending_handler != data->pending_handler)
-            lose("pending handler changed in gc: %x -> %x.",
+            lose("pending handler changed in gc: %p -> %p.",
                  original_pending_handler, data->pending_handler);
     }
 
@@ -1162,17 +1163,6 @@ interrupt_handle_now(int signal, siginfo_t *info, os_context_t *context)
          * return-elsewhere world (the original context will no longer
          * be available; should we copy it or was nobody using it anyway?)
          * then we should convert this to return-elsewhere */
-
-        /* CMUCL comment said "Allocate the SAPs while the interrupts
-         * are still disabled.".  I (dan, 2003.08.21) assume this is
-         * because we're not in pseudoatomic and allocation shouldn't
-         * be interrupted.  In which case it's no longer an issue as
-         * all our allocation from C now goes through a PA wrapper,
-         * but still, doesn't hurt.
-         *
-         * Yeah, but non-gencgc platforms don't really wrap allocation
-         * in PA. MG - 2005-08-29  */
-
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
         /* Leave deferrable signals blocked, the handler itself will
@@ -1296,7 +1286,7 @@ store_signal_data_for_later (struct interrupt_data *data, void *handler,
                              siginfo_t *info, os_context_t *context)
 {
     if (data->pending_handler)
-        lose("tried to overwrite pending interrupt handler %x with %x\n",
+        lose("tried to overwrite pending interrupt handler %p with %p",
              data->pending_handler, handler);
     if (!handler)
         lose("tried to defer null interrupt handler\n");
@@ -1359,7 +1349,9 @@ low_level_maybe_now_maybe_later(int signal, siginfo_t *info, void *void_context)
 
 /* This function must not cons, because that may trigger a GC. */
 void
-sig_stop_for_gc_handler(int signal, siginfo_t *info, os_context_t *context)
+sig_stop_for_gc_handler(int __attribute__((unused)) signal,
+                        siginfo_t __attribute__((unused)) *info,
+                        os_context_t *context)
 {
     struct thread *thread=arch_os_get_current_thread();
     boolean was_in_lisp;
@@ -1412,8 +1404,10 @@ sig_stop_for_gc_handler(int signal, siginfo_t *info, os_context_t *context)
     }
 
     if(thread_state(thread)!=STATE_RUNNING) {
-        lose("sig_stop_for_gc_handler: wrong thread state: %ld\n",
-             fixnum_value(thread->state));
+        // macOS warns if OBJ_FMTX is used to format a 'sword_t'
+        // which fixnum_value() returns.
+        lose("sig_stop_for_gc_handler: wrong thread state: %"OBJ_FMTX,
+             (lispobj)fixnum_value(thread->state));
     }
 
     set_thread_state(thread,STATE_STOPPED);
@@ -1429,8 +1423,8 @@ sig_stop_for_gc_handler(int signal, siginfo_t *info, os_context_t *context)
     FSHOW_SIGNAL((stderr,"resumed\n"));
 
     if(thread_state(thread)!=STATE_RUNNING) {
-        lose("sig_stop_for_gc_handler: wrong thread state on wakeup: %ld\n",
-             fixnum_value(thread_state(thread)));
+        lose("sig_stop_for_gc_handler: wrong thread state on wakeup: %"OBJ_FMTX,
+             (lispobj)fixnum_value(thread_state(thread)));
     }
 
     if (was_in_lisp) {
@@ -1723,7 +1717,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
        addr < CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size) {
         fake_foreign_function_call(context);
         lose("Control stack exhausted, fault: %p, PC: %p",
-             addr, *os_context_pc_addr(context));
+             addr, (void*)*os_context_pc_addr(context));
     }
     else if(addr >= CONTROL_STACK_GUARD_PAGE(th) &&
             addr < CONTROL_STACK_GUARD_PAGE(th) + os_vm_page_size) {
@@ -1734,7 +1728,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
         if (lose_on_corruption_p || gc_active_p) {
             fake_foreign_function_call(context);
             lose("Control stack exhausted, fault: %p, PC: %p",
-                 addr, *os_context_pc_addr(context));
+                 addr, (void*)*os_context_pc_addr(context));
         }
         if (th->control_stack_guard_page_protected == NIL)
             lose("control_stack_guard_page_protected NIL");
@@ -1846,7 +1840,9 @@ static volatile int sigaction_nodefer_works = -1;
 #define SA_NODEFER_TEST_KILL_SIGNAL SIGUSR1
 
 static void
-sigaction_nodefer_test_handler(int signal, siginfo_t *info, void *void_context)
+sigaction_nodefer_test_handler(int signal,
+                               siginfo_t __attribute__((unused)) *info,
+                               void __attribute__((unused)) *void_context)
 {
     sigset_t current;
     int i;
@@ -2059,7 +2055,7 @@ undoably_install_low_level_interrupt_handler (int signal,
 /* This is called from Lisp. */
 uword_t
 install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
-                int synchronous)
+                int __attribute__((unused)) synchronous)
 {
 #ifndef LISP_FEATURE_WIN32
     struct sigaction sa;
@@ -2113,7 +2109,9 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
 /* This must not go through lisp as it's allowed anytime, even when on
  * the altstack. */
 void
-sigabrt_handler(int signal, siginfo_t *info, os_context_t *context)
+sigabrt_handler(int __attribute__((unused)) signal,
+                siginfo_t __attribute__((unused)) *info,
+                os_context_t *context)
 {
     /* Save the interrupt context. No need to undo it, since lose()
      * shouldn't return. */

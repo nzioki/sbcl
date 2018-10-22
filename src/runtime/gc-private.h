@@ -69,7 +69,7 @@ gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
 }
 
 extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
-extern struct weak_pointer *weak_pointers; /* in gc-common.c */
+extern struct cons *weak_vectors; /* in gc-common.c */
 extern struct hash_table *weak_hash_tables; /* in gc-common.c */
 
 // These next two are prototyped for both GCs
@@ -77,6 +77,7 @@ extern struct hash_table *weak_hash_tables; /* in gc-common.c */
 void gc_mark_range(lispobj*start, long count);
 void gc_mark_obj(lispobj);
 void gc_dispose_private_pages();
+void add_to_weak_vector_list(lispobj* vector, lispobj header);
 
 extern void heap_scavenge(lispobj *start, lispobj *limit);
 extern sword_t scavenge(lispobj *start, sword_t n_words);
@@ -104,7 +105,7 @@ lispobj *search_dynamic_space(void *pointer);
 
 static inline int instruction_ptr_p(void *pointer, lispobj *start_addr)
 {
-    return widetag_of(*start_addr) == CODE_HEADER_WIDETAG &&
+    return widetag_of(start_addr) == CODE_HEADER_WIDETAG &&
         pointer >= (void*)(start_addr + code_header_words(*start_addr));
 }
 extern int properly_tagged_p_internal(lispobj pointer, lispobj *start_addr);
@@ -119,12 +120,11 @@ extern void scrub_thread_control_stack(struct thread *);
 
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
 
-static inline boolean filler_obj_p(lispobj* obj) { return 0; }
+static inline boolean filler_obj_p(lispobj __attribute__((unused)) *obj) { return 0; }
 
 #else
 
 extern void enliven_immobile_obj(lispobj*,int);
-extern void fixup_immobile_refs(lispobj (*)(lispobj), lispobj, struct code*);
 
 #define IMMOBILE_OBJ_VISITED_FLAG    0x10
 #define IMMOBILE_OBJ_GENERATION_MASK 0x0f // mask off the VISITED flag
@@ -136,15 +136,15 @@ extern void fixup_immobile_refs(lispobj (*)(lispobj), lispobj, struct code*);
 #ifdef LISP_FEATURE_LITTLE_ENDIAN
 static inline int immobile_obj_gen_bits(lispobj* pointer) // native pointer
 {
-  if (widetag_of(*pointer) == SIMPLE_FUN_WIDETAG)
+  if (widetag_of(pointer) == SIMPLE_FUN_WIDETAG)
     pointer = fun_code_header(pointer);
-  return ((generation_index_t*)pointer)[3];
+  return ((generation_index_t*)pointer)[3] & 0x3F;
 }
 // Faster way when we know that the object can't be a simple-fun,
 // such as when walking the immobile space.
 static inline int __immobile_obj_gen_bits(lispobj* pointer) // native pointer
 {
-  return ((generation_index_t*)pointer)[3];
+  return ((generation_index_t*)pointer)[3] & 0x3F;
 }
 #else
 #error "Need to define immobile_obj_gen_bits() for big-endian"
@@ -156,8 +156,8 @@ static inline boolean filler_obj_p(lispobj* obj) {
 
 #endif /* immobile space */
 
-#define WEAK_POINTER_NWORDS \
-        ALIGN_UP((sizeof(struct weak_pointer) / sizeof(lispobj)), 2)
+#define WEAK_POINTER_CHAIN_END (void*)(intptr_t)-1
+#define WEAK_POINTER_NWORDS ALIGN_UP(WEAK_POINTER_SIZE,2)
 
 static inline boolean weak_pointer_breakable_p(struct weak_pointer *wp)
 {
@@ -170,6 +170,20 @@ static inline boolean weak_pointer_breakable_p(struct weak_pointer *wp)
              immobile_obj_gen_bits(native_pointer(pointee)) == from_space)
 #endif
             );
+}
+
+static inline void add_to_weak_pointer_chain(struct weak_pointer *wp) {
+    /* Link 'wp' into weak_pointer_chain using its 'next' field.
+     * We ensure that 'next' is always NULL when the weak pointer isn't
+     * in the chain, and not NULL otherwise. The end of the chain
+     * is denoted by WEAK_POINTER_CHAIN_END which is distinct from NULL.
+     * The test of whether the weak pointer has been placed in the chain
+     * is performed in 'scav_weak_pointer' for gencgc.
+     * In cheneygc, chaining is performed in 'trans_weak_pointer'
+     * which works just as well, since an object is transported
+     * at most once per GC cycle */
+    wp->next = (struct weak_pointer *)LOW_WORD(weak_pointer_chain);
+    weak_pointer_chain = wp;
 }
 
 /// Same as Lisp LOGBITP, except no negative bignums allowed.
@@ -256,6 +270,24 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 
 #define NON_FAULTING_STORE(operation, addr) operation
 
+#endif
+
+#define OBJ_WRITTEN_FLAG 0x40
+#ifdef LISP_FEATURE_LITTLE_ENDIAN
+#define CLEAR_WRITTEN_FLAG(obj) ((unsigned char*)obj)[3] &= ~OBJ_WRITTEN_FLAG
+#define SET_WRITTEN_FLAG(obj)   ((unsigned char*)obj)[3] |= OBJ_WRITTEN_FLAG
+#else
+#define CLEAR_WRITTEN_FLAG(obj) *obj &= ~(OBJ_WRITTEN_FLAG<<24)
+#define SET_WRITTEN_FLAG(obj)   *obj |=  (OBJ_WRITTEN_FLAG<<24)
+#endif
+static inline int header_rememberedp(lispobj header) {
+  return (header & (OBJ_WRITTEN_FLAG << 24)) != 0;
+}
+
+#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_X86)
+# define CODE_PAGES_USE_SOFT_PROTECTION 1
+#else
+# define CODE_PAGES_USE_SOFT_PROTECTION 0
 #endif
 
 #endif /* _GC_PRIVATE_H_ */

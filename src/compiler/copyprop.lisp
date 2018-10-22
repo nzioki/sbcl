@@ -78,10 +78,19 @@
                 (let ((arg-tn (tn-ref-tn (vop-args vop))))
                   (and (or (not (tn-sc arg-tn))
                            (eq (tn-kind arg-tn) :constant))
-                       (subsetp (primitive-type-scs
-                                 (tn-primitive-type tn))
-                                (primitive-type-scs
-                                 (tn-primitive-type arg-tn)))
+                       (or
+                        (let ((reads (tn-reads tn)))
+                          ;; For moves to another moves the SC does
+                          ;; not matter, the intermediate SC will
+                          ;; match and there's no VOP selection to be
+                          ;; performed based on the SC.
+                          (and reads
+                               (null (tn-ref-next reads))
+                               (eq (vop-info-name (vop-info (tn-ref-vop reads))) 'move)))
+                        (subsetp (primitive-type-scs
+                                  (tn-primitive-type tn))
+                                 (primitive-type-scs
+                                  (tn-primitive-type arg-tn))))
                        (let ((leaf (tn-leaf tn)))
                          (or (not leaf)
                              (and
@@ -101,7 +110,11 @@
   (do ((ref (tn-reads tn) (tn-ref-next ref)))
       ((null ref) t)
     (let ((vop (tn-ref-vop ref)))
-      (unless (eq (ir2-block-block (vop-block vop)) block)
+      ;; MOVEs can be chained and read in other blocks. This is done
+      ;; not for correctness but for memory usage reduction, so there
+      ;; is no need to follow all the chains, just be conservative.
+      (when (or (eq (vop-info-name (vop-info vop)) 'move)
+                (neq (ir2-block-block (vop-block vop)) block))
         (return)))))
 
 ;;; Init the sets in BLOCK for copy propagation. To find GEN, we just

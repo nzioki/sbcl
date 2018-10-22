@@ -43,7 +43,6 @@
 #endif
 #define BREAKPOINT_WIDTH 1
 #endif
-
 unsigned int cpuid_fn1_ecx;
 unsigned int avx_supported = 0;
 
@@ -120,7 +119,9 @@ void untune_asm_routines_for_microarch(void)
 
 #ifndef _WIN64
 os_vm_address_t
-arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
+arch_get_bad_addr(int __attribute__((unused)) sig,
+                  siginfo_t *code,
+                  os_context_t __attribute__((unused)) *context)
 {
     return (os_vm_address_t)code->si_addr;
 }
@@ -211,20 +212,20 @@ arch_internal_error_arguments(os_context_t *context)
 }
 
 boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
+arch_pseudo_atomic_atomic(os_context_t __attribute__((unused)) *context)
 {
     return get_pseudo_atomic_atomic(arch_os_get_current_thread());
 }
 
 void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
+arch_set_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
     struct thread *thread = arch_os_get_current_thread();
     set_pseudo_atomic_interrupted(thread);
 }
 
 void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
+arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
     struct thread *thread = arch_os_get_current_thread();
     clear_pseudo_atomic_interrupted(thread);
@@ -349,7 +350,9 @@ restore_breakpoint_from_single_step(os_context_t * context)
 }
 
 void
-sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
+sigtrap_handler(int __attribute__((unused)) signal,
+                siginfo_t __attribute__((unused)) *info,
+                os_context_t *context)
 {
     unsigned int trap;
 
@@ -373,7 +376,9 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 }
 
 void
-sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
+sigill_handler(int __attribute__((unused)) signal,
+               siginfo_t __attribute__((unused)) *siginfo,
+               os_context_t *context) {
     /* Triggering SIGTRAP using int3 is unreliable on OS X/x86, so
      * we need to use illegal instructions for traps.
      */
@@ -390,7 +395,7 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
 #endif
 
     fake_foreign_function_call(context);
-    lose("Unhandled SIGILL at %p.", *os_context_pc_addr(context));
+    lose("Unhandled SIGILL at %p.", (void*)*os_context_pc_addr(context));
 }
 
 #ifdef X86_64_SIGFPE_FIXUP
@@ -551,26 +556,21 @@ arch_set_fp_modes(unsigned int mxcsr)
 ///     it resemble a simple-fun in terms of call convention, or
 /// (3) a code-component with no simple-fun within it, that makes
 ///     closures and other funcallable-instances look like simple-funs.
-lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
-    extern unsigned asm_routines_end;
-    if (((lispobj)fdefn->raw_addr & 0xFE) == 0xE8) {  // looks good
-        int32_t offs = UNALIGNED_LOAD32((char*)&fdefn->raw_addr + 1);
-        unsigned int raw_fun =
-            (int)(long)&fdefn->raw_addr + 5 + offs; // 5 = length of "JMP rel32"
-        switch (((unsigned char*)&fdefn->raw_addr)[5]) {
-        case 0x00: // no closure/fin trampoline
-          // If the target is an assembly routine, there is no simple-fun
-          // that corresponds to the entry point. The code is kept live
-          // by *ASSEMBLER-OBJECTS*. Otherwise, return the simple-fun.
-          return raw_fun < asm_routines_end ? 0 : raw_fun - FUN_RAW_ADDR_OFFSET;
-        case 0x48: // embedded funcallable instance trampoline
-          return (raw_fun - (4<<WORD_SHIFT)) | FUN_POINTER_LOWTAG;
-        case 0x90: // general closure/fin trampoline
-          return (raw_fun - offsetof(struct code, constants)) | OTHER_POINTER_LOWTAG;
-        }
-    } else if (fdefn->raw_addr == 0)
+/// If the fdefn jumps to the UNDEFINED-FDEFN routine, then return 0.
+lispobj virtual_fdefn_callee_lispobj(struct fdefn* fdefn, uword_t vaddr) {
+    unsigned char tagged_ptr_bias = ((unsigned char*)&fdefn->raw_addr)[7];
+    // If the pointer bias is 0, then this fdefn's raw_addr must
+    // point to an assembler routine entry point.
+    if (tagged_ptr_bias == 0)
         return 0;
-    lose("Can't decode fdefn raw addr @ %p: %p\n", fdefn, fdefn->raw_addr);
+    int32_t offs = UNALIGNED_LOAD32((char*)&fdefn->raw_addr + 1);
+    // Base the callee address off where the fdefn virtually is.
+    // Compensate for the offset of the raw_addr slot,
+    // and add 5 for the length of "JMP rel32" instruction.
+    return vaddr + offsetof(struct fdefn,raw_addr) + 5 + offs - tagged_ptr_bias;
+}
+lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
+  return virtual_fdefn_callee_lispobj(fdefn, (uword_t)fdefn);
 }
 #endif
 
@@ -678,7 +678,7 @@ allocation_tracker_counted(uword_t* sp)
         // but since this is self-modifying code, the most stringent memory
         // order is prudent.
         if (!__sync_bool_compare_and_swap(pc, word_at_pc, new_inst))
-            lose("alloc profiler failed to rewrite instruction @ %lx", pc);
+            lose("alloc profiler failed to rewrite instruction @ %p", pc);
         if (index != 2)
             record_pc(pc, index, 0);
     }
@@ -717,7 +717,7 @@ allocation_tracker_sized(uword_t* sp)
         // opcode is changed, fallthrough to the next instruction occurs.
         if (!__sync_bool_compare_and_swap(pc+1, word_after_pc, new_inst2) ||
             !__sync_bool_compare_and_swap(pc,   word_at_pc,    new_inst1))
-            lose("alloc profiler failed to rewrite instructions @ %lx", pc);
+            lose("alloc profiler failed to rewrite instructions @ %p", pc);
         if (index != 0) // can't record a PC for the overflow counts
             record_pc(pc, index, 1);
     }

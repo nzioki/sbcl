@@ -121,18 +121,13 @@
 ;;;     and FOP-MAYBE-COLD-LOAD.
 
 ;;; the conventional file extension for our fasl files
+;;; FIXME this should be (DEFCONSTANT-EQX +FASL-FILE-TYPE+ "fasl" #'EQUAL),
+;;; but renaming the variable would harm 'asdf-dependency-grovel' and other
+;;; random 3rd-party libraries. However, we can't keep the name and make it
+;;; constant, because the compiler warns about asterisks on constants.
+;;; So we keep the asterisks and make it defglobal.
 (declaim (type simple-string *fasl-file-type*))
-(defvar *fasl-file-type* "fasl")
-
-;;;; information about below-Lisp-level linkage
-
-;;; Note:
-;;;   Assembler routines are named by full Lisp symbols: they
-;;;     have packages and that sort of native Lisp stuff associated
-;;;     with them. We can compare them with EQ.
-(defglobal *assembler-routines* nil)
-#-sb-xc-host (declaim (code-component *assembler-routines*))
-
+(defglobal *fasl-file-type* "fasl")
 
 ;;;; the FOP database
 
@@ -181,3 +176,10 @@
   ;; NIL if we're executing normally.
   (skip-until nil))
 (declaim (freeze-type fasl-input))
+
+;;; Unique number assigned into high 4 bytes of 64-bit code size slot
+;;; so that we can sort the contents of varyobj space in a more-or-less
+;;; predictable manner based on the order in which code was loaded.
+;;; This wraps around at 32 bits, but it's still deterministic.
+(define-load-time-global *code-serialno* 0)
+(declaim (fixnum *code-serialno*))

@@ -16,12 +16,15 @@
 
 ;;; Run the cross-compiler to produce cold fasl files.
 (setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
+(setq sb!c::*static-vop-usage-counts* (make-hash-table))
 (let (fail
       variables
       functions
       types)
   (sb!xc:with-compilation-unit ()
-    (load "src/cold/compile-cold-sbcl.lisp")
+    (let ((*feature-evaluation-results* nil))
+      (load "src/cold/compile-cold-sbcl.lisp")
+      (sanity-check-feature-evaluation))
     ;; Enforce absence of unexpected forward-references to warm loaded code.
     ;; Looking into a hidden detail of this compiler seems fair game.
     #!+(or x86 x86-64 arm64) ; until all the rest are clean
@@ -39,6 +42,20 @@
             "Undefined ~:[~;variables~] ~:[~;types~]~
              ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-WHITELIST*?)~]"
             variables types functions)))
+
+#-clisp ; DO-ALL-SYMBOLS seems to kill CLISP at random
+(do-all-symbols (s)
+  (when (and (sb!int:info :function :inlinep s)
+             (eq (sb!int:info :function :where-from s) :assumed))
+      (warn "Did you forget to define ~S?" s)))
+
+;; enable this too see which vops were or weren't used
+#+nil
+(when (hash-table-p sb!c::*static-vop-usage-counts*)
+  (format t "Vops used:~%")
+  (dolist (cell (sort (sb!int:%hash-table-alist sb!c::*static-vop-usage-counts*)
+                      #'> :key #'cdr))
+    (format t "~6d ~s~%" (cdr cell) (car cell))))
 
 (when sb!c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
@@ -90,7 +107,7 @@
                   (not (gethash spec sb!c::*checkgen-used-types*)))
         do (format t "       ~S~%" spec)))
 
-;; Print some information about how well the function caches performed
+;; Print some information about how well the type operator caches performed
 (when sb!impl::*profile-hash-cache*
   (sb!impl::show-hash-cache-statistics))
 #|
@@ -117,12 +134,6 @@ Sample output
     10416      9492 ( 91.1%)      668 (  6.4%)  256  100.0% TYPE-NEGATION-CACHE
 |#
 
-;;; miscellaneous tidying up and saving results
-(let ((filename "output/object-filenames-for-genesis.lisp-expr"))
-  (ensure-directories-exist filename :verbose t)
-  (with-open-file (s filename :direction :output :if-exists :supersede)
-    (write *target-object-file-names* :stream s :readably t)))
-
 ;;; Let's check that the type system was reasonably sane. (It's easy
 ;;; to spend a long time wandering around confused trying to debug
 ;;; cold init if it wasn't.)
@@ -133,8 +144,9 @@ Sample output
 ;;; time to run it. The resulting core isn't used in the normal build,
 ;;; but can be handy for experimenting with the system. (See slam.sh
 ;;; for an example.)
-(when (position :sb-after-xc-core sb!xc:*features*)
+#+sb-after-xc-core
+(progn
   #+cmu (ext:save-lisp "output/after-xc.core" :load-init-file nil)
-  #+sbcl (sb-ext:save-lisp-and-die "output/after-xc.core")
+  #+sbcl (host-sb-ext:save-lisp-and-die "output/after-xc.core")
   #+openmcl (ccl::save-application "output/after-xc.core")
   #+clisp (ext:saveinitmem "output/after-xc.core"))

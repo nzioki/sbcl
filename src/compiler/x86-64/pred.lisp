@@ -60,7 +60,7 @@
               (dolist (flag flags)
                 (inst jmp flag dest)))))))
 
-(defvar *cmov-ptype-representation-vop*
+(define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
             (destructuring-bind (ptypes &optional sc vop)
                 entry
@@ -207,7 +207,7 @@
     (cond
       ((sc-is y immediate)
        (let* ((value (encode-value-if-immediate y))
-              (immediate (immediate32-p value)))
+              (immediate (plausible-signed-imm32-operand-p value)))
          (cond ((fixup-p value) ; immobile object
                 (inst cmp x value))
                ((and (zerop value) (sc-is x any-reg descriptor-reg))
@@ -242,3 +242,18 @@
   (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
   (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
   (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))
+
+(define-vop (%instance-ref-eq)
+  (:args (instance :scs (descriptor-reg))
+         (x :scs (descriptor-reg immediate)))
+  (:arg-types * (:constant (unsigned-byte 16)) *)
+  (:info slot)
+  (:translate %instance-ref-eq)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst cmp :qword
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         (encode-value-if-immediate x))))

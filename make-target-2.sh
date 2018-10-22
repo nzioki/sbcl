@@ -40,6 +40,10 @@ fi
 # without trying to tell you about what it's doing. So unless it hangs
 # for much longer than that, don't worry, it's likely to be normal.
 if [ "$1" != --load ]; then
+    if [ "x$1" != x ]; then
+        echo Unknown option \'"$1"\' to make-target-2
+        exit 1
+    fi
     echo //doing warm init - compilation phase
     ./src/runtime/sbcl --core output/cold-sbcl.core \
      --lose-on-corruption --no-sysinit --no-userinit \
@@ -68,7 +72,7 @@ echo //checking for leftover cold-init symbols
         (sb-int:awhen
           (mapcan (quote apropos-list)
            (quote ("DEFINE-INFO-TYPE" "LVAR-TYPE-USING"
-                   "COPY-LIST-MACRO" "TWO-ARG-+/-"
+                   "TWO-ARG-+/-"
                    "PPRINT-TAGBODY-GUTS" "WITH-DESCRIPTOR-HANDLERS"
                    "SUBTRACT-BIGNUM-LOOP" "BIGNUM-REPLACE" "WITH-BIGNUM-BUFFERS"
                    "GCD-ASSERT" "MODULARLY" "BIGNUM-NEGATE-LOOP"

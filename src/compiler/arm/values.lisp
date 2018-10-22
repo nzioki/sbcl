@@ -23,7 +23,7 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:temporary (:sc any-reg) stack-pointer)
   (:ignore r-moved-ptrs)
   (:generator 1
@@ -110,7 +110,7 @@
     (inst add csp-temp csp-temp n-word-bytes)
     (store-csp csp-temp)
     (storew temp csp-temp -1)
-    (test-type list LOOP nil (list-pointer-lowtag) :temp ndescr)
+    (test-type list ndescr LOOP nil (list-pointer-lowtag))
     (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE

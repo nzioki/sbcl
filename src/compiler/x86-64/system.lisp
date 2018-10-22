@@ -13,43 +13,38 @@
 
 ;;;; type frobbing VOPs
 
+;;; For non-list pointer descriptors, return the header's widetag byte.
+;;; For lists and non-pointers, return the low 8 descriptor bits.
+;;; We need not return exactly list-pointer-lowtag for lists - the high 4 bits
+;;; are arbitrary. Similarly we don't care that fixnums return other than 0.
+;;; Provided that the result is the correct index to **built-in-class-codes**
+;;; everything works out fine.  All backends should follow this simpler model,
+;;; but might or might not opt to use the same technique of producing a native
+;;; pointer and doing one memory access for all 3 non-list pointer types.
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset rax-offset :target result
-                   :to (:result 0)) rax)
+  (:args (object :scs (any-reg descriptor-reg)))
+  (:temporary (:sc unsigned-reg :target result :to (:result 0)) temp)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst movzx rax (reg-in-size object :byte))
-    (inst and al-tn lowtag-mask)
-    (inst cmp al-tn other-pointer-lowtag)
-    (inst jmp :e OTHER-PTR)
-    (inst cmp al-tn fun-pointer-lowtag)
-    (inst jmp :e FUNCTION-PTR)
-
-    ;; Pick off fixnums.
-    (inst test al-tn fixnum-tag-mask)
-    (inst jmp :e DONE)
-
-    ;; Pick off structures and list pointers.
-    (inst test al-tn 2)
-    (inst jmp :ne DONE)
-
-    ;; must be an other immediate
-    (inst movzx rax (reg-in-size object :byte))
+    (inst lea :dword temp (ea -3 object))
+    (inst test :byte temp 3)
+    (inst jmp :nz IMMEDIATE)
+    (inst and :byte temp lowtag-mask)
+    (inst cmp :byte temp (- list-pointer-lowtag 3))
+    (inst jmp :e IMMEDIATE)
+    ;; It's a function, instance, or other pointer.
+    (inst mov temp object)
+    ;; OBJECT is implicitly pinned, TEMP can GC-safely point to it
+    ;; with no lowtag.
+    (inst and temp (lognot lowtag-mask)) ; native pointer
+    (inst movzx '(:byte :dword) result (ea temp))
     (inst jmp DONE)
-
-    FUNCTION-PTR
-    (load-type rax object (- fun-pointer-lowtag))
-    (inst jmp DONE)
-
-    OTHER-PTR
-    (load-type rax object (- other-pointer-lowtag))
-
-    DONE
-    (move result rax)))
+    IMMEDIATE
+    (inst movzx '(:byte :dword) result object)
+    DONE))
 
 #!+compact-instance-header
 ;; ~20 instructions vs. 35
@@ -65,53 +60,50 @@
       ;;         #b1011 fun
       ;;         #b1111 other
       (inst mov  rax object)
-      (inst xor  (reg-in-size rax :byte) #b0011)
-      (inst test (reg-in-size rax :byte) #b0111)
+      (inst xor  :byte rax #b0011)
+      (inst test :byte rax #b0111)
       (inst jmp  :ne try-other)
       ;; It's an instance or function. Both have the layout in the header.
-      (inst and  (reg-in-size rax :byte) #b11110111)
-      (inst mov  (reg-in-size result :dword) (make-ea :dword :base rax :disp 4))
+      (inst and  :byte rax #b11110111)
+      (inst mov  :dword result (ea 4 rax))
       (inst jmp  done)
       TRY-OTHER
-      (inst xor  (reg-in-size rax :byte) #b1100)
-      (inst test (reg-in-size rax :byte) #b1111)
+      (inst xor  :byte rax #b1100)
+      (inst test :byte rax #b1111)
       (inst jmp  :ne imm-or-list)
       ;; It's an other-pointer. Read the widetag.
-      (inst movzx (reg-in-size rax :dword) (make-ea :byte :base rax))
+      (inst movzx '(:byte :dword) rax (ea rax))
       (inst jmp  load-from-vector)
       IMM-OR-LIST
       (inst cmp  object nil-value)
       (inst jmp  :eq NULL)
-      (inst movzx (reg-in-size rax :dword) (reg-in-size object :byte))
+      (inst movzx '(:byte :dword) rax object)
       LOAD-FROM-VECTOR
       (inst mov  result layouts)
-      (inst mov  (reg-in-size result :dword)
-            (make-ea :dword :base result
-                            :index rax :scale 8
-                            :disp (+ (ash vector-data-offset word-shift)
-                                     (- other-pointer-lowtag))))
+      (inst mov  :dword result
+            (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
+                result rax 8))
       (inst jmp  done)
       NULL
       (inst mov  result (make-fixup (find-layout 'null) :layout))
       DONE))
 
+(macrolet ((load-type (target source lowtag)
+             `(inst movzx '(:byte :dword) ,target (ea (- ,lowtag) ,source))))
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
-  (:generator 6
-    (load-type result object (- other-pointer-lowtag))))
-
+  (:generator 1 (load-type result object other-pointer-lowtag)))
 (define-vop (fun-subtype)
   (:translate fun-subtype)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
-  (:generator 6
-    (load-type result function (- fun-pointer-lowtag))))
+  (:generator 1 (load-type result function fun-pointer-lowtag))))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -130,26 +122,27 @@
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (let ((res (reg-in-size res :dword)))
-      (inst movzx res
-            (make-ea :word :base x :disp (1+ (- fun-pointer-lowtag))))
-      (inst btr res 15) ; Clear the NAMEDP header bit
-      (inst shl res n-fixnum-tag-bits))))
+    (inst movzx '(:word :dword) res (ea (1+ (- fun-pointer-lowtag)) x))
+    (inst btr :dword res 15) ; Clear the NAMEDP header bit
+    (inst shl :dword res n-fixnum-tag-bits)))
 
+;;; This operation is racy with GC and therefore slightly dangerous, especially
+;;; on objects in immobile space which reserve byte 3 of the header for GC.
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg) :target res :to (:result 0))
-         (data :scs (any-reg) :target eax))
+         (data :scs (any-reg) :target temp))
   (:arg-types * positive-fixnum)
   (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset eax-offset
-                   :from (:argument 1) :to (:result 0)) eax)
+  (:temporary (:sc unsigned-reg :from (:argument 1) :to (:result 0)) temp)
   (:generator 6
-    (move eax data)
-    (inst shl eax (- n-widetag-bits n-fixnum-tag-bits))
-    (inst mov al-tn (make-ea :byte :base x :disp (- other-pointer-lowtag)))
-    (storew eax x 0 other-pointer-lowtag)
+    (move temp data)
+    (inst shl temp (- n-widetag-bits n-fixnum-tag-bits))
+    ;; merge in the widetag. We should really preserve bit 63 as well
+    ;; which could be a GC mark bit, but it's not concurrent at the moment.
+    (inst mov :byte temp (ea (- other-pointer-lowtag) x))
+    (storew temp x 0 other-pointer-lowtag)
     (move res x)))
 
 (define-vop (get-header-data-high)
@@ -159,8 +152,7 @@
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst mov (reg-in-size res :dword)
-          (make-ea :dword :base x :disp (- 4 other-pointer-lowtag)))
+    (inst mov :dword res (ea (- 4 other-pointer-lowtag) x))
     (inst shl res n-fixnum-tag-bits)))
 
 ;;; Swap the high half of the header word of an object
@@ -178,12 +170,8 @@
   (:result-types positive-fixnum)
   (:generator 5
      (move rax old)
-     (inst cmpxchg (make-ea :dword :base object
-                            :disp (- 4 other-pointer-lowtag))
-           (reg-in-size new :dword) :lock)
-     (inst lea result
-           (make-ea :qword :index rax
-                    :scale (ash 1 n-fixnum-tag-bits)))))
+     (inst cmpxchg :dword (ea (- 4 other-pointer-lowtag) object) new :lock)
+     (inst lea result (ea nil rax (ash 1 n-fixnum-tag-bits)))))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -192,10 +180,8 @@
   (:policy :fast-safe)
   (:generator 1
     (move res ptr)
-    ;; Mask the lowtag, and shift the whole address into a positive
-    ;; fixnum.
-    (inst and res (lognot lowtag-mask))
-    (inst shr res 1)))
+    (inst and res (constantize (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
+                                             n-fixnum-tag-bits) 0)))))
 
 ;;;; allocation
 
@@ -224,11 +210,8 @@
   (:results (sap :scs (sap-reg) :from (:argument 0)))
   (:result-types system-area-pointer)
   (:generator 10
-    (inst mov (reg-in-size sap :dword)
-              (make-ea :dword :base code :disp (- 4 other-pointer-lowtag)))
-    (inst lea sap (make-ea :byte :base code :index sap
-                           :scale n-word-bytes
-                           :disp (- other-pointer-lowtag)))))
+    (inst mov :dword sap (ea (- 4 other-pointer-lowtag) code))
+    (inst lea sap (ea (- other-pointer-lowtag) code sap n-word-bytes))))
 
 (define-vop (compute-fun)
   (:args (code :scs (descriptor-reg) :to (:result 0))
@@ -236,12 +219,10 @@
   (:arg-types * positive-fixnum)
   (:results (func :scs (descriptor-reg) :from (:argument 0)))
   (:generator 10
-    (inst mov (reg-in-size func :dword)
-              (make-ea :dword :base code :disp (- 4 other-pointer-lowtag)))
+    (inst mov :dword func (ea (- 4 other-pointer-lowtag) code))
     (inst lea func
-          (make-ea :byte :base offset :index func
-                   :scale n-word-bytes
-                   :disp (- fun-pointer-lowtag other-pointer-lowtag)))
+          (ea (- fun-pointer-lowtag other-pointer-lowtag)
+              offset func n-word-bytes))
     (inst add func code)))
 
 ;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
@@ -257,9 +238,8 @@
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst lea result
-          (make-ea :byte :base result
-                   :disp (- fun-pointer-lowtag
-                            (* simple-fun-code-offset n-word-bytes))))))
+          (ea  (- fun-pointer-lowtag (* simple-fun-code-offset n-word-bytes))
+               result))))
 
 ;;;; symbol frobbing
 (defun load-symbol-info-vector (result symbol temp)
@@ -269,8 +249,8 @@
   ;; there is an info-vector in the slot, it has at least one element.
   ;; This would compile to almost the same code without a VOP,
   ;; but using a jmp around a mov instead.
-  (inst lea temp (make-ea :dword :base result :disp (- list-pointer-lowtag)))
-  (inst test (reg-in-size temp :byte) lowtag-mask)
+  (inst lea :dword temp (ea (- list-pointer-lowtag) result))
+  (inst test :byte temp lowtag-mask)
   (inst cmov :e result
         (make-ea-for-object-slot result cons-cdr-slot list-pointer-lowtag)))
 
@@ -295,7 +275,7 @@
     ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
-    (inst test (reg-in-size res :byte) fixnum-tag-mask)
+    (inst test :byte res fixnum-tag-mask)
     (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
@@ -308,13 +288,6 @@
     (inst break pending-interrupt-trap)))
 
 #!+sb-thread
-;; 29 signed bits is the max before shifting left by 3 that fits in the
-;; 'displacement' of an EA. This is hugely generous.
-;; We need negative indices to reference the interrupt contexts
-(defknown current-thread-offset-sap ((signed-byte 29))
-  system-area-pointer (flushable))
-
-#!+sb-thread
 (progn
 (define-vop (current-thread-offset-sap/c)
   (:results (sap :scs (sap-reg)))
@@ -324,7 +297,7 @@
   (:arg-types (:constant signed-byte))
   (:policy :fast-safe)
   (:generator 1
-    (inst mov sap (thread-tls-ea (ash n 3)))))
+    (inst mov sap (thread-slot-ea n))))
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -334,8 +307,8 @@
   (:policy :fast-safe)
   (:generator 2
     (inst mov sap
-          (make-ea :qword :base thread-base-tn :index n
-                          :scale (ash 1 (- word-shift n-fixnum-tag-bits)))))))
+          (ea thread-base-tn
+              n (ash 1 (- word-shift n-fixnum-tag-bits)))))))
 
 (define-vop (halt)
   (:generator 1
@@ -409,9 +382,9 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:args (count-vector :scs (descriptor-reg)))
   (:info index)
   (:generator 0
-    (inst inc (make-ea :qword :base count-vector
-                       :disp (- (* (+ vector-data-offset index) n-word-bytes)
-                                other-pointer-lowtag)))))
+    (inst inc (ea (- (* (+ vector-data-offset index) n-word-bytes)
+                     other-pointer-lowtag)
+                  count-vector))))
 
 ;;;; Memory barrier support
 

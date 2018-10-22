@@ -155,21 +155,21 @@ extern page_index_t page_table_pages;
 
 void update_dynamic_space_free_pointer(void);
 void gc_close_region(struct alloc_region *alloc_region, int page_type_flag);
-static void inline ensure_region_closed(struct alloc_region *alloc_region,
+static inline void ensure_region_closed(struct alloc_region *alloc_region,
                                         int page_type_flag)
 {
     if (alloc_region->start_addr)
         gc_close_region(alloc_region, page_type_flag);
 }
 
-static void inline gc_set_region_empty(struct alloc_region *region)
+static inline void gc_set_region_empty(struct alloc_region *region)
 {
     /* last_page is not reset. It can be used as a hint where to resume
      * allocating after closing and re-opening the region */
     region->start_addr = region->free_pointer = region->end_addr = 0;
 }
 
-static void inline gc_init_region(struct alloc_region *region)
+static inline void gc_init_region(struct alloc_region *region)
 {
     region->last_page = 0; // must always be a valid page index
     gc_set_region_empty(region);
@@ -216,7 +216,7 @@ static inline boolean pinned_p(lispobj obj, page_index_t page)
         return 0;
 # ifdef RETURN_PC_WIDETAG
     /* Conceivably there could be a precise GC without RETURN-PC objects */
-    if (widetag_of(*native_pointer(obj)) == RETURN_PC_WIDETAG)
+    if (widetag_of(native_pointer(obj)) == RETURN_PC_WIDETAG)
         obj = make_lispobj(fun_code_header(native_pointer(obj)),
                            OTHER_POINTER_LOWTAG);
 # endif
@@ -245,20 +245,6 @@ static boolean __attribute__((unused)) new_space_p(lispobj obj)
     gc_dcheck(compacting_p());
     page_index_t page_index = find_page_index((void*)obj);
     return page_index >= 0 && page_table[page_index].gen == new_space;
-}
-
-#include "genesis/weak-pointer.h"
-static inline void add_to_weak_pointer_list(struct weak_pointer *wp) {
-    /* Since we overwrite the 'next' field, we have to make
-     * sure not to do so for pointers already in the list.
-     * Instead of searching the list of weak_pointers each
-     * time, we ensure that next is always NULL when the weak
-     * pointer isn't in the list, and not NULL otherwise.
-     * Since we can't use NULL to denote end of list, we
-     * use a pointer back to the same weak_pointer.
-     */
-    wp->next = weak_pointers ? weak_pointers : wp;
-    weak_pointers = wp;
 }
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -290,5 +276,7 @@ extern page_index_t next_free_page;
 extern uword_t
 walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),
                 generation_index_t generation, uword_t extra);
+
+generation_index_t gc_gen_of(lispobj obj, int defaultval);
 
 #endif /* _GENCGC_INTERNAL_H_*/

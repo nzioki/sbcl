@@ -561,7 +561,7 @@
   (let* ((name (class-name class))
          (classoid (find-classoid name))
          (slots (condition-classoid-slots classoid))
-         (source (sb-kernel::layout-source-location (classoid-layout classoid))))
+         (source (sb-kernel::classoid-source-location classoid)))
     ;; to balance the REMOVE-SLOT-ACCESSORS call in
     ;; REINITIALIZE-INSTANCE :BEFORE (SLOT-CLASS).
     (flet ((add-source-location (method)
@@ -1485,10 +1485,11 @@
   (do () ((typep value slot-type))
     (restart-case
         (bad-type value slot-type
+                  (sb-format:tokens
                   "~@<Error during ~A. Current value in slot ~
                    ~/sb-ext:print-symbol-with-prefix/ of an instance ~
                    of ~S is ~S, which does not match the new slot type ~
-                   ~S in class ~S.~:@>"
+                   ~S in class ~S.~:@>")
                   context slot-name old-class value slot-type new-class)
       (use-value (new-value)
         :interactive read-evaluated-form

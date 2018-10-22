@@ -10,6 +10,7 @@
 (in-package "SB!VM")
 
 (defconstant sb!assem:assem-scheduler-p nil)
+(defconstant sb!assem:+inst-alignment-bytes+ 4)
 
 (defconstant +backend-fasl-file-implementation+ :alpha)
 
@@ -114,12 +115,6 @@
 (progn
   (defconstant read-only-space-start #x20000000)
   (defconstant read-only-space-end   #x24000000))
-
-#!+osf1
-(progn
-  (defconstant read-only-space-start #x10000000)
-  (defconstant read-only-space-end   #x25000000))
-
 
 (defconstant static-space-start    #x28000000)
 (defconstant static-space-end      #x2c000000)

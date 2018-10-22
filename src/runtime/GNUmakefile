@@ -14,6 +14,10 @@
 all: targets tags
 TARGET=sbcl
 
+# Allow using paxctl(8) or similar programs to adjust PaX permissions
+# of src/runtime/sbcl during the build.
+SBCL_PAXCTL ?= :
+
 # Defaults which might be overridden or modified by values in the
 # Config file. Most of them are same on most systems right now.
 # If you need to override one of these, do it in Config.
@@ -61,8 +65,8 @@ endif
 
 COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
 	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
-	interr.c interrupt.c                                            \
-	largefile.c monitor.c murmur_hash.c os-common.c parse.c print.c \
+	interr.c interrupt.c largefile.c main.c                         \
+	monitor.c murmur_hash.c os-common.c parse.c print.c             \
 	purify.c pthread-futex.c regnames.c run-program.c runtime.c     \
 	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
 	validate.c var-io.c vars.c wrap.c
@@ -79,6 +83,13 @@ targets: $(TARGET) $(OBJTARGET) sbcl.nm sbcl.mk
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
+	$(SBCL_PAXCTL) $@
+
+# Enable compiling gencgc with even more assertions and/or
+# data collection, with COMPILING_TESTS. Not really used yet.
+gc-unit-tests.o: CFLAGS=-DCOMPILING_TESTS
+unit-tests: gc-unit-tests.o libsbcl.a
+	cc -g -no-pie -o $@ $^ -ldl -lpthread -lm
 
 # ld -r -o sbcl.o works on Linux, but not on other platforms.
 # On macOS, it fails to keep debug sections.

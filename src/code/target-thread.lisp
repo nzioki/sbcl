@@ -90,8 +90,7 @@ read by the function THREAD-ERROR-THREAD."))
                         (cdr part)))
        (format stream "    ~S~%" start)))))
 
-(setf
- (fdocumentation 'thread-error-thread 'function)
+(setf (documentation 'thread-error-thread 'function)
  "Return the offending thread that the THREAD-ERROR pertains to.")
 
 (define-condition symbol-value-in-thread-error (cell-error thread-error)
@@ -157,8 +156,7 @@ exited. The offending thread can be accessed using THREAD-ERROR-THREAD."))
 ;;; gencgc and numbers on the stack (returned by GET-LISP-OBJ-ADDRESS)
 ;;; are treated as references.
 
-(setf
- (fdocumentation 'thread-name 'function)
+(setf (documentation 'thread-name 'function)
  "Name of the thread. Can be assigned to using SETF. Thread names can be
 arbitrary printable objects, and need not be unique.")
 
@@ -241,30 +239,12 @@ created and old ones may exit at any time."
 
 ;;; used by debug-int.lisp to access interrupt contexts
 
-;;; The two uses immediately below of (unsigned-byte 27) are arbitrary,
-;;; as a more reasonable type restriction is an integer from 0 to
-;;;  (+ (primitive-object-size
-;;;      (find 'thread *primitive-objects* :key #'primitive-object-name))
-;;;     MAX-INTERRUPTS) ; defined only for C in 'interrupt.h'
-;;;
-;;; The x86 32-bit port is helped slightly by having a stricter constraint
-;;; than the (unsigned-byte 32) from its DEFKNOWN of this function.
-;;; Ideally a single defknown would work for any backend because the thread
-;;; structure is, after all, defined in the generic objdefs. But the VM needs
-;;; the defknown before the VOP, and this file comes too late, so we'd
-;;; need to pick some other place - maybe 'thread.lisp'?
-
-#!-(or sb-fluid sb-thread) (declaim (inline sb!vm::current-thread-offset-sap))
 #!-sb-thread
-(defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (signed-byte 28) n))
-  (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
-               (* n sb!vm:n-word-bytes)))
-
-#!+sb-thread
-(defun sb!vm::current-thread-offset-sap (n)
-  (declare (type (signed-byte 28) n))
-  (sb!vm::current-thread-offset-sap n))
+(progn
+  (declaim (inline sb!vm::current-thread-offset-sap))
+  (defun sb!vm::current-thread-offset-sap (n)
+    (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
+                 (* n sb!vm:n-word-bytes))))
 
 (declaim (inline current-thread-sap))
 (defun current-thread-sap ()
@@ -435,10 +415,8 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 
 ;;;; Mutexes
 
-(setf (fdocumentation 'make-mutex 'function)
-      "Create a mutex."
-      (fdocumentation 'mutex-name 'function)
-      "The name of the mutex. Setfable.")
+(setf (documentation 'make-mutex 'function) "Create a mutex."
+      (documentation 'mutex-name 'function) "The name of the mutex. Setfable.")
 
 #!+(and sb-thread sb-futex)
 (progn
@@ -910,10 +888,8 @@ IF-NOT-OWNER is :FORCE)."
   (print-unreadable-object (waitqueue stream :type t :identity t)
     (format stream "~@[~A~]" (waitqueue-name waitqueue))))
 
-(setf (fdocumentation 'waitqueue-name 'function)
-      "The name of the waitqueue. Setfable."
-      (fdocumentation 'make-waitqueue 'function)
-      "Create a waitqueue.")
+(setf (documentation 'waitqueue-name 'function) "The name of the waitqueue. Setfable."
+      (documentation 'make-waitqueue 'function) "Create a waitqueue.")
 
 #!+(and sb-thread sb-futex)
 (locally (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
@@ -1135,9 +1111,9 @@ future."
   (mutex (make-mutex :name "semaphore lock") :read-only t)
   (queue (make-waitqueue) :read-only t))
 
-(setf (fdocumentation 'semaphore-name 'function)
+(setf (documentation 'semaphore-name 'function)
       "The name of the semaphore INSTANCE. Setfable."
-      (fdocumentation 'make-semaphore 'function)
+      (documentation 'make-semaphore 'function)
       "Create a semaphore with the supplied COUNT and NAME.")
 
 (defstruct (semaphore-notification (:constructor make-semaphore-notification ())
@@ -1147,7 +1123,7 @@ TRY-SEMAPHORE as the :NOTIFICATION argument. Consequences are undefined if
 multiple threads are using the same notification object in parallel."
   (%status nil :type boolean))
 
-(setf (fdocumentation 'make-semaphore-notification 'function)
+(setf (documentation 'make-semaphore-notification 'function)
       "Constructor for SEMAPHORE-NOTIFICATION objects. SEMAPHORE-NOTIFICATION-STATUS
 is initially NIL.")
 
@@ -1375,6 +1351,7 @@ on this semaphore, then N of them is woken up."
   ;; being spawned, and guarantees that *ALL-THREADS*
   ;; is up to date.
   (with-deadline (:seconds nil :override t)
+    (sb!impl::finalizer-thread-stop)
     (grab-mutex *make-thread-lock*)
     (let ((timeout sb!ext:*exit-timeout*)
           (code *exit-in-process*)
@@ -1386,7 +1363,6 @@ on this semaphore, then N of them is woken up."
             (lambda (c h)
               (sb!debug::debugger-disabled-hook c h :quit nil)
               (abort-thread :allow-exit t)))
-      (sb!impl::finalizer-thread-stop)
       (dolist (thread (list-all-threads))
         (cond ((eq thread current))
               ((main-thread-p thread)
@@ -1582,7 +1558,9 @@ session."
                                (multiple-value-list
                                 (unwind-protect
                                      (catch '%return-from-thread
-                                       (apply real-function arguments))
+                                       (sb!c::inspect-unwinding
+                                        (apply real-function arguments)
+                                        #'sb!di::catch-runaway-unwind))
                                   (when *exit-in-process*
                                     (sb!impl::call-exit-hooks))))
                              #!+sb-safepoint
@@ -1878,7 +1856,7 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
 
 (define-alien-routine "thread_yield" int)
 
-(setf (fdocumentation 'thread-yield 'function)
+(setf (documentation 'thread-yield 'function)
       "Yield the processor to other threads.")
 
 ;;; internal use only.  If you think you need to use these, either you

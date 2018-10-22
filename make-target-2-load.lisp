@@ -13,7 +13,7 @@
   (dolist (package (list-all-packages))
     (sb-int:awhen (find-symbol "!REMOVE-BOOTSTRAP-SYMBOLS" package)
       (funcall sb-int:it)))
-  (dolist (list sb-impl::*!removable-symbols*)
+  (dolist (list sb-int:*!removable-symbols*)
     (let ((package (find-package (car list))))
       (dolist (symbol (cdr list))
         (fmakunbound symbol)
@@ -55,7 +55,7 @@
                 ;; never called post-build, it is not discarded. Also, I suspect
                 ;; that the following loop should print nothing, but it does:
 #|
-                (sb-vm::map-allocated-objects
+                (sb-vm:map-allocated-objects
                   (lambda (obj type size)
                     (declare (ignore size))
                     (when (= type sb-vm:code-header-widetag)
@@ -71,12 +71,55 @@
     (setf (sb-c::vop-parse-body v) nil))
   result)
 
+;;; Check for potentially bad format-control strings
+(defun !scan-format-control-strings ()
+  (labels ((possibly-ungood-package-reference (string)
+             ;; We want to see nothing SB-package-like at all
+             (or (search "sb-" string :test #'char-equal)
+                 (search "sb!" string :test #'char-equal)))
+           (possibly-format-control (string)
+             (when (find #\~ string)
+               ;; very likely to be a format control if it parses OK.
+               ;; Possibly not, but false positives are acceptable.
+               (some (lambda (x)
+                       (and (typep x 'sb-format::format-directive)
+                            (eql (sb-format::directive-character x) #\/)
+                            (possibly-ungood-package-reference
+                             (subseq string
+                                     (sb-format::directive-start x)
+                                     (sb-format::directive-end x)))))
+                     (ignore-errors
+                      (sb-format::%tokenize-control-string
+                       string 0 (length string) nil))))))
+    (let (wps)
+      (sb-vm:map-allocated-objects
+       (lambda (obj type size)
+         (declare(ignore type size))
+         (when (and (stringp obj) (possibly-format-control obj))
+           (push (make-weak-pointer obj) wps)))
+       :all)
+      (when wps
+        (dolist (wp wps)
+          (format t "Found string ~S~%" (weak-pointer-value wp)))
+        (warn "Potential problem with format-control strings.
+Please check that all strings which were not recognizable to the compiler
+(as the first argument to WARN, etc) are wrapped in SB-FORMAT:TOKENS")
+        ;; This is for display only, I don't check the result.
+        ;; NOTE: this symbol doesn't become external until after fasload.
+        #+gencgc (when (fboundp 'sb-ext::search-roots)
+                   (sb-ext::search-roots wps :static)))
+      wps)))
+
 (progn
   (defvar *compile-files-p* nil)
   "about to LOAD warm.lisp (with *compile-files-p* = NIL)")
 
 (progn
-  (load "src/cold/warm.lisp")
+  (load (merge-pathnames "src/cold/warm.lisp" *load-pathname*))
+  ;; See the giant comment at the bottom of this file
+  ;; concerning the need for this GC.
+  (gc :full t)
+  (!scan-format-control-strings)
 
   ;;; Remove docstrings that snuck in, as will happen with
   ;;; any file compiled in warm load.
@@ -89,7 +132,7 @@
                          `(setf ,place nil))
                     (incf count))))
       ;; 1. Functions, macros, special operators
-      (sb-vm::map-allocated-objects
+      (sb-vm:map-allocated-objects
        (lambda (obj type size)
          (declare (ignore size))
          (case type
@@ -120,17 +163,21 @@
   ;; Globally declaiming EVAL-STORE-SOURCE-FORM 0 would work too,
   ;; but isn't it nice to know that the logic for storing the forms
   ;; actually works? (Yes)
-  (sb-vm::map-allocated-objects
+  (sb-vm:map-allocated-objects
    (lambda (obj type size)
      (declare (ignore size))
-     (when (= type sb-vm:code-header-widetag)
+     (case type
+      (#.sb-vm:instance-widetag
+       (when (typep obj 'sb-c::core-debug-source)
+         (setf (sb-c::core-debug-source-form obj) nil)))
+      (#.sb-vm:code-header-widetag
        (dotimes (i (sb-kernel:code-n-entries obj))
          (let ((fun (sb-kernel:%code-entry-point obj i)))
-           (when (sb-impl::%simple-fun-lexpr fun)
-             (sb-impl::set-simple-fun-info
+           (when (sb-kernel:%simple-fun-lexpr fun)
+             (sb-kernel:set-simple-fun-info
               fun nil
               (sb-kernel:%simple-fun-doc fun)
-              (sb-kernel:%simple-fun-xrefs fun)))))))
+              (sb-kernel:%simple-fun-xrefs fun))))))))
    :all)
 
   ;; Fix unknown types in globaldb
@@ -227,18 +274,8 @@
 #+sb-xref-for-internals (sb-c::repack-xref :verbose 1)
 (fmakunbound 'sb-c::repack-xref)
 
-;;; The "--with" command-line mechanism (or equivalent 'customize-' file)
-;;; is convenient for passing boolean flags, but we shouldn't reflect
-;;; that mechanism into the target for every potential compile-time option
-;;; once build is complete.
-(setq *features* (delete :sb-after-xc-core *features*))
-;;; :CONS-PROFILING is not intended to persist after build.
-;;; It was merely a way to pass in a default OPTIMIZE quality.
-;;; Use (DESCRIBE-COMPILER-POLICY) to see the policy at startup.
-(setq *features* (delete :cons-profiling *features*))
-
 (progn
-  (load "src/code/shaketree")
+  (load (merge-pathnames "src/code/shaketree" *load-pathname*))
   (sb-impl::shake-packages
    ;; Retain all symbols satisfying this predicate
    #+sb-devel
@@ -257,9 +294,13 @@
                             sb-vm::map-stack-references
                             sb-vm::thread-profile-data-slot
                             sb-vm::thread-alloc-region-slot
-                            ;; Naughty outside-world code uses this.
-                            sb-vm::thread-control-stack-start-slot
-                            sb-vm::primitive-object-size))
+                            sb-vm::primitive-object-size
+                            ;; need this for defining a vop which
+                            ;; tests the x86-64 allocation profiler
+                            sb-vm::pseudo-atomic
+                            ;; Naughty outside-world code uses these.
+                            #+x86-64 sb-vm::reg-in-size
+                            sb-vm::thread-control-stack-start-slot))
            (search "-OFFSET" (string symbol))
            (search "-TN" (string symbol))))
       ((#.(find-package "SB-C")
@@ -301,9 +342,70 @@
   (loop (multiple-value-bind (winp symbol) (iter)
           (if winp (unintern symbol "CL-USER") (return)))))
 
-#+immobile-code (setq sb-c::*compile-to-memory-space* :dynamic)
+#+immobile-code (setq sb-c::*compile-to-memory-space* :auto)
 #+sb-fasteval (setq sb-ext:*evaluator-mode* :interpret)
+;; folding doesn't actually do anything unless the backend supports it,
+;; but the interface exists no matter what.
+(sb-ext:fold-identical-code :aggressive t :preserve-docstrings t)
+
 ;; See comments in 'readtable.lisp'
 (setf (readtable-base-char-preference *readtable*) :symbols)
 
 "done with warm.lisp, about to SAVE-LISP-AND-DIE"
+
+#|
+This is the actual "name" of a toplevel code component that gets dumped to fasl
+when compiling src/pcl/boot. Not only does it contain a format control string in
+its raw representation, this is a complete and utter waste of time to dump.
+We really ought to try a LOT harder not to produce such garbage metadata:
+
+* (progn (terpri)
+   (write (sb-c::compiled-debug-fun-toplevel-name
+           (elt (sb-c::compiled-debug-info-fun-map *cdi*) 0))
+          :level nil :length nil))
+
+(SB-C::TOP-LEVEL-FORM
+ (LABELS ((WARN-PARSE (SPECIALIZER &OPTIONAL CONDITION)
+            (STYLE-WARN "~@<Cannot parse specializer ~S in ~S~@[: ~A~].~@:>"
+                        SPECIALIZER # CONDITION))
+          (WARN-FIND (CONDITION NAME PROTO-GENERIC-FUNCTION PROTO-METHOD)
+            (WARN CONDITION :FORMAT-CONTROL
+                  #<(SIMPLE-BASE-STRING
+                     228) ~@<Cannot find type for specializer ~
+                  ~/sb-ext:print-symbol-with-prefix/ when executing ~S ~
+                  for a ~/sb-impl:print-type-specifier/ of a ~
+                  ~/sb-imp... {1003A2BC8F}>
+                  :FORMAT-ARGUMENTS #))
+          (CLASS-NAME-TYPE-SPECIFIER
+              (NAME PROTO-GENERIC-FUNCTION PROTO-METHOD &OPTIONAL #)
+            (LET #
+              #)))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/SYMBOL
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (LET (#)
+       (WHEN SPECIALIZER #)))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/T
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (LET (#)
+       (WHEN SPECIALIZER #)))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/CLASS-EQ-SPECIALIZER
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (SPECIALIZER-TYPE-SPECIFIER PROTO-GENERIC-FUNCTION PROTO-METHOD
+      (SPECIALIZER-CLASS SPECIALIZER)))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/EQL-SPECIALIZER
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
+     `(EQL SB-IMPL::COMMA))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/STRUCTURE-CLASS
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
+     (CLASS-NAME SPECIALIZER))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/SYSTEM-CLASS
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
+     (CLASS-NAME SPECIALIZER))
+   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/CLASS
+          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
+     (LET (#)
+       (WHEN # #)))))
+|#

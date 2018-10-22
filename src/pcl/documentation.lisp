@@ -6,15 +6,99 @@
 ;;;; This software is in the public domain and is provided with absolutely no
 ;;;; warranty. See the COPYING and CREDITS files for more information.
 
-(in-package "SB-C") ; FIXME: not the best package for FDOCUMENTATION
+(in-package "SB-PCL")
 
-;;; FDOCUMENTATION refers to STRUCTURE-CLASS which has only a skeletal
-;;; representation during cross-compilation. Better to define this late.
-(defun fdocumentation (x doc-type)
+(defun fun-doc (function)
+  (typecase function
+    #+sb-fasteval
+    (sb-interpreter:interpreted-function
+     (sb-interpreter:proto-fn-docstring (sb-interpreter:fun-proto-fn function)))
+    #+sb-eval
+    (sb-eval:interpreted-function
+     (sb-eval:interpreted-function-documentation function))
+    (generic-function
+     (slot-value function '%documentation))
+    (t
+     (when (closurep function)
+       (let ((val (nth-value sb-impl::+closure-doc-index+
+                             (closure-extra-values function))))
+         (unless (unbound-marker-p val)
+           (return-from fun-doc val))))
+     (%simple-fun-doc (%fun-fun function)))))
+
+(defun (setf fun-doc) (new-value function)
+  (declare (type (or null string) new-value))
+  (typecase function
+    #+sb-fasteval
+    (sb-interpreter:interpreted-function
+     (setf (sb-interpreter:proto-fn-docstring
+            (sb-interpreter:fun-proto-fn function)) new-value))
+    #+sb-eval
+    (sb-eval:interpreted-function
+     (setf (sb-eval:interpreted-function-documentation function) new-value))
+    (generic-function
+     (setf (slot-value function '%documentation) new-value))
+    (closure
+     (set-closure-extra-values
+      function nil
+      (pack-closure-extra-values
+       (nth-value +closure-name-index+ (closure-extra-values function))
+       new-value)))
+    (simple-fun
+     ;; Don't allow PCL CTORs and other random functions through
+     ;; because we don't want to affect builtin docstrings.
+     (setf (%simple-fun-doc function) new-value)))
+  new-value)
+
+;;; (SETF %DOC-INFO) is a thin wrapper on INFO that set or clears
+;;; a :DOCUMENTATION info value depending on whether STRING is NIL.
+;;; It, and the corresponding reader, are not for use outside this file.
+(defun (setf %doc-info) (string name doc-type)
+  (declare (type (or null string) string))
+  (let ((info-number
+         (macrolet ((info-number (class type)
+                      (meta-info-number (meta-info class type))))
+           (case doc-type
+             (variable (info-number :variable :documentation))
+             (structure
+              (cond ((eq (info :type :kind name) :instance)
+                     (info-number :type :documentation))
+                    ((info :typed-structure :info name)
+                     (info-number :typed-structure :documentation))))
+             (type (info-number :type :documentation))
+             (setf (info-number :setf :documentation))))))
+    (cond (info-number
+           (if string
+               (set-info-value name info-number string)
+             (clear-info-values name (list info-number))))
+          ((eq doc-type 'function)
+           ;; FIXME: this silently loses
+           ;; * (setf (documentation '(a bad name) 'function) "x") => "x"
+           ;; * (documentation '(a bad name) 'function) => NIL
+           ;; which is fine because as noted in pcl/documentation.lsp
+           ;;   even for supported doc types an implementation is permitted
+           ;;   to discard docs at any time
+           ;; but should a warning be issued just as for an unknown DOC-TYPE?
+           ;;
+           ;; And there's additional weirdness if you do, in this order -
+           ;;  * (setf (documentation 'foo 'function) "hi")
+           ;;  * (defun foo () "hey" 1)
+           ;;  * (documentation 'foo 'function) => "hi" ; should be "hey"
+           ;; CLHS says regarding DEFUN:
+           ;; " Documentation is attached as a documentation string to
+           ;;   /name/ (as kind function) and to the /function object/."
+           (cond ((not (legal-fun-name-p name)))
+                 ((not (equal (sb-c::real-function-name name) name))
+                  (setf (random-documentation name 'function) string))
+                 (t
+                  (setf (fun-doc (fdefinition name)) string))))
+          ((typep name '(or symbol cons))
+           (setf (random-documentation name doc-type) string)))))
+
+;;; It would be nice not to need this at all, but there's too much spaghetti
+;;; and macrology for me to figure out where relying on a method just works.
+(defun %doc-info (x doc-type)
   (case doc-type
-    (variable
-     (typecase x
-       (symbol (values (info :variable :documentation x)))))
     (function
      ;; Unused
      (error "FUNCTION doc-type is not supported."))
@@ -29,29 +113,15 @@
      (typecase x
        (structure-class (values (info :type :documentation (class-name x))))
        (t (and (typep x 'symbol) (values (info :type :documentation x))))))
-    (setf (values (info :setf :documentation x)))
     ((t)
      (typecase x
-       (function (%fun-doc x))
-       (package (package-doc-string x))
+       (function (fun-doc x))
        (structure-class (values (info :type :documentation (class-name x))))
        ((or symbol cons)
         (random-documentation x doc-type))))
     (t
      (when (typep x '(or symbol cons))
        (random-documentation x doc-type)))))
-
-(in-package "SB-PCL")
-
-(defun fun-doc (x)
-  (if (typep x 'generic-function)
-      (slot-value x '%documentation)
-      (%fun-doc x)))
-
-(defun (setf fun-doc) (new-value x)
-  (if (typep x 'generic-function)
-      (setf (slot-value x '%documentation) new-value)
-      (setf (%fun-doc x) new-value)))
 
 (defun set-function-name-documentation (name documentation)
   (aver name)
@@ -67,6 +137,13 @@
   documentation)
 
 ;;; Generic behavior
+
+(defgeneric documentation (object doc-type)
+  (:argument-precedence-order doc-type object))
+
+(fmakunbound '(setf documentation))
+(defgeneric (setf documentation) (new-value object doc-type)
+  (:argument-precedence-order doc-type object new-value))
 
 (defmethod (setf documentation) :around (new-value (x (eql nil)) doc-type)
   (style-warn "Ignoring doc-type ~a for ~a." doc-type nil)
@@ -163,10 +240,7 @@
       (documentation it t)))
 
   (defmethod documentation ((x symbol) (doc-type (eql 'setf)))
-    (fdocumentation x 'setf)))
-
-(defmethod documentation ((x symbol) (doc-type (eql 'optimize)))
-  (random-documentation x 'optimize))
+    (values (info :setf :documentation x))))
 
 (defmethod (setf documentation) (new-value (x function) (doc-type (eql 't)))
   (setf (fun-doc x) new-value))
@@ -189,7 +263,7 @@
     (setf (documentation it t) new-value)))
 
 (defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'setf)))
-  (setf (fdocumentation x 'setf) new-value))
+  (setf (%doc-info x 'setf) new-value))
 
 ;;; method combinations
 (defmethod documentation ((x method-combination) (doc-type (eql 't)))
@@ -222,22 +296,6 @@
     (new-value (x standard-method) (doc-type (eql 't)))
   (setf (slot-value x '%documentation) new-value))
 
-;;; packages
-
-;;; KLUDGE: It's nasty having things like this accessor
-;;; (PACKAGE-DOC-STRING) floating around out in this mostly-unrelated
-;;; source file. Perhaps it would be better to support WARM-INIT-FORMS
-;;; by analogy with the existing !COLD-INIT-FORMS and have them be
-;;; EVAL'ed after basic warm load is done? That way things like this
-;;; could be defined alongside the other code which does low-level
-;;; hacking of packages.. -- WHN 19991203
-
-(defmethod documentation ((x package) (doc-type (eql 't)))
-  (package-doc-string x))
-
-(defmethod (setf documentation) (new-value (x package) (doc-type (eql 't)))
-  (setf (package-doc-string x) new-value))
-
 ;;; types, classes, and structure names
 
 (macrolet
@@ -265,7 +323,7 @@
              ((find-class x nil)
               (documentation it t))
              (t
-              (fdocumentation x ',doc-type))))
+              (%doc-info x ',doc-type))))
 
           (defmethod (setf documentation) (new-value
                                            (x symbol)
@@ -274,11 +332,11 @@
              ((find-class x nil)
               (setf (documentation it t) new-value))
              (t
-              (setf (fdocumentation x ',doc-type) new-value)))))))
+              (setf (%doc-info x ',doc-type) new-value)))))))
 
   (define-type-documentation-methods structure-class
-      (fdocumentation (class-name x) 'type)
-      (setf (fdocumentation (class-name x) 'type) new-value))
+      (%doc-info (class-name x) 'type)
+      (setf (%doc-info (class-name x) 'type) new-value))
 
   (define-type-documentation-methods class
       (slot-value x '%documentation)
@@ -289,8 +347,8 @@
   ;; (if condition-class is in fact not implemented as a
   ;; standard-class or structure-class).
   (define-type-documentation-methods condition-class
-      (fdocumentation (class-name x) 'type)
-      (setf (fdocumentation (class-name x) 'type) new-value))
+      (%doc-info (class-name x) 'type)
+      (setf (%doc-info (class-name x) 'type) new-value))
 
   (define-type-documentation-lookup-methods type)
   (define-type-documentation-lookup-methods structure))
@@ -298,12 +356,12 @@
 
 ;;; variables
 (defmethod documentation ((x symbol) (doc-type (eql 'variable)))
-  (fdocumentation x 'variable))
+  (values (info :variable :documentation x)))
 
 (defmethod (setf documentation) (new-value
                                  (x symbol)
                                  (doc-type (eql 'variable)))
-  (setf (fdocumentation x 'variable) new-value))
+  (setf (%doc-info x 'variable) new-value))
 
 ;;; extra-standard methods, for getting at slot documentation
 (defmethod documentation ((slotd standard-slot-definition) (doc-type (eql 't)))
@@ -347,3 +405,9 @@ assigning this to it using (SETF STANDARD-INSTANCE-ACCESS).
 Value of +SLOT-UNBOUND+ is unspecified, and should not be relied to be
 of any particular type, but it is guaranteed to be suitable for EQ
 comparison.")
+
+#.(prog1 `(progn ,@*!documentation-methods*)
+    (setq *!documentation-methods* nil))
+
+(dolist (args (prog1 *!docstrings* (makunbound '*!docstrings*)))
+  (apply #'(setf documentation) args))

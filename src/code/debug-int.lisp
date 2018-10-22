@@ -191,7 +191,7 @@
             (debug-var-symbol debug-var)
             (debug-var-id debug-var))))
 
-(setf (fdocumentation 'debug-var-id 'function)
+(setf (documentation 'debug-var-id 'function)
   "Return the integer that makes DEBUG-VAR's name and package unique
    with respect to other DEBUG-VARs in the same function.")
 
@@ -263,7 +263,7 @@
   (print-unreadable-object (obj str :type t)
     (prin1 (debug-block-fun-name obj) str)))
 
-(setf (fdocumentation 'debug-block-elsewhere-p 'function)
+(setf (documentation 'debug-block-elsewhere-p 'function)
   "Return whether debug-block represents elsewhere code.")
 
 (defstruct (compiled-debug-block (:include debug-block)
@@ -483,27 +483,11 @@
 ;;; real component to continue executing, as opposed to the bogus
 ;;; component which appeared in some frame's LRA location.
 (defconstant real-lra-slot
+  ;; FIXME: this isn't really right, because the 'fixups' slot
+  ;; is already accounted for in the fixed part of the code header.
   ;; X86 stores a fixup vector at the first constant slot
   #!-x86 sb!vm:code-constants-offset
   #!+x86 (1+ sb!vm:code-constants-offset))
-
-;;; These are magically converted by the compiler.
-(defun current-sp () (current-sp))
-(defun current-fp () (current-fp))
-(defun stack-ref (s n) (stack-ref s n))
-(defun %set-stack-ref (s n value) (%set-stack-ref s n value))
-(defun fun-code-header (fun) (fun-code-header fun))
-#!-(or x86 x86-64) (defun lra-code-header (lra) (lra-code-header lra))
-(defun %make-lisp-obj (value) (%make-lisp-obj value))
-(defun get-lisp-obj-address (thing) (get-lisp-obj-address thing))
-
-(defun fun-word-offset (fun)
-  (ldb (byte (- sb!vm:n-word-bits sb!vm:n-widetag-bits
-                ;; Chop off the layout
-                #!+(and 64-bit immobile-space) 32)
-             sb!vm:n-widetag-bits)
-       (sap-ref-word (int-sap (get-lisp-obj-address fun))
-                     (- sb!vm:fun-pointer-lowtag))))
 
 #!-sb-fluid (declaim (inline control-stack-pointer-valid-p))
 (defun control-stack-pointer-valid-p (x &optional (aligned t))
@@ -666,9 +650,56 @@
 #!+(or x86 x86-64)
 (defun find-saved-frame-down (fp up-frame)
   (multiple-value-bind (saved-fp saved-pc)
-      (sb!alien-internals:find-saved-fp-and-pc fp)
+      (find-saved-fp-and-pc fp)
     (when saved-fp
       (compute-calling-frame saved-fp saved-pc up-frame t))))
+
+(defun walk-binding-stack (symbol function)
+  (let* (#!+sb-thread
+         (tls-index #!+sb-thread
+                    (get-lisp-obj-address (symbol-tls-index symbol)))
+         (current-value
+           #!+sb-thread
+           (sap-ref-lispobj (sb!thread::current-thread-sap) tls-index)
+           #!-sb-thread
+           (symbol-value symbol)))
+    (unless (eq (get-lisp-obj-address current-value)
+                no-tls-value-marker-widetag)
+      (funcall function current-value)
+      (loop for start = (descriptor-sap *binding-stack-start*)
+            for pointer = (descriptor-sap sb!vm::*binding-stack-pointer*)
+            then (sap+ pointer (* n-word-bytes -2))
+            while (sap> pointer start)
+            when
+            #!+sb-thread (eq (sap-ref-word pointer (* n-word-bytes -1)) tls-index)
+            #!-sb-thread (eq (sap-ref-lispobj pointer (* n-word-bytes -1)) symbol)
+            do (unless (or #!+sb-thread
+                           (= (sap-ref-word pointer (* n-word-bytes -2))
+                              no-tls-value-marker-widetag))
+                 (funcall function
+                          (sap-ref-lispobj pointer
+                                           (* n-word-bytes -2))))))))
+
+#!+c-stack-is-control-stack
+(defun find-saved-fp-and-pc (fp)
+  (block nil
+    (walk-binding-stack
+     'sb!alien-internals:*saved-fp*
+     (lambda (x)
+       (when x
+         (let* ((saved-fp (descriptor-sap x))
+                (caller-fp (sap-ref-sap saved-fp
+                                        (sb!vm::frame-byte-offset
+                                         ocfp-save-offset))))
+           (when (#!+stack-grows-downward-not-upward
+                  sap>
+                  #!-stack-grows-downward-not-upward
+                  sap<
+                  caller-fp fp)
+             (return (values caller-fp
+                             (sap-ref-sap saved-fp
+                                          (sb!vm::frame-byte-offset
+                                           return-pc-save-offset)))))))))))
 
 (defun return-pc-offset-for-location (debug-fun location)
   (declare (ignorable debug-fun location))
@@ -870,21 +901,19 @@
                              (or escaped (and savedp off-stack)))))))
 
 (defun nth-interrupt-context (n)
-  (declare (muffle-conditions t))
-  (declare (type (unsigned-byte 32) n)
+  (declare (muffle-conditions compiler-note))
+  (declare (type (mod #.sb!vm::max-interrupts) n)
            (optimize (speed 3) (safety 0)))
-  (sb!alien:sap-alien
-   (sb!vm::current-thread-offset-sap
-    #!+x86-64
-    (- -1 n
-       #!+sb-safepoint
-       ;; the C safepoint page
-       (/ sb!c:+backend-page-bytes+ n-word-bytes))
-    #!-x86-64
-    (+ sb!vm::primitive-thread-object-length
-       #!-alpha n
-       #!+alpha (* 2 n)))
-   (* os-context-t)))
+  (let* ((n (- -1 n
+               #!+sb-safepoint
+               ;; the C safepoint page
+               (/ sb!c:+backend-page-bytes+ n-word-bytes)))
+         (context-pointer
+           ;; The Alpha code is quite possibly wrong; I have no idea.
+           (sb!vm::current-thread-offset-sap
+            #!-alpha n
+            #!+alpha (* 2 n))))
+    (sb!alien:sap-alien context-pointer (* os-context-t))))
 
 ;;; On SB-DYNAMIC-CORE symbols which come from the runtime go through
 ;;; an indirection table, but the debugger needs to know the actual
@@ -899,13 +928,39 @@
 (defun static-foreign-symbol-sap (name)
   (int-sap (static-foreign-symbol-address name)))
 
-(defun context-code-pc-offset (context code)
-  (declare (type (sb!alien:alien (* os-context-t)) context)
-           (type code-component code))
+(defun catch-runaway-unwind (block)
+  (declare (ignorable block))
+  #!-(and win32 x86) ;; uses SEH
+  (let ((target (sap-ref-sap (descriptor-sap block)
+                             (* unwind-block-uwp-slot n-word-bytes))))
+    (loop for uwp = (descriptor-sap sb!vm::*current-unwind-protect-block*)
+          then (sap-ref-sap uwp (* unwind-block-uwp-slot n-word-bytes))
+          until (zerop (sap-int uwp))
+          thereis (sap= target uwp)
+          finally
+          (let* ((pc (sap-ref-sap (descriptor-sap block)
+                                  (* unwind-block-entry-pc-slot n-word-bytes)))
+                 (code (code-header-from-pc pc))
+                 (fun-name
+                   (and code
+                        (or
+                         (multiple-value-bind (offset valid) (code-pc-offset pc code)
+                           (and valid
+                                (let ((debug-fun (debug-fun-from-pc code offset nil)))
+                                  (and (compiled-debug-fun-p debug-fun)
+                                       (debug-fun-name debug-fun)))))
+                         code))))
+            (error 'simple-control-error
+                   :format-control
+                   "Attempt to RETURN-FROM a block or GO to a tag that no longer exists~@[ in ~s~]"
+                   :format-arguments (list fun-name))))))
+
+(defun code-pc-offset (pc code)
+  (declare (type code-component code))
   (let ((code-header-len (* (code-header-words code)
                             n-word-bytes)))
     (with-pinned-objects (code)
-      (let ((pc-offset (- (sap-int (context-pc context))
+      (let ((pc-offset (- (sap-int pc)
                           (- (get-lisp-obj-address code)
                              other-pointer-lowtag)
                           code-header-len))
@@ -913,6 +968,9 @@
         (values pc-offset
                 (<= 0 pc-offset code-size)
                 code-size)))))
+
+(defun context-code-pc-offset (context code)
+  (code-pc-offset (context-pc context) code))
 
 (defun find-escaped-frame (frame-pointer)
   (declare (type system-area-pointer frame-pointer))
@@ -1257,11 +1315,14 @@ register."
                ,@body))
            ,result))))
 
+;;; Compute byte offset of FUNCTION into CODE-INSTRUCTIONS of its code,
+;;; which is the byte offset from the base of its code
+;;; minus the number of bytes in the boxed portion of its code header.
 (defun function-start-pc-offset (function)
   (let* ((fun (%fun-fun function))
          (code (fun-code-header fun)))
-    (- (* (fun-word-offset fun) n-word-bytes)
-       (code-header-words code))))
+    (- (%fun-code-offset fun)
+       (* (code-header-words code) sb!vm:n-word-bytes))))
 
 ;;; Return the object of type FUNCTION associated with the DEBUG-FUN,
 ;;; or NIL if the function is unavailable or is non-existent as a user
@@ -1338,7 +1399,7 @@ register."
                 (when (typep val 'sb!interpreter:interpreted-function)
                   (%fun-name val))))))) ; Get its name
        ((sb!c::compiled-debug-fun-closure-save compiler-debug-fun)
-        (sb!impl::closure-name
+        (%fun-name
          (if (all-args-available-p frame)
              (sub-access-debug-var-slot (frame-pointer frame)
                                         sb!c:closure-sc
@@ -1369,9 +1430,7 @@ register."
           ;;   works for all named functions anyway.
           ;; -- WHN 20000120
           (debug-fun-from-pc component
-                             (* (- (fun-word-offset simple-fun)
-                                   (code-header-words component))
-                                sb!vm:n-word-bytes))))))
+                             (function-start-pc-offset simple-fun))))))
 
 ;;; Return the kind of the function, which is one of :OPTIONAL, :MORE
 ;;; :EXTERNAL, :TOPLEVEL, :CLEANUP, or NIL.
@@ -2321,7 +2380,9 @@ register."
            (code-header-ref
             (code-header-from-pc (sb!vm:context-pc escaped))
             (sb!c:sc+offset-offset sc+offset))
-           :invalid-value-for-unescaped-register-storage)))))
+           :invalid-value-for-unescaped-register-storage))
+      (#.immediate-sc-number
+       (sb!c:sc+offset-offset sc+offset)))))
 
 ;;; This stores value as the value of DEBUG-VAR in FRAME. In the
 ;;; COMPILED-DEBUG-VAR case, access the current value to determine if
@@ -2681,8 +2742,8 @@ register."
   (let ((d-source (code-location-debug-source location)))
     (let* ((offset (code-location-toplevel-form-offset location))
            (res
-             (cond ((and (typep d-source 'sb!c::core-debug-source)
-                         (sb!c::core-debug-source-form d-source)))
+             (cond ((and (core-debug-source-p d-source)
+                         (core-debug-source-form d-source)))
                    ((debug-source-namestring d-source)
                     (get-file-toplevel-form location))
                    (t (bug "Don't know how to use a DEBUG-SOURCE without ~
@@ -2924,7 +2985,8 @@ register."
 ;;; This maps bogus-lra-components to cookies, so that
 ;;; HANDLE-FUN-END-BREAKPOINT can find the appropriate cookie for the
 ;;; breakpoint hook.
-(defvar *fun-end-cookies* (make-hash-table :test 'eq :synchronized t))
+(define-load-time-global *fun-end-cookies*
+    (make-hash-table :test 'eq :synchronized t))
 
 ;;; This returns a hook function for the start helper breakpoint
 ;;; associated with a :FUN-END breakpoint. The returned function
@@ -3165,7 +3227,8 @@ register."
 ;;;; breakpoint handlers (layer between C and exported interface)
 
 ;;; This maps components to a mapping of offsets to BREAKPOINT-DATAs.
-(defvar *component-breakpoint-offsets* (make-hash-table :test 'eq :synchronized t))
+(define-load-time-global *component-breakpoint-offsets*
+    (make-hash-table :test 'eq :synchronized t))
 
 ;;; This returns the BREAKPOINT-DATA object associated with component cross
 ;;; offset. If none exists, this makes one, installs it, and returns it.
@@ -3328,7 +3391,9 @@ register."
 (defconstant bogus-lra-constants
   (+ sb!vm:code-constants-offset
      #!-(or x86-64 x86) 1
+     ;; Wtf???
      #!+x86-64 2
+     ;; FIXME: 'fixups' already accounted for in header.
      ;; One more for a fixup vector
      #!+x86 3))
 

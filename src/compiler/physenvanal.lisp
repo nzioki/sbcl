@@ -32,8 +32,6 @@
                  (eq (functional-kind x) :deleted))
                (component-new-functionals component)))
   (setf (component-new-functionals component) ())
-  (dolist (clambda (component-lambdas component))
-    (reinit-lambda-physenv clambda))
   (mapc #'add-lambda-vars-and-let-vars-to-closures
         (component-lambdas component))
 
@@ -55,21 +53,6 @@
   (setf (component-nlx-info-generated-p component) t)
   (values))
 
-;;; This is to be called on a COMPONENT with top level LAMBDAs before
-;;; the compilation of the associated non-top-level code to detect
-;;; closed over top level variables. We just do COMPUTE-CLOSURE on all
-;;; the lambdas. This will pre-allocate environments for all the
-;;; functions with closed-over top level variables. The post-pass will
-;;; use the existing structure, rather than allocating a new one. We
-;;; return true if we discover any possible closure vars.
-(defun pre-physenv-analyze-toplevel (component)
-  (declare (type component component))
-  (let ((found-it nil))
-    (dolist (lambda (component-lambdas component))
-      (when (add-lambda-vars-and-let-vars-to-closures lambda)
-        (setq found-it t)))
-    found-it))
-
 ;;; If CLAMBDA has a PHYSENV, return it, otherwise assign an empty one
 ;;; and return that.
 (defun get-lambda-physenv (clambda)
@@ -87,23 +70,6 @@
             (aver (null (lambda-physenv letlambda)))
             (setf (lambda-physenv letlambda) res))
           res))))
-
-;;; If FUN has no physical environment, assign one, otherwise clean up
-;;; the old physical environment and the INDIRECT flag on LAMBDA-VARs.
-;;; This is necessary because pre-analysis is done before
-;;; optimization.
-(defun reinit-lambda-physenv (fun)
-  (let ((old (lambda-physenv (lambda-home fun))))
-    (cond (old
-           (setf (physenv-closure old) nil)
-           (flet ((clear (fun)
-                    (dolist (var (lambda-vars fun))
-                      (setf (lambda-var-indirect var) nil))))
-             (clear fun)
-             (map nil #'clear (lambda-lets fun))))
-          (t
-           (get-lambda-physenv fun))))
-  (values))
 
 ;;; Get NODE's environment, assigning one if necessary.
 (defun get-node-physenv (node)
@@ -404,20 +370,16 @@
   (values))
 
 ;;; Iterate over the EXITs in COMPONENT, calling NOTE-NON-LOCAL-EXIT
-;;; when we find a block that ends in a non-local EXIT node. We also
-;;; ensure that all EXIT nodes are either non-local or degenerate by
-;;; calling IR1-OPTIMIZE-EXIT on local exits. This makes life simpler
-;;; for later phases.
+;;; when we find a block that ends in a non-local EXIT node.
 (defun find-non-local-exits (component)
   (declare (type component component))
   (let ((*functional-escape-info* nil))
     (dolist (lambda (component-lambdas component))
       (dolist (entry (lambda-entries lambda))
-        (dolist (exit (entry-exits entry))
-          (let ((target-physenv (node-physenv entry)))
-            (if (eq (node-physenv exit) target-physenv)
-                (maybe-delete-exit exit)
-                (note-non-local-exit target-physenv exit)))))))
+        (let ((target-physenv (node-physenv entry)))
+          (dolist (exit (entry-exits entry))
+            (aver (neq (node-physenv exit) target-physenv))
+            (note-non-local-exit target-physenv exit))))))
   (values))
 
 ;;;; final decision on stack allocation of dynamic-extent structures
@@ -505,10 +467,11 @@
             (:catch
              (code `(%catch-breakup)))
             (:unwind-protect
-             (code `(%unwind-protect-breakup))
-             (let ((fun (ref-leaf (lvar-uses (second args)))))
-               (reanalyze-funs fun)
-               (code `(%funcall ,fun))))
+              (code `(%unwind-protect-breakup))
+              (let ((fun (ref-leaf (lvar-uses (second args)))))
+                (when (functional-p fun)
+                  (reanalyze-funs fun)
+                  (code `(%funcall ,fun)))))
             ((:block :tagbody)
              (dolist (nlx (cleanup-info cleanup))
                (code `(%lexical-exit-breakup ',nlx))))
@@ -519,7 +482,7 @@
              (code `(%primitive set-nsp ,(ref-leaf node))))))))
     (flet ((coalesce-unbinds (code)
              code
-              #!+(and sb-thread unbind-n-vop)
+              #!+(vop-named sb!c:unbind-n)
               (loop with cleanup
                     while code
                     do (setf cleanup (pop code))

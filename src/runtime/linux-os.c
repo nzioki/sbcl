@@ -132,11 +132,11 @@ char* futex_name(int *lock_word)
     // Otherwise return NULL.
     lispobj name = *(lock_word - 1);
     struct vector* v = (struct vector*)native_pointer(name);
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(v->header) == SIMPLE_BASE_STRING_WIDETAG)
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
         return (char*)(v->data);
     name = *(lock_word - 2);
     v = (struct vector*)native_pointer(name);
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(v->header) == SIMPLE_BASE_STRING_WIDETAG)
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
         return (char*)(v->data);
     return 0;
 }
@@ -212,7 +212,8 @@ static void getuname(int *major_version, int* minor_version, int *patch_version)
     }
 }
 
-void os_init(char *argv[], char *envp[])
+void os_init(char __attribute__((unused)) *argv[],
+             char __attribute__((unused)) *envp[])
 {
     int major_version, minor_version, patch_version;
     getuname(&major_version, &minor_version, &patch_version);
@@ -280,9 +281,6 @@ int os_preinit(char *argv[], char *envp[])
      * by setting a personality flag and re-executing. (We need
      * to re-execute, since the memory maps that can conflict with
      * the SBCL spaces have already been done at this point).
-     *
-     * Since randomization is currently implemented only on x86 kernels,
-     * don't do this trick on other platforms.
      */
     int major_version, minor_version, patch_version;
     getuname(&major_version, &minor_version, &patch_version);
@@ -351,50 +349,6 @@ os_set_cheneygc_spaces(uword_t space0_start, uword_t space1_start)
 }
 
 #endif
-
-os_vm_address_t
-os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
-{
-    int flags =  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    os_vm_address_t actual;
-
-#ifdef LISP_FEATURE_ALPHA
-    if (!addr) {
-        addr=under_2gb_free_pointer;
-    }
-#endif
-#ifdef MAP_32BIT
-    if (movable & MOVABLE_LOW)
-        flags |= MAP_32BIT;
-#endif
-    actual = mmap(addr, len, OS_VM_PROT_ALL, flags, -1, 0);
-    if (actual == MAP_FAILED) {
-        perror("mmap");
-        return 0;               /* caller should check this */
-    }
-
-    if (!movable && (addr!=actual)) {
-        fprintf(stderr, "mmap: wanted %lu bytes at %p, actually mapped at %p\n",
-                (unsigned long) len, addr, actual);
-        return 0;
-    }
-
-#ifdef LISP_FEATURE_ALPHA
-
-    len=(len+(os_vm_page_size-1))&(~(os_vm_page_size-1));
-    under_2gb_free_pointer+=len;
-#endif
-
-    return actual;
-}
-
-void
-os_invalidate(os_vm_address_t addr, os_vm_size_t len)
-{
-    if (munmap(addr,len) == -1) {
-        perror("munmap");
-    }
-}
 
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
@@ -487,7 +441,7 @@ os_install_interrupt_handlers(void)
 }
 
 char *
-os_get_runtime_executable_path(int external)
+os_get_runtime_executable_path(int __attribute__((unused)) external)
 {
     char path[PATH_MAX + 1];
     int size;

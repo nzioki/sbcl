@@ -585,10 +585,17 @@ of specialized arrays is supported."
   ;; Allocate and possibly initialize the vector.
   (multiple-value-bind (type n-bits-shift)
       (%vector-widetag-and-n-bits-shift element-type)
-    (let ((vector
-            (allocate-static-vector type length
-                                    (vector-length-in-words length
-                                                            n-bits-shift))))
+    (let* ((full-length
+             (if (or (= type simple-base-string-widetag)
+                     #!+sb-unicode
+                     (= type
+                        simple-character-string-widetag))
+                 (1+ length)
+                 length))
+           (vector
+             (allocate-static-vector type length
+                                     (vector-length-in-words full-length
+                                                             n-bits-shift))))
       (cond (initial-element-p
              (fill vector initial-element))
             (initial-contents-p
@@ -1827,3 +1834,22 @@ function to be removed without further warning."
 ;;; Horrible kludge for the "static-vectors" system
 ;;; which uses an internal symbol in SB-IMPL.
 (import '%vector-widetag-and-n-bits-shift 'sb!impl)
+
+(defun make-weak-vector (length &key (initial-contents nil contents-p)
+                                     (initial-element nil element-p))
+  (declare (index length))
+  (when (and element-p contents-p)
+    (error "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS"))
+  (let ((v (if contents-p
+               (make-array length :initial-contents initial-contents)
+               (make-array length :initial-element
+                           ;; 0 is the usual default, but NIL makes more sense
+                           ;; for weak vectors because it's the value assigned
+                           ;; when a pointer is broken by GC.
+                           (if element-p initial-element nil)))))
+    (set-header-data v vector-weak-subtype)
+    v))
+
+(defun weak-vector-p (x)
+  (and (simple-vector-p x)
+       (eql (get-header-data x) vector-weak-subtype)))

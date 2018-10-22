@@ -591,17 +591,6 @@
     `(lambda (function ,@names)
        (alien-funcall (deref function) ,@names))))
 
-#-sb-xc-host
-(defun find-saved-fp-and-pc (fp)
-  (dolist (x *saved-fp-and-pcs*)
-    (declare (type (simple-array word (2)) x))
-    (when (#!+stack-grows-downward-not-upward
-           sap>
-           #!-stack-grows-downward-not-upward
-           sap<
-           (int-sap (aref x 0)) fp)
-      (return (values (int-sap (aref x 0)) (int-sap (aref x 1)))))))
-
 (deftransform alien-funcall ((function &rest args) * * :node node)
   (let ((type (lvar-type function)))
     (unless (alien-type-type-p type)
@@ -679,7 +668,7 @@
             ;; like.
             #!+c-stack-is-control-stack
             (when (policy node (= 3 alien-funcall-saves-fp-and-pc))
-              (setf body `(invoke-with-saved-fp-and-pc (lambda () ,body))))
+              (setf body `(invoke-with-saved-fp (lambda () ,body))))
             (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
             `(lambda (function ,@(params))
                ,@(when ignore-fun '((declare (ignore function))))

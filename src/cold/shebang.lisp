@@ -24,21 +24,22 @@
 (declaim (type list sb!xc:*features*))
 (defvar sb!xc:*features*)
 
-(defun target-platform-name ()
-  (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :sparc :x86 :x86-64)
-                            sb!xc:*features*)))
+(defun target-platform-keyword (&optional (features sb!xc:*features*))
+  (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :ppc64 :sparc :x86 :x86-64)
+                            features)))
     (cond ((not arch) (error "No architecture selected"))
           ((> (length arch) 1) (error "More than one architecture selected")))
-    (string-downcase (car arch))))
+    (car arch)))
 
 ;;; Not necessarily the logical place to define BACKEND-ASM-PACKAGE-NAME,
 ;;; but a convenient one, because sb!xc:*features* needs to have been
 ;;; DEFVARed, and because 'chill' loads this and only this file.
 (defun backend-asm-package-name ()
-  (concatenate 'string "SB!" (string-upcase (target-platform-name)) "-ASM"))
+  (concatenate 'string "SB-" (string (target-platform-keyword)) "-ASM"))
 
 (defun any-vop-named-p (vop-name)
-  (gethash vop-name (symbol-value (find-symbol "*BACKEND-PARSED-VOPS*" "SB!C"))))
+  (let ((ht (symbol-value (find-symbol "*BACKEND-PARSED-VOPS*" "SB!C"))))
+    (not (null (gethash vop-name ht)))))
 
 (defun any-vop-translates-p (fun-name)
   (let ((f (intern "INFO" "SB!INT")))
@@ -46,8 +47,39 @@
       (let ((info (funcall f :function :info fun-name)))
         (if info
             (let ((f (intern "FUN-INFO-TEMPLATES" "SB!C")))
-              (and (fboundp f) (not (null (funcall f info)))))
-            (error "vop-translates: ~s is not a known function." fun-name))))))
+              (and (fboundp f) (not (null (funcall f info))))))))))
+
+(defvar *feature-eval-results-file* "output/feature-tests.lisp-expr")
+(defvar *feature-evaluation-results*)
+
+(defun recording-feature-eval (expression value)
+  ;; This safety check does not work for parallel build, but that produces
+  ;; different code anyway due to missing derived types in any file that would
+  ;; have been compiled in the serial order but was interpreted instead.
+  (when (boundp '*feature-evaluation-results*)
+    ; (format t "~&FEATURE EXPR: ~S -> ~S~%" expression value)
+    (push (cons expression value) *feature-evaluation-results*))
+  value)
+
+(defun write-feature-eval-results ()
+  (with-open-file (f *feature-eval-results-file*
+                     :direction :output
+                     :if-exists :supersede :if-does-not-exist :create)
+    (let ((*print-readably* t))
+      (format f "(~{~S~^~% ~})~%" *feature-evaluation-results*))))
+
+(defun sanity-check-feature-evaluation ()
+  (flet ((check (phase list)
+           (dolist (x list)
+             (let ((answer
+                     (ecase (caar x)
+                      (:vop-named (any-vop-named-p (cadar x)))
+                      (:vop-translates (any-vop-translates-p (cadar x))))))
+               (unless (eq answer (cdr x))
+                 (error "make-host-~D DEFINE-VOP ordering bug:~@
+ ~S should be ~S, was ~S at xc time" phase x answer (cdr x)))))))
+    (check 1 (with-open-file (f *feature-eval-results-file*) (read f)))
+    (check 2 *feature-evaluation-results*)))
 
 (defun feature-in-list-p (feature list)
   (labels ((sane-expr-p (x)
@@ -74,8 +106,12 @@
                         ;; (:HOST-FEATURE :sym) looks in *FEATURES* for :SYM
                     (check-type subexpr symbol)
                     (member subexpr *features* :test #'eq))
-                   (:vop-named (any-vop-named-p subexpr))
-                   (:vop-translates (any-vop-translates-p subexpr))
+                   (:vop-named
+                    (recording-feature-eval feature
+                                      (any-vop-named-p subexpr)))
+                   (:vop-translates
+                    (recording-feature-eval feature
+                                            (any-vop-translates-p subexpr)))
                    (t
                     (not (subfeature-in-list-p subexpr)))))))))))
 (compile 'feature-in-list-p)
@@ -154,6 +190,8 @@
 (defvar *shebang-backend-subfeatures*)
 
 ;;;; string checker, for catching non-portability early
+;;;; This is defined here, but not installed here.
+;;;; See IN-TARGET-CROSS-COMPILATION-MODE for the gory details.
 (defun make-quote-reader (standard-quote-reader)
   (lambda (stream char)
     (let ((result (funcall standard-quote-reader stream char)))
@@ -161,5 +199,3 @@
         (warn "Found non-STANDARD-CHAR in ~S" result))
       result)))
 (compile 'make-quote-reader)
-
-(set-macro-character #\" (make-quote-reader (get-macro-character #\" nil)))

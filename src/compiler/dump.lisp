@@ -147,13 +147,10 @@
 (defun dump-fop+operands (fasl-output opcode arg1
                                       &optional (arg2 0 arg2p) (arg3 0 arg3p))
   (declare (type (unsigned-byte 8) opcode) (type word arg1 arg2 arg3))
-  (let ((opcode-modifier (if (< arg1 #x10000)
-                             (if (< arg1 #x100) 0 1)
-                             (if (< arg1 (ash 1 32)) 2 3))))
-    (dump-byte (logior opcode opcode-modifier) fasl-output)
-    (dump-integer-as-n-bytes arg1 (ash 1 opcode-modifier) fasl-output)
-    (when arg2p (dump-varint arg2 fasl-output))
-    (when arg3p (dump-varint arg3 fasl-output))))
+  (dump-byte opcode fasl-output)
+  (dump-varint arg1 fasl-output)
+  (when arg2p (dump-varint arg2 fasl-output))
+  (when arg3p (dump-varint arg3 fasl-output)))
 
 ;;; Dump the FOP code for the named FOP to the specified FASL-OUTPUT.
 (defmacro dump-fop (fs-expr file &rest args)
@@ -1101,8 +1098,9 @@
               (fasl-output-source-info fasl-output))
         (dump-object info fasl-output))
 
-      (dump-object (sb!c::code-immobile-p component) fasl-output)
-      (dump-fop 'fop-load-code fasl-output code-length header-length)
+      (dump-fop 'fop-load-code fasl-output
+                (if (sb!c::code-immobile-p component) 1 0)
+                header-length code-length)
 
       (dump-segment code-segment code-length fasl-output)
 
@@ -1115,7 +1113,7 @@
 
 ;;; This is only called from assemfile, which doesn't exist in the target.
 #+sb-xc-host
-(defun dump-assembler-routines (code-segment length fixups routines file)
+(defun dump-assembler-routines (code-segment octets fixups routines file)
   (dump-fixups fixups file)
 
   ;; Mapping from name to address has to be created before applying fixups
@@ -1130,7 +1128,7 @@
                   file))
   (dump-integer (length routines) file)
   (dump-fop 'fop-assembler-code file)
-  (dump-word length file)
+  (dump-word (length octets) file)
   (write-segment-contents code-segment (fasl-output-stream file))
   (dump-pop file))
 
@@ -1174,7 +1172,7 @@
       (dump-object (sb!c::entry-info-name entry) file)
       (dump-object (sb!c::entry-info-arguments entry) file)
       (dump-object (sb!c::entry-info-type entry) file)
-      (dump-object (sb!c::entry-info-info entry) file)
+      (dump-object (sb!c::entry-info-form/doc/xrefs entry) file)
       (dump-fop 'fop-fun-entry file (decf fun-index))
       (let ((entry-handle (dump-pop file)))
         (setf (gethash entry (fasl-output-entry-table file)) entry-handle)

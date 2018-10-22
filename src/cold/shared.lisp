@@ -188,18 +188,49 @@
 ;;; In order to refer to target features specifically, we refer to
 ;;; SB!XC:*FEATURES* instead of CL:*FEATURES*, and use the #!+ and #!-
 ;;; readmacros instead of the ordinary #+ and #- readmacros.
+;;;
+;;; To support building in a read-only filesystem, the 'local-target-features'
+;;; file might not be directly located here, since it's a generated file.
+;;; In as much as we use files as the means of passing parameters to
+;;; our Lisp scripts - because we can't in general assume that we can read
+;;; the command-line arguments in any Lisp - it doesn't make sense to have
+;;; another file specifying the name of the local-target-features file.
+;;; The compromise is to examine a variable specifying a path
+;;; (and it can't go in SB-COLD because the package is not made soon enough)
 (setf sb!xc:*features*
-      (let* ((default-features
-               (funcall (compile
-                         nil
-                         (read-from-file "local-target-features.lisp-expr"))
+      (let* ((pathname (let ((var 'cl-user::*sbcl-target-features-file*))
+                         (if (boundp var)
+                             (symbol-value var)
+                             "local-target-features.lisp-expr")))
+             (default-features
+               (funcall (compile nil (read-from-file pathname))
                         (read-from-file "base-target-features.lisp-expr")))
              (customizer-file-name "customize-target-features.lisp")
              (customizer (if (probe-file customizer-file-name)
                              (compile nil
                                       (read-from-file customizer-file-name))
-                             #'identity)))
-        (sort (funcall customizer default-features) #'string<)))
+                             #'identity))
+             (target-feature-list (funcall customizer default-features))
+             (arch (target-platform-keyword target-feature-list)))
+        ;; Sort the arch name to the front and de-dup the rest in case the
+        ;; command line had a redundant --with-mumble option and/or the
+        ;; customizer decided to return dups.
+        (cons arch (sort (remove-duplicates (remove arch target-feature-list))
+                         #'string<))))
+
+(defvar *build-features* (let ((filename "build-features.lisp-expr"))
+                           (when (probe-file filename)
+                             (read-from-file filename))))
+(dolist (target-feature '(:sb-after-xc-core :cons-profiling))
+  (when (member target-feature sb!xc:*features*)
+    (setf sb!xc:*features* (delete target-feature sb!xc:*features*))
+    ;; If you use --fancy and --with-sb-after-xc-core you might
+    ;; add the feature twice if you don't use pushnew
+    (pushnew target-feature *build-features*)))
+
+;; We update the host's features, because a build-feature is essentially
+;; an option to check in the host enviroment
+(setf *features* (append *build-features* *features*))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -211,7 +242,7 @@
     (funcall customizer default-subfeatures)))
 
 ;;; Call for effect of signaling an error if no target picked.
-(target-platform-name)
+(target-platform-keyword)
 
 ;;; You can get all the way through make-host-1 without either one of these
 ;;; features, but then 'bit-bash' will fail to cross-compile.
@@ -231,7 +262,7 @@
           ":GENCGC and :CHENEYGC are incompatible")
          ("(and cheneygc (not (or alpha arm hppa mips ppc sparc)))"
           ":CHENEYGC not supported on selected architecture")
-         ("(and gencgc (not (or sparc ppc x86 x86-64 arm arm64)))"
+         ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64)))"
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
@@ -325,10 +356,7 @@
     ;; never figured out but which were apparently acceptable in CMU
     ;; CL. Eventually, it would be great to just get rid of all
     ;; warnings and remove support for this flag. -- WHN 19990323)
-    :ignore-failure-p
-    ;; meaning: Build this file, but don't put it on the list for
-    ;; genesis to include in the cold core.
-    :not-genesis))
+    :ignore-failure-p))
 
 (defvar *array-to-specialization* (make-hash-table :test #'eq))
 
@@ -347,7 +375,7 @@
     (if position
       (concatenate 'string
                    (subseq stem 0 (1+ position))
-                   (target-platform-name)
+                   (string-downcase (target-platform-keyword))
                    (subseq stem (+ position 7)))
       stem)))
 (compile 'stem-remap-target)

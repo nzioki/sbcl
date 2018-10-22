@@ -106,7 +106,9 @@
                       (:translate ,translate)))
                 (:args ,@(mapcar (lambda (arg)
                                    `(,arg :scs (descriptor-reg any-reg character-reg
-                                                unsigned-reg signed-reg constant)
+                                                unsigned-reg signed-reg constant
+                                                single-reg double-reg
+                                                complex-single-reg complex-double-reg)
                                           #!+immobile-space
                                           ,@(if (eq name 'type-check-error)
                                                 `(:load-if (type-err-type-tn-loadp ,arg)))))
@@ -149,22 +151,23 @@
   (unless (and (eq kind error-trap)
                compact-error-trap)
     (inst byte code))
-  (encode-internal-error-args
-   (mapcar (lambda (tn)
-             (cond ((and (tn-p tn) (sc-is tn immediate))
-                    (aver (typep (tn-value tn) '(or symbol layout)))
-                    (make-sc+offset constant-sc-number (tn-offset tn)))
-                   (t
-                    tn)))
-           values)))
+  (encode-internal-error-args values))
 
 (defun encode-internal-error-args (values)
   (sb!c::with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset
-       (if (tn-p where)
-           (make-sc+offset (sc-number (tn-sc where)) (or (tn-offset where) 0))
-           where)
+       (cond ((not (tn-p where))
+              where)
+             ((and (sc-is where immediate)
+                   (fixnump (tn-value where)))
+              (make-sc+offset immediate-sc-number (tn-value where)))
+             (t
+              (make-sc+offset (if (and (sc-is where immediate)
+                                       (typep (tn-value where) '(or symbol layout)))
+                                  constant-sc-number
+                                  (sc-number (tn-sc where)))
+                              (or (tn-offset where) 0))))
        vector))
     (loop for octet across vector do (inst byte octet))))

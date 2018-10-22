@@ -16,39 +16,31 @@
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
+  (:args (object :scs (any-reg descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset eax-offset :to (:result 0)) eax)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
     (inst mov eax object)
-    (inst and al-tn lowtag-mask)
-    (inst cmp al-tn other-pointer-lowtag)
-    (inst jmp :e other-ptr)
-    (inst cmp al-tn fun-pointer-lowtag)
-    (inst jmp :e function-ptr)
-
-    ;; Pick off structures and list pointers.
     (inst test al-tn 1)
-    (inst jmp :ne done)
-
-    ;; Pick off fixnums.
-    (inst and al-tn fixnum-tag-mask)
-    (inst jmp :e done)
-
-    ;; must be an other immediate
+    (inst jmp :z IMMEDIATE)
+    (inst and al-tn lowtag-mask)
+    (inst cmp al-tn list-pointer-lowtag)
+    (inst jmp :e IMMEDIATE)
+    ;; It's a function, instance, or other pointer.
     (inst mov eax object)
-    (inst jmp done)
+    ;; OBJECT is implicitly pinned, EAX can GC-safely point to it
+    ;; with no lowtag.
+    (inst and eax (lognot lowtag-mask)) ; native pointer
+    (inst movzx result (make-ea :byte :base eax))
+    (inst jmp DONE)
+    IMMEDIATE
+    ;; If OBJECT is in ESI or EDI we can't do a MOVZX byte-to-dword
+    ;; because there are no SIL,DIL registers. Use MOV + AND instead.
+    (move result object)
+    (inst and result #xFF)
+    DONE))
 
-    FUNCTION-PTR
-    (load-type al-tn object (- fun-pointer-lowtag))
-    (inst jmp done)
-
-    OTHER-PTR
-    (load-type al-tn object (- other-pointer-lowtag))
-
-    DONE
-    (inst movzx result al-tn)))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -148,7 +140,8 @@
   (:result-types system-area-pointer)
   (:generator 10
     (loadw sap code 0 other-pointer-lowtag)
-    (inst shr sap n-widetag-bits)
+    (inst shl sap 2) ; shift out the two GC-reserved bits
+    (inst shr sap (+ 2 n-widetag-bits))
     (inst lea sap (make-ea :byte :base code :index sap :scale 4
                            :disp (- other-pointer-lowtag)))))
 
@@ -159,7 +152,8 @@
   (:results (func :scs (descriptor-reg) :from (:argument 0)))
   (:generator 10
     (loadw func code 0 other-pointer-lowtag)
-    (inst shr func n-widetag-bits)
+    (inst shl func 2) ; shift out the two GC-reserved bits
+    (inst shr func (+ 2 n-widetag-bits))
     (inst lea func
           (make-ea :byte :base offset :index func :scale 4
                    :disp (- fun-pointer-lowtag other-pointer-lowtag)))
@@ -226,28 +220,36 @@
     (inst break pending-interrupt-trap)))
 
 #!+sb-thread
-(defknown current-thread-offset-sap ((unsigned-byte 32))
-  system-area-pointer (flushable))
-
-#!+sb-thread
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (unsigned-reg)
-            #!+win32 #!+win32 :to :save
-            #!-win32 #!-win32 :target sap))
-  (:arg-types unsigned-num)
+  ;; Note that SAP conflicts with N
+  (:args (n :scs (any-reg) :to :save :target sap))
+  (:arg-types tagged-num)
   (:policy :fast-safe)
   (:generator 2
     #!+win32
-    (progn
-      ;; Note that SAP conflicts with N in this case, hence the reader
-      ;; conditionals above.
-      (inst mov sap (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
-      (inst mov sap (make-ea :dword :base sap :disp 0 :index n :scale 4)))
-    #!-win32
-    (inst mov sap (make-ea :dword :disp 0 :index n :scale 4) :fs)))
+    (inst mov sap (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
+    ;; Using the FS segment, memory can be accessed only at the segment
+    ;; base specified by the descriptor (as segment-relative address 0)
+    ;; up through the segment limit. Negative indices are no good.
+    ;; Instead of accessing via FS, load thread->this into SAP,
+    ;; and then the index can be signed.
+    #!-win32 (inst mov sap (make-ea :dword :disp (ash thread-this-slot 2)) :fs)
+    (inst mov sap (make-ea :dword :base sap :index n))))
+;; ADDRESS-BASED-COUNTER-VAL uses the thread's alloc region free pointer
+;; as a quasi-random value, so that's a relatively useful case to handle
+;; without the extra instruction. Win32 needs an extra instruction always.
+#!+(and sb-thread (not win32))
+(define-vop (current-thread-offset-sap/c)
+  (:results (sap :scs (sap-reg)))
+  (:result-types system-area-pointer)
+  (:translate current-thread-offset-sap)
+  (:info n)
+  (:arg-types (:constant unsigned-byte)) ; UNSIGNED!
+  (:policy :fast-safe)
+  (:generator 1 (inst mov sap (make-ea :dword :disp (ash n 2)) :fs)))
 
 (define-vop (halt)
   (:generator 1

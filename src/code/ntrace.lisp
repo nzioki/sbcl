@@ -14,96 +14,6 @@
 ;;; FIXME: Why, oh why, doesn't the SB-DEBUG package use the SB-DI
 ;;; package? That would let us get rid of a whole lot of stupid
 ;;; prefixes..
-
-(defvar *trace-indentation-step* 2
-  "the increase in trace indentation at each call level")
-
-(defvar *max-trace-indentation* 40
-  "If the trace indentation exceeds this value, then indentation restarts at
-   0.")
-
-(defvar *trace-encapsulate-default* t
-  "the default value for the :ENCAPSULATE option to TRACE")
-
-;;;; internal state
-
-;;; a hash table that maps each traced function to the TRACE-INFO. The
-;;; entry for a closure is the shared function entry object.
-(defvar *traced-funs* (make-hash-table :test 'eq :synchronized t))
-
-(deftype trace-report-type ()
-  '(member nil trace))
-
-;;; A TRACE-INFO object represents all the information we need to
-;;; trace a given function.
-(defstruct (trace-info
-             (:print-object (lambda (x stream)
-                              (print-unreadable-object (x stream :type t)
-                                (prin1 (trace-info-what x) stream)))))
-  ;; the original representation of the thing traced
-  (what nil :type (or function cons symbol))
-  ;; Is WHAT a function name whose definition we should track?
-  (named nil)
-  ;; Is tracing to be done by encapsulation rather than breakpoints?
-  ;; T implies NAMED.
-  (encapsulated *trace-encapsulate-default*)
-  ;; Has this trace been untraced?
-  (untraced nil)
-  ;; breakpoints we set up to trigger tracing
-  (start-breakpoint nil :type (or sb-di:breakpoint null))
-  (end-breakpoint nil :type (or sb-di:breakpoint null))
-  ;; the list of function names for WHEREIN, or NIL if unspecified
-  (wherein nil :type list)
-  ;; should we trace methods given a generic function to trace?
-  (methods nil)
-
-  ;; The following slots represent the forms that we are supposed to
-  ;; evaluate on each iteration. Each form is represented by a cons
-  ;; (Form . Function), where the Function is the cached result of
-  ;; coercing Form to a function. Forms which use the current
-  ;; environment are converted with PREPROCESS-FOR-EVAL, which gives
-  ;; us a one-arg function. Null environment forms also have one-arg
-  ;; functions, but the argument is ignored. NIL means unspecified
-  ;; (the default.)
-
-  ;; report type
-  (report 'trace :type trace-report-type)
-  ;; current environment forms
-  (condition nil)
-  (break nil)
-  ;; List of current environment forms
-  (print () :type list)
-  ;; null environment forms
-  (condition-after nil)
-  (break-after nil)
-  ;; list of null environment forms
-  (print-after () :type list))
-(!set-load-form-method trace-info (:target))
-
-;;; This is a list of conses (fun-end-cookie . condition-satisfied),
-;;; which we use to note distinct dynamic entries into functions. When
-;;; we enter a traced function, we add a entry to this list holding
-;;; the new end-cookie and whether the trace condition was satisfied.
-;;; We must save the trace condition so that the after breakpoint
-;;; knows whether to print. The length of this list tells us the
-;;; indentation to use for printing TRACE messages.
-;;;
-;;; This list also helps us synchronize the TRACE facility dynamically
-;;; for detecting non-local flow of control. Whenever execution hits a
-;;; :FUN-END breakpoint used for TRACE'ing, we look for the
-;;; FUN-END-COOKIE at the top of *TRACED-ENTRIES*. If it is not
-;;; there, we discard any entries that come before our cookie.
-;;;
-;;; When we trace using encapsulation, we bind this variable and add
-;;; (NIL . CONDITION-SATISFIED), so a NIL "cookie" marks an
-;;; encapsulated tracing.
-(defvar *traced-entries* ())
-(declaim (list *traced-entries*))
-
-;;; This variable is used to discourage infinite recursions when some
-;;; trace action invokes a function that is itself traced. In this
-;;; case, we quietly ignore the inner tracing.
-(defvar *in-trace* nil)
 
 ;;;; utilities
 
@@ -346,6 +256,22 @@
         (let ((vals (multiple-value-list (apply function args))))
           (funcall (trace-end-breakpoint-fun info) frame nil vals nil)
           (values-list vals))))))
+
+;;; This function is like TRACE-CALL above, but munges the method
+;;; calling conventions into something more like what the user might
+;;; expect to see -- so not (<args> <next methods>) or (<permutation
+;;; vector> <next-emf> <arg> ...), but the method's actual arglist.
+(defun trace-method-call (info function fmf-p &rest args)
+  (let ((transform (if fmf-p (lambda (x) (nthcdr 2 x)) #'car)))
+    (multiple-value-bind (start cookie) (trace-start-breakpoint-fun info)
+      (declare (type function start cookie))
+      (let ((frame (sb-di:frame-down (sb-di:top-frame))))
+        (apply #'funcall start frame nil (funcall transform args))
+        (let ((*traced-entries* *traced-entries*))
+          (funcall cookie frame nil)
+          (let ((vals (multiple-value-list (apply function args))))
+            (funcall (trace-end-breakpoint-fun info) frame nil vals nil)
+            (values-list vals)))))))
 
 ;;; Trace one function according to the specified options. We copy the
 ;;; trace info (it was a quoted constant), fill in the functions, and
@@ -440,7 +366,7 @@
           (let ((mf (sb-mop:method-function method)))
             ;; NOTE: this direct style of tracing methods -- tracing the
             ;; pcl-internal method functions -- is only one possible
-            ;; alternative.  It fails (a) when encapulation is
+            ;; alternative.  It fails (a) when encapsulation is
             ;; requested, because the function objects themselves are
             ;; stored in the method object; (b) when the method in
             ;; question is particularly simple, when the method
@@ -620,12 +546,12 @@ The following options are defined:
        functions have string names like \"DEFUN FOO\".
 
    :ENCAPSULATE {:DEFAULT | T | NIL}
-       If T, the tracing is done via encapsulation (redefining the function
-       name) rather than by modifying the function. :DEFAULT is the default,
-       and means to use encapsulation for interpreted functions and funcallable
-       instances, breakpoints otherwise. When encapsulation is used, forms are
-       *not* evaluated in the function's lexical environment, but SB-DEBUG:ARG
-       can still be used.
+       If T, the default, tracing is done via encapsulation (redefining the
+       function name) rather than by modifying the function.  :DEFAULT is
+       not the default, but means to use encapsulation for interpreted
+       functions and funcallable instances, breakpoints otherwise. When
+       encapsulation is used, forms are *not* evaluated in the function's
+       lexical environment, but SB-DEBUG:ARG can still be used.
 
    :METHODS {T | NIL}
        If T, any function argument naming a generic function will have its

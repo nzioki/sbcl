@@ -49,7 +49,8 @@
         (,lambda-expr ,whole-var *lexenv*)
         (values))
       #-sb-xc-host
-      (install-guard-function ',name '(:special ,name) ,doc)
+      (progn (install-guard-function ',name '(:special ,name))
+             (setf (documentation (symbol-function ',name) t) ',doc))
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
       (setf (info :function :ir1-convert ',name) #',fn-name)
@@ -118,7 +119,7 @@
                    (make-lambda-list llks nil req opt rest keys aux)
                    lambda-list)) ; otherwise use the original list
        (args (make-symbol "ARGS")))
-    `(setf (info :function :source-transform ',fun-name)
+    `(%define-source-transform ',fun-name
            (named-lambda (:source-transform ,fun-name)
                (,lambda-whole ,lambda-env &aux (,args (cdr ,lambda-whole)))
              ,@(if (not env) `((declare (ignore ,lambda-env))))
@@ -133,6 +134,10 @@
                        ,@inner-decls
                        (block ,(fun-name-block-name fun-name) ,@forms))
                    (values call pass)))))))
+(defun %define-source-transform (fun-name lambda)
+  (when (info :function :source-transform fun-name)
+    (warn "Redefining source-transform for ~S" fun-name))
+  (setf (info :function :source-transform fun-name) lambda))
 
 ;;;; lambda-list parsing utilities
 ;;;;
@@ -628,8 +633,6 @@
 ;;; experimentation, not for ordinary use, so it should probably
 ;;; become conditional on SB-SHOW.
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
 (defstruct (event-info (:copier nil))
   ;; The name of this event.
   (name (missing-arg) :type symbol)
@@ -646,7 +649,7 @@
   (action nil :type (or function null)))
 
 ;;; A hashtable from event names to event-info structures.
-(defvar *event-info* (make-hash-table :test 'eq))
+(define-load-time-global *event-info* (make-hash-table :test 'eq))
 
 ;;; Return the event info for Name or die trying.
 (declaim (ftype (function (t) event-info) event-info-or-lose))
@@ -655,8 +658,6 @@
     (unless res
       (error "~S is not the name of an event." name))
     res))
-
-) ; EVAL-WHEN
 
 ;;; Return the number of times that EVENT has happened.
 (declaim (ftype (function (symbol) fixnum) event-count))
@@ -698,7 +699,7 @@
 (defmacro defevent (name description &optional (level 0))
   (let ((var-name (symbolicate "*" name "-EVENT-INFO*")))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (defvar ,var-name
+       (define-load-time-global ,var-name
          (make-event-info :name ',name
                           :description ',description
                           :var ',var-name

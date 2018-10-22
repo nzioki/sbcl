@@ -16,26 +16,6 @@
 
 (in-package "SB!C")
 
-(declaim (ftype (sfunction (boolean fixnum fixnum) code-component) allocate-code-object))
-;;; Allocate a code component with BOXED words in the header
-;;; followed by UNBOXED bytes of raw data.
-;;; BOXED must be the exact count of boxed words desired. No adjustments
-;;; are made for alignment considerations or the fixed slots.
-(defun allocate-code-object (immobile-p boxed unboxed)
-  (declare (ignorable immobile-p))
-  ;; Enforce limit on boxed words dependent on how many bits it gets in header.
-  (aver (typep boxed '(unsigned-byte #!+64-bit 32 #!-64-bit 23)))
-  #!+gencgc
-  (without-gcing
-      (cond #!+immobile-code
-            (immobile-p (sb!vm::allocate-immobile-code boxed unboxed))
-            (t (%make-lisp-obj
-                (alien-funcall (extern-alien "alloc_code_object"
-                                             (function unsigned unsigned unsigned))
-                               boxed unboxed)))))
-  #!-gencgc
-  (%primitive allocate-code-object boxed unboxed))
-
 ;;; Map of code-component -> list of PC offsets at which allocations occur.
 ;;; This table is needed in order to enable allocation profiling.
 (define-load-time-global *allocation-point-fixups*
@@ -51,8 +31,7 @@
          ;; CODE-OBJ must already be pinned in order to legally call this.
          ;; One call site that reaches here is below at MAKE-CORE-COMPONENT
          ;; and the other is LOAD-CODE, both of which pin the code.
-         (let ((savep
-                (sb!vm:fixup-code-object
+         (when (sb!vm:fixup-code-object
                  code-obj offset
                  (ecase flavor
                    ((:assembly-routine :assembly-routine*)
@@ -66,28 +45,23 @@
                    (:immobile-object (get-lisp-obj-address sym))
                    #!+immobile-code (:named-call (sb!vm::fdefn-entry-address sym))
                    #!+immobile-code (:static-call (sb!vm::function-raw-address sym)))
-                 kind flavor)))
-           ;; These won't exist except for x86-64, but it doesn't matter.
-           (when (member sym '(sb!vm::enable-alloc-counter
-                               sb!vm::enable-sized-alloc-counter))
-             (push offset (elt preserved-lists 2)))
-           (cond ((eq savep :relative) (push offset (elt preserved-lists 0)))
-                 (savep (push offset (elt preserved-lists 1))))))
+                 kind flavor)
+           (ecase kind
+             (:relative (push offset (elt preserved-lists 0)))
+             (:absolute (push offset (elt preserved-lists 1)))))
+         ;; These won't exist except for x86-64, but it doesn't matter.
+         (when (member sym '(sb!vm::enable-alloc-counter
+                             sb!vm::enable-sized-alloc-counter))
+           (push offset (elt preserved-lists 2))))
 
        (finish-fixups (code-obj preserved-lists)
          (declare (ignorable code-obj preserved-lists))
          #!+(or immobile-space x86)
          (let ((rel-fixups (elt preserved-lists 0))
                (abs-fixups (elt preserved-lists 1)))
-             ;; Store a cons of both only if there are any relative fixups,
-             ;; otherwise just the absolute [sic] fixups (the more common kind),
-             ;; some of which are actually relative fixups on x86. The C code
-             ;; deciphers (usually correctly) which are which. (See lp#1749369)
            (when (or abs-fixups rel-fixups)
-             (let ((abs (sb!c::pack-code-fixup-locs abs-fixups))
-                   (rel (sb!c::pack-code-fixup-locs rel-fixups)))
-               (setf (sb!vm::%code-fixups code-obj)
-                     (if rel-fixups (cons abs rel) abs)))))
+             (setf (sb!vm::%code-fixups code-obj)
+                   (sb!c::pack-code-fixup-locs abs-fixups rel-fixups))))
          (awhen (elt preserved-lists 2)
            (setf (gethash code-obj *allocation-point-fixups*)
                  (convert-alloc-point-fixups code-obj it)))
@@ -176,10 +150,9 @@
   (let ((debug-info (debug-info-for-component component)))
     (let* ((2comp (component-info component))
            (constants (ir2-component-constants 2comp))
+           (nboxed (align-up (length constants) sb!c::code-boxed-words-align))
            (code-obj (allocate-code-object
-                      (or #!+immobile-code (eq *compile-to-memory-space* :immobile))
-                      (align-up (length constants) sb!c::code-boxed-words-align)
-                      length)))
+                      (component-mem-space component) nboxed length)))
 
       ;; The following operations need the code pinned:
       ;; 1. copying into code-instructions (a SAP)
@@ -200,11 +173,8 @@
             (setf (%simple-fun-name fun) (entry-info-name entry-info))
             (setf (%simple-fun-arglist fun) (entry-info-arguments entry-info))
             (setf (%simple-fun-type fun) (entry-info-type entry-info))
-            ;; We can't make a decision to record the source here
-            ;; because the policy is not available in a simple way.
-            ;; (It would demand groveling through the component to find
-            ;; the lambda-bind corresponding to this entry)
-            (setf (%simple-fun-info fun) (entry-info-info entry-info))
+            (apply #'set-simple-fun-info fun
+                   (entry-info-form/doc/xrefs entry-info))
             (note-fun entry-info fun object))))
 
       (push debug-info (core-object-debug-info object))

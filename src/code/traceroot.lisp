@@ -9,6 +9,10 @@
 
 (in-package "SB-EXT")
 
+;;; Not loaded until warm build. package-data-list only affects symbols
+;;; that are visible to genesis.
+(export '(search-roots gc-and-search-roots))
+
 (define-alien-variable  "gc_object_watcher" unsigned)
 (define-alien-variable  "gc_traceroot_criterion" int)
 
@@ -41,6 +45,6 @@
 (defun search-roots (wps &optional (criterion :oldest))
   (let ((list (ensure-list wps)))
     (sb-sys:without-gcing
-      (alien-funcall (extern-alien "prove_liveness" (function void unsigned int))
+      (alien-funcall (extern-alien "prove_liveness" (function int unsigned int))
                      (sb-kernel:get-lisp-obj-address list)
                      (criterion-value criterion))))))

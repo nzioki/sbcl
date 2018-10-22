@@ -12,8 +12,7 @@
 (in-package "SB!VM")
 
 (defun ea-for-sse-stack (tn &optional (base rbp-tn))
-  (make-ea :qword :base base
-           :disp (frame-byte-offset (1+ (tn-offset tn)))))
+  (ea (frame-byte-offset (1+ (tn-offset tn))) base))
 
 (defun float-sse-p (tn)
   (sc-is tn single-sse-reg single-sse-stack single-sse-immediate
@@ -153,7 +152,7 @@
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:generator 3
-    (inst movd dst x)))
+    (inst movq dst x)))
 
 (define-vop (%simd-pack-high)
   (:translate %simd-pack-high)
@@ -167,7 +166,17 @@
   (:generator 3
     (move tmp x)
     (inst psrldq tmp 8)
-    (inst movd dst tmp)))
+    (inst movq dst tmp)))
+(define-vop (%simd-pack-high/sse4) ; 1 instruction and no temp
+  (:translate %simd-pack-high)
+  (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)))
+  (:arg-types simd-pack)
+  (:results (dst :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:policy :fast-safe)
+  (:guard (member :sse4 *backend-subfeatures*))
+  (:generator 1
+    (inst pextrq dst x 1)))
 
 (define-vop (%make-simd-pack)
   (:translate %make-simd-pack)
@@ -196,8 +205,8 @@
   (:results (dst :scs (int-sse-reg)))
   (:result-types simd-pack-int)
   (:generator 5
-    (inst movd dst lo)
-    (inst movd tmp hi)
+    (inst movq dst lo)
+    (inst movq tmp hi)
     (inst punpcklqdq dst tmp)))
 
 #-sb-xc-host
@@ -257,42 +266,50 @@
     (inst unpcklps tmp w)
     (inst unpcklps dst tmp)))
 
+(defknown %simd-pack-single-item
+  (simd-pack (integer 0 3)) single-float (flushable))
+
 (define-vop (%simd-pack-single-item)
   (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)
             :target tmp))
-  (:arg-types simd-pack)
+  (:translate %simd-pack-single-item)
+  (:arg-types simd-pack (:constant t))
   (:info index)
   (:results (dst :scs (single-reg)))
   (:result-types single-float)
   (:temporary (:sc single-sse-reg :from (:argument 0)) tmp)
   (:policy :fast-safe)
   (:generator 3
-    (cond ((and (zerop index)
-                (not (location= x dst)))
-           (inst xorps dst dst)
-           (inst movss dst x))
-          (t
-           (move tmp x)
-           (when (plusp index)
-             (inst psrldq tmp (* 4 index)))
-           (inst xorps dst dst)
-           (inst movss dst tmp)))))
+              (cond ((and (zerop index)
+                          (not (location= x dst)))
+                     (inst xorps dst dst)
+                     (inst movss dst x))
+                    (t
+                     (move tmp x)
+                     (when (plusp index)
+                       (inst psrldq tmp (* 4 index)))
+                     (inst xorps dst dst)
+                     (inst movss dst tmp)))))
 
 #-sb-xc-host
 (declaim (inline %simd-pack-singles))
 #-sb-xc-host
 (defun %simd-pack-singles (pack)
   (declare (type simd-pack pack))
-  (values (%primitive %simd-pack-single-item pack 0)
-          (%primitive %simd-pack-single-item pack 1)
-          (%primitive %simd-pack-single-item pack 2)
-          (%primitive %simd-pack-single-item pack 3)))
+  (values (%simd-pack-single-item pack 0)
+          (%simd-pack-single-item pack 1)
+          (%simd-pack-single-item pack 2)
+          (%simd-pack-single-item pack 3)))
+
+(defknown %simd-pack-double-item
+  (simd-pack (integer 0 1)) double-float (flushable))
 
 (define-vop (%simd-pack-double-item)
+  (:translate %simd-pack-double-item)
   (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)
             :target tmp))
   (:info index)
-  (:arg-types simd-pack)
+  (:arg-types simd-pack (:constant t))
   (:results (dst :scs (double-reg)))
   (:result-types double-float)
   (:temporary (:sc double-sse-reg :from (:argument 0)) tmp)
@@ -314,5 +331,5 @@
 #-sb-xc-host
 (defun %simd-pack-doubles (pack)
   (declare (type simd-pack pack))
-  (values (%primitive %simd-pack-double-item pack 0)
-          (%primitive %simd-pack-double-item pack 1)))
+  (values (%simd-pack-double-item pack 0)
+          (%simd-pack-double-item pack 1)))

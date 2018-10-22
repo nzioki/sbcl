@@ -15,7 +15,7 @@
   (reinit-internal-real-time))
 
 ;;; Implemented in unix.lisp and win32.lisp.
-(setf (fdocumentation 'get-internal-real-time 'function)
+(setf (documentation 'get-internal-real-time 'function)
       "Return the real time (\"wallclock time\") since startup in the internal
 time format. (See INTERNAL-TIME-UNITS-PER-SECOND.)")
 
@@ -193,7 +193,7 @@ format."
           (truncate years 100))
        (truncate (+ years 300) 400))))
 
-(define-load-time-global **days-before-month**
+(defconstant +days-before-month+
   #.(let ((reversed-result nil)
           (sum 0))
       (push nil reversed-result)
@@ -201,8 +201,6 @@ format."
         (push sum reversed-result)
         (incf sum days-in-month))
       (coerce (nreverse reversed-result) 'simple-vector)))
-
-(declaim (type (simple-vector 13) **days-before-month**))
 
 (defun encode-universal-time (second minute hour date month year
                                      &optional time-zone)
@@ -224,7 +222,7 @@ format."
                    year))
          (days (+ (1- date)
                   (truly-the (mod 335)
-                             (svref **days-before-month** month))
+                             (svref +days-before-month+ month))
                   (if (> month 2)
                       (leap-years-before (1+ year))
                       (leap-years-before year))
@@ -314,7 +312,7 @@ normally during operations like SLEEP."
 
 ;;; Return all the data that we want TIME to report.
 (defun time-get-sys-info ()
-  (multiple-value-bind (user sys faults) (sb!sys:get-system-info)
+  (multiple-value-bind (user sys faults) (get-system-info)
     (values user sys faults (get-bytes-consed))))
 
 (defun elapsed-cycles (h0 l0 h1 l1)

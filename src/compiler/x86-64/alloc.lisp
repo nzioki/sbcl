@@ -17,6 +17,11 @@
 ;;; from the C alloc() function by way of the alloc-tramp
 ;;; assembly routine.
 
+(defun tagify (result base lowtag)
+  (if (eql lowtag 0)
+      (inst mov result base)
+      (inst lea result (ea lowtag base))))
+
 (defun stack-allocation (alloc-tn size lowtag)
   (aver (not (location= alloc-tn rsp-tn)))
   (inst sub rsp-tn size)
@@ -28,7 +33,7 @@
   ;; - The real issue is that it's not obvious that the stack is
   ;;   16-byte-aligned at *all* times. Maybe it is, maybe it isn't.
   (inst and rsp-tn #.(lognot lowtag-mask))
-  (inst lea alloc-tn (make-ea :byte :base rsp-tn :disp lowtag))
+  (tagify alloc-tn rsp-tn lowtag)
   (values))
 
 (defun %alloc-tramp (node result-tn size lowtag)
@@ -46,9 +51,8 @@
     (invoke-asm-routine 'call (if to-r11 'alloc-tramp-r11 'alloc-tramp) node)
     (unless to-r11
       (inst pop result-tn)))
-
-  (when lowtag
-    (inst or (reg-in-size result-tn :byte) lowtag))
+  (unless (eql lowtag 0)
+    (inst or :byte result-tn lowtag))
   (values))
 
 ;;; Insert allocation profiler instrumentation
@@ -56,8 +60,7 @@
   (when (policy node (> sb!c::instrument-consing 1))
     (let ((skip-instrumentation (gen-label)))
       (inst mov temp-reg-tn
-            (make-ea :qword :base thread-base-tn
-                     :disp (* n-word-bytes thread-profile-data-slot)))
+            (ea (* n-word-bytes thread-profile-data-slot) thread-base-tn))
       (inst test temp-reg-tn temp-reg-tn)
       ;; This instruction is modified to "JMP :z" when profiling is
       ;; partially enabled. After the buffer is assigned, it becomes
@@ -75,9 +78,7 @@
                (inst call (make-fixup helper :assembly-routine)) ; 5 bytes
                (emit-alignment 3 :long-nop))
               (t
-               (inst call ; 7 bytes
-                     (make-ea :qword :disp
-                              (make-fixup helper :assembly-routine*)))
+               (inst call (ea (make-fixup helper :assembly-routine*))) ; 7 bytes
                (inst nop))) ; align
         (unless (integerp size)
           ;; This TEST instruction is never executed- it informs the profiler
@@ -112,44 +113,59 @@
         (in-elsewhere (sb!assem::assembling-to-elsewhere-p))
         ;; thread->alloc_region.free_pointer
         (free-pointer
-         #!+sb-thread
-         (thread-tls-ea (* n-word-bytes thread-alloc-region-slot))
-         #!-sb-thread
-         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign)))
+         #!+sb-thread (thread-slot-ea thread-alloc-region-slot)
+         #!-sb-thread (ea (make-fixup "gc_alloc_region" :foreign)))
         ;; thread->alloc_region.end_addr
         (end-addr
-         #!+sb-thread
-         (thread-tls-ea (* n-word-bytes (1+ thread-alloc-region-slot)))
-         #!-sb-thread
-         (make-ea :qword :disp (make-fixup "gc_alloc_region" :foreign 8))))
+         #!+sb-thread (thread-slot-ea (1+ thread-alloc-region-slot))
+         #!-sb-thread (ea (make-fixup "gc_alloc_region" :foreign 8))))
 
     (cond ((or in-elsewhere
                ;; large objects will never be made in a per-thread region
                (and (integerp size)
                     (>= size large-object-size)))
            (%alloc-tramp node alloc-tn size lowtag))
+          ((eql lowtag 0)
+           (cond ((and (tn-p size) (location= size alloc-tn))
+                  (inst mov temp-reg-tn free-pointer)
+                  ;; alloc-tn <- old free ptr and temp <- new free ptr
+                  (inst xadd temp-reg-tn alloc-tn))
+                 (t
+                  (inst mov alloc-tn free-pointer)
+                  (inst lea temp-reg-tn (ea size alloc-tn))))
+           (inst cmp temp-reg-tn end-addr)
+           (inst jmp :a NOT-INLINE)
+           (inst mov free-pointer temp-reg-tn)
+           (emit-label DONE)
+           (assemble (:elsewhere)
+             (emit-label NOT-INLINE)
+             (let ((size (cond ((and (tn-p size) (location= size alloc-tn))
+                                (inst sub temp-reg-tn alloc-tn)
+                                temp-reg-tn)
+                               (t
+                                size))))
+               (%alloc-tramp node alloc-tn size 0))
+             (inst jmp DONE)))
           (t
            (inst mov temp-reg-tn free-pointer)
            (cond ((integerp size)
-                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :disp size)))
+                  (inst lea alloc-tn (ea size temp-reg-tn)))
                  ((location= alloc-tn size)
                   (inst add alloc-tn temp-reg-tn))
                  (t
-                  (inst lea alloc-tn (make-ea :qword :base temp-reg-tn :index size))))
+                  (inst lea alloc-tn (ea temp-reg-tn size))))
            (inst cmp alloc-tn end-addr)
            (inst jmp :a NOT-INLINE)
            (inst mov free-pointer alloc-tn)
            (emit-label DONE)
-           (if lowtag
-               (inst lea alloc-tn (make-ea :byte :base temp-reg-tn :disp lowtag))
-               (inst mov alloc-tn temp-reg-tn))
+           (tagify alloc-tn temp-reg-tn lowtag)
            (assemble (:elsewhere)
              (emit-label NOT-INLINE)
              (cond ((and (tn-p size) (location= size alloc-tn)) ; recover SIZE
                     (inst sub alloc-tn free-pointer)
-                    (%alloc-tramp node temp-reg-tn alloc-tn nil))
+                    (%alloc-tramp node temp-reg-tn alloc-tn 0))
                    (t ; SIZE is intact
-                    (%alloc-tramp node temp-reg-tn size nil)))
+                    (%alloc-tramp node temp-reg-tn size 0)))
              (inst jmp DONE))))
     (values)))
 
@@ -160,7 +176,7 @@
                     &aux (bytes (pad-data-block size)))
   (unless stack-allocate-p
     (instrument-alloc bytes node))
-  (maybe-pseudo-atomic stack-allocate-p
+  (pseudo-atomic (:elide-if stack-allocate-p)
       (allocation result-tn bytes node stack-allocate-p other-pointer-lowtag)
       (storew* (logior (ash (1- size) n-widetag-bits) widetag)
                result-tn 0 other-pointer-lowtag
@@ -200,7 +216,7 @@
                     (size (* (pad-data-block cons-size) cons-cells)))
                (unless stack-allocate-p
                  (instrument-alloc size node))
-               (maybe-pseudo-atomic stack-allocate-p
+               (pseudo-atomic (:elide-if stack-allocate-p)
                 (allocation res size node stack-allocate-p list-pointer-lowtag)
                 (move ptr res)
                 (dotimes (i (1- cons-cells))
@@ -232,8 +248,8 @@
 (defun storew* (word object slot lowtag zeroed)
   (if (or (not zeroed) (not (typep word '(signed-byte 32))))
       (storew word object slot lowtag) ; Possibly use temp-reg-tn
-      (inst mov
-            (make-ea (cond ((typep word '(unsigned-byte 8)) :byte)
+      (let ((size
+             (cond ((typep word '(unsigned-byte 8)) :byte)
                            ((and (not (logtest word #xff))
                                  (typep (ash word -8) '(unsigned-byte 8)))
                             ;; Array lengths 128 to 16384 which are multiples of 128
@@ -248,10 +264,8 @@
                             :byte)
                            ((typep word '(unsigned-byte 16)) :word)
                            ;; Definitely a (signed-byte 32) due to pre-test.
-                           (t :dword))
-                     :base object
-                     :disp (- (* slot n-word-bytes) lowtag))
-            word)))
+                           (t :dword))))
+        (inst mov size (ea (- (* slot n-word-bytes) lowtag) object) word))))
 
 ;;; ALLOCATE-VECTOR
 (macrolet ((calc-size-in-bytes (n-words result-tn)
@@ -259,20 +273,17 @@
                      (pad-data-block (+ (tn-value ,n-words) vector-data-offset)))
                     (t
                      (inst lea ,result-tn
-                           (make-ea :byte :index ,n-words
-                                          :scale (ash 1 (- word-shift n-fixnum-tag-bits))
-                                          :disp (+ lowtag-mask
-                                                   (* vector-data-offset n-word-bytes))))
+                           (ea (+ lowtag-mask (* vector-data-offset n-word-bytes))
+                               nil ,n-words (ash 1 (- word-shift n-fixnum-tag-bits))))
                      (inst and ,result-tn (lognot lowtag-mask))
                      ,result-tn)))
-           (put-header (vector-tn type length zeroed)
+           (put-header (vector-tn lowtag type length zeroed)
              `(progn (storew* (if (sc-is ,type immediate) (tn-value ,type) ,type)
-                              ,vector-tn 0 other-pointer-lowtag ,zeroed)
+                              ,vector-tn 0 ,lowtag ,zeroed)
                      (storew* (if (sc-is ,length immediate)
                                   (fixnumize (tn-value ,length))
                                   ,length)
-                              ,vector-tn vector-length-slot other-pointer-lowtag
-                              ,zeroed))))
+                              ,vector-tn vector-length-slot ,lowtag ,zeroed))))
 
   (define-vop (allocate-vector-on-heap)
     (:args (type :scs (unsigned-reg immediate))
@@ -289,9 +300,10 @@
       ;; so don't move it inside.
       (let ((size (calc-size-in-bytes words result)))
         (instrument-alloc size node)
-        (pseudo-atomic
-         (allocation result size node nil other-pointer-lowtag)
-         (put-header result type length t)))))
+        (pseudo-atomic ()
+         (allocation result size node nil 0)
+         (put-header result 0 type length t)
+         (inst or :byte result other-pointer-lowtag)))))
 
   (define-vop (allocate-vector-on-stack)
     (:args (type :scs (unsigned-reg immediate))
@@ -309,8 +321,10 @@
     (:generator 100
       (let ((size (calc-size-in-bytes words result))
             (rax-zeroed))
+        ;; Compute tagged pointer sooner than later since access off RSP
+        ;; requires an extra byte in the encoding anyway.
         (stack-allocation result size other-pointer-lowtag)
-        (put-header result type length nil)
+        (put-header result other-pointer-lowtag type length nil)
         ;; FIXME: It would be good to check for stack overflow here.
         ;; It would also be good to skip zero-fill of specialized vectors
         ;; perhaps in a policy-dependent way. At worst you'd see random
@@ -321,8 +335,7 @@
           #!+linux ; unimplemented for others
           (let ((words-savep
                  ;; 'words' might be co-located with any of the temps
-                 (or (location= words rdi) (location= words rcx) (location= words rax)))
-                (rax rax))
+                 (or (location= words rdi) (location= words rcx) (location= words rax))))
             (setq rax-zeroed (not (location= words rax)))
             (when words-savep ; use 'result' to save 'words'
               (inst mov result words))
@@ -330,11 +343,8 @@
                    (inst mov rcx (+ (tn-value words) vector-data-offset)))
                   (t
                    (inst lea rcx
-                         (make-ea :qword :base words
-                                  :disp (ash vector-data-offset n-fixnum-tag-bits)))
-                   (if (= n-fixnum-tag-bits 1)
-                       (setq rax (reg-in-size rax :dword)) ; don't bother shifting rcx
-                       (inst shr rcx n-fixnum-tag-bits))))
+                         (ea (ash vector-data-offset n-fixnum-tag-bits) words))
+                   (inst shr rcx n-fixnum-tag-bits)))
             (inst mov rdi msan-mem-to-shadow-xor-const)
             (inst xor rdi rsp-tn) ; compute shadow address
             (zeroize rax)
@@ -343,19 +353,18 @@
             (when words-savep
               (inst mov words result) ; restore 'words'
               (inst lea result ; recompute the tagged pointer
-                    (make-ea :byte :base rsp-tn :disp other-pointer-lowtag)))))
+                    (ea other-pointer-lowtag rsp-tn)))))
         (unless (sb!c::vector-initialized-p node)
           (let ((data-addr
-                  (make-ea :qword :base result
-                                  :disp (- (* vector-data-offset n-word-bytes)
-                                           other-pointer-lowtag))))
+                  (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      result)))
             (block zero-fill
               (cond ((sc-is words immediate)
                      (let ((n (tn-value words)))
                        (cond ((> n 8)
                               (inst mov rcx (tn-value words)))
                              ((= n 1)
-                              (inst mov data-addr 0)
+                              (inst mov :qword data-addr 0)
                               (return-from zero-fill))
                              (t
                               (multiple-value-bind (double single) (truncate n 2)
@@ -363,9 +372,8 @@
                                 (dotimes (i double)
                                   (inst movapd data-addr zero)
                                   (setf data-addr
-                                        (make-ea :qword :base (ea-base data-addr)
-                                                        :disp (+ (ea-disp data-addr)
-                                                                 (* n-word-bytes 2)))))
+                                        (ea (+ (ea-disp data-addr) (* n-word-bytes 2))
+                                            (ea-base data-addr))))
                                 (unless (zerop single)
                                   (inst movaps data-addr zero))
                                 (return-from zero-fill))))))
@@ -387,21 +395,19 @@
                      (inst test ,length ,length)
                      (inst jmp :z done)
                      (inst lea ,answer
-                           (make-ea :byte :base nil :index ,length
-                                    :scale (ash 1 (1+ (- word-shift
-                                                         n-fixnum-tag-bits)))))
+                           (ea nil ,length
+                               (ash 1 (1+ (- word-shift n-fixnum-tag-bits)))))
                      ,answer)))
            (compute-end ()
              `(let ((size (cond ((or (not (fixnump size))
-                                     (immediate32-p size))
+                                     (plausible-signed-imm32-operand-p size))
                                  size)
                                 (t
                                  (inst mov limit size)
                                  limit))))
                 (inst lea limit
-                      (make-ea :qword :base result
-                                      :index (if (fixnump size) nil size)
-                                      :disp (if (fixnump size) size 0))))))
+                      (ea (if (fixnump size) size 0) result
+                          (if (fixnump size) nil size))))))
 
   (define-vop (allocate-list-on-stack)
     (:args (length :scs (any-reg immediate))
@@ -444,7 +450,7 @@
             (no-init
              (and (sc-is element immediate) (eql (tn-value element) 0))))
         (instrument-alloc size node)
-        (pseudo-atomic
+        (pseudo-atomic ()
          (allocation result size node nil list-pointer-lowtag)
          (compute-end)
          (inst mov next result)
@@ -487,23 +493,18 @@
           (header (logior (ash (1- words) n-widetag-bits) closure-widetag)))
      (unless stack-allocate-p
        (instrument-alloc bytes node))
-     (maybe-pseudo-atomic stack-allocate-p
+     (pseudo-atomic (:elide-if stack-allocate-p)
        (allocation result bytes node stack-allocate-p fun-pointer-lowtag)
        (storew* #!-immobile-space header ; write the widetag and size
                 #!+immobile-space        ; ... plus the layout pointer
                 (progn (inst mov temp header)
                        (inst or temp #!-sb-thread (static-symbol-value-ea 'function-layout)
                                      #!+sb-thread
-                                     (thread-tls-ea (ash thread-function-layout-slot
-                                                         word-shift)))
+                                     (thread-slot-ea thread-function-layout-slot))
                        temp)
                 result 0 fun-pointer-lowtag (not stack-allocate-p)))
-     ;; These two instructions are within the scope of PSEUDO-ATOMIC.
-     ;; This is due to scav_closure() assuming that it can always subtract
-     ;; FUN_RAW_ADDR_OFFSET from closure->fun to obtain a Lisp object,
-     ;; without any precheck for whether that word is currently 0.
-     (inst lea temp (rip-relative-ea :qword label
-                                     (ash simple-fun-code-offset word-shift)))
+     ;; Done with pseudo-atomic
+     (inst lea temp (rip-relative-ea label (ash simple-fun-code-offset word-shift)))
      (storew temp result closure-fun-slot fun-pointer-lowtag))))
 
 ;;; The compiler likes to be able to directly make value cells.
@@ -531,7 +532,7 @@
   (:generator 1
     (let ((tramp (make-fixup 'funcallable-instance-tramp :assembly-routine)))
       (if (sb!c::code-immobile-p vop)
-          (inst lea result (make-ea :qword :base rip-tn :disp tramp))
+          (inst lea result (ea tramp rip-tn))
           (inst mov result tramp)))))
 
 (define-vop (fixed-alloc)
@@ -544,8 +545,10 @@
     (progn name) ; possibly not used
     (unless stack-allocate-p
       (instrument-alloc bytes node))
-    (maybe-pseudo-atomic stack-allocate-p
-     (allocation result bytes node stack-allocate-p lowtag)
+    (pseudo-atomic (:elide-if stack-allocate-p)
+     ;; If storing a header word, defer ORing in the lowtag until after
+     ;; the header is written so that displacement can be 0.
+     (allocation result bytes node stack-allocate-p (if type 0 lowtag))
      (when type
        (let* ((widetag (if (typep type 'layout) instance-widetag type))
               (header (logior (ash (1- words) n-widetag-bits) widetag)))
@@ -555,12 +558,13 @@
              ;; filled in when the layout is stored. Can't use STOREW* though,
              ;; because it tries to store as few bytes as possible,
              ;; where this instruction must write exactly 4 bytes.
-             (inst mov (make-ea :dword :base result :disp (- lowtag)) header)
-             (storew* header result 0 lowtag (not stack-allocate-p)))
-         (unless (eq type widetag) ; TYPE is actually a LAYOUT
-           (inst mov (make-ea :dword :base result :disp (+ 4 (- lowtag)))
-                 ;; XXX: should layout fixups use a name, not a layout object?
-                 (make-fixup type :layout)))))))))
+             (inst mov :dword (ea 0 result) header)
+             (storew* header result 0 0 (not stack-allocate-p)))
+         (inst or :byte result lowtag))))
+    (when (typep type 'layout)
+      (inst mov :dword (ea (+ 4 (- lowtag)) result)
+            ;; XXX: should layout fixups use a name, not a layout object?
+            (make-fixup type :layout))))))
 
 ;;; Allocate a non-vector variable-length object.
 ;;; Exactly 4 allocators are rendered via this vop:
@@ -581,26 +585,20 @@
   (:node-var node)
   (:generator 50
    ;; With the exception of bignums, these objects have effectively
-   ;; 32-bit headers because the high half contains other data.
-   (multiple-value-bind (bytes header extra)
-      (if (= type bignum-widetag)
-          (values bytes header extra)
-          (values (reg-in-size bytes  :dword)
-                  (reg-in-size header :dword)
-                  (reg-in-size extra  :dword)))
-    (inst lea bytes
-          (make-ea :qword :disp (* (1+ words) n-word-bytes) :index extra
-                   :scale (ash 1 (- word-shift n-fixnum-tag-bits))))
-    (inst mov header bytes)
-    (inst shl header (- n-widetag-bits word-shift)) ; w+1 to length field
-    (inst lea header                    ; (w-1 << 8) | type
-          (make-ea :qword :base header
-                   :disp (+ (ash -2 n-widetag-bits) type)))
-    (inst and bytes (lognot lowtag-mask)))
-    (instrument-alloc bytes node)
-    (pseudo-atomic
-     (allocation result bytes node nil lowtag)
-     (storew header result 0 lowtag))))
+   ;; 32-bit headers because the high 4 byes contain a layout pointer.
+   (let ((operand-size (if (= type bignum-widetag) :qword :dword)))
+      (inst lea operand-size bytes
+            (ea (* (1+ words) n-word-bytes) nil
+                extra (ash 1 (- word-shift n-fixnum-tag-bits))))
+      (inst mov operand-size header bytes)
+      (inst shl operand-size header (- n-widetag-bits word-shift)) ; w+1 to length field
+      (inst lea operand-size header                    ; (w-1 << 8) | type
+            (ea (+ (ash -2 n-widetag-bits) type) header))
+      (inst and operand-size bytes (lognot lowtag-mask)))
+      (instrument-alloc bytes node)
+      (pseudo-atomic ()
+       (allocation result bytes node nil lowtag)
+       (storew header result 0 lowtag))))
 
 #!+immobile-space
 (macrolet ((c-call (name)
@@ -622,13 +620,13 @@
    ;; RSP needn't be restored because the allocators all return immediately
    ;; which has that effect
    (inst and rsp-tn -16)
-   (pseudo-atomic
+   (pseudo-atomic ()
      (c-call "alloc_fixedobj")
-     (inst lea result (make-ea :qword :base c-result :disp lowtag))
+     (inst lea result (ea lowtag c-result))
      ;; If code, the next word must be set within the P-A
      ;; otherwise the GC would compute the wrong object size.
      (when word1
-       (inst mov (make-ea :qword :base result :disp (- n-word-bytes lowtag)) word1)))))
+       (inst mov :qword (ea (- n-word-bytes lowtag) result) word1)))))
 (define-vop (alloc-immobile-layout)
   (:args (slots :scs (descriptor-reg) :target c-arg1))
   (:temporary (:sc unsigned-reg :from (:argument 0) :to :eval :offset rdi-offset)
@@ -642,7 +640,7 @@
    ;; RSP needn't be restored because the allocators all return immediately
    ;; which has that effect
    (inst and rsp-tn -16)
-   (pseudo-atomic (c-call "alloc_layout"))
+   (pseudo-atomic () (c-call "alloc_layout"))
    (move result c-result)))
 ) ; end MACROLET
 

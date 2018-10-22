@@ -674,19 +674,6 @@
                                    (cdr buffering)))))))
             bufferings)))
 
-;;; FIXME: is this used anywhere any more?
-(def-output-routines ("OUTPUT-CHAR-~A-BUFFERED"
-                      1
-                      t
-                      (:none character)
-                      (:line character)
-                      (:full character))
-  (if (eql byte #\Newline)
-      (setf (fd-stream-output-column stream) 0)
-      (incf (fd-stream-output-column stream)))
-  (setf (sap-ref-8 (buffer-sap obuf) tail)
-        (char-code byte)))
-
 (def-output-routines ("OUTPUT-UNSIGNED-BYTE-~A-BUFFERED"
                       1
                       nil
@@ -955,7 +942,7 @@
 ;;; a list of all available input routines. Each element is a list of
 ;;; the element-type input, the function name, and the number of bytes
 ;;; per element.
-(defvar *input-routines* ())
+(define-load-time-global *input-routines* ())
 
 ;;; Return whether a primitive partial read operation on STREAM's FD
 ;;; would (probably) block.  Signal a `simple-stream-error' if the

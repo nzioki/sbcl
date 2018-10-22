@@ -106,8 +106,10 @@
 ;;; The set of types of which no object can be a member during cross-compilation.
 (dolist (symbol '(alien system-area-pointer sb!alien-internals:alien-value
                   code-component fdefn lra extended-sequence
-                  sb!pcl::%method-function sb!pcl::standard-instance
+                  sb!pcl::%method-function
+                  sb!pcl::standard-instance sb!pcl::standard-funcallable-instance
                   funcallable-instance generic-function
+                  sb!format::fmt-control
                   #!+sb-eval sb!eval:interpreted-function
                   #!+sb-fasteval sb!interpreter:interpreted-function
                   weak-pointer simd-pack))
@@ -295,7 +297,7 @@
                     (values nil t))
                    (t
                     (warn-and-give-up))))
-            ((target-type-is-in '(stream instance
+            ((target-type-is-in '(stream instance sb!impl::string-output-stream
                                   broadcast-stream file-stream))
              ;; Neither target CL:STREAM nor target SB!KERNEL:INSTANCE
              ;; is implemented as a STRUCTURE-OBJECT, so they'll fall

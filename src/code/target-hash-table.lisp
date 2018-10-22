@@ -120,8 +120,12 @@
 #!-sb-fluid (declaim (inline eql-hash))
 (defun eql-hash (key)
   (declare (values hash (member t nil)))
-  (if (numberp key)
-      (equal-hash key)
+  (if (%other-pointer-subtype-p
+       key
+       '#.(list sb!vm:bignum-widetag sb!vm:ratio-widetag sb!vm:double-float-widetag
+                sb!vm:single-float-widetag
+                sb!vm:complex-widetag sb!vm:complex-single-float-widetag sb!vm:complex-double-float-widetag))
+      (values (sxhash key) nil)
       (eq-hash key)))
 
 (defun equalp-hash (key)
@@ -457,13 +461,13 @@ Examples:
            (values index))
   (hash-table-number-entries hash-table))
 
-(setf (fdocumentation 'hash-table-rehash-size 'function)
+(setf (documentation 'hash-table-rehash-size 'function)
       "Return the rehash-size HASH-TABLE was created with.")
 
-(setf (fdocumentation 'hash-table-rehash-threshold 'function)
+(setf (documentation 'hash-table-rehash-threshold 'function)
       "Return the rehash-threshold HASH-TABLE was created with.")
 
-(setf (fdocumentation 'hash-table-synchronized-p 'function)
+(setf (documentation 'hash-table-synchronized-p 'function)
       "Returns T if HASH-TABLE is synchronized.")
 
 (defun hash-table-size (hash-table)
@@ -472,7 +476,7 @@ Examples:
    having to be grown."
   (hash-table-rehash-trigger hash-table))
 
-(setf (fdocumentation 'hash-table-test 'function)
+(setf (documentation 'hash-table-test 'function)
       "Return the test HASH-TABLE was created with.")
 
 ;;; Called when we detect circular chains in a hash-table.

@@ -87,16 +87,20 @@
 ;;; All the primitive type predicate wrappers share a parallel form..
 (macrolet ((def-type-predicate-wrapper (pred)
              (let* ((name (symbol-name pred))
+                    (package (package-name (symbol-package pred)))
                     (stem (string-left-trim "%" (string-right-trim "P-" name)))
                     (article (if (position (schar name 0) "AEIOU") "an" "a")))
+               (aver (not (string= package "SB!XC")))
                `(defun ,pred (object)
-                  ,(format nil
-                           "Return true if OBJECT is ~A ~A, and NIL otherwise."
-                           article
-                           stem)
+                  ,@(unless (eql (mismatch package "SB!") 3)
+                      (list (format nil
+                                    "Return true if OBJECT is ~A ~A, and NIL otherwise."
+                                    article
+                                    stem)))
                   ;; (falling through to low-level implementation)
                   (,pred object)))))
   (def-type-predicate-wrapper array-header-p)
+  (def-type-predicate-wrapper simple-array-header-p)
   (def-type-predicate-wrapper arrayp)
   (def-type-predicate-wrapper atom)
   ;; Testing for BASE-CHAR-P is usually redundant on #-sb-unicode,
@@ -139,7 +143,11 @@
   (def-type-predicate-wrapper single-float-p)
   #!+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
   (def-type-predicate-wrapper %instancep)
+  (def-type-predicate-wrapper funcallable-instance-p)
   (def-type-predicate-wrapper symbolp)
+  ;; The interpreter needs this because it assumes that any type spec
+  ;; in SB-C::*BACKEND-TYPE-PREDICATES* has a callable predicate.
+  (def-type-predicate-wrapper non-null-symbol-p)
   (def-type-predicate-wrapper %other-pointer-p)
   (def-type-predicate-wrapper system-area-pointer-p)
   (def-type-predicate-wrapper unbound-marker-p)
@@ -173,12 +181,6 @@
 (defun fixnum-mod-p (x limit)
   (and (fixnump x)
        (<= 0 x limit)))
-
-#!+(or x86 x86-64 ppc)
-(defun %other-pointer-subtype-p (x choices)
-  (and (%other-pointer-p x)
-       (member (%other-pointer-widetag x) choices)
-       t))
 
 ;;; Return the layout for an object. This is the basic operation for
 ;;; finding out the "type" of an object, and is used for generic

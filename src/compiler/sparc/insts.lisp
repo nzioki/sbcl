@@ -24,8 +24,6 @@
             sb!vm::zero-tn
             sb!vm::zero-offset sb!vm::null-offset sb!vm::alloc-offset)))
 
-(defconstant +disassem-inst-alignment-bytes+ sb!vm:n-word-bytes)
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf *assem-max-locations* 100))
 
@@ -621,9 +619,6 @@ about function addresses and register values.")
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-format-1 32
   (byte 2 30) (byte 30 0))
@@ -1608,22 +1603,12 @@ about function addresses and register values.")
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
   (:delay 0)
   (:emitter
    (emit-byte segment byte)))
-
-(define-bitfield-emitter emit-header-object 32
-  (byte 24 8) (byte 8 0))
 
 (defun emit-header-data (segment type)
   (emit-back-patch
@@ -1653,7 +1638,8 @@ about function addresses and register values.")
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   (lambda (segment posn delta-if-after)
+   (lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
          (when (<= (- (ash 1 12)) delta (1- (ash 1 12)))
            (emit-back-patch segment 4

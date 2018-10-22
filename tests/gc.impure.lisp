@@ -13,6 +13,28 @@
 
 (in-package :cl-user)
 
+(defvar *weak-vect* (make-weak-vector 8))
+(with-test (:name :weak-vector)
+  (let ((a *weak-vect*)
+        (random-symbol (make-symbol "FRED")))
+    (setf (aref a 0) (cons 'foo 'bar)
+          (aref a 1) (format nil "Time is: ~D~%" (get-internal-real-time))
+          (aref a 2) 'interned-symbol
+          (aref a 3) random-symbol
+          (aref a 4) 18
+          (aref a 5) (+ most-positive-fixnum (random 100) (random 100))
+          (aref a 6) (make-hash-table))
+    (assert (typep (aref a 5) 'bignum))
+    (assert (weak-vector-p a))
+    (sb-sys:scrub-control-stack)
+    (gc)
+    (assert (eq (aref a 2) 'interned-symbol))
+    (assert (eq (aref a 3) random-symbol))
+    (assert (= (aref a 4) 18))
+    ;; broken cells are the cons, string, bignum, hash-table, plus one NIL
+    ;; cell that was never assigned into
+    (assert (= (count nil *weak-vect*) 5))))
+
 ;;; Make sure MAP-REFERENCING-OBJECTS doesn't spuriously treat raw bits as
 ;;; potential pointers. Also make sure it sees the SYMBOL-INFO slot.
 (defstruct afoo (slot nil :type sb-ext:word))
@@ -45,13 +67,13 @@
                  (bit-vector (incf n-bitvectors))
                  (symbol     (incf n-symbols))
                  (t          (incf n-other))))))
-      (sb-vm::map-allocated-objects #'countit :all)
+      (sb-vm:map-allocated-objects #'countit :all)
       (replace before after)
       (fill after 0)
       ;; expect to see 1 cons, 1 bit-vector, 1 symbol, and nothing else
       (let ((* (cons (make-array 5 :element-type 'bit)
                      (make-symbol "WAT"))))
-        (sb-vm::map-allocated-objects #'countit :all)
+        (sb-vm:map-allocated-objects #'countit :all)
         (assert (equal (map 'list #'- after before) '(0 1 1 1)))))))
 
 (defparameter *x* ())
@@ -158,7 +180,7 @@
     (assert (not (gc-logfile)))
     (delete-file p)))
 
-#+immobile-code
+#+nil ; immobile-code
 (with-test (:name (sb-kernel::order-by-in-degree :uninterned-function-names))
   ;; This creates two functions whose names are uninterned symbols and
   ;; that are both referenced once, resulting in a tie
@@ -197,12 +219,13 @@
     (assert (= (sb-kernel:get-lisp-obj-address *pin-test-object*)
                *pin-test-object-address*))))
 
+#+gencgc
 (defun ensure-code/data-separation ()
   (let* ((n-bits (+ sb-vm:next-free-page 10))
          (code-bits (make-array n-bits :element-type 'bit))
          (data-bits (make-array n-bits :element-type 'bit))
          (total-code-size 0))
-    (sb-vm::map-allocated-objects
+    (sb-vm:map-allocated-objects
      (lambda (obj type size)
        (declare ((and fixnum (integer 1)) size))
        ;; M-A-O disables GC, therefore GET-LISP-OBJ-ADDRESS is safe
@@ -223,17 +246,18 @@
      :dynamic)
     (assert (not (find 1 (bit-and code-bits data-bits))))
     (let* ((code-bytes-consumed
-            (* (count 1 code-bits) sb-vm:gencgc-card-bytes))
+             (* (count 1 code-bits) sb-vm:gencgc-card-bytes))
            (waste
-            (- total-code-size code-bytes-consumed)))
+             (- total-code-size code-bytes-consumed)))
       ;; This should be true for all platforms.
       ;; Some have as little as .5% space wasted.
       (assert (<= waste (* 3/100 code-bytes-consumed))))))
 
-(compile 'ensure-code/data-separation)
+
 
 (with-test (:name :code/data-separation
-                  :skipped-on (:not :gencgc))
+            :skipped-on (not :gencgc))
+  (compile 'ensure-code/data-separation)
   (ensure-code/data-separation))
 
 #+immobile-space
@@ -262,3 +286,31 @@
   (setf (symbol-function 'callfoo)
         (compile nil '(lambda () (loop repeat 500000000 do (foo)))))
   (funcall 'callfoo))
+
+;;; Pseudo-static large objects should retain the single-object flag
+#+gencgc ; PSEUDO-STATIC-GENERATION etc don't exist for cheneygc
+(with-test (:name :pseudostatic-large-objects)
+  (sb-vm:map-allocated-objects
+   (lambda (obj type size)
+     (declare (ignore type size))
+     (when (>= (sb-vm::primitive-object-size obj) (* 4 sb-vm:gencgc-card-bytes))
+       (let* ((addr (sb-kernel:get-lisp-obj-address obj))
+              (pte (deref sb-vm:page-table (sb-vm:find-page-index addr))))
+         (when (eq (slot pte 'sb-vm::gen) sb-vm:+pseudo-static-generation+)
+           (let* ((flags (slot pte 'sb-vm::flags))
+                  (type (ldb (byte 5 (+ #+big-endian 3)) flags)))
+             (assert (logbitp 4 type)))))))
+   :all))
+
+#+64-bit ; code-serialno not defined unless 64-bit
+(with-test (:name :unique-code-serialno)
+  (let ((a (make-array 100000 :element-type 'bit :initial-element 0)))
+    (sb-vm:map-allocated-objects
+     (lambda (obj type size)
+       (declare (ignore size))
+       (when (and (= type sb-vm:code-header-widetag)
+                  (plusp (sb-kernel:code-n-entries obj)))
+         (let ((serial (sb-kernel:%code-serialno obj)))
+           (assert (zerop (aref a serial)))
+           (setf (aref a serial) 1))))
+     :all)))

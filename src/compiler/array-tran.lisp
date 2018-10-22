@@ -1004,6 +1004,9 @@
       (let* ((args (splice-fun-args dims :any 2)) ; the args to CONS
              (dummy (cadr args)))
         (flush-dest dummy)
+        ;; Don't want (list (list x)) to become a valid dimension specifier.
+        (assert-lvar-type (car args) (specifier-type 'index)
+                          (%coerce-to-policy call))
         (setf (combination-args call) (delete dummy (combination-args call)))
         (return-from make-array
           (transform-make-array-vector (car args)
@@ -1266,41 +1269,42 @@
     (give-up-ir1-transform "The axis is not constant."))
   ;; Dimensions may change thanks to ADJUST-ARRAY, so we need the
   ;; conservative type.
-  (let ((array-type (lvar-conservative-type array))
-        (axis (lvar-value axis)))
-    (let ((dims (array-type-dimensions-or-give-up array-type)))
-      (unless (listp dims)
-        (give-up-ir1-transform
-         "The array dimensions are unknown; must call ARRAY-DIMENSION at runtime."))
-      (unless (> (length dims) axis)
-        (abort-ir1-transform "The array has dimensions ~S, ~W is too large."
-                             dims
-                             axis))
-      (let ((dim (nth axis dims)))
-        (cond ((integerp dim)
-               dim)
-              ((= (length dims) 1)
-               (ecase (conservative-array-type-complexp array-type)
-                 ((t)
-                  '(%array-dimension array 0))
-                 ((nil)
-                  '(vector-length array))
-                 ((:maybe)
-                  `(if (array-header-p array)
-                       (%array-dimension array axis)
-                       (vector-length array)))))
-              (t
-               '(%array-dimension array axis)))))))
+  (let* ((array-type (lvar-conservative-type array))
+         (axis (lvar-value axis))
+         (dims (array-type-dimensions-or-give-up array-type)))
+    (unless (listp dims)
+      (give-up-ir1-transform
+       "The array dimensions are unknown; must call ARRAY-DIMENSION at runtime."))
+    (unless (> (length dims) axis)
+      (abort-ir1-transform "The array has dimensions ~S, ~W is too large."
+                           dims
+                           axis))
+    (let ((dim (nth axis dims)))
+      (cond ((integerp dim)
+             dim)
+            ((= (length dims) 1)
+             (ecase (conservative-array-type-complexp array-type)
+               ((t)
+                '(%array-dimension array 0))
+               ((nil)
+                '(vector-length array))
+               ((:maybe)
+                `(if (array-header-p array)
+                     (%array-dimension array axis)
+                     (vector-length array)))))
+            (t
+             '(%array-dimension array axis))))))
 
-;;; If the length has been declared and it's simple, just return it.
-(deftransform length ((vector)
-                      ((simple-array * (*))))
-  (let ((type (lvar-type vector)))
-    (let ((dims (array-type-dimensions-or-give-up type)))
-      (unless (and (listp dims) (integerp (car dims)))
-        (give-up-ir1-transform
-         "Vector length is unknown, must call LENGTH at runtime."))
-      (car dims))))
+(deftransform %array-dimension ((array axis)
+                                (array (constant-arg index)))
+  (let* ((array-type (lvar-conservative-type array))
+         (dims (array-type-dimensions-or-give-up array-type))
+         (axis (lvar-value axis))
+         (dim (and (listp dims)
+                   (nth axis dims))))
+    (if (integerp dim)
+        dim
+        (give-up-ir1-transform))))
 
 ;;; All vectors can get their length by using VECTOR-LENGTH. If it's
 ;;; simple, it will extract the length slot from the vector. It it's
@@ -1312,13 +1316,36 @@
 ;;; If a simple array with known dimensions, then VECTOR-LENGTH is a
 ;;; compile-time constant.
 (deftransform vector-length ((vector))
-  (let ((vtype (lvar-type vector)))
-    (let ((dim (first (array-type-dimensions-or-give-up vtype))))
-      (when (eq dim '*)
-        (give-up-ir1-transform))
-      (when (conservative-array-type-complexp vtype)
-        (give-up-ir1-transform))
-      dim)))
+  (let* ((vtype (lvar-type vector))
+         (dim (first (array-type-dimensions-or-give-up vtype))))
+    (when (eq dim '*)
+      (give-up-ir1-transform))
+    (when (conservative-array-type-complexp vtype)
+      (give-up-ir1-transform))
+    dim))
+
+(defoptimizer (vector-length derive-type) ((vector))
+  (let ((array-type (lvar-conservative-type vector))
+        min-length
+        max-length)
+    (when (and
+           (union-type-p array-type)
+           (loop for type in (union-type-types array-type)
+                 always (and (array-type-p type)
+                             (typep (array-type-dimensions type)
+                                    '(cons integer null)))
+                 do (let ((length (car (array-type-dimensions type))))
+                      (cond ((array-type-complexp type)
+                             ;; fill-pointer can start from 0
+                             (setf min-length 0))
+                            ((or (not min-length)
+                                 (< length min-length))
+                             (setf min-length length)))
+                      (when (or (not max-length)
+                                (> length max-length))
+                        (setf max-length length)))))
+      (specifier-type `(integer ,(or min-length 0)
+                                ,max-length)))))
 
 ;;; Again, if we can tell the results from the type, just use it.
 ;;; Otherwise, if we know the rank, convert into a computation based
@@ -1338,23 +1365,44 @@
 
 ;;; Only complex vectors have fill pointers.
 (deftransform array-has-fill-pointer-p ((array))
-  (let ((array-type (lvar-type array)))
-    (let ((dims (array-type-dimensions-or-give-up array-type)))
-      (if (and (listp dims) (not (= (length dims) 1)))
-          nil
-          (ecase (conservative-array-type-complexp array-type)
-            ((t)
-             t)
-            ((nil)
-             nil)
-            ((:maybe)
-             (give-up-ir1-transform
-              "The array type is ambiguous; must call ~
-               ARRAY-HAS-FILL-POINTER-P at runtime.")))))))
+  (let* ((array-type (lvar-type array))
+         (dims (array-type-dimensions-or-give-up array-type)))
+    (if (and (listp dims) (not (= (length dims) 1)))
+        nil
+        (ecase (conservative-array-type-complexp array-type)
+          ((t)
+           t)
+          ((nil)
+           nil)
+          ((:maybe)
+           (give-up-ir1-transform
+            "The array type is ambiguous; must call ~
+               ARRAY-HAS-FILL-POINTER-P at runtime."))))))
 
-(deftransform check-bound ((array dimension index) * * :node node)
-  ;; This is simply to avoid multiple evaluation of INDEX by the
-  ;; translator, it's easier to wrap it in a lambda from DEFTRANSFORM
+(deftransform %check-bound ((array dimension index) ((simple-array * (*)) * *))
+  (let ((array-ref (lvar-uses array))
+        (index-ref (lvar-uses index)))
+    (unless (and
+             (ref-p array-ref)
+             (ref-p index-ref)
+             (or
+              (loop for constraint in (ref-constraints array-ref)
+                    thereis (and (eq (constraint-y constraint)
+                                     (ref-leaf index-ref))))
+              (loop for constraint in (ref-constraints index-ref)
+                    thereis (and (eq (constraint-y constraint)
+                                     (ref-leaf array-ref))))))
+      (give-up-ir1-transform)))
+  ;; It's in bounds but it may be of the wrong type
+  `(the (and fixnum unsigned-byte) index))
+
+(deftransform check-bound ((array dimension index))
+  ;; %CHECK-BOUND will perform both bound and type checking when
+  ;; necessary, delete the cast so that it doesn't get confused by
+  ;; its derived type.
+  (let ((use (principal-lvar-ref-use index)))
+    (when (array-index-cast-p use)
+      (delete-cast use)))
   `(bound-cast array ,(if (constant-lvar-p dimension)
                           (lvar-value dimension)
                           'dimension)
@@ -1569,7 +1617,11 @@
     (with-unique-names (n-vector)
       `(let ((,n-vector ,vector))
          (truly-the ,elt-type (data-vector-set
-                               (the* (simple-vector :modifying (setf svref)) ,n-vector)
+                               (the simple-vector
+                                    (with-annotations
+                                        (,(make-lvar-modified-annotation :caller
+                                                                         '(setf svref)))
+                                      ,n-vector))
                                (check-bound ,n-vector (length ,n-vector) ,index)
                                (the ,elt-type ,value)))))))
 
@@ -1631,7 +1683,7 @@
 
   (deftransform (setf aref) ((new-value array &rest subscripts))
     (with-row-major-index (array subscripts index new-value)
-                          (hairy-data-vector-set array index new-value))))
+      (hairy-data-vector-set array index new-value))))
 
 ;; For AREF of vectors we do the bounds checking in the callee. This
 ;; lets us do a significantly more efficient check for simple-arrays
@@ -1776,3 +1828,8 @@
                     (specifier-type '(eql t)))
                    (t
                     nil)))))))
+
+(defoptimizer (array-header-p constraint-propagate-if)
+    ((array) node gen)
+  (declare (ignore gen))
+  (values array (specifier-type '(and array (not (simple-array * (*)))))))

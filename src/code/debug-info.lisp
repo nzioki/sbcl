@@ -359,7 +359,7 @@
                           (:copier nil))
   ;; When the DEBUG-SOURCE describes a file, the file's namestring.
   ;; Otherwise, NIL.
-  (namestring nil :type (or null string) :read-only t)
+  (namestring nil :type (or null string))
   ;; the universal time that the source was written, or NIL if
   ;; unavailable
   (created nil :type (or unsigned-byte null))
@@ -374,7 +374,7 @@
   ;; That form can generate multiple functions, and those functions can
   ;; be in one or more code components. They all point at the same form.
   form
-  function)
+  (function nil :read-only t))
 
 ;;;; DEBUG-INFO structures
 
@@ -399,7 +399,7 @@
   ;; vector.
   (fun-map (missing-arg) :type simple-vector :read-only t)
   ;; Location contexts
-  ;; Either a simple-vector or a context if there's only one context.
+  ;; A (simple-array * (*)) or a context if there's only one context.
   (contexts nil :type t :read-only t)
   (tlf-num+offset nil :type integer))
 

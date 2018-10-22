@@ -29,6 +29,7 @@
 #include "interr.h" /* for lose() */
 
 extern const char *widetag_names[];
+extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 
 /// Enable extra debug-only checks if DEBUG
 #ifdef DEBUG
@@ -92,19 +93,31 @@ do {                                                                   \
  */
 static inline unsigned int*
 code_fun_table(struct code* code) {
-  return (unsigned int*)((char*)code
-                         + code_header_words(code->header) * N_WORD_BYTES
-                         + fixnum_value(code->code_size) - sizeof (uint16_t));
+  return (unsigned int*)
+      ((char*)code + code_header_words(code->header) * N_WORD_BYTES
+       // Cast out high 32 bits of code_size if lispobj is 64 bits.
+       + fixnum_value((uint32_t)code->code_size) - sizeof (uint16_t));
 }
 static inline unsigned short
 code_n_funs(struct code* code) {
     // immobile space filler objects appear to be code but have no simple-funs.
     // Should probably consider changing the widetag to FILLER_WIDETAG.
-    return (code_header_words(code->header) > 2)
-        ? *((unsigned short*)code_fun_table(code)) : 0;
+    return code_header_words(code->header)
+        ? *((unsigned short*)code_fun_table(code)) >> 4 : 0;
 }
 
-#define is_vector_subtype(header, val) ((HeaderValue(header) & 3) == subtype_##val)
+// Test for presence of a bit in vector's header.
+// As a special case, if 'val' is 0, then test for all bits clear.
+#define is_vector_subtype(header, val) \
+  (subtype_##val ? (HeaderValue(header) & subtype_##val) : \
+   !(HeaderValue(header) & 7))
+
+// Mask out the fullcgc mark bit when asserting header validity
+#define UNSET_WEAK_VECTOR_VISITED(v) \
+  gc_assert((v->header & 0xffff) == \
+    (((subtype_VectorWeakVisited|subtype_VectorWeak) << N_WIDETAG_BITS) \
+     | SIMPLE_VECTOR_WIDETAG)); \
+  v->header ^= subtype_VectorWeakVisited << N_WIDETAG_BITS
 
 // Iterate over the native pointers to each function in 'code_var'
 // offsets are stored as the number of bytes into the instructions
@@ -121,7 +134,7 @@ code_n_funs(struct code* code) {
        struct simple_fun* fun_var                                           \
            = (struct simple_fun*)(_insts_ + _offsets_[-index_var]);         \
        if (assertp)                                                         \
-         gc_assert(widetag_of(fun_var->header)==SIMPLE_FUN_WIDETAG);        \
+         gc_assert(widetag_of(&fun_var->header)==SIMPLE_FUN_WIDETAG);       \
        guts ;                                                               \
       } while (++index_var < _nfuns_);                                      \
   }}
@@ -133,6 +146,7 @@ code_n_funs(struct code* code) {
  * struct page in gencgc-internal.h. These constants are used in gc-common,
  * so they can't easily be made gencgc-only */
 #define FREE_PAGE_FLAG        0
+#define PAGE_TYPE_MASK        7 // mask out the 'single-object flag'
 /* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
 #define BOXED_PAGE_FLAG       1
 #define UNBOXED_PAGE_FLAG     2
@@ -141,7 +155,7 @@ code_n_funs(struct code* code) {
 
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \
-  (is_cons_half(header)?2:sizetab[widetag_of(header)](where))
+  (is_cons_half(header)?2:sizetab[header_widetag(header)](where))
 
 lispobj *gc_search_space3(void *pointer, lispobj *start, void *limit);
 static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
@@ -190,10 +204,12 @@ static inline lispobj funinstance_layout(lispobj* instance_ptr) { // native ptr
     return instance_ptr[3];
 }
 // No layout in simple-fun or closure, because there are no free bits
-static inline lispobj function_layout(lispobj* fun_ptr) { // native ptr
+static inline lispobj
+function_layout(lispobj __attribute__((unused)) *fun_ptr) { // native ptr
     return 0;
 }
-static inline void set_function_layout(lispobj* fun_ptr, lispobj layout) {
+static inline void set_function_layout(lispobj __attribute__((unused)) *fun_ptr,
+                                       lispobj __attribute__((unused)) layout) {
     lose("Can't assign layout");
 }
 #endif
@@ -214,6 +230,7 @@ extern boolean positive_bignum_logbitp(int,struct bignum*);
  * neither of which materially impact garbage collection. */
 
 extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
+extern lispobj virtual_fdefn_callee_lispobj(struct fdefn *fdefn,uword_t);
 
 #else
 
@@ -236,11 +253,12 @@ static inline lispobj fdefn_callee_lispobj(struct fdefn *fdefn) {
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 #include "genesis/layout.h"
 #define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
-/// First 5 layouts: T, FUNCTION, STRUCTURE-OBJECT, LAYOUT, PACKAGE
+/// First 4 layouts: T, STRUCTURE-OBJECT, LAYOUT, FUNCTION
 /// (These #defines ought to be emitted by genesis)
-#define LAYOUT_OF_FUNCTION ((FIXEDOBJ_SPACE_START+1*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
-#define LAYOUT_OF_LAYOUT   ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
-#define LAYOUT_OF_PACKAGE  ((FIXEDOBJ_SPACE_START+4*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_LAYOUT   ((FIXEDOBJ_SPACE_START+2*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_FUNCTION ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
 #endif
+
+boolean valid_widetag_p(unsigned char widetag);
 
 #endif /* _GC_INTERNAL_H_ */

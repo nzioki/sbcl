@@ -221,7 +221,7 @@
 
 (defmethod print-object ((type alien-type) stream)
   (print-unreadable-object (type stream :type t)
-    (sb!ext:print-type-specifier stream (unparse-alien-type type))))
+    (sb!impl:print-type-specifier stream (unparse-alien-type type))))
 
 ;;;; the SAP type
 
@@ -1153,7 +1153,7 @@
         (error "~S is not a valid L-value." form))))
 
 (push '("SB-ALIEN" define-alien-type-class define-alien-type-method)
-      sb!impl::*!removable-symbols*)
+      *!removable-symbols*)
 
 (in-package "SB!IMPL")
 

@@ -32,6 +32,7 @@
         (saetp-primitive-type-name info)
         (room-info-name info)))
 
+(defconstant tiny-boxed-size-mask #xFF)
 (defun !compute-room-infos ()
   (let ((infos (make-array 256 :initial-element nil))
         (default-size-mask (mask-field (byte 23 0) -1)))
@@ -43,7 +44,7 @@
                    (not (member widetag '(t nil))))
           (setf (svref infos (symbol-value widetag))
                 (make-room-info (if (member name '(fdefn symbol))
-                                    #xFF
+                                    tiny-boxed-size-mask
                                     default-size-mask)
                                 name :other)))))
 
@@ -262,8 +263,8 @@
           ;; a non-nil, non-ROOM-INFO object as INFO.
         ((specialized-array-element-type-properties-p info)
          (reconstitute-vector (tagged-object other-pointer-lowtag) info))
-        ((= widetag sb-vm:filler-widetag)
-         (values nil sb-vm:filler-widetag (boxed-size header-value)))
+        ((= widetag filler-widetag)
+         (values nil filler-widetag (boxed-size header-value)))
         ((null info)
          (error "Unrecognized widetag #x~2,'0X in reconstitute-object"
                 widetag))
@@ -317,7 +318,7 @@
       ;; SIZE is almost surely a fixnum. Non-fixnum would mean at least
       ;; a 512MB object if 32-bit words, and is inconceivable if 64-bit.
        (aver (not (logtest (the word size) lowtag-mask)))
-       (unless (= typecode sb-vm:filler-widetag)
+       (unless (= typecode filler-widetag)
          (funcall fun obj typecode size))
              ;; This special little dance is to add a number of octets
              ;; (and it had best be a number evenly divisible by our
@@ -620,7 +621,7 @@ We could try a few things to mitigate this:
 ;;; Return a list of 3-lists (bytes object type-name) for the objects
 ;;; allocated in Space.
 (defun type-breakdown (space)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (let ((sizes (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits)))
         (counts (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits))))
     (map-allocated-objects
@@ -767,9 +768,13 @@ We could try a few things to mitigate this:
     (map-allocated-objects
      (lambda (obj type size)
        (declare (optimize (speed 3)))
-       (when (eql type instance-widetag)
+       (when (or (eql type instance-widetag)
+                 (eql type funcallable-instance-widetag))
          (incf total-objects)
-         (let* ((classoid (layout-classoid (%instance-layout obj)))
+         (let* ((layout (if (eql type funcallable-instance-widetag)
+                            (%funcallable-instance-layout obj)
+                            (%instance-layout obj)))
+                (classoid (layout-classoid layout))
                 (found (ensure-gethash classoid totals (cons 0 0)))
                 (size size))
            (declare (fixnum size))
@@ -912,7 +917,7 @@ We could try a few things to mitigate this:
 
 (defun list-allocated-objects (space &key type larger smaller count
                                      test)
-  (declare (type spaces space)
+  (declare (type (or (eql :all) spaces) space)
            (type (or index null) larger smaller type count)
            (type (or function null) test))
   (declare (dynamic-extent test))
@@ -960,6 +965,11 @@ We could try a few things to mitigate this:
     #+stack-grows-downward-not-upward (iter + *control-stack-end* sap>)
     #-stack-grows-downward-not-upward (iter - *control-stack-start* sap<)))
 
+(declaim (inline symbol-extra-slot-p))
+(defun symbol-extra-slot-p (x)
+  (> (logand (get-header-data x) tiny-boxed-size-mask)
+     (1- symbol-size)))
+
 ;;; Invoke FUNCTOID (a macro or function) on OBJ and any values in MORE.
 ;;; Note that neither OBJ nor items in MORE undergo ONCE-ONLY treatment.
 ;;; The fact that FUNCTOID can be a macro allows treatment of its first argument
@@ -990,18 +1000,26 @@ We could try a few things to mitigate this:
          ,.(make-case 'cons `(car ,obj) `(cdr ,obj))
          ,.(make-case* 'instance
             `(let ((.l. (%instance-layout ,obj)))
-               (,functoid .l. ,@more)
+               ;; Though we've bound %INSTANCE-LAYOUT to a variable,
+               ;; pass the form %INSTANCE-LAYOUT to functoid
+               ;; in case it wants to examine the form
+               (,functoid (%instance-layout ,obj) ,@more)
                (do-instance-tagged-slot (.i. ,obj :layout .l. :pad nil)
                  (,functoid (%instance-ref ,obj .i.) ,@more))))
          (function
           (typecase ,obj
             ,.(make-case* 'closure
                `(,functoid (%closure-fun ,obj) ,@more)
-               `(do-closure-values (.o. ,obj) (,functoid .o. ,@more)))
+               `(do-closure-values (.o. ,obj :include-extra-values t)
+                  ;; FIXME: doesn't allow setf, but of course there is
+                  ;; no closure-index-set anyway, so .O. might be unused
+                  ;; if functoid is a macro that does nothing.
+                  (,functoid .o. ,@more)))
             ,.(make-case* 'funcallable-instance
                `(let ((.l. (%funcallable-instance-layout ,obj)))
-                  (,functoid .l. ,@more)
-                  (,functoid (%funcallable-instance-function ,obj) ,@more)
+                  ;; As for INSTANCE, allow the functoid to see the access form
+                  (,functoid (%funcallable-instance-layout ,obj) ,@more)
+                  (,functoid (%funcallable-instance-fun ,obj) ,@more)
                   (ecase (layout-bitmap .l.)
                     (#.sb-kernel::+layout-all-tagged+
                      (loop for .i. from instance-data-start ; exclude layout
@@ -1031,21 +1049,23 @@ We could try a few things to mitigate this:
                `(%array-displaced-p ,obj)
                `(%array-displaced-from ,obj))
             ,.(make-case 'array)
-            ,.(make-case 'symbol
-               `(%primitive sb-c:fast-symbol-value ,obj)
-               `(symbol-info ,obj)
-               `(symbol-name ,obj)
-               `(symbol-package ,obj))
+            ,.(make-case* 'symbol
+               `(,functoid (%primitive sb-c:fast-symbol-global-value ,obj) ,@more)
+               `(,functoid (symbol-info ,obj) ,@more)
+               `(,functoid (symbol-name ,obj) ,@more)
+               `(,functoid (symbol-package ,obj) ,@more)
+               `(when (symbol-extra-slot-p ,obj)
+                  (,functoid (symbol-extra ,obj) ,@more)))
             ,.(make-case 'fdefn
                `(fdefn-name ,obj)
                `(fdefn-fun ,obj)
                #+immobile-code
-               `(sb-kernel:%make-lisp-obj
+               `(%make-lisp-obj
                  (alien-funcall (extern-alien "fdefn_callee_lispobj" (function unsigned unsigned))
                                 (logandc2 (get-lisp-obj-address ,obj) lowtag-mask))))
             ,.(make-case* 'code-component
                `(,functoid (%code-debug-info ,obj) ,@more)
-               #+(or x86 immobile-code) `(,functoid (%code-fixups,obj) ,@more)
+               #+(or x86 immobile-code) `(,functoid (%code-fixups ,obj) ,@more)
                `(loop for .i. from code-constants-offset below (code-header-words ,obj)
                       do (,functoid (code-header-ref ,obj .i.) ,@more))
                ;; Caller should extend behavior for embedded objects, like:
@@ -1053,16 +1073,13 @@ We could try a few things to mitigate this:
                ;;        do (,functoid (%code-entry-point ,obj .i.) ,@more)))
                ;; and/or visit the slots of each simple-fun but not the fun per se.
                )
-            ,.(make-case '(or float bignum #+sb-simd-pack simd-pack
+            ,.(make-case '(or float (complex float) bignum
+                              #+sb-simd-pack simd-pack
                               system-area-pointer)) ; nothing to do
             ,.(make-case 'weak-pointer `(weak-pointer-value ,obj))
             ,.(make-case 'ratio `(%numerator ,obj) `(%denominator ,obj))
-            ;; Use the non-primitive slot readers because we don't know
-            ;; which subtype of complex number this is.
-            ,.(make-case 'complex `(realpart ,obj) `(imagpart ,obj))
-            ;; Heap scans will never encounter SIMPLE-FUN so we don't really
-            ;; need it here, but just to keep it out of the T case.
-            ,.(make-case 'simple-fun)
+            ;; Visitor won't be invoked on (COMPLEX float)
+            ,.(make-case '(complex rational) `(%realpart ,obj) `(%imagpart ,obj))
             ;; Caller can do anything in the fallback case.
             ,.(make-case 't))))
       (when (> (length alterations) n-matched-alterations)
@@ -1075,7 +1092,6 @@ We could try a few things to mitigate this:
   (macrolet ((test (x) `(when (eq ,x that) (go win))))
     (tagbody
        (do-referenced-object (this test)
-         (simple-fun :delete) ; omit this type
          (code-component
           :extend
           (dotimes (i (code-n-entries this))
@@ -1089,9 +1105,9 @@ We could try a few things to mitigate this:
          (t
           :extend
           (case (widetag-of this)
-            (#.sb-vm:value-cell-widetag
+            (#.value-cell-widetag
              (test (value-cell-ref this)))
-            (#.sb-vm:filler-widetag)
+            (#.filler-widetag)
             (t
              (bug "Unknown object type #x~x addr=~x"
                   (widetag-of this)
@@ -1242,6 +1258,70 @@ We could try a few things to mitigate this:
            (when (simple-fun-p object)
              (setq addr (get-lisp-obj-address (fun-code-header object))))
            (logand #xF (sap-ref-8 (int-sap (logandc2 addr lowtag-mask)) 3))))))
+
+;;; Unfortunately this is a near total copy of the test in gc.impure.lisp
+(defun !ensure-genesis-code/data-separation ()
+  #+gencgc
+  (let* ((n-bits (+ next-free-page 10))
+         (code-bits (make-array n-bits :element-type 'bit))
+         (data-bits (make-array n-bits :element-type 'bit))
+         (total-code-size 0))
+    (map-allocated-objects
+     (lambda (obj type size)
+       (declare ((and fixnum (integer 1)) size))
+       ;; M-A-O disables GC, therefore GET-LISP-OBJ-ADDRESS is safe
+       (let ((obj-addr (get-lisp-obj-address obj))
+             (array (cond ((= type code-header-widetag)
+                           (incf total-code-size size)
+                           code-bits)
+                          (t
+                           data-bits)))
+             (other-array (cond ((= type code-header-widetag)
+                                 data-bits)
+                                (t
+                                 code-bits))))
+         ;; This is not the most efficient way to update the bit arrays,
+         ;; but the simplest and clearest for sure. (The loop could avoided
+         ;; if the current page is the same as the previously seen page)
+         (loop for index from (find-page-index obj-addr)
+               to (find-page-index (truly-the word
+                                              (+ (logandc2 obj-addr lowtag-mask)
+                                                 (1- size))))
+               do (cond ((= (sbit other-array index) 1)
+                         (format t "~&broken on page index ~d base ~x~%"
+                                 index
+                                 (+ dynamic-space-start (* index gencgc-card-bytes)))
+                         (alien-funcall (extern-alien "ldb_monitor" (function void))))
+                        (t
+                         (setf (sbit array index) 1))))))
+     :dynamic)))
+;;; Because pseudo-static objects can not move nor be freed,
+;;; this is a valid test that genesis separated code and data.
+(!ensure-genesis-code/data-separation)
+
+(defun hexdump (obj &optional (n-words
+                               (if (typep obj 'code-component)
+                                   ;; Display up through the first fun header
+                                   (+ (code-header-words obj)
+                                      (ash (sb-impl::%code-fun-offset obj 0)
+                                           (- word-shift))
+                                      simple-fun-code-offset)
+                                   ;; at most 10 words
+                                   (min 10 (ash (primitive-object-size obj)
+                                                (- word-shift)))))
+                              ;; pass NIL explicitly if T crashes on you
+                              (decode t))
+  (with-pinned-objects (obj)
+    (let ((a (logandc2 (get-lisp-obj-address obj) lowtag-mask)))
+      (dotimes (i n-words)
+        (let ((word (sap-ref-word (int-sap a) (ash i word-shift))))
+          (multiple-value-bind (lispobj ok) (if decode (make-lisp-obj word nil))
+            (let ((*print-lines* 1)
+                  (*print-pretty* t))
+              (format t "~x: ~v,'0x~:[~; = ~S~]~%"
+                      (+ a (ash i word-shift))
+                      (* 2 n-word-bytes)
+                      word ok lispobj))))))))
 
 (in-package "SB-C")
 ;;; As soon as practical in warm build it makes sense to add

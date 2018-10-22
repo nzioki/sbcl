@@ -26,23 +26,28 @@ run_sbcl <<EOF >$tmpfilename
 (setq sb-ext:*evaluator-mode* :compile)
 (defvar *fred*)
 (defstruct foo a)
+
+(defun scrubstack () 
+  (sb-int:dx-let ((b (make-array 20))) (eval b))
+  (sb-sys:scrub-control-stack))
+
 (defun test1 (wp obj root)
   (let ((*fred* (list (make-foo :a (list (vector #xfeefa (list obj)))))))
     (setq obj nil) ; so OBJ is not found as a stack reference
     (ecase root
       (:tls
-       (sb-sys:scrub-control-stack)
-       (sb-ext::gc-and-search-roots wp))
+       (scrubstack)
+       (sb-ext:gc-and-search-roots wp))
       (:bindings ; bind *FRED* again so the old value is on the binding stack
        (let ((*fred* 1))
-         (sb-sys:scrub-control-stack)
-         (sb-ext::gc-and-search-roots wp)))
+         (scrubstack)
+         (sb-ext:gc-and-search-roots wp)))
       (:stack
        ; put the OBJ back on the control stack
        ; and also ensure that *FRED* is not a root.
        (setq obj *fred* *fred* nil)
-       (sb-sys:scrub-control-stack)
-       (sb-ext::gc-and-search-roots wp)))))
+       (scrubstack)
+       (sb-ext:gc-and-search-roots wp)))))
 
 (let ((wp (make-weak-pointer (list 1 2 3 4))))
   (test1 wp (weak-pointer-value wp) :stack)
@@ -53,7 +58,7 @@ run_sbcl <<EOF >$tmpfilename
 (defun f0 ()
   (let* ((c (cons 1 2))
          (wp (make-weak-pointer c)))
-    (sb-ext::gc-and-search-roots wp :static)
+    (sb-ext:gc-and-search-roots wp :static)
     c))
 (f0)
 EOF

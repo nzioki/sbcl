@@ -263,8 +263,7 @@ bootstrapping.
                     (arglist (elt qab arglist-pos))
                     (qualifiers (subseq qab 0 arglist-pos))
                     (body (nthcdr (1+ arglist-pos) qab)))
-               `(push (defmethod ,fun-name ,@qualifiers ,arglist ,@body)
-                      (generic-function-initial-methods (fdefinition ',fun-name))))))
+               `(defmethod ,fun-name ,@qualifiers ,arglist ,@body))))
       (macrolet ((initarg (key) `(getf initargs ,key)))
         (dolist (option options)
           (let ((car-option (car option)))
@@ -338,8 +337,14 @@ bootstrapping.
            (compile-or-load-defgeneric ',fun-name))
          (load-defgeneric ',fun-name ',lambda-list
                           (sb-c:source-location) ,@initargs)
-         ,@(mapcar #'expand-method-definition methods)
+         ,@(when methods
+             `((set-initial-methods (list ,@(mapcar #'expand-method-definition methods))
+                                    (fdefinition ',fun-name))))
          (fdefinition ',fun-name)))))
+
+(defun set-initial-methods (methods gf)
+  (sb-thread::with-recursive-system-lock ((gf-lock gf))
+    (setf (generic-function-initial-methods gf) methods)))
 
 (defun compile-or-load-defgeneric (fun-name)
   (proclaim-as-fun-name fun-name)
@@ -360,9 +365,10 @@ bootstrapping.
           :new-location source-location)
     (let ((fun (fdefinition fun-name)))
       (when (generic-function-p fun)
-        (loop for method in (generic-function-initial-methods fun)
-              do (remove-method fun method))
-        (setf (generic-function-initial-methods fun) '()))))
+        (sb-thread::with-recursive-system-lock ((gf-lock fun))
+          (loop for method in (generic-function-initial-methods fun)
+                do (remove-method fun method))
+          (setf (generic-function-initial-methods fun) '())))))
   (apply #'ensure-generic-function
          fun-name
          :lambda-list lambda-list
@@ -1028,8 +1034,8 @@ bootstrapping.
                  :format-control
                  "~@<Cannot find type for specializer ~
                   ~/sb-ext:print-symbol-with-prefix/ when executing ~S ~
-                  for a ~/sb-ext:print-type-specifier/ of a ~
-                  ~/sb-ext:print-type-specifier/.~@:>"
+                  for a ~/sb-impl:print-type-specifier/ of a ~
+                  ~/sb-impl:print-type-specifier/.~@:>"
                  :format-arguments
                  (list name 'specializer-type-specifier
                        (class-name (class-of proto-method))
@@ -1913,7 +1919,7 @@ bootstrapping.
   (multiple-value-bind (llks nrequired noptional keywords keyword-parameters)
       (analyze-lambda-list lambda-list)
     (declare (ignore keyword-parameters))
-    (let* ((old (proclaimed-ftype name)) ;FIXME:FDOCUMENTATION instead?
+    (let* ((old (proclaimed-ftype name))
            (old-ftype (if (fun-type-p old) old nil))
            (old-restp (and old-ftype (fun-type-rest old-ftype)))
            (old-keys (and old-ftype
@@ -1963,16 +1969,19 @@ bootstrapping.
 (defun generic-clobbers-function (fun-name)
   (cerror "Replace the function binding"
           'simple-program-error
-          :format-control "~@<~/sb-ext:print-symbol-with-prefix/ ~
+          ;; I'm too lazy to put automatic SB-FORMAT:TOKENS wrapping
+          ;; on CERROR arguments. It's one of a kind
+          :format-control (sb-format:tokens
+                           "~@<~/sb-ext:print-symbol-with-prefix/ ~
                            already names an ordinary function or a ~
-                           macro.~@:>"
+                           macro.~@:>")
           :format-arguments (list fun-name)))
 
 (define-load-time-global *sgf-wrapper*
   (!boot-make-wrapper (!early-class-size 'standard-generic-function)
                       'standard-generic-function))
 
-(defvar *sgf-slots-init*
+(define-load-time-global *sgf-slots-init*
   (mapcar (lambda (canonical-slot)
             (if (memq (getf canonical-slot :name) '(arg-info source))
                 +slot-unbound+
@@ -2312,15 +2321,16 @@ bootstrapping.
                         argument-precedence-order source
                         documentation))))
 
-(defun make-early-gf (spec &optional lambda-list lambda-list-p
+(defun make-early-gf (name &optional lambda-list lambda-list-p
                       function argument-precedence-order source-location
                       documentation)
-  (let ((fin (allocate-standard-funcallable-instance *sgf-wrapper*)))
+  (let ((fin (allocate-standard-funcallable-instance
+              *sgf-wrapper* name)))
     (replace (fsc-instance-slots fin) *sgf-slots-init*)
     (when function
       (set-funcallable-instance-function fin function))
-    (setf (gdefinition spec) fin)
-    (!bootstrap-set-slot 'standard-generic-function fin 'name spec)
+    (setf (gdefinition name) fin)
+    (!bootstrap-set-slot 'standard-generic-function fin 'name name)
     (!bootstrap-set-slot 'standard-generic-function fin
                          'source source-location)
     (!bootstrap-set-slot 'standard-generic-function fin
@@ -2328,10 +2338,10 @@ bootstrapping.
     (let ((arg-info (make-arg-info)))
       (setf (early-gf-arg-info fin) arg-info)
       (when lambda-list-p
-        (setf (info :function :type spec)
+        (setf (info :function :type name)
               (specifier-type
-               (ftype-declaration-from-lambda-list lambda-list spec))
-              (info :function :where-from spec) :defined-method)
+               (ftype-declaration-from-lambda-list lambda-list name))
+              (info :function :where-from name) :defined-method)
         (if argument-precedence-order
             (set-arg-info fin
                           :lambda-list lambda-list
@@ -2436,8 +2446,8 @@ bootstrapping.
                (not (csubtypep gf-type (setf old-type (proclaimed-ftype fun-name)))))
       (style-warn "~@<Generic function ~
                    ~/sb-ext:print-symbol-with-prefix/ clobbers an ~
-                   earlier ~S proclamation ~/sb-ext:print-type/ for ~
-                   the same name with ~/sb-ext:print-type/.~:@>"
+                   earlier ~S proclamation ~/sb-impl:print-type/ for ~
+                   the same name with ~/sb-impl:print-type/.~:@>"
                    fun-name 'ftype old-type gf-type))
     (setf (info :function :type fun-name) gf-type
           (info :function :where-from fun-name) :defined-method)

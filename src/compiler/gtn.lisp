@@ -56,20 +56,21 @@
                                         (policy node (zerop debug))
                                         (policy node (= speed 3))))))
         (cond
-         ((and (lambda-var-indirect var)
-               (not (lambda-var-explicit-value-cell var)))
-          ;; Force closed-over indirect LAMBDA-VARs without explicit
-          ;; VALUE-CELLs to the stack, and make sure that they are
-          ;; live over the dynamic contour of the physenv.
-          (setf (tn-sc res) (if ptype-info
-                                (second ptype-info)
-                                (sc-or-lose 'sb!vm::control-stack)))
-          (physenv-live-tn res (lambda-physenv fun)))
+          ((and (lambda-var-indirect var)
+                (not (lambda-var-explicit-value-cell var)))
+           ;; Force closed-over indirect LAMBDA-VARs without explicit
+           ;; VALUE-CELLs to the stack, and make sure that they are
+           ;; live over the dynamic contour of the physenv.
+           (setf (tn-sc res) (if ptype-info
+                                 (second ptype-info)
+                                 (sc-or-lose 'sb!vm::control-stack)))
+           (physenv-live-tn res (lambda-physenv fun)))
 
-         (debug-variable-p
-          (physenv-debug-live-tn res (lambda-physenv fun))))
+          (debug-variable-p
+           (physenv-debug-live-tn res (lambda-physenv fun))))
 
         (setf (tn-leaf res) var)
+        (setf (tn-type res) (leaf-type var))
         (setf (leaf-info var) res))))
   (values))
 
@@ -78,22 +79,32 @@
 ;;; environment values and the old-FP/return-PC.)
 (defun assign-ir2-physenv (clambda)
   (declare (type clambda clambda))
-  (let ((lambda-physenv (lambda-physenv clambda))
-        (reversed-ir2-physenv-alist nil))
-    ;; FIXME: should be MAPCAR, not DOLIST
-    (dolist (thing (physenv-closure lambda-physenv))
-      (let ((ptype (etypecase thing
-                     (lambda-var
-                      (if (lambda-var-indirect thing)
-                          *backend-t-primitive-type*
-                          (primitive-type (leaf-type thing))))
-                     (nlx-info *backend-t-primitive-type*)
-                     (clambda *backend-t-primitive-type*))))
-        (push (cons thing (make-normal-tn ptype))
-              reversed-ir2-physenv-alist)))
-
+  (let* ((lambda-physenv (lambda-physenv clambda))
+         (indirect-fp-tns)
+         (ir2-physenv-alist
+           (loop for thing in (physenv-closure lambda-physenv)
+                 collect
+                 (cons thing
+                       (etypecase thing
+                         (lambda-var
+                          (cond ((not (lambda-var-indirect thing))
+                                 (make-normal-tn
+                                  (primitive-type (leaf-type thing))))
+                                ((not (lambda-var-explicit-value-cell thing))
+                                 (let ((physenv (lambda-physenv (lambda-var-home thing))))
+                                   (or (getf indirect-fp-tns physenv)
+                                       (let ((tn (make-normal-tn *backend-t-primitive-type*)))
+                                         (push tn indirect-fp-tns)
+                                         (push physenv indirect-fp-tns)
+                                         tn))))
+                                (t
+                                 (make-normal-tn *backend-t-primitive-type*))))
+                         (nlx-info
+                          (make-normal-tn *backend-t-primitive-type*))
+                         (clambda
+                          (make-normal-tn *backend-t-primitive-type*)))))))
     (let ((res (make-ir2-physenv
-                :closure (nreverse reversed-ir2-physenv-alist)
+                :closure ir2-physenv-alist
                 :return-pc-pass (make-return-pc-passing-location
                                  (xep-p clambda)))))
       (setf (physenv-info lambda-physenv) res)
@@ -179,10 +190,12 @@
       (if (or (eq count :unknown) use-standard)
           (make-return-info :kind :unknown
                             :count count
-                            :types ptypes)
+                            :primitive-types ptypes
+                            :types types)
           (make-return-info :kind :fixed
                             :count count
-                            :types ptypes
+                            :primitive-types ptypes
+                            :types types
                             :locations (mapcar #'make-normal-tn ptypes))))))
 
 ;;; If TAIL-SET doesn't have any INFO, then make a RETURN-INFO for it.
@@ -214,5 +227,7 @@
                      (if (nlx-info-safe-p nlx)
                          (make-normal-tn *backend-t-primitive-type*)
                          (make-stack-pointer-tn)))
-             :save-sp (make-nlx-sp-tn physenv)))))
+             :save-sp (unless (eq (cleanup-kind (nlx-info-cleanup nlx))
+                                  :unwind-protect)
+                        (make-nlx-sp-tn physenv))))))
   (values))

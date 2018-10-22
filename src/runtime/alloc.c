@@ -33,7 +33,8 @@ boolean alloc_profiling;              // enabled flag
 static pthread_mutex_t allocation_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t alloc_profiler_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
-lispobj alloc_code_object (unsigned boxed_nwords, unsigned unboxed_nbytes)
+lispobj alloc_code_object (unsigned boxed_nwords, unsigned unboxed_nbytes,
+                           unsigned serialno)
 {
     /* It used to be that even on gencgc builds the
      * ALLOCATE-CODE-OBJECT VOP did all this initialization within
@@ -65,10 +66,11 @@ lispobj alloc_code_object (unsigned boxed_nwords, unsigned unboxed_nbytes)
 
 #ifdef LISP_FEATURE_64_BIT
     code->header = (uword_t)boxed_nwords << 32 | CODE_HEADER_WIDETAG;
+    code->code_size = (uword_t)serialno << 32 | make_fixnum(unboxed_nbytes);
 #else
     code->header = (boxed_nwords << N_WIDETAG_BITS) | CODE_HEADER_WIDETAG;
-#endif
     code->code_size = make_fixnum(unboxed_nbytes);
+#endif
     code->debug_info = NIL;
     return make_lispobj(code, OTHER_POINTER_LOWTAG);
 }
@@ -98,8 +100,8 @@ void allocation_profiler_start()
             profile_buffer_size = size;
             old_buffer = alloc_profile_buffer;
             alloc_profile_buffer = os_allocate(size);
-            printf("using %d cells (%ld bytes) for profile buffer @ %p\n",
-                   max_alloc_point_counters, size, alloc_profile_buffer);
+            printf("using %d cells (0x%"OBJ_FMTX" bytes) for profile buffer @ %p\n",
+                   max_alloc_point_counters, (lispobj)size, alloc_profile_buffer);
         }
         alloc_profiling = 1;
         int n = 0;

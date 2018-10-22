@@ -452,7 +452,25 @@
 ;;; More args are stored consecutively on the stack, starting
 ;;; immediately at the context pointer.  The context pointer is not
 ;;; typed, so the lowtag is 0.
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg))
+         (index :scs (any-reg immediate)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+    (sc-case index
+      (immediate
+       (inst ldr value
+             (@ context
+                (load-store-offset
+                 (ash (tn-value index) word-shift)))))
+      (t
+       (inst add temp context (lsl index (- word-shift n-fixnum-tag-bits)))
+       (loadw value temp)))))
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)

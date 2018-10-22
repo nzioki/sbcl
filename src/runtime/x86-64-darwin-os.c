@@ -103,7 +103,7 @@ boolean will_exhaust_stack(struct thread * th, x86_thread_state64_t *context, in
     __uint64_t sp = context->rsp - size;
 
     if(sp < (__uint64_t)(CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size)) {
-        lose("Control stack exhausted during signal emulation: PC: %p",
+        lose("Control stack exhausted during signal emulation: PC: %llx",
              context->rip);
     }
 
@@ -283,7 +283,7 @@ catch_exception_raise(mach_port_t exception_port,
     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
     if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
         != KERN_SUCCESS) {
-        lose("Can't find the thread for an exception %p", exception_port);
+        lose("Can't find the thread for an exception %u", exception_port);
     }
     thread_get_state(thread, x86_THREAD_STATE64,
                      (thread_state_t)&thread_state, &thread_state_count);
@@ -407,6 +407,24 @@ catch_exception_raise(mach_port_t exception_port,
     return ret;
 }
 #endif
+
+void set_thread_stack(void *address) {
+    /* KLUDGE: There is no interface to change the stack location of
+       the initial thread, and without that backtrace(3) returns zero
+       frames, which breaks some graphical applications on High Sierra
+    */
+    pthread_t thread = pthread_self();
+    void *stackaddr = pthread_get_stackaddr_np(thread);
+    size_t stacksize = pthread_get_stacksize_np(thread);
+
+    if (__PTHREAD_SIZE__ >= 22*8 &&
+        ((void **)thread->__opaque)[20] == stackaddr &&
+        ((size_t *)thread->__opaque)[21] == stacksize) {
+        ((void **)thread->__opaque)[20] = address;
+        ((size_t *)thread->__opaque)[21] = thread_control_stack_size;
+        ((size_t *)thread->__opaque)[23] = (thread_control_stack_size + vm_page_size);
+    }
+}
 
 void
 os_restore_fp_control(os_context_t *context)

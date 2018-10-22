@@ -9,6 +9,125 @@
 
 (in-package "SB-COLD")
 
+;;; The list below contains the name of every symbol whose function might be
+;;; called from a non-compiled format string. This is important only for SBCL
+;;; as host lisp built prior to git revision 6d743d78d9ba840b.
+;;; For such hosts, after giving all host packages a new name, we must ASAP
+;;; reestablish the function bindings of these "missing" symbols.
+;;;
+;;; * PRINT-SYMBOL-WITH-PREFIX was added in rev ff218a24fbd70b2e (2007-04-29)
+;;;   and later exported from SB-EXT with no explanation.
+;;;   It was occasionally invoked via SB-IMPL: which it no longer is.
+;;;
+;;; * SB-IMPL:PRINT-TYPE and SB-IMPL:PRINT-TYPE-SPECIFIER were first added
+;;;   in rev c1b03a36ec4439c8 (2016-01-09). Newer code always uses them
+;;;   from SB-IMPL but older code used them from SB-EXT as well.
+;;;
+;;; The other 3 functions mentioned below have been stable
+;;; in that they are always used from SB-IMPL.
+;;;
+;;; This list must contain names of functions used by *ANY* past revision
+;;; even if such function does not appear in current code.  The list does
+;;; not need additions to it for future changes though. i.e. this is final.
+;;;
+(defparameter *host-format-function-names*
+  '("PRINT-SYMBOL-WITH-PREFIX"
+    "PRINT-TYPE"
+    "PRINT-TYPE-SPECIFIER"
+    "FORMAT-MILLISECONDS"
+    "FORMAT-MICROSECONDS"
+    "PRINT-DEPRECATION-REPLACEMENTS"))
+(defparameter *host-format-functions* nil)
+
+;;; Rename all host packages, but unhide the host's format functions
+;;; for hosts that do not support renaming of internal packages.
+;;; Consider all situations in which functions are called via ~// directives:
+;;; - The host calls ~/PRINT-TYPE/ for itself (i.e in its compiler) while
+;;;   running make-host-1 because "our" code (being compiled) is wrong.
+;;;   Barring a host bug (such as was fixed in rev e6fd2a9635e4),
+;;;   the format string referencing this function would spell the name
+;;;   using a "dash" package. We restore the format functions into the
+;;;   expected package below.
+;;; - The cross-compiler wants to call a ~// function while executing,
+;;;   maybe even from a macro. The format control string should spell the
+;;;   function as a "bang" package. If it didn't, the string is wrong.
+;;; - The target wants to call a ~// function.
+;;;   That's conceptually the easiest to deal with - we've already ensured
+;;;   that cross-compiled format strings dump their symbols correctly.
+;;;
+#+sbcl
+(defun hide-host-packages ()
+  ;; Rename
+  (sb-ext:without-package-locks
+   (dolist (pkg (list-all-packages))
+     (let ((name (package-name pkg)))
+       (unless (member name '("KEYWORD" "COMMON-LISP"  "COMMON-LISP-USER"
+                              "SB-COLD" "SB!XC")
+                       :test #'string=)
+         ;; This also removes nicknames SEQUENCE and SB-C-CALL.
+         (rename-package pkg (concatenate 'string "HOST-" name)))))))
+
+#+sbcl
+(defun unhide-host-format-funs ()
+  ;; Restore operation
+  (unless (find-symbol "FMT-CONTROL" "HOST-SB-FORMAT")
+    (format t "~&; Restoring format control functions~%")
+    ;; Copy the definitions from SB-EXT and SB-IMPL as needed.
+    (dolist (symbol-name *host-format-function-names*)
+      (dolist (package-name '("SB-EXT" "SB-IMPL"))
+        (multiple-value-bind (host-symbol access)
+            (find-symbol symbol-name (concatenate 'string "HOST-" package-name))
+          (when (and access (fboundp host-symbol))
+            (let ((original-fun (fdefinition host-symbol)))
+              (push (list* host-symbol original-fun package-name)
+                    *host-format-functions*)
+              (setf (fdefinition (intern symbol-name package-name))
+                    original-fun)))))))
+
+  nil)
+
+#-sbcl
+(progn (defun hide-host-packages ())
+       (defun unhide-host-format-funs ()))
+
+(compile 'hide-host-packages)
+(compile 'unhide-host-format-funs)
+
+;;; Macro invoked from 'src/code/early-extensions' to avoid clobbering
+;;; host functions that are potentially called from format strings.
+(export 'preserving-host-function)
+(defmacro preserving-host-function (defun)
+  (let ((name (second defun)))
+    `(progn
+       ;; Assume that this function got a definition from set-up-cold-packages
+       ;; and prevent a possible redefinition warning.
+       (fmakunbound ',name)
+       ,defun
+       (restore-host-function ',(string name)))))
+
+(defun restore-host-function (name)
+  (declare (ignorable name))
+  #+sbcl
+  (let ((host-fun (second (assoc name *host-format-functions* :test #'string=))))
+    (when host-fun
+      (if (string= name "PRINT-TYPE")
+          (let* ((our-fun (fdefinition (intern name "SB-IMPL")))
+                 (combined
+                  (lambda (stream object &rest rest)
+                    (let ((ours (typep object (find-symbol "CTYPE" "SB-KERNEL"))))
+                      (apply (if ours our-fun host-fun) stream object rest)))))
+            (dolist (entry *host-format-functions*)
+              (when (string= (car entry) 'print-type)
+                (let ((symbol (intern name (cddr entry))))
+                  ;; The parallelized build performs this twice: once from
+                  ;;interpreted load, again from compilation.
+                  ;; So don't wrap more than once.
+                  (unless (sb-kernel:closurep (fdefinition symbol))
+                    (setf (fdefinition symbol) combined))))))
+          (dolist (entry *host-format-functions*)
+            (when (string= (car entry) name)
+              (setf (fdefinition (intern name (cddr entry))) host-fun)))))))
+
 ;;; an entry in the table which describes the non-standard part (i.e. not
 ;;; CL/CL-USER/KEYWORD) of the package structure of the SBCL system
 ;;;
@@ -170,19 +289,15 @@
              (mapcan (lambda (x) (if (listp x) (flatten x) (list x)))
                      tree)))
 
+    (hide-host-packages)
+
     ;; Build all packages that we need, and initialize them as far as we
     ;; can without referring to any other packages.
     (dolist (package-data package-data-list)
-      (let* ((package (make-package
-                       (package-data-name package-data)
-                       ;; Note: As of 0.7.0, the only nicknames we use
-                       ;; for our implementation packages are hacks
-                       ;; not needed at cross-compile time (e.g. the
-                       ;; deprecated SB-C-CALL nickname for SB-ALIEN).
-                       ;; So support for nicknaming during xc is gone,
-                       ;; since any nicknames are hacked in during
-                       ;; cold init.
-                       :nicknames nil
+      (let* ((name (package-data-name package-data))
+             (package (make-package
+                       name
+                       :nicknames (list (concatenate 'string "SB!" (subseq name 3)))
                        :use nil)))
         (shadowing-import *shadowing-imports* package)
         ;; Walk the tree of exported names, exporting each name.
@@ -195,24 +310,12 @@
       (use-package (package-data-use package-data)
                    (package-data-name package-data))
       (dolist (sublist (package-data-import-from package-data))
-        (let* ((from-package (first sublist))
-               (symbol-names (rest sublist))
-               (symbols (mapcar (lambda (name)
-                                  ;; old way, broke for importing symbols
-                                  ;; like SB!C::DEBUG-SOURCE-FORM into
-                                  ;; SB!DI -- WHN 19990714
-                                  #+nil
-                                  (let ((s (find-symbol name from-package)))
-                                    (unless s
-                                      (error "can't find ~S in ~S"
-                                             name
-                                             from-package))
-                                    s)
-                                  ;; new way, works for SB!DI stuff
-                                  ;; -- WHN 19990714
-                                  (intern name from-package))
-                                (flatten symbol-names))))
-          (import symbols (package-data-name package-data)))))
+        (let ((from-package (first sublist)))
+          (import (mapcar (lambda (name) (intern name from-package))
+                          (rest sublist))
+                  (package-data-name package-data)))))
+
+    (unhide-host-format-funs)
 
     ;; Now that all package-package references exist, we can handle
     ;; REEXPORT operations. (We have to wait until now because they
@@ -255,19 +358,21 @@
   (when (find-package pkg-name)
     (delete-package pkg-name))
   (let ((pkg (make-package pkg-name
-                           :use '("CL" "SB!INT" "SB!EXT" "SB!KERNEL" "SB!VM"
-                                  "SB!SYS" ; for SAP accessors
+                           :nicknames
+                           (list (concatenate 'string "SB!" (subseq pkg-name 3)))
+                           :use '("CL" "SB-INT" "SB-EXT" "SB-KERNEL" "SB-VM"
+                                  "SB-SYS" ; for SAP accessors
                                   ;; Dependence of the assembler on the compiler
                                   ;; feels a bit backwards, but assembly needs
                                   ;; TN-SC, TN-OFFSET, etc. because the compiler
                                   ;; doesn't speak the assembler's language.
                                   ;; Rather vice-versa.
-                                  "SB!C"))))
+                                  "SB-C"))))
     (shadowing-import *shadowing-imports* pkg)
     ;; Both SB-ASSEM and SB-DISASSEM export these two symbols.
     ;; Neither is shadowing-imported. If you need one, package-qualify it.
     (shadow '("SEGMENT" "MAKE-SEGMENT") pkg)
-    (use-package '("SB!ASSEM" "SB!DISASSEM") pkg)
+    (use-package '("SB-ASSEM" "SB-DISASSEM") pkg)
     pkg))
 
 ;; Each backend should have a different package for its instruction set
