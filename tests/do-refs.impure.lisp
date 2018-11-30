@@ -105,8 +105,7 @@
                        ,(sxhash instance)
                        :a  ay :b bee :format-arguments "wat"))))
 
-(test-util:with-test (:name :walk-slots-pcl-ctor
-                      :fails-on :interpreter)
+(test-util:with-test (:name :walk-slots-pcl-ctor)
   (let* ((slot-vals '("A" "B" "C" "D" "E" "F"))
          (f (apply (compile nil '(lambda (&rest args)
                                   (let ((ctor (apply #'sb-pcl::%make-ctor args)))
@@ -136,8 +135,9 @@
 ;;; (It works, but might reach the entire heap)
 ;;; To turn this into an actual thing, we'd want to reduce the consing.
 (defun deep-size (obj &optional (leafp (lambda (x)
-                                         (typep x '(or symbol layout fdefn
-                                                       classoid)))))
+                                         (typep x '(or package symbol fdefn
+                                                       function code-component
+                                                       layout classoid)))))
   (let ((worklist (list obj))
         (seen (make-hash-table :test 'eq))
         (tot-bytes 0))

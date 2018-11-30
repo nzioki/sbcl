@@ -152,6 +152,7 @@ static int find_ref(lispobj* source, lispobj target)
         bitmap = layout ? LAYOUT(layout)->bitmap : make_fixnum(-1);
         for(i=1; i<scan_limit; ++i)
             if (layout_bitmap_logbitp(i-1, bitmap)) check_ptr(i, source[i]);
+        // FIXME: check CUSTOM_GC_SCAVENGE in the header
         return -1;
 #if FUN_SELF_FIXNUM_TAGGED
     case CLOSURE_WIDETAG:
@@ -373,23 +374,39 @@ static struct node* find_node(struct layer* layer, lispobj ptr)
 static inline uint32_t encode_pointer(lispobj pointer)
 {
     uword_t encoding;
-    if (pointer >= DYNAMIC_SPACE_START) {
+    if (find_page_index((void*)pointer) >= 0) {
         // A dynamic space pointer is stored as a count in doublewords
         // from the heap base address. A 32GB range is representable.
         encoding = (pointer - DYNAMIC_SPACE_START) / (2*N_WORD_BYTES);
         gc_assert(encoding <= 0x7FFFFFFF);
-        return (encoding<<1) | 1; // Low bit signifies compressed ptr.
-    } else {
-        // Non-dynamic-space pointers are stored as-is.
-        gc_assert(pointer <= 0xFFFFFFFF && !(pointer & 1));
-        return pointer; // Low bit 0 signifies literal pointer
+        // Low bit of 1 signifies dynamic space compressed ptr.
+        return (encoding<<1) | 1;
+    } else
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (find_varyobj_page_index((void*)pointer) >= 0) {
+        // A varyobj space pointer is stored as a count in doublewords
+        // from the base address.
+        encoding = (pointer - VARYOBJ_SPACE_START) / (2*N_WORD_BYTES);
+        gc_assert(encoding <= 0x3FFFFFFF);
+        // bit pattern #b10 signifies varyobj space compressed ptr.
+        return (encoding<<2) | 2;
+    } else
+#endif
+    {
+        // Everything else is stored as-is.
+        gc_assert(pointer <= 0xFFFFFFFF && !(pointer & 3));
+        return pointer; // bit pattern #b00 signifies uncompressed ptr
     }
 }
 
 static inline lispobj decode_pointer(uint32_t encoding)
 {
-    if (encoding & 1)  // Compressed ptr
+    if (encoding & 1)  // Compressed ptr to dynamic space
         return (encoding>>1)*(2*N_WORD_BYTES) + DYNAMIC_SPACE_START;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    else if ((encoding & 3) == 2) // Compressed ptr to varyobj space
+        return (encoding>>2)*(2*N_WORD_BYTES) + VARYOBJ_SPACE_START;
+#endif
     else
         return encoding; // Literal pointer
 }
@@ -702,6 +719,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
             check_ptr(layout);
             // Partially initialized instance can't have nonzero words yet
             bitmap = layout ? LAYOUT(layout)->bitmap : make_fixnum(-1);
+            // FIXME: check CUSTOM_GC_SCAVENGE in the header
             // If no raw slots, just scan without use of the bitmap.
             if (bitmap == make_fixnum(-1)) break;
             for(i=1; i<scan_limit; ++i)
@@ -861,7 +879,7 @@ static int trace_paths(void (*context_scanner)(),
         lispobj car = CONS(weak_pointers)->car;
         lispobj value = ((struct weak_pointer*)native_pointer(car))->value;
         weak_pointers = CONS(weak_pointers)->cdr;
-        if (value != UNBOUND_MARKER_WIDETAG) {
+        if (is_lisp_pointer(value)) {
             if (heap_trace_verbose)
                 fprintf(stderr, "Target=%p (%s)\n", (void*)value, classify_obj(value));
             hopscotch_reset(&visited);
@@ -885,24 +903,31 @@ int gc_prove_liveness(void(*context_scanner)(),
                       int n_pins, uword_t* pins,
                       int criterion)
 {
-    int n_watched = 0, n_live = 0, n_bad = 0;
+    int n_watched = 0, n_live = 0, n_bad = 0, n_imm = 0;
     lispobj list;
     for (list = objects ; list != NIL && listp(list) ; list = CONS(list)->cdr) {
         ++n_watched;
         lispobj car = CONS(list)->car;
         if ((lowtag_of(car) != OTHER_POINTER_LOWTAG ||
-             widetag_of(native_pointer(car)) != WEAK_POINTER_WIDETAG))
+             widetag_of(native_pointer(car)) != WEAK_POINTER_WIDETAG)) {
             ++n_bad;
-        else
-            n_live += ((struct weak_pointer*)native_pointer(car))->value
-                != UNBOUND_MARKER_WIDETAG;
+            continue;
+        }
+        lispobj wpval = ((struct weak_pointer*)native_pointer(car))->value;
+        if (is_lisp_pointer(wpval))
+            ++n_live;
+        else if (wpval != UNBOUND_MARKER_WIDETAG)
+            ++n_imm;
     }
     if (!listp(list) || n_bad) {
         fprintf(stderr, "; Bad value in liveness tracker\n");
         return -1;
     }
-    fprintf(stderr, "; Liveness tracking: %d/%d live watched objects\n",
+    fprintf(stderr, "; Liveness tracking: %d/%d live watched objects",
             n_live, n_watched);
+    if (n_imm)
+        fprintf(stderr, " (ignored %d non-pointers)", n_imm);
+    putc('\n', stderr);
     if (!n_live)
         return 0;
     // Put back lowtags on pinned objects, since wipe_nonpinned_words() removed

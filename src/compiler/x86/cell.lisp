@@ -27,7 +27,7 @@
   (:info name offset lowtag)
   (:results)
   (:generator 1
-    (cond ((emit-gc-barrier-store-p name)
+    (cond ((emit-code-page-write-barrier-p name)
            (inst push (encode-value-if-immediate value))
            (inst push offset)
            (inst push object)
@@ -458,7 +458,8 @@
   (:result-types positive-fixnum)
   (:generator 4
     (loadw res struct 0 instance-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
+    (inst shr res n-widetag-bits)
+    (inst and res short-header-max-words))) ; clear special GC bit
 
 (define-full-reffer instance-index-ref *
   instance-slots-offset instance-pointer-lowtag

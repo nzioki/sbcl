@@ -551,6 +551,7 @@
 
 ;;; a handle on the NIL object
 (defvar *nil-descriptor*)
+(defvar *c-callable-fdefn-vector*)
 
 ;;; the head of a list of TOPLEVEL-THINGs describing stuff to be done
 ;;; when the target Lisp starts up
@@ -1137,7 +1138,16 @@ core and return a descriptor to it."
                           descriptor)
                 make-cold-layout))
 (defun make-cold-layout (name length inherits depthoid bitmap)
-  (let ((result (allocate-struct (symbol-value *cold-layout-gspace*) *layout-layout*
+  (let ((flags (let* ((inherit-names (listify-cold-inherits inherits))
+                      (second (second inherit-names)))
+                 ;; Note similarity to FOP-LAYOUT here, but with extra
+                 ;; test for the subtree roots.
+                 (cond ((or (eq second 'structure-object) (eq name 'structure-object))
+                        +structure-layout-flag+)
+                       ((or (eq second 'condition) (eq name 'condition))
+                        +condition-layout-flag+)
+                       (t 0))))
+        (result (allocate-struct (symbol-value *cold-layout-gspace*) *layout-layout*
                                  target-layout-length t)))
     ;; Don't set the CLOS hash value: done in cold-init instead.
     ;;
@@ -1150,16 +1160,7 @@ core and return a descriptor to it."
      :inherits inherits
      :depthoid depthoid
      :length length
-     :%flags (let* ((inherit-names (listify-cold-inherits inherits))
-                    (second (second inherit-names)))
-               (make-fixnum-descriptor
-                 ;; Note similarity to FOP-LAYOUT here, but with extra
-                 ;; test for the subtree roots.
-                 (cond ((or (eq second 'structure-object) (eq name 'structure-object))
-                        +structure-layout-flag+)
-                       ((or (eq second 'condition) (eq name 'condition))
-                        +condition-layout-flag+)
-                       (t 0))))
+     :%flags (make-fixnum-descriptor flags)
      :info *nil-descriptor*
      :bitmap bitmap
       ;; Nothing in cold-init needs to call EQUALP on a structure with raw slots,
@@ -1176,6 +1177,14 @@ core and return a descriptor to it."
                                  (setq *vacuous-slot-table*
                                        (host-constant-to-core '#(1 nil)))))
          (values)))
+    (when (and (logtest flags +structure-layout-flag+)
+               (> (descriptor-fixnum depthoid) 2))
+      (loop with dsd-index = (get-dsd-index sb!kernel::layout sb!kernel::depth2-ancestor)
+            for i from 2 to (min (1- (descriptor-fixnum depthoid)) 4)
+            do (write-wordindexed result
+                                  (+ sb!vm:instance-slots-offset dsd-index)
+                                  (cold-svref inherits i))
+               (incf dsd-index)))
 
     (setf (gethash (descriptor-bits result) *cold-layout-names*) name
           (gethash name *cold-layouts*) result)))
@@ -1397,7 +1406,8 @@ core and return a descriptor to it."
                                       (base-string-to-core name))
                               :%nicknames (chill-nicknames name)
                               :doc-string (if docstring
-                                              (base-string-to-core docstring)
+                                              (set-readonly
+                                               (base-string-to-core docstring))
                                               *nil-descriptor*)
                               :%use-list *nil-descriptor*)
                  ;; the cddr of this will accumulate the 'used-by' package list
@@ -1445,7 +1455,12 @@ core and return a descriptor to it."
       ;; pass 3: set the 'used-by' lists
       (dolist (cell target-pkg-list)
         (write-slots (cadr cell) package-layout
-                     :%used-by-list (list-to-core (cddr cell)))))))
+                     :%used-by-list (list-to-core (cddr cell))))
+      ;; finally, assign *PACKAGE* since it supposed to be always-bound
+      ;; and various things assume that it is. e.g. FIND-PACKAGE has an
+      ;; (IF (BOUNDP '*PACKAGE*)) test which the compiler could elide as
+      ;; tautologically true if it wanted to.
+      (cold-set '*package* (find-cold-package "COMMON-LISP-USER")))))
 
 ;;; sanity check for a symbol we're about to create on the target
 ;;;
@@ -1681,6 +1696,19 @@ core and return a descriptor to it."
                            sb!vm:symbol-value-slot
                            (ash address-bits 32)))
 
+  ;; Immobile code prefers all FDEFNs adjacent so that code can be located
+  ;; anywhere in the addressable memory allowed by the OS, as long as all
+  ;; FDEFNs are near enough all code (i.e. within a 32-bit jmp offset).
+  ;; That fails if static fdefns are wired to an address below 4GB
+  ;; and code resides above 4GB. But as the Fundamental Theorem says:
+  ;;   any problem can be solved by adding another indirection.
+  #!+immobile-code
+  (setf *c-callable-fdefn-vector*
+        (vector-in-core (make-list (length sb!vm::+c-callable-fdefns+)
+                                   :initial-element *nil-descriptor*)
+                        *static*))
+
+  #!-immobile-code
   (dolist (sym sb!vm::+c-callable-fdefns+)
     (cold-fdefinition-object (cold-intern sym) nil *static*))
 
@@ -1742,6 +1770,12 @@ core and return a descriptor to it."
 
   (dolist (symbol sb!impl::*cache-vector-symbols*)
     (cold-set symbol *nil-descriptor*))
+
+  ;; Put the C-callable fdefns into the static-fdefn vector if #!+immobile-code.
+  #!+immobile-code
+  (loop for i from 0 for sym in sb!vm::+c-callable-fdefns+
+        do (cold-svset *c-callable-fdefn-vector* i
+                       (cold-fdefinition-object sym)))
 
   ;; Symbols for which no call to COLD-INTERN would occur - due to not being
   ;; referenced until warm init - must be artificially cold-interned.
@@ -3285,6 +3319,20 @@ core and return a descriptor to it."
         (format stream "#define ~A (*)~%" c-symbol))
       (format stream "#define ~A_tlsindex 0x~X~%"
               c-symbol (ensure-symbol-tls-index symbol))))
+
+  ;; For immobile code, define a constant for the address of the vector of
+  ;; C-callable fdefns, and then fdefns in terms of indices to that vector.
+  #!+immobile-code
+  (progn
+    (format stream "#define STATIC_FDEFNS LISPOBJ(0x~X)~%"
+            (descriptor-bits *c-callable-fdefn-vector*))
+    (loop for symbol in sb!vm::+c-callable-fdefns+
+          for index from 0
+          do (format stream "#define ~A_fdefn ~d~0@*
+#define ~A_FDEFN (VECTOR(STATIC_FDEFNS)->data[~d])~%"
+                     (c-symbol-name symbol) index)))
+  ;; Everybody else can address each fdefn directly.
+  #!-immobile-code
   (loop for symbol in sb!vm::+c-callable-fdefns+
         for index from 0
         do
@@ -3633,6 +3681,7 @@ III. initially undefined function references (alphabetically):
                                      #!-gencgc sb!vm:dynamic-0-space-start))
            (*nil-descriptor*)
            (*simple-vector-0-descriptor*)
+           (*c-callable-fdefn-vector*)
            (*known-structure-classoids* nil)
            (*classoid-cells* (make-hash-table :test 'eq))
            (*ctype-cache* (make-hash-table :test 'equal))

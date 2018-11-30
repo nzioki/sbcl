@@ -58,11 +58,12 @@
 #include <thread.h>
 #endif
 
-#ifdef LISP_FEATURE_WIN32
+#if defined(LISP_FEATURE_WIN32) || defined(OS_THREAD_STACK)
 # define IMMEDIATE_POST_MORTEM
+#else
+static struct thread *postmortem_thread;
 #endif
 
-static struct thread *postmortem_thread;
 #endif
 
 int dynamic_values_bytes=TLS_SIZE*sizeof(lispobj);  /* same for all threads */
@@ -473,11 +474,30 @@ void* new_thread_trampoline(void* arg)
     result = funcall0(function);
     undo_init_new_thread(th, &scribble);
 
+#ifndef OS_THREAD_STACK
     schedule_thread_post_mortem(th);
+#endif
 
     FSHOW((stderr,"/exiting thread %p\n", thread_self()));
     return (void*)(uintptr_t)result;
 }
+
+#ifdef OS_THREAD_STACK
+extern void* funcall1_switching_stack(void*, void *(*fun)(void *))
+# ifdef LISP_FEATURE_X86_64
+    __attribute__((sysv_abi))
+# endif
+    ;
+
+void* new_thread_trampoline_switch_stack(void* arg) {
+    struct thread *th = (struct thread *)arg;
+    void* ret = funcall1_switching_stack(arg,  new_thread_trampoline);
+
+    schedule_thread_post_mortem(th);
+    return ret;
+
+}
+#endif
 
 static struct thread *create_thread_struct(lispobj);
 
@@ -885,18 +905,21 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
        /* call_into_lisp_first_time switches the stack for the initial
         * thread. For the others, we use this. */
         if (
-#if defined(LISP_FEATURE_WIN32)
-       (pthread_attr_setstacksize(&attr, thread_control_stack_size)) ||
+#ifdef OS_THREAD_STACK
+            pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN) ||
+            (retcode = pthread_create(kid_tid, &attr, new_thread_trampoline_switch_stack, th))
 #else
-# if defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
-       (pthread_attr_setstack(&attr, th->control_stack_start,
-                              thread_control_stack_size)) ||
+
+# if defined(LISP_FEATURE_WIN32)
+            pthread_attr_setstacksize(&attr, thread_control_stack_size) ||
+# elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
+            pthread_attr_setstack(&attr, th->control_stack_start, thread_control_stack_size) ||
 # else
-       (pthread_attr_setstack(&attr, th->alien_stack_start,
-                              ALIEN_STACK_SIZE)) ||
+            pthread_attr_setstack(&attr, th->alien_stack_start, ALIEN_STACK_SIZE) ||
 # endif
+            (retcode = pthread_create(kid_tid, &attr, new_thread_trampoline, th))
 #endif
-       (retcode = pthread_create(kid_tid, &attr, new_thread_trampoline, th))) {
+            ) {
           perror("create_os_thread");
         } else {
           success = 1;

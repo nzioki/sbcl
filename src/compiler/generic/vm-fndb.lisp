@@ -72,6 +72,11 @@
            non-null-symbol-p)
     (t) boolean (movable foldable flushable))
 
+(defknown (fixnump-instance-ref) (instance index) boolean
+  (flushable always-translatable))
+(defknown (fixnump-car fixnump-cdr) (list) boolean
+  (flushable always-translatable))
+
 (defknown #.(loop for (name) in *vector-without-complex-typecode-infos*
                   collect name)
     (t) boolean (movable foldable flushable))
@@ -93,11 +98,12 @@
   (or index null)
   (foldable flushable))
 
-(defknown %sxhash-simple-string (simple-string) hash
-  (foldable flushable))
+(defknown %sxhash-string (string) hash (foldable flushable))
+(defknown %sxhash-simple-string (simple-string) hash (foldable flushable))
 
-(defknown (%sxhash-simple-substring compute-symbol-hash)
-  (simple-string index) hash
+(defknown (%sxhash-simple-substring) (simple-string index index) hash
+  (foldable flushable))
+(defknown (compute-symbol-hash) (simple-string index) hash
   (foldable flushable))
 
 (defknown symbol-hash (symbol) hash

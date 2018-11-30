@@ -142,6 +142,10 @@ the stack without triggering overflow protection.")
  (setf **world-lock** (sb!thread:make-mutex :name "World Lock")))
 (!defun-from-collected-cold-init-forms !world-lock-cold-init)
 
+#-sb-xc-host
+(define-load-time-global *static-linker-lock*
+    (sb!thread:make-mutex :name "static linker"))
+
 (defmacro with-world-lock (() &body body)
   `(sb!thread:with-recursive-lock (**world-lock**)
      ,@body))
@@ -226,8 +230,8 @@ the stack without triggering overflow protection.")
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)
-                               (:copier nil)))
+(defstruct (debug-name-marker (:print-function print-debug-name-marker)
+                              (:copier nil)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -237,14 +241,8 @@ the stack without triggering overflow protection.")
 
 (defmethod make-load-form ((marker debug-name-marker) &optional env)
   (declare (ignore env))
-  (cond ((eq marker *debug-name-sharp*)
-         `(if (boundp '*debug-name-sharp*)
-              *debug-name-sharp*
-              (make-debug-name-marker)))
-        ((eq marker *debug-name-ellipsis*)
-         `(if (boundp '*debug-name-ellipsis*)
-              *debug-name-ellipsis*
-              (make-debug-name-marker)))
+  (cond ((eq marker *debug-name-sharp*) '*debug-name-sharp*)
+        ((eq marker *debug-name-ellipsis*) '*debug-name-ellipsis*)
         (t
          (warn "Dumping unknown debug-name marker.")
          '(make-debug-name-marker))))

@@ -202,12 +202,6 @@ arbitrary printable objects, and need not be unique.")
 (defmethod print-object ((mutex mutex) stream)
   (print-lock mutex (mutex-name mutex) (mutex-owner mutex) stream))
 
-(defun thread-alive-p (thread)
-  "Return T if THREAD is still alive. Note that the return value is
-potentially stale even before the function returns, as the thread may exit at
-any time."
-  (thread-%alive-p thread))
-
 ;; NB: ephemeral threads must terminate strictly before the test of NTHREADS>1
 ;; in DEINIT, i.e. this is not a promise that the thread will terminate
 ;; just-in-time for the final call out to save, but rather by an earlier time.
@@ -260,8 +254,18 @@ created and old ones may exit at any time."
   #!-sb-thread
   0)
 
+(sb!ext:define-load-time-global *stack-addr-table* nil)
 (sb!ext:define-load-time-global *initial-thread* nil)
 (sb!ext:define-load-time-global *make-thread-lock* nil)
+
+(defun note-stack-range (thread table)
+  (let ((start (get-lisp-obj-address sb!vm:*control-stack-start*))
+        (end (get-lisp-obj-address sb!vm:*control-stack-end*)))
+    (multiple-value-bind (new-tree insertedp)
+        ;; We're within the scope of all-threads-lock here.
+        (treap-insert table start (cons end thread))
+      (aver insertedp)
+      (setq *stack-addr-table* new-tree))))
 
 (defun init-initial-thread ()
   (/show0 "Entering INIT-INITIAL-THREAD")
@@ -273,7 +277,9 @@ created and old ones may exit at any time."
           (thread-primitive-thread thread) (sap-int (current-thread-sap))
           *initial-thread* thread
           *current-thread* thread)
+    (setq sb!impl::*treap-random-state* (make-random-state *random-state*))
     (grab-mutex (thread-result-lock *initial-thread*))
+    (note-stack-range thread nil)
     ;; Either *all-threads* is empty or it contains exactly one thread
     ;; in case we are in reinit since saving core with multiple
     ;; threads doesn't work.
@@ -1322,16 +1328,17 @@ on this semaphore, then N of them is woken up."
 
 ;;; Remove thread from its session, if it has one.
 #!+sb-thread
-(defun handle-thread-exit (thread)
+(defun handle-thread-exit (thread control-stack-start)
   (/show0 "HANDLING THREAD EXIT")
   (when *exit-in-process*
     (%exit))
   ;; Lisp-side cleanup
   (with-all-threads-lock
+    (setq *stack-addr-table* (treap-delete control-stack-start *stack-addr-table*))
     (setf (thread-%alive-p thread) nil)
     (setf (thread-os-thread thread)
           (ldb (byte sb!vm:n-word-bits 0) -1))
-    (setq *all-threads* (delq thread *all-threads*))
+    (setq *all-threads* (delq1 thread *all-threads*))
     (when *session*
       (%delete-thread-from-session thread *session*))))
 
@@ -1507,6 +1514,12 @@ session."
 
 ;;;; The beef
 
+;;; One must parse this name carefully: it is the initial "thread function trampoline",
+;;; and not the "initial thread" "function trampoline".
+;;; i.e. there is an initial thread, which DOES NOT start via this function.
+;;; All threads other than the initial thread DO start via this function.
+;;; The initial thread has its own way of doing things, which ends up calling
+;;; INIT-INITIAL-THREAD.  It might be nice to come up with some better naming.
 #!+sb-thread
 (defun initial-thread-function-trampoline (thread setup-sem real-function arguments)
   ;; Can't initiate GC before *current-thread* is set, otherwise the
@@ -1522,6 +1535,7 @@ session."
     (let* ((thread-list (list thread thread))
            (session-cons (cdr thread-list)))
       (with-all-threads-lock
+        (note-stack-range thread *stack-addr-table*)
         (setf (cdr thread-list) *all-threads*
               *all-threads* thread-list))
       (let ((session *session*))
@@ -1576,7 +1590,9 @@ session."
                 (setq *interrupt-pending* nil)
                 #!+sb-thruption
                 (setq *thruption-pending* nil)
-                (handle-thread-exit thread))))))))
+                (handle-thread-exit thread
+                                    (get-lisp-obj-address
+                                     sb!vm:*control-stack-start*)))))))))
   (values))
 
 (defun make-thread (function &key name arguments ephemeral)

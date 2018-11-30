@@ -2905,3 +2905,38 @@
                          (let (*symbol-value-bound-here-escaping*))
                          *symbol-value-bound-here-escaping*))))))
                10)))
+
+(with-test (:name :+constant-boundp+)
+  (let* ((package-name (gensym "CONSTANT-BOUNDP-TEST"))
+         (*package* (make-package package-name :use '(cl))))
+    (ctu:file-compile
+     "(defconstant +constant-boundp+
+        (if (boundp '+constant-boundp+)
+            (symbol-value '+constant-boundp+)
+            (let (*) (make-hash-table))))"
+     :load t
+     :before-load (lambda ()
+                    (delete-package *package*)
+                    (setf *package* (make-package package-name :use '(cl)))))))
+
+(with-test (:name :bug-1804796)
+  (let ((f337
+         (checked-compile
+          `(lambda (a)
+             (flet ((%f9 (f9-1 &optional (f9-2 0) (f9-3 (complex a 0)))
+                      (declare (ignore f9-1 f9-3))
+                      (/
+                       (count
+                        (flet ((%f14 (&optional (f14-1 0) (f14-2 (complex f9-2 0)))
+                                 (declare (ignore f14-1 f14-2))
+                                 0))
+                          (multiple-value-call #'%f14 (values f9-2)))
+                        '(1 2 3))
+                       -1)))
+               (apply #'%f9
+                      (list 0
+                            (complex (complex
+                                      (multiple-value-call #'%f9 (values a))
+                                      0)
+                                     0))))))))
+    (assert (eql (funcall f337 17) 0))))

@@ -456,12 +456,26 @@ information."
            "error printing dynamic-extent object")))
       obj))
 
-(defun stack-allocated-p (obj)
-  "Returns T if OBJ is allocated on the stack of the current
-thread, NIL otherwise."
-  (let ((sap (int-sap (get-lisp-obj-address obj))))
-    (when (sb!vm:control-stack-pointer-valid-p sap nil)
-      t)))
+;;; If X is stack-allocated and on the current thread's stack, then return
+;;; the value of *current-thread*. Otherwise, if ALL-THREADS is T, then
+;;; look for X on any stack, returning the thread that contains it.
+;;; If X is not stack-allocated, or allocated on a different thread's stack
+;;; when ALL-THREADS is NIL, then return NIL.
+(defun stack-allocated-p (x &optional all-threads)
+  (let ((a (get-lisp-obj-address x)))
+    (and (sb!vm:is-lisp-pointer a)
+         (cond ((and (<= (get-lisp-obj-address sb!vm:*control-stack-start*) a)
+                     (< a (get-lisp-obj-address sb!vm:*control-stack-end*)))
+                sb!thread:*current-thread*)
+               (all-threads
+                ;; find a stack whose base is nearest and below A.
+                ;; this is likely to return a wrong answer during thread creation/deletion
+                ;; due to the 'rotate' operations which are incrementally performed
+                ;; on the binary search tree.
+                (binding* ((node (bst-find<= a sb!thread::*stack-addr-table*) :exit-if-null)
+                           (data (bst-node-data node)))
+                  (when (< a (car data))
+                    (cdr data))))))))
 
 ;;;; frame printing
 
@@ -670,7 +684,13 @@ the current thread are replaced with dummy objects which can safely escape."
         object)
     (error (cond)
       (declare (ignore cond))
-      (make-unprintable-object "error printing object"))))
+      (multiple-value-bind (type address)
+          (ignore-errors (values (type-of object)
+                                 (get-lisp-obj-address object)))
+        (make-unprintable-object
+         (if type
+             (format nil "error printing ~a {~x}" type address)
+             "error printing object"))))))
 
 (defun frame-call-arg (var location frame)
   (lambda-var-dispatch var location
@@ -713,9 +733,12 @@ the current thread are replaced with dummy objects which can safely escape."
         ;; possible, punting the loop over lambda-list variables since
         ;; any other arguments will be in the &REST arg's list of
         ;; values.
-        (let ((args (if emergency-best-effort
-                        (ensure-printable-object args)
-                        args)))
+        (let ((args (cond ((not emergency-best-effort)
+                           args)
+                          ((consp args)
+                           (mapcar #'ensure-printable-object args))
+                          (t
+                           (ensure-printable-object args)))))
           (cond ((not (listp args))
                  (format stream " ~S" args))
                 (t

@@ -35,7 +35,7 @@
 ;;; false. Otherwise, the code must branch to dest if the test was true.
 
 (define-vop (branch-if)
-  (:info dest flags not-p)
+  (:info dest not-p flags)
   (:generator 0
      (when (eq (car flags) 'not)
        (pop flags)
@@ -257,3 +257,29 @@
                 (ash (+ slot instance-slots-offset) word-shift))
              instance)
          (encode-value-if-immediate x))))
+
+(define-vop (fixnump-instance-ref)
+  (:args (instance :scs (descriptor-reg)))
+  (:arg-types * (:constant (unsigned-byte 16)))
+  (:info slot)
+  (:translate fixnump-instance-ref)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst test :byte
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         fixnum-tag-mask)))
+(macrolet ((def-fixnump-cxr (name index)
+             `(define-vop (,name)
+                (:args (x :scs (descriptor-reg)))
+                (:translate ,name)
+                (:conditional :e)
+                (:policy :fast-safe)
+                (:generator 1
+                 (inst test :byte
+                       (ea (- (ash ,index word-shift) list-pointer-lowtag) x)
+                       fixnum-tag-mask)))))
+  (def-fixnump-cxr fixnump-car cons-car-slot)
+  (def-fixnump-cxr fixnump-cdr cons-cdr-slot))

@@ -23,8 +23,27 @@
 
 (cl:in-package :cl-user)
 
+(enable-test-parallelism)
+
 (defun compiles-with-warning (lambda)
   (assert (nth-value 2 (checked-compile lambda :allow-warnings t))))
+
+(with-test (:name :position-derive-type)
+  (checked-compile '(lambda (x)
+                      (ash 1 (position (the (member a b c) x) #(a b c )))))
+  (checked-compile '(lambda (x)
+                      (ash 1 (position x #(a b c ))))
+                   :allow-style-warnings t)
+  (let ((f (compile nil '(lambda (x) (position x '(a b c d e f g h i j k l m))))))
+    ;; test should be EQ, not EQL
+    (assert (or (find (symbol-function 'eq)
+                      (ctu:find-code-constants f :type 'sb-kernel:simple-fun))
+                (ctu:find-named-callees f :name 'eq))))
+  (let ((f (compile nil
+                    '(lambda (x)
+                       (position x '(a b c d e d c b a) :from-end t)))))
+    (assert (= (funcall f 'a) 8))
+    (assert (= (funcall f 'b) 7))))
 
 (with-test (:name (ldb :recognize-local-macros))
   ;; Should not call %LDB
@@ -140,14 +159,16 @@
     (assert (ctu:find-named-callees f :name 'princ-to-string))))
 
 (with-test (:name :space-bounds-no-consing
-                  :skipped-on :interpreter)
+            :serial t
+            :skipped-on :interpreter)
   ;; Asking for the size of a heap space should not cost anything!
   (ctu:assert-no-consing (sb-vm:%space-bounds :static))
   (ctu:assert-no-consing (sb-vm:space-bytes :static)))
 
 (with-test (:name (sb-vm:map-allocated-objects :no-consing)
-                  :fails-on :cheneygc
-                  :skipped-on :interpreter)
+            :serial t
+            :fails-on :cheneygc
+            :skipped-on :interpreter)
   (let ((n 0))
     (sb-int:dx-flet ((f (obj type size)
                        (declare (ignore obj type size))
@@ -1228,6 +1249,16 @@
                 (funcall x)))))
           '(function (t) (values (integer 133 133) &optional)))))
 
+(with-test (:name :mv-call-lambda-type-derivation.closure)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            '(lambda (x)
+              (multiple-value-call
+                  (lambda () (print x) 133)
+                (funcall x)))))
+          '(function (t) (values (integer 133 133) &optional)))))
+
 (with-test (:name :constant-folding-and-hairy-types)
   (checked-compile-and-assert
       ()
@@ -1535,6 +1566,7 @@
     (('list) nil)))
 
 (with-test (:name :copyprop-sc-mismatch-between-moves
+            :serial t
             :skipped-on :interpreter)
   (let ((f (checked-compile
             '(lambda (f x)
@@ -1702,3 +1734,163 @@
       `(lambda (type)
          (make-array 4 :element-type type))
     (('(or (cons (satisfies eval)) atom)) #(0 0 0 0) :test #'equalp)))
+
+(with-test (:name :substitute-single-use-lvar-exit-cleanups)
+  (checked-compile-and-assert
+      ()
+      `(lambda (z)
+         (block nil
+           (let ((b (1+ (funcall z))))
+             (catch 'c (return b)))))
+    (((constantly 33)) 34)))
+
+(with-test (:name :substitute-single-use-lvar-unknown-exits)
+  (checked-compile-and-assert
+      ()
+      `(lambda (f)
+         (block nil
+           (let ((x (evenp (funcall f)))
+                 (y (catch 'c
+                      (return (catch 'c (block nil 11))))))
+             (declare (ignore y))
+             x)))
+    (((constantly 33)) 11)))
+
+(with-test (:name :substitute-single-use-lvar-unknown-exits.2)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (block nil
+           (if (catch 'c 0)
+               (return
+                 (let ((x (the real b)))
+                   (let ((* (list 1)))
+                     (declare (dynamic-extent *))
+                     (catch 'ct5
+                       (if t (return 34))))
+                   x))
+               (catch 'c 0))))
+    ((1) 34)))
+
+(with-test (:name :substitute-single-use-lvar-unknown-exits.3)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (let ((a b))
+           (block nil
+             (let ((* (list 1)))
+               (declare (dynamic-extent *))
+               (if b
+                   (let ((j a))
+                     (let ((* (list 1)))
+                       (declare (dynamic-extent *))
+                       (if b (return 44))
+                       (setf a nil))
+                     (let ((z j)) z))
+                   (eval 2))))))
+      ((33) 44)))
+
+(with-test (:name :substitute-single-use-lvar-unknown-exits.4)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (block nil
+        (flet ((f ()
+                 (let ((p (1+ a)))
+                   (let ((* (list 1)))
+                     (declare (dynamic-extent *))
+                     (if a
+                         (return 45)))
+                   p)))
+          (let ((* (lambda ()
+                     (return (eval a)))))
+            (f)))))
+   ((33) 45)))
+
+(with-test (:name :substitute-single-use-lvar-unknown-exits.5)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b c)
+      (block nil
+        (flet ((f ()
+                 (return (catch 'c (block b b)))))
+          (return
+            (block b5
+              (let ((o c))
+                (setf c
+                      (catch 'c
+                        (flet ((g ()
+                                 (return)))
+                          (f))))
+                (let ((x o)) x)))))))
+   ((10 20) 10)))
+
+(with-test (:name :lambda-let-inline)
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (let ((x (lambda () 1)))
+                   (funcall x))))))
+    (assert (null (ctu:find-anonymous-callees fun)))
+    (assert (= (funcall fun) 1))))
+
+(with-test (:name :external-cast-deletion)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a c)
+      (declare (notinline elt logior))
+      (logior
+       (if c
+           (the integer (elt '(10 20) a))
+           (let ((v1 (loop repeat 3 count t)))
+             (declare (dynamic-extent v1))
+             v1))))
+   ((0 t) 10)
+   ((1 nil) 3)))
+
+(with-test (:name :fixnump-instance-ref-immediately-used)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c)
+      (let (z)
+        (and
+         (typep
+          (let ((y (let ((s (cons a b)))
+                     (declare (dynamic-extent s))
+                     (cdr s))))
+            (unwind-protect
+                 (let ((s (list c)))
+                   (declare (dynamic-extent s))
+                   (setf z (car s))))
+            y)
+          'fixnum)
+         z)))
+   ((1 2 'a) 'a)))
+
+(with-test (:name :fixnump-instance-ref-immediately-used.2)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c)
+      (let* ((l (cons a b))
+             (cdr (cdr l)))
+        (setf (cdr l) c)
+        (typep cdr 'fixnum)))
+   ((1 2 'a) t)))
+
+(with-test (:name :round-numeric-bound)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a c f)
+      (declare (type (integer -1111868182375 1874303539234) a))
+      (- (rem (funcall f) (max 23 (* 45092832376540563 a -4469591966)))
+         (signum c)))
+   ((1874303539234 2 (constantly 123)) 7)))
+
+(with-test (:name :ir2-optimize-jumps-to-nowhere)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare (type fixnum a))
+      (if (< a 0 a)
+          (block a (shiftf a 1))
+          0))
+   ((0) 0)))

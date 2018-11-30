@@ -19,6 +19,17 @@
 (define-source-transform identity (x) `(prog1 ,x))
 (define-source-transform values (x) `(prog1 ,x))
 
+(deftransform constantly ((value) * * :node node)
+  (let ((lvar (node-lvar node)))
+    (map-all-lvar-dests
+     lvar
+     (lambda (lvar node)
+       (unless (lvar-called-by-node-p lvar node)
+         (give-up-ir1-transform))))
+    `#'(lambda (&rest rest)
+         (declare (ignore rest))
+         value)))
+
 ;;; CONSTANTLY is pretty much never worth transforming, but it's good to get the type.
 (defoptimizer (constantly derive-type) ((value))
   (specifier-type
@@ -3689,7 +3700,7 @@
       ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
        nil)
       #!+(vop-translates sb!kernel:%instance-ref-eq)
-      ;; Reduce (eq (%instance-ref x i) a-constant) to 1 instruction
+      ;; Reduce (eq (%instance-ref x i) Y) to 1 instruction
       ;; if possible, but do not defer the memory load unless doing
       ;; so can have no effect, i.e. Y is a constant or provably not
       ;; effectful. For now, just handle constant Y.
@@ -4530,6 +4541,7 @@
 ;;; instance, ~{ ... ~} requires a list argument, so if the lvar-type
 ;;; of a corresponding argument is known and does not intersect the
 ;;; list type, a warning could be signalled.
+(defglobal *optimize-format-strings* t)
 (defun check-format-args (node fun arg-n verify-arg-count
                           &aux (combination-args (basic-combination-args node)))
   ;; ARG-N is the index into COMBINATION-ARGS of a format control string,
@@ -4574,7 +4586,8 @@
                      "Too many arguments (~D) to ~S ~S: uses at most ~D."
                      :format-arguments (list nargs fun string max))))))
           ;; Now possibly replace the control string
-          (maybe-replace control)
+          (when *optimize-format-strings*
+            (maybe-replace control))
           (return-from check-format-args)))
       ;; Look for a :FORMAT-CONTROL and possibly replace that. Always do that
       ;; when cross-compiling, but in the target, cautiously skip this step
@@ -4590,7 +4603,8 @@
       ;;
       ;; In this cross-compiler, this processing is not only always right, but
       ;; in fact mandatory, to make our format strings agnostic of package names.
-      (when (and (member fun '(error warn style-warn
+      (when (and *optimize-format-strings*
+                 (member fun '(error warn style-warn
                                compiler-warn compiler-style-warn))
                  ;; Hmm, should we additionally require that this symbol be
                  ;; known to designate a subtype of SIMPLE-CONDITION? Perhaps.
@@ -5101,6 +5115,11 @@
              (typep (symbol-value symbol) '(or number character symbol)))
         symbol
         (give-up-ir1-transform))))
+
+(deftransform boundp ((symbol) ((constant-arg symbol)))
+  (if (always-boundp (lvar-value symbol))
+      t
+      (give-up-ir1-transform)))
 
 (flet ((xform (symbol match-kind)
          (let* ((symbol (lvar-value symbol))

@@ -19,12 +19,12 @@
 (defstruct (room-info (:constructor make-room-info (mask name kind))
                       (:copier nil))
     ;; the mask applied to HeaderValue to compute object size
-    (mask 0 :type (and fixnum unsigned-byte))
+    (mask 0 :type (and fixnum unsigned-byte) :read-only t)
     ;; the name of this type
     (name nil :type symbol :read-only t)
     ;; kind of type (how to reconstitute an object)
     (kind nil
-          :type (member :other :closure :instance :list :code :vector-nil)
+          :type (member :other :closure :instance :list :code)
           :read-only t))
 
 (defun room-info-type-name (info)
@@ -48,12 +48,12 @@
                                     default-size-mask)
                                 name :other)))))
 
-    (dolist (code (list #+sb-unicode complex-character-string-widetag
-                        complex-base-string-widetag simple-array-widetag
-                        complex-bit-vector-widetag complex-vector-widetag
-                        complex-array-widetag complex-vector-nil-widetag))
-      (setf (svref infos code)
-            (make-room-info default-size-mask 'array-header :other)))
+    (let ((info (make-room-info default-size-mask 'array-header :other)))
+      (dolist (code (list #+sb-unicode complex-character-string-widetag
+                          complex-base-string-widetag simple-array-widetag
+                          complex-bit-vector-widetag complex-vector-widetag
+                          complex-array-widetag complex-vector-nil-widetag))
+        (setf (svref infos code) info)))
 
     (setf (svref infos bignum-widetag)
           ;; Lose 1 more bit than n-widetag-bits because fullcgc robs 1 bit,
@@ -70,7 +70,7 @@
           (setf (svref infos (saetp-typecode saetp)) saetp))))
 
     (setf (svref infos simple-array-nil-widetag)
-          (make-room-info 0 'simple-array-nil :vector-nil))
+          (make-room-info 0 'simple-array-nil :other))
 
     (setf (svref infos code-header-widetag)
           (make-room-info 0 'code :code))
@@ -276,31 +276,26 @@
                    list-pointer-lowtag
                    (* 2 n-word-bytes)))
 
-          (:closure ; also funcallable-instance
-           (values (tagged-object fun-pointer-lowtag)
-                   widetag
-                   (boxed-size (logand header-value short-header-max-words))))
-
           (:instance
            (values (tagged-object instance-pointer-lowtag)
                    widetag
                    (boxed-size (logand header-value short-header-max-words))))
 
-          (:other
-           (values (tagged-object other-pointer-lowtag)
+          (:closure ; also funcallable-instance
+           (values (tagged-object fun-pointer-lowtag)
                    widetag
-                   (boxed-size (logand header-value (room-info-mask info)))))
-
-          (:vector-nil
-           (values (tagged-object other-pointer-lowtag)
-                   simple-array-nil-widetag
-                   (* 2 n-word-bytes)))
+                   (boxed-size (logand header-value short-header-max-words))))
 
           (:code
            (let ((c (tagged-object other-pointer-lowtag)))
              (values c
                      code-header-widetag
-                     (code-component-size c))))))))))
+                     (code-component-size c))))
+
+          (:other
+           (values (tagged-object other-pointer-lowtag)
+                   widetag
+                   (boxed-size (logand header-value (room-info-mask info)))))))))))
 
 ;;; Iterate over all the objects in the contiguous block of memory
 ;;; with the low address at START and the high address just before
@@ -467,7 +462,7 @@ We could try a few things to mitigate this:
        ;; in fixedobj subspace, or code without enough header words
        ;; in varyobj subspace. (cf 'filler_obj_p' in gc-internal.h)
        (dx-flet ((filter (obj type size)
-                   (unless (consp obj)
+                   (unless (= type list-pointer-lowtag)
                      (funcall fun obj type size))))
          (map-immobile-objects #'filter :fixed))
        (dx-flet ((filter (obj type size)
@@ -585,10 +580,9 @@ We could try a few things to mitigate this:
              (hole-bytes 0))
     (map-immobile-objects
      (lambda (obj type size)
-       (declare (ignore type))
        (let ((address (logandc2 (get-lisp-obj-address obj) lowtag-mask)))
          (when (case subspace
-                 (:fixed (consp obj))
+                 (:fixed (= type list-pointer-lowtag))
                  (:variable (hole-p address)))
            (push (cons address size) holes)
            (incf hole-bytes size))))
@@ -822,6 +816,9 @@ We could try a few things to mitigate this:
 ;;; (2) sb-sprof deciding how many regions [sic] were made if #+cheneygc
 (defun get-page-size () sb-c:+backend-page-bytes+)
 
+;;; This function is sheer madness.  You're better off using
+;;; LIST-ALLOCATED-OBJECTS and then iterating over that, to avoid
+;;; seeing all the junk created while doing this thing.
 (defun print-allocated-objects (space &key (percent 0) (pages 5)
                                       type larger smaller count
                                       (stream *standard-output*))
@@ -918,24 +915,59 @@ We could try a few things to mitigate this:
 (defun list-allocated-objects (space &key type larger smaller count
                                      test)
   (declare (type (or (eql :all) spaces) space)
-           (type (or index null) larger smaller type count)
+           (type (or (unsigned-byte 8) null) type)
+           (type (or index null) larger smaller count)
            (type (or function null) test))
   (declare (dynamic-extent test))
-  (unless *ignore-after*
-    (setq *ignore-after* (cons 1 2)))
-  (collect ((counted 0 1+))
-    (let ((res ()))
-      (map-allocated-objects
-       (lambda (obj obj-type size)
-         (when (and (or (not type) (eql obj-type type))
-                    (or (not smaller) (<= size smaller))
-                    (or (not larger) (>= size larger))
-                    (or (not test) (funcall test obj)))
-           (setq res (maybe-cons space obj res))
-           (when (and count (>= (counted) count))
-             (return-from list-allocated-objects res))))
-       space)
-      res)))
+  (when (eql count 0)
+    (return-from list-allocated-objects nil))
+  ;; This function was pretty much random as to what subset of the heap it
+  ;; visited- it might see half the heap, 1/10th of the heap, who knows, because
+  ;; it stopped based on hitting a sentinel cons cell made just prior to the loop.
+  ;; That stopping condition was totally wrong because allocation does not occur
+  ;; linearly.  Taking 2 passes (first count, then store) stands a chance of
+  ;; getting a reasonable point-in-time view as long as other threads are not consing
+  ;; like crazy. If the user-supplied TEST function conses at all, then the result is
+  ;; still very arbitrary - including possible duplication of objects if we visit
+  ;; something and then see it again after GC transports it higher. The only way to
+  ;; allow consing in the predicate would be to use dedicated "arenas" for new
+  ;; allocations, that being a concept which we do not now - and may never - support.
+  (sb-int:dx-flet ((wantp (obj widetag size)
+                     (and (or (not type) (eql widetag type))
+                          (or (not smaller) (<= size smaller))
+                          (or (not larger) (>= size larger))
+                          (or (not test) (funcall test obj)))))
+    ;; Unless COUNT is smallish, always start by counting. Don't just trust the user
+    ;; because s/he might specify :COUNT huge-num which is acceptable provided that
+    ;; huge-num is an INDEX which could either exhaust the heap, or at least be
+    ;; wasteful if but a tiny handful of objects would actually satisfy WANTP.
+    (let* ((output (make-array
+                    (if (typep count '(integer 0 100000))
+                        count
+                        (let ((n 0))
+                          (map-allocated-objects
+                           (lambda (obj widetag size)
+                             (when (wantp obj widetag size) (incf n)))
+                           space)
+                          n))))
+           (index 0))
+      (block done
+       (map-allocated-objects
+        (lambda (obj widetag size)
+          (when (wantp obj widetag size)
+            (setf (aref output index) obj)
+            (when (= (incf index) (length output))
+              (return-from done))))
+        space))
+      (let ((list
+             (cond ((= index (length output)) ; easy case
+                    (coerce output 'list))
+                   (t ; didn't fill the array
+                    (collect ((res))
+                      (dotimes (i index (res))
+                        (res (svref output i))))))))
+        (fill output 0) ; assist GC a bit
+        list))))
 
 ;;; Calls FUNCTION with all objects that have (possibly conservative)
 ;;; references to them on current stack.
@@ -1203,7 +1235,7 @@ We could try a few things to mitigate this:
   (values))
 
 #+nil ; for debugging
-(defun dump-dynamic-space-code (&optional (stream *standard-output*)
+(defun show-dynamic-space-code (&optional (stream *standard-output*)
                                 &aux (n-code-bytes 0)
                                      (total-pages next-free-page)
                                      (pages
@@ -1246,6 +1278,23 @@ We could try a few things to mitigate this:
       (format t "~&Used-bytes=~D Pages=~D Waste=~D (~F%)~%"
               n-code-bytes n-pages waste
               (* 100 (/ waste tot))))))
+
+#+nil ; for debugging
+(defun show-immobile-spaces (which)
+  (flet ((show (obj type size)
+           (declare (ignore type size))
+           (let ((*print-pretty* nil))
+             (format t "~x: ~s~%" (get-lisp-obj-address obj) obj))))
+    (when (or (eq which :fixed) (eq which :both))
+      (format t "Fixedobj space~%==============~%")
+      (map-objects-in-range #'show
+        (%make-lisp-obj fixedobj-space-start)
+        (%make-lisp-obj (sap-int *fixedobj-space-free-pointer*))))
+    (when (or (eq which :variable) (eq which :both))
+      (format t "Varyobj space~%=============~%")
+      (map-objects-in-range #'show
+        (%make-lisp-obj varyobj-space-start)
+        (%make-lisp-obj (sap-int *varyobj-space-free-pointer*))))))
 
 #+gencgc
 (defun generation-of (object)
@@ -1300,14 +1349,14 @@ We could try a few things to mitigate this:
 (!ensure-genesis-code/data-separation)
 
 (defun hexdump (obj &optional (n-words
-                               (if (typep obj 'code-component)
+                               (if (and (typep obj 'code-component)
+                                        (plusp (code-n-entries obj)))
                                    ;; Display up through the first fun header
                                    (+ (code-header-words obj)
-                                      (ash (sb-impl::%code-fun-offset obj 0)
-                                           (- word-shift))
+                                      (ash (%code-fun-offset obj 0) (- word-shift))
                                       simple-fun-code-offset)
-                                   ;; at most 10 words
-                                   (min 10 (ash (primitive-object-size obj)
+                                   ;; at most 16 words
+                                   (min 16 (ash (primitive-object-size obj)
                                                 (- word-shift)))))
                               ;; pass NIL explicitly if T crashes on you
                               (decode t))

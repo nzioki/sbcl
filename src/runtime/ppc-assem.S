@@ -8,15 +8,14 @@
 #include "sbcl.h"
 #include "lispregs.h"
 #include "globals.h"
+#include "validate.h"
 
 #include "genesis/simple-fun.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/static-symbols.h"
-#ifdef LISP_FEATURE_SB_THREAD
 #include "genesis/thread.h"
-#endif
 
 #ifdef LISP_FEATURE_DARWIN
 #define CSYMBOL(x) _ ## x
@@ -289,9 +288,37 @@ x:
 /* the CSP page sits right before the thread */
 # define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 #endif
-
 	.text
 
+#ifdef OS_THREAD_STACK
+	GFUNCDEF(funcall1_switching_stack)
+        /* The arguments are switched, funcall1_switching_stack(arg, function)
+           to avoid shuffling registers
+        */
+	/* save LR on old stack */
+	mflr	REG(0)
+	stw	REG(0),4(REG(1))
+
+	/* store old SP and switch to new stack */
+        lwz     REG(10),THREAD_ALIEN_STACK_START_OFFSET(REG(3))
+        addis   REG(10),REG(10),ALIEN_STACK_SIZE@ha
+#if ALIEN_STACK_SIZE % 65536 != 0
+        addi    REG(10),REG(10),ALIEN_STACK_SIZE@l
+#endif
+	stwu	REG(1),-16(REG(10))
+	mr	REG(1),REG(10)
+
+	/* call function */
+	mtctr	REG(4)
+	bctrl
+
+	/* restore old SP and LR then return */
+	lwz	REG(1),0(REG(1))
+	lwz	REG(0),4(REG(1))
+	mtlr	REG(0)
+	blr
+	SET_SIZE(funcall1_switching_stack)
+#endif
 /*
  * Function to transfer control into lisp.  The lisp object to invoke is
  * passed as the first argument, which puts it in NL0

@@ -26,6 +26,11 @@
   "Return non-NIL if SYMBOL is bound to a value."
   (boundp symbol))
 
+;;; Same as BOUNDP but without a transform. Used for initialization forms
+;;; to avoid a local notinline decl on BOUNDP in the expansion of DEFVAR etc.
+(defun %boundp (symbol)
+  (boundp symbol))
+
 (defun set (symbol new-value)
   "Set SYMBOL's value cell to NEW-VALUE."
   (declare (type symbol symbol))
@@ -82,7 +87,7 @@ distinct from the global value. Can also be SETF."
                    (char= (schar string 2) #\L)))))
       (return-from compute-symbol-hash (sxhash nil)))
   ;; And make a symbol's hash not the same as (sxhash name) in general.
-  (let ((sxhash (logand (lognot (%sxhash-simple-substring string length))
+  (let ((sxhash (logand (lognot (%sxhash-simple-substring string 0 length))
                         sb!xc:most-positive-fixnum)))
     (if (zerop sxhash) #x55AA sxhash))) ; arbitrary substitute for 0
 

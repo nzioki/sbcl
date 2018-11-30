@@ -1839,9 +1839,35 @@ wipe_nonpinned_words()
  * the number of keys in the hashtable.
  */
 static void
-pin_object(lispobj* base_addr)
+pin_object(lispobj object)
 {
-    lispobj object = compute_lispobj(base_addr);
+    if (!compacting_p()) {
+        gc_mark_obj(object);
+        return;
+    }
+
+    lispobj* object_start = native_pointer(object);
+    page_index_t first_page = find_page_index(object_start);
+    size_t nwords = OBJECT_SIZE(*object_start, object_start);
+    page_index_t last_page = find_page_index(object_start + nwords - 1);
+    page_index_t page;
+    // It would be better if it were possible to touch only the PTE for the
+    // first page of a large object instead of touching N page table entries.
+    // I'm not sure how well the rest of GC would handle that.
+    for (page = first_page; page <= last_page; ++page) {
+        /* Oldspace pages were unprotected at start of GC.
+         * Assert this here, because the previous logic used to,
+         * and page protection bugs are scary */
+        gc_assert(!page_table[page].write_protected);
+        /* Mark the page immovable. */
+        page_table[page].pinned = 1;
+    }
+
+    if (page_single_obj_p(first_page)) {
+        maybe_adjust_large_object(first_page, nwords);
+        return;
+    }
+
     if (!hopscotch_containsp(&pinned_objects, object)) {
         hopscotch_insert(&pinned_objects, object, 1);
         struct code* maybe_code = (struct code*)native_pointer(object);
@@ -1852,6 +1878,23 @@ pin_object(lispobj* base_addr)
                                1);
           })
         }
+    }
+    if (lowtag_of(object) == INSTANCE_POINTER_LOWTAG
+        && (*(lispobj*)(object - INSTANCE_POINTER_LOWTAG)
+            & CUSTOM_GC_SCAVENGE_FLAG)) {
+        struct instance* instance = (struct instance*)(object - INSTANCE_POINTER_LOWTAG);
+        // When pinning a logically deleted lockfree list node, always pin the
+        // successor too, since the Lisp code will reconstruct the next node's tagged
+        // pointer from the native pointer. Since we're still in the object pinning phase
+        // of GC, layouts can't have been forwarded yet. In fact we don't use bits
+        // from the layout, but it's worth noting, in case we needed to.
+        // Note also that this 'pin' does not need to happen for mark-only GC.
+        // The pin is from an address perspective, not a liveness perspective,
+        // because the instance scavenger would correctly trace this reference.
+        lispobj next = instance->slots[INSTANCE_DATA_START];
+        // Be sure to ignore 0 words.
+        if (fixnump(next) && next && from_space_p(next | INSTANCE_POINTER_LOWTAG))
+            pin_object(next | INSTANCE_POINTER_LOWTAG);
     }
 }
 #else
@@ -1895,43 +1938,19 @@ preserve_pointer(void *addr)
                             (page_single_obj_p(page) &&
                              page_table[page].pinned)))
         return;
-     object_start = native_pointer((lispobj)addr);
-     switch (widetag_of(object_start)) {
-     case SIMPLE_FUN_WIDETAG:
+    object_start = native_pointer((lispobj)addr);
+    switch (widetag_of(object_start)) {
+    case SIMPLE_FUN_WIDETAG:
 #ifdef RETURN_PC_WIDETAG
-     case RETURN_PC_WIDETAG:
+    case RETURN_PC_WIDETAG:
 #endif
-         object_start = fun_code_header(object_start);
-     }
+        object_start = fun_code_header(object_start);
+    }
 #else
     if ((object_start = conservative_root_p((lispobj)addr, page)) == NULL)
         return;
 #endif
-
-    if (!compacting_p()) {
-        /* Just mark it.  No distinction between large and small objects. */
-        gc_mark_obj(compute_lispobj(object_start));
-        return;
-    }
-
-    page_index_t first_page = find_page_index(object_start);
-    size_t nwords = OBJECT_SIZE(*object_start, object_start);
-    page_index_t last_page = find_page_index(object_start + nwords - 1);
-
-    for (page = first_page; page <= last_page; ++page) {
-        /* Oldspace pages were unprotected at start of GC.
-         * Assert this here, because the previous logic used to,
-         * and page protection bugs are scary */
-        gc_assert(!page_table[page].write_protected);
-
-        /* Mark the page immovable. */
-        page_table[page].pinned = 1;
-    }
-
-    if (page_single_obj_p(first_page))
-        maybe_adjust_large_object(first_page, nwords);
-    else
-        pin_object(object_start);
+    pin_object(compute_lispobj(object_start));
 }
 
 
@@ -2077,6 +2096,7 @@ static void
 update_code_writeprotection(page_index_t first_page, page_index_t last_page,
                             lispobj* start, lispobj* limit)
 {
+    if (!ENABLE_PAGE_PROTECTION) return;
     page_index_t i;
     for (i=first_page+1; i <= last_page; ++i) // last_page is inclusive
         gc_assert((page_table[i].type & PAGE_TYPE_MASK) == CODE_PAGE_TYPE);
@@ -2516,6 +2536,7 @@ struct verify_state {
 #define VERIFY_FINAL      32
 /* VERIFYING_foo indicates internal state, not a caller's option */
 #define VERIFYING_HEAP_OBJECTS 64
+#define VERIFYING_GENERATIONAL 128
 
 // Generalize over INSTANCEish things. (Not general like SB-KERNEL:LAYOUT-OF)
 static inline lispobj layout_of(lispobj* instance) { // native ptr
@@ -2555,9 +2576,6 @@ static void
 verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
 {
     extern int valid_lisp_pointer_p(lispobj);
-    boolean is_in_readonly_space =
-        (READ_ONLY_SPACE_START <= (uword_t)where &&
-         where < read_only_space_free_pointer);
 
     /* Strict containment: no pointer from a heap space may point
      * to anything outside of a heap space. */
@@ -2602,27 +2620,32 @@ verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
             if (state->flags & VERIFY_QUICK)
                 continue;
 
-            page_index_t page_index = find_page_index((void*)thing);
-            boolean to_immobile_space = immobile_space_p(thing);
-
 #define FAIL_IF(what, why) if (what) { \
     if (++state->errors > 25) lose("Too many errors"); else GC_WARN(why); }
 
-            /* Does it point to the dynamic space? */
-            if (page_index != -1) {
-                /* If it's within the dynamic space it should point to a used page. */
-                FAIL_IF(page_free_p(page_index), "free page");
-                FAIL_IF(!(page_table[page_index].type & OPEN_REGION_PAGE_FLAG)
-                        && (thing & (GENCGC_CARD_BYTES-1)) >= page_bytes_used(page_index),
-                        "unallocated space");
-                /* Check that it doesn't point to a forwarding pointer! */
+            page_index_t page_index = find_page_index((void*)thing);
+            if (page_index >= 0 || immobile_space_p(thing)) {
+                if (page_index >= 0) {
+                    // If it's within the dynamic space it should point to a used page.
+                    FAIL_IF(page_free_p(page_index), "free page");
+                    FAIL_IF(!(page_table[page_index].type & OPEN_REGION_PAGE_FLAG)
+                            && (thing & (GENCGC_CARD_BYTES-1)) >= page_bytes_used(page_index),
+                            "unallocated space");
+                } else {
+                    // The object pointed to must not have been discarded as garbage.
+                    FAIL_IF(!other_immediate_lowtag_p(*native_pointer(thing)) ||
+                            filler_obj_p(native_pointer(thing)),
+                            "trashed object");
+                }
+                // Must not point to a forwarding pointer
                 FAIL_IF(*native_pointer(thing) == 0x01, "forwarding ptr");
-                /* Check that its not in the RO space as it would then be a
-                 * pointer from the RO to the dynamic space. */
-                FAIL_IF(is_in_readonly_space, "dynamic space from RO space");
+                // Forbid pointers from R/O space into a GCed space
+                FAIL_IF((READ_ONLY_SPACE_START <= (uword_t)where &&
+                         where < read_only_space_free_pointer),
+                        "dynamic space from RO space");
                 if (CODE_PAGES_USE_SOFT_PROTECTION
                     && state->widetag == CODE_HEADER_WIDETAG
-                    && gen_of(thing) < state->object_gen) {
+                    && to_gen < state->object_gen) {
                     // two things must be true:
                     // 1. the page containing object_start must not be write-protected
                     FAIL_IF(card_protected_p(state->object_start),
@@ -2631,29 +2654,21 @@ verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
                     if (!header_rememberedp(*state->object_start))
                         lose("code @ %p (g%d). word @ %p -> %"OBJ_FMTX" (g%d)",
                              state->object_start, state->object_gen,
-                             where, thing, gen_of(thing));
-                } else {
-                    page_index_t my_page_index =
-                        find_page_index(state->vaddr ? state->vaddr : where);
-                    FAIL_IF(my_page_index >= 0 &&
-                            page_table[my_page_index].write_protected &&
-                            page_table[page_index].gen < page_table[my_page_index].gen,
+                             where, thing, to_gen);
+                } else if (state->flags & VERIFYING_GENERATIONAL) {
+                    // When testing for old->young ptrs, if from dynamic space then use
+                    // the address of the word that holds the pointer in question,
+                    // geting the per-page generation. Immobile space has only a generation
+                    // per object, and you *must* use the correct object header address.
+                    lispobj vaddr = (lispobj)(state->vaddr ? state->vaddr : where);
+                    generation_index_t from_gen
+                        = gen_of(find_page_index((lispobj*)vaddr) >= 0 ?
+                                 vaddr : (lispobj)state->object_start);
+                    FAIL_IF(to_gen < from_gen && card_protected_p((lispobj*)vaddr),
                             "younger obj from WP page");
                 }
-            } else if (to_immobile_space) {
-                // the object pointed to must not have been discarded as garbage
-                FAIL_IF(!other_immediate_lowtag_p(*native_pointer(thing)) ||
-                        filler_obj_p(native_pointer(thing)),
-                        "trashed object");
-            }
-            /* Any pointer that points to non-static space is examined further.
-             * You might think this should scan stacks first as a quick out,
-             * but that would take time proportional to the number of threads. */
-            if (page_index >= 0 || to_immobile_space) {
                 int valid;
-                /* If aggressive, or to/from immobile space, do a full search
-                 * (as entailed by valid_lisp_pointer_p) */
-                if (state->flags & VERIFY_AGGRESSIVE)
+                if (state->flags & VERIFY_AGGRESSIVE) // Extreme paranoia mode
                     valid = valid_lisp_pointer_p(thing);
                 else {
                     /* Efficiently decide whether 'thing' is plausible.
@@ -2699,6 +2714,16 @@ verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
                     lispobj bitmap = layout->bitmap;
                     gc_assert(fixnump(bitmap)
                               || widetag_of(native_pointer(bitmap))==BIGNUM_WIDETAG);
+                    if (*where & CUSTOM_GC_SCAVENGE_FLAG) {
+                        struct instance* node = (struct instance*)where;
+                        lispobj next = node->slots[INSTANCE_DATA_START];
+                        if (fixnump(next) && next) {
+                            state->vaddr = &node->slots[INSTANCE_DATA_START];
+                            next |= INSTANCE_POINTER_LOWTAG;
+                            verify_range(&next, 1, state);
+                            state->vaddr = 0;
+                        }
+                    }
                     instance_scan((void (*)(lispobj*, sword_t, uword_t))verify_range,
                                   where+1, nslots, bitmap, (uintptr_t)state);
                     count = 1 + nslots;
@@ -2803,8 +2828,10 @@ void verify_heap(uword_t flags)
 #  endif
     if (verbose)
         fprintf(stderr, " [immobile]");
-    verify_space(FIXEDOBJ_SPACE_START, fixedobj_free_pointer, flags);
-    verify_space(VARYOBJ_SPACE_START, varyobj_free_pointer, flags);
+    verify_space(FIXEDOBJ_SPACE_START,
+                 fixedobj_free_pointer, flags | VERIFYING_GENERATIONAL);
+    verify_space(VARYOBJ_SPACE_START,
+                 varyobj_free_pointer, flags | VERIFYING_GENERATIONAL);
 #endif
     struct thread *th;
     if (verbose)
@@ -2827,7 +2854,7 @@ void verify_heap(uword_t flags)
     verify_space(STATIC_SPACE_START, static_space_free_pointer, flags);
     if (verbose)
         fprintf(stderr, " [dynamic]");
-    verify_generation(-1, flags);
+    verify_generation(-1, flags | VERIFYING_GENERATIONAL);
     if (verbose)
         fprintf(stderr, " passed\n");
 }
@@ -4254,13 +4281,17 @@ void gc_show_pte(lispobj obj)
     page = find_varyobj_page_index((void*)obj);
     if (page>=0) {
         extern unsigned char* varyobj_page_gens;
-        printf("page %ld (v) gens %x%s\n", page, varyobj_page_gens[page],
+        printf("page %ld (v) ss=%p gens %x%s\n", page,
+               varyobj_scan_start(page),
+               varyobj_page_gens[page],
                card_protected_p((void*)obj)? " WP":"");
         return;
     }
     page = find_fixedobj_page_index((void*)obj);
     if (page>=0) {
-        printf("page %ld (f) gens %x%s\n", page, fixedobj_pages[page].attr.parts.gens_,
+        printf("page %ld (f) align %d gens %x%s\n", page,
+               fixedobj_pages[page].attr.parts.obj_align,
+               fixedobj_pages[page].attr.parts.gens_,
                card_protected_p((void*)obj)? " WP":"");
         return;
     }

@@ -190,40 +190,6 @@ sufficiently motivated to do lengthy fixes."
           (return-from save-lisp-and-die))))
     (when (eql t compression)
       (setf compression -1))
-
-    ;; C code will GC again (nonconservatively if pertinent), but the coalescing
-    ;; steps done below will be more efficient if some junk is removed now.
-    #+gencgc (gc :full t)
-
-    ;; Share EQUALP FUN-INFOs
-    (let ((ht (make-hash-table :test 'equalp)))
-      (sb-int:call-with-each-globaldb-name
-       (lambda (name)
-         (binding* ((info (info :function :info name) :exit-if-null)
-                    (shared-info (gethash info ht)))
-           (if shared-info
-               (setf (info :function :info name) shared-info)
-               (setf (gethash info ht) info))))))
-    ;; Share similar simple-fun arglists and types
-    ;; EQUALISH considers any two identically-spelled gensyms as EQ
-    (let ((arglist-hash (make-hash-table :hash-function 'equal-hash
-                                         :test 'fun-names-equalish))
-          (type-hash (make-hash-table :test 'equal)))
-      (sb-vm:map-allocated-objects
-       (lambda (object widetag size)
-         (declare (ignore size))
-         (when (= widetag sb-vm:code-header-widetag)
-           (dotimes (i (sb-kernel:code-n-entries object))
-             (let* ((fun (sb-kernel:%code-entry-point object i))
-                    (arglist (%simple-fun-arglist fun))
-                    (type (sb-vm::%%simple-fun-type fun)))
-               (setf (%simple-fun-arglist fun)
-                     (ensure-gethash arglist arglist-hash arglist))
-               (setf (sb-kernel:%simple-fun-type fun)
-                     (ensure-gethash type type-hash type))))))
-       :all))
-    (sb-c::coalesce-debug-sources)
-    ;;
     (labels ((restart-lisp ()
                (handling-end-of-the-world
                  (reinit)
@@ -238,7 +204,6 @@ sufficiently motivated to do lengthy fixes."
                (if value 1 0)))
       (let ((name (native-namestring (physicalize-pathname core-file-name)
                                      :as-file t)))
-        (tune-image-for-dump)
         (deinit)
         ;; FIXME: Would it be possible to unmix the PURIFY logic from this
         ;; function, and just do a GC :FULL T here? (Then if the user wanted
@@ -246,16 +211,10 @@ sufficiently motivated to do lengthy fixes."
         ;; SAVE-LISP-AND-DIE.)
         #+gencgc
         (progn
-          #+immobile-code
-          (progn
-            ;; Perform static linkage. There seems to be no reason to have users
-            ;; decide whether they want this. Functions become un-statically-linked
-            ;; on demand, for TRACE, redefinition, etc.
-            (sb-vm::statically-link-core)
-            ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
-            ;; prior causes compilation to occur into immobile space.
-            ;; Failing to see all immobile code would miss some relocs.
-            (sb-vm::choose-code-component-order root-structures))
+          ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
+          ;; prior causes compilation to occur into immobile space.
+          ;; Failing to see all immobile code would miss some relocs.
+          #+immobile-code (sb-vm::choose-code-component-order root-structures)
           ;; Save the restart function. Logically a passed argument, but can't be,
           ;; as it would require pinning around the whole save operation.
           (with-pinned-objects (#'restart-lisp)
@@ -295,6 +254,20 @@ sufficiently motivated to do lengthy fixes."
     (error 'save-error)))
 
 (defun tune-image-for-dump ()
+  ;; C code will GC again (nonconservatively if pertinent), but the coalescing
+  ;; steps done below will be more efficient if some junk is removed now.
+  #+gencgc (gc :full t)
+
+  ;; Share EQUALP FUN-INFOs
+  (let ((ht (make-hash-table :test 'equalp)))
+    (sb-int:call-with-each-globaldb-name
+     (lambda (name)
+       (binding* ((info (info :function :info name) :exit-if-null)
+                  (shared-info (gethash info ht)))
+         (if shared-info
+             (setf (info :function :info name) shared-info)
+             (setf (gethash info ht) info))))))
+  (sb-c::coalesce-debug-info) ; Share even more things
   #+sb-fasteval (sb-interpreter::flush-everything)
   (tune-hashtable-sizes-of-all-packages))
 
@@ -313,6 +286,7 @@ sufficiently motivated to do lengthy fixes."
         (error 'save-with-multiple-threads-error
                :interactive-threads interactive
                :other-threads other))))
+  (tune-image-for-dump)
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
@@ -328,6 +302,10 @@ sufficiently motivated to do lengthy fixes."
   ;; Must clear this cache if asm routines are movable.
   (setq sb-disassem::*assembler-routines-by-addr* nil)
   (os-deinit)
+  (setq sb-thread::*stack-addr-table* nil)
+  ;; Perform static linkage. Functions become un-statically-linked
+  ;; on demand, for TRACE, redefinition, etc.
+  #+immobile-code (sb-vm::statically-link-core)
   ;; Do this last, to have some hope of printing if we need to.
   (stream-deinit)
   (setf * nil ** nil *** nil
@@ -350,22 +328,15 @@ sufficiently motivated to do lengthy fixes."
 ;;; Doing too much consing within MAP-ALLOCATED-OBJECTS can lead to heap
 ;;; exhaustion (due to inhibited GC), so this takes several passes.
 (defun coalesce-ctypes (&optional verbose)
-  (let* ((dynspace-start (current-dynamic-space-start))
-         (dynspace-end (+ dynspace-start (dynamic-space-size)))
-         (table (make-hash-table :test 'equal))
+  (let* ((table (make-hash-table :test 'equal))
          interned-ctypes
          referencing-objects)
-    (labels ((in-dynamic-space-p (obj)
-               (let ((a (get-lisp-obj-address obj)))
-                 (and (sb-vm:is-lisp-pointer a)
-                      (>= a dynspace-start)
-                      (< a dynspace-end))))
-             (interesting-subpart-p (part)
+    (labels ((interesting-subpart-p (part)
                ;; Heap objects can point to "dead" stack objects - those
                ;; from a no-longer-existing stack frame - so only examine
                ;; outgoing references within the dynamic space.
                ;; As to why the pointing object didn't die - who knows?
-               (and (in-dynamic-space-p part)
+               (and (heap-allocated-p part)
                     (typep part 'ctype)
                     ;; PART is not interesting if it points to an interned
                     ;; ctype, because that's already a canonical object.
@@ -441,26 +412,60 @@ sufficiently motivated to do lengthy fixes."
                  (setf (svref obj 1) 1)))))))))) ; set need-to-rehash
 
 sb-c::
-(defun coalesce-debug-sources ()
+(defun coalesce-debug-info ()
   (flet ((debug-source= (a b)
            (and (equal (debug-source-plist a) (debug-source-plist b))
                 (eql (debug-source-created a) (debug-source-created b))
                 (eql (debug-source-compiled a) (debug-source-compiled b)))))
-    (let ((ht (make-hash-table :test 'equal)))
+    ;; Coalesce the following:
+    ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
+    ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
+    ;; FUN-NAMES-EQUALISH considers any two string= gensyms as EQ.
+    (let ((source-ht (make-hash-table :test 'equal))
+          (name-ht (make-hash-table :test 'equal))
+          (arglist-hash (make-hash-table :hash-function 'sb-impl::equal-hash
+                                         :test 'sb-impl::fun-names-equalish))
+          (type-hash (make-hash-table :test 'equal)))
       (sb-vm:map-allocated-objects
-       (lambda (obj type size)
-         (declare (ignore type size))
-         (when (typep obj 'compiled-debug-info)
-           (let ((source (compiled-debug-info-source obj)))
-             (typecase source
-               (core-debug-source) ; skip
-               (debug-source
-                (let ((canonical-repr
-                       (find-if (lambda (x) (debug-source= x source))
-                                (gethash (debug-source-namestring source) ht))))
-                  (cond ((not canonical-repr)
-                         (push source (gethash (debug-source-namestring source) ht)))
-                        ((neq source canonical-repr)
-                         (setf (compiled-debug-info-source obj)
-                               canonical-repr)))))))))
+       (lambda (obj widetag size)
+         (declare (ignore size))
+         (case widetag
+          (#.sb-vm:code-header-widetag
+           (dotimes (i (sb-kernel:code-n-entries obj))
+             (let* ((fun (sb-kernel:%code-entry-point obj i))
+                    (arglist (%simple-fun-arglist fun))
+                    (type (sb-vm::%%simple-fun-type fun)))
+               (setf (%simple-fun-arglist fun)
+                     (ensure-gethash arglist arglist-hash arglist))
+               (setf (sb-kernel:%simple-fun-type fun)
+                     (ensure-gethash type type-hash type)))))
+          (#.sb-vm:instance-widetag
+           (typecase obj
+            (compiled-debug-info
+             (let ((source (compiled-debug-info-source obj)))
+               (typecase source
+                 (core-debug-source) ; skip
+                 (debug-source
+                  (let* ((namestring (debug-source-namestring source))
+                         (canonical-repr
+                          (find-if (lambda (x) (debug-source= x source))
+                                   (gethash namestring source-ht))))
+                    (cond ((not canonical-repr)
+                           (push source (gethash namestring source-ht)))
+                          ((neq source canonical-repr)
+                           (setf (compiled-debug-info-source obj)
+                                 canonical-repr)))))))
+             (let ((fun-map (compiled-debug-info-fun-map obj)))
+               (loop for i from 0 below (length fun-map) by 2
+                     do (binding* ((debug-fun (svref fun-map i))
+                                   (name (compiled-debug-fun-name debug-fun))
+                                   ((new foundp) (gethash name name-ht)))
+                          (cond ((not foundp)
+                                 (setf (gethash name name-ht) name))
+                                ((neq name new)
+                                 (setf (%instance-ref debug-fun
+                                        (get-dsd-index compiled-debug-fun name))
+                                       new)))))))
+            (sb-lfl::linked-list
+             (sb-lfl::finalize-deletion obj))))))
        :all))))

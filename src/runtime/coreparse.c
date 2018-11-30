@@ -395,6 +395,8 @@ adjust_code_refs(struct heap_adjust* adj, struct code* code, lispobj original_va
         void* fixup_where = instructions + loc;
         lispobj ptr = UNALIGNED_LOAD32(fixup_where);
         lispobj adjusted = ptr + calc_adjustment(adj, ptr);
+        if (!(adjusted <= UINT32_MAX))
+            lose("Absolute fixup @ %p exceeds 32 bits", fixup_where);
         if (adjusted != ptr)
             FIXUP32(UNALIGNED_STORE32(fixup_where, adjusted), fixup_where);
     }
@@ -407,7 +409,9 @@ adjust_code_refs(struct heap_adjust* adj, struct code* code, lispobj original_va
         prev_loc = loc;
         void* fixup_where = instructions + loc;
         lispobj rel32operand = UNALIGNED_LOAD32(fixup_where);
-        lispobj adjusted = rel32operand - displacement;
+        sword_t adjusted = rel32operand - displacement;
+        if (!(adjusted >= INT32_MIN && adjusted <= INT32_MAX))
+            lose("Relative fixup @ %p exceeds 32 bits", fixup_where);
         FIXUP_rel(UNALIGNED_STORE32(fixup_where, adjusted), fixup_where);
     }
 #endif
@@ -700,6 +704,12 @@ set_adjustment(struct heap_adjust* adj,
 }
 #endif
 
+#if defined(LISP_FEATURE_ELF) && defined(LISP_FEATURE_IMMOBILE_SPACE)
+    extern int apply_pie_relocs(long,long,int);
+#else
+#   define apply_pie_relocs(dummy1,dummy2,dummy3) (0)
+#endif
+
 static void
 process_directory(int count, struct ndir_entry *entry,
                   int fd, os_vm_offset_t file_offset,
@@ -740,7 +750,9 @@ process_directory(int count, struct ndir_entry *entry,
         varyobj_free_pointer = &lisp_jit_code;
         varyobj_space_size = (uword_t)&__lisp_code_end - VARYOBJ_SPACE_START;
         spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len = varyobj_space_size;
-        gc_assert(varyobj_free_pointer >= (lispobj*)VARYOBJ_SPACE_START);
+        if (varyobj_free_pointer < (lispobj*)VARYOBJ_SPACE_START
+            || !PTR_IS_ALIGNED(&__lisp_code_end, 4096))
+            lose("ELF core alignment bug. Check for proper padding in 'editcore'");
 #if !ENABLE_PAGE_PROTECTION
         printf("Lisp code present in executable @ %lx:%lx (freeptr=%p)\n",
                (uword_t)&__lisp_code_start, (uword_t)&__lisp_code_end,
@@ -938,9 +950,13 @@ process_directory(int count, struct ndir_entry *entry,
     set_adjustment(adj, FIXEDOBJ_SPACE_START, // actual
                    spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].base, // expected
                    spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].len);
-    set_adjustment(adj, VARYOBJ_SPACE_START, // actual
-                   spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].base, // expected
-                   spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len);
+    if (!apply_pie_relocs(VARYOBJ_SPACE_START
+                          - spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].base,
+                          DYNAMIC_SPACE_START - spaces[DYNAMIC_CORE_SPACE_ID].base,
+                          fd))
+        set_adjustment(adj, VARYOBJ_SPACE_START, // actual
+                       spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].base, // expected
+                       spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len);
 #    endif
 #  else
     set_adjustment(adj, DYNAMIC_0_SPACE_START, // actual

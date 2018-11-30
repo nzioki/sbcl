@@ -9,7 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-(and x86-64 immobile-space sb-thread) (sb-ext:exit :code 104) ; can't run these tests
+#-x86-64 (sb-ext:exit :code 104)
 
 (defun disasm (safety expr &optional (remove-epilogue t))
   ;; This lambda has a name because if it doesn't, then the name
@@ -23,13 +23,13 @@
     (sb-int:encapsulate 'sb-disassem::add-debugging-hooks 'test
                         (lambda (f &rest args) (declare (ignore f args))))
     (let ((lines
-           (split-string
-            (with-output-to-string (s)
-              (let ((sb-disassem:*disassem-location-column-width* 0))
-                (disassemble fun :stream s)))
-            #\newline)))
+            (split-string
+             (with-output-to-string (s)
+               (let ((sb-disassem:*disassem-location-column-width* 0))
+                 (disassemble fun :stream s)))
+             #\newline)))
       (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)
-      (setq lines (cddr lines)) ; remove "Disassembly for"
+      (setq lines (cddr lines))         ; remove "Disassembly for"
       ;; For human-readability, kill the whitespace
       (setq lines (mapcar (lambda (x) (string-left-trim " ;" x)) lines))
       (when (string= (car (last lines)) "")
@@ -61,7 +61,8 @@
 ;; DO NOT REMOVE!
 (compile nil '(lambda (foo) (eval 'frob)))
 
-(with-test (:name :symeval-known-tls-index :skipped-on :immobile-symbols)
+(with-test (:name :symeval-known-tls-index
+                  :skipped-on (or (not :immobile-space) :immobile-symbols))
   ;; When symbol SC is IMMEDIATE:
   ;;    498B9578210000     MOV RDX, [R13+disp]       ; tls: *PRINT-BASE*
   ;;    83FA61             CMP EDX, 97
@@ -78,10 +79,11 @@
 
 (defvar *blub*) ; immobile space
 (defvar blub)   ; dynamic space
-(assert (sb-kernel:immobile-space-obj-p '*blub*))
+#+immobile-space (assert (sb-kernel:immobile-space-obj-p '*blub*))
 #-immobile-symbols (assert (not (sb-kernel:immobile-space-obj-p 'blub)))
 
-(with-test (:name :symeval-unknown-tls-index :skipped-on :immobile-symbols)
+(with-test (:name :symeval-unknown-tls-index
+                  :skipped-on (or (not :immobile-space) :immobile-symbols))
   ;; When symbol SC is immediate:
   ;;    8B142514A24C20     MOV EDX, [#x204CA214]    ; tls_index: *BLUB*
   ;;    4A8B142A           MOV RDX, [RDX+R13]
@@ -129,6 +131,23 @@
                                  (search "RIP" line) ; require RIP-relative mode
                                  ;; and verify disassembly
                                  (search (car testcase) line)))))))
+
+#+immobile-code ; uses SB-C::*COMPILE-TO-MEMORY-SPACE*
+(with-test (:name :static-link-compile-to-memory)
+  (let* ((string
+          (with-output-to-string (stream)
+            (disassemble
+             (let ((sb-c::*compile-to-memory-space* :immobile))
+               (compile nil '(lambda () (print (gensym)))))
+             :stream stream)))
+         (lines (split-string string #\newline)))
+    (flet ((find-line (mnemonic operand)
+             (find-if (lambda (line)
+                        (and (search mnemonic line)
+                             (search operand line)))
+                      lines)))
+    (assert (find-line "CALL" "FUNCTION GENSYM"))
+    (assert (find-line "JMP" "FUNCTION PRINT")))))
 
 #+immobile-code
 (with-test (:name :static-unlinker)
@@ -188,7 +207,8 @@
     (assert success)))
 
 (defglobal *avar* nil)
-(with-test (:name :set-symbol-value-imm-2)
+(with-test (:name :set-symbol-value-imm-2
+                  :skipped-on (not :immobile-space))
   (let (success)
     (dolist (line (split-string
                    (with-output-to-string (s)
@@ -258,7 +278,8 @@
         (setq success t)))
     (assert success)))
 
-(with-test (:name :list-vop-immediate-to-mem)
+(with-test (:name :list-vop-immediate-to-mem
+                  :skipped-on (not :immobile-space))
   (let ((lines
          (split-string
           (with-output-to-string (s)
@@ -269,84 +290,9 @@
                   thereis (and (search "MOV QWORD PTR [" line)
                                (search ":KEY" line))))))
 
-(with-test (:name :aprof-smoketest-struct
-            :fails-on :sb-safepoint)
-  (let ((nbytes
-         (let ((*standard-output* (make-broadcast-stream)))
-           (sb-aprof:aprof-run
-            (checked-compile
-             '(sb-int:named-lambda "test" ()
-                (declare (inline sb-thread:make-mutex)
-                         (optimize sb-c::instrument-consing))
-                (loop repeat 50 collect (sb-thread:make-mutex))))))))
-    (assert (= nbytes
-                (+ (* 51 2 sb-vm:n-word-bytes) ; list (extra for dummy head)
-                   (* 50 (sb-vm::primitive-object-size
-                          (sb-thread:make-mutex))))))))
-
-(with-test (:name :aprof-smoketest-non-constant-size-vector)
-  (let ((nbytes
-         (let ((*standard-output* (make-broadcast-stream)))
-           (sb-aprof:aprof-run
-            (checked-compile
-             '(sb-int:named-lambda "test" (&optional (n 10))
-                (declare (optimize sb-c::instrument-consing))
-                (make-array (the (mod 64) n))))))))
-    (assert (= nbytes (* 12 sb-vm:n-word-bytes)))))
-
-;;; The profiler's disassembler expected to see a store at alloc-ptr
-;;; or that + n-word-bytes, when in fact the code might write to 1 byte
-;;; positioned anywhere in the word after the object header.
-(with-test (:name :aprof-smoketest-bit-vector)
-  (let ((nbytes
-         (let ((*standard-output* (make-broadcast-stream)))
-           (sb-aprof:aprof-run
-            (checked-compile
-             '(sb-int:named-lambda "test" ()
-                (declare (optimize sb-c::instrument-consing))
-                (make-array (* 128 16) :element-type 'bit)))))))
-    (assert (= nbytes (sb-vm::primitive-object-size
-                       (make-array (* 128 16) :element-type 'bit))))))
-
-(with-test (:name :aprof-smoketest-large-vector)
-  (let ((nbytes
-         (let ((*standard-output* (make-broadcast-stream)))
-           (sb-aprof:aprof-run
-            (checked-compile
-             '(sb-int:named-lambda "test" ()
-               (declare (optimize sb-c::instrument-consing))
-               (make-array 45000)))))))
-    (assert (= nbytes (* (+ 45000 sb-vm:vector-data-offset)
-                         8)))))
-
-sb-vm::
-(define-vop (cl-user::alloc-to-r8)
-  (:temporary (:sc any-reg :offset r8-offset :from :eval) result)
-  (:node-var node)
-  (:generator 1
-    (let* ((bytes large-object-size) ; payload + header total
-           (words (- (/ bytes n-word-bytes) vector-data-offset)))
-      (instrument-alloc bytes node)
-      (pseudo-atomic ()
-       (allocation result bytes node nil other-pointer-lowtag)
-       (storew* simple-array-unsigned-byte-64-widetag result 0
-                other-pointer-lowtag t)
-       (storew* (fixnumize words) result vector-length-slot
-                other-pointer-lowtag t)))))
-
-(with-test (:name :aprof-smoketest-large-vector-to-upper-register)
-  (let ((nbytes
-         (let ((*standard-output* (make-broadcast-stream)))
-           (sb-aprof:aprof-run
-            (checked-compile
-             '(sb-int:named-lambda "test" ()
-               (declare (optimize sb-c::instrument-consing))
-               (sb-sys:%primitive cl-user::alloc-to-r8)
-               nil))))))
-    (assert (= nbytes sb-vm:large-object-size))))
-
 (defstruct thing x)
-(with-test (:name :instance-ref-eq)
+(with-test (:name :instance-ref-eq
+                  :skipped-on (not :immobile-space))
   (let ((lines
          (split-string
           (with-output-to-string (s)
@@ -359,3 +305,23 @@ sb-vm::
                   thereis
                   (and (search "CMP QWORD PTR [" line)
                        (search ":YUP" line))))))
+
+(with-test (:name :fixnump-thing-ref)
+  (flet ((try (access-form true false)
+           (let* ((f (compile nil `(lambda (obj) (typep ,access-form 'fixnum))))
+                  (lines
+                   (split-string
+                    (with-output-to-string (s) (disassemble f :stream s))
+                    #\newline)))
+             (assert (funcall f true))
+             (assert (not (funcall f false)))
+             ;; assert that the TEST instruction dereferenced OBJ and performed the test
+             (assert (loop for line in lines
+                           thereis
+                           (and (search "TEST BYTE PTR [" line)
+                                (search (format nil ", ~D" sb-vm:fixnum-tag-mask)
+                                        line)))))))
+    (try '(thing-x (truly-the thing obj))
+         (make-thing :x 1) (make-thing :x "hi"))
+    (try '(car obj) '(1) '("hi"))
+    (try '(cdr obj) '("hi" . 1) '("hi"))))

@@ -36,6 +36,13 @@ in future versions."
    :type mutex)
   waiting-for)
 
+(declaim (inline thread-alive-p))
+(defun thread-alive-p (thread)
+  "Return T if THREAD is still alive. Note that the return value is
+potentially stale even before the function returns, as the thread may exit at
+any time."
+  (thread-%alive-p thread))
+
 (def!struct (mutex (:constructor make-mutex (&key name))
                    (:copier nil))
   "Mutex type."

@@ -86,6 +86,30 @@
                       ;; If it's a lisp-rep-type, the CTYPE should be one already.
                       (aver (not (compute-lisp-rep-type alien-type)))
                       `(sb!alien::alien-value-typep object ',alien-type)))
+                   #!+(vop-translates sb!int:fixnump-instance-ref)
+                   ((and (type= type (specifier-type 'fixnum))
+                         (let ((use (lvar-uses object)) index)
+                           (and (combination-p use)
+                                (almost-immediately-used-p object use)
+                                (or (and (eq (lvar-fun-name (combination-fun use))
+                                             '%instance-ref)
+                                         (constant-lvar-p
+                                          (setf index (second (combination-args use)))))
+                                    (member (lvar-fun-name (combination-fun use))
+                                            '(car cdr))))))
+                    ;; This is a disturbing trend, but it's the best way to
+                    ;; combine instructions in the compiler as it is
+                    ;; (as opposed to the compiler as we wish it would be).
+                    (case (lvar-fun-name (combination-fun (lvar-uses object)))
+                     (%instance-ref
+                      (splice-fun-args object '%instance-ref 2)
+                      `(lambda (obj i) (fixnump-instance-ref obj i)))
+                     (car
+                      (splice-fun-args object 'car 1)
+                      `(lambda (obj) (fixnump-car obj)))
+                     (cdr
+                      (splice-fun-args object 'cdr 1)
+                      `(lambda (obj) (fixnump-cdr obj)))))
                    (t
                     (give-up-ir1-transform)))))
       (cond ((not (types-equal-or-intersect otype type))
@@ -857,8 +881,15 @@
                      `(eq ,get-ancestor ,layout))
                    (deeper-p `(> (layout-depthoid ,n-layout) ,depthoid)))
               (aver (equal pred '(%instancep object)))
-              `(and ,pred
-                    (let ((,n-layout ,get-layout))
+              ;; For shallow hierarchies, we can avoid reading the 'inherits'
+              ;; because the layout has the ancestor layouts directly in it.
+              ;; Not even a depthoid check is needed.
+              ;; Since only layouts for structure types will have ancestors
+              ;; populated, and this transform case is only for structures,
+              ;; there can be no false positives. STREAM and CONDITION types
+              ;; have a depthoid>0, but are not structure-classoid-p.
+              `(and (%instancep object)
+                    (let ((,n-layout (%instance-layout object)))
                       ;; we used to check for invalid layouts here,
                       ;; but in fact that's both unnecessary and
                       ;; wrong; it's unnecessary because structure
@@ -866,10 +897,22 @@
                       ;; because it is quite legitimate to pass an
                       ;; object with an invalid layout to a structure
                       ;; type test.
-                      ,(if abstract-base-p
-                           `(eq (if ,deeper-p ,get-ancestor ,n-layout) ,layout)
-                           `(cond ((eq ,n-layout ,layout) t)
-                                  (,deeper-p ,ancestor-layout-eq)))))))
+                      ,(let ((ancestor-slot (case depthoid
+                                             (2 'sb!kernel::layout-depth2-ancestor)
+                                             (3 'sb!kernel::layout-depth3-ancestor)
+                                             (4 'sb!kernel::layout-depth4-ancestor))))
+                         (if ancestor-slot
+                             (if abstract-base-p
+                                 `(or (eq (,ancestor-slot ,n-layout) ,layout)
+                                      (eq ,n-layout ,layout)) ; not likely
+                                 ;; Indifferent to order here. Might as well test
+                                 ;; for an exact match first.
+                                 `(or (eq ,n-layout ,layout)
+                                      (eq (,ancestor-slot ,n-layout) ,layout)))
+                             (if abstract-base-p
+                                 `(eq (if ,deeper-p ,get-ancestor ,n-layout) ,layout)
+                                 `(cond ((eq ,n-layout ,layout) t)
+                                        (,deeper-p ,ancestor-layout-eq)))))))))
            ((and layout (>= (layout-depthoid layout) 0))
             ;; hierarchical layout depths for other things (e.g.
             ;; CONDITION, STREAM)

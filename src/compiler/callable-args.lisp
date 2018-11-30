@@ -179,10 +179,24 @@
                                    (proclaimed-ftype (leaf-%source-name leaf))))
                               (t
                                (global-var-defined-type leaf)))))
-         (lvar-type (if (and defined-type
-                             (neq defined-type *universal-type*))
-                        defined-type
-                        lvar-type))
+         (entry-fun (if (and (functional-p leaf)
+                             (eq (functional-kind leaf) :external))
+                        (functional-entry-fun leaf)
+                        leaf))
+         (lvar-type (cond ((and defined-type
+                                (neq defined-type *universal-type*))
+                           defined-type)
+                          ((and (functional-p entry-fun)
+                                (fun-type-p (functional-type entry-fun)))
+                           (functional-type entry-fun))
+                          ((and (not (fun-type-p lvar-type))
+                                (lambda-p entry-fun)
+                                (lambda-tail-set entry-fun))
+                           (make-fun-type :wild-args t
+                                          :returns
+                                          (tail-set-type (lambda-tail-set entry-fun))))
+                          (t
+                           lvar-type)))
          (fun-name (cond ((or (fun-type-p lvar-type)
                               (functional-p leaf))
                           (cond ((constant-lvar-p lvar)
@@ -349,44 +363,44 @@
     (nreverse result)))
 
 (defun report-arg-count-mismatch (callee caller type arg-count
-                                  condition-type)
-  (multiple-value-bind (min max optional) (fun-type-arg-limits type)
-    (cond
-      ((and (not min) (not max))
-       nil)
-      ((not optional)
-       (when (/= arg-count min)
-         (warn condition-type
-               :format-control
-               "The function ~S is called by ~S with ~R argument~:P, but wants exactly ~R."
-               :format-arguments
-               (list
-                callee
-                caller
-                arg-count min))
-         t))
-      ((< arg-count min)
-       (warn condition-type
-             :format-control
-             "The function ~S is called by ~S with ~R argument~:P, but wants at least ~R."
-             :format-arguments
-             (list
-              callee
-              caller
-              arg-count min))
-       t)
-      ((not max)
-       nil)
-      ((> arg-count max)
-       (warn condition-type
-             :format-control
-             "The function ~S called by ~S with ~R argument~:P, but wants at most ~R."
-             :format-arguments
-             (list
-              callee
-              caller
-              arg-count max))
-       t))))
+                                  condition-type
+                                  &key lossage-fun)
+  (flet ((lose (format-control &rest format-args)
+           (if lossage-fun
+               (apply lossage-fun format-control format-args)
+               (warn condition-type :format-control format-control
+                                    :format-arguments format-args))
+           t))
+    (multiple-value-bind (min max optional) (fun-type-arg-limits type)
+      (or
+       (cond
+         ((and (not min) (not max))
+          nil)
+         ((not optional)
+          (when (/= arg-count min)
+            (lose
+             "The function ~S is called~@[ by ~S~] with ~R argument~:P, but wants exactly ~R."
+             callee caller
+             arg-count min)))
+         ((< arg-count min)
+          (lose
+           "The function ~S is called~@[ by ~S~] with ~R argument~:P, but wants at least ~R."
+           callee caller
+           arg-count min))
+         ((not max)
+          nil)
+         ((> arg-count max)
+          (lose
+           "The function ~S called~@[ by ~S~] with ~R argument~:P, but wants at most ~R."
+           callee caller
+           arg-count max)))
+       (let ((positional (fun-type-positional-count type)))
+         (when (and (fun-type-keyp type)
+                    (> arg-count positional)
+                    (oddp (- arg-count positional)))
+           (lose
+            "The function ~s is called with odd number of keyword arguments."
+            callee)))))))
 
 ;;; This can provide better errors and better handle OR types than a
 ;;; simple type intersection.
@@ -469,18 +483,30 @@
   (let ((atype (lvar-function-annotation-type annotation)))
     (multiple-value-bind (type name leaf) (lvar-fun-type lvar)
       (when (fun-type-p type)
-        (let ((int (type-intersection type atype)))
-          (when (or (memq *empty-type* (fun-type-required int))
-                    (and (eq (fun-type-returns int) *empty-type*)
-                         (neq (fun-type-returns type) *empty-type*)
-                         (not (and (eq (fun-type-returns atype) *empty-type*)
-                                   (eq (fun-type-returns type) *wild-type*)))))
-            (%compile-time-type-error-warn annotation
-                                           (type-specifier atype)
-                                           (type-specifier type)
-                                           (list name)
-                                           :condition
-                                           (callable-argument-lossage-kind name
-                                                                           leaf
-                                                                           'type-style-warning
-                                                                           'type-warning))))))))
+        (let ((condition (callable-argument-lossage-kind name
+                                                         leaf
+                                                         'type-style-warning
+                                                         'type-warning)))
+          (if (eq (lvar-function-annotation-context annotation) :mv-call)
+              (let* ((*compiler-error-context* annotation)
+                     (max-accepted (nth-value 1 (fun-type-nargs (lvar-fun-type lvar))))
+                     (min-args (fun-type-nargs atype)))
+                (when (and max-accepted
+                           (> min-args max-accepted))
+                  (warn condition
+                        :format-control
+                        "~@<MULTIPLE-VALUE-CALL calls ~a with with at least ~R ~
+                              values when it expects at most ~R.~@:>"
+                        :format-arguments (list name min-args
+                                                max-accepted))))
+              (let ((int (type-intersection type atype)))
+                (when (or (memq *empty-type* (fun-type-required int))
+                          (and (eq (fun-type-returns int) *empty-type*)
+                               (neq (fun-type-returns type) *empty-type*)
+                               (not (and (eq (fun-type-returns atype) *empty-type*)
+                                         (eq (fun-type-returns type) *wild-type*)))))
+                  (%compile-time-type-error-warn annotation
+                                                 (type-specifier atype)
+                                                 (type-specifier type)
+                                                 (list name)
+                                                 :condition condition)))))))))

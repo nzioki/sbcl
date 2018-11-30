@@ -117,6 +117,15 @@
                         dest)))))
     (pld lvar)))
 
+(defun principal-lvar-dest-and-lvar (lvar)
+  (labels ((pld (lvar)
+             (and lvar
+                  (let ((dest (lvar-dest lvar)))
+                    (if (cast-p dest)
+                        (pld (cast-lvar dest))
+                        (values dest lvar))))))
+    (pld lvar)))
+
 ;;; Update lvar use information so that NODE is no longer a use of its
 ;;; LVAR.
 ;;;
@@ -205,7 +214,8 @@
 (defun almost-immediately-used-p (lvar node)
   (declare (type lvar lvar)
            (type node node))
-  (aver (eq (node-lvar node) lvar))
+  (unless (bind-p node)
+    (aver (eq (node-lvar node) lvar)))
   (let ((dest (lvar-dest lvar)))
     (tagbody
      :next
@@ -692,7 +702,8 @@
   (let ((home (lambda-var-home leaf)))
     (if (eq :external (functional-kind home))
         (let* ((entry (functional-entry-fun home))
-               (p (1- (position leaf (lambda-vars home)))))
+               (p (1- (or (position leaf (lambda-vars home))
+                          (bug "can't find leaf")))))
           (leaf-debug-name
            (if (optional-dispatch-p entry)
                (elt (optional-dispatch-arglist entry) p)
@@ -1332,6 +1343,22 @@
         (and (ref-p node)
              (eq (block-last block) node)
              node)))))
+
+;;; (if x x nil)
+(defun if-test-redundant-p (test con alt)
+  (let ((ref-alt (single-ref-block-p alt))
+        (ref-con (single-ref-block-p con))
+        (ref-test (lvar-uses test)))
+    (and (ref-p ref-test)
+         ref-alt
+         ref-con
+         (equal (block-succ alt) (block-succ con))
+         (eq (ref-lvar ref-alt) (ref-lvar ref-con))
+         (eq (ref-leaf ref-con) (ref-leaf ref-test))
+         (and (constant-p (ref-leaf ref-alt))
+              (null (constant-value (ref-leaf ref-alt))))
+         (eq (node-enclosing-cleanup ref-alt)
+             (node-enclosing-cleanup ref-con)))))
 
 ;;; If a block consisting of a single ref is equivalent to another
 ;;; block with the same ref and the have the same successor it can be
@@ -2640,6 +2667,7 @@ is :ANY, the function name is not checked."
   (declare (type basic-combination call))
   (let ((kind (basic-combination-kind call)))
     (or (eq kind :full)
+        (eq kind :unknown-keys)
         ;; It has an ir2-converter, but needs to behave like a full call.
         (eq (lvar-fun-name (basic-combination-fun call) t)
             '%coerce-callable-for-call)
@@ -2762,7 +2790,8 @@ is :ANY, the function name is not checked."
     ;; but we still want to check the full type at compile time.
     (add-annotation value
                     (make-lvar-function-annotation
-                     :type type)))
+                     :type type
+                     :context (shiftf context nil))))
   (%make-cast :asserted-type type
               :type-to-check (maybe-weaken-check type policy)
               :value value
@@ -2901,8 +2930,37 @@ is :ANY, the function name is not checked."
                                   (funcall function singleton-arg
                                            (pop vars) type))
                             (setf vars (nthcdr length vars))))))))))
-
 
+(defun lvar-lambda-var (lvar)
+  (let* ((let (lvar-dest lvar))
+         (fun (combination-lambda let)))
+    (loop for arg in (combination-args let)
+          for var in (lambda-vars fun)
+          when (eq arg lvar)
+          return var)))
+
+;;; If the dest is a LET variable use the variable refs.
+(defun map-all-lvar-dests (lvar fun)
+  (let ((dest (principal-lvar-dest lvar)))
+    (if (and (combination-p dest)
+             (eq (combination-kind dest) :local))
+        (let ((var (lvar-lambda-var lvar)))
+          ;; Will PROPAGATE-LET-ARGS substitute the references?
+          (if (preserve-single-use-debug-var-p dest var)
+              (funcall fun lvar dest)
+              (loop for ref in (lambda-var-refs var)
+                    do (multiple-value-bind (dest lvar)
+                           (principal-lvar-dest (node-lvar ref))
+                         (funcall fun lvar dest)))))
+        (funcall fun lvar dest))))
+
+(defun lvar-called-by-node-p (lvar node)
+  (and (basic-combination-p node)
+       (let ((fun (basic-combination-fun node)))
+         (or (eq fun lvar)
+             (lvar-fun-is fun '(%coerce-callable-for-call))))))
+
+
 (defun proper-or-circular-list-p (x)
   (if (consp x)
       (let ((rabbit (cdr x))

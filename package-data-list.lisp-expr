@@ -145,7 +145,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "+INST-ALIGNMENT-BYTES+"
 
                "ASSEM-SCHEDULER-P"
-               "*ASSEM-MAX-LOCATIONS*"
+               "+ASSEM-MAX-LOCATIONS+"
 
                "*ASMSTREAM*" "MAKE-ASMSTREAM"
                "ASMSTREAM-DATA-SECTION"
@@ -682,6 +682,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "GET-TIME-OF-DAY"
 
                ;; People have various good reasons to mess with the GC.
+               "HEAP-ALLOCATED-P"
+               "STACK-ALLOCATED-P"
                "*AFTER-GC-HOOKS*"
                "BYTES-CONSED-BETWEEN-GCS"
                "GC" "GET-BYTES-CONSED"
@@ -1029,6 +1031,13 @@ possibly temporarily, because it might be used internally."
                "SSET-ADJOIN" "SSET-DELETE" "SSET-EMPTY" "SSET-COUNT"
                "SSET-MEMBER"
 
+               ;; Treaps
+               ;; the finders/accesors are for a generic binary-search-tree
+               ;; (in the event that we have more than one), but the mutators
+               ;; refer specifically to what flavor of tree it is.
+               "BST-FIND" "BST-FIND<=" "BST-NODE-DATA"
+               "TREAP-INSERT" "TREAP-DELETE"
+
                ;; communication between the runtime and Lisp
                "*CORE-STRING*"
 
@@ -1065,6 +1074,7 @@ possibly temporarily, because it might be used internally."
                "SHOW-INFO"
                "UPDATE-SYMBOL-INFO"
                "WITH-GLOBALDB-NAME"
+               "%BOUNDP"
 
                ;; Calling a list of hook functions, plus error handling.
                "CALL-HOOKS"
@@ -1132,9 +1142,6 @@ possibly temporarily, because it might be used internally."
                "C-STRING-DECODING-ERROR"
                "ATTEMPT-RESYNC" "FORCE-END-OF-FILE"
 
-               ;; bug workaround. Or not. I don't know if it's a bug
-               "!POSSIBLY-DEFCONSTANT-EQX"
-
                ;; bootstrapping magic, to make things happen both in
                ;; the cross-compilation host compiler's environment and
                ;; in the cross-compiler's environment
@@ -1165,6 +1172,8 @@ possibly temporarily, because it might be used internally."
                "SANE-DEFAULT-PATHNAME-DEFAULTS"
                "SBCL-HOMEDIR-PATHNAME"
                "SIMPLIFY-NAMESTRING"
+               "DEBUG-SOURCE-NAMESTRING"
+               "DEBUG-SOURCE-CREATED"
 
                "*N-BYTES-FREED-OR-PURIFIED*"
 
@@ -1195,7 +1204,7 @@ possibly temporarily, because it might be used internally."
                "AND/TYPE" "NOT/TYPE"
                "ANY/TYPE" "EVERY/TYPE"
                "EQUAL-BUT-NO-CAR-RECURSION"
-               "TYPE-BOUND-NUMBER"
+               "TYPE-BOUND-NUMBER" "COERCE-NUMERIC-BOUND"
                "CONSTANTLY-T" "CONSTANTLY-NIL" "CONSTANTLY-0"
                "PSXHASH"
                "%BREAK"
@@ -1275,6 +1284,7 @@ possibly temporarily, because it might be used internally."
                "SHORT-FLOAT-P"
                "SINGLE-FLOAT-P"
                "FIXNUMP"
+               "FIXNUMP-INSTANCE-REF" "FIXNUMP-CAR" "FIXNUMP-CDR"
                "BIGNUMP"
                "RATIOP"
                "UNBOUND-MARKER-P"
@@ -1640,7 +1650,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SET-SIGNED-SAP-REF-8" "%SET-STACK-REF"
                "%SET-SYMBOL-HASH"
                "%SIN" "%SIN-QUICK" "%SINGLE-FLOAT"
-               "%SINH" "%SQRT" "%SXHASH-SIMPLE-STRING"
+               "%SINH" "%SQRT" "%SXHASH-STRING" "%SXHASH-SIMPLE-STRING"
                #!+sb-simd-pack("%SIMD-PACK-TAG"
                                "%SIMD-PACK-LOW"
                                "%SIMD-PACK-HIGH")
@@ -2160,6 +2170,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%NUMERATOR" "CLASSOID-TYPEP" "DSD-READ-ONLY"
                "DSD-DEFAULT" "LAYOUT-INHERITS" "DD-LENGTH"
                "%CODE-ENTRY-POINT"
+               "%CODE-FUN-OFFSET"
                "CODE-ENTRY-POINTS" ; new accessor - returns a vector
                "CODE-N-ENTRIES"
                "CODE-OBJ-IS-FILLER-P"

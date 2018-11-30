@@ -95,7 +95,28 @@
 #endif
 
 #define THREAD_BASE_REG %r13
-        
+
+#ifdef OS_THREAD_STACK
+        .text
+	.globl  GNAME(funcall1_switching_stack)
+	TYPE(GNAME(funcall1_switching_stack))
+	.align	align_16byte,0x90
+GNAME(funcall1_switching_stack):
+        /* The arguments are switched, funcall1_switching_stack(arg, function)
+           to avoid shuffling registers.
+        */
+        push    %rbp
+        mov     %rsp,%rbp
+
+        mov     THREAD_CONTROL_STACK_END_OFFSET(%rdi),%rsp
+        call    *%rsi
+
+        mov     %rbp, %rsp
+        pop     %rbp
+        ret
+        SIZE(GNAME(funcall1_switching_stack))
+#endif
+
 	.text	
 	.globl  GNAME(call_into_lisp_first_time)
 	TYPE(GNAME(call_into_lisp_first_time))
@@ -233,7 +254,6 @@ LsingleValue:
 	.cfi_endproc
 	SIZE(GNAME(call_into_lisp))
 
-#ifdef LISP_FEATURE_SB_THREAD
 	.text	
 	.globl  GNAME(funcall_alien_callback)
 	TYPE(GNAME(funcall_alien_callback))
@@ -243,7 +263,7 @@ GNAME(funcall_alien_callback):
    rdi arg1
    rsi arg2
    rdx arg0
-   rcx thread
+   rcx thread #+sb-thread
 */
         
 	push	%rbp		# Save old frame pointer.
@@ -254,15 +274,23 @@ GNAME(funcall_alien_callback):
 	push	%r13    # the lisp function returns
 	push	%r14    #
 	push	%r15    #
-
+#ifdef LISP_FEATURE_SB_THREAD
         mov     %rcx, THREAD_BASE_REG
+#endif
         mov     $(3 << N_FIXNUM_TAG_BITS),%rcx
 
 	/* Alloc new frame. */
         push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
         mov	%rsp,%rbp
+#ifdef LISP_FEATURE_IMMOBILE_CODE
+#include "genesis/vector.h"
+        // An extra instruction is needed to load the fdefn.
+        mov	(STATIC_FDEFNS+VECTOR_DATA_OFFSET+8*ENTER_ALIEN_CALLBACK_fdefn),%rax
+        mov	FDEFN_FUN_OFFSET(%rax),%rax
+#else
         mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
+#endif
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 /* Restore C regs */
@@ -276,7 +304,6 @@ GNAME(funcall_alien_callback):
 
 	ret
 	SIZE(GNAME(funcall_alien_callback))
-#endif
 
 /*
  * fun-end breakpoint magic
