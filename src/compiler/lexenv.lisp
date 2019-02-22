@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; support for the idiom (in MACROEXPAND and elsewhere) that NIL is
 ;;; to be taken as a null lexical environment.
@@ -19,8 +19,8 @@
   (etypecase x
     (null (make-null-lexenv))
     (lexenv x)
-    #!+(and sb-fasteval (host-feature sb-xc))
-    (sb!interpreter:basic-env (sb!interpreter:lexenv-from-env x))))
+    #+(and sb-fasteval (not sb-xc-host))
+    (sb-interpreter:basic-env (sb-interpreter:lexenv-from-env x))))
 
 ;;; Take the lexenv surrounding an inlined function and extract things
 ;;; needed for the inline expansion suitable for dumping into fasls.
@@ -126,9 +126,9 @@
              ;; defining form. The syntactic env is correctly captured.
              ((reconstruct-lexenv lexenv)
               `(lambda-with-lexenv ,it ,@(cdr lambda))))))
-   #!+(and sb-fasteval (host-feature sb-xc))
-   (sb!interpreter:basic-env
-    (awhen (sb!interpreter::reconstruct-syntactic-closure-env lexenv)
+   #+(and sb-fasteval (not sb-xc-host))
+   (sb-interpreter:basic-env
+    (awhen (sb-interpreter::reconstruct-syntactic-closure-env lexenv)
       `(lambda-with-lexenv ,it ,@(cdr lambda))))
-   #!+sb-fasteval
+   #+sb-fasteval
    (null lambda))) ; trivial case. Never occurs in the compiler.

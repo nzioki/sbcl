@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-DEBUG") ; (SB-, not SB!, since we're built in warm load.)
+(in-package "SB-DEBUG")
 
 ;;; FIXME: Why, oh why, doesn't the SB-DEBUG package use the SB-DI
 ;;; package? That would let us get rid of a whole lot of stupid
@@ -48,7 +48,7 @@
         (values (%closure-fun res) named-p :compiled-closure))
        (funcallable-instance
         (values res named-p :funcallable-instance))
-       ;; FIXME: What about SB!EVAL:INTERPRETED-FUNCTION -- it gets picked off
+       ;; FIXME: What about SB-EVAL:INTERPRETED-FUNCTION -- it gets picked off
        ;; by the FIN above, is that right?
        (t
         (values res named-p :compiled))))))

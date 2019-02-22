@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!INTERPRETER")
+(in-package "SB-INTERPRETER")
 
 (defstruct (interpreted-fun-prototype
              (:predicate proto-fn-p)
@@ -19,8 +19,8 @@
                                  &optional (pretty-arglist lambda-list)))
              (:copier nil))
   (source-location
-   (let ((s (sb!c::make-definition-source-location)))
-     (if (sb!c::definition-source-location-namestring s) s)))
+   (let ((s (sb-c::make-definition-source-location)))
+     (if (sb-c::definition-source-location-namestring s) s)))
   (name        0 :read-only nil)
   (lambda-list 0 :read-only nil)
   (pretty-arglist) ; same as what a generic-function terms it
@@ -41,7 +41,7 @@
 ;; compiler/main and code/deftypes-for-target.
 
 ;; This is 8 words: header, layout, trampoline, fin-fun, info[4]
-(sb!kernel::!defstruct-with-alternate-metaclass
+(sb-kernel::!defstruct-with-alternate-metaclass
  interpreted-function
  :slot-names (%proto-fn env frame cookie)
  :constructor %make-interpreted-function

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun pointer-hash (key)
   (pointer-hash key))
@@ -66,28 +66,28 @@
   ;; search starting from 2^60*pi.  The multiplication should be
   ;; efficient no matter what the platform thanks to modular
   ;; arithmetic.
-  (let* ((mul (logand 3622009729038463111 sb!xc:most-positive-fixnum))
-         (xor (logand 608948948376289905 sb!xc:most-positive-fixnum))
-         (xy (logand (+ (* x mul) y) sb!xc:most-positive-fixnum)))
-    (logand (logxor xor xy (ash xy -5)) sb!xc:most-positive-fixnum)))
+  (let* ((mul (logand 3622009729038463111 sb-xc:most-positive-fixnum))
+         (xor (logand 608948948376289905 sb-xc:most-positive-fixnum))
+         (xy (logand (+ (* x mul) y) sb-xc:most-positive-fixnum)))
+    (logand (logxor xor xy (ash xy -5)) sb-xc:most-positive-fixnum)))
 
 ;; Return a number that increments by 1 for each word-pair allocation,
 ;; barring complications such as exhaustion of the current page.
 ;; The result is guaranteed to be a positive fixnum.
 (declaim (inline address-based-counter-val))
 (defun address-based-counter-val ()
-  #!+(and (not sb-thread) cheneygc)
-  (ash (sap-int (dynamic-space-free-pointer)) (- (1+ sb!vm:word-shift)))
+  #+(and (not sb-thread) cheneygc)
+  (ash (sap-int (dynamic-space-free-pointer)) (- (1+ sb-vm:word-shift)))
   ;; dynamic-space-free-pointer increments only when a page is full.
   ;; Using boxed_region directly is finer-grained.
-  #!+(and (not sb-thread) gencgc)
+  #+(and (not sb-thread) gencgc)
   (ash (extern-alien "gc_alloc_region" unsigned-long)
-       (- (1+ sb!vm:word-shift)))
+       (- (1+ sb-vm:word-shift)))
   ;; threads imply gencgc. use the per-thread alloc region pointer
-  #!+sb-thread
-  (ash (sap-int (sb!vm::current-thread-offset-sap
-                 #.sb!vm::thread-alloc-region-slot))
-       (- (1+ sb!vm:word-shift))))
+  #+sb-thread
+  (ash (sap-int (sb-vm::current-thread-offset-sap
+                 #.sb-vm::thread-alloc-region-slot))
+       (- (1+ sb-vm:word-shift))))
 
 ;; Return some bits that are dependent on the next address that will be
 ;; allocated, mixed with the previous state (in case addresses get recycled).
@@ -126,9 +126,9 @@
                   (set-result (+ result (ash result 10)))
                   (set-result (logxor result (ash result -6)))))
              (set-result (form)
-               `(setf result (ldb (byte #.sb!vm:n-word-bits 0) ,form))))
-    (let ((result 0))
-      (declare (type (unsigned-byte #.sb!vm:n-word-bits) result))
+               `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
+    (let ((result 238625159)) ; (logandc2 most-positive-fixnum (sxhash #\S)) on 32 bits
+      (declare (type (unsigned-byte #.sb-vm:n-word-bits) result))
       ;; Avoid accessing elements of a (simple-array nil (*)).
       ;; The expansion of STRING-DISPATCH involves ETYPECASE,
       ;; so we can't simply omit one case. Therefore that macro
@@ -139,7 +139,7 @@
       (set-result (+ result (ash result 3)))
       (set-result (logxor result (ash result -11)))
       (set-result (logxor result (ash result 15)))
-      (logand result most-positive-fixnum))))
+      (logand result sb-xc:most-positive-fixnum))))
 ;;; test:
 ;;;   (let ((ht (make-hash-table :test 'equal)))
 ;;;     (do-all-symbols (symbol)
@@ -192,29 +192,29 @@
            (quasi-random-address-based-hash
             (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte))
                              t)
-            most-positive-fixnum))))
+            sb-xc:most-positive-fixnum))))
      (when (plusp answer)
        ;; Make sure we never return 0 (almost no chance of that anyway).
        (return answer)))))
 
 (declaim (inline !condition-hash))
 (defun !condition-hash (instance)
-  (let ((hash (sb!kernel::condition-hash instance)))
+  (let ((hash (sb-kernel::condition-hash instance)))
     (if (not (eql hash 0))
         hash
         (let ((new (new-instance-hash-code)))
           ;; At most one thread will compute a random hash.
-          (let ((old (cas (sb!kernel::condition-hash instance) 0 new)))
+          (let ((old (cas (sb-kernel::condition-hash instance) 0 new)))
             (if (eql old 0) new old))))))
 
-#!+(and compact-instance-header x86-64)
+#+(and compact-instance-header x86-64)
 (progn
   (declaim (inline %std-instance-hash))
   (defun %std-instance-hash (slots) ; return or compute the 32-bit hash
-    (let ((stored-hash (sb!vm::get-header-data-high slots)))
+    (let ((stored-hash (sb-vm::get-header-data-high slots)))
       (if (eql stored-hash 0)
           (let ((new (logand (new-instance-hash-code) #xFFFFFFFF)))
-            (let ((old (sb!vm::cas-header-data-high slots 0 new)))
+            (let ((old (sb-vm::cas-header-data-high slots 0 new)))
               (if (eql old 0) new old)))
           stored-hash))))
 
@@ -222,7 +222,7 @@
   ;; Apparently we care that the object is of primitive type INSTANCE, but not
   ;; whether it is STANDARD-INSTANCE. It had better be, or we're in trouble.
   (declare (instance instance))
-  #!+(and compact-instance-header x86-64)
+  #+(and compact-instance-header x86-64)
   ;; The one logical slot (excluding layout) in the primitive object is index 0.
   ;; That holds a vector of the clos slots, and its header holds the hash.
   (let* ((slots (%instance-ref instance 0))
@@ -230,16 +230,16 @@
     ;; Simulate N-POSITIVE-FIXNUM-BITS of output for backward-compatibility,
     ;; in case people use the high order bits.
     ;; (There are only 32 bits of actual randomness, if even that)
-    (logxor (ash hash (- sb!vm:n-positive-fixnum-bits 32)) hash))
-  #!-(and compact-instance-header x86-64)
+    (logxor (ash hash (- sb-vm:n-positive-fixnum-bits 32)) hash))
+  #-(and compact-instance-header x86-64)
   (locally
-   (declare (optimize (sb!c::type-check 0)))
-   (let ((hash (sb!pcl::standard-instance-hash-code instance)))
+   (declare (optimize (sb-c::type-check 0)))
+   (let ((hash (sb-pcl::standard-instance-hash-code instance)))
      (if (not (eql hash 0))
          hash
          (let ((new (new-instance-hash-code)))
           ;; At most one thread will compute a random hash.
-          (let ((old (cas (sb!pcl::standard-instance-hash-code instance) 0 new)))
+          (let ((old (cas (sb-pcl::standard-instance-hash-code instance) 0 new)))
             (if (eql old 0) new old)))))))
 
 ;; These are also random numbers, but not lazily computed.
@@ -249,16 +249,37 @@
   ;; whether it is STANDARD-FUNCALLABLE-INSTANCE. Let's assume it is.
   (declare (function fin))
   (locally
-   (declare (optimize (sb!c::type-check 0)))
-   #!+compact-instance-header
-   (sb!vm::get-header-data-high
-    (sb!pcl::standard-funcallable-instance-clos-slots fin))
-   #!-compact-instance-header
-   (sb!pcl::standard-funcallable-instance-hash-code fin)))
+   (declare (optimize (sb-c::type-check 0)))
+   #+compact-instance-header
+   (sb-vm::get-header-data-high
+    (sb-pcl::standard-funcallable-instance-clos-slots fin))
+   #-compact-instance-header
+   (sb-pcl::standard-funcallable-instance-hash-code fin)))
 
 (defun sxhash (x)
   ;; profiling SXHASH is hard, but we might as well try to make it go
   ;; fast, in case it is the bottleneck somewhere.  -- CSR, 2003-03-14
+  ;; So, yes, profiling is a little tough but not impossible with some added
+  ;; instrumentation in each stanza of the COND, either manually or
+  ;; automagically. Based on a manual approach, the order of the tests below
+  ;; are now better arranged by approximate descending frequency in terms
+  ;; of calls observed in certain test. Regardless of the fact that applications
+  ;; will vary by use-cases, this seems like a good order because:
+  ;;  * despite that INSTANCE is often the 2nd-most common object type in the heap
+  ;;    (right behind CONS), there are probably at least as many heap words
+  ;;    that are FIXNUM as instance pointers. So it stands to reason that
+  ;;    SXHASH-RECURSE is invoked very often on FIXNUM.
+  ;;  * SYMBOLs are extremely common as table keys, more so than INSTANCE,
+  ;;    so we should pick off SYMBOL sooner than INSTANCE as well.
+  ;;  * INSTANCE (except for PATHNAME) doesn't recurse anyway - in fact
+  ;;    it is particularly dumb (by design), so performing that test later
+  ;;    doesn't incur much of a penalty. And our users probably know that
+  ;;    SXHASH on instance doesn't really do anything.
+  ;; Anyway, afaiu, the code below was previously ordered by gut feeling
+  ;; rather than than actual measurement, so having any rationale for ordering
+  ;; is better than having no rationale. And as a further comment observes,
+  ;; we could do away with the question of order if only we had jump tables.
+  ;; (Also, could somebody perhaps explain how these magic numbers were chosen?)
   (declare (optimize speed))
   (labels ((sxhash-number (x)
              (macrolet ((hash-complex-float ()
@@ -268,17 +289,19 @@
                              (mixf result (sxhash (imagpart x)))
                              result)))
                (etypecase x
+                 ;; FIXNUM is handled in the outer typecase, but we also see it
+                 ;; in SXHASH-NUMBER because of RATIONAL and (COMPLEX RATIONAL).
                  (fixnum (sxhash x))    ; through DEFTRANSFORM
-                 (integer (sb!bignum:sxhash-bignum x))
+                 (integer (sb-bignum:sxhash-bignum x))
                  (single-float (sxhash x)) ; through DEFTRANSFORM
                  (double-float (sxhash x)) ; through DEFTRANSFORM
-                 #!+long-float (long-float (error "stub: no LONG-FLOAT"))
+                 #+long-float (long-float (error "stub: no LONG-FLOAT"))
                  (ratio (let ((result 127810327))
                           (declare (type fixnum result))
                           (mixf result (sxhash-number (numerator x)))
                           (mixf result (sxhash-number (denominator x)))
                           result))
-                 #!+long-float
+                 #+long-float
                  ((complex long-float)
                   (hash-complex-float))
                  ((complex double-float)
@@ -313,6 +336,8 @@
                         (mix (sxhash-recurse (car x) (1- depthoid))
                              (sxhash-recurse (cdr x) (1- depthoid)))
                         261835505)))
+               (symbol (sxhash x)) ; through DEFTRANSFORM
+               (fixnum (sxhash x)) ; through DEFTRANSFORM
                (instance
                 (typecase x
                   (pathname
@@ -345,7 +370,6 @@
                              (layout-classoid (%instance-layout x))))))
                   (condition (!condition-hash x))
                   (t (std-instance-hash x))))
-               (symbol (sxhash x))      ; through DEFTRANSFORM
                (array
                 (typecase x
                   ;; If we could do something smart for widetag-based jump tables,
@@ -367,11 +391,15 @@
                    ;; approach.  This will probably do for now.
                    (sxhash-recurse (copy-seq x) depthoid))
                   (t (logxor 191020317 (sxhash (array-rank x))))))
+               ;; general, inefficient case of NUMBER
+               ;; There's a spurious FIXNUMP test here, as we've already picked it off.
+               ;; Maybe the NUMBERP emitter could be informed that X can't be a fixnum,
+               ;; because writing this case as (OR BIGNUM RATIO FLOAT COMPLEX)
+               ;; produces far worse code.
+               (number (sxhash-number x))
                (character
                 (logxor 72185131
                         (sxhash (char-code x)))) ; through DEFTRANSFORM
-               ;; general, inefficient case of NUMBER
-               (number (sxhash-number x))
                (funcallable-instance
                 (if (layout-for-std-class-p
                      (%funcallable-instance-layout x))
@@ -513,8 +541,8 @@
            ;; it didn't.)
            (sxhash val)))
     (macrolet ((hash-float (type key)
-                 (let ((lo (coerce sb!xc:most-negative-fixnum type))
-                       (hi (coerce sb!xc:most-positive-fixnum type)))
+                 (let ((lo (coerce sb-xc:most-negative-fixnum type))
+                       (hi (coerce sb-xc:most-positive-fixnum type)))
                    `(let ((key ,key))
                       (cond ( ;; This clause allows FIXNUM-sized integer
                              ;; values to be handled without consing.
@@ -529,10 +557,10 @@
                              ;; {single,double}-float infinities are EQUALP
                              (if (minusp key)
                                  (load-time-value
-                                  (sxhash (symbol-value 'sb!ext:single-float-negative-infinity))
+                                  (sxhash (symbol-value 'sb-ext:single-float-negative-infinity))
                                   t)
                                  (load-time-value
-                                  (sxhash (symbol-value 'sb!ext:single-float-positive-infinity))
+                                  (sxhash (symbol-value 'sb-ext:single-float-positive-infinity))
                                   t)))
                             (t
                              (multiple-value-bind (q r) (floor key)
@@ -554,11 +582,11 @@
                 (etypecase key
                   (single-float (hash-float single-float key))
                   (double-float (hash-float double-float key))
-                  #!+long-float
+                  #+long-float
                   (long-float (error "LONG-FLOAT not currently supported")))))
-       (rational (if (and (<= most-negative-double-float
+       (rational (if (and (<= sb-xc:most-negative-double-float
                               key
-                              most-positive-double-float)
+                              sb-xc:most-positive-double-float)
                           (= (coerce key 'double-float) key))
                      (sxhash-double-float (coerce key 'double-float))
                      (sxhash key)))
@@ -589,7 +617,7 @@
                (declare (fixnum depthoid))
                (cond ((atom x) (sxhash x))
                      ((zerop depthoid)
-                      #.(logand sb!xc:most-positive-fixnum #36Rglobaldbsxhashoid))
+                      #.(logand sb-xc:most-positive-fixnum #36Rglobaldbsxhashoid))
                      (t (mix (recurse (car x) (1- depthoid))
                              (recurse (cdr x) (1- depthoid)))))))
       (traverse 0 name 10))))

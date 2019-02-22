@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun machine-type ()
   "Return a string describing the type of the local machine."
@@ -23,7 +23,7 @@
 (defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
-  (let* ((obj-start-addr (logandc2 (get-lisp-obj-address code) sb!vm:lowtag-mask))
+  (let* ((obj-start-addr (logandc2 (get-lisp-obj-address code) sb-vm:lowtag-mask))
          (sap (code-instructions code))
          (code-end-addr (+ (sap-int sap) (%code-code-size code))))
     (ecase kind
@@ -66,17 +66,17 @@
 ;;;;      and internal error handling) the extra runtime cost should be
 ;;;;      negligible.
 
-#!+(or linux win32)
+#+(or linux win32)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
 (defun context-float-register (context index format)
   (declare (ignorable context index))
-  #!-(or linux win32)
+  #-(or linux win32)
   (progn
     (warn "stub CONTEXT-FLOAT-REGISTER")
     (coerce 0 format))
-  #!+(or linux win32)
+  #+(or linux win32)
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
@@ -97,7 +97,7 @@
 
 ;;; Given a signal context, return the floating point modes word in
 ;;; the same format as returned by FLOATING-POINT-MODES.
-#!-(or linux sunos)
+#-(or linux sunos)
 (defun context-floating-point-modes (context)
   ;; FIXME: As of sbcl-0.6.7 and the big rewrite of signal handling for
   ;; POSIXness and (at the Lisp level) opaque signal contexts,
@@ -107,9 +107,9 @@
   (warn "stub CONTEXT-FLOATING-POINT-MODES")
   0)
 
-#!+(or linux sunos)
+#+(or linux sunos)
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
-    (sb!alien:unsigned 32)
+    (sb-alien:unsigned 32)
   (context (* os-context-t)))
 
 ;;;; INTERNAL-ERROR-ARGS
@@ -121,7 +121,7 @@
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
-    (sb!kernel::decode-internal-error-args (sap+ pc 1) trap-number)))
+    (sb-kernel::decode-internal-error-args (sap+ pc 1) trap-number)))
 
 ;;; This is used in error.lisp to insure that floating-point exceptions
 ;;; are properly trapped. The compiler translates this to a VOP.

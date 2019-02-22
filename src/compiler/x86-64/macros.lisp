@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; instruction-like macros
 
@@ -26,14 +26,14 @@
   ;; all seemingly redundant moves, and then eliminate them before emission.
   ;; This way we can track movement of TNs into the same physical reg in a
   ;; different SC which will give useful information to a peephole optimizer.
-  (when (and (sb!x86-64-asm::register-p dst)
-             (sb!x86-64-asm::register-p src))
-    (let ((dst (sb!x86-64-asm::reg-id dst))
-          (src (sb!x86-64-asm::reg-id src)))
-      (aver (sb!x86-64-asm::is-gpr-id-p dst))
-      (aver (sb!x86-64-asm::is-gpr-id-p src))
-      (unless (= (sb!x86-64-asm::reg-id-num dst)
-                 (sb!x86-64-asm::reg-id-num src))
+  (when (and (sb-x86-64-asm::register-p dst)
+             (sb-x86-64-asm::register-p src))
+    (let ((dst (sb-x86-64-asm::reg-id dst))
+          (src (sb-x86-64-asm::reg-id src)))
+      (aver (sb-x86-64-asm::is-gpr-id-p dst))
+      (aver (sb-x86-64-asm::is-gpr-id-p src))
+      (unless (= (sb-x86-64-asm::reg-id-num dst)
+                 (sb-x86-64-asm::reg-id-num src))
         (inst mov dst src)))
     (return-from move))
   (unless (location= dst src)
@@ -44,14 +44,22 @@
       ((double-reg complex-double-reg)
        (aver (xmm-tn-p src))
        (inst movapd dst src))
-      #!+sb-simd-pack
+      #+sb-simd-pack
       ((int-sse-reg sse-reg)
        (aver (xmm-tn-p src))
        (inst movdqa dst src))
-      #!+sb-simd-pack
+      #+sb-simd-pack
       ((single-sse-reg double-sse-reg)
        (aver (xmm-tn-p src))
        (inst movaps dst src))
+      #+sb-simd-pack-256
+      ((int-avx2-reg avx2-reg)
+       (aver (xmm-tn-p src))
+       (inst vmovdqa dst src))
+      #+sb-simd-pack-256
+      ((single-avx2-reg double-avx2-reg)
+       (aver (xmm-tn-p src))
+       (inst vmovaps dst src))
       (t
        (inst mov dst src)))))
 
@@ -109,7 +117,7 @@
 (defun thread-slot-ea (slot-index)
   (ea (ash slot-index word-shift) thread-base-tn))
 
-#!+sb-thread
+#+sb-thread
 (progn
   ;; Return an EA for the TLS of SYMBOL, or die.
   (defun symbol-known-tls-cell (symbol)
@@ -125,7 +133,7 @@
   (defmacro store-tl-symbol-value (reg symbol)
     `(inst mov (symbol-known-tls-cell ',symbol) ,reg)))
 
-#!-sb-thread
+#-sb-thread
 (progn
   (defmacro load-tl-symbol-value (reg symbol)
     `(inst mov ,reg (static-symbol-value-ea ',symbol)))
@@ -179,24 +187,24 @@
 
 ;;; Unsafely clear pa flags so that the image can properly lose in a
 ;;; pa section.
-#!+sb-thread
+#+sb-thread
 (defmacro %clear-pseudo-atomic ()
   '(inst mov :qword (thread-slot-ea thread-pseudo-atomic-bits-slot) 0))
 
-#!+sb-safepoint
+#+sb-safepoint
 (defun emit-safepoint ()
   (inst test :byte rax-tn (ea (- nil-value n-word-bytes other-pointer-lowtag
                                  gc-safepoint-trap-offset))))
 
 (defmacro pseudo-atomic ((&key elide-if) &rest forms)
-  #!+sb-safepoint-strictly
+  #+sb-safepoint-strictly
   `(progn ,@forms (unless ,elide-if (emit-safepoint)))
-  #!-sb-safepoint-strictly
+  #-sb-safepoint-strictly
   (with-unique-names (label pa-bits-ea)
     `(let ((,label (gen-label))
            (,pa-bits-ea
-            #!+sb-thread (thread-slot-ea thread-pseudo-atomic-bits-slot)
-            #!-sb-thread (static-symbol-value-ea '*pseudo-atomic-bits*)))
+            #+sb-thread (thread-slot-ea thread-pseudo-atomic-bits-slot)
+            #-sb-thread (static-symbol-value-ea '*pseudo-atomic-bits*)))
        (unless ,elide-if
          (inst mov ,pa-bits-ea rbp-tn))
        ,@forms
@@ -207,7 +215,7 @@
          ;; using the process signal mask.
          (inst break pending-interrupt-trap)
          (emit-label ,label)
-         #!+sb-safepoint
+         #+sb-safepoint
          ;; In this case, when allocation thinks a GC should be done, it
          ;; does not mark PA as interrupted, but schedules a safepoint
          ;; trap instead.  Let's take the opportunity to trigger that

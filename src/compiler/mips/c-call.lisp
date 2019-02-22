@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defstruct arg-state
   (stack-frame-size 0)
@@ -131,8 +131,8 @@
                                         (make-result-state))))))
 
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (env (make-null-lexenv))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
@@ -141,22 +141,22 @@
     ;; and results.
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
                  (dolist (type arg-types)
                    (let ((arg (gensym)))
                      (lambda-vars arg)
                      (cond ((and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type) 32))
+                                 (> (sb-alien::alien-integer-type-bits type) 32))
                             ;; 64-bit long long types are stored in
                             ;; consecutive locations, endian word order,
                             ;; aligned to 8 bytes.
                             (when (oddp (length (new-args)))
                               (new-args nil))
-                            #!-little-endian
+                            #-little-endian
                             (progn (new-args `(ash ,arg -32))
                                    (new-args `(logand ,arg #xffffffff))
                                    (if (oddp (length (new-arg-types)))
@@ -165,7 +165,7 @@
                                        (new-arg-types (parse-alien-type '(signed 32) env))
                                        (new-arg-types (parse-alien-type '(unsigned 32) env)))
                                    (new-arg-types (parse-alien-type '(unsigned 32) env)))
-                            #!+little-endian
+                            #+little-endian
                             (progn (new-args `(logand ,arg #xffffffff))
                                    (new-args `(ash ,arg -32))
                                    (if (oddp (length (new-arg-types)))
@@ -178,23 +178,23 @@
                             (new-args arg)
                             (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
-                                      #!-little-endian
+                                      #-little-endian
                                       '(values (signed 32) (unsigned 32))
-                                      #!+little-endian
+                                      #+little-endian
                                       '(values (unsigned 32) (signed 32))
                                       '(values (unsigned 32) (unsigned 32)))
                                   env))))
                           `(lambda (function type ,@(lambda-vars))
                             (declare (ignore type))
                              (multiple-value-bind
-                               #!-little-endian
+                               #-little-endian
                                (high low)
-                               #!+little-endian
+                               #+little-endian
                                (low high)
                                (%alien-funcall function
                                   ',(make-alien-fun-type
@@ -210,7 +210,7 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
@@ -223,7 +223,7 @@
   (:generator 2
     (inst li res (make-fixup foreign-symbol :foreign))))
 
-#!+linkage-table
+#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -297,7 +297,7 @@
   ;; can't we have something like the :ARG-TN methods for all of this
   ;; mess?  -- AB, 2015-Nov-02
   (let* ((parsed-type (parse-alien-type type nil))
-         (alignment-bits (sb!alien::alien-type-alignment parsed-type))
+         (alignment-bits (sb-alien::alien-type-alignment parsed-type))
          (alignment-bytes (truncate alignment-bits n-byte-bits))
          ;; OFFSET is at least 32-bit aligned, we're trying to pick
          ;; out the cases where we need 64-bit alignment.
@@ -306,7 +306,7 @@
      (ecase *backend-byte-order*
        (:big-endian
         (if (alien-integer-type-p parsed-type)
-            (let ((bits (sb!alien::alien-integer-type-bits parsed-type)))
+            (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
               (let ((byte-offset
                      (cond ((< bits n-word-bits)
                             (- n-word-bytes
@@ -352,7 +352,7 @@ and a pointer to the arguments."
              (let ((offset (* words-processed n-word-bytes)))
                (cond ((not (alien-float-type-p type))
                       (when (and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type)
+                                 (> (sb-alien::alien-integer-type-bits type)
                                     n-word-bits)
                                  (oddp words-processed))
                         (pop gprs)
@@ -448,7 +448,7 @@ and a pointer to the arguments."
                   (inst lwc1 (make-fpr 1) sp (+ n-callee-register-args-bytes
                                                 n-word-bytes)))))
               ((and (alien-integer-type-p result-type)
-                    (> (sb!alien::alien-integer-type-bits result-type)
+                    (> (sb-alien::alien-integer-type-bits result-type)
                        n-word-bits))
                (inst lw v0 sp n-callee-register-args-bytes)
                (inst lw v1 sp (+ n-callee-register-args-bytes n-word-bytes)))
@@ -468,7 +468,7 @@ and a pointer to the arguments."
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let* ((buffer (sb!assem::segment-buffer segment))
+      (let* ((buffer (sb-assem::segment-buffer segment))
              (vector (make-static-vector (length buffer)
                                          :element-type '(unsigned-byte 8)
                                          :initial-contents buffer))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defconstant arg-count-sc (make-sc+offset any-reg-sc-number rcx-offset))
 (defconstant closure-sc (make-sc+offset any-reg-sc-number rax-offset))
@@ -138,10 +138,10 @@
                                 (list (primitive-type-or-lose ',name)
                                       (sc-or-lose ',stack-sc)
                                       (lambda (node block fp value res)
-                                        (sb!c::vop ,ref node block
+                                        (sb-c::vop ,ref node block
                                                    fp value res))
                                       (lambda (node block fp new-val value)
-                                        (sb!c::vop ,set node block
+                                        (sb-c::vop ,set node block
                                                    fp new-val value)))))))))
     (foo (double-float double-stack
                        ancestor-frame-ref/double-float
@@ -172,7 +172,7 @@
   (:info start-lab)
   (:generator 1
     (let ((nop-kind
-           (shiftf (sb!assem::asmstream-inter-function-padding sb!assem:*asmstream*)
+           (shiftf (sb-assem::asmstream-inter-function-padding sb-assem:*asmstream*)
                    :nop)))
       (emit-alignment n-lowtag-bits (if (eq nop-kind :nop) #x90 0)))
     (emit-label start-lab)
@@ -214,7 +214,7 @@
               (* (max (if (> nargs register-arg-count)
                           nargs
                           0)
-                      (sb!c::sb-size (sb-or-lose 'stack)))
+                      (sb-c::sb-size (sb-or-lose 'stack)))
                  n-word-bytes)))
       (make-wired-tn *fixnum-primitive-type* any-reg-sc-number rsp-offset)
       (make-normal-tn *fixnum-primitive-type*)))
@@ -231,7 +231,7 @@
           (stack-size (* (max (if (> nargs register-arg-count)
                                   nargs
                                   0)
-                              (sb!c::sb-size (sb-or-lose 'stack)))
+                              (sb-c::sb-size (sb-or-lose 'stack)))
                          n-word-bytes)))
       (cond ((= fp-offset stack-size)
              (inst sub rsp-tn stack-size)
@@ -261,12 +261,12 @@
 (defun default-unknown-values (vop values nvals node)
   (declare (type (or tn-ref null) values)
            (type unsigned-byte nvals))
-  (let ((type (sb!c::basic-combination-derived-type node)))
+  (let ((type (sb-c::basic-combination-derived-type node)))
     (cond
       ((<= nvals 1)
        (note-this-location vop :single-value-return)
        (cond
-         ((<= (sb!kernel:values-type-max-value-count type)
+         ((<= (sb-kernel:values-type-max-value-count type)
               register-arg-count)
           (when (and (named-type-p type)
                      (eq nil (named-type-name type)))
@@ -274,13 +274,13 @@
             ;; ends right here leavig the :SINGLE-VALUE-RETURN note
             ;; dangling. Let's emit a NOP.
             (inst nop)))
-         ((not (sb!kernel:values-type-may-be-single-value-p type))
+         ((not (sb-kernel:values-type-may-be-single-value-p type))
           (inst mov rsp-tn rbx-tn))
          (t
           (inst cmov :c rsp-tn rbx-tn))))
       ((<= nvals register-arg-count)
        (note-this-location vop :unknown-return)
-       (when (sb!kernel:values-type-may-be-single-value-p type)
+       (when (sb-kernel:values-type-may-be-single-value-p type)
          (let ((regs-defaulted (gen-label)))
            (inst jmp :c regs-defaulted)
            ;; Default the unsupplied registers.
@@ -301,7 +301,7 @@
            (inst mov rbx-tn rsp-tn)
            (emit-label regs-defaulted)))
        (when (< register-arg-count
-                (sb!kernel:values-type-max-value-count type))
+                (sb-kernel:values-type-max-value-count type))
          (inst mov rsp-tn rbx-tn)))
       (t
        (collect ((defaults))
@@ -373,12 +373,12 @@
 ;;; them.)
 (defun receive-unknown-values (args nargs start count node)
   (declare (type tn args nargs start count))
-  (let ((type (sb!c::basic-combination-derived-type node))
+  (let ((type (sb-c::basic-combination-derived-type node))
         (variable-values (gen-label))
         (stack-values (gen-label))
         (done (gen-label))
         (unused-count-p (eq (tn-kind count) :unused)))
-    (when (sb!kernel:values-type-may-be-single-value-p type)
+    (when (sb-kernel:values-type-may-be-single-value-p type)
       (inst jmp :c variable-values)
       (cond ((location= start (first *register-arg-tns*))
              (inst push (first *register-arg-tns*))
@@ -391,13 +391,13 @@
       (emit-label variable-values))
     ;; The stack frame is burnt and RETurned from if there are no
     ;; stack values. In this case quickly reallocate sufficient space.
-    (when (<= (sb!kernel:values-type-min-value-count type)
+    (when (<= (sb-kernel:values-type-min-value-count type)
               register-arg-count)
       (inst cmp nargs (fixnumize register-arg-count))
       (inst jmp :g stack-values)
-      #!+#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
+      #+#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
       (inst sub rsp-tn nargs)
-      #!-#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
+      #-#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
       (progn
         ;; FIXME: This can't be efficient, but LEA (my first choice)
         ;; doesn't do subtraction.
@@ -412,7 +412,7 @@
     (loop
       for arg in *register-arg-tns*
       for i downfrom -1
-      for j below (sb!kernel:values-type-max-value-count type)
+      for j below (sb-kernel:values-type-max-value-count type)
       do (storew arg args i))
     (move start args)
     (unless unused-count-p
@@ -438,13 +438,13 @@
 (defun check-ocfp-and-return-pc (old-fp return-pc)
   #+nil
   (format t "*known-return: old-fp ~S, tn-kind ~S; ~S ~S~%"
-          old-fp (tn-kind old-fp) (sb!c::tn-save-tn old-fp)
-          (tn-kind (sb!c::tn-save-tn old-fp)))
+          old-fp (tn-kind old-fp) (sb-c::tn-save-tn old-fp)
+          (tn-kind (sb-c::tn-save-tn old-fp)))
   #+nil
   (format t "*known-return: return-pc ~S, tn-kind ~S; ~S ~S~%"
           return-pc (tn-kind return-pc)
-          (sb!c::tn-save-tn return-pc)
-          (tn-kind (sb!c::tn-save-tn return-pc)))
+          (sb-c::tn-save-tn return-pc)
+          (tn-kind (sb-c::tn-save-tn return-pc)))
   (unless (and (sc-is old-fp control-stack)
                (= (tn-offset old-fp) ocfp-save-offset))
     (error "ocfp not on stack in standard save location?"))
@@ -604,7 +604,7 @@
 ;;; have been set up in the current frame.
 (macrolet ((define-full-call (vop-name named return variable)
             (aver (not (and variable (eq return :tail))))
-            #!+immobile-code (when named (setq named :direct))
+            #+immobile-code (when named (setq named :direct))
             `(define-vop (,vop-name ,@(when (eq return :unknown)
                                         '(unknown-values-receiver)))
                (:args
@@ -797,7 +797,7 @@
 
                (when (and step-instrumenting
                           ,@(and (eq named :direct)
-                                 `((not (and #!+immobile-code
+                                 `((not (and #+immobile-code
                                              ;; handle-single-step-around-trap can't handle it
                                              (static-fdefn-offset fun))))))
                  (emit-single-step-test)
@@ -806,14 +806,14 @@
                DONE
                (note-this-location vop :call-site)
                ,(cond ((eq named :direct)
-                       #!+immobile-code
+                       #+immobile-code
                        `(let* ((fixup (make-fixup
                                        fun
                                        (if (static-fdefn-offset fun)
                                            :static-call
                                            :named-call)))
                                (target
-                                 (if (and (sb!c::code-immobile-p node)
+                                 (if (and (sb-c::code-immobile-p node)
                                           (not step-instrumenting))
                                      fixup
                                      (progn
@@ -826,10 +826,10 @@
                                        (inst mov rax-tn fixup)
                                        rax-tn))))
                           (inst ,(if (eq return :tail) 'jmp 'call) target))
-                       #!-immobile-code
+                       #-immobile-code
                        `(inst ,(if (eq return :tail) 'jmp 'call)
                               (ea (+ nil-value (static-fun-offset fun)))))
-                      #!-immobile-code
+                      #-immobile-code
                       (named
                        `(inst ,(if (eq return :tail) 'jmp 'call)
                               (ea (- (* fdefn-raw-addr-slot n-word-bytes)
@@ -849,15 +849,15 @@
 
   (define-full-call call nil :fixed nil)
   (define-full-call call-named t :fixed nil)
-  #!-immobile-code
+  #-immobile-code
   (define-full-call static-call-named :direct :fixed nil)
   (define-full-call multiple-call nil :unknown nil)
   (define-full-call multiple-call-named t :unknown nil)
-  #!-immobile-code
+  #-immobile-code
   (define-full-call static-multiple-call-named :direct :unknown nil)
   (define-full-call tail-call nil :tail nil)
   (define-full-call tail-call-named t :tail nil)
-  #!-immobile-code
+  #-immobile-code
   (define-full-call static-tail-call-named :direct :tail nil)
 
   (define-full-call call-variable nil :fixed t)
@@ -865,7 +865,7 @@
 
 ;;; Invoke the function-designator FUN.
 (defun tail-call-unnamed (fun type vop)
-  (let ((relative-call (sb!c::code-immobile-p vop))
+  (let ((relative-call (sb-c::code-immobile-p vop))
         (fun-ea (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
                     fun)))
     (case type
@@ -874,33 +874,33 @@
          (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
          (inst test :byte rbx-tn lowtag-mask)
          (inst jmp :nz (if relative-call
-                           (make-fixup 'tail-call-symbol :assembly-routine)
+                           (make-fixup 'call-symbol :assembly-routine)
                            not-fun))
          (inst jmp fun-ea)
          not-fun
          (unless relative-call
-           (invoke-asm-routine 'jmp 'tail-call-symbol vop))))
+           (invoke-asm-routine 'jmp 'call-symbol vop))))
       (:symbol
-       (invoke-asm-routine 'jmp 'tail-call-symbol vop))
+       (invoke-asm-routine 'jmp 'call-symbol vop))
       (t
        (inst jmp fun-ea)))))
 
 (defun call-unnamed (fun type vop)
   (case type
     (:symbol
-     ;; CALL-SYMBOL returns past the CALL instruction that follows it,
-     ;; which is not needed here, hence TAIL-CALL-SYMBOL.
-     (invoke-asm-routine 'call 'tail-call-symbol vop))
+     (invoke-asm-routine 'call 'call-symbol vop))
     (t
      (assemble ()
        (when (eq type :designator)
          (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
          (inst test :byte rbx-tn lowtag-mask)
          (inst jmp :z call)
-         (invoke-asm-routine 'call 'call-symbol vop))
+         (invoke-asm-routine 'call 'call-symbol vop)
+         (inst jmp ret))
        call
        (inst call (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                      fun))))))
+                      fun))
+       ret))))
 
 ;;; This is defined separately, since it needs special code that BLT's
 ;;; the arguments down. All the real work is done in the assembly
@@ -1200,7 +1200,7 @@
     DONE))
 
 (define-vop (more-kw-arg)
-  (:translate sb!c::%more-kw-arg)
+  (:translate sb-c::%more-kw-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
          (index :scs (any-reg) :to (:result 1) :target keyword))
@@ -1214,7 +1214,7 @@
                            (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 (define-vop (more-arg/c)
-  (:translate sb!c::%more-arg)
+  (:translate sb-c::%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:info index)
@@ -1225,7 +1225,7 @@
     (inst mov value (ea (- (* index n-word-bytes)) object))))
 
 (define-vop (more-arg)
-  (:translate sb!c::%more-arg)
+  (:translate sb-c::%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
          (index :scs (any-reg) :to (:result 1) :target value))
@@ -1303,7 +1303,7 @@
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg) :target count))
   (:arg-types positive-fixnum (:constant fixnum))
   (:info fixed)
@@ -1361,7 +1361,7 @@
 ;; in regard to SB-C::%TYPE-CHECK-ERROR. Figure out why.
 (define-vop (type-check-error/word)
   (:policy :fast-safe)
-  (:translate sb!c::%type-check-error)
+  (:translate sb-c::%type-check-error)
   (:args (object :scs (signed-reg unsigned-reg))
          ;; Types are trees of symbols, so 'any-reg' is not
          ;; really possible.
@@ -1376,7 +1376,7 @@
     (error-call vop 'object-not-type-error object type)))
 (define-vop (type-check-error/word/c)
   (:policy :fast-safe)
-  (:translate sb!c::%type-check-error/c)
+  (:translate sb-c::%type-check-error/c)
   (:args (object :scs (signed-reg unsigned-reg)))
   (:arg-types untagged-num (:constant symbol) (:constant t))
   (:info errcode *location-context*)
@@ -1396,8 +1396,8 @@
   ;; and reading a slot from a thread structure would require an extra
   ;; register on -SB-THREAD. While this isn't critical for x86-64,
   ;; it's more serious for x86.
-  #!+sb-thread (inst cmp :byte (thread-slot-ea thread-stepping-slot) 0)
-  #!-sb-thread (inst cmp :byte (static-symbol-value-ea 'sb!impl::*stepping*) 0))
+  #+sb-thread (inst cmp :byte (thread-slot-ea thread-stepping-slot) 0)
+  #-sb-thread (inst cmp :byte (static-symbol-value-ea 'sb-impl::*stepping*) 0))
 
 (define-vop (step-instrument-before-vop)
   (:policy :fast-safe)

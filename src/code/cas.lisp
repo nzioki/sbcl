@@ -1,4 +1,4 @@
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; COMPARE-AND-SWAP
 ;;;;
@@ -18,7 +18,7 @@
          (casser
           (case (dsd-raw-type slotd)
             ((t) '%instance-cas)
-            #!+(or x86 x86-64)
+            #+(or x86 x86-64)
             ((word) '%raw-instance-cas/word))))
     (unless casser
       (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
@@ -83,7 +83,7 @@ EXPERIMENTAL: Interface subject to change."
   ;;    to use %MACROEXPAND[-1] so as not to lose the "truly-the"-ness
   ;; 2. if both a CAS expander and a macro exist, the CAS expander
   ;;    should be preferred before macroexpanding (just like SETF does)
-    (let ((expanded (sb!xc:macroexpand place environment)))
+    (let ((expanded (sb-xc:macroexpand place environment)))
       (flet ((invalid-place ()
            (error "Invalid place to CAS: ~S -> ~S" place expanded)))
       (unless (consp expanded)
@@ -112,7 +112,7 @@ EXPERIMENTAL: Interface subject to change."
                      (vals nil)
                      (args nil))
                  (dolist (x (reverse (cdr expanded)))
-                   (cond ((sb!xc:constantp x environment)
+                   (cond ((sb-xc:constantp x environment)
                           (push x args))
                          (t
                           (let ((tmp (gensymify x)))
@@ -229,7 +229,7 @@ been defined. (See SB-EXT:CAS for more information.)
 
 (define-cas-expander symbol-value (name &environment env)
   (multiple-value-bind (tmp val cname)
-      (if (sb!xc:constantp name env)
+      (if (sb-xc:constantp name env)
           (values nil nil (constant-form-value name env))
           (values (gensymify name) name nil))
     (let ((symbol (or tmp `',cname)))
@@ -262,18 +262,18 @@ been defined. (See SB-EXT:CAS for more information.)
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun expand-atomic-frob
     (name specified-place diff env
-          &aux (place (sb!xc:macroexpand specified-place env)))
+          &aux (place (sb-xc:macroexpand specified-place env)))
        (declare (type (member atomic-incf atomic-decf) name))
   (flet ((invalid-place ()
            (error "Invalid first argument to ~S: ~S" name specified-place))
          (compute-newval (old) ; used only if no atomic inc vop
            `(logand (,(case name (atomic-incf '+) (atomic-decf '-)) ,old
-                     (the sb!vm:signed-word ,diff)) sb!ext:most-positive-word))
+                     (the sb-vm:signed-word ,diff)) sb-ext:most-positive-word))
          (compute-delta () ; used only with atomic inc vop
            `(logand ,(case name
-                       (atomic-incf `(the sb!vm:signed-word ,diff))
-                       (atomic-decf `(- (the sb!vm:signed-word ,diff))))
-                    sb!ext:most-positive-word)))
+                       (atomic-incf `(the sb-vm:signed-word ,diff))
+                       (atomic-decf `(- (the sb-vm:signed-word ,diff))))
+                    sb-ext:most-positive-word)))
     (declare (ignorable #'compute-newval #'compute-delta))
     (when (and (symbolp place)
                (eq (info :variable :kind place) :global)
@@ -294,12 +294,12 @@ been defined. (See SB-EXT:CAS for more information.)
            (invalid-place))
          (with-unique-names (array)
            `(let ((,array (the (simple-array word (*)) ,(car args))))
-              #!+compare-and-swap-vops
+              #+compare-and-swap-vops
               (%array-atomic-incf/word
                ,array
                (check-bound ,array (array-dimension ,array 0) ,(cadr args))
                ,(compute-delta))
-              #!-compare-and-swap-vops
+              #-compare-and-swap-vops
               ,(with-unique-names (index old-value)
                 `(without-interrupts
                   (let* ((,index ,(cadr args))
@@ -330,20 +330,20 @@ been defined. (See SB-EXT:CAS for more information.)
          (let* ((accessor-info (structure-instance-accessor-p op))
                 (slotd (cdr accessor-info))
                 (type (dsd-type slotd)))
-           (unless (and (eq 'sb!vm:word (dsd-raw-type slotd))
-                        (type= (specifier-type type) (specifier-type 'sb!vm:word)))
+           (unless (and (eq 'sb-vm:word (dsd-raw-type slotd))
+                        (type= (specifier-type type) (specifier-type 'sb-vm:word)))
              (error "~S requires a slot of type (UNSIGNED-BYTE ~S), not ~S: ~S"
-                    name sb!vm:n-word-bits type place))
+                    name sb-vm:n-word-bits type place))
            (when (dsd-read-only slotd)
              (error "Cannot use ~S with structure accessor for a read-only slot: ~S"
                     name place))
-           #!+compare-and-swap-vops
-           `(truly-the sb!vm:word
+           #+compare-and-swap-vops
+           `(truly-the sb-vm:word
              (%raw-instance-atomic-incf/word
               (the ,(dd-name (car accessor-info)) ,@args)
               ,(dsd-index slotd)
               ,(compute-delta)))
-           #!-compare-and-swap-vops
+           #-compare-and-swap-vops
            (with-unique-names (structure old-value)
              `(without-interrupts
                (let* ((,structure ,@args)
@@ -376,8 +376,8 @@ which is well-defined over two different domains:
 DIFF defaults to 1.
 
 EXPERIMENTAL: Interface subject to change."
-  sb!vm:n-word-bits most-positive-word
-  sb!xc:most-positive-fixnum sb!xc:most-negative-fixnum)
+  sb-vm:n-word-bits most-positive-word
+  sb-xc:most-positive-fixnum sb-xc:most-negative-fixnum)
   (expand-atomic-frob 'atomic-incf place diff env))
 
 (defmacro atomic-decf (&environment env place &optional (diff 1))
@@ -405,15 +405,6 @@ which is well-defined over two different domains:
 DIFF defaults to 1.
 
 EXPERIMENTAL: Interface subject to change."
-  sb!vm:n-word-bits most-positive-word
-  sb!xc:most-negative-fixnum sb!xc:most-positive-fixnum)
+  sb-vm:n-word-bits most-positive-word
+  sb-xc:most-negative-fixnum sb-xc:most-positive-fixnum)
   (expand-atomic-frob 'atomic-decf place diff env))
-
-;; Interpreter stubs for ATOMIC-INCF.
-#!+(and compare-and-swap-vops (host-feature sb-xc))
-(progn
-  ;; argument types are declared in vm-fndb
-  (defun %array-atomic-incf/word (array index diff)
-    (%array-atomic-incf/word array index diff))
-  (defun %raw-instance-atomic-incf/word (instance index diff)
-    (%raw-instance-atomic-incf/word instance index diff)))

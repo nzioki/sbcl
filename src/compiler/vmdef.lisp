@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Return the template having the specified name, or die trying.
 (defun template-or-lose (x)
@@ -141,8 +141,8 @@
                  (tn (if (logbitp 0 temp)
                          (make-wired-tn
                           nil
-                          (ldb (byte sb!vm:sc-number-bits 1) temp)
-                          (ash temp (- (1+ sb!vm:sc-number-bits))))
+                          (ldb (byte sb-vm:sc-number-bits 1) temp)
+                          (ash temp (- (1+ sb-vm:sc-number-bits))))
                          (make-restricted-tn nil (ash temp -1))))
                  (write-ref (reference-tn tn t)))
                      ;; KLUDGE: These formulas must be consistent with
@@ -177,7 +177,7 @@
       (when targets
         (dotimes (i (length targets))
           (let ((target (aref targets i)))
-            (sb!regalloc:target-if-desirable
+            (sb-regalloc:target-if-desirable
                     (aref refs (ldb (byte 8 8) target))
                     (aref refs (ldb (byte 8 0) target)))))))
     vop))
@@ -196,7 +196,7 @@
 
 ;;; Return a function type specifier describing TEMPLATE's type computed
 ;;; from the operand type restrictions.
-#!-sb-fluid (declaim (inline template-conditional-p))
+#-sb-fluid (declaim (inline template-conditional-p))
 (defun template-conditional-p (template)
   (declare (type template template))
   (let ((rtypes (template-result-types template)))

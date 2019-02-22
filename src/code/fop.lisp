@@ -1,6 +1,6 @@
 ;;;; FOP definitions
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 ;;; Bind STACK-VAR and PTR-VAR to the start of a subsequence of
 ;;; the fop stack of length COUNT, then execute BODY.
@@ -11,7 +11,7 @@
   `(macrolet ((fop-stack-ref (i)
                 `(locally
                      #-sb-xc-host
-                     (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                    (svref ,',stack-var (truly-the index ,i)))))
      (let* (,@(when stack-expr
                 (list `(,stack-var (the simple-vector ,stack-expr))))
@@ -78,10 +78,13 @@
           (sbit (cdr **fop-signatures**) opcode) pushp))
   name)
 
-;;; a helper function for reading string values from FASL files: sort
+;;; helper functions for reading string values from FASL files: sort
 ;;; of like READ-SEQUENCE specialized for files of (UNSIGNED-BYTE 8),
 ;;; with an automatic conversion from (UNSIGNED-BYTE 8) into CHARACTER
 ;;; for each element read
+
+;;; Variation 1: character string, transfer elements of type (unsigned-byte 8)
+;;: [Can we eliminate this one?]
 (defun read-string-as-bytes (stream string &optional (length (length string)))
   (declare (type (simple-array character (*)) string)
            (type index length)
@@ -89,8 +92,9 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb!xc:code-char (fast-read-byte)))))
+            (sb-xc:code-char (fast-read-byte)))))
   string)
+;;; Variation 2: base-string, transfer elements of type (unsigned-byte 8)
 (defun read-base-string-as-bytes (stream string &optional (length (length string)))
   (declare (type (simple-array base-char (*)) string)
            (type index length)
@@ -98,18 +102,30 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb!xc:code-char (fast-read-byte)))))
+            (sb-xc:code-char (fast-read-byte)))))
   string)
-#!+(and sb-unicode (host-feature sb-xc))
-(defun read-string-as-unsigned-byte-32
+;;; Variation 3: character-string, transfer elements of type varint
+(defun read-char-string-as-varints
     (stream string &optional (length (length string)))
   (declare (type (simple-array character (*)) string)
            (type index length)
            (optimize speed))
   (with-fast-read-byte ((unsigned-byte 8) stream)
-    (dotimes (i length)
-      (setf (aref string i)
-            (sb!xc:code-char (fast-read-u-integer 4)))))
+    ;; OAOO violation- This repeats code in DEFINE-READ-VAR-INTEGER in 'debug-var-io'
+    ;; but there isn't a good expansion of that macro that would operate on a stream
+    ;; (which is ok in itself) but also that would entail only a single wrapping of
+    ;; WITH-FAST-READ-BYTE for all work.
+    ;; i.e. we don't want to update the stream slots after each varint.
+    (flet ((read-varint ()
+             (loop for shift :of-type (integer 0 28) from 0 by 7 ; position in integer
+                   for octet = (fast-read-byte)
+                   for accum :of-type (mod #.sb-xc:char-code-limit)
+                     = (logand octet #x7F)
+                     then (logior (ash (logand octet #x7F) shift) accum)
+                   unless (logbitp 7 octet) return accum)))
+      (dotimes (i length)
+        (setf (aref string i)
+              (sb-xc:code-char (read-varint))))))
   string)
 
 ;;;; miscellaneous fops
@@ -134,13 +150,13 @@
 (!define-fop 48 :not-host (fop-struct ((:operands size) layout))
   (let ((res (%make-instance size)) ; number of words excluding header
         ;; Discount the layout from number of user-visible words.
-        (n-data-words (- size sb!vm:instance-data-start)))
+        (n-data-words (- size sb-vm:instance-data-start)))
     (setf (%instance-layout res) layout)
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
       (declare (type index ptr))
       (let ((bitmap (layout-bitmap layout)))
         ;; Values on the stack are in the same order as in the structure itself.
-        (do ((i sb!vm:instance-data-start (1+ i)))
+        (do ((i sb-vm:instance-data-start (1+ i)))
             ((>= i size))
           (declare (type index i))
           (let ((val (fop-stack-ref ptr)))
@@ -185,12 +201,7 @@
               (setf (slot-value obj slot-name) val))))))
 
 (!define-fop 64 (fop-end-group () nil)
-  (/show0 "THROWing FASL-GROUP-END")
   (throw 'fasl-group-end t))
-
-;;; We used to have FOP-NORMAL-LOAD as 81 and FOP-MAYBE-COLD-LOAD as
-;;; 82 until GENESIS learned how to work with host symbols and
-;;; packages directly instead of piggybacking on the host code.
 
 (!define-fop 62 (fop-verify-table-size () nil)
   (let ((expected-index (read-word-arg (fasl-input-stream))))
@@ -221,7 +232,7 @@
                      (svref buffer base-p) string))
              (funcall (if (eql base-p 1)
                           'read-base-string-as-bytes
-                          'read-string-as-unsigned-byte-32)
+                          'read-char-string-as-varints)
                       (%fasl-input-stream fasl-input) string namelen)
              (values string namelen elt-type)))
          (aux-fop-intern (length+flag package fasl-input)
@@ -233,8 +244,7 @@
                         :format-arguments
                         (list (subseq name 0 length)
                               (undefined-package-error package)))
-                 (push-fop-table (without-package-locks
-                                  (%intern name length package elt-type))
+                 (push-fop-table (%intern name length package elt-type t)
                                  fasl-input))))
          ;; Symbol-hash is usually computed lazily and memoized into a symbol.
          ;; Laziness slightly improves the speed of allocation.
@@ -269,8 +279,7 @@
 
 (!define-fop 156 :not-host (fop-named-package-save ((:operands length)) nil)
   (let ((package-name (make-string length)))
-    #!-sb-unicode (read-string-as-bytes (fasl-input-stream) package-name)
-    #!+sb-unicode (read-string-as-unsigned-byte-32 (fasl-input-stream) package-name)
+    (read-char-string-as-varints (fasl-input-stream) package-name)
     (push-fop-table
      (handler-case (find-undeleted-package-or-lose package-name)
        (simple-package-error (c)
@@ -300,7 +309,7 @@
 
 (!define-fop 34 (fop-word-integer)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
-    (fast-read-s-integer #.sb!vm:n-word-bytes)))
+    (fast-read-s-integer #.sb-vm:n-word-bytes)))
 
 (!define-fop 35 (fop-byte-integer)
   ;; FIXME: WITH-FAST-READ-BYTE for exactly 1 byte is not really faster/better
@@ -332,19 +341,28 @@
                       (,reader))))))
     (define-complex-fop 72 fop-complex-single-float single-float)
     (define-complex-fop 73 fop-complex-double-float double-float)
-    #!+long-float
+    #+long-float
     (define-complex-fop 67 fop-complex-long-float long-float)
     (define-float-fop 46 fop-single-float single-float)
     (define-float-fop 47 fop-double-float double-float)
-    #!+long-float
+    #+long-float
     (define-float-fop 52 fop-long-float long-float)))
 
-#!+sb-simd-pack
+#+sb-simd-pack
 (!define-fop 88 :not-host (fop-simd-pack)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
-    (%make-simd-pack (fast-read-s-integer 8)
-                     (fast-read-u-integer 8)
-                     (fast-read-u-integer 8))))
+    (let ((tag (fast-read-s-integer 8)))
+      (cond #+sb-simd-pack-256
+            ((logbitp 2 tag)
+             (%make-simd-pack-256 (logand tag #b11)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)))
+            (t
+             (%make-simd-pack tag
+                              (fast-read-u-integer 8)
+                              (fast-read-u-integer 8)))))))
 
 ;;;; loading lists
 
@@ -400,13 +418,9 @@
    (read-base-string-as-bytes (fasl-input-stream)
                               (make-string length :element-type 'base-char))))
 
-;; FIXME: can save space by UTF-8 encoding, or use 1 bit to indicate pure ASCII
-;; in the fasl even though the result will be a non-base string.
-#!+sb-unicode
 (!define-fop 160 :not-host (fop-character-string ((:operands length)))
   (logically-readonlyize
-   (read-string-as-unsigned-byte-32 (fasl-input-stream)
-                                    (make-string length))))
+   (read-char-string-as-varints (fasl-input-stream) (make-string length))))
 
 (!define-fop 92 (fop-vector ((:operands size)))
   (if (zerop size)
@@ -422,25 +436,25 @@
 (!define-fop 89 :not-host (fop-array (vec))
   (let* ((rank (read-word-arg (fasl-input-stream)))
          (length (length vec))
-         (res (make-array-header sb!vm:simple-array-widetag rank)))
+         (res (make-array-header sb-vm:simple-array-widetag rank)))
     (declare (simple-array vec)
-             (type (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits)) rank))
+             (type (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits)) rank))
     (set-array-header res vec length nil 0
                       (fop-list-from-stack (operand-stack) rank)
                       nil t)
     res))
 
 (defglobal **saetp-bits-per-length**
-    (let ((array (make-array (1+ sb!vm:widetag-mask)
+    (let ((array (make-array (1+ sb-vm:widetag-mask)
                              :element-type '(unsigned-byte 8)
                              :initial-element 255)))
-      (loop for saetp across sb!vm:*specialized-array-element-type-properties*
+      (loop for saetp across sb-vm:*specialized-array-element-type-properties*
             do
-            (setf (aref array (sb!vm:saetp-typecode saetp))
-                  (sb!vm:saetp-n-bits saetp)))
+            (setf (aref array (sb-vm:saetp-typecode saetp))
+                  (sb-vm:saetp-n-bits saetp)))
       array)
     "255 means bad entry.")
-(declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb!vm:widetag-mask)))
+(declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb-vm:widetag-mask)))
                **saetp-bits-per-length**))
 
 ;; No ALLOCATE-VECTOR on host (nor READ-N-BYTES)
@@ -450,9 +464,9 @@
          (bits-per-length (aref **saetp-bits-per-length** widetag))
          (bits (progn (aver (< bits-per-length 255))
                       (* length bits-per-length)))
-         (bytes (ceiling bits sb!vm:n-byte-bits))
-         (words (ceiling bytes sb!vm:n-word-bytes))
-         (vector (if (and (= widetag sb!vm:simple-vector-widetag)
+         (bytes (ceiling bits sb-vm:n-byte-bits))
+         (words (ceiling bytes sb-vm:n-word-bytes))
+         (vector (if (and (= widetag sb-vm:simple-vector-widetag)
                           (= words 0))
                      #()
                      (logically-readonlyize
@@ -538,25 +552,25 @@
 (!define-fop #xE0 :not-host (fop-load-code ((:operands immobile-p
                                                        n-boxed-words
                                                        n-code-bytes)))
-  (let ((n-constants (- n-boxed-words sb!vm:code-constants-offset)))
+  (let ((n-constants (- n-boxed-words sb-vm:code-constants-offset)))
     ;; stack has (at least) N-CONSTANTS words plus debug-info
     (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
       (let* ((debug-info-index (+ ptr n-constants))
-             (n-boxed-words (+ sb!vm:code-constants-offset n-constants))
-             (code (sb!c:allocate-code-object
+             (n-boxed-words (+ sb-vm:code-constants-offset n-constants))
+             (code (sb-c:allocate-code-object
                     (if (eql immobile-p 1) :immobile :dynamic)
-                    (align-up n-boxed-words sb!c::code-boxed-words-align)
+                    (align-up n-boxed-words sb-c::code-boxed-words-align)
                     n-code-bytes)))
         (setf (%code-debug-info code) (svref stack debug-info-index))
-        (loop for i of-type index from sb!vm:code-constants-offset
+        (loop for i of-type index from sb-vm:code-constants-offset
               for j of-type index from ptr below debug-info-index
               do (setf (code-header-ref code i) (svref stack j)))
         (with-pinned-objects (code)
           (read-n-bytes (fasl-input-stream) (code-instructions code) 0 n-code-bytes)
-          (sb!c::apply-fasl-fixups stack code))
+          (sb-c::apply-fasl-fixups stack code))
         #-sb-xc-host
         (when (typep (code-header-ref code (1- n-boxed-words))
-                     '(cons (eql sb!c::coverage-map)))
+                     '(cons (eql sb-c::coverage-map)))
           ;; Record this in the global list of coverage-instrumented code.
           (atomic-push (make-weak-pointer code) (cdr *code-coverage-info*)))
         code))))
@@ -658,10 +672,10 @@
         (#x6d structure-object)
         (#x6e condition)
         (#x6f definition-source-location)
-        (#x70 sb!c::debug-fun)
-        (#x71 sb!c::compiled-debug-fun)
-        (#x72 sb!c::debug-info)
-        (#x73 sb!c::compiled-debug-info)
-        (#x74 sb!c::debug-source)
+        (#x70 sb-c::debug-fun)
+        (#x71 sb-c::compiled-debug-fun)
+        (#x72 sb-c::debug-info)
+        (#x73 sb-c::compiled-debug-info)
+        (#x74 sb-c::debug-source)
         (#x75 defstruct-description)
         (#x76 defstruct-slot-description)))

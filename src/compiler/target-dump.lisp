@@ -11,30 +11,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FASL")
-
-;;; a helper function shared by DUMP-SIMPLE-CHARACTER-STRING and
-;;; DUMP-SYMBOL (in the target compiler: the cross-compiler uses the
-;;; portability knowledge and always dumps BASE-STRINGS).
-#!+sb-unicode
-(defun dump-characters-of-string (s fasl-output)
-  (declare (type string s) (type fasl-output fasl-output))
-  (dovector (c s)
-    (dump-unsigned-byte-32 (char-code c) fasl-output))
-  (values))
-#!+sb-unicode
-(defun dump-simple-character-string (s file)
-  (declare (type (simple-array character (*)) s))
-  (dump-fop 'fop-character-string file (length s))
-  (dump-characters-of-string s file)
-  (values))
+(in-package "SB-FASL")
 
 ;;; Dump the first N bytes of VEC out to FILE. VEC is some sort of unboxed
 ;;; vector-like thing that we can BLT from.
 (defun dump-raw-bytes (vec n fasl-output)
   (declare (type index n) (type fasl-output fasl-output))
   ;; FIXME: Why not WRITE-SEQUENCE?
-  (sb!impl::buffer-output (fasl-output-stream fasl-output) vec 0 n)
+  (sb-impl::buffer-output (fasl-output-stream fasl-output) vec 0 n)
   (values))
 
 ;;; Dump a multi-dimensional array. Note: any displacements are folded out.
@@ -58,7 +42,7 @@
     (dump-word rank file)
     (eq-save-object array file)))
 
-#!+(and long-float x86)
+#+(and long-float x86)
 (defun dump-long-float (float file)
   (declare (long-float float))
   (let ((exp-bits (long-float-exp-bits float))
@@ -71,7 +55,7 @@
     (dump-integer-as-n-bytes high-bits 4 file)
     (dump-integer-as-n-bytes exp-bits 2 file)))
 
-#!+(and long-float sparc)
+#+(and long-float sparc)
 (defun dump-long-float (float file)
   (declare (long-float float))
   (let ((exp-bits (long-float-exp-bits float))

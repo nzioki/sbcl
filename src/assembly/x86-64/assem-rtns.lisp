@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; RETURN-MULTIPLE
 
@@ -137,7 +137,7 @@
     ;; Calculate NARGS (as a fixnum)
     (move nargs rsi)
     (inst sub nargs rsp-tn)
-    #!-#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
+    #-#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
     (inst shr nargs (- word-shift n-fixnum-tag-bits))
 
     ;; Check for all the args fitting the registers.
@@ -222,21 +222,15 @@
 
   (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
   (inst test :byte rbx-tn lowtag-mask)
-  (inst jmp :nz (make-fixup 'tail-call-symbol :assembly-routine))
+  (inst jmp :nz (make-fixup 'call-symbol :assembly-routine))
   (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
 
 #+sb-assembling
 (define-assembly-routine (call-symbol
-                          (:return-style :none)
-                          (:export tail-call-symbol))
+                          (:return-style :none))
     ((:temp fun (any-reg descriptor-reg) rax-offset)
      (:temp length (any-reg descriptor-reg) rax-offset)
      (:temp vector (any-reg descriptor-reg) rbx-offset))
-  ;; Jump over CALL QWORD PTR [RAX-3] in the caller
-  (inst add :qword (ea rsp-tn) 3)
-  (emit-alignment n-lowtag-bits :long-nop)
-
-  TAIL-CALL-SYMBOL
   (%lea-for-lowtag-test vector fun other-pointer-lowtag)
   (inst test :byte vector lowtag-mask)
   (inst jmp :nz not-callable)
@@ -258,11 +252,11 @@
   (let ((fdefn-raw-addr
           (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag)
               fun)))
-    #!+immobile-code
+    #+immobile-code
     (progn
       (inst lea vector fdefn-raw-addr)
       (inst jmp vector))
-    #!-immobile-code
+    #-immobile-code
     (inst jmp fdefn-raw-addr))
   UNDEFINED
   (inst jmp (make-fixup 'undefined-tramp :assembly-routine))
@@ -271,7 +265,7 @@
   (inst jmp :e undefined)
 
   (inst pop (ea n-word-bytes rbp-tn))
-  (emit-error-break nil error-trap (error-number-or-lose 'sb!kernel::object-not-callable-error)
+  (emit-error-break nil error-trap (error-number-or-lose 'sb-kernel::object-not-callable-error)
                     (list fun)))
 
 
@@ -388,17 +382,17 @@
   (inst push rdi-tn)
   ;; stack: spill[2], ret-pc, object, index, value-to-store
 
-  #!-sb-thread
+  #-sb-thread
   (progn
     ;; Load THREAD-BASE-TN from the all_threads. Does not need to be spilled
     ;; to stack, because we do do not give the register allocator access to it.
     ;; And call_into_lisp saves it as per convention, not that it matters,
     ;; because there's no way to get back into C code anyhow.
-    #!+sb-dynamic-core
+    #+sb-dynamic-core
     (progn
       (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
       (inst mov thread-base-tn (ea thread-base-tn)))
-    #!-sb-dynamic-core
+    #-sb-dynamic-core
     (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign))))
 
   (inst mov temp-reg-tn (ea 24 rsp-tn))
@@ -409,7 +403,7 @@
       (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
       (inst jmp :ae try-dynamic-space)
       (inst mov rdi-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-      (inst bts (ea rdi-tn) temp-reg-tn :lock)
+      (inst bts :dword (ea rdi-tn) temp-reg-tn :lock)
       (inst jmp store)
 
       TRY-DYNAMIC-SPACE
@@ -451,13 +445,13 @@
 #+sb-assembling
 (define-assembly-routine (touch-gc-card (:return-style :none)) ()
   ;; stack: ret-pc, object
-  #!-sb-thread
+  #-sb-thread
   (progn
-    #!+sb-dynamic-core
+    #+sb-dynamic-core
     (progn
       (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
       (inst mov thread-base-tn (ea thread-base-tn)))
-    #!-sb-dynamic-core
+    #-sb-dynamic-core
     (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign))))
   (inst mov temp-reg-tn (ea 8 rsp-tn))
   (inst sub temp-reg-tn (thread-slot-ea thread-varyobj-space-addr-slot))
@@ -467,7 +461,7 @@
 
   (inst push rax-tn)
   (inst mov rax-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-  (inst bts (ea rax-tn) temp-reg-tn :lock)
+  (inst bts :dword (ea rax-tn) temp-reg-tn :lock)
   (inst pop rax-tn)
 
   DONE

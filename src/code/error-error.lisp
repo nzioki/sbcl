@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; These specials are used by ERROR-ERROR to track the success of recovery
 ;;; attempts. Not to be confused with SB-KERNEL::*CURRENT-ERROR-DEPTH*.
@@ -21,7 +21,7 @@
   (let ((*error-error-depth* (1+ *error-error-depth*)))
     (when (> *error-error-depth* 4)
       (/show0 "*ERROR-ERROR-DEPTH* too big, trying HALT")
-      (%primitive sb!c:halt)
+      (%primitive sb-c:halt)
       (/show0 "*ERROR-ERROR-DEPTH* too big, trying THROW")
       (throw 'toplevel-catcher nil))
     ;; We can be somewhat more relaxed now, the above will save us.
@@ -34,7 +34,7 @@
                (dolist (item messages)
                  (princ item *terminal-io*))
                (terpri *terminal-io*)
-               (sb!debug:print-backtrace :stream *terminal-io* :emergency-best-effort t)
+               (sb-debug:print-backtrace :stream *terminal-io* :emergency-best-effort t)
                (force-output *terminal-io*)
                (invoke-debugger
                 (coerce-to-condition "Maximum error nesting depth exceeded"
@@ -70,6 +70,6 @@
             (t
              (safely-print "Will try to halt this thread as a last resort.")
              (/show0 "*ERROR-ERROR-DEPTH* too big, trying HALT")
-             (%primitive sb!c:halt)
+             (%primitive sb-c:halt)
              (/show0 "*ERROR-ERROR-DEPTH* too big, trying THROW")
              (throw '%abort-thread nil))))))))

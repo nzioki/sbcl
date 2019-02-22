@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; moves and coercions
 
@@ -210,27 +210,27 @@
                       (move result
                             ,(if (eq size :dword) 'value 'eax-tn))))))))
 
-  (def-system-ref-and-set sb!c::sap-ref-8-with-offset sb!c::%set-sap-ref-8-with-offset
+  (def-system-ref-and-set sb-c::sap-ref-8-with-offset sb-c::%set-sap-ref-8-with-offset
     unsigned-reg positive-fixnum :byte nil)
-  (def-system-ref-and-set sb!c::signed-sap-ref-8-with-offset sb!c::%set-signed-sap-ref-8-with-offset
+  (def-system-ref-and-set sb-c::signed-sap-ref-8-with-offset sb-c::%set-signed-sap-ref-8-with-offset
     signed-reg tagged-num :byte t)
-  (def-system-ref-and-set sb!c::sap-ref-16-with-offset sb!c::%set-sap-ref-16-with-offset
+  (def-system-ref-and-set sb-c::sap-ref-16-with-offset sb-c::%set-sap-ref-16-with-offset
     unsigned-reg positive-fixnum :word nil)
-  (def-system-ref-and-set sb!c::signed-sap-ref-16-with-offset sb!c::%set-signed-sap-ref-16-with-offset
+  (def-system-ref-and-set sb-c::signed-sap-ref-16-with-offset sb-c::%set-signed-sap-ref-16-with-offset
     signed-reg tagged-num :word t)
-  (def-system-ref-and-set sb!c::sap-ref-32-with-offset sb!c::%set-sap-ref-32-with-offset
+  (def-system-ref-and-set sb-c::sap-ref-32-with-offset sb-c::%set-sap-ref-32-with-offset
     unsigned-reg unsigned-num :dword nil)
-  (def-system-ref-and-set sb!c::signed-sap-ref-32-with-offset sb!c::%set-signed-sap-ref-32-with-offset
+  (def-system-ref-and-set sb-c::signed-sap-ref-32-with-offset sb-c::%set-signed-sap-ref-32-with-offset
     signed-reg signed-num :dword t)
-  (def-system-ref-and-set sb!c::sap-ref-sap-with-offset sb!c::%set-sap-ref-sap-with-offset
+  (def-system-ref-and-set sb-c::sap-ref-sap-with-offset sb-c::%set-sap-ref-sap-with-offset
     sap-reg system-area-pointer :dword)
-  (def-system-ref-and-set sb!c::sap-ref-lispobj-with-offset sb!c::%set-sap-ref-lispobj-with-offset
+  (def-system-ref-and-set sb-c::sap-ref-lispobj-with-offset sb-c::%set-sap-ref-lispobj-with-offset
     descriptor-reg * :dword))
 
 ;;;; SAP-REF-DOUBLE
 
 (define-vop (sap-ref-double-with-offset)
-  (:translate sb!c::sap-ref-double-with-offset)
+  (:translate sb-c::sap-ref-double-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (signed-reg immediate)))
@@ -251,7 +251,7 @@
                               :disp disp)))))))
 
 (define-vop (%set-sap-ref-double-with-offset)
-  (:translate sb!c::%set-sap-ref-double-with-offset)
+  (:translate sb-c::%set-sap-ref-double-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg) :to (:eval 0))
          (offset :scs (signed-reg) :to (:eval 0))
@@ -283,7 +283,7 @@
                   (inst fxch value)))))))
 
 (define-vop (%set-sap-ref-double-with-offset-c)
-  (:translate sb!c::%set-sap-ref-double-with-offset)
+  (:translate sb-c::%set-sap-ref-double-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg) :to (:eval 0))
          (value :scs (double-reg)))
@@ -317,7 +317,7 @@
 ;;;; SAP-REF-SINGLE
 
 (define-vop (sap-ref-single-with-offset)
-  (:translate sb!c::sap-ref-single-with-offset)
+  (:translate sb-c::sap-ref-single-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (signed-reg immediate)))
@@ -337,7 +337,7 @@
           (inst fld (make-ea :dword :base sap :index offset :disp disp)))))))
 
 (define-vop (%set-sap-ref-single-with-offset)
-  (:translate sb!c::%set-sap-ref-single-with-offset)
+  (:translate sb-c::%set-sap-ref-single-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg) :to (:eval 0))
          (offset :scs (signed-reg) :to (:eval 0))
@@ -369,7 +369,7 @@
                   (inst fxch value)))))))
 
 (define-vop (%set-sap-ref-single-with-offset-c)
-  (:translate sb!c::%set-sap-ref-single-with-offset)
+  (:translate sb-c::%set-sap-ref-single-with-offset)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg) :to (:eval 0))
          (value :scs (single-reg)))
@@ -408,8 +408,8 @@
   (:args (sap :scs (sap-reg))
          (offset :scs (signed-reg)))
   (:arg-types system-area-pointer signed-num)
-  (:results (result :scs (#!+long-float long-reg #!-long-float double-reg)))
-  (:result-types #!+long-float long-float #!-long-float double-float)
+  (:results (result :scs (#+long-float long-reg #-long-float double-reg)))
+  (:result-types #+long-float long-float #-long-float double-float)
   (:generator 5
      (with-empty-tn@fp-top(result)
         (inst fldl (make-ea :dword :base sap :index offset)))))
@@ -420,13 +420,13 @@
   (:args (sap :scs (sap-reg)))
   (:arg-types system-area-pointer (:constant (signed-byte 32)))
   (:info offset)
-  (:results (result :scs (#!+long-float long-reg #!-long-float double-reg)))
-  (:result-types #!+long-float long-float #!-long-float double-float)
+  (:results (result :scs (#+long-float long-reg #-long-float double-reg)))
+  (:result-types #+long-float long-float #-long-float double-float)
   (:generator 4
      (with-empty-tn@fp-top(result)
         (inst fldl (make-ea :dword :base sap :disp offset)))))
 
-#!+long-float
+#+long-float
 (define-vop (%set-sap-ref-long)
   (:translate %set-sap-ref-long)
   (:policy :fast-safe)

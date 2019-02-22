@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Fill 'vector' with 'item', unrolling the loop, and taking care
 ;;; to deal with pre- and post-loop pieces for proper alignment.
@@ -25,7 +25,9 @@
                           (:arg  end    (any-reg descriptor-reg) rsi-offset)
                           (:res  res    (descriptor-reg) rdx-offset)
                           (:temp count unsigned-reg rcx-offset)
-                          (:temp wordpair sse-reg float0-offset))
+                          ;; storage class doesn't matter since all float regs
+                          ;; and sse regs map to the same storage base.
+                          (:temp wordpair double-reg float0-offset))
   (move res vector) ; to "use" res
   (move count end)
   (inst sub count start)

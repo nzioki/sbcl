@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defstruct arg-state
   (stack-frame-size 0))
@@ -167,7 +167,7 @@
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:vop-var vop)
   (:generator 0
-    (let ((cur-nfp (sb!c::current-nfp-tn vop)))
+    (let ((cur-nfp (sb-c::current-nfp-tn vop)))
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
       (move function cfunc)

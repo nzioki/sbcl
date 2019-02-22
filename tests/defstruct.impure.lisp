@@ -751,16 +751,15 @@
             (setf (find-class 'foo) nil)
             (defstruct foo slot-1)))))
 
-;;; bug 348, evaluation order of slot writer arguments. Fixed by Gabor
-;;; Melis.
 (defstruct bug-348 x)
 
-(assert (eql -1 (let ((i (eval '-2))
-                      (x (make-bug-348)))
-                  (funcall #'(setf bug-348-x)
-                           (incf i)
-                           (aref (vector x) (incf i)))
-                  (bug-348-x x))))
+(with-test (:name :eval-order-slot-writer-arguments)
+  (assert (eql -1 (let ((i (eval '-2))
+                        (x (make-bug-348)))
+                    (funcall #'(setf bug-348-x)
+                             (incf i)
+                             (aref (vector x) (incf i)))
+                    (bug-348-x x)))))
 
 ;;; obsolete instance trapping
 ;;;
@@ -1353,6 +1352,8 @@ redefinition."
                (assert win)))))
     (assert-that "redefinition of X-Y clobbers structure accessor"
                  '(defun x-y (z) (list :x-y z)))
+    (assert-that "redefinition of COPY-X clobbers structure copier"
+                 '(defun copy-x (a b) (list a b)))
     (assert-that "redefinition of X-P clobbers structure predicate"
                  '(defun x-p (z) (list 'bork z))))
   (assert (equalp

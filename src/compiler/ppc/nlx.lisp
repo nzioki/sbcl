@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -42,7 +42,7 @@
   (:args (catch :scs (descriptor-reg))
          (nfp :scs (descriptor-reg))
          (nsp :scs (descriptor-reg)))
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:vop-var vop)
   (:generator 10
     (store-tl-symbol-value catch *current-catch-block* temp)
@@ -126,14 +126,14 @@
 ;;;
 (define-vop (set-unwind-protect)
   (:args (uwp :scs (any-reg)))
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:generator 7
     (store-tl-symbol-value uwp *current-unwind-protect-block* temp)))
 
 
 (define-vop (unlink-catch-block)
   (:temporary (:scs (any-reg)) block)
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
   (:translate %catch-breakup)
   (:generator 17
@@ -143,7 +143,7 @@
 
 (define-vop (unlink-unwind-protect)
   (:temporary (:scs (any-reg)) block)
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
   (:translate %unwind-protect-breakup)
   (:generator 17

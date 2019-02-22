@@ -10,9 +10,13 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; utilities
+
+;;; like INDEX, but only up to half the maximum. Used by hash-table
+;;; code that does plenty to (aref v (* 2 i)) and (aref v (1+ (* 2 i))).
+(deftype index/2 () `(integer 0 (,(floor sb-xc:array-dimension-limit 2))))
 
 ;;; T if and only if table has non-null weakness kind.
 (declaim (inline hash-table-weak-p))
@@ -51,9 +55,9 @@
 (defmacro with-concurrent-access-check (hash-table operation &body body)
   (declare (ignorable hash-table operation)
            (type (member :read :write) operation))
-  #!-sb-hash-table-debug
+  #-sb-hash-table-debug
   `(progn ,@body)
-  #!+sb-hash-table-debug
+  #+sb-hash-table-debug
   (let ((thread-slot-accessor (if (eq operation :read)
                                   'hash-table-reading-thread
                                   'hash-table-writing-thread)))
@@ -77,7 +81,7 @@
                                                     ,hash-table)))))
                         (error-fun))
                       (setf (,thread-slot-accessor ,hash-table)
-                            sb!thread::*current-thread*)
+                            sb-thread::*current-thread*)
                       (body-fun))
                  (unless (and ,@(when (eq operation :read)
                                   `((null (hash-table-writing-thread
@@ -88,22 +92,22 @@
                                            ,hash-table))
                                     (eq (hash-table-writing-thread
                                          ,hash-table)
-                                        sb!thread::*current-thread*))))
+                                        sb-thread::*current-thread*))))
                    (error-fun))
                  (when (eq (,thread-slot-accessor ,hash-table)
-                           sb!thread::*current-thread*)
+                           sb-thread::*current-thread*)
                    ;; this is not 100% correct here and may hide
                    ;; concurrent access in rare circumstances.
                    (setf (,thread-slot-accessor ,hash-table) nil)))
                (body-fun)))))))
 
-#!-sb-fluid (declaim (inline eq-hash))
+#-sb-fluid (declaim (inline eq-hash))
 (defun eq-hash (key)
   (declare (values hash (member t nil)))
   (values (pointer-hash key)
           (oddp (get-lisp-obj-address key))))
 
-#!-sb-fluid (declaim (inline equal-hash))
+#-sb-fluid (declaim (inline equal-hash))
 (defun equal-hash (key)
   (declare (values hash (member t nil)))
   (typecase key
@@ -117,14 +121,14 @@
     (t
      (eq-hash key))))
 
-#!-sb-fluid (declaim (inline eql-hash))
+#-sb-fluid (declaim (inline eql-hash))
 (defun eql-hash (key)
   (declare (values hash (member t nil)))
   (if (%other-pointer-subtype-p
        key
-       '#.(list sb!vm:bignum-widetag sb!vm:ratio-widetag sb!vm:double-float-widetag
-                sb!vm:single-float-widetag
-                sb!vm:complex-widetag sb!vm:complex-single-float-widetag sb!vm:complex-double-float-widetag))
+       '#.(list sb-vm:bignum-widetag sb-vm:ratio-widetag sb-vm:double-float-widetag
+                sb-vm:single-float-widetag
+                sb-vm:complex-widetag sb-vm:complex-single-float-widetag sb-vm:complex-double-float-widetag))
       (values (sxhash key) nil)
       (eq-hash key)))
 
@@ -381,7 +385,7 @@ Examples:
                            ;; SIZE is just a hint, so if the user asks
                            ;; for a SIZE which'd be too big for us to
                            ;; easily implement, we bump it down.
-                           (floor array-dimension-limit 1024))))
+                           (floor sb-xc:array-dimension-limit 1024))))
            (rehash-size (if (integerp rehash-size)
                             rehash-size
                             (float rehash-size 1.0)))
@@ -411,14 +415,14 @@ Examples:
            ;; Reducing this to (unsigned-byte 32) would save memory.
            (index-vector (make-array length
                                      :element-type
-                                     '(unsigned-byte #.sb!vm:n-word-bits)
+                                     '(unsigned-byte #.sb-vm:n-word-bits)
                                      :initial-element 0))
            ;; Needs to be the half the length of the KV vector to link
            ;; KV entries - mapped to indeces at 2i and 2i+1 -
            ;; together.
            (next-vector (make-array size+1
                                     :element-type
-                                    '(unsigned-byte #.sb!vm:n-word-bits)))
+                                    '(unsigned-byte #.sb-vm:n-word-bits)))
            (kv-vector (make-array (* 2 size+1)
                                   :initial-element +empty-ht-slot+))
            (weakness (if weakness
@@ -441,7 +445,7 @@ Examples:
                      ;; See FIXME at INDEX-VECTOR. Same concern.
                      (make-array size+1
                                  :element-type '(unsigned-byte
-                                                 #.sb!vm:n-word-bits)
+                                                 #.sb-vm:n-word-bits)
                                  :initial-element +magic-hash-vector-value+))
                    (logior (if synchronized 2 0) weakness))))
       (declare (type index size+1 scaled-size length))
@@ -533,7 +537,7 @@ multiple threads accessing the same hash-table without locking."
          (old-size (length old-next-vector)))
 
     ;; Disable GC tricks on the OLD-KV-VECTOR.
-    (set-header-data old-kv-vector sb!vm:vector-normal-subtype)
+    (set-header-data old-kv-vector sb-vm:vector-normal-subtype)
 
     ;; GC must never observe a value other than 0 or 1 in the 1st element
     ;; of a vector marked as valid-hashing. The vector is initially filled
@@ -543,7 +547,7 @@ multiple threads accessing the same hash-table without locking."
 
     ;; Non-empty weak hash tables always need GC support.
     (when (and (hash-table-weak-p table) (plusp (hash-table-count table)))
-      (set-header-data new-kv-vector sb!vm:vector-valid-hashing-subtype))
+      (set-header-data new-kv-vector sb-vm:vector-valid-hashing-subtype))
 
     ;; FIXME: here and in several other places in the hash table code,
     ;; loops like this one are used when FILL or REPLACE would be
@@ -590,7 +594,7 @@ multiple threads accessing the same hash-table without locking."
                ;; EQ-based hash.
                ;; Enable GC tricks.
                (set-header-data new-kv-vector
-                                sb!vm:vector-valid-hashing-subtype)
+                                sb-vm:vector-valid-hashing-subtype)
                (let* ((hashing (pointer-hash key))
                       (index (index-for-hashing hashing new-size))
                       (next (aref new-index-vector index)))
@@ -626,7 +630,7 @@ multiple threads accessing the same hash-table without locking."
     (unless (and (hash-table-weak-p table) (plusp (hash-table-count table)))
       ;; Disable GC tricks, they will be re-enabled during the re-hash
       ;; if necessary.
-      (set-header-data kv-vector sb!vm:vector-normal-subtype))
+      (set-header-data kv-vector sb-vm:vector-normal-subtype))
 
     ;; Rehash all the entries.
     (setf (hash-table-next-free-kv table) 0)
@@ -656,7 +660,7 @@ multiple threads accessing the same hash-table without locking."
               (t
                ;; EQ-based hash.
                ;; Enable GC tricks.
-               (set-header-data kv-vector sb!vm:vector-valid-hashing-subtype)
+               (set-header-data kv-vector sb-vm:vector-valid-hashing-subtype)
                (let* ((hashing (pointer-hash key))
                       (index (index-for-hashing hashing length))
                       (next (aref index-vector index)))
@@ -683,7 +687,7 @@ multiple threads accessing the same hash-table without locking."
     (cond ((rehash-p)
            ;; Use recursive locks since for weak tables the lock has
            ;; already been acquired.
-           (sb!thread::with-recursive-system-lock
+           (sb-thread::with-recursive-system-lock
                ((hash-table-lock hash-table))
              ;; Repeat the condition inside the lock to ensure that if
              ;; two reader threads enter MAYBE-REHASH at the same time
@@ -701,7 +705,7 @@ multiple threads accessing the same hash-table without locking."
                    (rehash hash-table new-size new-kv-vector new-next-vector
                            new-hash-vector new-index-vector))))))
           ((rehash-without-growing-p)
-           (sb!thread::with-recursive-system-lock
+           (sb-thread::with-recursive-system-lock
                ((hash-table-lock hash-table) :without-gcing t)
              (when (rehash-without-growing-p)
                (rehash-without-growing hash-table)))))))
@@ -722,7 +726,7 @@ multiple threads accessing the same hash-table without locking."
                 (locally (declare (inline ,@inline))
                   ,@body))))
        (if (hash-table-weak-p ,hash-table)
-           (sb!thread::with-recursive-system-lock
+           (sb-thread::with-recursive-system-lock
                ((hash-table-lock ,hash-table) :without-gcing t)
              (,body-fun))
            (with-pinned-objects ,pin
@@ -730,7 +734,7 @@ multiple threads accessing the same hash-table without locking."
                  ;; We use a "system" lock here because it is very
                  ;; slightly faster, as it doesn't re-enable
                  ;; interrupts.
-                 (sb!thread::with-recursive-system-lock
+                 (sb-thread::with-recursive-system-lock
                      ((hash-table-lock ,hash-table))
                    (,body-fun))
                  (,body-fun)))))))
@@ -750,7 +754,7 @@ if there is no such entry. Entries can be added using SETF."
            (values t (member t nil)))
   (tagbody
    start
-     (let ((start-epoch sb!kernel::*gc-epoch*))
+     (let ((start-epoch sb-kernel::*gc-epoch*))
        (macrolet ((result (value foundp)
                     ;; When the table has multiple concurrent readers,
                     ;; it's possible that there was a GC after this
@@ -761,7 +765,7 @@ if there is no such entry. Entries can be added using SETF."
                     ;; redo the lookup if the GC epoch counter has changed.
                     ;; -- JES,  2007-09-30
                     `(if (and (not ,foundp)
-                              (not (eq start-epoch sb!kernel::*gc-epoch*)))
+                              (not (eq start-epoch sb-kernel::*gc-epoch*)))
                          (go start)
                          (return-from %gethash3 (values ,value ,foundp))))
                   (overflow ()
@@ -852,11 +856,11 @@ if there is no such entry. Entries can be added using SETF."
            (test-fun (hash-table-test-fun hash-table)))
       (declare (type index index next))
       (when (hash-table-weak-p hash-table)
-        (set-header-data kv-vector sb!vm:vector-valid-hashing-subtype))
+        (set-header-data kv-vector sb-vm:vector-valid-hashing-subtype))
       (cond ((or eq-based (not hash-vector))
              (when eq-based
                (set-header-data kv-vector
-                                sb!vm:vector-valid-hashing-subtype))
+                                sb-vm:vector-valid-hashing-subtype))
              ;; Search next-vector chain for a matching key.
              (do ((next next (aref next-vector next))
                   (i 0 (1+ i)))
@@ -1028,7 +1032,7 @@ table itself."
              (size (length next-vector))
              (index-vector (hash-table-index-vector hash-table)))
         ;; Disable GC tricks.
-        (set-header-data kv-vector sb!vm:vector-normal-subtype)
+        (set-header-data kv-vector sb-vm:vector-normal-subtype)
         ;; Mark all slots as empty by setting all keys and values to magic
         ;; tag.
         (aver (eq (aref kv-vector 0) hash-table))

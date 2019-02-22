@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (debug-cur-sp)
   (:translate current-sp)
@@ -98,7 +98,7 @@
 
 (define-vop (get-lisp-obj-address)
   (:policy :fast-safe)
-  (:translate sb!di::get-lisp-obj-address)
+  (:translate sb-di::get-lisp-obj-address)
   (:args (thing :scs (descriptor-reg control-stack) :target result))
   (:results (result :scs (unsigned-reg)
                     :load-if (not (and (sc-is thing descriptor-reg)

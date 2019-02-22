@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defmacro %string (x) `(if (stringp ,x) ,x (string ,x)))
 
@@ -103,21 +103,21 @@
         (return-from string=* nil))
       ;; Optimizing the non-unicode builds is not terribly important
       ;; because no per-character test for base/UCS4 is needed.
-      #!+sb-unicode
+      #+sb-unicode
       (let* ((widetag1 (%other-pointer-widetag string1))
              (widetag2 (%other-pointer-widetag string2))
              (char-shift
-              #!+(or x86 x86-64)
+              #+(or x86 x86-64)
               ;; The cost of WITH-PINNED-OBJECTS is near nothing on x86,
               ;; and memcmp() is much faster except below a cutoff point.
               ;; The threshold is higher on x86-32 because the overhead
               ;; of a foreign call is higher due to FPU stack save/restore.
               (if (and (= widetag1 widetag2)
-                       (>= len #!+x86 16
-                               #!+x86-64 8))
+                       (>= len #+x86 16
+                               #+x86-64 8))
                   (case widetag1
-                    (#.sb!vm:simple-base-string-widetag 0)
-                    (#.sb!vm:simple-character-string-widetag 2)))))
+                    (#.sb-vm:simple-base-string-widetag 0)
+                    (#.sb-vm:simple-character-string-widetag 2)))))
         (when char-shift
           (return-from string=*
             ;; Efficiently compute byte indices. Derive-type on ASH isn't
@@ -129,9 +129,9 @@
                          `(sap+ (vector-sap (truly-the string ,string))
                                 (scale ,start)))
                        (scale (index)
-                         `(truly-the sb!vm:signed-word
+                         `(truly-the sb-vm:signed-word
                            (ash (truly-the index ,index) char-shift))))
-              (declare (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
+              (declare (optimize (sb-c:alien-funcall-saves-fp-and-pc 0)))
               (with-pinned-objects (string1 string2)
                 (zerop (alien-funcall
                         (extern-alien "memcmp"
@@ -143,7 +143,7 @@
                `(return-from string=*
                   (let ((string1 (truly-the (simple-array ,type1 1) string1))
                         (string2 (truly-the (simple-array ,type2 1) string2)))
-                    (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                    (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                     (do ((index1 start1 (1+ index1))
                          (index2 start2 (1+ index2)))
                         ((>= index1 end1) t)
@@ -159,17 +159,17 @@
           ;; On non-x86, Lisp code is used always because I did not profile
           ;; memcmp(), and this code is at least as good as %SP-STRING-COMPARE.
           ;; Also, (ARRAY NIL) always punts.
-          (cond #!-x86-64
+          (cond #-x86-64
                 ((= widetag1 widetag2)
                  (case widetag1
-                   (#.sb!vm:simple-base-string-widetag
+                   (#.sb-vm:simple-base-string-widetag
                     (char-loop base-char base-char))
-                   (#.sb!vm:simple-character-string-widetag
+                   (#.sb-vm:simple-character-string-widetag
                     (char-loop character character))))
-                ((or (and (= widetag1 sb!vm:simple-character-string-widetag)
-                          (= widetag2 sb!vm:simple-base-string-widetag))
-                     (and (= widetag2 sb!vm:simple-character-string-widetag)
-                          (= widetag1 sb!vm:simple-base-string-widetag)
+                ((or (and (= widetag1 sb-vm:simple-character-string-widetag)
+                          (= widetag2 sb-vm:simple-base-string-widetag))
+                     (and (= widetag2 sb-vm:simple-character-string-widetag)
+                          (= widetag1 sb-vm:simple-base-string-widetag)
                           (progn (rotatef start1 start2)
                                  (rotatef end1 end2)
                                  (rotatef string1 string2)
@@ -585,5 +585,5 @@ new string COUNT long filled with the fill character."
   ;;  #b10_ ; literal compiled to core
   (set-header-data (the (simple-array * 1) vector)
                    (if always-shareable
-                       sb!vm:+vector-shareable+
-                       sb!vm:+vector-shareable-nonstd+)))
+                       sb-vm:+vector-shareable+
+                       sb-vm:+vector-shareable-nonstd+)))

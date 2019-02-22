@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (define-condition simple-style-warning (simple-condition style-warning) ())
 (defun style-warn (datum &rest arguments)
@@ -94,7 +94,7 @@ which can be found at <http://sbcl.sourceforge.net/>.~:@>"
 (deftype package-locked-error () nil)
 (deftype symbol-package-locked-error () nil)
 
-(define-condition sb!c:inlining-dependency-failure
+(define-condition sb-c:inlining-dependency-failure
     ;; By inheriting from WARNING, not STYLE-WARNING,
     ;; we hold ourselves to a higher standard.
     (simple-warning) ())

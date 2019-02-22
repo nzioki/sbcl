@@ -9,12 +9,19 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; types
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (deftype bit-offset () '(integer 0 (#.sb!vm:n-word-bits))))
+(eval-when (:compile-toplevel)
+  ;; This DEFTYPE must be macroexpanded directly by the host, as it is referenced by
+  ;; a defun that is also within an eval-when. Writing the eval-when situations as
+  ;; (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL) isn't good enough, because that expands only
+  ;; by the cross-compiler. In reality this type isn't technically helpful to have,
+  ;; because both its uses are in an LDB expression whose type is trivially derivable.
+  ;; However I'm keeping it as a minimal example of a tricky cross-compilation issue.
+  (deftype bit-offset () `(integer 0 (,sb-vm:n-word-bits))))
+(deftype bit-offset () `(integer 0 (,sb-vm:n-word-bits)))
 
 ;;;; support routines
 
@@ -42,14 +49,14 @@
 ;;; is a right-shift.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun shift-towards-start (number countoid)
-    (declare (type sb!vm:word number) (fixnum countoid))
-    (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) countoid)))
+    (declare (type sb-vm:word number) (fixnum countoid))
+    (let ((count (ldb (byte (1- (integer-length sb-vm:n-word-bits)) 0) countoid)))
       (declare (type bit-offset count))
       (if (zerop count)
           number
-          (ecase sb!c:*backend-byte-order*
+          (ecase sb-c:*backend-byte-order*
             (:big-endian
-               (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count))
+               (ash (ldb (byte (- sb-vm:n-word-bits count) 0) number) count))
             (:little-endian
                (ash number (- count))))))))
 
@@ -58,18 +65,18 @@
 ;;; right-shift and on little-endian machines this is a left-shift.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun shift-towards-end (number count)
-    (declare (type sb!vm:word number) (fixnum count))
-    (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) count)))
+    (declare (type sb-vm:word number) (fixnum count))
+    (let ((count (ldb (byte (1- (integer-length sb-vm:n-word-bits)) 0) count)))
       (declare (type bit-offset count))
       (if (zerop count)
           number
-          (ecase sb!c:*backend-byte-order*
+          (ecase sb-c:*backend-byte-order*
             (:big-endian
                (ash number (- count)))
             (:little-endian
-               (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count)))))))
+               (ash (ldb (byte (- sb-vm:n-word-bits count) 0) number) count)))))))
 
-#!-sb-fluid (declaim (inline start-mask end-mask))
+#-sb-fluid (declaim (inline start-mask end-mask))
 
 ;;; Produce a mask that contains 1's for the COUNT "start" bits and
 ;;; 0's for the remaining "end" bits. Only the lower 5 bits of COUNT
@@ -77,7 +84,7 @@
 ;;; on 32-bit word size -- WHN 2001-03-19).
 (defun start-mask (count)
   (declare (fixnum count))
-  (shift-towards-start (1- (ash 1 sb!vm:n-word-bits)) (- count)))
+  (shift-towards-start (1- (ash 1 sb-vm:n-word-bits)) (- count)))
 
 ;;; Produce a mask that contains 1's for the COUNT "end" bits and 0's
 ;;; for the remaining "start" bits. Only the lower 5 bits of COUNT are
@@ -85,24 +92,24 @@
 ;;; 32-bit word size -- WHN 2001-03-19).
 (defun end-mask (count)
   (declare (fixnum count))
-  (shift-towards-end (1- (ash 1 sb!vm:n-word-bits)) (- count)))
+  (shift-towards-end (1- (ash 1 sb-vm:n-word-bits)) (- count)))
 
-#!-sb-fluid (declaim (inline word-sap-ref %set-word-sap-ref))
+#-sb-fluid (declaim (inline word-sap-ref %set-word-sap-ref))
 (defun word-sap-ref (sap offset)
   (declare (type system-area-pointer sap)
            (type index offset)
-           (values sb!vm:word)
+           (values sb-vm:word)
            (muffle-conditions compiler-note) ; "unsigned word to integer coercion"
            (optimize (speed 3) (safety 0)))
-  (sap-ref-word sap (the index (ash offset sb!vm:word-shift))))
+  (sap-ref-word sap (the index (ash offset sb-vm:word-shift))))
 (defun %set-word-sap-ref (sap offset value)
   (declare (type system-area-pointer sap)
            (type index offset)
-           (type sb!vm:word value)
-           (values sb!vm:word)
+           (type sb-vm:word value)
+           (values sb-vm:word)
            (muffle-conditions compiler-note) ; "unsigned word to integer coercion"
            (optimize (speed 3) (safety 0)))
-  (setf (sap-ref-word sap (the index (ash offset sb!vm:word-shift)))
+  (setf (sap-ref-word sap (the index (ash offset sb-vm:word-shift)))
         value))
 
 
@@ -133,7 +140,7 @@
                  (values system-area-pointer index))
         (let ((address (sap-int sap))
               (word-mask (1- (ash 1 word-shift))))
-          (values (int-sap #!-alpha (word-logical-andc2 address word-mask)
+          (values (int-sap #-alpha (word-logical-andc2 address word-mask)
                            ;; KLUDGE: WORD-LOGICAL-ANDC2 is defined in
                            ;; terms of n-word-bits.  On all systems
                            ;; where n-word-bits is not equal to
@@ -141,7 +148,7 @@
                            ;; another way.  At this time, these
                            ;; systems are alphas, though there was
                            ;; some talk about an x86-64 build option.
-                           #!+alpha (ash (ash address (- word-shift)) word-shift))
+                           #+alpha (ash (ash address (- word-shift)) word-shift))
                   (+ ,(ecase bitsize
                        ((1 2 4) `(* (logand address word-mask)
                                     (/ n-byte-bits ,bitsize)))
@@ -150,28 +157,28 @@
 
 ;;; We cheat a little bit by using TRULY-THE in the copying function to
 ;;; force the compiler to generate good code in the (= BITSIZE
-;;; SB!VM:N-WORD-BITS) case.  We don't use TRULY-THE in the other cases
+;;; SB-VM:N-WORD-BITS) case.  We don't use TRULY-THE in the other cases
 ;;; to give the compiler freedom to generate better code.
 (defmacro !define-byte-bashers (bitsize)
   (let* ((bytes-per-word (/ n-word-bits bitsize))
          (byte-offset `(integer 0 (,bytes-per-word)))
          (byte-count `(integer 1 (,bytes-per-word)))
-         (max-bytes sb!xc:most-positive-fixnum)
+         (max-bytes sb-xc:most-positive-fixnum)
          (offset `(integer 0 ,max-bytes))
          (max-word-offset (ceiling max-bytes bytes-per-word))
          (word-offset `(integer 0 ,max-word-offset))
          (fix-sap-and-offset-name (intern (format nil "FIX-SAP-AND-OFFSET-UB~D" bitsize)))
-         (constant-bash-name (intern (format nil "CONSTANT-UB~D-BASH" bitsize) (find-package "SB!KERNEL")))
-         (array-fill-name (intern (format nil "UB~D-BASH-FILL" bitsize) (find-package "SB!KERNEL")))
-         (system-area-fill-name (intern (format nil "SYSTEM-AREA-UB~D-FILL" bitsize) (find-package "SB!KERNEL")))
-         (unary-bash-name (intern (format nil "UNARY-UB~D-BASH" bitsize) (find-package "SB!KERNEL")))
-         (array-copy-name (intern (format nil "UB~D-BASH-COPY" bitsize) (find-package "SB!KERNEL")))
-         (system-area-copy-name (intern (format nil "SYSTEM-AREA-UB~D-COPY" bitsize) (find-package "SB!KERNEL")))
+         (constant-bash-name (intern (format nil "CONSTANT-UB~D-BASH" bitsize) (find-package "SB-KERNEL")))
+         (array-fill-name (intern (format nil "UB~D-BASH-FILL" bitsize) (find-package "SB-KERNEL")))
+         (system-area-fill-name (intern (format nil "SYSTEM-AREA-UB~D-FILL" bitsize) (find-package "SB-KERNEL")))
+         (unary-bash-name (intern (format nil "UNARY-UB~D-BASH" bitsize) (find-package "SB-KERNEL")))
+         (array-copy-name (intern (format nil "UB~D-BASH-COPY" bitsize) (find-package "SB-KERNEL")))
+         (system-area-copy-name (intern (format nil "SYSTEM-AREA-UB~D-COPY" bitsize) (find-package "SB-KERNEL")))
          (array-copy-to-system-area-name
-          (intern (format nil "COPY-UB~D-TO-SYSTEM-AREA" bitsize) (find-package "SB!KERNEL")))
+          (intern (format nil "COPY-UB~D-TO-SYSTEM-AREA" bitsize) (find-package "SB-KERNEL")))
          (system-area-copy-to-array-name
           (intern (format nil "COPY-UB~D-FROM-SYSTEM-AREA" bitsize)
-                  (find-package "SB!KERNEL"))))
+                  (find-package "SB-KERNEL"))))
     `(progn
       (declaim (inline ,constant-bash-name ,unary-bash-name))
       ;; Fill DST with VALUE starting at DST-OFFSET and continuing
@@ -570,14 +577,14 @@
 ) ; EVAL-WHEN
 
 (eval-when (:compile-toplevel)
-  (sb!xc:proclaim '(muffle-conditions compiler-note)))
+  (sb-xc:proclaim '(muffle-conditions compiler-note)))
 ;;; We would normally do this with a MACROLET, but then we run into
 ;;; problems with the lexical environment being too hairy for the
 ;;; cross-compiler and it cannot inline the basic basher functions.
 #.(loop for i = 1 then (* i 2)
         collect `(!define-sap-fixer ,i) into fixers
         collect `(!define-byte-bashers ,i) into bashers
-        until (= i sb!vm:n-word-bits)
+        until (= i sb-vm:n-word-bits)
         ;; FIXERS must come first so their inline expansions are available
         ;; for the bashers.
         finally (return `(progn ,@fixers ,@bashers)))
@@ -619,27 +626,27 @@
                          (first-word (ash start (- +bit-position-base-shift+)))
                          (first-bits (logand start +bit-position-base-mask+))
                          ;; These mask out everything but the interesting parts.
-                         (end-mask #!+little-endian (lognot (ash -1 last-bits))
-                                   #!+big-endian (ash -1 (- sb!vm:n-word-bits last-bits)))
-                         (start-mask #!+little-endian (ash -1 first-bits)
-                                     #!+big-endian (lognot (ash -1 (- sb!vm:n-word-bits first-bits)))))
+                         (end-mask #+little-endian (lognot (ash -1 last-bits))
+                                   #+big-endian (ash -1 (- sb-vm:n-word-bits last-bits)))
+                         (start-mask #+little-endian (ash -1 first-bits)
+                                     #+big-endian (lognot (ash -1 (- sb-vm:n-word-bits first-bits)))))
                     (declare (index last-word first-word))
-                    (flet ((#!+little-endian start-bit
-                            #!+big-endian end-bit (x)
+                    (flet ((#+little-endian start-bit
+                            #+big-endian end-bit (x)
                              (declare (word x))
-                             #!+(or x86-64 x86)
+                             #+(or x86-64 x86)
                              (truly-the (mod #.n-word-bits)
                                  (%primitive unsigned-word-find-first-bit x))
-                             #!-(or x86-64 x86)
-                             (- #!+big-endian sb!vm:n-word-bits
+                             #-(or x86-64 x86)
+                             (- #+big-endian sb-vm:n-word-bits
                                 (integer-length (logand x (- x)))
-                                #!+little-endian 1))
-                           (#!+little-endian end-bit
-                            #!+big-endian start-bit (x)
+                                #+little-endian 1))
+                           (#+little-endian end-bit
+                            #+big-endian start-bit (x)
                              (declare (word x))
-                             (- #!+big-endian sb!vm:n-word-bits
+                             (- #+big-endian sb-vm:n-word-bits
                                 (integer-length x)
-                                #!+little-endian 1))
+                                #+little-endian 1))
                            (found (i word-offset)
                              (declare (index i word-offset))
                              (return-from ,name
@@ -702,7 +709,7 @@
                             ;; and it doesn't upset the compiler in the least -
                             ;; it still uses unboxed reads and compares throughout.
                             (when (eql end-mask 0)
-                              (setq end-mask sb!ext:most-positive-word)
+                              (setq end-mask sb-ext:most-positive-word)
                               (decf last-word)) ; make it an inclusive bound
                             (loop
                               (when (> word-offset last-word)

@@ -19,7 +19,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; miscellaneous backend properties
 
@@ -31,14 +31,14 @@
 ;;; the byte order of the target machine. :BIG-ENDIAN has the MSB first (e.g.
 ;;; IBM RT), :LITTLE-ENDIAN has the MSB last (e.g. DEC VAX).
 (defglobal *backend-byte-order*
-  #!+little-endian :little-endian
-  #!+big-endian :big-endian)
+  #+little-endian :little-endian
+  #+big-endian :big-endian)
 (declaim (type (member nil :little-endian :big-endian) *backend-byte-order*))
 
 ;;; translation from SC numbers to SC info structures. SC numbers are always
 ;;; used instead of names at run time, so changing this vector changes all the
 ;;; references.
-(defglobal *backend-sc-numbers* (make-array sb!vm:sc-number-limit :initial-element nil))
+(defglobal *backend-sc-numbers* (make-array sb-vm:sc-number-limit :initial-element nil))
 (declaim (type sc-vector *backend-sc-numbers*))
 
 ;;; a vector of all the SBs defined, so that we can easily iterate over them
@@ -150,10 +150,10 @@ SPARC code in CMUCL,
 and at the IR2 translation stage, the function #'`(LAMBDA () ,GUARD) would be called.
 
 Until SBCL-0.7pre57, this is translated as
-  (:GUARD #!+(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) T
-          #!-(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) NIL)
+  (:GUARD #+(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) T
+          #-(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) NIL)
 which means that whether this VOP will ever be used is determined at
-compiler compile-time depending on the contents of SB!XC:*FEATURES*.
+compiler compile-time depending on the contents of SB-XC:*FEATURES*.
 
 As of SBCL-0.7pre57, a new special variable,
 SB-C:*BACKEND-SUBFEATURES*?, is introduced. As of that version, only

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DISASSEM")
+(in-package "SB-DISASSEM")
 
 ;;; types and defaults
 
@@ -34,7 +34,7 @@
 ;; and disassembler for other supported backends,
 ;; if that backend has been converted to use a distinct ASM package.
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter sb!assem::*backend-instruction-set-package*
+  (defparameter sb-assem::*backend-instruction-set-package*
     (find-package #.(sb-cold::backend-asm-package-name))))
 
 ;; How many columns of output to allow for the address preceding each line.
@@ -67,7 +67,7 @@
 ;;;; KLUDGE: It's not clear that using bit-vectors would be any more efficient.
 ;;;; Perhaps the abstraction could go away. -- WHN 19991124
 
-#!-sb-fluid
+#-sb-fluid
 (declaim (inline dchunk-or dchunk-and dchunk-clear dchunk-not
                  dchunk-make-mask dchunk-make-field
                  dchunk-extract
@@ -81,8 +81,8 @@
 ;;; Ideally this constant would go in the 'insts' file for the architecture,
 ;;; but there's really no easy way to do that at present.
 (defconstant dchunk-bits
-  #!+x86-64 56
-  #!-x86-64 sb!vm:n-word-bits)
+  #+x86-64 56
+  #-x86-64 sb-vm:n-word-bits)
 
 (deftype dchunk ()
   `(unsigned-byte ,dchunk-bits))
@@ -394,7 +394,7 @@
                                    instruction-format ~W bits wide.~:>"
                              (arg-name arg) bytespec format-length))
                     (correct-dchunk-bytespec-for-endianness
-                     bytespec format-length sb!c:*backend-byte-order*))
+                     bytespec format-length sb-c:*backend-byte-order*))
                   fields)))
   arg)
 
@@ -424,9 +424,17 @@
         (let* ((binding (cdr rendering))
                (vars (car binding))
                (vals (cdr binding)))
-          (if (listp vars)
-              (mapc (lambda (var val) (push `(,var ,val) bindings)) vars vals)
-              (push `(,vars ,vals) bindings)))))))
+          ;; We can end up here with VARS = NIL, and VALS = an atom.
+          ;; As the spec says, MAPC "should be prepared to signal an error
+          ;; ... if any list is not a proper list"
+          ;; We don't err in that situation because we check for ENDP of the
+          ;; lists from left to right. However, at least one implementation
+          ;; does rigorously use ENDP on both lists on each iteration.
+          (cond ((not vars))
+                ((listp vars)
+                 (mapc (lambda (var val) (push `(,var ,val) bindings)) vars vals))
+                (t
+                 (push `(,vars ,vals) bindings))))))))
 
 ;;; Return the form(s) that should be evaluated to render ARG in the chosen
 ;;; RENDERING style, which is one of :RAW, :SIGN-EXTENDED,
@@ -437,7 +445,7 @@
   (labels ((tempvars (n)
              (if (plusp n)
                  (cons (package-symbolicate
-                        (load-time-value (find-package "SB!DISASSEM"))
+                        #.(find-package "SB-DISASSEM")
                         ".T" (write-to-string (incf *!temp-var-counter*)))
                        (tempvars (1- n))))))
     (let* ((arg-cell (assq arg funstate))
@@ -502,7 +510,7 @@
                                unless (eq ind :type)
                                nconc (list ind val)))))
     `(progn
-       (eval-when (:compile-toplevel)
+       (eval-when (:compile-toplevel :execute)
          (%def-arg-type ',name ,inherit ,@(massage-arg pair :compile)))
        #-sb-xc-host ; Host doesn't need the real definition.
        (%def-arg-type ',name ,inherit ,@(massage-arg pair :eval)))))
@@ -851,6 +859,8 @@
           ((eq key :negative)
            `(< ,(arg-value-form (arg-or-lose subj funstate) funstate :numeric)
                0))
+          ((eq key :test)
+           `(,@body ,(arg-value-form (arg-or-lose subj funstate) funstate :numeric)))
           ((eq key :same-as)
            (let ((arg1 (arg-or-lose subj funstate))
                  (arg2 (arg-or-lose (car body) funstate)))
@@ -877,17 +887,17 @@
           (t
            (pd-error "bogus test-form: ~S" test)))))
 
-#!-sb-fluid (declaim (inline bytes-to-bits))
+#-sb-fluid (declaim (inline bytes-to-bits))
 (declaim (maybe-inline sign-extend tab tab0))
 
 (defun bytes-to-bits (bytes)
   (declare (type disassem-length bytes))
-  (* bytes sb!vm:n-byte-bits))
+  (* bytes sb-vm:n-byte-bits))
 
 (defun bits-to-bytes (bits)
   (declare (type disassem-length bits))
   (multiple-value-bind (bytes rbits)
-      (truncate bits sb!vm:n-byte-bits)
+      (truncate bits sb-vm:n-byte-bits)
     (when (not (zerop rbits))
       (error "~W bits is not a byte-multiple." bits))
     bytes))

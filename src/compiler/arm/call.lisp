@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
@@ -211,7 +211,7 @@
                                 :unknown-return))
     (inst compute-code code-tn lip lra-label temp)
     ;; Pick off the single-value case first.
-    (sb!assem:without-scheduling ()
+    (sb-assem:without-scheduling ()
 
       ;; Default register values for single-value return case.
       ;; The callee returns with condition bits CLEAR in the
@@ -533,7 +533,7 @@
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -891,7 +891,7 @@
                                                     ,(incf index)))
                                            *register-arg-names*))
                                (storew cfp-tn new-fp ocfp-save-offset))
-                             '((inst mov nargs-pass (fixnumize nargs)))))
+                             '((load-immediate-word nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)
                             '((:load-return-pc
                                (error "RETURN-PC not in its passing location"))
@@ -911,11 +911,11 @@
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
                     (assemble ()
-                      ;; Get the symbol-value of SB!IMPL::*STEPPING*
+                      ;; Get the symbol-value of SB-IMPL::*STEPPING*
                       ;; KLUDGE: ... into LIP.  Either it's zero or it
                       ;; isn't, and even taking a stray interrupt and
                       ;; GC can't screw that up.
-                      (load-symbol-value lip sb!impl::*stepping*)
+                      (load-symbol-value lip sb-impl::*stepping*)
                       (inst cmp lip 0)
                       ;; If it's not 0, trap.
                       (inst b :eq step-done-label)
@@ -1161,7 +1161,7 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     ;; If it's not zero, trap.
     (inst cmp stepping 0)
     (inst b :eq DONE)

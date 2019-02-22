@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We track pred/succ info at the IR2-block level, extrapolating
 ;;; most of the data from IR1 to initialise.
@@ -68,7 +68,7 @@
         (pushnew 2block (car (gethash new *2block-info*)))))))
 
 ;;;; Conditional move insertion support code
-#!-sb-fluid (declaim (inline vop-name))
+#-sb-fluid (declaim (inline vop-name))
 (defun vop-name (vop &optional default)
   (declare (type vop vop))
   (let ((vop-info (vop-info vop)))
@@ -258,7 +258,7 @@
       (let ((args (vop-args vop))
             (results (vop-results vop)))
        (case (vop-name vop)
-         ((move sb!vm::sap-move)
+         ((move sb-vm::sap-move)
           (let ((x (tn-ref-tn args))
                 (y (tn-ref-tn results)))
             (when (location= x y)

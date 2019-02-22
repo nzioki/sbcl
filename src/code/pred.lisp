@@ -9,11 +9,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; miscellaneous non-primitive predicates
 
-#!-sb-fluid (declaim (inline streamp))
+#-sb-fluid (declaim (inline streamp))
 (defun streamp (stream)
   (typep stream 'stream))
 
@@ -87,12 +87,11 @@
 ;;; All the primitive type predicate wrappers share a parallel form..
 (macrolet ((def-type-predicate-wrapper (pred)
              (let* ((name (symbol-name pred))
-                    (package (package-name (symbol-package pred)))
                     (stem (string-left-trim "%" (string-right-trim "P-" name)))
                     (article (if (position (schar name 0) "AEIOU") "an" "a")))
-               (aver (not (string= package "SB!XC")))
                `(defun ,pred (object)
-                  ,@(unless (eql (mismatch package "SB!") 3)
+                  ;; Document the standardized predicates and not the internal ones.
+                  ,@(when (eql (sb-xc:symbol-package pred) *cl-package*)
                       (list (format nil
                                     "Return true if OBJECT is ~A ~A, and NIL otherwise."
                                     article
@@ -106,9 +105,9 @@
   ;; Testing for BASE-CHAR-P is usually redundant on #-sb-unicode,
   ;; remove it there completely so that #-sb-unicode build will
   ;; break when it's used.
-  #!+sb-unicode (def-type-predicate-wrapper base-char-p)
+  #+sb-unicode (def-type-predicate-wrapper base-char-p)
   (def-type-predicate-wrapper base-string-p)
-  #!+sb-unicode (def-type-predicate-wrapper character-string-p)
+  #+sb-unicode (def-type-predicate-wrapper character-string-p)
   (def-type-predicate-wrapper bignump)
   (def-type-predicate-wrapper bit-vector-p)
   (def-type-predicate-wrapper characterp)
@@ -118,7 +117,7 @@
   (def-type-predicate-wrapper complexp)
   (def-type-predicate-wrapper complex-double-float-p)
   (def-type-predicate-wrapper complex-float-p)
-  #!+long-float (def-type-predicate-wrapper complex-long-float-p)
+  #+long-float (def-type-predicate-wrapper complex-long-float-p)
   (def-type-predicate-wrapper complex-rational-p)
   (def-type-predicate-wrapper complex-single-float-p)
   ;; (COMPLEX-VECTOR-P is not included here since it's awkward to express
@@ -133,7 +132,7 @@
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  #!-(or x86 x86-64) (def-type-predicate-wrapper lra-p)
+  #-(or x86 x86-64) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
   (def-type-predicate-wrapper rationalp)
@@ -141,7 +140,8 @@
   (def-type-predicate-wrapper realp)
   (def-type-predicate-wrapper short-float-p)
   (def-type-predicate-wrapper single-float-p)
-  #!+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
+  #+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
+  #+sb-simd-pack-256 (def-type-predicate-wrapper simd-pack-256-p)
   (def-type-predicate-wrapper %instancep)
   (def-type-predicate-wrapper funcallable-instance-p)
   (def-type-predicate-wrapper symbolp)
@@ -152,11 +152,11 @@
   (def-type-predicate-wrapper system-area-pointer-p)
   (def-type-predicate-wrapper unbound-marker-p)
   (def-type-predicate-wrapper weak-pointer-p)
-  #!-64-bit
+  #-64-bit
   (progn
     (def-type-predicate-wrapper unsigned-byte-32-p)
     (def-type-predicate-wrapper signed-byte-32-p))
-  #!+64-bit
+  #+64-bit
   (progn
     (def-type-predicate-wrapper unsigned-byte-64-p)
     (def-type-predicate-wrapper signed-byte-64-p))
@@ -166,8 +166,8 @@
                   ,@(map 'list
                          (lambda (saetp)
                            `(def-type-predicate-wrapper
-                                ,(symbolicate (sb!vm:saetp-primitive-type-name saetp) "-P")))
-                         sb!vm:*specialized-array-element-type-properties*))))
+                                ,(symbolicate (sb-vm:saetp-primitive-type-name saetp) "-P")))
+                         sb-vm:*specialized-array-element-type-properties*))))
     (saetp-defs))
   ;; Other array types
   (def-type-predicate-wrapper simple-array-p)
@@ -177,7 +177,7 @@
   (def-type-predicate-wrapper vectorp)
   (def-type-predicate-wrapper vector-nil-p))
 
-#!+(or x86 x86-64 arm arm64)
+#+(or x86 x86-64 arm arm64)
 (defun fixnum-mod-p (x limit)
   (and (fixnump x)
        (<= 0 x limit)))
@@ -192,10 +192,10 @@
 #-sb-xc-host
 (defun layout-of (x)
   (declare (optimize (speed 3) (safety 0)))
-  #!+(and compact-instance-header x86-64)
+  #+(and compact-instance-header x86-64)
   (values (%primitive layout-of x
-                      (load-time-value sb!kernel::**built-in-class-codes** t)))
-  #!-(and compact-instance-header x86-64)
+                      (load-time-value sb-kernel::**built-in-class-codes** t)))
+  #-(and compact-instance-header x86-64)
   (cond ((%instancep x) (%instance-layout x))
         ((funcallable-instance-p x) (%funcallable-instance-layout x))
         ;; Compiler can dump literal layouts, which handily sidesteps
@@ -204,7 +204,7 @@
         (t
          ;; Note that WIDETAG-OF is slightly suboptimal here and could be
          ;; improved - we've already ruled out some of the lowtags.
-         (svref (load-time-value sb!kernel::**built-in-class-codes** t)
+         (svref (load-time-value sb-kernel::**built-in-class-codes** t)
                 (widetag-of x)))))
 
 (declaim (inline classoid-of))
@@ -229,10 +229,10 @@
      (cond
        ((<= 0 object 1) 'bit)
        ((< object 0) 'fixnum)
-       (t '(integer 0 #.sb!xc:most-positive-fixnum))))
+       (t '(integer 0 #.sb-xc:most-positive-fixnum))))
     (integer
      (if (>= object 0)
-         '(integer #.(1+ sb!xc:most-positive-fixnum))
+         '(integer #.(1+ sb-xc:most-positive-fixnum))
          'bignum))
     (character
      (typecase object
@@ -246,21 +246,21 @@
     (symbol
      (cond ((eq object t) 'boolean)
            ((eq object nil) 'null)
-           ((eq (symbol-package object) *keyword-package*) 'keyword)
+           ((eq (sb-xc:symbol-package object) *keyword-package*) 'keyword)
            (t 'symbol)))
-    ((or array complex #!+sb-simd-pack simd-pack)
-     (let ((sb!kernel::*unparse-allow-negation* nil))
-       (declare (special sb!kernel::*unparse-allow-negation*)) ; forward ref
+    ((or array complex #+sb-simd-pack simd-pack #+sb-simd-pack-256 simd-pack-256)
+     (let ((sb-kernel::*unparse-allow-negation* nil))
+       (declare (special sb-kernel::*unparse-allow-negation*)) ; forward ref
        (type-specifier (ctype-of object))))
     (t
      (let* ((classoid (classoid-of object))
             (name (classoid-name classoid)))
        (if (%instancep object)
            (case name
-             (sb!alien-internals:alien-value
+             (sb-alien-internals:alien-value
               `(alien
-                ,(sb!alien-internals:unparse-alien-type
-                  (sb!alien-internals:alien-value-type object))))
+                ,(sb-alien-internals:unparse-alien-type
+                  (sb-alien-internals:alien-value-type object))))
              (t
               (let ((pname (classoid-proper-name classoid)))
                 (if (classoid-p pname)
@@ -276,7 +276,7 @@
   (eq obj1 obj2))
 ;;; and this too, but it's only needed for backends on which
 ;;; IR1 might potentially transform EQL into %EQL/INTEGER.
-#!+integer-eql-vop
+#+integer-eql-vop
 (defun %eql/integer (obj1 obj2)
   ;; This is just for constant folding, no need to transform into the %EQL/INTEGER VOP
   (eql obj1 obj2))
@@ -304,11 +304,11 @@
             (foo
              (single-float eql)
              (double-float eql)
-             #!+long-float
+             #+long-float
              (long-float eql)
              (bignum
-              #!-integer-eql-vop (lambda (x y) (zerop (bignum-compare x y)))
-              #!+integer-eql-vop eql) ; will become %eql/integer
+              #-integer-eql-vop (lambda (x y) (zerop (bignum-compare x y)))
+              #+integer-eql-vop eql) ; will become %eql/integer
              (ratio
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
@@ -381,8 +381,8 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
           ((consp x) (and (consp y)
                           (recurse (car x) (car y))
                           (recurse (cdr x) (cdr y))))
-          ((and (symbolp x) (not (symbol-package x)))
-           (and (symbolp y) (not (symbol-package y)) (string= x y)))
+          ((and (symbolp x) (not (sb-xc:symbol-package x)))
+           (and (symbolp y) (not (sb-xc:symbol-package y)) (string= x y)))
           (t
            (equal x y)))))
 
@@ -411,20 +411,20 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                   `(let ((x-el (%instance-ref x i))
                          (y-el (%instance-ref y i)))
                      (or (eq x-el y-el) (equalp x-el y-el)))))
-         (if (eql (layout-bitmap layout-x) sb!kernel::+layout-all-tagged+)
-             (loop for i of-type index from sb!vm:instance-data-start
+         (if (eql (layout-bitmap layout-x) sb-kernel::+layout-all-tagged+)
+             (loop for i of-type index from sb-vm:instance-data-start
                    below (layout-length layout-x)
                    always (slot-ref-equalp))
              (let ((comparators (layout-equalp-tests layout-x)))
                (unless (= (length comparators)
-                          (- (layout-length layout-x) sb!vm:instance-data-start))
+                          (- (layout-length layout-x) sb-vm:instance-data-start))
                  (bug "EQUALP got incomplete instance layout"))
                ;; See remark at the source code for %TARGET-DEFSTRUCT
                ;; explaining how to use the vector of comparators.
-               (loop for i of-type index from sb!vm:instance-data-start
+               (loop for i of-type index from sb-vm:instance-data-start
                      below (layout-length layout-x)
                      for test = (data-vector-ref
-                                 comparators (- i sb!vm:instance-data-start))
+                                 comparators (- i sb-vm:instance-data-start))
                      always (cond ((eql test 0) (slot-ref-equalp))
                                   ((functionp test)
                                    (funcall test i x y))
@@ -508,7 +508,6 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
               (array-equal-p x y)))
         (t nil)))
 
-(/show0 "about to do test cases in pred.lisp")
 (let ((test-cases `((0.0 ,(load-time-value (make-unportable-float :single-float-negative-zero)) t)
                     (0.0 1.0 nil)
                     (#c(1 0) #c(1.0 0.0) t)
@@ -517,14 +516,10 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                     ("Hello" "hello" t)
                     ("Hello" #(#\h #\E #\l #\l #\o) t)
                     ("Hello" "goodbye" nil))))
-  (/show0 "TEST-CASES bound in pred.lisp")
   (dolist (test-case test-cases)
-    (/show0 "about to do a TEST-CASE in pred.lisp")
     (destructuring-bind (x y expected-result) test-case
       (let* ((result (equalp x y))
              (bresult (if result 1 0))
              (expected-bresult (if expected-result 1 0)))
         (unless (= bresult expected-bresult)
-          (/show0 "failing test in pred.lisp")
           (error "failed test (EQUALP ~S ~S)" x y))))))
-(/show0 "done with test cases in pred.lisp")

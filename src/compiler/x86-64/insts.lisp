@@ -1,4 +1,4 @@
-;;;; that part of the description of the x86-64 instruction set
+;;; that part of the description of the x86-64 instruction set
 ;;;; which can live on the cross-compilation host
 
 ;;;; This software is part of the SBCL system. See the README file for
@@ -10,18 +10,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!X86-64-ASM")
+(in-package "SB-X86-64-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
   (import '(conditional-opcode
             plausible-signed-imm32-operand-p
             ea-p ea-base ea-index size-nbyte
-            ea make-ea ea-disp rip-relative-ea) "SB!VM")
+            ea make-ea ea-disp rip-relative-ea) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::tn-reg sb!vm::reg-name
-            sb!vm::frame-byte-offset sb!vm::rip-tn sb!vm::rbp-tn
-            sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
+  #+sb-simd-pack-256
+  (import '(sb-vm::int-avx2-reg sb-vm::double-avx2-reg sb-vm::single-avx2-reg))
+  (import '(sb-vm::tn-reg sb-vm::reg-name
+            sb-vm::frame-byte-offset sb-vm::rip-tn sb-vm::rbp-tn
+            #+avx2 sb-vm::avx2-reg
+            sb-vm::registers sb-vm::float-registers sb-vm::stack))) ; SB names
 
 ;;; a REG object discards all information about a TN except its storage base
 ;;; (a/k/a register class), size class (for GPRs), and encoding.
@@ -74,7 +77,8 @@
     (:word  2)
     (:dword 4)
     (:qword 8)
-    (:oword 16)))
+    (:oword 16)
+    (:hword 32)))
 
 (defun is-size-p (arg) (member arg '(:byte :word :dword :qword)))
 
@@ -91,7 +95,7 @@
     ;; Alternatively, the lower bound #xFFFFFFFF80000000 could
     ;; be spelled as (MASK-FIELD (BYTE 33 31) -1)
     ((integer #.(- (expt 2 64) (expt 2 31)) #.most-positive-word)
-     (sb!c::mask-signed-field 32 imm))
+     (sb-c::mask-signed-field 32 imm))
     (t nil)))
 ;;; Like above but for 8 bit signed immediate operands. In this case we need
 ;;; to know the operand size, because, for example #xffcf is a signed imm8
@@ -109,7 +113,7 @@
          (when (case operand-size
                  (:word (typep imm '(integer #xFF80 #xFFFF)))
                  (:dword (typep imm '(integer #xFFFFFF80 #xFFFFFFFF))))
-           (sb!c::mask-signed-field 8 imm)))))
+           (sb-c::mask-signed-field 8 imm)))))
 
 ;;;; disassembler argument types
 
@@ -144,7 +148,7 @@
   :sign-extend t
   :use-label (lambda (value dstate) (+ (dstate-next-addr dstate) value))
   :printer (lambda (value stream dstate)
-             (or #!+immobile-space
+             (or #+immobile-space
                  (and (integerp value) (maybe-note-lisp-callee value dstate))
                  (maybe-note-assembler-routine value nil dstate))
              (print-label value stream dstate)))
@@ -274,7 +278,7 @@
     (:le . 14) (:ng . 14)
     (:nle . 15) (:g . 15))
   #'equal)
-(defconstant-eqx sb!vm::+condition-name-vec+
+(defconstant-eqx sb-vm::+condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
@@ -295,7 +299,7 @@
   (define-sse-shuffle-arg-type sse-shuffle-pattern-2-2 "#b~2,'0B")
   (define-sse-shuffle-arg-type sse-shuffle-pattern-8-4 "#4r~4,4,'0R"))
 
-(define-arg-type condition-code :printer sb!vm::+condition-name-vec+)
+(define-arg-type condition-code :printer sb-vm::+condition-name-vec+)
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
@@ -422,7 +426,7 @@
                             :default-printer
                             `(:name :tab ,(swap-if 'dir 'reg/mem ", " 'reg)))
   (op  :field (byte 6 2))
-  (dir :field (byte 1 1)))
+  (dir :field (byte 1 1) :reader regrm-direction-bit))
 
 ;;; Same as reg-reg/mem, but uses the reg field as a second op code.
 (define-instruction-format (reg/mem 16
@@ -954,7 +958,7 @@
 ;;; (OR (SIGNED-BYTE 32) (UNSIGNED-BYTE 32)), so we provide a more
 ;;; restricted emitter here.
 (defun emit-signed-dword (segment value)
-  (declare (type sb!assem:segment segment)
+  (declare (type sb-assem:segment segment)
            (type (signed-byte 32) value))
   (declare (inline emit-dword))
   (emit-dword segment value))
@@ -1131,16 +1135,21 @@
 
 (defun reg-name (reg)
   (let ((id (reg-id reg)))
-    (svref (if (is-gpr-id-p id)
-               (svref (load-time-value
-                       (vector sb!vm::+qword-register-names+
-                               sb!vm::+dword-register-names+
-                               sb!vm::+word-register-names+
-                               sb!vm::+byte-register-names+)
-                       t)
-                      (gpr-id-size-class id))
-               #.(coerce (loop for i below 16 collect (format nil "XMM~D" i))
-                         'vector))
+    (svref (cond ((is-gpr-id-p id)
+                  (svref (load-time-value
+                          (vector sb-vm::+qword-register-names+
+                                  sb-vm::+dword-register-names+
+                                  sb-vm::+word-register-names+
+                                  sb-vm::+byte-register-names+)
+                          t)
+                         (gpr-id-size-class id)))
+                 #+avx2
+                 ((is-avx2-id-p id)
+                  #.(coerce (loop for i below 16 collect (format nil "YMM~D" i))
+                            'vector))
+                 (t
+                  #.(coerce (loop for i below 16 collect (format nil "XMM~D" i))
+                            'vector)))
            (reg-id-num id))))
 
 ;;; Return the "lossy" encoding of REG (keeping only the 3 low bits).
@@ -1148,7 +1157,7 @@
 ;;; this use of REG (we can't actually assert that since we don't know
 ;;; which REX bit should have been set, nor which bits were set).
 ;;; However, we can assert absence of REX if so called for.
-(declaim (ftype (sfunction (reg sb!assem:segment) (mod 8)) reg-encoding))
+(declaim (ftype (sfunction (reg sb-assem:segment) (mod 8)) reg-encoding))
 (defun reg-encoding (reg segment &aux (id (reg-id reg)))
   (cond ((and (is-gpr-id-p id)
               (eq (gpr-id-size-class id) +size-class-byte+)
@@ -1206,7 +1215,7 @@
 ;;; this saves some consing, but also allows removal of 2 or 3 storage classes.
 ;;; (i.e. We should never need to ask for a vop temporary that is DWORD-REG
 ;;; because you can't usefully pack 2 dwords in a qword)
-(defun sb!assem::perform-operand-lowering (operands)
+(defun sb-assem::perform-operand-lowering (operands)
   (mapcar (lambda (operand)
             (cond ((typep operand '(cons tn (eql :high-byte)))
                    (get-gpr :byte (+ 16 (the (mod 4) (tn-offset (car operand))))))
@@ -1215,13 +1224,21 @@
                    operand)
                   ((eq (sb-name (sc-sb (tn-sc operand))) 'registers)
                    (tn-reg operand))
+                  #+avx2
+                  ((memq (sc-name (tn-sc operand))
+                         '(avx2-reg
+                           int-avx2-reg
+                           double-avx2-reg
+                           single-avx2-reg))
+                   (get-avx2 (tn-offset operand)))
                   ((eq (sb-name (sc-sb (tn-sc operand))) 'float-registers)
                    (get-fpr (tn-offset operand)))
                   (t ; a stack SC or constant
                    operand)))
           operands))
 
-(defun emit-ea (segment thing reg &key allow-constants (remaining-bytes 0))
+(defun emit-ea (segment thing reg &key allow-constants (remaining-bytes 0)
+                                       xmm-index)
   (when (register-p reg)
     (setq reg (reg-encoding reg segment)))
   (etypecase thing
@@ -1284,9 +1301,12 @@
          (let ((ss (1- (integer-length scale)))
                (index (if (null index)
                           #b100
-                          (if (location= index sb!vm::rsp-tn)
+                          (if (location= index sb-vm::rsp-tn)
                               (error "can't index off of RSP")
-                              (reg-encoding (tn-reg index) segment))))
+                              (reg-encoding (if xmm-index
+                                                (get-fpr (tn-offset index))
+                                                (tn-reg index))
+                                            segment))))
                (base (if (null base) #b101 base-encoding)))
            (emit-sib-byte segment ss index base)))
        (cond ((= mod #b01)
@@ -1362,7 +1382,7 @@
     (emit-byte segment #x66))
   (ecase lock
     ((nil))
-    (:lock (emit-byte segment #xf0))) ; even if #!-sb-thread
+    (:lock (emit-byte segment #xf0))) ; even if #-sb-thread
   (let ((ea-p (ea-p thing)))
     (emit-rex-if-needed segment
                         (eq operand-size :qword) ; REX.W
@@ -1380,7 +1400,7 @@
 (defun operand-size (thing)
   (typecase thing
     (tn
-     (or (sb!c:sc-operand-size (tn-sc thing))
+     (or (sb-c:sc-operand-size (tn-sc thing))
          (error "can't tell the size of ~S" thing)))
     (reg
      (let ((id (reg-id thing)))
@@ -1463,7 +1483,7 @@
       thing))
 
 ;;; This function SHOULD NOT BE USED. It is only for compatibility.
-(defun sb!vm::reg-in-size (tn size)
+(defun sb-vm::reg-in-size (tn size)
   (sized-thing (tn-reg tn) size))
 
 (define-instruction mov (segment maybe-size dst &optional src)
@@ -2379,17 +2399,17 @@
 ;;;; interrupt instructions
 
 (define-instruction break (segment &optional (code nil codep))
-  #!-ud2-breakpoints (:printer byte-imm ((op (or #!+int4-breakpoints #xCE #xCC)))
+  #-ud2-breakpoints (:printer byte-imm ((op (or #+int4-breakpoints #xCE #xCC)))
                                '(:name :tab code) :control #'break-control)
-  #!+ud2-breakpoints (:printer word-imm ((op #x0B0F))
+  #+ud2-breakpoints (:printer word-imm ((op #x0B0F))
                                '(:name :tab code) :control #'break-control)
   (:emitter
-   #!-ud2-breakpoints (emit-byte segment (or #!+int4-breakpoints #xCE #xCC))
+   #-ud2-breakpoints (emit-byte segment (or #+int4-breakpoints #xCE #xCC))
    ;; On darwin, trap handling via SIGTRAP is unreliable, therefore we
    ;; throw a sigill with 0x0b0f instead and check for this in the
    ;; SIGILL handler and pass it on to the sigtrap handler if
    ;; appropriate
-   #!+ud2-breakpoints (emit-word segment #x0B0F)
+   #+ud2-breakpoints (emit-word segment #x0B0F)
    (when codep (emit-byte segment (the (unsigned-byte 8) code)))))
 
 (define-instruction int (segment number)
@@ -2417,7 +2437,7 @@
 ;;; Emit a sequence of single- or multi-byte NOPs to fill AMOUNT many
 ;;; bytes with the smallest possible number of such instructions.
 (defun emit-long-nop (segment amount)
-  (declare (type sb!assem:segment segment)
+  (declare (type sb-assem:segment segment)
            (type index amount))
   ;; Pack all instructions into one byte vector to save space.
   (let* ((bytes #.(!coerce-to-specialized
@@ -2469,7 +2489,7 @@
   (:emitter
    (emit-header-data segment
                      (logior simple-fun-widetag
-                             #!+(and compact-instance-header (host-feature sb-xc-host))
+                             #+(and compact-instance-header sb-xc-host)
                              (ash function-layout 32)))))
 
 
@@ -2479,7 +2499,7 @@
 ;; The one-element list is used in the cases where the REX prefix is
 ;; really a prefix and thus automatically supported, the two-element
 ;; list is used when the REX prefix is used in an infix position.
-(eval-when (:compile-toplevel :execute)
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun sse-inst-printer-list (inst-format-stem prefix opcode
                                 &key more-fields printer)
     (let ((fields `(,@(when prefix
@@ -2494,7 +2514,7 @@
                 `(:printer ,inst-format ,fields ,@(if printer `(',printer))))
               inst-formats)))
   (defun 2byte-sse-inst-printer-list (inst-format-stem prefix op1 op2
-                                       &key more-fields printer)
+                                      &key more-fields printer)
     (let ((fields `(,@(when prefix
                         `((prefix, prefix)))
                     (op1 ,op1)
@@ -2986,11 +3006,10 @@
                  (emit-byte segment imm)))))
 
 
-  ;; pinsrq not encodable in 64-bit mode
+  ;; pinsrq not encodable in 64-bit mode ;; FIXME: that's not true
   (define-insert-sse-instruction pinsrb #x66 #x3a #x20)
   (define-insert-sse-instruction pinsrw #x66 #xc4 nil)
   (define-insert-sse-instruction pinsrd #x66 #x3a #x22)
-  (define-insert-sse-instruction insertps #x66 #x3a #x21)
 
   (define-extract-sse-instruction pextrb #x66 #x3a #x14)
   (define-extract-sse-instruction pextrd #x66 #x3a #x16)
@@ -3002,10 +3021,10 @@
 (define-instruction pextrw (segment dst src imm)
   (:emitter
    (aver (xmm-register-p src))
-   (if (not (gpr-p dst))
-       (emit-sse-inst-2byte segment dst src #x66 #x3a #x15
-                            :operand-size :do-not-set :remaining-bytes 1)
+   (if (gpr-p dst)
        (emit-sse-inst segment dst src #x66 #xc5
+                            :operand-size :do-not-set :remaining-bytes 1)
+       (emit-sse-inst-2byte segment dst src #x66 #x3a #x15
                             :operand-size :do-not-set :remaining-bytes 1))
    (emit-byte segment imm))
   . #.(append
@@ -3163,6 +3182,8 @@
   (regular-2byte-sse-inst-imm pcmpestri #x66 #x3a #x61)
   (regular-2byte-sse-inst-imm pcmpistrm #x66 #x3a #x62)
   (regular-2byte-sse-inst-imm pcmpistri #x66 #x3a #x63)
+
+  (regular-2byte-sse-inst-imm insertps #x66 #x3a #x21)
 
   (regular-2byte-sse-inst-imm aeskeygenassist #x66 #x3a #xdf))
 
@@ -3359,50 +3380,55 @@
         (setf constant (list :complex-single-float first)))
        ((complex double-float)
         (setf constant (list :complex-double-float first)))
-       #!+sb-simd-pack
+       #+sb-simd-pack
        (simd-pack
         (setq constant
               (list :sse (logior (%simd-pack-low first)
-                                 (ash (%simd-pack-high first) 64))))))))
+                                 (ash (%simd-pack-high first) 64)))))
+       #+sb-simd-pack-256
+       (simd-pack-256
+        (setq constant
+              (list :avx2 (logior (%simd-pack-256-0 first)
+                                  (ash (%simd-pack-256-1 first) 64)
+                                  (ash (%simd-pack-256-2 first) 128)
+                                  (ash (%simd-pack-256-3 first) 192))))))))
   (destructuring-bind (type value) constant
     (ecase type
       ((:byte :word :dword :qword)
-         (aver (integerp value))
-         (cons type value))
+       (aver (integerp value))
+       (cons type value))
       ((:base-char)
-         #!+sb-unicode (aver (typep value 'base-char))
-         (cons :byte (char-code value)))
+       #+sb-unicode (aver (typep value 'base-char))
+       (cons :byte (char-code value)))
       ((:character)
-         (aver (characterp value))
-         (cons :dword (char-code value)))
+       (aver (characterp value))
+       (cons :dword (char-code value)))
       ((:single-float)
-         (aver (typep value 'single-float))
-         (cons (if alignedp :oword :dword)
-               (ldb (byte 32 0) (single-float-bits value))))
+       (aver (typep value 'single-float))
+       (cons (if alignedp :oword :dword)
+             (ldb (byte 32 0) (single-float-bits value))))
       ((:double-float)
-         (aver (typep value 'double-float))
-         (cons (if alignedp :oword :qword)
-               (ldb (byte 64 0) (logior (ash (double-float-high-bits value) 32)
-                                        (double-float-low-bits value)))))
+       (aver (typep value 'double-float))
+       (cons (if alignedp :oword :qword)
+             (ldb (byte 64 0) (double-float-bits value))))
       ((:complex-single-float)
-         (aver (typep value '(complex single-float)))
-         (cons (if alignedp :oword :qword)
-               (ldb (byte 64 0)
-                    (logior (ash (single-float-bits (imagpart value)) 32)
-                            (ldb (byte 32 0)
-                                 (single-float-bits (realpart value)))))))
+       (aver (typep value '(complex single-float)))
+       (cons (if alignedp :oword :qword)
+             (ldb (byte 64 0)
+                  (logior (ash (single-float-bits (imagpart value)) 32)
+                          (ldb (byte 32 0)
+                               (single-float-bits (realpart value)))))))
       ((:oword :sse)
-         (aver (integerp value))
-         (cons :oword value))
+       (aver (integerp value))
+       (cons :oword value))
+      ((:hword :avx2)
+       (aver (integerp value))
+       (cons :hword value))
       ((:complex-double-float)
-         (aver (typep value '(complex double-float)))
-         (cons :oword
-               (logior (ash (double-float-high-bits (imagpart value)) 96)
-                       (ash (double-float-low-bits (imagpart value)) 64)
-                       (ash (ldb (byte 32 0)
-                                 (double-float-high-bits (realpart value)))
-                            32)
-                       (double-float-low-bits (realpart value))))))))
+       (aver (typep value '(complex double-float)))
+       (cons :oword
+             (logior (ash (ldb (byte 64 0) (double-float-bits (imagpart value))) 64)
+                     (ldb (byte 64 0) (double-float-bits (realpart value)))))))))
 
 (defun inline-constant-value (constant)
   (declare (ignore constant)) ; weird!
@@ -3425,7 +3451,7 @@
                             collect (prog1 (ldb (byte 8 0) val)
                                       (setf val (ash val -8)))))))))
 
-(defun sb!assem::%mark-used-labels (operand)
+(defun sb-assem::%mark-used-labels (operand)
   (when (typep operand 'ea)
     (let ((disp (ea-disp operand)))
       (typecase disp
@@ -3434,9 +3460,9 @@
        (label+addend
         (setf (label-usedp (label+addend-label disp)) t))))))
 
-(defun sb!c::branch-opcode-p (mnemonic)
+(defun sb-c::branch-opcode-p (mnemonic)
   (member mnemonic (load-time-value
-                    (mapcar #'sb!assem::op-encoder-name
+                    (mapcar #'sb-assem::op-encoder-name
                             '(call ret jmp jrcxz break int iret
                               loop loopz loopnz syscall
                               byte word dword)) ; unexplained phenomena
@@ -3444,7 +3470,7 @@
 
 ;; Replace the INST-INDEXth element in INST-BUFFER with an instruction
 ;; to store a coverage mark in the OFFSETth byte beyond LABEL.
-(defun sb!c::replace-coverage-instruction (inst-buffer inst-index label offset)
+(defun sb-c::replace-coverage-instruction (inst-buffer inst-index label offset)
   (setf (svref inst-buffer inst-index)
         `(mov :byte ,(rip-relative-ea label offset) 1)))
 
@@ -3460,7 +3486,7 @@
   (flet ((fix (reg)
            (if (register-p reg)
                (make-random-tn :kind :normal
-                               :sc (sc-or-lose 'sb!vm::unsigned-reg)
+                               :sc (sc-or-lose 'sb-vm::unsigned-reg)
                                :offset (reg-id-num (reg-id reg)))
                reg)))
     (%make-ea-dont-use size disp (fix base) (fix index) scale)))

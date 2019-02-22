@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Given a sequence of declarations (and possibly a documentation
 ;;; string) followed by other forms (as occurs in the bodies of DEFUN,
@@ -28,7 +28,7 @@
                     ;; .. and says that the consequences of multiple
                     ;; doc strings are unspecified.
                     ;; That's probably not something the programmer intends.
-                    (sb!c:compiler-warn "Duplicate doc string ~S" x)
+                    (sb-c:compiler-warn "Duplicate doc string ~S" x)
                     t)))
          (declaration-p (x)
            (when (listp x)

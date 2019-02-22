@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (defun muffle-warning-p (warning)
   (declare (special *muffled-warnings*))
@@ -33,8 +33,8 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-#!+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
-#!-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
+#+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
+#-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
 
 ;;; a list of lists of currently active RESTART instances. maintained
 ;;; by RESTART-BIND.
@@ -209,7 +209,7 @@ with that condition (or with no condition) will be returned."
 
 ;;; To reduce expansion size of RESTART-CASE
 (defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
-  (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint*
+  (let ((sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint*
                                        'with-simple-condition-restarts))
         (condition (apply #'coerce-to-condition datum
                           (case function

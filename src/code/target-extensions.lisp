@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; variables initialization and shutdown sequences
 
@@ -127,11 +127,11 @@ these hooks.")
     `(let* ((,size ,initial-size)
             (,string (make-array ,size :element-type ',element-type))
             (,pointer 0))
-       (declare (type (integer 0 ,sb!xc:array-dimension-limit) ,size)
-                (type (integer 0 ,(1- sb!xc:array-dimension-limit)) ,pointer)
+       (declare (type (integer 0 ,sb-xc:array-dimension-limit) ,size)
+                (type (integer 0 ,(1- sb-xc:array-dimension-limit)) ,pointer)
                 (type (simple-array ,element-type (*)) ,string))
        (flet ((push-char (char)
-                (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                 (when (= ,pointer ,size)
                   (let ((old ,string))
                     (setf ,size (* 2 (+ ,size 2))
@@ -160,10 +160,10 @@ unspecified."
   ;; Needless to say, this also excludes some internal bits, but
   ;; getting there is too much detail when "unspecified" says what
   ;; is important -- unpredictable, but harmless.
-  `(sb!thread::with-recursive-lock ((hash-table-lock ,hash-table))
+  `(sb-thread::with-recursive-lock ((hash-table-lock ,hash-table))
      ,@body))
 
 (defmacro with-locked-system-table ((hash-table) &body body)
-  `(sb!thread::with-recursive-system-lock
+  `(sb-thread::with-recursive-system-lock
        ((hash-table-lock ,hash-table))
      ,@body))

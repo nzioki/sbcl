@@ -7,9 +7,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-(sb!xc:defstruct (random-state (:constructor %make-random-state
+(sb-xc:defstruct (random-state (:constructor %make-random-state
                                    (state))
                                ;; Needed for reading #S(random-state)
                                (:constructor %%make-random-state)

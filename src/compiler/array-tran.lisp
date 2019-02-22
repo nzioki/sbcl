@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; utilities for optimizing array operations
 
@@ -238,7 +238,7 @@
   (define hairy-data-vector-ref/check-bounds)
   (define data-vector-ref))
 
-#!+(or x86 x86-64)
+#+(or x86 x86-64)
 (defoptimizer (data-vector-ref-with-offset derive-type) ((array index offset))
   (declare (ignore index offset))
   (derive-aref-type array))
@@ -254,7 +254,7 @@
   (define hairy-data-vector-set/check-bounds)
   (define data-vector-set))
 
-#!+(or x86 x86-64)
+#+(or x86 x86-64)
 (defoptimizer (data-vector-set-with-offset derive-type) ((array index offset new-value))
   (declare (ignore index offset))
   (assert-new-value-type new-value array))
@@ -309,7 +309,7 @@
                                        (lvar-value element-type))))
                            (cond
                              ((or (null ctype) (contains-unknown-type-p ctype)) '*)
-                             (t (sb!xc:upgraded-array-element-type
+                             (t (sb-xc:upgraded-array-element-type
                                  (lvar-value element-type))))))
                         (t
                          '*))
@@ -349,10 +349,10 @@
   (declare (ignore n-bits))
   (let ((saetp (and (constant-lvar-p widetag)
                     (find (lvar-value widetag)
-                          sb!vm:*specialized-array-element-type-properties*
-                          :key #'sb!vm:saetp-typecode))))
+                          sb-vm:*specialized-array-element-type-properties*
+                          :key #'sb-vm:saetp-typecode))))
     (derive-make-array-type dims (if saetp
-                                     (sb!vm:saetp-ctype saetp)
+                                     (sb-vm:saetp-ctype saetp)
                                      *wild-type*)
                             adjustable fill-pointer displaced-to
                             node)))
@@ -390,7 +390,7 @@
   ;; optimizing `#(#(foo bar) #(,x ,y)) we convert the whole expression
   ;; into (VECTOR 'FOO 'BAR X Y), whereas in the unidimensional case
   ;; it never makes sense to turn #(FOO BAR) into (VECTOR 'FOO 'BAR).
-  (when (or (and (= rank 1) (sb!xc:constantp initial-contents env))
+  (when (or (and (= rank 1) (sb-xc:constantp initial-contents env))
             ;; If you inhibit inlining these - game over.
             (fun-lexically-notinline-p 'vector env)
             (fun-lexically-notinline-p 'list env)
@@ -398,12 +398,12 @@
     (return-from rewrite-initial-contents (values nil nil)))
   (let ((dimensions (make-array rank :initial-element nil))
         (output))
-    (named-let recurse ((form (handler-case (sb!xc:macroexpand initial-contents env)
+    (named-let recurse ((form (handler-case (sb-xc:macroexpand initial-contents env)
                                 (error ()
                                   (return-from rewrite-initial-contents))))
                         (axis 0))
       (flet ((make-list-ctor (tail &optional (prefix nil prefixp) &aux val)
-               (when (and (sb!xc:constantp tail)
+               (when (and (sb-xc:constantp tail)
                           (or (proper-list-p (setq val (constant-form-value tail env)))
                               (and (vectorp val) (not prefixp))))
                  (setq form
@@ -443,16 +443,16 @@
      ;; If the unaltered INITIAL-CONTENTS were constant, then the flattened
      ;; form must be too. Turning it back to a self-evaluating object
      ;; is essential to avoid compile-time blow-up on huge vectors.
-     (if (sb!xc:constantp initial-contents env)
+     (if (sb-xc:constantp initial-contents env)
          (map 'vector (lambda (x) (constant-form-value x env)) output)
          (let ((f (if (singleton-p output) 'list 'vector)))
            `(locally (declare (notinline ,f))
              (,f ,@(mapcar (lambda (x)
                              (cond ((and (symbolp x)
                                          (not (nth-value
-                                               1 (sb!xc:macroexpand-1 x env))))
+                                               1 (sb-xc:macroexpand-1 x env))))
                                     x)
-                                   ((sb!xc:constantp x env)
+                                   ((sb-xc:constantp x env)
                                     `',(constant-form-value x env))
                                    (t
                                     `(locally (declare (inline ,f)) ,x))))
@@ -469,13 +469,13 @@
 ;;; in this path, mainly due to complications in picking the right widetag.
 (define-source-transform make-array (dims-form &rest rest &environment env
                                                &aux dims dims-constp)
-  (cond ((and (sb!xc:constantp dims-form env)
+  (cond ((and (sb-xc:constantp dims-form env)
               (proper-list-p (setq dims (constant-form-value dims-form env)))
               (not (singleton-p dims))
               (every (lambda (x) (typep x 'index)) dims))
          (setq dims-constp t))
         ((and (cond ((typep (setq dims (handler-case
-                                           (sb!xc:macroexpand dims-form env)
+                                           (sb-xc:macroexpand dims-form env)
                                          (error ()
                                            (return-from make-array (values nil t)))))
                             '(cons (eql list)))
@@ -484,7 +484,7 @@
                     ;; `(,X 2 1) -> (LIST* X '(2 1)) for example
                     ((typep dims '(cons (eql list*) cons))
                      (let ((last (car (last dims))))
-                       (when (sb!xc:constantp last env)
+                       (when (sb-xc:constantp last env)
                          (let ((lastval (constant-form-value last env)))
                            (when (listp lastval)
                              (setq dims (append (butlast (cdr dims)) lastval))
@@ -492,7 +492,7 @@
               (proper-list-p dims)
               (not (singleton-p dims)))
          ;; If you spell '(2 2) as (LIST 2 2), it is constant for purposes of MAKE-ARRAY.
-         (when (every (lambda (x) (sb!xc:constantp x env)) dims)
+         (when (every (lambda (x) (sb-xc:constantp x env)) dims)
            (let ((values (mapcar (lambda (x) (constant-form-value x env)) dims)))
              (when (every (lambda (x) (typep x 'index)) values)
                (setq dims values dims-constp t)))))
@@ -524,7 +524,7 @@
                     (case k
                       (:element-type
                        (unless (eq et unsupplied) (return nil))
-                       (setq et (car v) et-constp (sb!xc:constantp et env)))
+                       (setq et (car v) et-constp (sb-xc:constantp et env)))
                       (:initial-element
                        (when (or contents element) (return nil))
                        (setq element v))
@@ -574,7 +574,7 @@
                                 (t '*))
                          ,(if dims-constp dims (length dims)))
               (make-array-header*
-               ,@(sb!vm::make-array-header-inits
+               ,@(sb-vm::make-array-header-inits
                   `(make-array ,size ,@keys) size dims)))))
       `(let* (,@axis-bindings ,@et-binding (,size (the index (* ,@dims))))
          ,(cond ((or (not contents) (and dims-constp (equal dims data-dims)))
@@ -588,15 +588,15 @@
                  ;; i.e. (LET* ((#:D0 (THE (EQL <n>) dimension0)) ...)
                  ;; but it seems preferable to imply that the initial contents
                  ;; are wrongly shaped rather than that the array is.
-                 `(sb!kernel::check-array-shape ,alloc-form ',data-dims))
+                 `(sb-kernel::check-array-shape ,alloc-form ',data-dims))
                 (t ; could not parse the data
                  `(fill-array ,(car contents) ,alloc-form)))))))
 
 (define-source-transform coerce (x type &environment env)
-  (if (and (sb!xc:constantp type env)
+  (if (and (sb-xc:constantp type env)
            (proper-list-p x)
-           (memq (car x) '(sb!impl::|List| list
-                           sb!impl::|Vector| vector)))
+           (memq (car x) '(sb-impl::|List| list
+                           sb-impl::|Vector| vector)))
       (let* ((type (constant-form-value type env))
              (length (1- (length x)))
              (ctype (careful-values-specifier-type type)))
@@ -660,10 +660,10 @@
                        (give-up-ir1-transform))
                       (t
                        (find-saetp-by-ctype elt-ctype))))
-         (default-initial-element (sb!vm:saetp-initial-element-default saetp))
-         (n-bits (sb!vm:saetp-n-bits saetp))
-         (typecode (sb!vm:saetp-typecode saetp))
-         (n-pad-elements (sb!vm:saetp-n-pad-elements saetp))
+         (default-initial-element (sb-vm:saetp-initial-element-default saetp))
+         (n-bits (sb-vm:saetp-n-bits saetp))
+         (typecode (sb-vm:saetp-typecode saetp))
+         (n-pad-elements (sb-vm:saetp-n-pad-elements saetp))
          (n-words-form
            (cond ((not c-length)
                   (let ((padded-length-form (if (zerop n-pad-elements)
@@ -671,29 +671,29 @@
                                                 `(+ length ,n-pad-elements))))
                     (cond
                       ((= n-bits 0) 0)
-                      ((>= n-bits sb!vm:n-word-bits)
+                      ((>= n-bits sb-vm:n-word-bits)
                        `(* ,padded-length-form
                            ;; i.e., not RATIO
-                           ,(the fixnum (/ n-bits sb!vm:n-word-bits))))
+                           ,(the fixnum (/ n-bits sb-vm:n-word-bits))))
                       (t
-                       (let ((n-elements-per-word (/ sb!vm:n-word-bits n-bits)))
+                       (let ((n-elements-per-word (/ sb-vm:n-word-bits n-bits)))
                          (declare (type index n-elements-per-word)) ; i.e., not RATIO
                          `(ceiling (truly-the index ,padded-length-form)
                                    ,n-elements-per-word))))))
                  ((and (fixnump c-length)
                        (>= c-length 0))
                   (ceiling (* (+ c-length n-pad-elements) n-bits)
-                           sb!vm:n-word-bits))
+                           sb-vm:n-word-bits))
                  (t
                   (give-up-ir1-transform))))
          (data-result-spec
-           `(simple-array ,(sb!vm:saetp-specifier saetp) (,(or c-length '*))))
+           `(simple-array ,(sb-vm:saetp-specifier saetp) (,(or c-length '*))))
          (result-spec
            (if complex
-               `(and (array ,(sb!vm:saetp-specifier saetp) (*))
+               `(and (array ,(sb-vm:saetp-specifier saetp) (*))
                      (not simple-array))
                `(simple-array
-                 ,(sb!vm:saetp-specifier saetp) (,(or c-length '*)))))
+                 ,(sb-vm:saetp-specifier saetp) (,(or c-length '*)))))
          (data-alloc-form
            `(truly-the ,data-result-spec
                        (allocate-vector ,typecode
@@ -726,8 +726,8 @@
                       `(let ((%length (the index ,(or c-length 'length))))
                          (truly-the
                           ,result-spec
-                          (make-array-header* ,(or (sb!vm:saetp-complex-typecode saetp)
-                                                   sb!vm:complex-vector-widetag)
+                          (make-array-header* ,(or (sb-vm:saetp-complex-typecode saetp)
+                                                   sb-vm:complex-vector-widetag)
                                               ;; fill-pointer
                                               ,(cond ((eq fill-pointer-value t)
                                                       '%length)
@@ -773,7 +773,7 @@
                   (lvar-matches initial-contents
                                 ;; FIXME: probably don't need all 4 of these now?
                                 :fun-names '(list vector
-                                             sb!impl::|List| sb!impl::|Vector|)
+                                             sb-impl::|List| sb-impl::|Vector|)
                                 :arg-count c-length))
              (let ((parameters (eliminate-keywords))
                    (elt-vars (make-gensym-list c-length))
@@ -930,15 +930,15 @@
                        "ELEMENT-TYPE ~s is not a known type"
                        eltype-type)
                       (find eltype-type
-                            sb!vm:*specialized-array-element-type-properties*
-                            :key #'sb!vm:saetp-ctype
+                            sb-vm:*specialized-array-element-type-properties*
+                            :key #'sb-vm:saetp-ctype
                             :test #'csubtypep)))
            (creation-form `(%make-array
                             dims
                             ,(if saetp
-                                 (sb!vm:saetp-typecode saetp)
+                                 (sb-vm:saetp-typecode saetp)
                                  (give-up-ir1-transform))
-                            ,(sb!vm:saetp-n-bits-shift saetp)
+                            ,(sb-vm:saetp-n-bits-shift saetp)
                             ,@(maybe-arg initial-contents)
                             ,@(maybe-arg adjustable)
                             ,@(maybe-arg fill-pointer)
@@ -947,7 +947,7 @@
       (cond ((or (not initial-element)
                  (and (constant-lvar-p initial-element)
                       (eql (lvar-value initial-element)
-                           (sb!vm:saetp-initial-element-default saetp))))
+                           (sb-vm:saetp-initial-element-default saetp))))
              creation-form)
             (t
              ;; error checking for target, disabled on the host because
@@ -956,7 +956,7 @@
              (when (constant-lvar-p initial-element)
                (let ((value (lvar-value initial-element)))
                  (cond
-                   ((not (ctypep value (sb!vm:saetp-ctype saetp)))
+                   ((not (ctypep value (sb-vm:saetp-ctype saetp)))
                     ;; this case will cause an error at runtime, so we'd
                     ;; better WARN about it now.
                     (warn 'array-initial-element-mismatch
@@ -965,7 +965,7 @@
                           :format-arguments
                           (list
                            value
-                           (type-specifier (sb!vm:saetp-ctype saetp))
+                           (type-specifier (sb-vm:saetp-ctype saetp))
                            'upgraded-array-element-type
                            eltype)))
                    ((not (ctypep value eltype-type))
@@ -976,7 +976,7 @@
              `(let ((array ,creation-form))
                 (multiple-value-bind (vector)
                     (%data-vector-and-index array 0)
-                  (fill vector (the ,(sb!vm:saetp-specifier saetp) initial-element)))
+                  (fill vector (the ,(sb-vm:saetp-specifier saetp) initial-element)))
                 array))))))
 
 ;;; The list type restriction does not ensure that the result will be a
@@ -1051,14 +1051,14 @@
                                  'simple-array)
                             ,(cond ((null element-type) t)
                                    (element-type-ctype
-                                    (sb!xc:upgraded-array-element-type
+                                    (sb-xc:upgraded-array-element-type
                                      (lvar-value element-type)))
                                    (t '*))
                             ,(make-list rank :initial-element '*))))
                `(truly-the ,spec
                            (make-array-header* ,(if complex
-                                                    sb!vm:complex-array-widetag
-                                                    sb!vm:simple-array-widetag)
+                                                    sb-vm:complex-array-widetag
+                                                    sb-vm:simple-array-widetag)
                                                ;; fill-pointer
                                                ,total-size
                                                ;; fill-pointer-p
@@ -1387,12 +1387,17 @@
              (ref-p array-ref)
              (ref-p index-ref)
              (or
-              (loop for constraint in (ref-constraints array-ref)
-                    thereis (and (eq (constraint-y constraint)
-                                     (ref-leaf index-ref))))
+              (let ((index-leaf (ref-leaf index-ref)))
+                (loop for constraint in (ref-constraints array-ref)
+                      for y = (constraint-y constraint)
+                      thereis (if (constant-p index-leaf)
+                                  (and (constant-p y)
+                                       (<= (constant-value index-leaf)
+                                           (constant-value y)))
+                                  (eq index-leaf y))))
               (loop for constraint in (ref-constraints index-ref)
-                    thereis (and (eq (constraint-y constraint)
-                                     (ref-leaf array-ref))))))
+                    thereis (eq (constraint-y constraint)
+                                (ref-leaf array-ref)))))
       (give-up-ir1-transform)))
   ;; It's in bounds but it may be of the wrong type
   `(the (and fixnum unsigned-byte) index))
@@ -1433,7 +1438,7 @@
 ;;; do type testing inside %WITH-ARRAY-DATA instead of outside, and
 ;;; the DEFTRANSFORM can't tell that that's going on, so it can make
 ;;; sense to use FORCE-INLINE option in that case.
-(sb!xc:defmacro with-array-data (((data-var array &key offset-var)
+(sb-xc:defmacro with-array-data (((data-var array &key offset-var)
                                   (start-var &optional (svalue 0))
                                   (end-var &optional (evalue nil))
                                   &key force-inline check-fill-pointer
@@ -1477,7 +1482,7 @@
 
 ;;; This is the fundamental definition of %WITH-ARRAY-DATA, for use in
 ;;; DEFTRANSFORMs and DEFUNs.
-(sb!xc:defmacro %with-array-data-macro
+(sb-xc:defmacro %with-array-data-macro
     (array start end &key (element-type '*) check-bounds check-fill-pointer
                           array-header-p)
   (with-unique-names (size defaulted-end data cumulative-offset)

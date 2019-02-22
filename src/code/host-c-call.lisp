@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (/show0 "host-c-call.lisp 12")
 
@@ -21,7 +21,7 @@
           (element-type 'character)
           (not-null nil))
   (make-alien-c-string-type
-   :to (parse-alien-type 'char (sb!kernel:make-null-lexenv))
+   :to (parse-alien-type 'char (sb-kernel:make-null-lexenv))
    :element-type element-type
    :external-format external-format
    :not-null not-null))
@@ -64,22 +64,22 @@
   #+sb-xc-host
   t
   #-sb-xc-host
-  (let ((external-format (sb!impl::get-external-format
+  (let ((external-format (sb-impl::get-external-format
                           ;; Can't use C-STRING-EXTERNAL-FORMAT here,
                           ;; since the meaning of :DEFAULT can change
                           ;; when *DEFAULT-C-STRING-EXTERNAL-FORMAT*
                           ;; changes.
                           (alien-c-string-type-external-format type))))
     (not (and external-format
-              (or (eq (first (sb!impl::ef-names external-format)) :ascii)
+              (or (eq (first (sb-impl::ef-names external-format)) :ascii)
                   ;; On non-SB-UNICODE all latin-1 codepoints will fit
                   ;; into a base-char, on SB-UNICODE they won't.
-                  #!-sb-unicode
-                  (eq (first (sb!impl::ef-names external-format)) :latin-1))))))
+                  #-sb-unicode
+                  (eq (first (sb-impl::ef-names external-format)) :latin-1))))))
 
 (declaim (ftype (sfunction (t) nil) null-error))
 (defun null-error (type)
-  #-sb-xc-host(declare (optimize sb!kernel:allow-non-returning-tail-call))
+  #-sb-xc-host(declare (optimize sb-kernel:allow-non-returning-tail-call))
   (aver (alien-c-string-type-not-null type))
   (error 'type-error
          :expected-type `(alien ,(unparse-alien-type type))
@@ -100,8 +100,8 @@
        ;; If we need to check for non-ascii data in the input, we
        ;; might as well go through the usual external-format machinery
        ;; instead of rewriting another version of it.
-       ,(if #!+sb-unicode t
-            #!-sb-unicode (c-string-needs-conversion-p type)
+       ,(if #+sb-unicode t
+            #-sb-unicode (c-string-needs-conversion-p type)
             `(c-string-to-string ,alien
                                  (c-string-external-format ,type)
                                  (alien-c-string-type-element-type

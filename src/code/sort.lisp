@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun sort-vector (vector start end predicate-fun key-fun-or-nil)
   (declare (dynamic-extent predicate-fun key-fun-or-nil))
@@ -37,7 +37,7 @@
                           :check-fill-pointer t)
           (sort-vector vector start end predicate-fun key-fun-or-nil))
         sequence)
-      (apply #'sb!sequence:sort sequence predicate args))))
+      (apply #'sb-sequence:sort sequence predicate args))))
 
 ;;;; stable sorting
 (defun stable-sort (sequence predicate &rest args &key key)
@@ -57,11 +57,11 @@
           (stable-sort-vector sequence
                               predicate-fun
                               (and key (%coerce-callable-to-fun key))))
-      (apply #'sb!sequence:stable-sort sequence predicate args))))
+      (apply #'sb-sequence:stable-sort sequence predicate args))))
 
 ;;; FUNCALL-USING-KEY saves us a function call sometimes.
 (eval-when (:compile-toplevel :execute)
-  (sb!xc:defmacro funcall2-using-key (pred key one two)
+  (sb-xc:defmacro funcall2-using-key (pred key one two)
     `(if ,key
          (funcall ,pred (funcall ,key ,one)
                   (funcall ,key  ,two))
@@ -218,7 +218,7 @@
 ;;;    end-1 (inclusive) ... end-2 (exclusive),
 ;;; and merges them into a target vector starting at index start-1.
 
-(sb!xc:defmacro stable-sort-merge-vectors* (source target start-1 end-1 end-2
+(sb-xc:defmacro stable-sort-merge-vectors* (source target start-1 end-1 end-2
                                                      pred key source-ref
                                                      target-ref)
   (let ((i (gensym))
@@ -258,7 +258,7 @@
 ;;; but it uses a temporary vector. DIRECTION determines whether we
 ;;; are merging into the temporary (T) or back into the given vector
 ;;; (NIL).
-(sb!xc:defmacro vector-merge-sort (vector pred key vector-ref)
+(sb-xc:defmacro vector-merge-sort (vector pred key vector-ref)
   (with-unique-names
       (vector-len n direction unsorted start-1 end-1 end-2 temp i)
     `(let* ((,vector-len (length (the vector ,vector)))
@@ -342,7 +342,7 @@
 ;;; of the elements of VECTOR-1 and VECTOR-2. Elements from VECTOR-2
 ;;; are chosen only if they are strictly less than elements of
 ;;; VECTOR-1, (PRED ELT-2 ELT-1), as specified in the manual.
-(sb!xc:defmacro merge-vectors (vector-1 length-1 vector-2 length-2
+(sb-xc:defmacro merge-vectors (vector-1 length-1 vector-2 length-2
                                result-vector pred key access)
   (let ((result-i (gensym))
         (i (gensym))
@@ -420,7 +420,7 @@
                                                        (length s2)))))
          (if (cons-type-p type)
              (multiple-value-bind (min exactp)
-                 (sb!kernel::cons-type-length-info type)
+                 (sb-kernel::cons-type-length-info type)
                (let ((length (+ (length s1) (length s2))))
                  (if exactp
                      (unless (= length min)
@@ -456,6 +456,6 @@
               ;; sequence.  Note that the one builtin method optimizes
               ;; for NIL as the key fun, and we correctly preserve a
               ;; NIL here.
-              (sb!sequence:merge
+              (sb-sequence:merge
                prototype sequence1 sequence2 pred-fun :key key-fun))))
       (t (bad-sequence-type-error result-type)))))

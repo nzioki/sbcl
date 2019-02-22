@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Similar to FUNCTION, but the result type is "exactly" specified:
 ;;; if it is an object type, then the function returns exactly one
@@ -21,7 +21,7 @@
                       ((or (atom result)
                            (not (eq (car result) 'values)))
                        `(values ,result &optional))
-                      ((intersection (cdr result) sb!xc:lambda-list-keywords)
+                      ((intersection (cdr result) sb-xc:lambda-list-keywords)
                        result)
                       (t `(values ,@(cdr result) &optional)))))
     `(function ,args ,result)))
@@ -33,7 +33,7 @@
 ;;; (:FUNCTION :TYPE) information is extracted through a wrapper.
 ;;; The globaldb representation is not necessarily literally a CTYPE.
 #-sb-xc-host
-(declaim (ftype (sfunction (t) (values ctype boolean)) proclaimed-ftype))
+(declaim (ftype (sfunction (t) ctype) global-ftype))
 
 ;;; At run time, we represent the type of a piece of INFO in the globaldb
 ;;; by a small integer between 1 and 63.  [0 is reserved for internal use.]
@@ -96,10 +96,9 @@
 ;;; so that it does not get tested when building the cross-compiler.
 ;;; This was the best way I could see to work around a spurious warning
 ;;; about a wrongly ordered VM definition in make-host-1.
-;;; The #!+/- reader can't see that a VOP-TRANSLATES term is not for the
+;;; The #+/- reader can't see that a VOP-TRANSLATES term is not for the
 ;;; host compiler unless the whole thing is one expression.
-#!-(or (host-feature sb-xc-host)
-       (vop-translates sb!kernel:symbol-info-vector))
+#-(or sb-xc-host (vop-translates sb-kernel:symbol-info-vector))
 (declaim (inline symbol-info-vector))
 #-sb-xc-host
 (defun symbol-info-vector (symbol)
@@ -191,12 +190,16 @@
                             .whole.)))
                     .whole.))))
 
+  ;; ECL bug workaround: INFO ceases to be a valid macrolet name
+  ;; because it tries to run the compiler-macro before the local macro.
+  ;; In particular, "(collect ((info)) ...)" will not compile correctly.
+  #-host-quirks-ecl
   (def info (category kind name)
     `(truly-the (values ,(meta-info-type-spec meta-info) boolean)
                 (get-info-value ,name ,(meta-info-number meta-info))))
 
   (def (setf info) (new-value category kind name)
-    (let* (#+sb-xc-host (sb!xc:*gensym-counter* sb!xc:*gensym-counter*)
+    (let* (#+sb-xc-host (sb-xc:*gensym-counter* sb-xc:*gensym-counter*)
            (tin (meta-info-number meta-info)) ; info-type id number
            (type-spec (meta-info-type-spec meta-info))
            (new (make-symbol "NEW"))
@@ -262,7 +265,7 @@
 ;;;; functions and VOPs. To save space and allow for quick set
 ;;;; operations, we represent the attributes as bits in a fixnum.
 
-(in-package "SB!C")
+(in-package "SB-C")
 (def!type attributes () 'fixnum)
 
 ;;; Given a list of attribute names and an alist that translates them
@@ -311,11 +314,11 @@
  !DEF-BOOLEAN-ATTRIBUTE."
          (multiple-value-bind (temps values stores setter getter)
              (#+sb-xc-host get-setf-expansion
-              #-sb-xc-host sb!xc:get-setf-expansion place env)
+              #-sb-xc-host sb-xc:get-setf-expansion place env)
            (when (cdr stores)
              (error "multiple store variables for ~S" place))
-           (let ((newval (sb!xc:gensym))
-                 (n-place (sb!xc:gensym))
+           (let ((newval (sb-xc:gensym))
+                 (n-place (sb-xc:gensym))
                  (mask (encode-attribute-mask attributes ,vector)))
              (values `(,@temps ,n-place)
                      `(,@values ,getter)
@@ -346,6 +349,6 @@
   `(the attributes
         (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
 (declaim (ftype (function (attributes attributes) boolean) attributes=))
-#!-sb-fluid (declaim (inline attributes=))
+#-sb-fluid (declaim (inline attributes=))
 (defun attributes= (attr1 attr2)
   (eql attr1 attr2))

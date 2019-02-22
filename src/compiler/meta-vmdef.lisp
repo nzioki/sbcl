@@ -16,7 +16,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; storage class and storage base definition
 
@@ -43,7 +43,7 @@
            (error "A size specification is meaningless in a ~S SB." kind)))
         ((:finite :unbounded)
          (unless size (error "Size is not specified in a ~S SB." kind))
-         (aver (<= size sb!vm:finite-sc-offset-limit))
+         (aver (<= size sb-vm:finite-sc-offset-limit))
          (aver (= 1 (logcount size-alignment)))
          (aver (not (logtest size (1- size-alignment))))
          (aver (not (logtest size-increment (1- size-alignment))))))
@@ -199,7 +199,7 @@
 
      (defun ,name ,lambda-list
        (declare (ignorable ,(car lambda-list)))
-       (sb!assem:assemble ()
+       (sb-assem:assemble ()
          ,@body))))
 
 (defglobal *sc-vop-slots*
@@ -215,8 +215,7 @@
   (declare (type symbol name) (type list scs))
   (let ((scns (mapcar #'sc-number-or-lose scs)))
     `(progn
-       (/show0 "doing !DEF-PRIMITIVE-TYPE, NAME=..")
-       (/primitive-print ,(symbol-name name))
+       (/show "doing !DEF-PRIMITIVE-TYPE" ,(string name))
        (assert (not (gethash ',name *backend-primitive-type-names*)))
        (setf (gethash ',name *backend-primitive-type-names*)
              (make-primitive-type :name ',name
@@ -522,7 +521,7 @@
             (aver sc)
             (setf (aref results index)
                   (if offset
-                      (+ (ash offset (1+ sb!vm:sc-number-bits))
+                      (+ (ash offset (1+ sb-vm:sc-number-bits))
                          (ash (sc-number-or-lose sc) 1)
                          1)
                       (ash (sc-number-or-lose sc) 1))))
@@ -780,11 +779,11 @@
 (defun make-operand-parse-temp ()
   (without-package-locks
    (intern (format nil "OPERAND-PARSE-TEMP-~D" *parse-vop-operand-count*)
-           (symbol-package '*parse-vop-operand-count*))))
+           #.(find-package "SB-C"))))
 (defun make-operand-parse-load-tn ()
   (without-package-locks
    (intern (format nil "OPERAND-PARSE-LOAD-TN-~D" *parse-vop-operand-count*)
-           (symbol-package '*parse-vop-operand-count*))))
+           #.(find-package "SB-C"))))
 
 ;;; Given a list of operand specifications as given to DEFINE-VOP,
 ;;; return a list of OPERAND-PARSE structures describing the fixed
@@ -979,7 +978,9 @@
         (:info
          (setf (vop-parse-info-args parse) (rest spec)))
         (:ignore
-         (setf (vop-parse-ignores parse) (rest spec)))
+         (setf (vop-parse-ignores parse)
+               (append (vop-parse-ignores parse)
+                       (rest spec))))
         (:variant
          (setf (vop-parse-variant parse) (rest spec)))
         (:variant-vars
@@ -1042,8 +1043,8 @@
 (defun compute-loading-costs (op load-p)
   (declare (type operand-parse op))
   (let ((scs (operand-parse-scs op))
-        (costs (make-array sb!vm:sc-number-limit :initial-element nil))
-        (load-scs (make-array sb!vm:sc-number-limit :initial-element nil)))
+        (costs (make-array sb-vm:sc-number-limit :initial-element nil))
+        (load-scs (make-array sb-vm:sc-number-limit :initial-element nil)))
     (dolist (sc-name (reverse scs))
       (let* ((load-sc (sc-or-lose sc-name))
              (load-scn (sc-number load-sc)))
@@ -1069,7 +1070,7 @@
               (unless (eq op-load t)
                 (pushnew load-scn (svref load-scs op-scn))))))
 
-        (dotimes (i sb!vm:sc-number-limit)
+        (dotimes (i sb-vm:sc-number-limit)
           (unless (svref costs i)
             (let ((op-sc (svref *backend-sc-numbers* i)))
               (when op-sc
@@ -1082,11 +1083,11 @@
     (values costs load-scs)))
 
 (defconstant-eqx +no-costs+
-    (make-array sb!vm:sc-number-limit :initial-element 0)
+    (make-array sb-vm:sc-number-limit :initial-element 0)
   #'equalp)
 
 (defconstant-eqx +no-loads+
-    (make-array sb!vm:sc-number-limit :initial-element t)
+    (make-array sb-vm:sc-number-limit :initial-element t)
   #'equalp)
 
 ;;; Pick off the case of operands with no restrictions.
@@ -1581,7 +1582,7 @@
               ((quotify-slots ()
                  (collect ((forms))
                    (dolist (x vop-parse-slot-names (cons 'list (forms)))
-                     (let ((reader (package-symbolicate (symbol-package 'vop-parse)
+                     (let ((reader (package-symbolicate (sb-xc:symbol-package 'vop-parse)
                                                         "VOP-PARSE-" x)))
                        (forms
                         (case x

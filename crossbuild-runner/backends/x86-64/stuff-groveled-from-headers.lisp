@@ -1,13 +1,24 @@
-;;;; This is an automatically generated file, please do not hand-edit it.
-;;;; See the program "grovel-headers.c".
+(in-package "SB-WIN32")
 
-(in-package "SB!ALIEN")
+;; I Made all these up. Maybe they're right, maybe they're not.
+(define-alien-type int-ptr (signed 64))
+(define-alien-type dword (signed 32))
+(define-alien-type bool (signed 32))
+(define-alien-type uint (unsigned 32))
+(define-alien-type ulong (unsigned 64))
+
+;; these are total fabrications
+(defconstant max_path 1024)
+(defconstant error-no-data 1)
+(defconstant +exception-maximum-parameters+ 6)
+
+(in-package "SB-ALIEN")
 
 ;;;flags for dlopen()
 (defconstant rtld-lazy 1) ; #x1
 (defconstant rtld-now 2) ; #x2
 (defconstant rtld-global 256) ; #x100
-(in-package "SB!UNIX")
+(in-package "SB-UNIX")
 
 ;;; select()
 (defconstant fd-setsize 1024) ; #x400
@@ -81,6 +92,7 @@
 (defconstant eexist 17) ; #x11
 (defconstant eloop 40) ; #x28
 (defconstant espipe 29) ; #x1d
+(defconstant epipe 32) ; #x20
 (defconstant ewouldblock 11) ; #xb
 
 ;;; for wait3(2) in run-program.lisp
@@ -145,7 +157,7 @@
           (tv-sec (signed 64))
           (tv-nsec (signed 64))))
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; GENCGC related
 (define-alien-type page-index-t (signed 64))

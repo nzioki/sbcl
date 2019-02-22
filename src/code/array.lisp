@@ -9,9 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-#!-sb-fluid
+#-sb-fluid
 (declaim (inline adjustable-array-p
                  array-displacement))
 
@@ -165,11 +165,11 @@
                   (when consp
                     (ill-type))
                   (result simple-vector-widetag))
-                 ((base-char standard-char #!-sb-unicode character)
+                 ((base-char standard-char #-sb-unicode character)
                   (when consp
                     (ill-type))
                   (result simple-base-string-widetag))
-                 #!+sb-unicode
+                 #+sb-unicode
                  ((character extended-char)
                   (when consp
                     (ill-type))
@@ -218,7 +218,7 @@
                       (%integer-vector-widetag-and-n-bits-shift
                        nil (integer-length (1- (cadr type))))
                       (ill-type)))
-                 #!+long-float
+                 #+long-float
                  (long-float
                   (with-parameters (long-float :intervals t) (low high)
                     (if (and (not (eq low '*))
@@ -257,7 +257,7 @@
                                        ((csubtypep ctype (specifier-type '(complex single-float)))
                                         (result
                                          simple-array-complex-single-float-widetag))
-                                       #!+long-float
+                                       #+long-float
                                        ((csubtypep ctype (specifier-type '(complex long-float)))
                                         (result
                                          simple-array-complex-long-float-widetag))
@@ -271,7 +271,7 @@
                                    (single-float
                                     (result
                                      simple-array-complex-single-float-widetag))
-                                   #!+long-float
+                                   #+long-float
                                    (long-float
                                     (result
                                      simple-array-complex-long-float-widetag))
@@ -287,7 +287,7 @@
       ;; Do things the hard way after falling through the tagbody.
       (let* ((ctype (type-or-nil-if-unknown type))
              (ctype (and ctype
-                         (sb!kernel::replace-hairy-type ctype))))
+                         (sb-kernel::replace-hairy-type ctype))))
         (typecase ctype
           (null (result simple-vector-widetag))
           (union-type
@@ -309,7 +309,7 @@
                     (result simple-array-double-float-widetag))
                    ((csubtypep ctype (specifier-type 'single-float))
                     (result simple-array-single-float-widetag))
-                   #!+long-float
+                   #+long-float
                    ((csubtypep ctype (specifier-type 'long-float))
                     (result simple-array-long-float-widetag))
                    ((csubtypep ctype (specifier-type 'complex-double-float))
@@ -324,8 +324,8 @@
                    unless (hairy-type-p type)
                    return (%vector-widetag-and-n-bits-shift (type-specifier type)))))
           (character-set-type
-           #!-sb-unicode (result simple-base-string-widetag)
-           #!+sb-unicode
+           #-sb-unicode (result simple-base-string-widetag)
+           #+sb-unicode
            (if (loop for (start . end)
                      in (character-set-type-pairs ctype)
                      always (and (< start base-char-code-limit)
@@ -374,7 +374,7 @@
   (let* ((n-bits-shift (or n-bits-shift
                            (aref %%simple-array-n-bits-shifts%% widetag)))
          (full-length (if (or (= widetag simple-base-string-widetag)
-                              #!+sb-unicode
+                              #+sb-unicode
                               (= widetag
                                  simple-character-string-widetag))
                           (1+ length)
@@ -405,7 +405,7 @@
     (let ((widetag (%other-pointer-widetag array)))
       (make-case))))
 
-(defun sb!impl::make-vector-like (vector length)
+(defun sb-impl::make-vector-like (vector length)
   (allocate-vector-with-widetag (array-underlying-widetag vector) length nil))
 
 ;; Complain in various ways about wrong :INITIAL-foo arguments,
@@ -561,7 +561,7 @@ of specialized arrays is supported."
   ;; is expensive, but probably worth the trouble as once we've allocated
   ;; the vector we have no way to get rid of it anymore...
   (when (eq t (upgraded-array-element-type element-type))
-    (error "Static arrays of type ~/sb!impl:print-type-specifier/ not supported."
+    (error "Static arrays of type ~/sb-impl:print-type-specifier/ not supported."
            element-type))
   (validate-array-initargs initial-element-p initial-element
                            initial-contents-p initial-contents nil) ; for effect
@@ -573,12 +573,12 @@ of specialized arrays is supported."
              length))
     (unless (every (lambda (x) (typep x element-type)) initial-contents)
       (error ":INITIAL-CONTENTS contains elements not of type ~
-               ~/sb!impl:print-type-specifier/."
+               ~/sb-impl:print-type-specifier/."
              element-type)))
   (when initial-element-p
     (unless (typep initial-element element-type)
       (error ":INITIAL-ELEMENT ~S is not of type ~
-               ~/sb!impl:print-type-specifier/."
+               ~/sb-impl:print-type-specifier/."
              initial-element element-type)))
   ;; STEP 2
   ;;
@@ -587,7 +587,7 @@ of specialized arrays is supported."
       (%vector-widetag-and-n-bits-shift element-type)
     (let* ((full-length
              (if (or (= type simple-base-string-widetag)
-                     #!+sb-unicode
+                     #+sb-unicode
                      (= type
                         simple-character-string-widetag))
                  (1+ length)
@@ -681,7 +681,7 @@ of specialized arrays is supported."
   (def !find-data-vector-reffer/check-bounds %%data-vector-reffers/check-bounds%%))
 
 ;;; Like DOVECTOR, but more magical -- can't use this on host.
-(defmacro sb!impl::do-vector-data ((elt vector &optional result) &body body)
+(defmacro sb-impl::do-vector-data ((elt vector &optional result) &body body)
   (multiple-value-bind (forms decls) (parse-body body nil)
     (with-unique-names (index vec start end ref)
       `(with-array-data ((,vec ,vector)
@@ -693,7 +693,7 @@ of specialized arrays is supported."
            (do ((,index ,start (1+ ,index)))
                ((>= ,index ,end)
                 (let ((,elt nil))
-                  ,@(sb!impl::filter-dolist-declarations decls)
+                  ,@(sb-impl::filter-dolist-declarations decls)
                   ,elt
                   ,result))
              (let ((,elt (funcall ,ref ,vec ,index)))
@@ -805,7 +805,7 @@ of specialized arrays is supported."
                 ,@(loop for widetag in '(complex-vector-widetag
                                          complex-vector-nil-widetag
                                          complex-bit-vector-widetag
-                                         #!+sb-unicode complex-character-string-widetag
+                                         #+sb-unicode complex-character-string-widetag
                                          complex-base-string-widetag
                                          simple-array-widetag
                                          complex-array-widetag)
@@ -1056,7 +1056,7 @@ of specialized arrays is supported."
         ((typep array 'vector)
          (list (length array)))
         (t
-         (sb!c::%type-check-error/c array 'object-not-array-error nil))))
+         (sb-c::%type-check-error/c array 'object-not-array-error nil))))
 
 (defun array-total-size (array)
   "Return the total number of elements in the Array."
@@ -1066,7 +1066,7 @@ of specialized arrays is supported."
         ((typep array 'vector)
          (length array))
         (t
-         (sb!c::%type-check-error/c array 'object-not-array-error nil))))
+         (sb-c::%type-check-error/c array 'object-not-array-error nil))))
 
 (defun array-displacement (array)
   "Return the values of :DISPLACED-TO and :DISPLACED-INDEX-offset
@@ -1186,7 +1186,7 @@ of specialized arrays is supported."
   (let* ((old-length (length vector))
          (min-extension (or min-extension
                             (min old-length
-                                 (- array-dimension-limit old-length))))
+                                 (- sb-xc:array-dimension-limit old-length))))
          (new-length (the index (+ old-length
                                    (max 1 min-extension))))
          (fill-pointer (1+ old-length)))
@@ -1296,8 +1296,8 @@ of specialized arrays is supported."
              (when (/= (array-underlying-widetag displaced-to) widetag)
                ;; See lp#1331299 again. Require exact match on upgraded type?
                (error "can't displace an array of type ~
-                        ~/sb!impl:print-type-specifier/ into another ~
-                        of type ~/sb!impl:print-type-specifier/"
+                        ~/sb-impl:print-type-specifier/ into another ~
+                        of type ~/sb-impl:print-type-specifier/"
                       element-type (array-element-type displaced-to)))
              (let ((displacement (or displaced-index-offset 0))
                    (array-size  (if (listp dimensions)
@@ -1434,7 +1434,7 @@ of specialized arrays is supported."
                  (lambda (saetp)
                    `((simple-array ,(saetp-specifier saetp) (*))
                      ,(if (or (eq (saetp-specifier saetp) 'character)
-                              #!+sb-unicode
+                              #+sb-unicode
                               (eq (saetp-specifier saetp) 'base-char))
                           '(code-char 0)
                           (saetp-initial-element-default saetp))))
@@ -1575,7 +1575,7 @@ function to be removed without further warning."
          (unless (or (not initial-element-p)
                      (typep initial-element element-type))
            (error "~S can't be used to initialize an array of type ~
-                    ~/sb!impl:print-type-specifier/."
+                    ~/sb-impl:print-type-specifier/."
                   initial-element element-type))
          (let ((temp (if initial-element-p
                          (make-array new-length :initial-element initial-element)
@@ -1681,7 +1681,12 @@ function to be removed without further warning."
               bit-array-1 result-bit-array))
      result-bit-array)))
 
-(defmacro def-bit-array-op (name function)
+;;; This used to be a DEFMACRO, but depending on the target's support for Unicode,
+;;; it got a constant-folding-error in the FORMAT call when producing the load-time
+;;; macro. CONCATENATE-FORMAT-P returns true, so then we want to know whether the
+;;; result is a base-string which entails calling SB-KERNEL:SIMPLE-BASE-STRING-P
+;;; which has no definition in the cross-compiler. (We could add one of course)
+(macrolet ((def-bit-array-op (name function)
   `(defun ,name (bit-array-1 bit-array-2 &optional result-bit-array)
      ,(format nil
               "Perform a bit-wise ~A on the elements of BIT-ARRAY-1 and ~
@@ -1721,7 +1726,7 @@ function to be removed without further warning."
                              (logand (,function (sbit data1 index-1)
                                                 (sbit data2 index-2))
                                      1))))
-                 result-bit-array)))))))
+                 result-bit-array))))))))
 
 (def-bit-array-op bit-and logand)
 (def-bit-array-op bit-ior logior)
@@ -1733,6 +1738,7 @@ function to be removed without further warning."
 (def-bit-array-op bit-andc2 logandc2)
 (def-bit-array-op bit-orc1 logorc1)
 (def-bit-array-op bit-orc2 logorc2)
+) ; end MACROLET
 
 (defun bit-not (bit-array &optional result-bit-array)
   "Performs a bit-wise logical NOT on the elements of BIT-ARRAY,
@@ -1784,7 +1790,7 @@ function to be removed without further warning."
 ;;; Finally, the DISPATCH-FOO macro is defined which does the actual
 ;;; dispatching when called. It expects arguments that match PARAMS.
 ;;;
-(defmacro sb!impl::!define-array-dispatch (dispatch-name params &body body)
+(defmacro sb-impl::!define-array-dispatch (dispatch-name params &body body)
   (let ((table-name (symbolicate "%%" dispatch-name "-FUNS%%"))
         (error-name (symbolicate "HAIRY-" dispatch-name "-ERROR")))
     `(progn
@@ -1829,7 +1835,7 @@ function to be removed without further warning."
                  (svref ,',table-name ,tag)))
              ,@args))))))
 
-(defun sb!kernel::check-array-shape (array dimensions)
+(defun sb-kernel::check-array-shape (array dimensions)
   (when (let ((dimensions dimensions))
           (dotimes (i (array-rank array))
             (unless (eql (array-dimension array i) (pop dimensions))
@@ -1846,7 +1852,7 @@ function to be removed without further warning."
 
 ;;; Horrible kludge for the "static-vectors" system
 ;;; which uses an internal symbol in SB-IMPL.
-(import '%vector-widetag-and-n-bits-shift 'sb!impl)
+(import '%vector-widetag-and-n-bits-shift 'sb-impl)
 
 (defun make-weak-vector (length &key (initial-contents nil contents-p)
                                      (initial-element nil element-p))

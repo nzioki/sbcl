@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defmacro with-pinned-objects ((&rest objects) &body body)
   #.(concatenate 'string
@@ -17,20 +17,20 @@
 OBJECTS will not be moved in memory for the duration of BODY.
 Useful for e.g. foreign calls where another thread may trigger
 garbage collection."
-     #!-gencgc "  This is currently implemented by disabling GC")
-  #!-gencgc
+     #-gencgc "  This is currently implemented by disabling GC")
+  #-gencgc
   (declare (ignore objects))            ; should we eval these for side-effect?
-  #!-gencgc
+  #-gencgc
   `(without-gcing
     ,@body)
-  #!+(and gencgc (not (or x86 x86-64)))
+  #+(and gencgc (not (or x86 x86-64)))
   `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
      (declare (truly-dynamic-extent *pinned-objects*))
      ,@body)
-  #!+(and gencgc (or x86 x86-64))
+  #+(and gencgc (or x86 x86-64))
   (if objects
       (let ((pins (make-gensym-list (length objects)))
-            (wpo (sb!xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
+            (wpo (sb-xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
         ;; BODY is stuffed in a function to preserve the lexical
         ;; environment.
         `(flet ((,wpo () (progn ,@body)))

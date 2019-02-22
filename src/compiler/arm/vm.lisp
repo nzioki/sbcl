@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; register specs
@@ -76,12 +76,12 @@
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
-#!+arm-vfp
+#+arm-vfp
 (define-storage-base float-registers :finite :size 32)
 ;; NOTE: If you fix the following, please to so with its own feature
 ;; conditional, and also adjust the definitions of the
 ;; {,COMPLEX-}{SINGLE,DOUBLE}-REG SCs below.
-#!-arm-vfp
+#-arm-vfp
 (error "Don't know how many float registers for non-VFP systems")
 )
 
@@ -230,7 +230,7 @@
   (typecase value
     (null
      null-sc-number)
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol
@@ -284,10 +284,10 @@
 
 (defun combination-implementation-style (node)
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((valid-funtype '(fixnum fixnum) '*)

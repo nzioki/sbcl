@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 #-sb-xc-host
 (defun machine-type ()
@@ -22,7 +22,7 @@
 (!with-bigvec-or-sap
 (defun fixup-code-object (code offset value kind flavor)
   (declare (ignore flavor))
-  (unless (zerop (rem offset sb!assem:+inst-alignment-bytes+))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
     (ecase kind
@@ -116,5 +116,5 @@
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 3)))
     (declare (type system-area-pointer pc))
-    (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
+    (sb-kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
 ) ; end PROGN

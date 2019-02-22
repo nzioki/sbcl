@@ -15,29 +15,31 @@
 #+clisp (setf custom:*suppress-check-redefinition* t)
 
 ;;; Run the cross-compiler to produce cold fasl files.
-(setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
-(setq sb!c::*static-vop-usage-counts* (make-hash-table))
+(setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
+(setq sb-c::*static-vop-usage-counts* (make-hash-table))
 (let (fail
       variables
       functions
       types)
-  (sb!xc:with-compilation-unit ()
+  (sb-xc:with-compilation-unit ()
     (let ((*feature-evaluation-results* nil))
       (load "src/cold/compile-cold-sbcl.lisp")
       (sanity-check-feature-evaluation))
     ;; Enforce absence of unexpected forward-references to warm loaded code.
     ;; Looking into a hidden detail of this compiler seems fair game.
-    #!+(or x86 x86-64 arm64) ; until all the rest are clean
-    (when sb!c::*undefined-warnings*
+    (when (and sb-c::*undefined-warnings*
+               (feature-in-list-p
+                '(:or :x86 :x86-64 :arm64) ; until all the rest are clean
+                :target))
       (setf fail t)
-      (dolist (warning sb!c::*undefined-warnings*)
-        (case (sb!c::undefined-warning-kind warning)
+      (dolist (warning sb-c::*undefined-warnings*)
+        (case (sb-c::undefined-warning-kind warning)
           (:variable (setf variables t))
           (:type (setf types t))
           (:function (setf functions t))))))
   ;; Exit the compilation unit so that the summary is printed. Then complain.
-  (when fail
-    #!-win32 ; build is known to be unclean
+  ;; win32 is not clean
+  (when (and fail (not (feature-in-list-p :win32 :target)))
     (cerror "Proceed anyway"
             "Undefined ~:[~;variables~] ~:[~;types~]~
              ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-WHITELIST*?)~]"
@@ -45,36 +47,41 @@
 
 #-clisp ; DO-ALL-SYMBOLS seems to kill CLISP at random
 (do-all-symbols (s)
-  (when (and (sb!int:info :function :inlinep s)
-             (eq (sb!int:info :function :where-from s) :assumed))
+  (when (and (sb-int:info :function :inlinep s)
+             (eq (sb-int:info :function :where-from s) :assumed))
       (warn "Did you forget to define ~S?" s)))
 
 ;; enable this too see which vops were or weren't used
 #+nil
-(when (hash-table-p sb!c::*static-vop-usage-counts*)
+(when (hash-table-p sb-c::*static-vop-usage-counts*)
   (format t "Vops used:~%")
-  (dolist (cell (sort (sb!int:%hash-table-alist sb!c::*static-vop-usage-counts*)
+  (dolist (cell (sort (sb-int:%hash-table-alist sb-c::*static-vop-usage-counts*)
                       #'> :key #'cdr))
     (format t "~6d ~s~%" (cdr cell) (car cell))))
 
-(when sb!c::*track-full-called-fnames*
+(when sb-c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb!int:call-with-each-globaldb-name
+    (sb-int:call-with-each-globaldb-name
      (lambda (name)
-       (let* ((cell (sb!int:info :function :emitted-full-calls name))
-              (inlinep (eq (sb!int:info :function :inlinep name) :inline))
-              (info (sb!int:info :function :info name)))
+       (let* ((cell (sb-int:info :function :emitted-full-calls name))
+              (inlinep (eq (sb-int:info :function :inlinep name) :inline))
+              (source-xform (sb-int:info :function :source-transform name))
+              (info (sb-int:info :function :info name)))
          (if (and cell
                   (or inlinep
-                      (and info (sb!c::fun-info-templates info))
-                      (sb!int:info :function :compiler-macro-function name)
-                      (sb!int:info :function :source-transform name)))
-             (if inlinep
-                 ;; A full call to an inline function almost always indicates
-                 ;; an out-of-order definition. If not an inline function,
-                 ;; the call could be due to an inapplicable transformation.
-                 (push (cons name cell) likely-suspicious)
-                 (push (cons name cell) possibly-suspicious))))))
+                      source-xform
+                      (and info (sb-c::fun-info-templates info))
+                      (sb-int:info :function :compiler-macro-function name)))
+             (cond (inlinep
+                    ;; A full call to an inline function almost always indicates
+                    ;; an out-of-order definition. If not an inline function,
+                    ;; the call could be due to an inapplicable transformation.
+                    (push (cons name cell) likely-suspicious))
+                   ;; structure constructors aren't inlined by default,
+                   ;; though we have a source-xform.
+                   ((and (listp source-xform) (eq :constructor (cdr source-xform))))
+                   (t
+                    (push (cons name cell) possibly-suspicious)))))))
     (flet ((show (label list)
              (when list
                (format t "~%~A suspicious calls:~:{~%~4d ~S~@{~%     ~S~}~}~%"
@@ -89,27 +96,28 @@
       (show "Possibly" possibly-suspicious))
     ;; As each platform's build becomes warning-free,
     ;; it should be added to the list here to prevent regresssions.
-    #!+(and (or x86 x86-64) (or linux darwin))
-    (when likely-suspicious
+    (when (and likely-suspicious
+               (feature-in-list-p '(:and (:or :x86 :x86-64) (:or :linux :darwin))
+                                  :target))
       (warn "Expected zero inlinining failures"))))
 
 ;; After cross-compiling, show me a list of types that checkgen
 ;; would have liked to use primitive traps for but couldn't.
 #+nil
-(let ((l (sb-impl::%hash-table-alist sb!c::*checkgen-used-types*)))
+(let ((l (sb-impl::%hash-table-alist sb-c::*checkgen-used-types*)))
   (format t "~&Types needed by checkgen: ('+' = has internal error number)~%")
   (setq l (sort l #'> :key #'cadr))
   (loop for (type-spec . (count . interr-p)) in l
         do (format t "~:[ ~;+~] ~5D ~S~%" interr-p count type-spec))
   (format t "~&Error numbers not used by checkgen:~%")
-  (loop for (spec symbol) across sb!c:+backend-internal-errors+
+  (loop for (spec symbol) across sb-c:+backend-internal-errors+
         when (and (not (stringp spec))
-                  (not (gethash spec sb!c::*checkgen-used-types*)))
+                  (not (gethash spec sb-c::*checkgen-used-types*)))
         do (format t "       ~S~%" spec)))
 
 ;; Print some information about how well the type operator caches performed
-(when sb!impl::*profile-hash-cache*
-  (sb!impl::show-hash-cache-statistics))
+(when sb-impl::*profile-hash-cache*
+  (sb-impl::show-hash-cache-statistics))
 #|
 Sample output
 -------------

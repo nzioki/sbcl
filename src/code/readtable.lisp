@@ -9,9 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(sb!xc:deftype attribute-table ()
+(sb-xc:deftype attribute-table ()
   '(simple-array (unsigned-byte 8) (#.base-char-code-limit)))
 
 ;;; constants for readtable character attributes. These are all as in
@@ -45,7 +45,7 @@
 ;; Meta: there is no such function as READ-UNQUALIFIED-TOKEN. No biggie.
 (defconstant +char-attr-delimiter+ 14) ; (a fake for READ-UNQUALIFIED-TOKEN)
 
-(sb!xc:defstruct (readtable (:conc-name nil)
+(sb-xc:defstruct (readtable (:conc-name nil)
                             (:constructor make-readtable ())
                             (:predicate readtablep)
                             ;; ANSI requires a CL:COPY-READTABLE to do
@@ -108,7 +108,7 @@ types for the Common Lisp expression reader."
   ;; as being less relevant. If you expect (copy-seq (string asymbol))
   ;; to produce a certain type of string, your code is unportable anyway.
   (%readtable-symbol-preference 'base-char :type (member character base-char))
-  (%readtable-normalization #!+sb-unicode t #!-sb-unicode nil :type boolean))
+  (%readtable-normalization #+sb-unicode t #-sb-unicode nil :type boolean))
 
 (defconstant +readtable-upcase+ 0)
 (defconstant +readtable-downcase+ 1)

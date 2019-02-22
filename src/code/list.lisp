@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Limitation: no list might have more than INDEX conses.
 
@@ -143,7 +143,8 @@
                       (y y (cdr y)))
                      ((or (atom x)
                           (atom y))
-                      (eql x y))
+                      (or (eql x y)
+                          (return-from tree-equal-eql)))
                    (cond ((consp (car x))
                           (when (atom (car y))
                             (return-from tree-equal-eql))
@@ -301,15 +302,15 @@
                 returned-list)))
 
   (defun %last0 (list)
-    (declare (optimize speed (sb!c::verify-arg-count 0)))
+    (declare (optimize speed (sb-c::verify-arg-count 0)))
     (last0-macro))
 
   (defun %last1 (list)
-    (declare (optimize speed (sb!c::verify-arg-count 0)))
+    (declare (optimize speed (sb-c::verify-arg-count 0)))
     (last1-macro))
 
   (defun %lastn/fixnum (list n)
-    (declare (optimize speed (sb!c::verify-arg-count 0))
+    (declare (optimize speed (sb-c::verify-arg-count 0))
              (type (and unsigned-byte fixnum) n))
     (case n
       (1 (last1-macro))
@@ -317,7 +318,7 @@
       (t (lastn-macro fixnum))))
 
   (defun %lastn/bignum (list n)
-    (declare (optimize speed (sb!c::verify-arg-count 0))
+    (declare (optimize speed (sb-c::verify-arg-count 0))
              (type (and unsigned-byte bignum) n))
     (lastn-macro unsigned-byte))
 
@@ -334,7 +335,7 @@
           (lastn-macro unsigned-byte)))))))
 
 (define-compiler-macro last (&whole form list &optional (n 1) &environment env)
-  (if (sb!xc:constantp n env)
+  (if (sb-xc:constantp n env)
       (case (constant-form-value n env)
         (0 `(%last0 ,list))
         (1 `(%last1 ,list))
@@ -410,7 +411,7 @@
        (cdr result)))))
 
 (defun append2 (x y)
-  (declare (optimize (sb!c::verify-arg-count 0)))
+  (declare (optimize (sb-c::verify-arg-count 0)))
   (if (null x)
       y
       (let ((result (list (car x))))
@@ -1405,7 +1406,7 @@
                                  body-loop)))
                   `(defun ,(intern (format nil "%~A~{-~A~}~@[-~A~]" name funs variant))
                        (x list ,@funs)
-                     (declare (optimize speed (sb!c::verify-arg-count 0)))
+                     (declare (optimize speed (sb-c::verify-arg-count 0)))
                      ,@(when funs `((declare (function ,@funs)
                                              (dynamic-extent ,@funs))))
                      ,@(unless (member name '(member assoc adjoin rassoc))

@@ -48,7 +48,6 @@
   (def %byte-blt (src src-start dst dst-start dst-end))
   (def get-header-data)
   (def set-header-data (x val))
-  (def get-closure-length)
   (def widetag-of)
   (def %other-pointer-widetag)
   (def vector-sap)
@@ -80,12 +79,12 @@
   (def %set-vector-raw-bits (object offset value))
   (def single-float-bits)
   (def double-float-high-bits)
+  #+64-bit
+  (def double-float-bits)
   (def double-float-low-bits)
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
-  ;; %code-code-size is an inline fun on 64-bit
-  #-64-bit (def %code-code-size)
   (def %code-debug-info)
   #+(or x86 immobile-space) (def sb-vm::%code-fixups)
 
@@ -105,6 +104,10 @@
   (def %funcallable-instance-info (fin i))
   (def %set-funcallable-instance-info (fin i new-value))
 
+  #+compare-and-swap-vops
+  (def* (%array-atomic-incf/word (array index diff))
+        (%raw-instance-atomic-incf/word (instance index diff)))
+
   #+sb-simd-pack
   (def* (%make-simd-pack (tag low high))
         (%make-simd-pack-single (x y z w))
@@ -113,6 +116,16 @@
         (%simd-pack-tag)
         (%simd-pack-low)
         (%simd-pack-high))
+  #+sb-simd-pack-256
+  (def* (%make-simd-pack-256 (tag p0 p1 p2 p3))
+        (%make-simd-pack-256-single (a b c d e f g h))
+        (%make-simd-pack-256-double (a b c d))
+        (%make-simd-pack-256-ub64 (a b c d))
+        (%simd-pack-256-tag)
+        (%simd-pack-256-0)
+        (%simd-pack-256-1)
+        (%simd-pack-256-2)
+        (%simd-pack-256-3))
   #+sb-thread (def sb-vm::current-thread-offset-sap)
   (def current-sp ())
   (def current-fp ())

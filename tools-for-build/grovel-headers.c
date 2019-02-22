@@ -121,7 +121,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 #ifdef _WIN32
     #include "grovel-headers-win32.h"
 #else
-    printf("(in-package \"SB!ALIEN\")\n\n");
+    printf("(in-package \"SB-ALIEN\")\n\n");
 
     printf (";;;flags for dlopen()\n");
 
@@ -129,7 +129,7 @@ main(int argc, char __attribute__((unused)) *argv[])
     defconstant ("rtld-now", RTLD_NOW);
     defconstant ("rtld-global", RTLD_GLOBAL);
 
-    printf("(in-package \"SB!UNIX\")\n\n");
+    printf("(in-package \"SB-UNIX\")\n\n");
 
     printf(";;; select()\n");
     defconstant("fd-setsize", FD_SETSIZE);
@@ -218,6 +218,7 @@ main(int argc, char __attribute__((unused)) *argv[])
     deferrno("eio", EIO);
     deferrno("eexist", EEXIST);
     deferrno("eloop", ELOOP);
+    deferrno("epipe", EPIPE);
     deferrno("espipe", ESPIPE);
     deferrno("ewouldblock", EWOULDBLOCK);
     printf("\n");
@@ -359,7 +360,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 
 #ifdef LISP_FEATURE_BSD
     printf(";;; sysctl(3) names\n");
-    printf("(in-package \"SB!IMPL\")\n");
+    printf("(in-package \"SB-IMPL\")\n");
     defconstant("ctl-kern", CTL_KERN);
     defconstant("ctl-hw", CTL_HW);
     defconstant("ctl-maxname", CTL_MAXNAME);
@@ -372,7 +373,7 @@ main(int argc, char __attribute__((unused)) *argv[])
     printf("\n");
 #endif
 
-    printf("(in-package \"SB!KERNEL\")\n\n");
+    printf("(in-package \"SB-KERNEL\")\n\n");
 #ifdef LISP_FEATURE_GENCGC
     printf(";;; GENCGC related\n");
     DEFTYPE("page-index-t", page_index_t);

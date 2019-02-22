@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; the largest number of TNs whose liveness changes that we can have
 ;;; in any block
@@ -22,70 +22,68 @@
 (def!type local-tn-bit-vector () `(simple-bit-vector ,local-tn-limit))
 
 ;;; vectors indexed by SC numbers
-(def!type sc-vector () `(simple-vector ,sb!vm:sc-number-limit))
-(deftype sc-bit-vector () `(simple-bit-vector ,sb!vm:sc-number-limit))
+(def!type sc-vector () `(simple-vector ,sb-vm:sc-number-limit))
+(deftype sc-bit-vector () `(simple-bit-vector ,sb-vm:sc-number-limit))
 
 ;;; Bitset representation of a set of locations in a finite SC.
 (def!type sc-locations ()
-  `(unsigned-byte ,sb!vm:finite-sc-offset-limit))
+  `(unsigned-byte ,sb-vm:finite-sc-offset-limit))
 
 (defun make-sc-locations (locations)
   (reduce (lambda (value location)
-            (check-type location sb!vm:finite-sc-offset)
+            (check-type location sb-vm:finite-sc-offset)
             (dpb 1 (byte 1 location) value))
           locations :initial-value 0))
 
 (declaim (inline sc-offset-to-sc-locations)
-         (ftype (sfunction (sb!vm:finite-sc-offset) sc-locations)
+         (ftype (sfunction (sb-vm:finite-sc-offset) sc-locations)
                 sc-offset-to-sc-locations))
 (defun sc-offset-to-sc-locations (offset)
   (dpb 1 (byte 1 offset) 0))
 
 (declaim (inline sc-locations-count)
-         (ftype (sfunction (sc-locations) (integer 0 #.sb!vm:finite-sc-offset-limit))
+         (ftype (sfunction (sc-locations) (integer 0 #.sb-vm:finite-sc-offset-limit))
                 sc-locations-count))
 (defun sc-locations-count (locations)
   (logcount locations))
 
 (declaim (inline sc-locations-first)
-         (ftype (sfunction (sc-locations) sb!vm:finite-sc-offset)
+         (ftype (sfunction (sc-locations) sb-vm:finite-sc-offset)
                 sc-locations-first))
 (defun sc-locations-first (locations)
   (1- (integer-length (logxor locations (1- locations)))))
 
 (declaim (inline sc-locations-member)
-         (ftype (sfunction (sb!vm:finite-sc-offset sc-locations) boolean)
+         (ftype (sfunction (sb-vm:finite-sc-offset sc-locations) boolean)
                 sc-locations-member))
 (defun sc-locations-member (location locations)
   (logbitp location locations))
 
+;;; This used to have two local functions in it, but when it did,
+;;; using ABCL as the build host crashed thusly with no backtrace:
+;;; (funcall (macro-function 'do-sc-locations)
+;;;           '(do-sc-locations (el (sc-locations sc) nil (sc-element-size sc))
+;;;             (feep))
+;;;            nil)
+;;;  => Debugger invoked on condition of type TYPE-ERROR
+;;;     The value NIL is not of type STRUCTURE-OBJECT.
 (defmacro do-sc-locations ((location locations
-                            &optional result increment (limit nil limitp))
+                            &optional result increment (limit 'sb-vm:finite-sc-offset-limit))
                            &body body)
-  (let* ((limit (cond
-                  ((not limitp)
-                   sb!vm:finite-sc-offset-limit)
-                  ((not (constantp limit))
-                   limit)
-                  ((eval limit))
-                  (t
-                   sb!vm:finite-sc-offset-limit)))
-         (mid   (floor sb!vm:finite-sc-offset-limit 2)))
+  (let ((mid (floor sb-vm:finite-sc-offset-limit 2)))
     (once-only ((locations locations)
-                (increment `(the sb!vm:finite-sc-offset ,(or increment 1))))
-      (labels ((make-block (start end)
-                 `(loop named #:noname
-                        for ,location
-                        from ,start below ,end by ,increment
-                        when (logbitp ,location ,locations)
-                        do (locally (declare (type sb!vm:finite-sc-offset
-                                              ,location))
-                             ,@body)))
-               (make-guarded-block (start end)
-                 (unless (and (numberp limit) (<= limit start))
+                (increment `(the sb-vm:finite-sc-offset ,(or increment 1))))
+      (flet ((make-guarded-block (start end)
+                 (unless (and (integerp limit) (> start limit))
                    (let ((mask (dpb -1 (byte mid start) 0)))
                      `((when (logtest ,mask ,locations)
-                         ,(make-block start end )))))))
+                         (loop named #:noname
+                               for ,location
+                               from ,start below ,end by ,increment
+                               when (logbitp ,location ,locations)
+                                 do (locally (declare (type sb-vm:finite-sc-offset
+                                                            ,location))
+                                      ,@body))))))))
         `(block nil
            ,@(make-guarded-block 0   mid)
            ,@(make-guarded-block mid limit)
@@ -363,7 +361,7 @@
   ;; dynamic vop count info. This is needed by both ir2-convert and
   ;; setup-dynamic-count-info. (But only if we are generating code to
   ;; collect dynamic statistics.)
-  #!+sb-dyncount
+  #+sb-dyncount
   (dyncount-info nil :type (or null dyncount-info)))
 
 ;;; An ENTRY-INFO condenses all the information that the dumper needs
@@ -415,11 +413,11 @@
   (return-pc-pass (missing-arg) :type tn :read-only t)
   ;; a label that marks the first instruction after the RETURN-PC has
   ;; been moved from its passing location to its save location.
-  #!-fp-and-pc-standard-save
+  #-fp-and-pc-standard-save
   (lra-saved-pc nil :type (or label null))
   ;; a label that marks the first instruction after the OLD-FP has
   ;; been moved from its passing location to its save location.
-  #!-fp-and-pc-standard-save
+  #-fp-and-pc-standard-save
   (cfp-saved-pc nil :type (or label null))
   ;; True if this function has a frame on the number stack. This is
   ;; set by representation selection whenever it is possible that some
@@ -439,7 +437,7 @@
   ;; function as far as the debugger is concerned.
   (environment-start nil :type (or label null))
   (closure-save-tn nil :type (or tn null))
-  #!+unwind-to-frame-and-call-vop
+  #+unwind-to-frame-and-call-vop
   (bsp-save-tn nil :type (or tn null)))
 
 (defprinter (ir2-physenv)
@@ -484,10 +482,10 @@
   (save-sp nil :type (or tn null))
   ;; the list of dynamic state save TNs
 
-  (dynamic-state #!-x86-64
+  (dynamic-state #-x86-64
                  (list* (make-stack-pointer-tn)
                         (make-dynamic-state-tns))
-                 #!+x86-64 nil
+                 #+x86-64 nil
                  :type list)
   ;; the target label for NLX entry
   (target (gen-label) :type label))
@@ -820,7 +818,7 @@
   ;; starts. Less then the length of those vectors when not all of the
   ;; length was used on the previously packed component.
   (last-block-count 0 :type index)
-  (wired-map 0 :type sb!vm:finite-sc-offset-map))
+  (wired-map 0 :type sb-vm:finite-sc-offset-map))
 (declaim (freeze-type storage-base finite-sb-template finite-sb))
 
 ;;; Give this a toplevel value so that it can be declaimed ALWAYS-BOUND.
@@ -879,9 +877,9 @@
   ;; of the corresponding move functions. If loading is impossible,
   ;; then the entries are NIL. LOAD-COSTS is initialized to have a 0
   ;; for this SC.
-  (move-funs (make-array sb!vm:sc-number-limit :initial-element nil)
+  (move-funs (make-array sb-vm:sc-number-limit :initial-element nil)
              :type sc-vector)
-  (load-costs (make-array sb!vm:sc-number-limit :initial-element nil)
+  (load-costs (make-array sb-vm:sc-number-limit :initial-element nil)
               :type sc-vector)
   ;; a vector mapping from SC numbers to possibly
   ;; representation-specific move and coerce VOPs. Each entry is a
@@ -901,18 +899,18 @@
   ;; TNs wired in the standard argument registers, since there may
   ;; already be live TNs wired in those locations holding the values
   ;; that we are setting up for unknown-values return.
-  (move-vops (make-array sb!vm:sc-number-limit :initial-element nil)
+  (move-vops (make-array sb-vm:sc-number-limit :initial-element nil)
              :type sc-vector)
   ;; the costs corresponding to the MOVE-VOPS. Separate because this
   ;; info is needed at meta-compile time, while the MOVE-VOPs don't
   ;; exist till load time. If no move is defined, then the entry is
   ;; NIL.
-  (move-costs (make-array sb!vm:sc-number-limit :initial-element nil)
+  (move-costs (make-array sb-vm:sc-number-limit :initial-element nil)
               :type sc-vector)
   ;; similar to Move-VOPs, except that we only ever use the entries
   ;; for this SC and its alternates, since we never combine complex
   ;; representation conversion with argument passing.
-  (move-arg-vops (make-array sb!vm:sc-number-limit :initial-element nil)
+  (move-arg-vops (make-array sb-vm:sc-number-limit :initial-element nil)
                  :type sc-vector)
   ;; true if this SC or one of its alternates in in the NUMBER-STACK SB.
   (number-stack-p nil :type boolean)
@@ -993,7 +991,7 @@
         :type (member :normal :environment :debug-environment
                       :save :save-once  :load :constant
                       :component :alias :unused
-                      #!-fp-and-pc-standard-save :specified-save
+                      #-fp-and-pc-standard-save :specified-save
                       :arg-pass))
   ;; the primitive-type for this TN's value. Null in restricted or
   ;; wired TNs.
@@ -1064,7 +1062,7 @@
 
 (declaim (freeze-type tn))
 (defmethod print-object ((tn tn) stream)
-  (cond ((not (boundp 'sb!c::*compiler-ir-obj-map*))
+  (cond ((not (boundp 'sb-c::*compiler-ir-obj-map*))
          (print-unreadable-object (tn stream :type t :identity t)))
         (t
          (print-unreadable-object (tn stream :type t)

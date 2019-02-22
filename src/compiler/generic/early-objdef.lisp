@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Tags for the main low-level types are stored in the low n (usually three)
 ;;; bits to identify the type of a machine word.  Certain constraints
@@ -56,7 +56,7 @@
   ;; The EVAL-WHEN is necessary (at least for Lispworks), because the
   ;; second DEFENUM uses the value of OTHER-IMMEDIATE-0-LOWTAG, which is
   ;; defined in the first DEFENUM. -- AL 20000216
-  #!+64-bit
+  #+64-bit
   (defenum ()
     even-fixnum-lowtag
     other-immediate-0-lowtag
@@ -74,7 +74,7 @@
     other-immediate-3-lowtag
     pad5-lowtag
     other-pointer-lowtag)
-  #!-64-bit
+  #-64-bit
   (defenum ()
     even-fixnum-lowtag
     instance-pointer-lowtag
@@ -90,7 +90,7 @@
 
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
-        (do-external-symbols (sym "SB!VM")
+        (do-external-symbols (sym "SB-VM")
           (let* ((name (symbol-name sym))
                  (len (length name)))
             (when (and (boundp sym)
@@ -117,7 +117,7 @@
 ;;; * BIGNUM + RATIO (+ FIXNUM) = RATIONAL
 ;;;
 ;;; * SINGLE-FLOAT + DOUBLE-FLOAT + LONG-FLOAT = FLOAT
-;;;   But: There's not a snowball's chance that #!+long-float works.
+;;;   But: There's not a snowball's chance that #+long-float works.
 ;;;        changeset 7646ae obliterated LONG-FLOAT-WIDETAG.
 ;;;
 ;;; * RATIONAL + FLOAT = REAL
@@ -166,7 +166,7 @@
 ;; SIMPLE-VECTOR means the latter doesn't make it right for SBCL internals.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-(defenum (;; The first widetag must be greater than SB!VM:LOWTAG-LIMIT
+(defenum (;; The first widetag must be greater than SB-VM:LOWTAG-LIMIT
           ;; otherwise code in generic/early-type-vops will suffer
           ;; a long, horrible death.  --njf, 2004-08-09
           :start #.(+ (ash 1 n-lowtag-bits) other-immediate-0-lowtag)
@@ -190,8 +190,8 @@
   funcallable-instance-widetag              ;  32   39  32   39
 
   ;; x86[-64] does not have objects with this widetag,
-  #!+(or x86 x86-64) unused00-widetag
-  #!-(or x86 x86-64)
+  #+(or x86 x86-64) unused00-widetag
+  #-(or x86 x86-64)
   return-pc-widetag                         ;  36   3D  36   3D
 
   value-cell-widetag                        ;  3A   41  3A   41
@@ -204,19 +204,22 @@
   fdefn-widetag                             ;  56   5D  56   5D
 
   no-tls-value-marker-widetag               ;  5A   61  5A   61
-  #!-sb-simd-pack
+  #-sb-simd-pack
   unused01-widetag                          ;  5E       5E
-  #!+sb-simd-pack
+  #+sb-simd-pack
   simd-pack-widetag                         ;       65       65
-  filler-widetag                            ;  62   69  62   69
-  unused03-widetag                          ;  66   6D  66   6D
+  #-sb-simd-pack-256
+  unused03-widetag                          ;  62   69  62   69
+  #+sb-simd-pack-256
+  simd-pack-256-widetag                     ;  62   69  62   69
+  filler-widetag                            ;  66   6D  66   6D
   unused04-widetag                          ;  6A   71  6A   71
   unused05-widetag                          ;  6E   75  6E   75
   unused06-widetag                          ;  72   79  72   79
   unused07-widetag                          ;  76   7D  76   7D
-  #!-64-bit
+  #-64-bit
   unused08-widetag                          ;  7A       7A
-  #!-64-bit
+  #-64-bit
   unused09-widetag                          ;  7E       7E
 
   simple-array-widetag                      ;  82   81  82   81
@@ -227,24 +230,24 @@
   simple-array-unsigned-byte-15-widetag     ;  96   95  96   95
   simple-array-unsigned-byte-16-widetag     ;  9A   99  9A   99
 
-  #!-64-bit
+  #-64-bit
   simple-array-unsigned-fixnum-widetag      ;  9E   A5  9E   A5
   simple-array-unsigned-byte-31-widetag     ;  A2   9D  A2   9D
   simple-array-unsigned-byte-32-widetag     ;  A6   A1  A6   A1
-  #!+64-bit
+  #+64-bit
   simple-array-unsigned-fixnum-widetag      ;  9E   A5  9E   A5
-  #!+64-bit
+  #+64-bit
   simple-array-unsigned-byte-63-widetag     ;       A9       A9
-  #!+64-bit
+  #+64-bit
   simple-array-unsigned-byte-64-widetag     ;       AD       AD
   simple-array-signed-byte-8-widetag        ;  AA   B1  AA   B1
   simple-array-signed-byte-16-widetag       ;  AE   B5  AE   B5
-  #!-64-bit
+  #-64-bit
   simple-array-fixnum-widetag               ;  B2   BD  B2   BD
   simple-array-signed-byte-32-widetag       ;  B6   B9  B6   B9
-  #!+64-bit
+  #+64-bit
   simple-array-fixnum-widetag               ;  B2   BD  B2   BD
-  #!+64-bit
+  #+64-bit
   simple-array-signed-byte-64-widetag       ;       C1       C1
   simple-array-single-float-widetag         ;  BA   C5  BA   C5
   simple-array-double-float-widetag         ;  BE   C9  BE   C9
@@ -256,9 +259,9 @@
   ;; Strings
   simple-array-nil-widetag                  ;  D2   DD  D2   DD
   simple-base-string-widetag                ;  D6   E1  D6   E1
-  #!+sb-unicode
+  #+sb-unicode
   simple-character-string-widetag           ;  DA   E5
-  #!+sb-unicode
+  #+sb-unicode
   complex-character-string-widetag          ;  DE   E9
   complex-base-string-widetag               ;  E2   ED  DA   E5
   complex-vector-nil-widetag                ;  E6   F1  DE   E9
@@ -304,17 +307,17 @@
 ;;; This is so that COMPILE-FILE knows that things like :ALLOW-OTHER-KEYS
 ;;; can be immediate constants.
 ;;; Note also that sb-fasteval uses 2 bits of the symbol header.
-#!+(and immobile-space (not immobile-symbols))
+#+(and immobile-space (not immobile-symbols))
 (defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
 
-#!+immobile-space
+#+immobile-space
 (progn
   ;; See 'doc/internal-notes/compact-instance' for rationale
-  (defconstant layout-align #!+64-bit 128 #!-64-bit 256) ; in bytes
+  (defconstant layout-align #+64-bit 128 #-64-bit 256) ; in bytes
 
   ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
   ;; low half of a closure header to form the full header word.
-  #!+(and (not (host-feature sb-xc-host)) (not sb-thread))
+  #+(and (not sb-xc-host) (not sb-thread))
   (defglobal function-layout 0)         ; set by genesis
 
   ;; The cross-compiler stores FUNCTION-LAYOUT in a more obvious way.
@@ -323,7 +326,7 @@
     (logior (+ fixedobj-space-start (* 3 layout-align)) instance-pointer-lowtag)))
 
 #|
-;; Run this in the SB-VM or SB!VM package once for each target feature combo.
+;; Run this in the SB-VM or SB-VM package once for each target feature combo.
 (defun rewrite-widetag-comments ()
   (rename-file "src/compiler/generic/early-objdef.lisp" "early-objdef.old")
   (with-open-file (in "src/compiler/generic/early-objdef.old")
@@ -331,7 +334,7 @@
                          :direction :output :if-exists :supersede)
       (let* ((target-features
               (if (find-package "SB-COLD")
-                  (symbol-value (find-symbol "*FEATURES*" "SB!XC"))
+                  (symbol-value (find-symbol "*FEATURES*" "SB-XC"))
                   *features*))
              (feature-bits
               (+ (if (= n-word-bits 64) 1 0)

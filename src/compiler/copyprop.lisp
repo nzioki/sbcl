@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; In copy propagation, we manipulate sets of TNs. We only consider
 ;;; TNs whose sole write is by a MOVE VOP. This allows us to use a
@@ -97,7 +97,7 @@
                               ;; Do we not care about preserving this this
                               ;; TN for debugging?
                               (or
-                               (not (symbol-package (leaf-debug-name leaf)))
+                               (not (cl:symbol-package (leaf-debug-name leaf)))
                                (policy (vop-node vop)
                                        (or (= speed 3) (< debug 2))))
                               ;; arguments of local functions have hidden write

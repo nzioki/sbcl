@@ -11,30 +11,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; There seems to be no portable way to mask float traps, but we
 ;;; shouldn't encounter any float traps when cross-compiling SBCL
 ;;; itself, anyway, so we just make this a no-op.
-(defmacro sb!vm::with-float-traps-masked (traps &body body)
+(defmacro sb-vm::with-float-traps-masked (traps &body body)
   (declare (ignore traps))
   #+nil
   (format *error-output*
           "~&(can't portably mask float traps, proceeding anyway)~%")
   `(progn ,@body))
-
-;;; a helper function for DOUBLE-FLOAT-FOO-BITS functions
-;;;
-;;; Return the low N bits of X as a signed N-bit value.
-(defun mask-and-sign-extend (x n)
-  (assert (plusp n))
-  (let* ((high-bit (ash 1 (1- n)))
-         (mask (1- (ash high-bit 1)))
-         (uresult (logand mask x)))
-    (if (zerop (logand uresult high-bit))
-        uresult
-        (logior uresult
-                (logand -1 (lognot mask))))))
 
 ;;; portable implementations of SINGLE-FLOAT-BITS,
 ;;; DOUBLE-FLOAT-LOW-BITS, and DOUBLE-FLOAT-HIGH-BITS
@@ -44,17 +31,11 @@
 ;;; "target's floating point is IEEE" in the code, but I can't see how
 ;;; to express that.
 ;;;
-;;; KLUDGE: It's sort of weird that these functions return signed
-;;; 32-bit values instead of unsigned 32-bit values. This is the way
-;;; that the CMU CL machine-dependent functions behaved, and I've
-;;; copied that behavior, but it seems to me that it'd be more
-;;; idiomatic to return unsigned 32-bit values. Maybe someday the
-;;; machine-dependent functions could be tweaked to return unsigned
-;;; 32-bit values?
 (defun single-float-bits (x)
   (declare (type single-float x))
   (assert (= (float-radix x) 2))
   (if (zerop x)
+      ;; FIXME: bogus test if the host does not support -0.0f0
       (if (eql x 0.0f0) 0 #x-80000000)
       (multiple-value-bind (lisp-significand lisp-exponent lisp-sign)
           (integer-decode-float x)
@@ -108,15 +89,22 @@
                         (warn "denormalized SINGLE-FLOAT-BITS ~S losing bits"
                               x))
                       (setf significand (ash significand -1)
-                            exponent (1+ exponent))))))
-          (ecase lisp-sign
-            (1 unsigned-result)
-            (-1 (logior unsigned-result (- (expt 2 31)))))))))
+                            exponent (1+ exponent)))))
+               (signed-result
+                (ecase lisp-sign
+                  (1 unsigned-result)
+                  (-1 (cl:dpb unsigned-result (cl:byte 31 0) -1)))))
+
+          ;; Check SIGNED-RESULT against the authoritative answer if we can
+          #+host-quirks-sbcl (assert (= (host-sb-kernel:single-float-bits x) signed-result))
+
+          signed-result))))
 
 (defun double-float-bits (x)
   (declare (type double-float x))
   (assert (= (float-radix x) 2))
   (if (zerop x)
+      ;; FIXME: bogus test if the host does not support -0.0d0
       (if (eql x 0.0d0) 0 #x-8000000000000000)
       ;; KLUDGE: As per comments in SINGLE-FLOAT-BITS, above.
       (multiple-value-bind (lisp-significand lisp-exponent lisp-sign)
@@ -158,27 +146,22 @@
                         (warn "denormalized SINGLE-FLOAT-BITS ~S losing bits"
                               x))
                       (setf significand (ash significand -1)
-                            exponent (1+ exponent))))))
-          (ecase lisp-sign
-            (1 unsigned-result)
-            (-1 (logior unsigned-result (- (expt 2 63)))))))))
+                            exponent (1+ exponent)))))
+               (signed-result
+                (ecase lisp-sign
+                  (1 unsigned-result)
+                  (-1 (cl:dpb unsigned-result (cl:byte 63 0) -1)))))
 
-(defun double-float-low-bits (x)
-  (declare (type double-float x))
-  (if (zerop x)
-      0
-      ;; FIXME: Unlike DOUBLE-FLOAT-HIGH-BITS or SINGLE-FLOAT-BITS,
-      ;; the CMU CL DOUBLE-FLOAT-LOW-BITS seemed to return a unsigned
-      ;; value, not a signed value, so we've done the same. But it
-      ;; would be nice to make the family of functions have a more
-      ;; consistent return convention.
-      (logand #xffffffff (double-float-bits x))))
+          ;; Check SIGNED-RESULT against the authoritative answer if we can
+          #+host-quirks-sbcl
+          (assert (= (logior (ash (host-sb-kernel:double-float-high-bits x) 32)
+                             (host-sb-kernel:double-float-low-bits x))
+                     signed-result))
 
-(defun double-float-high-bits (x)
-  (declare (type double-float x))
-  (if (zerop x)
-      (if (eql x 0.0d0) 0 #x-80000000)
-      (mask-and-sign-extend (ash (double-float-bits x) -32) 32)))
+          signed-result))))
+
+(defun double-float-high-bits (x) (ash (double-float-bits x) -32))
+(defun double-float-low-bits  (x) (cl:ldb (cl:byte 32 0) (double-float-bits x)))
 
 ;;; KLUDGE: This is a hack to work around a bug in CMU CL 18c which
 ;;; causes the 18c compiler to die with a floating point exception
@@ -254,3 +237,17 @@
 (defun float-nan-p (x)
   (declare (ignore x))
   (error "Can't call FLOAT-NAN-P"))
+
+;;; These constants are a temporary compromise among several goals.
+;;; We have always used the host's floating-point constants either by design
+;;; or out laziness. At the same time, we have kludges that attempt to selectively
+;;; prevent inadvertent use of CL: symbols, while allowing these. At a bare minimum,
+;;; we need to strengthen the test for mistaken CL: symbol usage, and NEVER allow it.
+;;; We can nonetheless borrow the host's values, which is bad, but less bad.
+;;; At some point I plan to change the compiler to model target floating-point numbers
+;;; using defstruct. That code may or may not lean on the host for actual computation.
+;;; i.e. If nothing else, we can fix the problem of using reflection.
+(defconstant sb-xc:most-negative-single-float cl:most-negative-single-float)
+(defconstant sb-xc:most-positive-single-float cl:most-positive-single-float)
+(defconstant sb-xc:most-negative-double-float cl:most-negative-double-float)
+(defconstant sb-xc:most-positive-double-float cl:most-positive-double-float)

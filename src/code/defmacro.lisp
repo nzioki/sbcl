@@ -9,12 +9,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (let ()
-  (defmacro sb!xc:defmacro (name lambda-list &body body)
-    (unless (symbolp name)
-      (error "The macro name ~S is not a symbol." name))
+  (defmacro sb-xc:defmacro (name lambda-list &body body)
+    (check-designator name defmacro)
     ;; When we are building the cross-compiler, we could be in a host
     ;; lisp which implements CL macros (e.g. CL:AND) as special
     ;; operators (while still providing a macroexpansion for
@@ -28,17 +27,17 @@
              name))
     ;; The name of the lambda is (MACRO-FUNCTION name)
     ;; which does not conflict with any legal function name.
-    (let ((def (make-macro-lambda (sb!c::debug-name 'macro-function name)
+    (let ((def (make-macro-lambda (sb-c::debug-name 'macro-function name)
                                   lambda-list body 'defmacro name)))
       `(progn
          ;; %COMPILER-DEFMACRO just performs a check for duplicate definitions
          ;; within a file.
          (eval-when (:compile-toplevel)
-           (sb!c::%compiler-defmacro :macro-function ',name))
+           (sb-c::%compiler-defmacro :macro-function ',name))
          (eval-when (:compile-toplevel :load-toplevel :execute)
-           (sb!c::%defmacro ',name ,def (sb!c:source-location)))))))
+           (sb-c::%defmacro ',name ,def (sb-c:source-location)))))))
 
-(defun sb!c::%defmacro (name definition source-location)
+(defun sb-c::%defmacro (name definition source-location)
   (declare (ignorable source-location)) ; xc-host doesn't use
             ;; old note (ca. 1985, maybe:-): "Eventually %%DEFMACRO
             ;; should deal with clearing old compiler information for
@@ -63,20 +62,20 @@
                   ;; and comparing it with the new one.
         (warn 'redefinition-with-defmacro :name name
               :new-function definition :new-location source-location))
-      (setf (sb!xc:macro-function name) definition)))
+      (setf (sb-xc:macro-function name) definition)))
   name)
 
 #+sb-xc-host
-(let ((real-expander (macro-function 'sb!xc:defmacro)))
-  ;; Inform the cross-compiler how to expand SB!XC:DEFMACRO (= DEFMACRO).
-  (setf (sb!xc:macro-function 'sb!xc:defmacro)
+(let ((real-expander (macro-function 'sb-xc:defmacro)))
+  ;; Inform the cross-compiler how to expand SB-XC:DEFMACRO (= DEFMACRO).
+  (setf (sb-xc:macro-function 'sb-xc:defmacro)
         (lambda (form env)
           (declare (ignore env))
-          ;; Since SB!KERNEL:LEXENV isn't compatible with the host,
+          ;; Since SB-KERNEL:LEXENV isn't compatible with the host,
           ;; just pass NIL. The expansion correctly captures a non-null
           ;; environment, but the expander doesn't need it.
           (funcall real-expander form nil)))
   ;; Building the cross-compiler should skip the compile-time-too
-  ;; processing SB!XC:DEFMACRO.
-  (setf (macro-function 'sb!xc:defmacro)
+  ;; processing SB-XC:DEFMACRO.
+  (setf (macro-function 'sb-xc:defmacro)
         (lambda (form env) `(let () ,(funcall real-expander form env)))))

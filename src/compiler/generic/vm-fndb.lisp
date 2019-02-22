@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; internal type predicates
 
@@ -18,13 +18,13 @@
 (defknown (fixnump bignump ratiop
            short-float-p single-float-p double-float-p long-float-p
            complex-rational-p complex-float-p complex-single-float-p
-           complex-double-float-p #!+long-float complex-long-float-p
+           complex-double-float-p #+long-float complex-long-float-p
            complex-vector-p
-           #!+sb-unicode base-char-p
+           #+sb-unicode base-char-p
            %standard-char-p %instancep
            base-string-p simple-base-string-p
-           #!+sb-unicode character-string-p
-           #!+sb-unicode simple-character-string-p
+           #+sb-unicode character-string-p
+           #+sb-unicode simple-character-string-p
            array-header-p
            simple-array-header-p
            sequencep extended-sequence-p
@@ -38,34 +38,34 @@
 
            simple-array-unsigned-byte-31-p
            simple-array-unsigned-byte-32-p
-           #!+64-bit
+           #+64-bit
            simple-array-unsigned-byte-63-p
-           #!+64-bit
+           #+64-bit
            simple-array-unsigned-byte-64-p
            simple-array-signed-byte-8-p simple-array-signed-byte-16-p
 
            simple-array-fixnum-p
 
            simple-array-signed-byte-32-p
-           #!+64-bit
+           #+64-bit
            simple-array-signed-byte-64-p
            simple-array-single-float-p simple-array-double-float-p
-           #!+long-float simple-array-long-float-p
+           #+long-float simple-array-long-float-p
            simple-array-complex-single-float-p
            simple-array-complex-double-float-p
-           #!+long-float simple-array-complex-long-float-p
+           #+long-float simple-array-complex-long-float-p
            simple-rank-1-array-*-p
            system-area-pointer-p realp
-           ;; #!-64-bit
+           ;; #-64-bit
            unsigned-byte-32-p
-           ;; #!-64-bit
+           ;; #-64-bit
            signed-byte-32-p
-           #!+64-bit
+           #+64-bit
            unsigned-byte-64-p
-           #!+64-bit
+           #+64-bit
            signed-byte-64-p
            weak-pointer-p code-component-p lra-p
-           sb!vm::unbound-marker-p
+           sb-vm::unbound-marker-p
            simple-fun-p
            closurep
            funcallable-instance-p
@@ -130,33 +130,29 @@
 (defknown vector-sap ((simple-unboxed-array (*))) system-area-pointer
   (flushable))
 
-#!+gencgc
-(defknown generation-of (t) (or (signed-byte 8) null) (flushable movable))
+#+gencgc
+(defknown generation-of (t) (or (signed-byte 8) null) (flushable))
 
 ;;; WIDETAG-OF needs extra code to handle LIST and FUNCTION lowtags.
 ;;; When dealing with known other-pointers (dispatching on array
 ;;; element type for example), %OTHER-POINTER-WIDETAG is faster.
 (defknown (widetag-of %other-pointer-widetag) (t)
-  (unsigned-byte #.sb!vm:n-widetag-bits)
+  (unsigned-byte #.sb-vm:n-widetag-bits)
   (flushable movable))
 
 ;;; Return the data from the header of object, which for GET-HEADER-DATA
-;;; must be an other-pointer, and for GET-CLOSURE-LENGTH a fun-pointer.
-(defknown (get-header-data) (t)
-    (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))
-  (flushable))
-;;; Closures have at least a trampoline word (length can't be 0),
-;;; and only 15 bits in which to express the payload size.
-(defknown (get-closure-length) (t) (integer 1 #.sb!vm:short-header-max-words)
+;;; must be an other-pointer, and for FUN-HEADER-DATA a fun-pointer.
+(defknown (get-header-data fun-header-data) (t)
+    (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))
   (flushable))
 
 ;;; This unconventional setter returns its first arg, not the newval.
 (defknown set-header-data
-    (t (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))) t)
-#!+64-bit
+    (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) t)
+#+64-bit
 (progn
-(defknown sb!vm::get-header-data-high (t) (unsigned-byte 32) (flushable))
-(defknown sb!vm::cas-header-data-high
+(defknown sb-vm::get-header-data-high (t) (unsigned-byte 32) (flushable))
+(defknown sb-vm::cas-header-data-high
     (t (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32)))
 
 (defknown %array-dimension (array index) index
@@ -166,11 +162,11 @@
 (defknown %array-rank (array) array-rank
   (flushable))
 
-#!+x86-64
+#+x86-64
 (defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
-(defknown sb!kernel::check-array-shape (simple-array list)
+(defknown sb-kernel::check-array-shape (simple-array list)
   (simple-array)
   (flushable)
   :result-arg 0)
@@ -199,17 +195,17 @@
   :derive-type #'result-type-last-arg)
 (defknown %layout-invalid-error (t layout) nil)
 
-#!+(or x86 x86-64)
-(defknown %raw-instance-cas/word (instance index sb!vm:word sb!vm:word)
-  sb!vm:word ())
+#+(or x86 x86-64)
+(defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
+  sb-vm:word ())
 #.`(progn
      ,@(map 'list
             (lambda (rsd)
-              (let* ((reader (sb!kernel::raw-slot-data-accessor-name rsd))
+              (let* ((reader (sb-kernel::raw-slot-data-accessor-name rsd))
                      (name (copy-seq (string reader)))
                      (writer (intern (replace name "-SET/"
                                               :start1 (search "-REF/" name))))
-                     (type (sb!kernel::raw-slot-data-raw-type rsd)))
+                     (type (sb-kernel::raw-slot-data-raw-type rsd)))
                 `(progn
                    (defknown ,reader (instance index) ,type
                      (flushable always-translatable))
@@ -221,19 +217,19 @@
                             (,reader instance index))
                           (defun ,writer (instance index new-value)
                             (,writer instance index new-value))))))
-            sb!kernel::*raw-slot-data*))
+            sb-kernel::*raw-slot-data*))
 
-#!+compare-and-swap-vops
-(defknown %raw-instance-atomic-incf/word (instance index sb!vm:word) sb!vm:word
+#+compare-and-swap-vops
+(defknown %raw-instance-atomic-incf/word (instance index sb-vm:word) sb-vm:word
     (always-translatable))
-#!+compare-and-swap-vops
-(defknown %array-atomic-incf/word (t index sb!vm:word) sb!vm:word
+#+compare-and-swap-vops
+(defknown %array-atomic-incf/word (t index sb-vm:word) sb-vm:word
   (always-translatable))
 
 ;;; These two are mostly used for bit-bashing operations.
-(defknown %vector-raw-bits (t index) sb!vm:word
+(defknown %vector-raw-bits (t index) sb-vm:word
   (flushable))
-(defknown (%set-vector-raw-bits) (t index sb!vm:word) sb!vm:word
+(defknown (%set-vector-raw-bits) (t index sb-vm:word) sb-vm:word
   ())
 
 
@@ -245,8 +241,8 @@
                            ;; to bytes, make sure it fits.
                            (and index
                                 (mod #.(- (expt 2
-                                                (- sb!vm:n-word-bits
-                                                   sb!vm:word-shift
+                                                (- sb-vm:n-word-bits
+                                                   sb-vm:word-shift
                                                    ;; all the allocation routines expect a signed word
                                                    1))
                                           ;; The size is double-word aligned, which is done by adding
@@ -257,7 +253,7 @@
     (flushable movable))
 
 ;;; Allocate an array header with type code TYPE and rank RANK.
-(defknown make-array-header ((unsigned-byte 8) (mod #.sb!xc:array-rank-limit)) array
+(defknown make-array-header ((unsigned-byte 8) (mod #.sb-xc:array-rank-limit)) array
   (flushable movable))
 
 (defknown make-array-header* (&rest t) array (flushable movable))
@@ -272,7 +268,7 @@
 (defknown make-value-cell (t) t
   (flushable movable))
 
-#!+sb-simd-pack
+#+sb-simd-pack
 (progn
   (defknown simd-pack-p (t) boolean (foldable movable flushable))
   (defknown %simd-pack-tag (simd-pack) fixnum (movable flushable))
@@ -310,32 +306,72 @@
       (values double-float double-float)
       (flushable movable foldable)))
 
+#+sb-simd-pack-256
+(progn
+  (defknown simd-pack-256-p (t) boolean (foldable movable flushable))
+  (defknown %simd-pack-256-tag (simd-pack-256) fixnum (movable flushable))
+  (defknown %make-simd-pack-256 (fixnum (unsigned-byte 64) (unsigned-byte 64)
+                                        (unsigned-byte 64) (unsigned-byte 64))
+      simd-pack-256
+      (flushable movable foldable))
+  (defknown %make-simd-pack-256-double (double-float double-float double-float double-float)
+      (simd-pack-256 double-float)
+      (flushable movable foldable))
+  (defknown %make-simd-pack-256-single (single-float single-float single-float single-float
+                                        single-float single-float single-float single-float)
+      (simd-pack-256 single-float)
+      (flushable movable foldable))
+  (defknown %make-simd-pack-256-ub32 ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+                                      (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
+      (simd-pack-256 integer)
+      (flushable movable foldable))
+  (defknown %make-simd-pack-256-ub64 ((unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
+      (simd-pack-256 integer)
+      (flushable movable foldable))
+  (defknown (%simd-pack-256-0 %simd-pack-256-1 %simd-pack-256-2 %simd-pack-256-3) (simd-pack-256)
+      (unsigned-byte 64)
+      (flushable movable foldable))
+  (defknown %simd-pack-256-ub32s (simd-pack-256)
+      (values (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+              (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-ub64s (simd-pack-256)
+      (values (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-singles (simd-pack-256)
+      (values single-float single-float single-float single-float
+              single-float single-float single-float single-float)
+      (flushable movable foldable))
+  (defknown %simd-pack-256-doubles (simd-pack-256)
+      (values double-float double-float double-float double-float)
+      (flushable movable foldable)))
+
 ;;;; threading
 
 (defknown (dynamic-space-free-pointer binding-stack-pointer-sap
                                       control-stack-pointer-sap)  ()
-  system-area-pointer
-  (flushable))
+    system-area-pointer
+    (flushable))
 
 (defknown ensure-symbol-tls-index (symbol) (and fixnum unsigned-byte))
 
 
 ;;;; debugger support
 
-(defknown sb!vm::current-thread-offset-sap (fixnum)
+(defknown sb-vm::current-thread-offset-sap (fixnum)
   system-area-pointer (flushable))
-(defknown (current-sp current-fp) () system-area-pointer (movable flushable))
-(defknown current-fp-fixnum () fixnum (movable flushable))
+(defknown (current-sp current-fp) () system-area-pointer (flushable))
+(defknown current-fp-fixnum () fixnum (flushable))
 (defknown stack-ref (system-area-pointer index) t (flushable))
 (defknown %set-stack-ref (system-area-pointer index t) t ())
 (defknown lra-code-header (t) t (movable flushable))
 (defknown fun-code-header (t) t (movable flushable))
-(defknown %make-lisp-obj (sb!vm:word) t (movable flushable))
-(defknown get-lisp-obj-address (t) sb!vm:word (movable flushable))
+(defknown %make-lisp-obj (sb-vm:word) t (movable flushable))
+(defknown get-lisp-obj-address (t) sb-vm:word (flushable))
 
 ;;;; 32-bit logical operations
 
-(defknown word-logical-not (sb!vm:word) sb!vm:word
+(defknown word-logical-not (sb-vm:word) sb-vm:word
   (foldable flushable movable))
 
 (defknown (word-logical-and word-logical-nand
@@ -343,11 +379,11 @@
            word-logical-xor word-logical-eqv
            word-logical-andc1 word-logical-andc2
            word-logical-orc1 word-logical-orc2)
-          (sb!vm:word sb!vm:word) sb!vm:word
+          (sb-vm:word sb-vm:word) sb-vm:word
   (foldable flushable movable))
 
-(defknown (shift-towards-start shift-towards-end) (sb!vm:word fixnum)
-  sb!vm:word
+(defknown (shift-towards-start shift-towards-end) (sb-vm:word fixnum)
+  sb-vm:word
   (foldable flushable movable))
 
 ;;;; bignum operations
@@ -356,14 +392,14 @@
   (flushable))
 
 (defknown %bignum-length (bignum) bignum-length
-  (foldable flushable movable))
+  (foldable flushable))
 
 (defknown %bignum-set-length (bignum bignum-length) bignum
   ())
 
 (defknown %bignum-ref (bignum bignum-index) bignum-element-type
   (flushable))
-#!+(or x86 x86-64)
+#+(or x86 x86-64)
 (defknown %bignum-ref-with-offset (bignum fixnum (signed-byte 24))
   bignum-element-type (flushable always-translatable))
 
@@ -404,11 +440,11 @@
   (foldable flushable movable))
 
 (defknown %fixnum-digit-with-correct-sign (bignum-element-type)
-  (signed-byte #.sb!vm:n-word-bits)
+  (signed-byte #.sb-vm:n-word-bits)
   (foldable flushable movable))
 
 (defknown (%ashl %ashr %digit-logical-shift-right)
-          (bignum-element-type (mod #.sb!vm:n-word-bits)) bignum-element-type
+          (bignum-element-type (mod #.sb-vm:n-word-bits)) bignum-element-type
   (foldable flushable movable))
 
 ;;;; bit-bashing routines
@@ -416,30 +452,26 @@
 ;;; FIXME: there's some ugly duplication between the (INTERN (FORMAT ...))
 ;;; magic here and the same magic in src/code/bit-bash.lisp.  I don't know
 ;;; of any good way to clean it up, but it's definitely violating OAOO.
-(macrolet ((define-known-copiers ()
+(macrolet ((define-known-copiers (&aux (pkg (find-package "SB-KERNEL")))
             `(progn
               ,@(loop for i = 1 then (* i 2)
-                      collect `(defknown ,(intern (format nil "UB~D-BASH-COPY" i)
-                                                  (find-package "SB!KERNEL"))
+                      collect `(defknown ,(intern (format nil "UB~D-BASH-COPY" i) pkg)
                                 ((simple-unboxed-array (*)) index (simple-unboxed-array (*)) index index)
                                 (values)
                                 ())
-                      collect `(defknown ,(intern (format nil "SYSTEM-AREA-UB~D-COPY" i)
-                                                  (find-package "SB!KERNEL"))
+                      collect `(defknown ,(intern (format nil "SYSTEM-AREA-UB~D-COPY" i) pkg)
                                 (system-area-pointer index system-area-pointer index index)
                                 (values)
                                 ())
-                      collect `(defknown ,(intern (format nil "COPY-UB~D-TO-SYSTEM-AREA" i)
-                                                  (find-package "SB!KERNEL"))
+                      collect `(defknown ,(intern (format nil "COPY-UB~D-TO-SYSTEM-AREA" i) pkg)
                                 ((simple-unboxed-array (*)) index system-area-pointer index index)
                                 (values)
                                 ())
-                      collect `(defknown ,(intern (format nil "COPY-UB~D-FROM-SYSTEM-AREA" i)
-                                                  (find-package "SB!KERNEL"))
+                      collect `(defknown ,(intern (format nil "COPY-UB~D-FROM-SYSTEM-AREA" i) pkg)
                                 (system-area-pointer index (simple-unboxed-array (*)) index index)
                                 (values)
                                 ())
-                      until (= i sb!vm:n-word-bits)))))
+                      until (= i sb-vm:n-word-bits)))))
   (define-known-copiers))
 
 ;;; (not really a bit-bashing routine, but starting to take over from
@@ -458,8 +490,12 @@
 ;;; set with SETF.
 (defknown code-header-ref (t index) t (flushable))
 (defknown code-header-set (t index t) t ())
+;;; Extract a 4-byte element relative to the end of CODE-OBJ.
+;;; The index should be strictly negative and a multiple of 4.
+(defknown code-trailer-ref (t fixnum) (unsigned-byte 32)
+  (flushable #-(or sparc alpha hppa ppc64) always-translatable))
 
-(defknown fun-subtype (function) (member . #.sb!vm::+function-widetags+)
+(defknown fun-subtype (function) (member . #.sb-vm::+function-widetags+)
   (flushable))
 
 (defknown make-fdefn (t) fdefn (flushable movable))
@@ -473,14 +509,14 @@
 
 (defknown %simple-fun-type (function) t (flushable))
 
-#!+(or x86 x86-64) (defknown sb!vm::%closure-callee (function) fixnum (flushable))
+#+(or x86 x86-64) (defknown sb-vm::%closure-callee (function) fixnum (flushable))
 (defknown %closure-fun (function) function (flushable))
 
 (defknown %closure-index-ref (function index) t
   (flushable))
 
 ;; T argument is for the 'fun' slot.
-(defknown sb!vm::%copy-closure (index t) function (flushable))
+(defknown sb-vm::%copy-closure (index t) function (flushable))
 
 (defknown %fun-fun (function) function (flushable recursive))
 
@@ -490,9 +526,9 @@
 (defknown %funcallable-instance-info (function index) t (flushable))
 (defknown %set-funcallable-instance-info (function index t) t ())
 
-#!+sb-fasteval
-(defknown sb!interpreter:fun-proto-fn (sb!interpreter:interpreted-function)
-  sb!interpreter::interpreted-fun-prototype (flushable))
+#+sb-fasteval
+(defknown sb-interpreter:fun-proto-fn (sb-interpreter:interpreted-function)
+  sb-interpreter::interpreted-fun-prototype (flushable))
 
 
 (defknown %data-vector-and-index (array index)
@@ -513,6 +549,10 @@
   (movable flushable))
 
 (defknown single-float-bits (single-float) (signed-byte 32)
+  (movable foldable flushable))
+
+#+64-bit
+(defknown double-float-bits (double-float) (signed-byte 64)
   (movable foldable flushable))
 
 (defknown double-float-high-bits (double-float) (signed-byte 32)
@@ -579,3 +619,32 @@
 
 (defknown (%unary-truncate %unary-round) (real) integer
   (movable foldable flushable))
+
+(macrolet
+    ((def (name kind width signedp)
+       (let ((type (ecase signedp
+                     ((nil) 'unsigned-byte)
+                     ((t) 'signed-byte))))
+         `(progn
+            (defknown ,name (integer (integer 0)) (,type ,width)
+                      (foldable flushable movable))
+            (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width)
+              (when (and (<= width ,width)
+                         (or (and (constant-lvar-p count)
+                                  (plusp (lvar-value count)))
+                             (csubtypep (lvar-type count)
+                                        (specifier-type '(and unsigned-byte fixnum)))))
+                (cut-to-width integer ,kind width ,signedp)
+                ',name))
+            (setf (gethash ',name (modular-class-versions (find-modular-class ',kind ',signedp)))
+                  `(ash ,',width))))))
+  ;; This should really be dependent on SB-VM:N-WORD-BITS, but since we
+  ;; don't have a true Alpha64 port yet, we'll have to stick to
+  ;; SB-VM:N-MACHINE-WORD-BITS for the time being.  --njf, 2004-08-14
+  #.`(progn
+       #+(or x86 x86-64 arm arm64)
+       (def sb-vm::ash-left-modfx
+           :tagged ,(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits) t)
+       (def ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits)
+                     "SB-VM")
+           :untagged ,sb-vm:n-machine-word-bits nil)))

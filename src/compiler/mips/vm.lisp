@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Registers
@@ -291,7 +291,7 @@
      (if (static-symbol-p value)
          immediate-sc-number
          nil))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
      immediate-sc-number)
     #-sb-xc-host ; There is no such object type in the host
@@ -362,7 +362,7 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
+  (declare (type sb-c::combination node) (ignore node))
   (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)

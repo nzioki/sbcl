@@ -11,15 +11,15 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant sb!assem:assem-scheduler-p nil)
-(defconstant sb!assem:+inst-alignment-bytes+ 4)
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
 
 (defconstant +backend-fasl-file-implementation+ :arm)
 
   ;; Minumum observed value, not authoritative.
-(defconstant +backend-page-bytes+ #!+linux 4096 #!+netbsd 8192)
+(defconstant +backend-page-bytes+ #+linux 4096 #+netbsd 8192)
 
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
@@ -71,7 +71,7 @@
 (defconstant double-float-digits
   (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
-#!+arm-vfp
+#+arm-vfp
 (progn
   (defconstant float-invalid-trap-bit (ash 1 0))
   (defconstant float-divide-by-zero-trap-bit (ash 1 1))
@@ -95,13 +95,13 @@
 ;; NOTE: As with the FLOAT-REGISTERS SB in vm.lisp, if you define this
 ;; for non-VFP systems, please use a specific positive feature
 ;; conditional.
-#!-arm-vfp
+#-arm-vfp
 (error "Don't know how to set the FPU control word layout on non-VFP systems")
 
 ;;;; Where to put the different spaces.
 
 ;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#!-gencgc
+#-gencgc
 (progn
   (defconstant read-only-space-start #x04000000)
   (defconstant read-only-space-end   #x07ff8000)
@@ -111,14 +111,14 @@
   (defconstant linkage-table-space-start #x0a000000)
   (defconstant linkage-table-space-end   #x0b000000))
 
-#!+gencgc
+#+gencgc
 (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
 (defconstant linkage-table-entry-size 16)
 
-#!+(or linux netbsd)
+#+(or linux netbsd)
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x66fff000)))
@@ -165,7 +165,7 @@
     two-arg-and two-arg-ior two-arg-xor two-arg-eqv
 
     eql
-    sb!kernel:%negate)
+    sb-kernel:%negate)
   #'equalp)
 
 

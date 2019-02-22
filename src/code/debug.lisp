@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DEBUG")
+(in-package "SB-DEBUG")
 
 ;;;; variables and constants
 
@@ -62,10 +62,7 @@ provide bindings for printer control variables.")
 ;;; If this is bound before the debugger is invoked, it is used as the stack
 ;;; top by the debugger. It can either be the first interesting frame, or the
 ;;; name of the last uninteresting frame.
-;;; This is a !DEFVAR so that cold-init can use SIGNAL.
-;;; It actually works as long as the condition is not a subtype of WARNING
-;;; or ERROR. (Any other direct descendant of CONDITION should be fine)
-(!defvar *stack-top-hint* nil)
+(defparameter *stack-top-hint* nil) ; initialized by genesis
 (defvar *current-frame* nil)
 (declaim (always-bound *stack-top-hint* *current-frame*))
 
@@ -77,7 +74,7 @@ provide bindings for printer control variables.")
   "Should the debugger display beginner-oriented help messages?")
 
 (defun debug-prompt (stream)
-  (sb!thread::get-foreground)
+  (sb-thread::get-foreground)
   (format stream
           "~%~W~:[~;[~W~]] "
           (frame-number *current-frame*)
@@ -150,7 +147,7 @@ Other commands:
     deeply nested input syntax, and now the reader is confused.)")
 
 (defmacro with-debug-io-syntax (() &body body)
-  (let ((thunk (sb!xc:gensym "THUNK")))
+  (let ((thunk (sb-xc:gensym "THUNK")))
     `(dx-flet ((,thunk ()
                        ,@body))
        (funcall-with-debug-io-syntax #',thunk))))
@@ -361,7 +358,7 @@ possible while navigating and ignoring possible errors."
               ((print-not-readable #'print-unreadably))
             (fresh-line stream)
             (when print-thread
-              (format stream "Backtrace for: ~S~%" sb!thread:*current-thread*))
+              (format stream "Backtrace for: ~S~%" sb-thread:*current-thread*))
             (map-backtrace (lambda (frame)
                              (restart-case
                                  (if emergency-best-effort
@@ -463,19 +460,16 @@ information."
 ;;; when ALL-THREADS is NIL, then return NIL.
 (defun stack-allocated-p (x &optional all-threads)
   (let ((a (get-lisp-obj-address x)))
-    (and (sb!vm:is-lisp-pointer a)
-         (cond ((and (<= (get-lisp-obj-address sb!vm:*control-stack-start*) a)
-                     (< a (get-lisp-obj-address sb!vm:*control-stack-end*)))
-                sb!thread:*current-thread*)
+    (and (sb-vm:is-lisp-pointer a)
+         (cond ((and (<= (get-lisp-obj-address sb-vm:*control-stack-start*) a)
+                     (< a (get-lisp-obj-address sb-vm:*control-stack-end*)))
+                sb-thread:*current-thread*)
                (all-threads
                 ;; find a stack whose base is nearest and below A.
-                ;; this is likely to return a wrong answer during thread creation/deletion
-                ;; due to the 'rotate' operations which are incrementally performed
-                ;; on the binary search tree.
-                (binding* ((node (bst-find<= a sb!thread::*stack-addr-table*) :exit-if-null)
-                           (data (bst-node-data node)))
-                  (when (< a (car data))
-                    (cdr data))))))))
+                (awhen (sb-thread::avl-find<= a sb-thread::*all-threads*)
+                  (let ((thread (sb-thread::avlnode-data it)))
+                    (when (< a (sb-thread::thread-stack-end thread))
+                      thread))))))))
 
 ;;;; frame printing
 
@@ -483,7 +477,7 @@ information."
 
 ;;; This is a convenient way to express what to do for each type of
 ;;; lambda-list element.
-(sb!xc:defmacro lambda-list-element-dispatch (element
+(sb-xc:defmacro lambda-list-element-dispatch (element
                                               &key
                                               required
                                               optional
@@ -504,7 +498,7 @@ information."
       (aver (eq ,element :deleted))
       ,@deleted)))
 
-(sb!xc:defmacro lambda-var-dispatch (variable location deleted valid other)
+(sb-xc:defmacro lambda-var-dispatch (variable location deleted valid other)
   (let ((var (gensym)))
     `(let ((,var ,variable))
        (cond ((eq ,var :deleted) ,deleted)
@@ -525,31 +519,31 @@ information."
 ;;; This includes the ARG-COUNT-ERROR and UNDEFINED-FUNCTION coming from
 ;;; undefined-tramp.
 (defun early-frame-nth-arg (n frame)
-  (let* ((escaped (sb!di::compiled-frame-escaped frame))
-         (pointer (sb!di::frame-pointer frame))
-         (arg-count (sb!di::sub-access-debug-var-slot
-                     pointer sb!c:arg-count-sc escaped)))
+  (let* ((escaped (sb-di::compiled-frame-escaped frame))
+         (pointer (sb-di::frame-pointer frame))
+         (arg-count (sb-di::sub-access-debug-var-slot
+                     pointer sb-c:arg-count-sc escaped)))
     (if (and (>= n 0)
              (< n arg-count))
-        (sb!di::sub-access-debug-var-slot
+        (sb-di::sub-access-debug-var-slot
          pointer
-         (sb!c:standard-arg-location-sc n)
+         (sb-c:standard-arg-location-sc n)
          escaped)
         (error "Index ~a out of bounds for ~a supplied argument~:p." n arg-count))))
 
 (defun early-frame-args (frame)
-  (let* ((escaped (sb!di::compiled-frame-escaped frame))
-         (pointer (sb!di::frame-pointer frame))
-         (arg-count (sb!di::sub-access-debug-var-slot
-                     pointer sb!c:arg-count-sc escaped)))
+  (let* ((escaped (sb-di::compiled-frame-escaped frame))
+         (pointer (sb-di::frame-pointer frame))
+         (arg-count (sb-di::sub-access-debug-var-slot
+                     pointer sb-c:arg-count-sc escaped)))
     (loop for i below arg-count
-          collect (sb!di::sub-access-debug-var-slot
+          collect (sb-di::sub-access-debug-var-slot
                    pointer
-                   (sb!c:standard-arg-location-sc i)
+                   (sb-c:standard-arg-location-sc i)
                    escaped))))
 
 (defun frame-args-as-list (frame)
-  (when (sb!di::all-args-available-p frame)
+  (when (sb-di::all-args-available-p frame)
     (return-from frame-args-as-list
       (early-frame-args frame)))
   (handler-case
@@ -584,7 +578,7 @@ information."
                         (setf reversed-result
                               (append (reverse
                                        (multiple-value-list
-                                        (sb!c::%more-arg-values context 0 count)))
+                                        (sb-c::%more-arg-values context 0 count)))
                                       reversed-result))
                         (return-from enumerating))
                       (push (make-unprintable-object "unavailable &MORE argument")
@@ -598,7 +592,7 @@ information."
   (values name
           (if (and (consp args)
                    ;; EARLY-FRAME-ARGS doesn't include arg-count
-                   (not (sb!di::all-args-available-p frame)))
+                   (not (sb-di::all-args-available-p frame)))
               (rest args)
               args)
           info))
@@ -613,7 +607,7 @@ information."
                  (butlast args 2)
                  (if (fixnump count)
                      (multiple-value-list
-                      (sb!c:%more-arg-values context 0 count))
+                      (sb-c:%more-arg-values context 0 count))
                      (list
                       (make-unprintable-object "more unavailable arguments")))))
               args)
@@ -639,7 +633,7 @@ information."
 
 (defun clean-frame-call (frame name method-frame-style info)
   (let ((args (frame-args-as-list frame)))
-    (cond ((typep name '(cons (eql sb!pcl::fast-method)))
+    (cond ((typep name '(cons (eql sb-pcl::fast-method)))
            (clean-fast-method name args method-frame-style info))
           ((memq :external info)
            (clean-xep frame name args info))
@@ -750,7 +744,7 @@ the current thread are replaced with dummy objects which can safely escape."
       (format stream " [~{~(~A~)~^,~}]" info)))
   (when print-frame-source
     (let* ((loc (frame-code-location frame))
-           (path (and (sb!di::compiled-debug-fun-p
+           (path (and (sb-di::compiled-debug-fun-p
                        (code-location-debug-fun loc))
                       (handler-case (code-location-debug-source loc)
                         (no-debug-blocks ())
@@ -758,7 +752,7 @@ the current thread are replaced with dummy objects which can safely escape."
                           (debug-source-namestring source))))))
       (when (or (eq print-frame-source :always)
                 ;; Avoid showing sources for internals,
-                ;; it will either fail anyway due to all the SB! and
+                ;; it will either fail anyway due to the
                 ;; reader conditionals or show something nobody has
                 ;; any iterest in.
                 (not (eql (search "SYS:SRC;" path) 0)))
@@ -838,8 +832,8 @@ the current thread are replaced with dummy objects which can safely escape."
                 ;; and the stream you're trying to watch), and any fix for
                 ;; that buggy arrangement will likely let this hack go away
                 ;; naturally.
-                (sb!impl::*circularity-hash-table* . nil)
-                (sb!impl::*circularity-counter* . nil)
+                (sb-impl::*circularity-hash-table* . nil)
+                (sb-impl::*circularity-counter* . nil)
                 (*readtable* *debug-readtable*))
             (progv
                 ;; (Why NREVERSE? PROGV makes the later entries have
@@ -886,7 +880,7 @@ the current thread are replaced with dummy objects which can safely escape."
 (defun invoke-debugger (condition)
   "Enter the debugger."
   (let ((*stack-top-hint* (resolve-stack-top-hint))
-        (sb!impl::*deadline* nil))
+        (sb-impl::*deadline* nil))
     ;; call *INVOKE-DEBUGGER-HOOK* first, so that *DEBUGGER-HOOK* is not
     ;; called when the debugger is disabled
     (run-hook '*invoke-debugger-hook* condition)
@@ -919,8 +913,8 @@ the current thread are replaced with dummy objects which can safely escape."
     (format stream
             "debugger invoked on a ~S~@[ in thread ~_~A~]: ~2I~_~A"
             (type-of condition)
-            #!+sb-thread sb!thread:*current-thread*
-            #!-sb-thread nil
+            #+sb-thread sb-thread:*current-thread*
+            #-sb-thread nil
             condition))
   (terpri stream))
 
@@ -954,7 +948,7 @@ the current thread are replaced with dummy objects which can safely escape."
                   '*nested-debug-condition*
                   (cell-error-name *nested-debug-condition*)))))
 
-    (let ((background-p (sb!thread::debugger-wait-until-foreground-thread
+    (let ((background-p (sb-thread::debugger-wait-until-foreground-thread
                          *debug-io*)))
 
       ;; After the initial error/condition/whatever announcement to
@@ -986,7 +980,7 @@ the current thread are replaced with dummy objects which can safely escape."
                         (show-restarts *debug-restarts* *debug-io*))
                       (internal-debug))
                  (when background-p
-                   (sb!thread:release-foreground)))))
+                   (sb-thread:release-foreground)))))
         (if (find 'abort *debug-restarts* :key #'restart-name)
             (debug)
             (restart-case (let* ((restarts (compute-restarts condition))
@@ -998,7 +992,7 @@ the current thread are replaced with dummy objects which can safely escape."
               (abort ()
                 :report (lambda (stream)
                           (format stream "~@<Exit from the current thread.~@:>"))
-                (sb!thread:abort-thread :allow-exit t))))))))
+                (sb-thread:abort-thread :allow-exit t))))))))
 
 ;;; this function is for use in *INVOKE-DEBUGGER-HOOK* when ordinary
 ;;; ANSI behavior has been suppressed by the "--disable-debugger"
@@ -1034,16 +1028,16 @@ the current thread are replaced with dummy objects which can safely escape."
            (format *error-output*
                    "~&~@<Unhandled ~S~@[ in thread ~S~]: ~2I~_~A~:>~2%"
                    (type-of condition)
-                   #!+sb-thread sb!thread:*current-thread*
-                   #!-sb-thread nil
+                   #+sb-thread sb-thread:*current-thread*
+                   #-sb-thread nil
                    condition)
            (finish-output *error-output*))
          (describe-condition ()
            (format *error-output*
                    "~&Unhandled ~S~@[ in thread ~S~]:~%"
                    (type-of condition)
-                   #!+sb-thread sb!thread:*current-thread*
-                   #!-sb-thread nil)
+                   #+sb-thread sb-thread:*current-thread*
+                   #-sb-thread nil)
            (describe condition *error-output*)
            (finish-output *error-output*))
          (display-backtrace ()
@@ -1111,16 +1105,16 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
   ;; This is not inside the UNLESS to ensure that LDB is disabled
   ;; regardless of what the old value of *INVOKE-DEBUGGER-HOOK* was.
   ;; This might matter for example when restoring a core.
-  (sb!alien:alien-funcall (sb!alien:extern-alien "disable_lossage_handler"
-                                                 (function sb!alien:void))))
+  (sb-alien:alien-funcall (sb-alien:extern-alien "disable_lossage_handler"
+                                                 (function sb-alien:void))))
 
 (defun enable-debugger ()
   "Restore the debugger if it has been turned off by DISABLE-DEBUGGER."
   (when (eql *invoke-debugger-hook* 'debugger-disabled-hook)
     (setf *invoke-debugger-hook* *old-debugger-hook*
           *old-debugger-hook* nil))
-  (sb!alien:alien-funcall (sb!alien:extern-alien "enable_lossage_handler"
-                                                 (function sb!alien:void))))
+  (sb-alien:alien-funcall (sb-alien:extern-alien "enable_lossage_handler"
+                                                 (function sb-alien:void))))
 
 (defun show-restarts (restarts s)
   (cond ((null restarts)
@@ -1165,7 +1159,7 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
 
 ;;; This calls DEBUG-LOOP, performing some simple initializations
 ;;; before doing so. INVOKE-DEBUGGER calls this to actually get into
-;;; the debugger. SB!KERNEL::ERROR-ERROR calls this in emergencies
+;;; the debugger. SB-KERNEL::ERROR-ERROR calls this in emergencies
 ;;; to get into a debug prompt as quickly as possible with as little
 ;;; risk as possible for stepping on whatever is causing recursive
 ;;; errors.
@@ -1283,12 +1277,12 @@ forms that explicitly control this kind of evaluation.")
   ;; arg count errors are checked before anything is set up but they
   ;; are reported in the elsewhere segment, which is after start-pc saved in the
   ;; debug function, defeating the checks.
-  (and (not (sb!di::all-args-available-p frame))
+  (and (not (sb-di::all-args-available-p frame))
        (eq (debug-var-validity var location) :valid)))
 
 (eval-when (:execute :compile-toplevel)
 
-(sb!xc:defmacro define-var-operation (ref-or-set &optional value-var)
+(sb-xc:defmacro define-var-operation (ref-or-set &optional value-var)
   `(let* ((temp (etypecase name
                   (symbol (debug-fun-symbol-vars
                            (frame-debug-fun *current-frame*)
@@ -1394,7 +1388,7 @@ forms that explicitly control this kind of evaluation.")
   (define-var-operation :set value))
 
 ;;; This returns the COUNT'th arg as the user sees it from args, the
-;;; result of SB!DI:DEBUG-FUN-LAMBDA-LIST. If this returns a
+;;; result of SB-DI:DEBUG-FUN-LAMBDA-LIST. If this returns a
 ;;; potential DEBUG-VAR from the lambda-list, then the second value is
 ;;; T. If this returns a keyword symbol or a value from a rest arg,
 ;;; then the second value is NIL.
@@ -1434,7 +1428,7 @@ forms that explicitly control this kind of evaluation.")
   "Return the N'th argument's value if possible. Argument zero is the first
    argument in a frame's default printed representation. Count keyword/value
    pairs as separate arguments."
-  (when (sb!di::all-args-available-p *current-frame*)
+  (when (sb-di::all-args-available-p *current-frame*)
     (return-from arg
       (early-frame-nth-arg n *current-frame*)))
   (multiple-value-bind (var lambda-var-p)
@@ -1642,7 +1636,7 @@ forms that explicitly control this kind of evaluation.")
   (show-restarts *debug-restarts* *debug-io*))
 
 (!def-debug-command "BACKTRACE" ()
- (print-backtrace :count (read-if-available most-positive-fixnum)))
+ (print-backtrace :count (read-if-available sb-xc:most-positive-fixnum)))
 
 (!def-debug-command "PRINT" ()
   (print-frame-call *current-frame* *debug-io*))
@@ -1651,13 +1645,13 @@ forms that explicitly control this kind of evaluation.")
 
 (!def-debug-command "LIST-LOCALS" ()
   (let ((d-fun (frame-debug-fun *current-frame*)))
-    #!+sb-fasteval
+    #+sb-fasteval
     (when (typep (debug-fun-name d-fun nil)
-                 '(cons (eql sb!interpreter::.eval.)))
+                 '(cons (eql sb-interpreter::.eval.)))
       (let ((env (arg 1)))
-        (when (typep env 'sb!interpreter:basic-env)
+        (when (typep env 'sb-interpreter:basic-env)
           (return-from list-locals-debug-command
-            (sb!interpreter:list-locals env)))))
+            (sb-interpreter:list-locals env)))))
     (if (debug-var-info-available d-fun)
         (let ((*standard-output* *debug-io*)
               (location (frame-code-location *current-frame*))
@@ -1672,7 +1666,7 @@ forms that explicitly control this kind of evaluation.")
             (setf any-p t)
             (when (var-valid-in-frame-p v location)
               (setf any-valid-p t)
-              (case (sb!di::debug-var-info v)
+              (case (sb-di::debug-var-info v)
                 (:more-context
                  (setf more-context (debug-var-value v *current-frame*)))
                 (:more-count
@@ -1686,7 +1680,7 @@ forms that explicitly control this kind of evaluation.")
           (when (and more-context more-count)
             (format *debug-io* "~S  =  ~S~%"
                     'more
-                    (multiple-value-list (sb!c:%more-arg-values more-context 0 more-count))))
+                    (multiple-value-list (sb-c:%more-arg-values more-context 0 more-count))))
           (cond
            ((not any-p)
             (format *debug-io*
@@ -1732,7 +1726,7 @@ forms that explicitly control this kind of evaluation.")
       (format *debug-io* "~&Already single-stepping.~%")
       (let ((restart (find-restart 'continue *debug-condition*)))
         (cond (restart
-               (sb!impl::enable-stepping)
+               (sb-impl::enable-stepping)
                (invoke-restart restart))
               (t
                (format *debug-io* "~&Non-continuable error, cannot start stepping.~%"))))))
@@ -1754,7 +1748,7 @@ forms that explicitly control this kind of evaluation.")
 
 (!def-debug-command "OUT" ()
   (if (typep *debug-condition* 'step-condition)
-      (if sb!impl::*step-out*
+      (if sb-impl::*step-out*
           (let ((restart (find-restart 'step-out *debug-condition*)))
             (aver restart)
             (invoke-restart restart))
@@ -1777,14 +1771,14 @@ forms that explicitly control this kind of evaluation.")
 ;;; RETURN-FROM-FRAME and RESTART-FRAME
 
 (defun unwind-to-frame-and-call (frame thunk)
-  #!+unwind-to-frame-and-call-vop
+  #+unwind-to-frame-and-call-vop
   (flet ((sap-int/fixnum (sap)
            ;; On unithreaded X86 *BINDING-STACK-POINTER* and
            ;; *CURRENT-CATCH-BLOCK* are negative, so we need to jump through
            ;; some hoops to make these calculated values negative too.
-           (ash (truly-the (signed-byte #.sb!vm:n-word-bits)
+           (ash (truly-the (signed-byte #.sb-vm:n-word-bits)
                            (sap-int sap))
-                (- sb!vm::n-fixnum-tag-bits))))
+                (- sb-vm::n-fixnum-tag-bits))))
     ;; To properly unwind the stack, we need three pieces of information:
     ;;   * The unwind block that should be active after the unwind
     ;;   * The catch block that should be active after the unwind
@@ -1794,61 +1788,61 @@ forms that explicitly control this kind of evaluation.")
           (unbind-to (find-binding-stack-pointer frame)))
       ;; This VOP will run the neccessary cleanup forms, reset the fp, and
       ;; then call the supplied function.
-      (sb!vm::%primitive sb!vm::unwind-to-frame-and-call
-                         (sb!di::frame-pointer frame)
+      (sb-vm::%primitive sb-vm::unwind-to-frame-and-call
+                         (sb-di::frame-pointer frame)
                          (find-enclosing-uwp frame)
-                         #!-x86-64
+                         #-x86-64
                          (lambda ()
                            ;; Before calling the user-specified
                            ;; function, we need to restore the binding
                            ;; stack and the catch block. The unwind block
                            ;; is taken care of by the VOP.
-                           (sb!vm::%primitive sb!vm::unbind-to-here
+                           (sb-vm::%primitive sb-vm::unbind-to-here
                                               unbind-to)
-                           (setf sb!vm::*current-catch-block* catch-block)
+                           (setf sb-vm::*current-catch-block* catch-block)
                            (funcall thunk))
-                         #!+x86-64 thunk
-                         #!+x86-64 unbind-to
-                         #!+x86-64 catch-block)))
-  #!-unwind-to-frame-and-call-vop
+                         #+x86-64 thunk
+                         #+x86-64 unbind-to
+                         #+x86-64 catch-block)))
+  #-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))
     (replace-frame-catch-tag frame
-                                   'sb!c:debug-catch-tag
+                                   'sb-c:debug-catch-tag
                                    tag)
     (throw tag thunk)))
 
-#!+unwind-to-frame-and-call-vop
+#+unwind-to-frame-and-call-vop
 (defun find-binding-stack-pointer (frame)
   (let ((debug-fun (frame-debug-fun frame)))
     (if (eq (debug-fun-kind debug-fun) :external)
         ;; XEPs do not bind anything, nothing to restore.
         ;; But they may call other code through SATISFIES
         ;; declaration, check that the interrupt is actually in the XEP.
-        (and (sb!di::compiled-frame-escaped frame)
-             sb!kernel::*interr-current-bsp*)
+        (and (sb-di::compiled-frame-escaped frame)
+             sb-kernel::*interr-current-bsp*)
         (let* ((compiled-debug-fun (and
-                                    (typep debug-fun 'sb!di::compiled-debug-fun)
-                                    (sb!di::compiled-debug-fun-compiler-debug-fun debug-fun)))
+                                    (typep debug-fun 'sb-di::compiled-debug-fun)
+                                    (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun)))
                (bsp-save-offset (and compiled-debug-fun
-                                     (sb!c::compiled-debug-fun-bsp-save compiled-debug-fun))))
+                                     (sb-c::compiled-debug-fun-bsp-save compiled-debug-fun))))
           (when bsp-save-offset
-            (sb!di::sub-access-debug-var-slot (sb!di::frame-pointer frame) bsp-save-offset))))))
+            (sb-di::sub-access-debug-var-slot (sb-di::frame-pointer frame) bsp-save-offset))))))
 
 (defun find-enclosing-catch-block (frame)
   ;; Walk the catch block chain looking for the first entry with an address
   ;; higher than the pointer for FRAME or a null pointer.
-  (let* ((frame-pointer (sb!di::frame-pointer frame))
-         (current-block (int-sap (ldb (byte #.sb!vm:n-word-bits 0)
-                                      (ash sb!vm::*current-catch-block*
-                                           sb!vm:n-fixnum-tag-bits))))
+  (let* ((frame-pointer (sb-di::frame-pointer frame))
+         (current-block (int-sap (ldb (byte #.sb-vm:n-word-bits 0)
+                                      (ash sb-vm::*current-catch-block*
+                                           sb-vm:n-fixnum-tag-bits))))
          (enclosing-block (loop for block = current-block
                                 then (sap-ref-sap block
-                                                  (* sb!vm:catch-block-previous-catch-slot
-                                                     sb!vm::n-word-bytes))
+                                                  (* sb-vm:catch-block-previous-catch-slot
+                                                     sb-vm::n-word-bytes))
                                 when (or (zerop (sap-int block))
-                                         #!+stack-grows-downward-not-upward
+                                         #+stack-grows-downward-not-upward
                                          (sap> block frame-pointer)
-                                         #!-stack-grows-downward-not-upward
+                                         #-stack-grows-downward-not-upward
                                          (sap< block frame-pointer))
                                 return block)))
     enclosing-block))
@@ -1856,17 +1850,17 @@ forms that explicitly control this kind of evaluation.")
 (defun find-enclosing-uwp (frame)
   ;; Walk the UWP chain looking for the first entry with an address
   ;; higher than the pointer for FRAME or a null pointer.
-  (let* ((frame-pointer (sb!di::frame-pointer frame))
-         (current-uwp (int-sap (ldb (byte #.sb!vm:n-word-bits 0)
-                                    (ash sb!vm::*current-unwind-protect-block*
-                                         sb!vm:n-fixnum-tag-bits))))
+  (let* ((frame-pointer (sb-di::frame-pointer frame))
+         (current-uwp (int-sap (ldb (byte #.sb-vm:n-word-bits 0)
+                                    (ash sb-vm::*current-unwind-protect-block*
+                                         sb-vm:n-fixnum-tag-bits))))
          (enclosing-uwp (loop for uwp-block = current-uwp
                               then (sap-ref-sap uwp-block
-                                                sb!vm:unwind-block-uwp-slot)
+                                                sb-vm:unwind-block-uwp-slot)
                               when (or (zerop (sap-int uwp-block))
-                                       #!+stack-grows-downward-not-upward
+                                       #+stack-grows-downward-not-upward
                                        (sap> uwp-block frame-pointer)
-                                       #!-stack-grows-downward-not-upward
+                                       #-stack-grows-downward-not-upward
                                        (sap< uwp-block frame-pointer))
                               return uwp-block)))
     enclosing-uwp))
@@ -1917,11 +1911,11 @@ forms that explicitly control this kind of evaluation.")
               *current-frame*)))
 
 (defun frame-has-debug-tag-p (frame)
-  #!+unwind-to-frame-and-call-vop
+  #+unwind-to-frame-and-call-vop
   ;; XEPs do not bind anything, nothing to restore
   (find-binding-stack-pointer frame)
-  #!-unwind-to-frame-and-call-vop
-  (find 'sb!c:debug-catch-tag (sb!di::frame-catches frame) :key #'car))
+  #-unwind-to-frame-and-call-vop
+  (find 'sb-c:debug-catch-tag (sb-di::frame-catches frame) :key #'car))
 
 (defun frame-has-debug-vars-p (frame)
   (debug-var-info-available

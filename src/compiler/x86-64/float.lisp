@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (macrolet ((ea-for-xf-desc (tn slot)
              `(ea (- (* ,slot n-word-bytes) other-pointer-lowtag) ,tn)))
@@ -1294,6 +1294,55 @@
         (move bits float)
         (inst sar bits 32)))))
 
+(define-vop (single-float-sign)
+  (:translate single-float-sign)
+  (:args (float :scs (descriptor-reg)))
+  (:arg-types single-float)
+  (:results (res :scs (descriptor-reg)))
+  (:policy :fast-safe)
+  (:generator 3
+    (move res float)
+    ;; preserve only the sign bit and widetag
+    (inst and res (constantize (ash #x80000000 32)))
+    ;; set the bits of corresponding to 1.0f0
+    (inst or  res (constantize (logior (ash #x3F800000 32)
+                                       single-float-widetag)))))
+;;; Return Y with its sign changed to that of X.
+;;; The arguments match FLOAT-SIGN which is the opposite of C's copysign().
+(define-vop (single-float-copysign)
+  (:translate single-float-copysign)
+  (:args (x :scs (descriptor-reg))
+         (y :scs (descriptor-reg)))
+  (:arg-types single-float single-float)
+  (:results (res :scs (descriptor-reg)))
+  (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
+  (:policy :fast-safe)
+  (:generator 3
+    (move temp x)
+    (move res y)
+    (inst shl res 1)   ; discard result's sign bit
+    (inst shl temp 1)  ; copy X's sign bit into the carry flag
+    (inst rcr res 1))) ; rotate carry into the result
+
+(define-vop (double-float-bits)
+  (:args (float :scs (double-reg descriptor-reg)
+                :load-if (not (sc-is float double-stack))))
+  (:results (bits :scs (signed-reg)))
+  (:arg-types double-float)
+  (:result-types signed-num)
+  (:translate double-float-bits)
+  (:policy :fast-safe)
+  (:generator 5
+     (sc-case float
+       (double-reg
+        (inst movq bits float))
+       (double-stack
+        (inst mov bits (ea (frame-byte-offset (tn-offset float)) rbp-tn)))
+       (descriptor-reg
+        (inst mov bits (ea (- (ash double-float-value-slot word-shift)
+                              other-pointer-lowtag)
+                           float))))))
+
 (define-vop (double-float-high-bits)
   (:args (float :scs (double-reg descriptor-reg)
                 :load-if (not (sc-is float double-stack))))
@@ -1302,7 +1351,6 @@
   (:result-types signed-num)
   (:translate double-float-high-bits)
   (:policy :fast-safe)
-  (:vop-var vop)
   (:generator 5
      (sc-case float
        (double-reg
@@ -1325,7 +1373,6 @@
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
   (:policy :fast-safe)
-  (:vop-var vop)
   (:generator 5
      (sc-case float
         (double-reg
@@ -1502,7 +1549,7 @@
 (defknown swap-complex ((complex float)) (complex float)
     (foldable flushable movable always-translatable))
 (defoptimizer (swap-complex derive-type) ((x))
-  (sb!c::lvar-type x))
+  (sb-c::lvar-type x))
 (defun swap-complex (x)
   (complex (imagpart x) (realpart x)))
 (define-vop (swap-complex-single-float)

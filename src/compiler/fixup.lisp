@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; a fixup of some kind
 (defstruct (fixup
@@ -26,7 +26,7 @@
   ;; fixups on the :X86 architecture, NAME is always NIL, so this
   ;; fixup doesn't refer to an external label, and OFFSET is an offset
   ;; from the beginning of the current code block.
-  (offset 0 :type (or sb!vm:signed-word #!+x86 (or label (cons label fixnum)))
+  (offset 0 :type (or sb-vm:signed-word #+x86 (or label (cons label fixnum)))
             :read-only t))
 
 (defstruct (fixup-note

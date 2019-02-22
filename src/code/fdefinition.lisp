@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;; This variable properly belongs in 'target-hash-table',
 ;; but it's compiled after this file is.
@@ -22,11 +22,11 @@
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
-  #!-immobile-space (make-fdefn name)
-  #!+immobile-space
+  #-immobile-space (make-fdefn name)
+  #+immobile-space
   (let ((fdefn (truly-the (values fdefn &optional)
-                          (sb!vm::alloc-immobile-fdefn))))
-    (sb!vm::%set-fdefn-name fdefn name)
+                          (sb-vm::alloc-immobile-fdefn))))
+    (sb-vm::%set-fdefn-name fdefn name)
     ;; Return the result of FDEFN-MAKUNBOUND because it (strangely) returns its
     ;; argument. Using FDEFN as the value of this function, as if we didn't know
     ;; that FDEFN-MAKUNBOUND did that, would cause a redundant register move.
@@ -36,10 +36,9 @@
   (declare (type function fun)
            (type fdefn fdefn)
            (values function))
-  #!+immobile-code (sb!vm::%set-fdefn-fun fdefn fun)
-  #!-immobile-code (setf (fdefn-fun fdefn) fun))
+  #+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
+  #-immobile-code (setf (fdefn-fun fdefn) fun))
 
-#!-sb-fluid (declaim (inline symbol-fdefn))
 ;; Return SYMBOL's fdefinition, if any, or NIL. SYMBOL must already
 ;; have been verified to be a symbol by the caller.
 (defun symbol-fdefn (symbol)
@@ -89,8 +88,8 @@
       ;; We won't reach here if the name was not legal
       (let ((fdefn (get-info-value-initializing :function :definition name
                                                 (make-fdefn name))))
-        (when (typep name '(cons (eql sb!pcl::slot-accessor)))
-          (sb!pcl::ensure-accessor name))
+        (when (typep name '(cons (eql sb-pcl::slot-accessor)))
+          (sb-pcl::ensure-accessor name))
         fdefn)))
 
 ;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
@@ -102,7 +101,7 @@
   ;; if we already know that FUNCTION is a function.
   ;; It will signal a type error if not, which is the right thing to do anyway.
   ;; (this isn't quite a true predicate)
-  (and (= (fun-subtype function) sb!vm:closure-widetag)
+  (and (= (fun-subtype function) sb-vm:closure-widetag)
        ;; This test needs to reference the name of any macro, but in order for
        ;; cold-init to work, the macro has to be defined first.
        ;; So pick DX-LET, as it's in primordial-extensions.
@@ -127,7 +126,10 @@
 ;;; but as we've defined FDEFINITION, that strips encapsulations.
 (defmacro %coerce-name-to-fun (name &optional (lookup-fn 'find-fdefn)
                                     strictly-functionp)
-  (declare (boolean strictly-functionp))
+  ;; Whoa! We were getting a warning from the *host* here -
+  ;;   "Abbreviated type declaration: (BOOLEAN SB-IMPL::STRICTLY-FUNCTIONP)."
+  ;; I guess it's because we hand it a lambda and it doesn't like our style?
+  (declare (type boolean strictly-functionp))
   `(let* ((name ,name) (fdefn (,lookup-fn name)) f)
      (if (and fdefn
               (setq f (fdefn-fun (truly-the fdefn fdefn)))
@@ -214,7 +216,7 @@
 ;;; encapsulations of the same name.
 (defun encapsulate (name type function)
   (let* ((fdefn (find-fdefn name))
-         (underlying-fun (sb!c:safe-fdefn-fun fdefn)))
+         (underlying-fun (sb-c:safe-fdefn-fun fdefn)))
     (when (typep underlying-fun 'generic-function)
       (return-from encapsulate
         (encapsulate-generic-function underlying-fun type function)))
@@ -402,10 +404,10 @@
     (and fdefn (fdefn-fun fdefn) t)))
 
 ;; Byte index 2 of the fdefn's header is the statically-linked flag
-#!+immobile-code
-(defmacro sb!vm::fdefn-has-static-callers (fdefn)
+#+immobile-code
+(defmacro sb-vm::fdefn-has-static-callers (fdefn)
   `(sap-ref-8 (int-sap (get-lisp-obj-address ,fdefn))
-              (- 2 sb!vm::other-pointer-lowtag)))
+              (- 2 sb-vm::other-pointer-lowtag)))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
@@ -414,9 +416,9 @@
       (:symbol name "removing the function or macro definition of ~A")
     (let ((fdefn (find-fdefn name)))
       (when fdefn
-        #!+immobile-code
-        (unless (eql (sb!vm::fdefn-has-static-callers fdefn) 0)
-          (sb!vm::remove-static-links fdefn))
+        #+immobile-code
+        (unless (eql (sb-vm::fdefn-has-static-callers fdefn) 0)
+          (sb-vm::remove-static-links fdefn))
         (fdefn-makunbound fdefn)))
     (undefine-fun-name name)
     name))

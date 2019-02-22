@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; compiler error context determination
 
@@ -441,7 +441,7 @@ has written, having proved that it is unreachable."))
      ;; Grammar note - starting a sentence with a numeral is wrong.
      (format stream
               "~@<~@(~D~) call~:P to ~
-               ~/sb!ext:print-symbol-with-prefix/ ~
+               ~/sb-ext:print-symbol-with-prefix/ ~
                ~2:*~[~;was~:;were~] compiled before a compiler-macro ~
                was defined for it. A declaration of NOTINLINE at the ~
                call site~:P will eliminate this warning, as will ~
@@ -514,7 +514,7 @@ has written, having proved that it is unreachable."))
       (let ((*print-level* 2)
             (*print-pretty* nil))
         ;; It's arbitrary how this name is stringified.
-        ;; Using ~A in lieu of ~S prevents "SB!" strings from getting in.
+        ;; Using ~A in lieu of ~S prevents "SB-" strings from getting in.
         (format nil
                 "~{~{~A~^ ~}~^ => ~}"
                 #+sb-xc-host (list (list (caar context)))
@@ -578,7 +578,7 @@ has written, having proved that it is unreachable."))
   ;; Whitelist functions are looked up prior to UNCROSS,
   ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
   (when (and (eq kind :function)
-             (gethash name *undefined-fun-whitelist*))
+             (gethash name sb-cold:*undefined-fun-whitelist*))
     (return-from note-undefined-reference (values)))
   (setq name (uncross name))
   (unless (and
@@ -637,7 +637,7 @@ has written, having proved that it is unreachable."))
 ;; The current approach is reliable, at a cost of ~3 words per function.
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
-  (unless (sb!xc:compiler-macro-function name)
+  (unless (sb-xc:compiler-macro-function name)
     (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning
@@ -672,7 +672,7 @@ has written, having proved that it is unreachable."))
         (compiler-warn
          'inlining-dependency-failure
          :format-control
-         "~@<Proclaiming ~/sb!ext:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
+         "~@<Proclaiming ~/sb-ext:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
 ~:*~[~;was~:;were~] previously compiled. A declaration of NOTINLINE ~
 at the call site~:P will eliminate this warning, as will proclaiming ~
 and defining the function before its first potential use.~@:>"
@@ -725,7 +725,7 @@ and defining the function before its first potential use.~@:>"
        'inlining-dependency-failure
        :format-control
        (if (info :function :assumed-type name)
-           (sb!format:tokens "~@<Call to ~/sb!ext:print-symbol-with-prefix/ ~
+           (sb-format:tokens "~@<Call to ~/sb-ext:print-symbol-with-prefix/ ~
                               could not be inlined because no definition ~
                               for it was seen prior to its first use.~:@>")
          ;; This message sort of implies that source form is the
@@ -733,7 +733,7 @@ and defining the function before its first potential use.~@:>"
          ;; could have been saved, which isn't in general true - it could
          ;; be saved as a parsed AST - but I don't really know how else to
          ;; phrase this. And it happens to be true in SBCL, so it's not wrong.
-           (sb!format:tokens "~@<Call to ~/sb!ext:print-symbol-with-prefix/ could ~
+           (sb-format:tokens "~@<Call to ~/sb-ext:print-symbol-with-prefix/ could ~
 not be inlined because its source code was not saved. A global INLINE ~
 or SB-EXT:MAYBE-INLINE proclamation must be ~
 in effect to save function definitions for inlining.~:@>"))

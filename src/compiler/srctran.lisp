@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We turn IDENTITY into PROG1 so that it is obvious that it just
 ;;; returns the first value of its argument. Ditto for VALUES with one
@@ -155,7 +155,7 @@
       ;; Something fishy here- If THE is removed, OPERAND-RESTRICTION-OK
       ;; returns NIL because type inference on MAKE-LIST never happens.
       ;; But the fndb entry for %MAKE-LIST is right, so I'm slightly bewildered.
-      `(%make-list (the (integer 0 (,(1- sb!xc:array-dimension-limit))) ,length)
+      `(%make-list (the (integer 0 (,(1- sb-xc:array-dimension-limit))) ,length)
                    ,(second rest))
       (values nil t))) ; give up
 
@@ -172,7 +172,7 @@
   (case (length lists)
     (0 nil)
     (1 (car lists))
-    (2 `(sb!impl::append2 ,@lists))
+    (2 `(sb-impl::append2 ,@lists))
     (t (values nil t))))
 
 (define-source-transform nconc (&rest lists)
@@ -218,7 +218,7 @@
 (defoptimizer (append derive-type) ((&rest args))
   (derive-append-type args))
 
-(defoptimizer (sb!impl::append2 derive-type) ((&rest args))
+(defoptimizer (sb-impl::append2 derive-type) ((&rest args))
   (derive-append-type args))
 
 (defoptimizer (nconc derive-type) ((&rest args))
@@ -254,13 +254,13 @@
 
 (define-source-transform gethash (&rest args)
   (case (length args)
-   (2 `(sb!impl::gethash3 ,@args nil))
-   (3 `(sb!impl::gethash3 ,@args))
+   (2 `(sb-impl::gethash3 ,@args nil))
+   (3 `(sb-impl::gethash3 ,@args))
    (t (values nil t))))
 (define-source-transform get (&rest args)
   (case (length args)
-   (2 `(sb!impl::get3 ,@args nil))
-   (3 `(sb!impl::get3 ,@args))
+   (2 `(sb-impl::get3 ,@args nil))
+   (3 `(sb-impl::get3 ,@args))
    (t (values nil t))))
 
 (defvar *default-nthcdr-open-code-limit* 6)
@@ -343,13 +343,13 @@
           ((eql integer-value -1)
            t)
           ((csubtypep integer-type (specifier-type '(or word
-                                                     sb!vm:signed-word)))
-           `(if (>= index #.sb!vm:n-word-bits)
+                                                     sb-vm:signed-word)))
+           `(if (>= index #.sb-vm:n-word-bits)
                 (minusp integer)
                 (not (zerop (logand integer (ash 1 index))))))
           ((csubtypep integer-type (specifier-type 'bignum))
            (if (csubtypep (lvar-type index)
-                          (specifier-type '(mod #.sb!vm:n-word-bits))) ; word-index
+                          (specifier-type '(mod #.sb-vm:n-word-bits))) ; word-index
                `(logbitp index (%bignum-ref integer 0))
                `(bignum-logbitp index integer)))
           (t
@@ -456,7 +456,7 @@
 
 (defun safe-double-coercion-p (x)
   (or (typep x 'double-float)
-      (<= most-negative-double-float x most-positive-double-float)))
+      (<= sb-xc:most-negative-double-float x sb-xc:most-positive-double-float)))
 
 (defun safe-single-coercion-p (x)
   (or (typep x 'single-float)
@@ -487,10 +487,10 @@
        ;;
        ;; FIXME: If we ever add SSE-support for x86, this conditional needs to
        ;; change.
-       #!+x86
+       #+x86
        (not (typep x `(or (integer * (,most-negative-exactly-single-float-fixnum))
                           (integer (,most-positive-exactly-single-float-fixnum) *))))
-       (<= most-negative-single-float x most-positive-single-float))))
+       (<= sb-xc:most-negative-single-float x sb-xc:most-positive-single-float))))
 
 ;;; Apply a binary operator OP to two bounds X and Y. The result is
 ;;; NIL if either is NIL. Otherwise bound is computed and the result
@@ -571,11 +571,11 @@
            xbound
            (list xbound))))
     ((subtypep type 'double-float)
-     (if (<= most-negative-double-float val most-positive-double-float)
+     (if (<= sb-xc:most-negative-double-float val sb-xc:most-positive-double-float)
          (coerce val type)))
     ((or (subtypep type 'single-float) (subtypep type 'float))
      ;; coerce to float returns a single-float
-     (if (<= most-negative-single-float val most-positive-single-float)
+     (if (<= sb-xc:most-negative-single-float val sb-xc:most-positive-single-float)
          (coerce val type)))
     (t (coerce val type))))
 
@@ -588,16 +588,16 @@
               (list xbound)))
         (cond
           ((subtypep type 'double-float)
-           (if (<= most-negative-double-float val most-positive-double-float)
+           (if (<= sb-xc:most-negative-double-float val sb-xc:most-positive-double-float)
                (coerce val type)
-               (if (< val most-negative-double-float)
-                   most-negative-double-float most-positive-double-float)))
+               (if (< val sb-xc:most-negative-double-float)
+                   sb-xc:most-negative-double-float sb-xc:most-positive-double-float)))
           ((or (subtypep type 'single-float) (subtypep type 'float))
            ;; coerce to float returns a single-float
-           (if (<= most-negative-single-float val most-positive-single-float)
+           (if (<= sb-xc:most-negative-single-float val sb-xc:most-positive-single-float)
                (coerce val type)
-               (if (< val most-negative-single-float)
-                   most-negative-single-float most-positive-single-float)))
+               (if (< val sb-xc:most-negative-single-float)
+                   sb-xc:most-negative-single-float sb-xc:most-positive-single-float)))
           (t (coerce val type))))))
 
 ;;; Convert a numeric-type object to an interval object.
@@ -1511,7 +1511,7 @@
   ;; CMU CL blows up on (ASH 1000000000 -100000000000) (i.e. ASH of
   ;; two bignums yielding zero) and it's hard to avoid that
   ;; calculation in here.
-  #+(and cmu sb-xc-host)
+  #+host-quirks-cmu
   (when (and (or (typep (numeric-type-low n-type) 'bignum)
                  (typep (numeric-type-high n-type) 'bignum))
              (or (typep (numeric-type-low shift) 'bignum)
@@ -1520,14 +1520,14 @@
   (flet ((ash-outer (n s)
            (when (and (fixnump s)
                       (<= s 64)
-                      (> s sb!xc:most-negative-fixnum))
+                      (> s sb-xc:most-negative-fixnum))
              (ash n s)))
          ;; KLUDGE: The bare 64's here should be related to
          ;; symbolic machine word size values somehow.
 
          (ash-inner (n s)
            (if (and (fixnump s)
-                    (> s sb!xc:most-negative-fixnum))
+                    (> s sb-xc:most-negative-fixnum))
              (ash n (min s 64))
              (if (minusp n) -1 0))))
     (or (and (csubtypep n-type (specifier-type 'integer))
@@ -1740,14 +1740,14 @@
                   (values 'integer nil))
                  (rational
                   (values 'rational nil))
-                 ((or single-float double-float #!+long-float long-float)
+                 ((or single-float double-float #+long-float long-float)
                   (values 'float rem-type))
                  (float
                   (values 'float nil))
                  (real
                   (values nil nil)))
              (when (member rem-type '(float single-float double-float
-                                            #!+long-float long-float))
+                                            #+long-float long-float))
                (setf rem (interval-func #'(lambda (x)
                                             (coerce-for-bound x rem-type))
                                         rem)))
@@ -1886,14 +1886,14 @@
                       (values 'integer nil))
                      (rational
                       (values 'rational nil))
-                     ((or single-float double-float #!+long-float long-float)
+                     ((or single-float double-float #+long-float long-float)
                       (values 'float result-type))
                      (float
                       (values 'float nil))
                      (real
                       (values nil nil)))
                  (when (member result-type '(float single-float double-float
-                                             #!+long-float long-float))
+                                             #+long-float long-float))
                    ;; Make sure that the limits on the interval have
                    ;; the right type.
                    (setf rem (interval-func (lambda (x)
@@ -2431,7 +2431,7 @@
               ,@(loop for member in (member-type-members type)
                       when (characterp member)
                       collect (char-code member)))))
-          ((sb!kernel::character-set-type-p type)
+          ((sb-kernel::character-set-type-p type)
            (specifier-type
             `(or
               ,@(loop for (low . high)
@@ -2442,7 +2442,7 @@
             `(mod ,base-char-code-limit)))
           (t
            (specifier-type
-            `(mod ,sb!xc:char-code-limit))))))
+            `(mod ,sb-xc:char-code-limit))))))
 
 (defoptimizer (code-char derive-type) ((code))
   (let ((type (lvar-type code)))
@@ -2563,7 +2563,7 @@
     (if (and (numeric-type-p size)
              (csubtypep size (specifier-type 'integer)))
         (let ((size-high (numeric-type-high size)))
-          (if (and size-high (<= size-high sb!vm:n-word-bits))
+          (if (and size-high (<= size-high sb-vm:n-word-bits))
               (specifier-type `(unsigned-byte* ,size-high))
               (specifier-type 'unsigned-byte)))
         *universal-type*)))
@@ -2579,7 +2579,7 @@
         (let ((size-high (numeric-type-high size))
               (posn-high (numeric-type-high posn)))
           (if (and size-high posn-high
-                   (<= (+ size-high posn-high) sb!vm:n-word-bits))
+                   (<= (+ size-high posn-high) sb-vm:n-word-bits))
               (specifier-type `(unsigned-byte* ,(+ size-high posn-high)))
               (specifier-type 'unsigned-byte)))
         *universal-type*)))
@@ -2601,12 +2601,12 @@
                    ;; (UNSIGNED-BYTE 1073741822), and then attempt to
                    ;; canonicalize this type to (INTEGER 0 (1- (ASH 1
                    ;; 1073741822))), with hilarious consequences.  We
-                   ;; cutoff at 4*SB!VM:N-WORD-BITS to allow inference
+                   ;; cutoff at 4*SB-VM:N-WORD-BITS to allow inference
                    ;; over a reasonable amount of shifting, even on
                    ;; the alpha/32 port, where N-WORD-BITS is 32 but
                    ;; machine integers are 64-bits.  -- CSR,
                    ;; 2003-09-12
-                   (<= (+ size-high posn-high) (* 4 sb!vm:n-word-bits)))
+                   (<= (+ size-high posn-high) (* 4 sb-vm:n-word-bits)))
           (let ((raw-bit-count (max (integer-length high)
                                     (integer-length low)
                                     (+ size-high posn-high))))
@@ -2625,27 +2625,27 @@
 
 (deftransform %ldb ((size posn int)
                     (fixnum fixnum integer)
-                    (unsigned-byte #.sb!vm:n-word-bits))
+                    (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   (if (and (constant-lvar-p size)
            (constant-lvar-p posn)
-           (<= (+ (lvar-value size) (lvar-value posn)) sb!vm:n-fixnum-bits))
+           (<= (+ (lvar-value size) (lvar-value posn)) sb-vm:n-fixnum-bits))
       (let ((size (lvar-value size))
             (posn (lvar-value posn)))
-        `(logand (ash (mask-signed-field sb!vm:n-fixnum-bits int) ,(- posn))
-                 ,(ash (1- (ash 1 sb!vm:n-word-bits))
-                       (- size sb!vm:n-word-bits))))
+        `(logand (ash (mask-signed-field sb-vm:n-fixnum-bits int) ,(- posn))
+                 ,(ash (1- (ash 1 sb-vm:n-word-bits))
+                       (- size sb-vm:n-word-bits))))
       `(logand (ash int (- posn))
-               (ash ,(1- (ash 1 sb!vm:n-word-bits))
-                    (- size ,sb!vm:n-word-bits)))))
+               (ash ,(1- (ash 1 sb-vm:n-word-bits))
+                    (- size ,sb-vm:n-word-bits)))))
 
 (deftransform %mask-field ((size posn int)
                            (fixnum fixnum integer)
-                           (unsigned-byte #.sb!vm:n-word-bits))
+                           (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(logand int
-           (ash (ash ,(1- (ash 1 sb!vm:n-word-bits))
-                     (- size ,sb!vm:n-word-bits))
+           (ash (ash ,(1- (ash 1 sb-vm:n-word-bits))
+                     (- size ,sb-vm:n-word-bits))
                 posn)))
 
 ;;; Note: for %DPB and %DEPOSIT-FIELD, we can't use
@@ -2656,7 +2656,7 @@
 
 (deftransform %dpb ((new size posn int)
                     *
-                    (unsigned-byte #.sb!vm:n-word-bits))
+                    (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ldb (byte size 0) -1)))
      (logior (ash (logand new mask) posn)
@@ -2664,7 +2664,7 @@
 
 (deftransform %dpb ((new size posn int)
                     *
-                    (signed-byte #.sb!vm:n-word-bits))
+                    (signed-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ldb (byte size 0) -1)))
      (logior (ash (logand new mask) posn)
@@ -2672,7 +2672,7 @@
 
 (deftransform %deposit-field ((new size posn int)
                               *
-                              (unsigned-byte #.sb!vm:n-word-bits))
+                              (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ash (ldb (byte size 0) -1) posn)))
      (logior (logand new mask)
@@ -2680,7 +2680,7 @@
 
 (deftransform %deposit-field ((new size posn int)
                               *
-                              (signed-byte #.sb!vm:n-word-bits))
+                              (signed-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ash (ldb (byte size 0) -1) posn)))
      (logior (logand new mask)
@@ -2691,7 +2691,7 @@
   (let ((size (lvar-type size)))
     (if (numeric-type-p size)
         (let ((size-high (numeric-type-high size)))
-          (if (and size-high (<= 1 size-high sb!vm:n-word-bits))
+          (if (and size-high (<= 1 size-high sb-vm:n-word-bits))
               (specifier-type `(signed-byte ,size-high))
               *universal-type*))
         *universal-type*)))
@@ -2699,15 +2699,15 @@
 ;;; Rightward ASH
 
 ;;; Assert correctness of build order. (Need not be exhaustive)
-#!-(vop-translates sb!kernel:%ash/right)
-(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %ASH/RIGHT vop"))
+#-(vop-translates sb-kernel:%ash/right)
+(eval-when (:compile-toplevel) #+x86-64 (error "Expected %ASH/RIGHT vop"))
 
-#!+(vop-translates sb!kernel:%ash/right)
+#+(vop-translates sb-kernel:%ash/right)
 (progn
   (defun %ash/right (integer amount)
     (ash integer (- amount)))
 
-  (deftransform ash ((integer amount) (sb!vm:signed-word (integer * 0)) *
+  (deftransform ash ((integer amount) (sb-vm:signed-word (integer * 0)) *
                      :important nil)
     "Convert ASH of signed word to %ASH/RIGHT"
     (when (constant-lvar-p amount)
@@ -2718,12 +2718,12 @@
              (splice-fun-args amount '%negate 1)
              `(lambda (integer amount)
                 (declare (type unsigned-byte amount))
-                (%ash/right integer (if (>= amount ,sb!vm:n-word-bits)
-                                        ,(1- sb!vm:n-word-bits)
+                (%ash/right integer (if (>= amount ,sb-vm:n-word-bits)
+                                        ,(1- sb-vm:n-word-bits)
                                         amount))))
             (t
-             `(%ash/right integer (if (<= amount ,(- sb!vm:n-word-bits))
-                                      ,(1- sb!vm:n-word-bits)
+             `(%ash/right integer (if (<= amount ,(- sb-vm:n-word-bits))
+                                      ,(1- sb-vm:n-word-bits)
                                       (- amount)))))))
 
   (deftransform ash ((integer amount) (word (integer * 0)) *
@@ -2737,11 +2737,11 @@
              (splice-fun-args amount '%negate 1)
              `(lambda (integer amount)
                 (declare (type unsigned-byte amount))
-                (if (>= amount ,sb!vm:n-word-bits)
+                (if (>= amount ,sb-vm:n-word-bits)
                     0
                     (%ash/right integer amount))))
             (t
-             `(if (<= amount ,(- sb!vm:n-word-bits))
+             `(if (<= amount ,(- sb-vm:n-word-bits))
                   0
                   (%ash/right integer (- amount)))))))
 
@@ -2757,15 +2757,15 @@
             ((type= return-type (specifier-type '(eql -1)))
              -1)
             ((csubtypep return-type (specifier-type '(member -1 0)))
-             `(ash integer ,(- sb!vm:n-word-bits)))
+             `(ash integer ,(- sb-vm:n-word-bits)))
             (t
              (give-up-ir1-transform)))))
 
   (defun %ash/right-derive-type-aux (n-type shift same-arg)
     (declare (ignore same-arg))
-    (or (and (or (csubtypep n-type (specifier-type 'sb!vm:signed-word))
+    (or (and (or (csubtypep n-type (specifier-type 'sb-vm:signed-word))
                  (csubtypep n-type (specifier-type 'word)))
-             (csubtypep shift (specifier-type `(mod ,sb!vm:n-word-bits)))
+             (csubtypep shift (specifier-type `(mod ,sb-vm:n-word-bits)))
              (let ((n-low (numeric-type-low n-type))
                    (n-high (numeric-type-high n-type))
                    (s-low (numeric-type-low shift))
@@ -2846,7 +2846,7 @@
     (labels ((reoptimize-node (node name)
                (setf (node-derived-type node)
                      (fun-type-returns
-                      (proclaimed-ftype name)))
+                      (global-ftype name)))
                (setf (lvar-%derived-type (node-lvar node)) nil)
                (setf (node-reoptimize node) t)
                (setf (block-reoptimize (node-block node)) t)
@@ -3120,22 +3120,22 @@
     (give-up-ir1-transform "BOOLE code is not a constant."))
   (let ((control (lvar-value op)))
     (case control
-      (#.sb!xc:boole-clr 0)
-      (#.sb!xc:boole-set -1)
-      (#.sb!xc:boole-1 'x)
-      (#.sb!xc:boole-2 'y)
-      (#.sb!xc:boole-c1 '(lognot x))
-      (#.sb!xc:boole-c2 '(lognot y))
-      (#.sb!xc:boole-and '(logand x y))
-      (#.sb!xc:boole-ior '(logior x y))
-      (#.sb!xc:boole-xor '(logxor x y))
-      (#.sb!xc:boole-eqv '(logeqv x y))
-      (#.sb!xc:boole-nand '(lognand x y))
-      (#.sb!xc:boole-nor '(lognor x y))
-      (#.sb!xc:boole-andc1 '(logandc1 x y))
-      (#.sb!xc:boole-andc2 '(logandc2 x y))
-      (#.sb!xc:boole-orc1 '(logorc1 x y))
-      (#.sb!xc:boole-orc2 '(logorc2 x y))
+      (#.sb-xc:boole-clr 0)
+      (#.sb-xc:boole-set -1)
+      (#.sb-xc:boole-1 'x)
+      (#.sb-xc:boole-2 'y)
+      (#.sb-xc:boole-c1 '(lognot x))
+      (#.sb-xc:boole-c2 '(lognot y))
+      (#.sb-xc:boole-and '(logand x y))
+      (#.sb-xc:boole-ior '(logior x y))
+      (#.sb-xc:boole-xor '(logxor x y))
+      (#.sb-xc:boole-eqv '(logeqv x y))
+      (#.sb-xc:boole-nand '(lognand x y))
+      (#.sb-xc:boole-nor '(lognor x y))
+      (#.sb-xc:boole-andc1 '(logandc1 x y))
+      (#.sb-xc:boole-andc2 '(logandc2 x y))
+      (#.sb-xc:boole-orc1 '(logorc1 x y))
+      (#.sb-xc:boole-orc2 '(logorc2 x y))
       (t
        (abort-ir1-transform "~S is an illegal control arg to BOOLE."
                             control)))))
@@ -3304,7 +3304,7 @@
            (choose-multiplier (y precision)
              (do* ((l (ld y))
                    (shift l (1- shift))
-                   (expt-2-n+l (expt 2 (+ sb!vm:n-word-bits l)))
+                   (expt-2-n+l (expt 2 (+ sb-vm:n-word-bits l)))
                    (m-low (truncate expt-2-n+l y) (ash m-low -1))
                    (m-high (truncate (+ expt-2-n+l
                                         (ash expt-2-n+l (- precision)))
@@ -3313,7 +3313,7 @@
                   ((not (and (< (ash m-low -1) (ash m-high -1))
                              (> shift 0)))
                    (values m-high shift)))))
-    (let ((n (expt 2 sb!vm:n-word-bits))
+    (let ((n (expt 2 sb-vm:n-word-bits))
           (precision (integer-length max-x))
           (shift1 0))
       (multiple-value-bind (m shift2)
@@ -3341,12 +3341,12 @@
                `(ash (%multiply-high (logandc2 x ,(1- (ash 1 shift1))) ,m)
                      ,(- (+ shift1 shift2)))))))))
 
-#!-(vop-translates sb!kernel:%multiply-high)
+#-(vop-translates sb-kernel:%multiply-high)
 (progn
 ;;; Assert correctness of build order. (Need not be exhaustive)
-(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %MULTIPLY-HIGH vop"))
+(eval-when (:compile-toplevel) #+x86-64 (error "Expected %MULTIPLY-HIGH vop"))
 (define-source-transform %multiply-high (x y)
-  `(values (sb!bignum:%multiply ,x ,y)))
+  `(values (sb-bignum:%multiply ,x ,y)))
 )
 
 ;;; If the divisor is constant and both args are positive and fit in a
@@ -3372,7 +3372,7 @@
     (when (zerop (logand y (1- y)))
       (give-up-ir1-transform))
     `(let* ((quot ,(gen-unsigned-div-by-constant-expr y max-x))
-            (rem (ldb (byte #.sb!vm:n-word-bits 0)
+            (rem (ldb (byte #.sb-vm:n-word-bits 0)
                       (- x (* quot ,y)))))
        (values quot rem))))
 
@@ -3522,7 +3522,7 @@
       ((csubtypep x (specifier-type 'double-float))
        (csubtypep y (specifier-type 'double-float))))))
 
-(def!type exact-number ()
+(sb-xc:deftype exact-number ()
   '(or rational (complex rational)))
 
 ;;; Fold (+ x 0).
@@ -3699,13 +3699,14 @@
       ((same-leaf-ref-p x y) t)
       ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
        nil)
-      #!+(vop-translates sb!kernel:%instance-ref-eq)
+      #+(vop-translates sb-kernel:%instance-ref-eq)
       ;; Reduce (eq (%instance-ref x i) Y) to 1 instruction
       ;; if possible, but do not defer the memory load unless doing
       ;; so can have no effect, i.e. Y is a constant or provably not
       ;; effectful. For now, just handle constant Y.
       ((and (constant-lvar-p y)
             (combination-p use)
+            (almost-immediately-used-p x use)
             (eql '%instance-ref (lvar-fun-name (combination-fun use)))
             (constant-lvar-p (setf arg (second (combination-args use))))
             (typep (lvar-value arg) '(unsigned-byte 16)))
@@ -3738,7 +3739,7 @@
   "convert to simpler equality predicate"
   (let ((x-type (lvar-type x))
         (y-type (lvar-type y))
-        #!+integer-eql-vop (int-type (specifier-type 'integer))
+        #+integer-eql-vop (int-type (specifier-type 'integer))
         (char-type (specifier-type 'character)))
     (cond
       ((same-leaf-ref-p x y) t)
@@ -3749,7 +3750,7 @@
        '(char= x y))
       ((or (eq-comparable-type-p x-type) (eq-comparable-type-p y-type))
        '(eq y x))
-      #!+integer-eql-vop
+      #+integer-eql-vop
       ((or (csubtypep x-type int-type) (csubtypep y-type int-type))
        '(%eql/integer x y))
       (t
@@ -3954,10 +3955,10 @@
                     (csubtypep y-type (specifier-type 'float)))
                (and (csubtypep x-type (specifier-type '(complex float)))
                     (csubtypep y-type (specifier-type '(complex float))))
-               #!+(vop-named sb!vm::=/complex-single-float)
+               #+(vop-named sb-vm::=/complex-single-float)
                (and (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
                     (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
-               #!+(vop-named sb!vm::=/complex-double-float)
+               #+(vop-named sb-vm::=/complex-double-float)
                (and (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
                     (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
            ;; They are both floats. Leave as = so that -0.0 is
@@ -3990,7 +3991,7 @@
 
 (flet ((maybe-invert (node op inverted x y)
          (cond
-           #!+(or x86-64 arm64) ;; have >=/<= VOPs
+           #+(or x86-64 arm64) ;; have >=/<= VOPs
            ((and (csubtypep (lvar-type x) (specifier-type 'float))
                  (csubtypep (lvar-type y) (specifier-type 'float)))
             (give-up-ir1-transform))
@@ -4218,7 +4219,7 @@
     (setf y (rational y))
     (if (and (csubtypep (lvar-type x)
                         (specifier-type 'integer))
-             (ratiop y))
+             (sb-xc:typep y 'ratio))
         nil
         `(= x ,y))))
 
@@ -4262,8 +4263,8 @@
                       (not-constants arg))
                     (:no-error (value)
                       ;; Some backends have no float traps
-                      (cond #!+(and (or arm arm64)
-                                    (not (host-feature sb-xc-host)))
+                      (cond #+(and (or arm arm64)
+                                    (not sb-xc-host))
                             ((or (and (floatp value)
                                       (or (float-infinity-p value)
                                           (float-nan-p value)))
@@ -4319,7 +4320,7 @@
   (source-transform-transitive 'logxor args 0 'integer))
 (define-source-transform logand (&rest args)
   (source-transform-transitive 'logand args -1 'integer))
-#!-(or arm arm64 hppa mips x86 x86-64) ; defined in compiler/target/arith.lisp
+#-(or arm arm64 hppa mips x86 x86-64) ; defined in compiler/target/arith.lisp
 (define-source-transform logeqv (&rest args)
   (source-transform-transitive 'logeqv args -1 'integer))
 (define-source-transform gcd (&rest args)
@@ -4549,17 +4550,17 @@
   (flet ((maybe-replace (control)
            (binding* ((string (lvar-value control))
                       ((symbols new-string)
-                       (sb!format::extract-user-fun-directives string)))
+                       (sb-format::extract-user-fun-directives string)))
              (when (or symbols (and new-string (string/= string new-string)))
                (change-ref-leaf
                 (lvar-use control)
                 (find-constant
                  (cond ((not symbols) new-string)
                        ((fasl-output-p *compile-object*)
-                        (sb!format::make-fmt-control-proxy new-string symbols))
+                        (sb-format::make-fmt-control-proxy new-string symbols))
                        #-sb-xc-host ; no such object as a FMT-CONTROL
                        (t
-                        (sb!format::make-fmt-control new-string symbols)))))))))
+                        (sb-format::make-fmt-control new-string symbols)))))))))
     (when (list-of-length-at-least-p combination-args (1+ arg-n))
       (let* ((args (nthcdr arg-n combination-args))
              (control (pop args)))
@@ -4568,9 +4569,9 @@
             (binding* ((string (lvar-value control))
                        (*compiler-error-context* node)
                        ((min max)
-                        (handler-case (sb!format:%compiler-walk-format-string
+                        (handler-case (sb-format:%compiler-walk-format-string
                                        string args)
-                          (sb!format:format-error (c)
+                          (sb-format:format-error (c)
                             (compiler-warn "~A" c)))
                         :exit-if-null)
                        (nargs (length args)))
@@ -4638,11 +4639,11 @@
 
 ;; Can these appear in the expansion of FORMATTER?
 #+sb-xc-host
-(dolist (fun '(sb!format::format-error
-               sb!format::format-error-at
-               sb!format::format-error-at*))
+(dolist (fun '(sb-format::format-error
+               sb-format::format-error-at
+               sb-format::format-error-at*))
   (setf (fun-info-optimizer (fun-info-or-lose fun))
-        (let ((arg-n (if (eq fun 'sb!format::format-error) 0 2))
+        (let ((arg-n (if (eq fun 'sb-format::format-error) 0 2))
               (fun fun))
           (lambda (node) (check-format-args node fun arg-n nil)))))
 
@@ -4669,10 +4670,10 @@
          ;; FIXME: instead of checking the condition report, define a
          ;; dedicated condition class
          (expr (handler-case ; in case %formatter wants to signal an error
-                   (sb!format::%formatter control argc nil)
+                   (sb-format::%formatter control argc nil)
                  ;; otherwise, let the macro complain
-                 (sb!format:format-error (c)
-                   (if (string= (sb!format::format-error-complaint c)
+                 (sb-format:format-error (c)
+                   (if (string= (sb-format::format-error-complaint c)
                                 "No package named ~S")
                        ;; "~/apackage:afun/" might become legal later.
                        ;; To put it in perspective, "~/f" (no closing slash)
@@ -4710,9 +4711,9 @@
    (loop for directive in control
          always
          (or (stringp directive)
-             (and (sb!format::format-directive-p directive)
-                  (let ((char (sb!format::directive-character directive))
-                        (params (sb!format::directive-params directive)))
+             (and (sb-format::format-directive-p directive)
+                  (let ((char (sb-format::directive-character directive))
+                        (params (sb-format::directive-params directive)))
                      (and (char= char #\A)
                           (null params)
                           (pop args))))))
@@ -4721,8 +4722,8 @@
 (deftransform format ((stream control &rest args) (null (constant-arg string) &rest string))
   (let ((tokenized
           (handler-case
-              (sb!format::tokenize-control-string (coerce (lvar-value control) 'simple-string))
-            (sb!format:format-error ()
+              (sb-format::tokenize-control-string (coerce (lvar-value control) 'simple-string))
+            (sb-format:format-error ()
               (give-up-ir1-transform)))))
     (unless (concatenate-format-p tokenized args)
       (give-up-ir1-transform))
@@ -4756,14 +4757,14 @@
       (when (and (stringp x) (stringp y))
         (multiple-value-bind (min1 max1)
             (handler-case
-                (sb!format:%compiler-walk-format-string x args)
-              (sb!format:format-error (c)
+                (sb-format:%compiler-walk-format-string x args)
+              (sb-format:format-error (c)
                 (compiler-warn "~A" c)))
           (when min1
             (multiple-value-bind (min2 max2)
                 (handler-case
-                    (sb!format:%compiler-walk-format-string y args)
-                  (sb!format:format-error (c)
+                    (sb-format:%compiler-walk-format-string y args)
+                  (sb-format:format-error (c)
                     (compiler-warn "~A" c)))
               (when min2
                 (let ((nargs (length args)))
@@ -4831,7 +4832,7 @@
                              (specifier-type '(complex single-float)))
                   (csubtypep result-typeoid
                              (specifier-type '(complex double-float)))
-                  #!+long-float
+                  #+long-float
                   (csubtypep result-typeoid
                              (specifier-type '(complex long-float))))
               ;; float complex types are never canonicalized.
@@ -4889,7 +4890,35 @@
                          *universal-type*))))
         (recurse array-type)))))
 
-(define-source-transform sb!impl::sort-vector (vector start end predicate key)
+(deftransform array-element-type ((array))
+  (let ((type (lvar-type array)))
+    (flet ((element-type (type)
+             (and (array-type-p type)
+                  (neq (array-type-specialized-element-type type) *wild-type*)
+                  (type-specifier (array-type-specialized-element-type type)))))
+      (cond ((let ((type (element-type type)))
+               (and type
+                    `',type)))
+            ((union-type-p type)
+             (let (result)
+               (loop for type in (union-type-types type)
+                     for et = (element-type type)
+                     unless (and et
+                                 (if result
+                                     (equal result et)
+                                     (setf result et)))
+                     do (give-up-ir1-transform))
+               `',result))
+            ((intersection-type-p type)
+             (loop for type in (intersection-type-types type)
+                   for et = (element-type type)
+                   when et
+                   return `',et
+                   finally (give-up-ir1-transform)))
+            (t
+             (give-up-ir1-transform))))))
+
+(define-source-transform sb-impl::sort-vector (vector start end predicate key)
   ;; Like CMU CL, we use HEAPSORT. However, other than that, this code
   ;; isn't really related to the CMU CL code, since instead of trying
   ;; to generalize the CMU CL code to allow START and END values, this
@@ -4935,7 +4964,7 @@
                        (start-1 (1- ,',start))
                        (current-heap-size (- ,',end ,',start))
                        (keyfun ,keyfun))
-                   (declare (type (integer -1 #.(1- sb!xc:most-positive-fixnum))
+                   (declare (type (integer -1 #.(1- sb-xc:most-positive-fixnum))
                                   start-1))
                    (declare (type index current-heap-size))
                    (declare (type function keyfun))
@@ -4966,7 +4995,7 @@
 
 (deftransform sort ((list predicate &key key)
                     (list * &rest t) *)
-  `(sb!impl::stable-sort-list list
+  `(sb-impl::stable-sort-list list
                               (%coerce-callable-to-fun predicate)
                               (if key (%coerce-callable-to-fun key) #'identity)))
 
@@ -4974,15 +5003,15 @@
                            ((or vector list) *))
   (let ((sequence-type (lvar-type sequence)))
     (cond ((csubtypep sequence-type (specifier-type 'list))
-           `(sb!impl::stable-sort-list sequence
+           `(sb-impl::stable-sort-list sequence
                                        (%coerce-callable-to-fun predicate)
                                        (if key (%coerce-callable-to-fun key) #'identity)))
           ((csubtypep sequence-type (specifier-type 'simple-vector))
-           `(sb!impl::stable-sort-simple-vector sequence
+           `(sb-impl::stable-sort-simple-vector sequence
                                                 (%coerce-callable-to-fun predicate)
                                                 (and key (%coerce-callable-to-fun key))))
           (t
-           `(sb!impl::stable-sort-vector sequence
+           `(sb-impl::stable-sort-vector sequence
                                          (%coerce-callable-to-fun predicate)
                                          (and key (%coerce-callable-to-fun key)))))))
 
@@ -5003,7 +5032,7 @@
 ;;;         `(integer ,(- bound) ,(1- bound)))))
 ;;; (The DEFTRANSFORM doesn't do anything but report at compile time,
 ;;; and the function doesn't do anything at all.)
-#!+sb-show
+#+sb-show
 (progn
   (defknown /report-lvar (t t) null)
   (deftransform /report-lvar ((x message) (t t))
@@ -5024,24 +5053,24 @@
     (constant-fold-call node)
     t))
 
-#!-(and win32 (not sb-thread))
+#-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((integer 0 #.(expt 10 8))))
-  `(if sb!impl::*deadline*
+  `(if sb-impl::*deadline*
        (locally (declare (notinline sleep)) (sleep seconds))
-       (sb!unix:nanosleep seconds 0)))
+       (sb-unix:nanosleep seconds 0)))
 
-#!-(and win32 (not sb-thread))
+#-(and win32 (not sb-thread))
 (deftransform sleep ((seconds)
                      ((constant-arg (and (real 0)
                                          (not (satisfies float-infinity-p))))))
   (let ((seconds-value (lvar-value seconds)))
     (multiple-value-bind (seconds nano)
-        (sb!impl::split-seconds-for-sleep seconds-value)
+        (sb-impl::split-seconds-for-sleep seconds-value)
       (if (> seconds (expt 10 8))
           (give-up-ir1-transform)
-          `(if sb!impl::*deadline*
+          `(if sb-impl::*deadline*
                (locally (declare (notinline sleep)) (sleep seconds))
-               (sb!unix:nanosleep ,seconds ,nano))))))
+               (sb-unix:nanosleep ,seconds ,nano))))))
 
 ;; On 64-bit architectures the TLS index is in the symbol header,
 ;; !DEFINE-PRIMITIVE-OBJECT doesn't define an accessor for it.
@@ -5050,13 +5079,13 @@
 ;; in Lisp like a fixnum that is off by a factor of (EXPT 2 N-FIXNUM-TAG-BITS).
 ;; We're reading with a raw SAP accessor, so must make it look equally "off".
 ;; Also we don't get the defknown automatically.
-#!+(and 64-bit sb-thread)
+#+(and 64-bit sb-thread)
 (defknown symbol-tls-index (t) fixnum (flushable))
-#!+(and 64-bit sb-thread)
+#+(and 64-bit sb-thread)
 (define-source-transform symbol-tls-index (sym)
   `(ash (sap-ref-32 (int-sap (get-lisp-obj-address (the symbol ,sym)))
-                    (- 4 sb!vm:other-pointer-lowtag))
-        (- sb!vm:n-fixnum-tag-bits)))
+                    (- 4 sb-vm:other-pointer-lowtag))
+        (- sb-vm:n-fixnum-tag-bits)))
 
 (deftransform make-string-output-stream ((&key element-type))
   (let ((element-type (cond ((not element-type)
@@ -5067,11 +5096,11 @@
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
-       `(sb!impl::%make-string-output-stream
+       `(sb-impl::%make-string-output-stream
          ',element-type
          (function ,(case element-type
-                      (base-char 'sb!impl::string-ouch/base-char)
-                      (t 'sb!impl::string-ouch))))
+                      (base-char 'sb-impl::string-ouch/base-char)
+                      (t 'sb-impl::string-ouch))))
        (give-up-ir1-transform))))
 
 (flet ((xform (symbol match-kind fallback)
@@ -5116,7 +5145,7 @@
         symbol
         (give-up-ir1-transform))))
 
-(deftransform boundp ((symbol) ((constant-arg symbol)))
+(deftransform boundp ((symbol) ((constant-arg symbol)) * :policy (< safety 3))
   (if (always-boundp (lvar-value symbol))
       t
       (give-up-ir1-transform)))

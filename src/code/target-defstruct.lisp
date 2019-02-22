@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (/show0 "target-defstruct.lisp 12")
 
@@ -22,7 +22,7 @@
 
 ;;; Normally IR2 converted, definition needed for interpreted structure
 ;;; constructors only.
-#!+(or sb-eval sb-fasteval)
+#+(or sb-eval sb-fasteval)
 (defun %make-structure-instance (dd slot-specs &rest slot-values)
   (let ((instance (%make-instance (dd-length dd))) ; length = sans header word
         (value-index 0))
@@ -32,7 +32,7 @@
       (destructuring-bind (kind raw-type . index) spec
         (if (eq kind :unbound)
             (setf (%instance-ref instance index)
-                  (sb!sys:%primitive make-unbound-marker))
+                  (sb-sys:%primitive make-unbound-marker))
             (macrolet ((make-case ()
                            `(ecase raw-type
                               ((t)
@@ -60,9 +60,6 @@
 (defun %target-defstruct (dd)
   (declare (type defstruct-description dd))
 
-  #!+(and sb-show (host-feature sb-xc))
-  (progn (write `(%target-defstruct ,(dd-name dd))) (terpri))
-
   (when (dd-doc dd)
     (setf (documentation (dd-name dd) 'structure)
           (dd-doc dd)))
@@ -88,12 +85,12 @@
               (let ((comparators
                      ;; If data-start is 1, subtract 1 because we don't need
                      ;; a comparator for the LAYOUT slot.
-                     (make-array (- (dd-length dd) sb!vm:instance-data-start)
+                     (make-array (- (dd-length dd) sb-vm:instance-data-start)
                                  :initial-element nil)))
                 (dolist (slot (dd-slots dd) comparators)
                   ;; -1 because LAYOUT (slot index 0) has no comparator stored.
                   (setf (aref comparators
-                              (- (dsd-index slot) sb!vm:instance-data-start))
+                              (- (dsd-index slot) sb-vm:instance-data-start))
                         (let ((rsd (dsd-raw-slot-data slot)))
                           (if (not rsd)
                               0 ; means recurse using EQUALP
@@ -102,7 +99,7 @@
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
 
-  (values))
+  (dd-name dd))
 
 ;;; Copy any old kind of structure.
 (defun copy-structure (structure)
@@ -126,7 +123,7 @@
         ;; On backends which don't segregate descriptor vs. non-descriptor
         ;; registers, we could speed up this code in an obvious way.
         (macrolet ((copy-loop (tagged-p &optional step)
-                     `(do ((i sb!vm:instance-data-start (1+ i)))
+                     `(do ((i sb-vm:instance-data-start (1+ i)))
                           ((>= i len))
                         (declare (index i))
                         (if ,tagged-p
@@ -184,7 +181,7 @@
     (prin1 name stream)
     (do ((index 0 (1+ index))
          (limit (or (and (not *print-readably*) *print-length*)
-                    most-positive-fixnum))
+                    sb-xc:most-positive-fixnum))
          (remaining-slots (dd-slots dd) (cdr remaining-slots)))
         ((or (null remaining-slots) (>= index limit))
          (write-string (if remaining-slots " ...)" ")") stream))
@@ -244,9 +241,8 @@
          (truly-the
           word
           (+ (get-lisp-obj-address instance)
-             ,(+ (- sb!vm:instance-pointer-lowtag)
-                 (* (+ sb!vm:instance-slots-offset index)
-                    sb!vm:n-word-bytes))))))))
-
+             ,(+ (- sb-vm:instance-pointer-lowtag)
+                 (* (+ sb-vm:instance-slots-offset index)
+                    sb-vm:n-word-bytes))))))))
 
 (/show0 "target-defstruct.lisp end of file")

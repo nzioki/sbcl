@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun zeroize (tn)
   (inst xor :dword tn tn))
@@ -84,7 +84,7 @@
      (cond ((and (numberp val) (zerop val)) (zeroize target))
            (t (inst mov target val))))
     ;; Likewise if the value is small enough.
-    ((typep val '(or (signed-byte 32) #!+immobile-space fixup))
+    ((typep val '(or (signed-byte 32) #+immobile-space fixup))
      ;; This logic is similar to that of STOREW*.
      ;; It would be nice to pull it all together in one place.
      ;; The basic idea is that storing any byte-aligned 8-bit value
@@ -95,8 +95,11 @@
                      (typecase val
                        ((unsigned-byte 8) :byte)
                        ((unsigned-byte 16) :word)
+                       ;; fixups can be :dword size because we don't reference
+                       ;; objects that require a 64-bit address as immediate operands.
                        ;; signed-32 is no good, as it needs sign-extension.
-                       ((unsigned-byte 32) :dword)))
+                       ((or (unsigned-byte 32) fixup)
+                        :dword)))
                 :qword)))
        (inst mov operand-size target val)))
     ;; Otherwise go through the temporary register
@@ -166,7 +169,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst mov y (tn-value x)))
           (t
            (inst mov y x)
@@ -176,7 +179,7 @@
 
 
 ;;; Arg is a fixnum or bignum, figure out which and load if necessary.
-#-#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#-#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg) :target rax))
   (:results (y :scs (signed-reg unsigned-reg)))
@@ -197,7 +200,7 @@
     (move y rax)
     DONE))
 
-#+#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#+#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg) :target y))
   (:results (y :scs (signed-reg unsigned-reg)))
@@ -290,14 +293,14 @@
     #.(aver (= n-fixnum-tag-bits 1))
     (move y x)
     (inst shl y 1)
-    (inst cmov :o y (emit-constant (1+ sb!xc:most-positive-fixnum)))))
+    (inst cmov :o y (emit-constant (1+ sb-xc:most-positive-fixnum)))))
 
 (define-vop (move-from-fixnum-1 move-from-fixnum+1)
   (:generator 4
     #.(aver (= n-fixnum-tag-bits 1))
     (move y x)
     (inst shl y 1)
-    (inst cmov :o y (emit-constant (1- sb!xc:most-negative-fixnum)))))
+    (inst cmov :o y (emit-constant (1- sb-xc:most-negative-fixnum)))))
 
 ;;; Convert an untagged unsigned word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly

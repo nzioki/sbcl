@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; SBCL has no proper byte compiler (having ditched the rather
 ;;; ambitious and slightly flaky byte compiler inherited from CMU CL)
@@ -179,43 +179,38 @@
  ;; this is probably where you need to make it happen.
  #+sb-xc-host
  (defun fopcompilable-p (form &optional (expand t))
-  (and expand
-       (or (and (self-evaluating-p form)
-                (constant-fopcompilable-p form))
-           (and (listp form)
-                (let ((function (car form)))
-                  ;; It is assumed that uses of recognized functions are
-                  ;; carefully controlled, and recursion on fopcompilable-p
-                  ;; would say "yes".
-                  (or (member function '(sb!impl::%defun
-                                         sb!pcl::!trivial-defmethod
-                                         sb!kernel::%defstruct))
-                      (and (eq function 'sb!c::%defconstant)
-                           ;; %DEFCONSTANT is fopcompilable only if the value
-                           ;; is trivially a compile-time constant,
-                           ;; and not, e.g. (COMPLICATED-FOLDABLE-EXPR),
-                           ;; because we can't compute that with fasl ops.
-                           (let ((val (third form)))
-                             (and (typep val '(or rational (cons (eql quote))))
-                                  (constant-fopcompilable-p
-                                   (constant-form-value val)))))
-                      (and (symbolp function) ; no ((lambda ...) ...)
-                           (get-properties (symbol-plist function)
-                                           '(:sb-cold-funcall-handler/for-effect
-                                             :sb-cold-funcall-handler/for-value)))
-                      (and (eq function 'setf)
-                           (fopcompilable-p (%macroexpand form *lexenv*)))
-                      (and (eq function 'sb!kernel:%svset)
-                           (destructuring-bind (thing index value) (cdr form)
-                             (and (symbolp thing)
-                                  (integerp index)
-                                  (eq (info :variable :kind thing) :global)
-                                  (typep value '(cons (member lambda function
-                                                       named-lambda))))))
-                      (and (eq function 'setq)
-                           (setq-fopcompilable-p (cdr form)))
-
-                      (eq function 'sb!fasl::setq-no-questions-asked))))))))
+   (declare (ignore expand))
+   (or (and (self-evaluating-p form)
+            (constant-fopcompilable-p form))
+       (and (typep form '(cons (eql quote) (cons t null)))
+            (constant-fopcompilable-p (constant-form-value form)))
+       (and (listp form)
+            (let ((function (car form)))
+              ;; It is assumed that uses of these three recognized functions
+              ;; are carefully controlled, and recursion on fopcompilable-p
+              ;; would say "yes" for each argument.
+              (or (member function '(sb-impl::%defun
+                                     sb-pcl::!trivial-defmethod
+                                     sb-kernel::%defstruct))
+                  ;; allow DEF{CONSTANT,PARAMETER} only if the value form is ok
+                  (and (member function '(%defconstant sb-impl::%defparameter))
+                       (fopcompilable-p (third form)))
+                  (and (symbolp function) ; no ((lambda ...) ...)
+                       (get-properties (symbol-plist function)
+                                       '(:sb-cold-funcall-handler/for-effect
+                                         :sb-cold-funcall-handler/for-value)))
+                  (and (eq function 'setf)
+                       (fopcompilable-p (%macroexpand form *lexenv*)))
+                  (and (eq function 'sb-kernel:%svset)
+                       (destructuring-bind (thing index value) (cdr form)
+                         (and (symbolp thing)
+                              (integerp index)
+                              (eq (info :variable :kind thing) :global)
+                              (typep value
+                                     '(cons (member lambda function named-lambda))))))
+                  (and (eq function 'setq)
+                       (setq-fopcompilable-p (cdr form))))))))
+) ; end FLET
 
 (defun let-fopcompilable-p (operator args)
   (when (>= (length args) 1)
@@ -257,6 +252,7 @@
 ;;; Check that a literal form is fopcompilable. It would not be, for example,
 ;;; when the form contains structures with funny MAKE-LOAD-FORMS.
 (defun constant-fopcompilable-p (constant)
+  (declare (optimize (debug 1))) ;; TCO
   (let ((xset (alloc-xset)))
     (labels ((grovel (value)
                ;; Unless VALUE is an object which which obviously
@@ -293,7 +289,7 @@
                       (grovel (row-major-aref value i))))
                    (instance
                     (case (%make-load-form value)
-                      (sb!fasl::fop-struct
+                      (sb-fasl::fop-struct
                          ;; FIXME: Why is this needed? If the constant
                          ;; is deemed fopcompilable, then when we dump
                          ;; it we bind *dump-only-valid-structures* to
@@ -351,7 +347,7 @@
                          (cond (handle
                                 (setf (lambda-var-ever-used lambda-var) t)
                                 (when for-value-p
-                                  (sb!fasl::dump-push handle fasl)))
+                                  (sb-fasl::dump-push handle fasl)))
                                (t
                                 ;; Undefined variable. Signal a warning, and
                                 ;; treat it as a special variable reference, like
@@ -383,7 +379,7 @@
                       ;; the function handle on the FOP stack.
                       ((function)
                        (fopcompile-function fasl (second form) path for-value-p))
-                      ;; KLUDGE! SB!C:SOURCE-LOCATION calls are normally handled
+                      ;; KLUDGE! SB-C:SOURCE-LOCATION calls are normally handled
                       ;; by a compiler-macro. But if SPACE > DEBUG we choose not
                       ;; to record locations, which is strange because the main
                       ;; compiler does not have similar logic afaict.
@@ -405,7 +401,7 @@
                            (loop for (arg . next) on args
                              do (fopcompile arg path
                                             (if next nil for-value-p)))))
-                      ((setq #+sb-xc-host sb!fasl::setq-no-questions-asked)
+                      ((setq #+sb-xc-host sb-fasl::setq-no-questions-asked)
                        (if (and for-value-p (endp args))
                            (fopcompile nil path t)
                            (loop for (name value . next) on args by #'cddr
@@ -433,7 +429,7 @@
                                                    orig-lexenv
                                                    *lexenv*)))
                                  (fopcompile value path t))
-                               (let* ((obj (sb!fasl::dump-pop fasl))
+                               (let* ((obj (sb-fasl::dump-pop fasl))
                                       (var (make-lambda-var
                                             :%source-name name
                                             :fop-value obj)))
@@ -469,7 +465,7 @@
                                (= 1 (length args))
                                for-value-p)
                           (fopcompile (first args) path t)
-                          (dump-fop 'sb!fasl::fop-package fasl))
+                          (dump-fop 'sb-fasl::fop-package fasl))
                          (t
                           (when (eq (info :function :where-from operator) :assumed)
                             (note-undefined-reference operator :function))
@@ -477,15 +473,15 @@
                           (dolist (arg args)
                             (fopcompile arg path t))
                           (if for-value-p
-                              (dump-fop 'sb!fasl::fop-funcall fasl)
-                              (dump-fop 'sb!fasl::fop-funcall-for-effect fasl))
+                              (dump-fop 'sb-fasl::fop-funcall fasl)
+                              (dump-fop 'sb-fasl::fop-funcall-for-effect fasl))
                           (let ((n-args (length args)))
                             ;; stub: FOP-FUNCALL isn't going to be usable
                             ;; to compile more than this, since its count
                             ;; is a single byte. Maybe we should just punt
                             ;; to the ordinary compiler in that case?
                             (aver (<= n-args 255))
-                            (sb!fasl::dump-byte n-args fasl))))))))))
+                            (sb-fasl::dump-byte n-args fasl))))))))))
            (t
             (bug "looks unFOPCOMPILEable: ~S" form))))))
 
@@ -494,7 +490,7 @@
           ;; Lambda forms are compiled with the real compiler
          (let ((handle (%compile form fasl :path path)))
            (when for-value-p
-             (sb!fasl::dump-push handle fasl))))
+             (sb-fasl::dump-push handle fasl))))
           ;; While function names are translated to a call to FDEFINITION.
         ((legal-fun-name-p form)
          (fopcompile `(fdefinition ',form) path for-value-p))
@@ -506,10 +502,10 @@
       args
     (let ((else-label (incf *fopcompile-label-counter*))
           (end-label (incf *fopcompile-label-counter*)))
-      (sb!fasl::dump-integer else-label fasl)
+      (sb-fasl::dump-integer else-label fasl)
       (fopcompile condition path t)
       ;; If condition was false, skip to the ELSE
-      (dump-fop 'sb!fasl::fop-skip-if-false fasl)
+      (dump-fop 'sb-fasl::fop-skip-if-false fasl)
       (fopcompile then path for-value-p)
       ;; The THEN branch will have produced a value even if we were
       ;; currently skipping to the ELSE branch (or over this whole
@@ -518,25 +514,25 @@
       ;; executed even when skipping over code. But this particular
       ;; value will be bogus, so we drop it.
       (when for-value-p
-        (dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
+        (dump-fop 'sb-fasl::fop-drop-if-skipping fasl))
       ;; Now skip to the END
-      (sb!fasl::dump-integer end-label fasl)
-      (dump-fop 'sb!fasl::fop-skip fasl)
+      (sb-fasl::dump-integer end-label fasl)
+      (dump-fop 'sb-fasl::fop-skip fasl)
       ;; Start of the ELSE branch
-      (sb!fasl::dump-integer else-label fasl)
-      (dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
+      (sb-fasl::dump-integer else-label fasl)
+      (dump-fop 'sb-fasl::fop-maybe-stop-skipping fasl)
       (fopcompile else path for-value-p)
       ;; As before
       (when for-value-p
-        (dump-fop 'sb!fasl::fop-drop-if-skipping fasl))
+        (dump-fop 'sb-fasl::fop-drop-if-skipping fasl))
       ;; End of IF
-      (sb!fasl::dump-integer end-label fasl)
-      (dump-fop 'sb!fasl::fop-maybe-stop-skipping fasl)
+      (sb-fasl::dump-integer end-label fasl)
+      (dump-fop 'sb-fasl::fop-maybe-stop-skipping fasl)
       ;; If we're still skipping, we must've triggered both of the
       ;; drop-if-skipping fops. To keep the stack balanced, push a
       ;; dummy value if needed.
       (when for-value-p
-        (dump-fop 'sb!fasl::fop-push-nil-if-skipping fasl)))))
+        (dump-fop 'sb-fasl::fop-push-nil-if-skipping fasl)))))
 
 (defun fopcompile-constant (fasl form for-value-p)
   (when for-value-p
@@ -544,5 +540,5 @@
     ;; structures: CONSTANT-FOPCOMPILABLE-P validates the structure
     ;; about to be dumped, not its load-form. Compare and contrast
     ;; with EMIT-MAKE-LOAD-FORM.
-    (let ((sb!fasl::*dump-only-valid-structures* nil))
+    (let ((sb-fasl::*dump-only-valid-structures* nil))
       (dump-object form fasl))))

@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; Unix pathname host support
 
@@ -267,18 +267,18 @@
 ;;;; Grabbing the kind of file when we have a namestring.
 (defun native-file-kind (namestring)
   (multiple-value-bind (existsp errno ino mode)
-      #!-win32
-      (sb!unix:unix-lstat namestring)
-      #!+win32
-      (sb!unix:unix-stat namestring)
+      #-win32
+      (sb-unix:unix-lstat namestring)
+      #+win32
+      (sb-unix:unix-stat namestring)
     (declare (ignore errno ino))
     (when existsp
-      (let ((ifmt (logand mode sb!unix:s-ifmt)))
+      (let ((ifmt (logand mode sb-unix:s-ifmt)))
        (case ifmt
-         (#.sb!unix:s-ifreg :file)
-         (#.sb!unix:s-ifdir :directory)
-         #!-win32
-         (#.sb!unix:s-iflnk :symlink)
+         (#.sb-unix:s-ifreg :file)
+         (#.sb-unix:s-ifdir :directory)
+         #-win32
+         (#.sb-unix:s-iflnk :symlink)
          (t :special))))))
 
 ;;;; TRUENAME, PROBE-FILE, FILE-AUTHOR, FILE-WRITE-DATE.
@@ -318,23 +318,32 @@
 ;;; logical pathnames, too (but never returns LPNs).  For internal
 ;;; use.
 (defun query-file-system (pathspec query-for &optional (errorp t))
-  (let ((pathname (translate-logical-pathname
-                   (merge-pathnames
-                    (pathname pathspec)
-                    (sane-default-pathname-defaults)))))
-    (when (wild-pathname-p pathname)
-      (simple-file-perror
-       "Can't find the ~*~A~2:* of wild pathname ~A~* (physicalized from ~A)."
-       pathname nil query-for pathspec))
-    (%query-file-system pathname query-for errorp)))
+  (block nil
+    (tagbody
+     retry
+       (restart-case
+           (let ((pathname (translate-logical-pathname
+                            (merge-pathnames
+                             (pathname pathspec)
+                             (sane-default-pathname-defaults)))))
+             (when (wild-pathname-p pathname)
+               (simple-file-perror
+                "Can't find the ~*~A~2:* of wild pathname ~A~* (physicalized from ~A)."
+                pathname nil query-for pathspec))
+             (return (%query-file-system pathname query-for errorp)))
+         (use-value (value)
+           :report "Specify a different path."
+           :interactive read-evaluated-form
+           (setf pathspec value)
+           (go retry))))))
 
-#!+win32
+#+win32
 (defun %query-file-system (pathname query-for errorp)
   (let ((filename (native-namestring pathname :as-file t)))
     (case query-for
       ((:existence :truename)
        (multiple-value-bind (file kind)
-           (sb!win32::native-probe-file-name filename)
+           (sb-win32::native-probe-file-name filename)
          (when (and (not file) kind)
            (setf file filename))
          ;; The following OR was an AND, but that breaks files like NUL,
@@ -350,16 +359,16 @@
            (errorp
             (simple-file-perror
              "Failed to find the ~*~A~2:* of ~A"
-             filename (sb!win32:get-last-error) query-for)))))
+             filename (sb-win32:get-last-error) query-for)))))
       (:write-date
        (cond
-         ((sb!win32::native-file-write-date filename))
+         ((sb-win32::native-file-write-date filename))
          (errorp
           (simple-file-perror
            "Failed to find the ~*~A~2:* of ~A"
-           filename (sb!win32:get-last-error) query-for)))))))
+           filename (sb-win32:get-last-error) query-for)))))))
 
-#!-win32
+#-win32
 (defun %query-file-system (pathname query-for errorp)
   (labels ((parse (filename &key as-directory)
              (values (parse-native-namestring
@@ -384,7 +393,7 @@
              ;; *DEFAULT-PATHNAME-DEFAULTS*, since PATHNAME may be a
              ;; relative pathname.
              (multiple-value-bind (realpath errno)
-                 (sb!unix:unix-realpath
+                 (sb-unix:unix-realpath
                   (native-namestring
                    (make-pathname
                     :name :unspecific
@@ -408,11 +417,11 @@
              ;; pipes or sockets on Linux
              (multiple-value-bind (linkp ignore ino mode nlink uid gid rdev
                                          size atime mtime)
-                 (sb!unix:unix-lstat filename)
+                 (sb-unix:unix-lstat filename)
                (declare (ignore ignore ino mode nlink gid rdev size atime))
                (cond
-                 ((and (or (= errno sb!unix:enoent)
-                           (= errno sb!unix:eloop)
+                 ((and (or (= errno sb-unix:enoent)
+                           (= errno sb-unix:eloop)
                            realpath-failed)
                        linkp)
                   (case query-for
@@ -428,7 +437,7 @@
                           (if (directory-pathname-p pathname)
                               (parse (car (last (pathname-directory pathname))))
                               pathname)))))
-                    (:author (sb!unix:uid-username uid))
+                    (:author (sb-unix:uid-username uid))
                     (:write-date (+ unix-to-universal-time mtime))))
                  ;; The file doesn't exist; maybe error.
                  (errorp
@@ -436,21 +445,21 @@
                                       pathname errno query-for))))))
     (binding* ((filename (native-namestring pathname :as-file t))
                ((existsp errno nil mode nil uid nil nil nil nil mtime)
-                (sb!unix:unix-stat filename)))
+                (sb-unix:unix-stat filename)))
       (if existsp
           (case query-for
             (:existence
-             (parse filename :as-directory (eql (logand mode sb!unix:s-ifmt)
-                                                sb!unix:s-ifdir)))
+             (parse filename :as-directory (eql (logand mode sb-unix:s-ifmt)
+                                                sb-unix:s-ifdir)))
             (:truename
              ;; Note: in case the file is stat'able, POSIX
              ;; realpath(3) gets us a canonical absolute filename,
              ;; even if the post-merge PATHNAME is not absolute
-             (parse (or (sb!unix:unix-realpath filename)
+             (parse (or (sb-unix:unix-realpath filename)
                         (resolve-problematic-symlink filename errno t))
-                    :as-directory (eql (logand mode sb!unix:s-ifmt)
-                                       sb!unix:s-ifdir)))
-            (:author (sb!unix:uid-username uid))
+                    :as-directory (eql (logand mode sb-unix:s-ifmt)
+                                       sb-unix:s-ifdir)))
+            (:author (sb-unix:uid-username uid))
             (:write-date (+ unix-to-universal-time mtime)))
           (resolve-problematic-symlink filename errno nil)))))
 
@@ -511,7 +520,7 @@ file, then the associated file is renamed."
              :format-control "~S can't be created."
              :format-arguments (list new-name)))
     (multiple-value-bind (res error)
-        (sb!unix:unix-rename original-namestring new-namestring)
+        (sb-unix:unix-rename original-namestring new-namestring)
       (unless res
         (error 'simple-file-error
                :pathname new-name
@@ -532,15 +541,16 @@ per standard Unix unlink() behaviour."
   (let* ((pathname (translate-logical-pathname
                     (merge-pathnames file (sane-default-pathname-defaults))))
          (namestring (native-namestring pathname :as-file t)))
-    #!+win32
+    #+win32
     (when (streamp file)
       (close file))
     (multiple-value-bind (res err)
-        #!-win32 (sb!unix:unix-unlink namestring)
-        #!+win32 (or (sb!win32::native-delete-file namestring)
-                     (values nil (sb!win32:get-last-error)))
+        #-win32 (sb-unix:unix-unlink namestring)
+        #+win32 (or (sb-win32::native-delete-file namestring)
+                     (values nil (sb-win32:get-last-error)))
         (unless res
-          (simple-file-perror "couldn't delete ~A" namestring err))))
+          (with-simple-restart (continue "Return T")
+            (file-perror 'delete-file-error "Couldn't delete ~A" namestring err)))))
   t)
 
 (defun directorize-pathname (pathname)
@@ -603,10 +613,10 @@ exist or if is a file or a symbolic link."
            (delete-dir (dir)
              (let ((namestring (native-namestring dir :as-file t)))
                (multiple-value-bind (res errno)
-                 #!+win32
-                 (or (sb!win32::native-delete-directory namestring)
-                     (values nil (sb!win32:get-last-error)))
-                 #!-win32
+                 #+win32
+                 (or (sb-win32::native-delete-directory namestring)
+                     (values nil (sb-win32:get-last-error)))
+                 #-win32
                  (values
                   (not (minusp (alien-funcall
                                 (extern-alien "rmdir"
@@ -627,7 +637,7 @@ exist or if is a file or a symbolic link."
           (delete-dir physical)))))
 
 
-(sb!alien:define-alien-variable ("sbcl_home" *sbcl-home*) c-string)
+(sb-alien:define-alien-variable ("sbcl_home" *sbcl-home*) c-string)
 
 (defun sbcl-homedir-pathname ()
   (let ((env (posix-getenv "SBCL_HOME")))
@@ -645,15 +655,15 @@ exist or if is a file or a symbolic link."
        (lose (&optional username)
          (error "Couldn't find home directory~@[ for ~S~]." username)))
 
-  #!-win32
+  #-win32
   (defun user-homedir-namestring (&optional username)
     (if username
-        (sb!unix:user-homedir username)
+        (sb-unix:user-homedir username)
         (or (not-empty (posix-getenv "HOME"))
-            (not-empty (sb!unix:uid-homedir (sb!unix:unix-getuid)))
+            (not-empty (sb-unix:uid-homedir (sb-unix:unix-getuid)))
             (lose))))
 
-  #!+win32
+  #+win32
   (defun user-homedir-namestring (&optional username)
     (if username
         (lose username)
@@ -675,8 +685,8 @@ system. HOST argument is ignored by SBCL."
   (values
    (parse-native-namestring
     (or (user-homedir-namestring)
-        #!+win32
-        (sb!win32::get-folder-namestring sb!win32::csidl_profile))
+        #+win32
+        (sb-win32::get-folder-namestring sb-win32::csidl_profile))
     *physical-host*
     *default-pathname-defaults*
     :as-directory t)))
@@ -814,10 +824,10 @@ filenames."
             (macrolet ((,iterator ()
                          `(funcall ,',one-iter)))
               ,@body)))
-       #!+win32
-       (sb!win32::native-call-with-directory-iterator
+       #+win32
+       (sb-win32::native-call-with-directory-iterator
         #'iterate ,namestring ,errorp)
-       #!-win32
+       #-win32
        (call-with-native-directory-iterator #'iterate ,namestring ,errorp))))
 
 (defun call-with-native-directory-iterator (function namestring errorp)
@@ -829,9 +839,9 @@ filenames."
           ((one-iter ()
              (tagbody
               :next
-                (let ((ent (sb!unix:unix-readdir dp nil)))
+                (let ((ent (sb-unix:unix-readdir dp nil)))
                   (when ent
-                    (let ((name (sb!unix:unix-dirent-name ent)))
+                    (let ((name (sb-unix:unix-dirent-name ent)))
                       (when name
                         (cond ((equal "." name)
                                (go :next))
@@ -841,11 +851,11 @@ filenames."
                                (return-from one-iter name))))))))))
         (unwind-protect
              (progn
-               (setf dp (sb!unix:unix-opendir namestring errorp))
+               (setf dp (sb-unix:unix-opendir namestring errorp))
                (when dp
                  (funcall function #'one-iter)))
           (when dp
-            (sb!unix:unix-closedir dp nil)))))))
+            (sb-unix:unix-closedir dp nil)))))))
 
 ;;; This is our core directory access interface that we use to implement
 ;;; DIRECTORY.
@@ -1247,7 +1257,7 @@ Experimental: interface subject to change."
                     (format *standard-output*
                             "~&creating directory: ~A~%"
                             namestring))
-                  (sb!unix:unix-mkdir namestring mode)
+                  (sb-unix:unix-mkdir namestring mode)
                   (unless (directory-pathname-p (probe-file newpath))
                     (restart-case
                         (error
@@ -1264,11 +1274,7 @@ Experimental: interface subject to change."
                         :report "Retry directory creation."
                         (ensure-directories-exist
                          pathspec
-                         :verbose verbose :mode mode))
-                      (continue ()
-                        :report
-                        "Continue as if directory creation was successful."
-                        nil)))
+                         :verbose verbose :mode mode))))
                   (setf created-p t)))))
       (values pathspec created-p))))
 

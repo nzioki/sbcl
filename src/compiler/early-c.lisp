@@ -13,27 +13,27 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; ANSI limits on compilation
-(defconstant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:call-arguments-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(defconstant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:lambda-parameters-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:multiple-values-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
 ;;;; cross-compiler-only versions of CL special variables, so that we
 ;;;; don't have weird interactions with the host compiler
 
-(defvar sb!xc:*compile-file-pathname*)
-(defvar sb!xc:*compile-file-truename*)
-(defvar sb!xc:*compile-print*)
-(defvar sb!xc:*compile-verbose*)
+(defvar sb-xc:*compile-file-pathname*)
+(defvar sb-xc:*compile-file-truename*)
+(defvar sb-xc:*compile-print*)
+(defvar sb-xc:*compile-verbose*)
 
 ;;;; miscellaneous types used both in the cross-compiler and on the target
 
@@ -45,8 +45,8 @@
 (def!type layout-depthoid () '(or index (integer -1 -1)))
 (def!type layout-bitmap ()
   ;; FIXME: Probably should exclude negative bignum
-  #!+compact-instance-header 'integer
-  #!-compact-instance-header '(and integer (not (eql 0))))
+  #+compact-instance-header 'integer
+  #-compact-instance-header '(and integer (not (eql 0))))
 
 ;;; An INLINEP value describes how a function is called. The values
 ;;; have these meanings:
@@ -99,7 +99,7 @@
 (defvar *allow-instrumenting*)
 
 ;;; miscellaneous forward declarations
-#!+sb-dyncount (defvar *collect-dynamic-statistics*)
+#+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
 (defvar *compiler-error-context*)
 (defvar *compiler-error-count*)
@@ -111,7 +111,7 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
-#!+sb-dyncount
+#+sb-dyncount
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere-label*)
 (defvar *event-note-threshold*)
@@ -133,28 +133,26 @@ possible. Potentially long (over one page in size) vectors are, however, not
 stack allocated except in zero SAFETY code, as such a vector could overflow
 the stack without triggering overflow protection.")
 
-(!begin-collecting-cold-init-forms)
 ;;; This lock is seized in the compiler, and related areas -- like the
 ;;; classoid/layout/class system.
-(defglobal **world-lock** nil)
+;;; Assigning a literal object enables genesis to dump and load it
+;;; without need of a cold-init function.
 #-sb-xc-host
-(!cold-init-forms
- (setf **world-lock** (sb!thread:make-mutex :name "World Lock")))
-(!defun-from-collected-cold-init-forms !world-lock-cold-init)
+(!define-load-time-global **world-lock** #.(sb-thread:make-mutex :name "World Lock"))
 
 #-sb-xc-host
 (define-load-time-global *static-linker-lock*
-    (sb!thread:make-mutex :name "static linker"))
+    (sb-thread:make-mutex :name "static linker"))
 
 (defmacro with-world-lock (() &body body)
-  `(sb!thread:with-recursive-lock (**world-lock**)
-     ,@body))
+  #+sb-xc-host `(progn ,@body)
+  #-sb-xc-host `(sb-thread:with-recursive-lock (**world-lock**) ,@body))
 
 ;;; unique ID for the next object created (to let us track object
 ;;; identity even across GC, useful for understanding weird compiler
 ;;; bugs where something is supposed to be unique but is instead
 ;;; exists as duplicate objects)
-#!+sb-show
+#+sb-show
 (progn
   (defvar *object-id-counter* 0)
   (defun new-object-id ()
@@ -294,7 +292,7 @@ the stack without triggering overflow protection.")
 (defvar *compile-time-eval* nil)
 (declaim (always-bound *compile-time-eval*))
 
-#!-immobile-code (defmacro code-immobile-p (thing) `(progn ,thing nil))
+#-immobile-code (defmacro code-immobile-p (thing) `(progn ,thing nil))
 
 ;;; Various error-code generating helpers
 (defvar *adjustable-vectors*)
@@ -322,7 +320,7 @@ the stack without triggering overflow protection.")
 
 ;;; The allocation quantum for boxed code header words.
 ;;; 2 implies an even length boxed header; 1 implies no restriction.
-(defconstant code-boxed-words-align (+ 2 #!+(or x86 x86-64) -1))
+(defconstant code-boxed-words-align (+ 2 #+(or x86 x86-64) -1))
 
 ;;; Used as the CDR of the code coverage instrumentation records
 ;;; (instead of NIL) to ensure that any well-behaving user code will
@@ -345,7 +343,7 @@ the stack without triggering overflow protection.")
     (list (make-hash-table :test 'equal :synchronized t)))
   (declaim (type (cons hash-table) *code-coverage-info*)))
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 ;;; Information describing a heap-allocated alien.
 (def!struct (heap-alien-info (:copier nil))
@@ -359,5 +357,5 @@ the stack without triggering overflow protection.")
 
 ;; from 'llvm/projects/compiler-rt/lib/msan/msan.h':
 ;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"
-#!+linux ; shadow space differs by OS
-(defconstant sb!vm::msan-mem-to-shadow-xor-const #x500000000000)
+#+linux ; shadow space differs by OS
+(defconstant sb-vm::msan-mem-to-shadow-xor-const #x500000000000)

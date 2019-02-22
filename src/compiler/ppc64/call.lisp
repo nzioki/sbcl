@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
@@ -234,7 +234,7 @@ default-value-8
            (type unsigned-byte nvals) (type tn move-temp temp))
   (if (<= nvals 1)
       (progn
-        (sb!assem:without-scheduling ()
+        (sb-assem:without-scheduling ()
           (note-this-location vop :single-value-return)
           (move csp-tn ocfp-tn)
           (inst nop))
@@ -243,7 +243,7 @@ default-value-8
             (defaulting-done (gen-label))
             (default-stack-vals (gen-label)))
         ;; Branch off to the MV case.
-        (sb!assem:without-scheduling ()
+        (sb-assem:without-scheduling ()
           (note-this-location vop :unknown-return)
           (if (> nvals register-arg-count)
               (inst addic. temp nargs-tn (- (fixnumize register-arg-count)))
@@ -318,7 +318,7 @@ default-value-8
   (declare (type tn args nargs start count temp))
   (let ((variable-values (gen-label))
         (done (gen-label)))
-    (sb!assem:without-scheduling ()
+    (sb-assem:without-scheduling ()
       (inst b variable-values)
       (inst nop))
 
@@ -732,10 +732,10 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    ;; Get the symbol-value of SB!IMPL::*STEPPING*
-                    #!-sb-thread
-                    (load-symbol-value stepping sb!impl::*stepping*)
-                    #!+sb-thread
+                    ;; Get the symbol-value of SB-IMPL::*STEPPING*
+                    #-sb-thread
+                    (load-symbol-value stepping sb-impl::*stepping*)
+                    #+sb-thread
                     (loadw stepping thread-base-tn thread-stepping-slot)
                     (inst cmpwi stepping 0)
                     ;; If it's not null, trap.
@@ -772,7 +772,7 @@ default-value-8
                   ;; it is essential (due to it being an interior
                   ;; pointer) that the function itself be in a
                   ;; register before the raw-addr is loaded.
-                  (sb!assem:without-scheduling ()
+                  (sb-assem:without-scheduling ()
                     (loadw function name-pass fdefn-fun-slot
                         other-pointer-lowtag)
                     (loadw entry-point name-pass fdefn-raw-addr-slot
@@ -1202,7 +1202,7 @@ default-value-8
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1236,10 +1236,10 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    ;; Get the symbol-value of SB!IMPL::*STEPPING*
-    #!-sb-thread
-    (load-symbol-value stepping sb!impl::*stepping*)
-    #!+sb-thread
+    ;; Get the symbol-value of SB-IMPL::*STEPPING*
+    #-sb-thread
+    (load-symbol-value stepping sb-impl::*stepping*)
+    #+sb-thread
     (loadw stepping thread-base-tn thread-stepping-slot)
     (inst cmpwi stepping 0)
     ;; If it's not zero, trap.

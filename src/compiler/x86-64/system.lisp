@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; type frobbing VOPs
 
@@ -46,7 +46,7 @@
     (inst movzx '(:byte :dword) result object)
     DONE))
 
-#!+compact-instance-header
+#+compact-instance-header
 ;; ~20 instructions vs. 35
 (define-vop (layout-of) ; no translation
     (:policy :fast-safe)
@@ -105,6 +105,16 @@
   (:result-types positive-fixnum)
   (:generator 1 (load-type result function fun-pointer-lowtag))))
 
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst shr res n-widetag-bits)))
+
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -114,17 +124,6 @@
   (:generator 6
     (loadw res x 0 other-pointer-lowtag)
     (inst shr res n-widetag-bits)))
-
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst movzx '(:word :dword) res (ea (1+ (- fun-pointer-lowtag)) x))
-    (inst btr :dword res 15) ; Clear the NAMEDP header bit
-    (inst shl :dword res n-fixnum-tag-bits)))
 
 ;;; This operation is racy with GC and therefore slightly dangerous, especially
 ;;; on objects in immobile space which reserve byte 3 of the header for GC.
@@ -144,6 +143,12 @@
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)
     (move res x)))
+;;; Set the bit indicating that instances of this type require
+;;; special treatment of slot index 0.
+(define-vop (set-custom-gc-scavenge-bit)
+  (:args (x :scs (descriptor-reg)))
+  (:generator 1
+    (inst or :byte (ea (- 3 instance-pointer-lowtag) x) #x80)))
 
 (define-vop (get-header-data-high)
   (:translate get-header-data-high)
@@ -210,20 +215,39 @@
   (:results (sap :scs (sap-reg) :from (:argument 0)))
   (:result-types system-area-pointer)
   (:generator 10
-    (inst mov :dword sap (ea (- 4 other-pointer-lowtag) code))
-    (inst lea sap (ea (- other-pointer-lowtag) code sap n-word-bytes))))
+    ;; load boxed header size in bytes
+    (inst mov :dword sap (ea (- n-word-bytes other-pointer-lowtag) code))
+    (inst lea sap (ea (- other-pointer-lowtag) code sap))))
+
+(define-vop (code-trailer-ref)
+  (:translate code-trailer-ref)
+  (:policy :fast-safe)
+  (:args (code :scs (descriptor-reg) :to (:result 0))
+         (offset :scs (signed-reg immediate) :to (:result 0)))
+  (:arg-types * fixnum)
+  (:results (res :scs (unsigned-reg) :from (:argument 0)))
+  (:result-types unsigned-num)
+  (:generator 10
+    ;; get the object size in words
+    (inst mov :dword res (ea (- 4 other-pointer-lowtag) code))
+    (cond ((sc-is offset immediate)
+           (inst mov :dword res (ea (- (tn-value offset) other-pointer-lowtag)
+                                    code res n-word-bytes)))
+          (t
+           ;; compute sum of object size in bytes + negative offset - lowtag
+           (inst lea :dword res (ea (- other-pointer-lowtag) offset res n-word-bytes))
+           (inst mov :dword res (ea code res))))))
 
 (define-vop (compute-fun)
   (:args (code :scs (descriptor-reg) :to (:result 0))
-         (offset :scs (signed-reg unsigned-reg) :to (:result 0)))
+         (offset :scs (signed-reg unsigned-reg) :to :eval :target func))
   (:arg-types * positive-fixnum)
-  (:results (func :scs (descriptor-reg) :from (:argument 0)))
-  (:generator 10
-    (inst mov :dword func (ea (- 4 other-pointer-lowtag) code))
-    (inst lea func
-          (ea (- fun-pointer-lowtag other-pointer-lowtag)
-              offset func n-word-bytes))
-    (inst add func code)))
+  (:results (func :scs (descriptor-reg) :from :eval))
+  (:generator 3
+    (move func offset)
+    ;; add boxed header size in bytes
+    (inst add :dword func (ea (- n-word-bytes other-pointer-lowtag) code))
+    (inst lea func (ea (- fun-pointer-lowtag other-pointer-lowtag) code func))))
 
 ;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
 ;;; as soon as it's loaded into a register, it prevents the underlying fun from
@@ -280,14 +304,14 @@
 
 ;;;; other miscellaneous VOPs
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst break pending-interrupt-trap)))
 
-#!+sb-thread
+#+sb-thread
 (progn
 (define-vop (current-thread-offset-sap/c)
   (:results (sap :scs (sap-reg)))
@@ -377,7 +401,7 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
                  (+ (ash (- ,hi1 ,hi0) 32)
                     (- ,lo1 ,lo0)))))))
 
-#!+sb-dyncount
+#+sb-dyncount
 (define-vop (count-me)
   (:args (count-vector :scs (descriptor-reg)))
   (:info index)

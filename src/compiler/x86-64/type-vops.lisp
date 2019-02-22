@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; test generation utilities
 
@@ -204,7 +204,7 @@
     (move tmp value)
     (inst shr tmp n-positive-fixnum-bits)))
 
-#-#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#-#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (fixnump/signed-byte-64 simple-type-predicate)
   (:args (value :scs (signed-reg)))
   (:info)
@@ -217,11 +217,11 @@
     ;;    a <= x <= a + 2^n - 1
     ;; is equivalent to unsigned
     ;;    ((x-a) >> n) = 0
-    (inst mov temp #.(- sb!xc:most-negative-fixnum))
+    (inst mov temp #.(- sb-xc:most-negative-fixnum))
     (inst add temp value)
     (inst shr temp n-fixnum-bits)))
 
-#+#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#+#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (fixnump/signed-byte-64 simple-type-predicate)
   (:args (value :scs (signed-reg) :target temp))
   (:info)
@@ -276,7 +276,7 @@
               (values not-target target)
               (values target not-target))
         ;; Is it a fixnum?
-        (inst mov :dword temp value)
+        (inst mov temp value)
         (inst test :byte temp fixnum-tag-mask)
         (inst jmp :e fixnum)
 
@@ -317,35 +317,28 @@
 
 (define-vop (test-fixnum-mod-power-of-two)
   (:args (value :scs (any-reg descriptor-reg
-                              unsigned-reg signed-reg
-                              immediate)))
+                              unsigned-reg signed-reg)))
   (:arg-types *
               (:constant (satisfies power-of-two-limit-p)))
   (:translate fixnum-mod-p)
   (:conditional :e)
   (:info hi)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 4
-     (aver (not (sc-is value immediate)))
      (let* ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
                            hi
                            (fixnumize hi))))
        (inst test value (constantize (lognot fixnum-hi))))))
 
 (define-vop (test-fixnum-mod-tagged-unsigned)
-  (:args (value :scs (any-reg descriptor-reg
-                              unsigned-reg signed-reg
-                              immediate)))
+  (:args (value :scs (any-reg unsigned-reg signed-reg)))
   (:arg-types (:or tagged-num unsigned-num signed-num)
               (:constant fixnum))
   (:translate fixnum-mod-p)
   (:conditional :be)
   (:info hi)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 5
-     (aver (not (sc-is value immediate)))
      (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
                           hi
                           (fixnumize hi))))
@@ -357,7 +350,6 @@
   (:translate fixnum-mod-p)
   (:conditional)
   (:info target not-p hi)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 6
      (let* ((fixnum-hi (fixnumize hi))
@@ -404,7 +396,7 @@
 
 ;;; TRANSFORM-INSTANCE-TYPEP checks for this vop by name and will try to use it,
 ;;; so don't define it if inapplicable.
-#!+compact-instance-header
+#+compact-instance-header
 (progn
 (defknown layout-eq (instance t) boolean (flushable))
 (define-vop (layout-eq)

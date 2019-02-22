@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; coercions
 
@@ -44,7 +44,7 @@
 ;;; Return an expression to generate an integer of N-BITS many random
 ;;; bits, using the minimal number of random chunks possible.
 (defun generate-random-expr-for-power-of-2 (n-bits state)
-  (declare (type (integer 1 #.sb!vm:n-word-bits) n-bits))
+  (declare (type (integer 1 #.sb-vm:n-word-bits) n-bits))
   (multiple-value-bind (n-chunk-bits chunk-expr)
       (cond ((<= n-bits n-random-chunk-bits)
              (values n-random-chunk-bits `(random-chunk ,state)))
@@ -66,7 +66,7 @@
 ;;; multiple of the limit that fits into one or two chunks and and doing
 ;;; a division to get the random value into the desired range.
 (deftransform random ((num &optional state)
-                      ((constant-arg (integer 1 #.(expt 2 sb!vm:n-word-bits)))
+                      ((constant-arg (integer 1 #.(expt 2 sb-vm:n-word-bits)))
                        &optional *)
                       *
                       :policy (and (> speed compilation-speed)
@@ -143,8 +143,20 @@
       (give-up-ir1-transform))
     float))
 
+;;; On the face of it, these transforms are ridiculous because if we're going
+;;; to express (MINUSP X) as (MINUSP (foo-FLOAT-BITS X)), then why not _always_
+;;; transform MINUSP of a float into an integer comparison instead of a
+;;; floating-point comparison, and then express this as (if (minusp float) ...)
+;;; rather than (if (minusp (bits float)) ...) ?
+;;; I suspect that the difference is that FLOAT-SIGN must remain silent
+;;; when given a signaling NaN.
 (deftransform float-sign ((float &optional float2)
                           (single-float &optional single-float) *)
+  #+(vop-translates sb-kernel:single-float-copysign)
+  (if float2
+      `(single-float-copysign float float2)
+      `(single-float-sign float))
+  #-(vop-translates sb-kernel:single-float-copysign)
   (if float2
       (let ((temp (gensym)))
         `(let ((,temp (abs float2)))
@@ -153,28 +165,32 @@
 
 (deftransform float-sign ((float &optional float2)
                           (double-float &optional double-float) *)
-  (if float2
-      (let ((temp (gensym)))
-        `(let ((,temp (abs float2)))
-          (if (minusp (double-float-high-bits float)) (- ,temp) ,temp)))
-      '(if (minusp (double-float-high-bits float)) -1d0 1d0)))
+  ;; If words are 64 bits, then it's actually simpler to  extract _all_ bits
+  ;; instead of only the upper bits.
+  (let ((bits #+64-bit '(double-float-bits float)
+              #-64-bit '(double-float-high-bits float)))
+    (if float2
+        (let ((temp (gensym)))
+          `(let ((,temp (abs float2)))
+            (if (minusp ,bits) (- ,temp) ,temp)))
+        `(if (minusp ,bits) -1d0 1d0))))
 
 ;;;; DECODE-FLOAT, INTEGER-DECODE-FLOAT, and SCALE-FLOAT
 
 (defknown decode-single-float (single-float)
-  (values single-float single-float-exponent (single-float -1f0 1f0))
+  (values single-float single-float-exponent (member -1f0 1f0))
   (movable foldable flushable))
 
 (defknown decode-double-float (double-float)
-  (values double-float double-float-exponent (double-float -1d0 1d0))
+  (values double-float double-float-exponent (member -1d0 1d0))
   (movable foldable flushable))
 
 (defknown integer-decode-single-float (single-float)
-  (values single-float-significand single-float-int-exponent (integer -1 1))
+  (values single-float-significand single-float-int-exponent (member -1 1))
   (movable foldable flushable))
 
 (defknown integer-decode-double-float (double-float)
-  (values double-float-significand double-float-int-exponent (integer -1 1))
+  (values double-float-significand double-float-int-exponent (member -1 1))
   (movable foldable flushable))
 
 (defknown scale-single-float (single-float integer) single-float
@@ -196,7 +212,7 @@
   '(integer-decode-double-float x))
 
 (deftransform scale-float ((f ex) (single-float *) *)
-  (cond #!+x86
+  (cond #+x86
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
          '(coerce (%scalbn (coerce f 'double-float) ex) 'single-float))
@@ -204,7 +220,7 @@
          '(scale-single-float f ex))))
 
 (deftransform scale-float ((f ex) (double-float *) *)
-  (cond #!+x86
+  (cond #+x86
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
          '(%scalbn f ex))
@@ -214,7 +230,7 @@
 ;;; Given a number X, create a form suitable as a bound for an
 ;;; interval. Make the bound open if OPEN-P is T. NIL remains NIL.
 ;;; FIXME: as this is a constructor, shouldn't it be named MAKE-BOUND?
-#!-sb-fluid (declaim (inline set-bound))
+#-sb-fluid (declaim (inline set-bound))
 (defun set-bound (x open-p)
   (if (and x open-p) (list x) x))
 
@@ -331,9 +347,9 @@
                 (type-error ()
                   nil)))))))
   (frob %single-float single-float
-        most-negative-single-float most-positive-single-float)
+        sb-xc:most-negative-single-float sb-xc:most-positive-single-float)
   (frob %double-float double-float
-        most-negative-double-float most-positive-double-float))
+        sb-xc:most-negative-double-float sb-xc:most-positive-double-float))
 ) ; PROGN
 
 ;;;; float contagion
@@ -343,10 +359,10 @@
   ;; problem, but in the context of evaluated and compiled (+ <int> <single>)
   ;; giving different result if we fail to check for this.
   (or (not (csubtypep x (specifier-type 'integer)))
-      #!+x86
+      #+x86
       (csubtypep x (specifier-type `(integer ,most-negative-exactly-single-float-fixnum
                                              ,most-positive-exactly-single-float-fixnum)))
-      #!-x86
+      #-x86
       (csubtypep x (specifier-type 'fixnum))))
 
 ;;; Do some stuff to recognize when the loser is doing mixed float and
@@ -528,7 +544,7 @@
              (declare (ignorable prim-quick))
              `(progn
                 (deftransform ,name ((x) (single-float) *)
-                  #!+x86 (cond ((csubtypep (lvar-type x)
+                  #+x86 (cond ((csubtypep (lvar-type x)
                                            (specifier-type '(single-float
                                                              (#.(- (expt 2f0 63)))
                                                              (#.(expt 2f0 63)))))
@@ -540,9 +556,9 @@
                                   because the argument range (~S) was not within 2^63"
                                  (type-specifier (lvar-type x)))
                                 `(coerce (,',prim (coerce x 'double-float)) 'single-float)))
-                  #!-x86 `(coerce (,',prim (coerce x 'double-float)) 'single-float))
+                  #-x86 `(coerce (,',prim (coerce x 'double-float)) 'single-float))
                (deftransform ,name ((x) (double-float) *)
-                 #!+x86 (cond ((csubtypep (lvar-type x)
+                 #+x86 (cond ((csubtypep (lvar-type x)
                                           (specifier-type '(double-float
                                                             (#.(- (expt 2d0 63)))
                                                             (#.(expt 2d0 63)))))
@@ -553,7 +569,7 @@
                                  because the argument range (~S) was not within 2^63"
                                 (type-specifier (lvar-type x)))
                                `(,',prim x)))
-                 #!-x86 `(,',prim x)))))
+                 #-x86 `(,',prim x)))))
   (def sin %sin %sin-quick)
   (def cos %cos %cos-quick)
   (def tan %tan %tan-quick))
@@ -599,7 +615,7 @@
 
 (deftransform phase ((x) ((float)) float)
   '(if (minusp (float-sign x))
-       (float pi x)
+       (float sb-xc:pi x)
        (float 0 x)))
 
 ;;; The number is of type REAL.
@@ -646,7 +662,7 @@
   ;; the host does not have long floats, then setting *R-D-F-F* to
   ;; LONG-FLOAT doesn't actually buy us anything.  FIXME.
   (setf *read-default-float-format*
-        #!+long-float 'long-float #!-long-float 'double-float))
+        #+long-float 'long-float #-long-float 'double-float))
 ;;; Test whether the numeric-type ARG is within the domain specified by
 ;;; DOMAIN-LOW and DOMAIN-HIGH, consider negative and positive zero to
 ;;; be distinct.
@@ -665,7 +681,7 @@
             (typecase arg-lo-val
               (single-float 0f0)
               (double-float 0d0)
-              #!+long-float
+              #+long-float
               (long-float 0l0))
             arg-lo-val arg-lo))
     (when (and arg-hi (zerop arg-hi-val) (floatp arg-hi-val) (consp arg-hi)
@@ -674,7 +690,7 @@
             (typecase arg-lo-val
               (single-float (load-time-value (make-unportable-float :single-float-negative-zero)))
               (double-float (load-time-value (make-unportable-float :double-float-negative-zero)))
-              #!+long-float
+              #+long-float
               (long-float (load-time-value (make-unportable-float :long-float-negative-zero))))
             arg-hi-val arg-hi))
     (flet ((fp-neg-zero-p (f)           ; Is F -0.0?
@@ -790,10 +806,10 @@
 
   ;; These functions are only defined for part of the real line. The
   ;; condition selects the desired part of the line.
-  (frob asin -1d0 1d0 (- (/ pi 2)) (/ pi 2))
+  (frob asin -1d0 1d0 (- (/ sb-xc:pi 2)) (/ sb-xc:pi 2))
   ;; Acos is monotonic decreasing, so we need to swap the function
   ;; values at the lower and upper bounds of the input domain.
-  (frob acos -1d0 1d0 0 pi :increasingp nil)
+  (frob acos -1d0 1d0 0 sb-xc:pi :increasingp nil)
   (frob acosh 1d0 nil nil nil)
   (frob atanh -1d0 1d0 -1 1)
   ;; Kahan says that (sqrt -0.0) is -0.0, so use a specifier that
@@ -1060,7 +1076,7 @@
       (one-arg-derive-type x #'log-derive-type-aux-1 #'log)))
 
 (defun atan-derive-type-aux-1 (y)
-  (elfun-derive-type-simple y #'atan nil nil (- (/ pi 2)) (/ pi 2)))
+  (elfun-derive-type-simple y #'atan nil nil (- (/ sb-xc:pi 2)) (/ sb-xc:pi 2)))
 
 (defun atan-derive-type-aux-2 (y x same-arg)
   (declare (ignore same-arg))
@@ -1077,8 +1093,8 @@
              (make-numeric-type :class 'float
                                 :format format
                                 :complexp :real
-                                :low (coerce (- pi) bound-format)
-                                :high (coerce pi bound-format))))
+                                :low (coerce (- sb-xc:pi) bound-format)
+                                :high (coerce sb-xc:pi bound-format))))
           (t
            ;; The result is a float or a complex number
            (float-or-complex-float-type result-type)))))
@@ -1118,8 +1134,8 @@
               (make-numeric-type :class 'float
                                  :format format
                                  :complexp :real
-                                 :low (coerce pi bound-type)
-                                 :high (coerce pi bound-type)))
+                                 :low (coerce sb-xc:pi bound-type)
+                                 :high (coerce sb-xc:pi bound-type)))
              (t
               ;; We can't tell. The result is 0 or pi. Use a union
               ;; type for this.
@@ -1132,16 +1148,16 @@
                (make-numeric-type :class 'float
                                   :format format
                                   :complexp :real
-                                  :low (coerce pi bound-type)
-                                  :high (coerce pi bound-type))))))
+                                  :low (coerce sb-xc:pi bound-type)
+                                  :high (coerce sb-xc:pi bound-type))))))
           (t
            ;; We have a complex number. The answer is the range -pi
            ;; to pi. (-pi is included because we have -0.)
            (make-numeric-type :class 'float
                               :format format
                               :complexp :real
-                              :low (coerce (- pi) bound-type)
-                              :high (coerce pi bound-type))))))
+                              :low (coerce (- sb-xc:pi) bound-type)
+                              :high (coerce sb-xc:pi bound-type))))))
 
 (defoptimizer (phase derive-type) ((num))
   (one-arg-derive-type num #'phase-derive-type-aux #'phase))
@@ -1260,7 +1276,7 @@
 ;;;   * real-complex, complex-real and complex-complex addition and subtraction
 ;;;   * complex-real and real-complex multiplication
 ;;;   * complex-real division
-;;;   * sb!vm::swap-complex, which swaps the real and imaginary parts.
+;;;   * sb-vm::swap-complex, which swaps the real and imaginary parts.
 ;;;   * conjugate
 ;;;   * complex-real, real-complex and complex-complex CL:=
 ;;;     (complex-complex EQL would usually be a good idea).
@@ -1281,7 +1297,7 @@
                 ;; of whether all the operations below are translated by vops.
                 ;; We could be more fine-grained, but it seems reasonable that
                 ;; they be implemented on an all-or-none basis.
-                #!-(vop-named sb!vm::%negate/complex-double-float)
+                #-(vop-named sb-vm::%negate/complex-double-float)
                 (progn
                 ;; negation
                 (deftransform %negate ((z) ((complex ,type)) *)
@@ -1338,7 +1354,7 @@
 
                 ;; Divide two complex numbers.
                 (deftransform / ((x y) ((complex ,type) (complex ,type)) *)
-                  #!-(vop-translates sb!vm::swap-complex)
+                  #-(vop-translates sb-vm::swap-complex)
                   '(let* ((rx (realpart x))
                           (ix (imagpart x))
                           (ry (realpart y))
@@ -1352,8 +1368,8 @@
                                (dn (+ iy (* r ry))))
                           (complex (/ (+ (* rx r) ix) dn)
                                    (/ (- (* ix r) rx) dn)))))
-                  #!+(vop-translates sb!vm::swap-complex)
-                  `(let* ((cs (conjugate (sb!vm::swap-complex x)))
+                  #+(vop-translates sb-vm::swap-complex)
+                  `(let* ((cs (conjugate (sb-vm::swap-complex x)))
                           (ry (realpart y))
                           (iy (imagpart y)))
                      (if (> (abs ry) (abs iy))
@@ -1365,7 +1381,7 @@
                            (/ (+ (* x r) cs) dn)))))
                 ;; Divide a real by a complex.
                 (deftransform / ((x y) (,type (complex ,type)) *)
-                  #!-(vop-translates sb!vm::swap-complex)
+                  #-(vop-translates sb-vm::swap-complex)
                   '(let* ((ry (realpart y))
                           (iy (imagpart y)))
                     (if (> (abs ry) (abs iy))
@@ -1377,7 +1393,7 @@
                                (dn (+ iy (* r ry))))
                           (complex (/ (* x r) dn)
                                    (/ (- x) dn)))))
-                  #!+(vop-translates sb!vm::swap-complex)
+                  #+(vop-translates sb-vm::swap-complex)
                   '(let* ((ry (realpart y))
                           (iy (imagpart y)))
                     (if (> (abs ry) (abs iy))
@@ -1394,6 +1410,9 @@
   (frob single-float (or rational single-float))
   (frob double-float (or rational single-float double-float)))
 
+(deftransform complex ((realpart &optional imagpart) (rational &optional (or null (integer 0 0))))
+  'realpart)
+
 ;;; Here are simple optimizers for SIN, COS, and TAN. They do not
 ;;; produce a minimal range for the result; the result is the widest
 ;;; possible answer. This gets around the problem of doing range
@@ -1405,39 +1424,41 @@
                                  &optional def-lo def-hi (increasingp t))
   (etypecase arg
     (numeric-type
-     (cond ((eq (numeric-type-complexp arg) :complex)
-            (make-numeric-type :class (numeric-type-class arg)
-                               :format (numeric-type-format arg)
-                               :complexp :complex))
-           ((numeric-type-real-p arg)
-            (let* ((format (case (numeric-type-class arg)
-                             ((integer rational) 'single-float)
-                             (t (numeric-type-format arg))))
-                   (bound-type (or format 'float)))
-              ;; If the argument is a subset of the "principal" domain
-              ;; of the function, we can compute the bounds because
-              ;; the function is monotonic. We can't do this in
-              ;; general for these periodic functions because we can't
-              ;; (and don't want to) do the argument reduction in
-              ;; exactly the same way as the functions themselves do
-              ;; it.
-              (if (csubtypep arg domain)
-                  (let ((res-lo (bound-func fun (numeric-type-low arg) nil))
-                        (res-hi (bound-func fun (numeric-type-high arg) nil)))
-                    (unless increasingp
-                      (rotatef res-lo res-hi))
+     (flet ((floatify-format ()
+              (case (numeric-type-class arg)
+                ((integer rational) 'single-float)
+                (t (numeric-type-format arg)))))
+       (cond ((eq (numeric-type-complexp arg) :complex)
+              (make-numeric-type :class 'float
+                                 :format (floatify-format)
+                                 :complexp :complex))
+             ((numeric-type-real-p arg)
+              (let* ((format (floatify-format))
+                     (bound-type (or format 'float)))
+                ;; If the argument is a subset of the "principal" domain
+                ;; of the function, we can compute the bounds because
+                ;; the function is monotonic. We can't do this in
+                ;; general for these periodic functions because we can't
+                ;; (and don't want to) do the argument reduction in
+                ;; exactly the same way as the functions themselves do
+                ;; it.
+                (if (csubtypep arg domain)
+                    (let ((res-lo (bound-func fun (numeric-type-low arg) nil))
+                          (res-hi (bound-func fun (numeric-type-high arg) nil)))
+                      (unless increasingp
+                        (rotatef res-lo res-hi))
+                      (make-numeric-type
+                       :class 'float
+                       :format format
+                       :low (coerce-numeric-bound res-lo bound-type)
+                       :high (coerce-numeric-bound res-hi bound-type)))
                     (make-numeric-type
                      :class 'float
                      :format format
-                     :low (coerce-numeric-bound res-lo bound-type)
-                     :high (coerce-numeric-bound res-hi bound-type)))
-                  (make-numeric-type
-                   :class 'float
-                   :format format
-                   :low (and def-lo (coerce def-lo bound-type))
-                   :high (and def-hi (coerce def-hi bound-type))))))
-           (t
-            (float-or-complex-float-type arg def-lo def-hi))))))
+                     :low (and def-lo (coerce def-lo bound-type))
+                     :high (and def-hi (coerce def-hi bound-type))))))
+             (t
+              (float-or-complex-float-type arg def-lo def-hi)))))))
 
 (defoptimizer (sin derive-type) ((num))
   (one-arg-derive-type
@@ -1446,7 +1467,7 @@
      ;; Derive the bounds if the arg is in [-pi/2, pi/2].
      (trig-derive-type-aux
       arg
-      (specifier-type `(float ,(- (/ pi 2)) ,(/ pi 2)))
+      (specifier-type `(float ,(- (/ sb-xc:pi 2)) ,(/ sb-xc:pi 2)))
       #'sin
       -1 1))
    #'sin))
@@ -1457,7 +1478,7 @@
    (lambda (arg)
      ;; Derive the bounds if the arg is in [0, pi].
      (trig-derive-type-aux arg
-                           (specifier-type `(float 0d0 ,pi))
+                           (specifier-type `(float 0d0 ,sb-xc:pi))
                            #'cos
                            -1 1
                            nil))
@@ -1469,7 +1490,7 @@
    (lambda (arg)
      ;; Derive the bounds if the arg is in [-pi/2, pi/2].
      (trig-derive-type-aux arg
-                           (specifier-type `(float ,(- (/ pi 2)) ,(/ pi 2)))
+                           (specifier-type `(float ,(- (/ sb-xc:pi 2)) ,(/ sb-xc:pi 2)))
                            #'tan
                            nil nil))
    #'tan))
@@ -1581,12 +1602,12 @@
   (declare (type single-float x))
   (declare (optimize speed (safety 0)))
   (let* ((bits (single-float-bits x))
-         (exp (ldb sb!vm:single-float-exponent-byte bits))
+         (exp (ldb sb-vm:single-float-exponent-byte bits))
          (biased (the single-float-exponent
-                   (- exp sb!vm:single-float-bias))))
+                   (- exp sb-vm:single-float-bias))))
     (declare (type (signed-byte 32) bits))
     (cond
-      ((= exp sb!vm:single-float-normal-exponent-max) x)
+      ((= exp sb-vm:single-float-normal-exponent-max) x)
       ((<= biased 0) (* x 0f0))
       ((>= biased (float-digits x)) x)
       (t
@@ -1601,13 +1622,13 @@
   (declare (optimize speed (safety 0)))
   (let* ((high (double-float-high-bits x))
          (low (double-float-low-bits x))
-         (exp (ldb sb!vm:double-float-exponent-byte high))
+         (exp (ldb sb-vm:double-float-exponent-byte high))
          (biased (the double-float-exponent
-                   (- exp sb!vm:double-float-bias))))
+                   (- exp sb-vm:double-float-bias))))
     (declare (type (signed-byte 32) high)
              (type (unsigned-byte 32) low))
     (cond
-      ((= exp sb!vm:double-float-normal-exponent-max) x)
+      ((= exp sb-vm:double-float-normal-exponent-max) x)
       ((<= biased 0) (* x 0d0))
       ((>= biased (float-digits x)) x)
       (t

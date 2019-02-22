@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Unlike most other "Stub functions" that never called called except
 ;;; by the interpreter, these two do get called, by MAKE-UNPORTABLE-FLOAT
@@ -32,5 +32,5 @@
       (:double-float-negative-zero (make-double-float
                                     (opaque-identity #x-80000000)
                                     (opaque-identity #x00000000)))
-      #!+long-float
+      #+long-float
       (:long-float-negative-zero (error "write LONG-FLOAT creation form")))))

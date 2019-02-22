@@ -14,7 +14,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (!begin-collecting-cold-init-forms)
 
@@ -28,7 +28,7 @@
        (defvar *type-classes* (make-array 20 :fill-pointer 0)))
 #+sb-xc
 (macrolet ((def ()
-             (let* ((state-type `(unsigned-byte ,sb!vm:n-positive-fixnum-bits))
+             (let* ((state-type `(unsigned-byte ,sb-vm:n-positive-fixnum-bits))
                     (initform `(make-array 1 :element-type ',state-type))
                     (n (length *type-classes*)))
              `(progn
@@ -187,7 +187,7 @@
   (coerce :type (or symbol null))
   |#
   )
-#!-sb-fluid (declaim (freeze-type type-class))
+#-sb-fluid (declaim (freeze-type type-class))
 
 #+sb-xc-host
 (defun ctype-random (mask)
@@ -208,12 +208,12 @@
 ;; Complicated types don't admit the quick failure check.
 ;; At any rate, the totally opaque pseudo-random bits are under this mask.
 (defconstant +ctype-hash-mask+
-  (ldb (byte (1- sb!vm:n-positive-fixnum-bits) 0) -1))
+  (ldb (byte (1- sb-vm:n-positive-fixnum-bits) 0) -1))
 
 ;;; When comparing two ctypes, if this bit is 1 in each and they are not EQ,
 ;;; and at least one is interned, then they are not TYPE=.
 (defconstant +type-admits-type=-optimization+
-  (ash 1 (- sb!vm:n-positive-fixnum-bits 1)))
+  (ash 1 (- sb-vm:n-positive-fixnum-bits 1)))
 
 ;;; Represent an index into *SPECIALIZED-ARRAY-ELEMENT-TYPE-PROPERTIES*
 ;;; if applicable. For types which are not array specializations,
@@ -221,7 +221,7 @@
 (defconstant +ctype-saetp-index-bits+ 5)
 (defmacro !ctype-saetp-index (x)
   `(ldb (byte +ctype-saetp-index-bits+
-              ,(- sb!vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
+              ,(- sb-vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
         (type-hash-value ,x)))
 
 ;;; Generate a random hash value for use in memoization
@@ -229,7 +229,7 @@
 ;;; in the hash, as well as the pseudorandom bits
 (defun new-type-hash ()
    #+sb-xc-host (ctype-random +ctype-hash-mask+)
-   #-sb-xc-host (sb!impl::quasi-random-address-based-hash
+   #-sb-xc-host (sb-impl::quasi-random-address-based-hash
                  *ctype-hash-state* +ctype-hash-mask+))
 
 (def!struct (ctype (:conc-name type-)
@@ -255,7 +255,7 @@
   ;; - in the target, use scrambled bits from the allocation pointer
   ;;   instead.
   (hash-value (new-type-hash)
-              :type (signed-byte #.sb!vm:n-fixnum-bits)
+              :type (signed-byte #.sb-vm:n-fixnum-bits)
               ;; This is logically read-only, but because the host can not
               ;; calculate target hash values - it would need the identical
               ;; string hash algorithm and some other things - the hash is
@@ -277,8 +277,8 @@
          ;; whereas classoids with no name should get a pseudo-random hash
          (if (or symbol (eq metatype 'named))
              ;; symbol hashes don't use the package so  mix that in too
-             (let* ((pkg-hash (acond ((symbol-package symbol)
-                                      (sxhash (sb!impl::package-%name it)))
+             (let* ((pkg-hash (acond ((sb-xc:symbol-package symbol)
+                                      (sxhash (sb-impl::package-%name it)))
                                      (t 0)))
                     (mixed (logxor pkg-hash (sxhash (symbol-name symbol)))))
                (logand (ecase metatype
@@ -288,14 +288,14 @@
                          (named    (lognot mixed)))
                        +ctype-hash-mask+))
              ;; anonymous classoid (do we support those?) or other metatype
-             (sb!impl::quasi-random-address-based-hash
+             (sb-impl::quasi-random-address-based-hash
               *ctype-hash-state* +ctype-hash-mask+))))
     (when saetp-index
       (setf (ldb (byte +ctype-saetp-index-bits+
-                       (- sb!vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
+                       (- sb-vm:n-positive-fixnum-bits (1+ +ctype-saetp-index-bits+)))
                  hash)
             saetp-index))
-    (logior sb!xc:most-negative-fixnum       ; "interned" bit
+    (logior sb-xc:most-negative-fixnum       ; "interned" bit
             ;; All metatypes of interned ctypes except for ARRAY allow
             ;; the TYPE= optimization that two instances of the type
             ;; which are not EQ are not TYPE=. With arrays it is possible
@@ -372,7 +372,7 @@
   ;; that function says that it can't be inlined due to reasons.
   ;; In make-host-2 everything is fine, because of DEF!STRUCT magic.
   ;; And finally, we are prevented from writing "#+sbcl" here, for reasons.
-  #!+(host-feature sbcl) (declare (notinline dd-slots)) ; forward reference
+  #+host-quirks-sbcl (declare (notinline dd-slots)) ; forward reference
   (dsd-index (find slot-name
                    (dd-slots (find-defstruct-description type-name))
                    :key #'dsd-name)))
@@ -398,13 +398,18 @@
                  (loop for name in !type-class-fun-slots
                        append `(,(keywordicate name)
                                 (,(!type-class-fun-slot name) parent))))))))
-    #-sb-xc
-    `(if (find ',name *type-classes* :key #'type-class-name)
+    #+sb-xc-host
+    `(progn
+       (if (find ',name *type-classes* :key #'type-class-name)
          ;; Careful: type-classes are very complicated things to redefine.
          ;; For the sake of parallelized make-host-1 we have to allow it
          ;; not to be an error to get here, but we can't overwrite anything.
          (style-warn "Not redefining type-class ~S" ',name)
          (vector-push-extend ,make-it *type-classes*))
+       ;; I have no idea what compiler bug could be fixed by adding a form here,
+       ;; but this certainly achieves something, somehow.
+       #+host-quirks-cmu (print (aref *type-classes* (1- (length *type-classes*)))))
+
     ;; The Nth entry in the array of classes contain a list of instances
     ;; of the type-class created by genesis that need patching.
     ;; Types are dumped into the cold core without pointing to their class
@@ -449,7 +454,7 @@
                                    :environment nil))
          (ll-decl (third lexpr))
          (defun-name (symbolicate "PARSE-<" name ">")))
-    (aver (and (eq (car ll-decl) 'declare) (caadr ll-decl) 'sb!c::lambda-list))
+    (aver (and (eq (car ll-decl) 'declare) (caadr ll-decl) 'sb-c::lambda-list))
     `(progn
        (defun ,defun-name (,context spec)
          ,ll-decl
@@ -541,17 +546,17 @@
 ;;; FIXME: This was a macro in CMU CL, and is now an INLINE function. Is
 ;;; it important for it to be INLINE, or could be become an ordinary
 ;;; function without significant loss? -- WHN 19990413
-#!-sb-fluid (declaim (inline type-cache-hash))
-(declaim (ftype (function (ctype ctype) (signed-byte #.sb!vm:n-fixnum-bits))
+#-sb-fluid (declaim (inline type-cache-hash))
+(declaim (ftype (function (ctype ctype) (signed-byte #.sb-vm:n-fixnum-bits))
                 type-cache-hash))
 (defun type-cache-hash (type1 type2)
   (logxor (ash (type-hash-value type1) -3) (type-hash-value type2)))
 
-#!-sb-fluid (declaim (inline type-list-cache-hash))
-(declaim (ftype (function (list) (signed-byte #.sb!vm:n-fixnum-bits))
+#-sb-fluid (declaim (inline type-list-cache-hash))
+(declaim (ftype (function (list) (signed-byte #.sb-vm:n-fixnum-bits))
                 type-list-cache-hash))
 (defun type-list-cache-hash (types)
-  (loop with res of-type (signed-byte #.sb!vm:n-fixnum-bits) = 0
+  (loop with res of-type (signed-byte #.sb-vm:n-fixnum-bits) = 0
         for type in types
         do (setq res (logxor (ash res -1) (type-hash-value type)))
         finally (return res)))
@@ -717,8 +722,8 @@
   ;; types never have exclusive bounds, i.e. they may have them on
   ;; input, but they're canonicalized to inclusive bounds before we
   ;; store them here.
-  (low nil :type (or number cons null) :read-only t)
-  (high nil :type (or number cons null) :read-only t))
+  (low nil :type (or real (cons real null) null) :read-only t)
+  (high nil :type (or real (cons real null) null) :read-only t))
 
 ;;; A CONS-TYPE is used to represent a CONS type.
 (defstruct (cons-type (:include ctype (class-info (type-class-or-lose 'cons)))
@@ -730,7 +735,7 @@
   (car-type (missing-arg) :type ctype :read-only t)
   (cdr-type (missing-arg) :type ctype :read-only t))
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 (def!struct (alien-type
              (:copier nil)
              (:constructor make-alien-type
@@ -742,7 +747,7 @@
   (alignment nil :type (or null unsigned-byte)))
 (!set-load-form-method alien-type (:xc :target))
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 (defstruct (alien-type-type
             (:include ctype
                       (class-info (type-class-or-lose 'alien)))

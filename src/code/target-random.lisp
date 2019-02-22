@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; Constants
 (defconstant mt19937-n 624)
@@ -107,9 +107,9 @@ See SB-EXT:SEED-RANDOM-STATE for a SBCL extension to this functionality."
   ;; [ADDRESS-BASED-COUNTER-VAL in 'target-sxhash' could be used here]
   (/show0 "No /dev/urandom, using randomness from time and pid")
   (+ (get-internal-real-time)
-     (ash (sb!unix:unix-getpid) 32)))
+     (ash (sb-unix:unix-getpid) 32)))
 
-#!-win32
+#-win32
 (defun os-random-seed ()
   (or
    ;; On unices, we try to read from /dev/urandom and pass the results
@@ -125,10 +125,10 @@ See SB-EXT:SEED-RANDOM-STATE for a SBCL extension to this functionality."
         a)))
    (fallback-random-seed)))
 
-#!+win32
+#+win32
 (defun os-random-seed ()
   (/show0 "Getting randomness from CryptGenRandom")
-  (or (sb!win32:crypt-gen-random 32)
+  (or (sb-win32:crypt-gen-random 32)
       (fallback-random-seed)))
 
 (defun seed-random-state (&optional state)
@@ -245,9 +245,9 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
 
 ;;; This function generates a 32bit integer between 0 and #xffffffff
 ;;; inclusive.
-#!-sb-fluid (declaim (inline random-chunk))
+#-sb-fluid (declaim (inline random-chunk))
 ;;; portable implementation
-#!-x86
+#-x86
 (defun random-mt19937-update (state)
   (declare (type random-state-state state)
            (optimize (speed 3) (safety 0)))
@@ -274,7 +274,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
           (logxor (aref state (+ 3 (1- mt19937-m)))
                   (ash y -1) (aref state (logand y 1)))))
   (values))
-#!-x86
+#-x86
 (defun random-chunk (state)
   (declare (type random-state state))
   (let* ((state (random-state-state state))
@@ -297,12 +297,12 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
 ;;; FIXME: It would be nice to have some benchmark numbers on this.
 ;;; My inclination is to get rid of the nonportable implementation
 ;;; unless the performance difference is just enormous.
-#!+x86
+#+x86
 (defun random-chunk (state)
   (declare (type random-state state))
-  (sb!vm::random-mt19937 (random-state-state state)))
+  (sb-vm::random-mt19937 (random-state-state state)))
 
-#!-sb-fluid (declaim (inline big-random-chunk))
+#-sb-fluid (declaim (inline big-random-chunk))
 (defun big-random-chunk (state)
   (declare (type random-state state))
   (logior (ash (random-chunk state) 32)
@@ -312,7 +312,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
 ;;; float between 0.0 and 1.0 by clobbering the significand of 1.0
 ;;; with random bits, then subtracting 1.0. This hides the fact that
 ;;; we have a hidden bit.
-#!-sb-fluid (declaim (inline %random-single-float %random-double-float))
+#-sb-fluid (declaim (inline %random-single-float %random-double-float))
 (declaim (ftype (function ((single-float (0f0)) random-state)
                           (single-float 0f0))
                 %random-single-float))
@@ -322,8 +322,8 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
   (* arg
      (- (make-single-float
          (dpb (ash (random-chunk state)
-                   (- sb!vm:single-float-digits n-random-chunk-bits))
-              sb!vm:single-float-significand-byte
+                   (- sb-vm:single-float-digits n-random-chunk-bits))
+              sb-vm:single-float-significand-byte
               (single-float-bits 1.0)))
         1.0)))
 (declaim (ftype (function ((double-float (0d0)) random-state)
@@ -331,40 +331,40 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                 %random-double-float))
 
 ;;; 32-bit version
-#!+nil
+#+nil
 (defun %random-double-float (arg state)
   (declare (type (double-float (0d0)) arg)
            (type random-state state))
   (* (float (random-chunk state) 1d0) (/ 1d0 (expt 2 32))))
 
 ;;; 53-bit version
-#!-x86
+#-x86
 (defun %random-double-float (arg state)
   (declare (type (double-float (0d0)) arg)
            (type random-state state))
   (* arg
-     (- (sb!impl::make-double-float
+     (- (sb-impl::make-double-float
          (dpb (ash (random-chunk state)
-                   (- sb!vm:double-float-digits n-random-chunk-bits 32))
-              sb!vm:double-float-significand-byte
-              (sb!impl::double-float-high-bits 1d0))
+                   (- sb-vm:double-float-digits n-random-chunk-bits 32))
+              sb-vm:double-float-significand-byte
+              (sb-impl::double-float-high-bits 1d0))
          (random-chunk state))
         1d0)))
 
 ;;; using a faster inline VOP
-#!+x86
+#+x86
 (defun %random-double-float (arg state)
   (declare (type (double-float (0d0)) arg)
            (type random-state state))
   (let ((state-vector (random-state-state state)))
     (* arg
-       (- (sb!impl::make-double-float
-           (dpb (ash (sb!vm::random-mt19937 state-vector)
-                     (- sb!vm:double-float-digits n-random-chunk-bits
-                        sb!vm:n-word-bits))
-                sb!vm:double-float-significand-byte
-                (sb!impl::double-float-high-bits 1d0))
-           (sb!vm::random-mt19937 state-vector))
+       (- (sb-impl::make-double-float
+           (dpb (ash (sb-vm::random-mt19937 state-vector)
+                     (- sb-vm:double-float-digits n-random-chunk-bits
+                        sb-vm:n-word-bits))
+                sb-vm:double-float-significand-byte
+                (sb-impl::double-float-high-bits 1d0))
+           (sb-vm::random-mt19937 state-vector))
           1d0))))
 
 
@@ -384,9 +384,9 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
 ;;; as the speed gains due to needing fewer loop iterations are by far
 ;;; outweighted by the cost of the two divisions required (one to find
 ;;; the multiplier and one to bring the result into the correct range).
-#!-sb-fluid (declaim (inline %random-fixnum))
+#-sb-fluid (declaim (inline %random-fixnum))
 (defun %random-fixnum (arg state)
-  (declare (type (integer 1 #.sb!xc:most-positive-fixnum) arg)
+  (declare (type (integer 1 #.sb-xc:most-positive-fixnum) arg)
            (type random-state state))
   (if (= arg 1)
       0
@@ -403,9 +403,9 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
               (accept-reject-loop big-random-chunk))))))
 
 (defun random (arg &optional (state *random-state*))
-  #!-sb-fluid (declare (inline %random-fixnum
+  #-sb-fluid (declare (inline %random-fixnum
                                %random-single-float %random-double-float
-                               #!+long-float %random-long-float))
+                               #+long-float %random-long-float))
   (declare (explicit-check))
   (cond
     ((and (fixnump arg) (> arg 0))
@@ -414,7 +414,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
      (%random-single-float arg state))
     ((and (typep arg 'double-float) (> arg 0.0d0))
      (%random-double-float arg state))
-    #!+long-float
+    #+long-float
     ((and (typep arg 'long-float) (> arg 0.0l0))
      (%random-long-float arg state))
     ((and (bignump arg) (> arg 0))

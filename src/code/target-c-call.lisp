@@ -15,16 +15,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 ;;;; extra types
 
 (define-alien-type char (integer 8))
 (define-alien-type short (integer 16))
 (define-alien-type int (integer 32))
-#!-(and win32 x86-64)
-(define-alien-type long (integer #.sb!vm::n-machine-word-bits))
-#!+(and win32 x86-64)
+#-(and win32 x86-64)
+(define-alien-type long (integer #.sb-vm::n-machine-word-bits))
+#+(and win32 x86-64)
 (define-alien-type long (integer 32))
 
 (define-alien-type long-long (integer 64))
@@ -32,9 +32,9 @@
 (define-alien-type unsigned-char (unsigned 8))
 (define-alien-type unsigned-short (unsigned 16))
 (define-alien-type unsigned-int (unsigned 32))
-#!-(and win32 x86-64)
-(define-alien-type unsigned-long (unsigned #.sb!vm::n-machine-word-bits))
-#!+(and win32 x86-64)
+#-(and win32 x86-64)
+(define-alien-type unsigned-long (unsigned #.sb-vm::n-machine-word-bits))
+#+(and win32 x86-64)
 (define-alien-type unsigned-long (unsigned 32))
 (define-alien-type unsigned-long-long (unsigned 64))
 
@@ -45,13 +45,13 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (define-alien-type-translator void ()
-    (parse-alien-type '(values) (sb!kernel:make-null-lexenv))))
+    (parse-alien-type '(values) (sb-kernel:make-null-lexenv))))
 
 
 (defun default-c-string-external-format ()
   (or *default-c-string-external-format*
       (setf *default-c-string-external-format*
-            (sb!impl::default-external-format))))
+            (sb-impl::default-external-format))))
 
 ;;; FIXME: %NATURALIZE-C-STRING (and the UTF8 siblings below) would
 ;;; appear to be vulnerable to the lisp string moving from underneath
@@ -70,5 +70,5 @@
                         until (zerop (sap-ref-8 sap offset))
                         finally (return offset))))
       (let ((result (make-string length :element-type 'base-char)))
-        (sb!kernel:copy-ub8-from-system-area sap 0 result 0 length)
+        (sb-kernel:copy-ub8-from-system-area sap 0 result 0 length)
         result))))

@@ -10,16 +10,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ARM-ASM")
+(in-package "SB-ARM-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
   (import '(conditional-opcode emit-word
             composite-immediate-instruction encodable-immediate
-            lsl lsr asr ror cpsr @) "SB!VM")
+            lsl lsr asr ror cpsr @) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::nil-value sb!vm::registers sb!vm::null-tn sb!vm::null-offset
-            sb!vm::pc-tn sb!vm::pc-offset sb!vm::code-offset)))
+  (import '(sb-vm::nil-value sb-vm::registers sb-vm::null-tn sb-vm::null-offset
+            sb-vm::pc-tn sb-vm::pc-offset sb-vm::code-offset)))
 
 
 
@@ -40,7 +40,7 @@
     (:le . 13)
     (:al . 14))
   #'equal)
-(defconstant-eqx sb!vm::+condition-name-vec+
+(defconstant-eqx sb-vm::+condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
@@ -484,7 +484,7 @@
   (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
 
 ;; FIXME: it would be idiomatic to use (DEFINE-INSTRUCTION-MACRO COMPOSITE ...)
-;; instead of exporting another instruction-generating macro into SB!VM.
+;; instead of exporting another instruction-generating macro into SB-VM.
 ;; An invocation would resemble (INST COMPOSITE {ADD|SUB|whatever| ARGS ...)
 (defmacro composite-immediate-instruction (op r x y &key fixnumize neg-op invert-y invert-r single-op-op first-op first-no-source temporary)
   ;; Successively applies 8-bit wide chunks of Y to X using OP storing the result in R.
@@ -724,11 +724,11 @@
 ;;; officially undefined instruction as a single-instruction SIGTRAP
 ;;; generation instruction, or breakpoint.
 (define-instruction debug-trap (segment)
-  (:printer debug-trap ((opcode-32 #!+linux #xe7f001f0
-                                   #!+netbsd #xe7ffdefe))
+  (:printer debug-trap ((opcode-32 #+linux #xe7f001f0
+                                   #+netbsd #xe7ffdefe))
             :default :control #'debug-trap-control)
   (:emitter
-   (emit-word segment #!+linux #xe7f001f0 #!+netbsd #xe7ffdefe)))
+   (emit-word segment #+linux #xe7f001f0 #+netbsd #xe7ffdefe)))
 
 ;;;; Miscellaneous arithmetic instructions
 

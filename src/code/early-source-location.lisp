@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 #| No calls to #'SOURCE-LOCATION must happen from this file because:
 ;; - it would imply lack of location information for the definition,
@@ -19,12 +19,12 @@
 ;; but this is possibly a mistake! Ordinary DEFMACRO supplies the location
 ;; to %DEFMACRO. Compiler macros should too. This extra form will be needed:
 (eval-when (#+sb-xc :compile-toplevel)
-  (setf (sb!int:info :function :compiler-macro-function 'source-location)
+  (setf (info :function :compiler-macro-function 'source-location)
         (lambda (form env)
           (declare (ignore form env))
           (make-definition-source-location)))) |#
 
-#!+sb-source-locations
+#+sb-source-locations
 (progn
   #-sb-xc-host
   (define-compiler-macro source-location ()
@@ -34,12 +34,12 @@
   (defun source-location ()
     #-sb-xc-host (make-definition-source-location)))
 
-#!-sb-source-locations
+#-sb-source-locations
 (defun source-location () nil)
 
 #-sb-xc-host
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (dolist (entry '#.sb!vm::!per-thread-c-interface-symbols)
+  (dolist (entry '#.sb-vm::!per-thread-c-interface-symbols)
     (let ((symbol (if (consp entry) (car entry) entry)))
       (declare (notinline info (setf info)))
       ;; CURRENT-{CATCH/UWP}-BLOCK are thread slots,

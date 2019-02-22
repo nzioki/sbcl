@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; information for known functions:
 
@@ -37,7 +37,7 @@
   (foldable flushable))
 
 ;;; These can be affected by type definitions, so they're not FOLDABLE.
-(defknown (sb!xc:upgraded-complex-part-type sb!xc:upgraded-array-element-type)
+(defknown (sb-xc:upgraded-complex-part-type sb-xc:upgraded-array-element-type)
     (type-specifier &optional lexenv-designator) (or list symbol)
     (unsafely-flushable))
 
@@ -87,14 +87,14 @@
   (movable foldable flushable commutative))
 (defknown (equal equalp) (t t) boolean (foldable flushable recursive))
 
-#!+(or x86 x86-64 arm arm64)
+#+(or x86 x86-64 arm arm64)
 (defknown fixnum-mod-p (t fixnum) boolean
   (movable foldable flushable always-translatable))
 
 
 ;;;; classes
 
-(sb!xc:deftype name-for-class () t) ; FIXME: disagrees w/ LEGAL-CLASS-NAME-P
+(sb-xc:deftype name-for-class () t) ; FIXME: disagrees w/ LEGAL-CLASS-NAME-P
 (defknown find-classoid (name-for-class &optional t)
   (or classoid null) ())
 (defknown classoid-of (t) classoid (flushable))
@@ -173,7 +173,7 @@
 ;;;; from the "Symbols" chapter:
 
 (defknown get (symbol t &optional t) t (flushable))
-(defknown sb!impl::get3 (symbol t t) t (flushable))
+(defknown sb-impl::get3 (symbol t t) t (flushable))
 (defknown remprop (symbol t) t)
 (defknown symbol-plist (symbol) list (flushable))
 (defknown getf (list t &optional t) t (foldable flushable))
@@ -184,10 +184,10 @@
 ;; is %%make-symbol, because when immobile space feature is present,
 ;; we dispatch to either the C allocator or the Lisp allocator.
 (defknown %make-symbol (fixnum simple-string) symbol (flushable))
-(defknown sb!vm::%%make-symbol (simple-string) symbol (flushable))
+(defknown sb-vm::%%make-symbol (simple-string) symbol (flushable))
 (defknown copy-symbol (symbol &optional t) symbol (flushable))
 (defknown gensym (&optional (or string unsigned-byte)) symbol ())
-(defknown symbol-package (symbol) (or package null) (flushable))
+(defknown sb-xc:symbol-package (symbol) (or package null) (flushable))
 (defknown keywordp (t) boolean (flushable))       ; If someone uninterns it...
 
 ;;;; from the "Packages" chapter:
@@ -375,6 +375,13 @@
   (movable foldable unsafely-flushable))
 (defknown float-radix (float) float-radix
   (movable foldable unsafely-flushable))
+;;; This says "unsafely flushable" as if to imply that there is a possibility
+;;; of signaling a condition in safe code, but in practice we can never trap
+;;; on a NaN because the implementation uses foo-FLOAT-BITS instead of
+;;; performing a floating-point comparison. I think that is done on purpose,
+;;; so at best the "unsafely-" is disingenuous, and at worst our code is wrong.
+;;; e.g. the behavior if the first arg is a NaN is well-defined as we have it,
+;;; but what about the second arg? We need some test cases around this.
 (defknown float-sign (float &optional float) float
   (movable foldable unsafely-flushable))
 (defknown (float-digits float-precision) (float) float-digits
@@ -382,6 +389,10 @@
 (defknown integer-decode-float (float)
     (values integer float-int-exponent (member -1 1))
     (movable foldable unsafely-flushable))
+
+(defknown single-float-sign (single-float) single-float (movable foldable flushable))
+(defknown single-float-copysign (single-float single-float)
+  single-float (movable foldable flushable))
 
 (defknown complex (real &optional real) number
   (movable foldable flushable))
@@ -403,8 +414,8 @@
 (defknown logbitp (unsigned-byte integer) boolean (movable foldable flushable))
 (defknown ash (integer integer) integer
   (movable foldable flushable))
-(defknown %ash/right ((or word sb!vm:signed-word) (mod #.sb!vm:n-word-bits))
-  (or word sb!vm:signed-word)
+(defknown %ash/right ((or word sb-vm:signed-word) (mod #.sb-vm:n-word-bits))
+  (or word sb-vm:signed-word)
   (movable foldable flushable always-translatable))
 (defknown (logcount integer-length) (integer) bit-index
   (movable foldable flushable))
@@ -531,7 +542,7 @@
     (flushable))
 (defknown %concatenate-to-simple-vector (&rest sequence) simple-vector
   (flushable))
-(defknown %concatenate-to-vector ((unsigned-byte #.sb!vm:n-widetag-bits) &rest sequence)
+(defknown %concatenate-to-vector ((unsigned-byte #.sb-vm:n-widetag-bits) &rest sequence)
     vector
   (flushable))
 
@@ -556,11 +567,11 @@
   (call)
   :derive-type #'result-type-first-arg)
 
-(defknown #.(loop for info across sb!vm:*specialized-array-element-type-properties*
+(defknown #.(loop for info across sb-vm:*specialized-array-element-type-properties*
                   collect
                   (intern (concatenate 'string "VECTOR-MAP-INTO/"
-                                       (string (sb!vm:saetp-primitive-type-name info)))
-                          :sb!impl))
+                                       (string (sb-vm:saetp-primitive-type-name info)))
+                          :sb-impl))
     (simple-array index index function list)
     index
     (call))
@@ -736,7 +747,7 @@
     (:end (inhibit-flushing sequence-end nil))
     (:from-end t)
     (:key (function-designator ((nth-arg 1 :sequence t)))))
-  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable call))
 
 (defknown (position-if position-if-not)
@@ -745,14 +756,14 @@
    (:start (inhibit-flushing index 0))
     (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
-  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable call))
 
 (defknown (%bit-position/0 %bit-position/1) (simple-bit-vector t index index)
-  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable))
 (defknown %bit-position (t simple-bit-vector t index index)
-  (or (mod #.(1- sb!xc:array-dimension-limit)) null)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable))
 
 (defknown count
@@ -798,18 +809,18 @@
   sequence
   (call)
   :derive-type #'result-type-first-arg)
-(defknown sb!impl::stable-sort-list (list function function) list
+(defknown sb-impl::stable-sort-list (list function function) list
   (call important-result))
-(defknown sb!impl::sort-vector (vector index index function (or function null))
+(defknown sb-impl::sort-vector (vector index index function (or function null))
   * ; SORT-VECTOR works through side-effect
   (call))
 
-(defknown sb!impl::stable-sort-vector
+(defknown sb-impl::stable-sort-vector
   (vector function (or function null))
   vector
   (call))
 
-(defknown sb!impl::stable-sort-simple-vector
+(defknown sb-impl::stable-sort-simple-vector
   (simple-vector function (or function null))
   simple-vector
   (call))
@@ -880,16 +891,16 @@
   (movable flushable))
 (defknown %make-list (index t) list (movable flushable))
 
-(defknown sb!impl::|List| (&rest t) list (movable flushable foldable))
-(defknown sb!impl::|List*| (t &rest t) t (movable flushable foldable))
-(defknown sb!impl::|Append| (&rest t) t (flushable foldable))
-(defknown sb!impl::|Vector| (&rest t) simple-vector (flushable foldable))
+(defknown sb-impl::|List| (&rest t) list (movable flushable foldable))
+(defknown sb-impl::|List*| (t &rest t) t (movable flushable foldable))
+(defknown sb-impl::|Append| (&rest t) t (flushable foldable))
+(defknown sb-impl::|Vector| (&rest t) simple-vector (flushable foldable))
 
 ;;; All but last must be of type LIST, but there seems to be no way to
 ;;; express that in this syntax.
 (defknown append (&rest t) t (flushable)
   :call-type-deriver #'append-call-type-deriver)
-(defknown sb!impl::append2 (list t) t (flushable)
+(defknown sb-impl::append2 (list t) t (flushable)
   :call-type-deriver #'append-call-type-deriver)
 
 (defknown copy-list (proper-or-dotted-list) list (flushable))
@@ -1028,7 +1039,7 @@
 (defknown hash-table-p (t) boolean (movable foldable flushable))
 (defknown gethash (t hash-table &optional t) (values t boolean)
   (flushable)) ; not FOLDABLE, since hash table contents can change
-(defknown sb!impl::gethash3 (t hash-table t) (values t boolean)
+(defknown sb-impl::gethash3 (t hash-table t) (values t boolean)
   (flushable)) ; not FOLDABLE, since hash table contents can change
 (defknown %puthash (t (modifying hash-table) t) t ()
   :derive-type #'result-type-last-arg)
@@ -1060,8 +1071,8 @@
   array (flushable))
 
 (defknown %make-array ((or index list)
-                       (unsigned-byte #.sb!vm:n-widetag-bits)
-                       (mod #.sb!vm:n-word-bits)
+                       (unsigned-byte #.sb-vm:n-widetag-bits)
+                       (mod #.sb-vm:n-word-bits)
                        &key
                        (:element-type type-specifier)
                        (:initial-element t)
@@ -1143,7 +1154,7 @@
   (movable foldable flushable))
 (defknown fill-pointer (complex-vector) index
     (unsafely-flushable))
-(defknown sb!impl::fill-pointer-error (t &optional t) nil)
+(defknown sb-impl::fill-pointer-error (t &optional t) nil)
 
 (defknown vector-push (t (modifying complex-vector)) (or index null) ())
 (defknown vector-push-extend (t (modifying complex-vector) &optional (and index (integer 1))) index
@@ -1245,10 +1256,10 @@
 (defknown make-two-way-stream (stream stream) stream (unsafely-flushable))
 (defknown make-echo-stream (stream stream) stream (flushable))
 (defknown make-string-input-stream (string &optional index sequence-end)
-  sb!impl::string-input-stream
+  sb-impl::string-input-stream
   (flushable))
 (defknown make-string-output-stream (&key (:element-type type-specifier))
-  sb!impl::string-output-stream
+  sb-impl::string-output-stream
   (flushable))
 (defknown get-output-stream-string (stream) simple-string ())
 (defknown streamp (t) boolean (movable foldable flushable))
@@ -1300,11 +1311,11 @@
   ())
 
 (defknown copy-pprint-dispatch
-  (&optional (or sb!pretty:pprint-dispatch-table null))
-  sb!pretty:pprint-dispatch-table
+  (&optional (or sb-pretty:pprint-dispatch-table null))
+  sb-pretty:pprint-dispatch-table
   ())
 (defknown pprint-dispatch
-  (t &optional (or sb!pretty:pprint-dispatch-table null))
+  (t &optional (or sb-pretty:pprint-dispatch-table null))
   (values function-designator boolean)
   ())
 (defknown (pprint-fill pprint-linear)
@@ -1330,7 +1341,7 @@
   ())
 (defknown set-pprint-dispatch
   (type-specifier (function-designator (t t) * :no-function-conversion t)
-   &optional real sb!pretty:pprint-dispatch-table)
+   &optional real sb-pretty:pprint-dispatch-table)
   null
   (call))
 
@@ -1416,7 +1427,7 @@
            (unsafely-flushable)))
 
 (defknown (prin1-to-string princ-to-string) (t) simple-string (unsafely-flushable))
-(defknown sb!impl::stringify-object (t) simple-string)
+(defknown sb-impl::stringify-object (t) simple-string)
 
 (defknown write-char (character &optional stream-designator) character ()
   :derive-type #'result-type-first-arg)
@@ -1441,16 +1452,16 @@
                   (or string function) &rest t)
   (or string null)
     ())
-(defknown sb!format::format-error* (string list &rest t &key &allow-other-keys)
+(defknown sb-format::format-error* (string list &rest t &key &allow-other-keys)
     nil)
-(defknown sb!format::format-error (string &rest t) nil)
-(defknown sb!format::format-error-at* ((or null string) (or null index) string list
+(defknown sb-format::format-error (string &rest t) nil)
+(defknown sb-format::format-error-at* ((or null string) (or null index) string list
                                        &rest t &key &allow-other-keys)
     nil)
-(defknown sb!format::format-error-at ((or null string) (or null index) string
+(defknown sb-format::format-error-at ((or null string) (or null index) string
                                       &rest t)
     nil)
-(defknown sb!format::args-exhausted (string integer) nil)
+(defknown sb-format::args-exhausted (string integer) nil)
 
 (defknown (y-or-n-p yes-or-no-p) (&optional (or string null function) &rest t) boolean
   ())
@@ -1557,7 +1568,7 @@
                                            :append :supersede nil))
                        (:if-does-not-exist (member :error :create nil))
                        (:external-format external-format-designator)
-                       #!+win32 (:overlapped t))
+                       #+win32 (:overlapped t))
   (or stream null))
 
 (defknown rename-file (pathname-designator filename)
@@ -1610,10 +1621,10 @@
   null)
 
 ;;; and analogous SBCL extension:
-(defknown sb!impl::%failed-aver (t) nil)
+(defknown sb-impl::%failed-aver (t) nil)
 (defknown bug (t &rest t) nil) ; never returns
-(defknown sb!int:simple-reader-error (stream string &rest t) nil)
-(defknown sb!kernel:reader-eof-error (stream string) nil)
+(defknown simple-reader-error (stream string &rest t) nil)
+(defknown sb-kernel:reader-eof-error (stream string) nil)
 
 
 ;;;; from the "Miscellaneous" Chapter:
@@ -1758,7 +1769,7 @@
 (defknown %listify-rest-args (t index) list (flushable))
 (defknown %more-arg-context (t t) (values t index) (flushable))
 (defknown %more-arg (t index) t)
-#!+stack-grows-downward-not-upward
+#+stack-grows-downward-not-upward
 ;;; FIXME: The second argument here should really be NEGATIVE-INDEX, but doing that
 ;;; breaks the build, and I cannot seem to figure out why. --NS 2006-06-29
 (defknown %more-kw-arg (t fixnum) (values t t))
@@ -1935,11 +1946,11 @@
 (defknown %alien-funcall ((or string system-area-pointer) alien-type &rest *) *)
 
 ;; Used by WITH-PINNED-OBJECTS
-#!+(or x86 x86-64)
-(defknown sb!vm::touch-object (t) (values)
+#+(or x86 x86-64)
+(defknown sb-vm::touch-object (t) (values)
   (always-translatable))
 
-#!+linkage-table
+#+linkage-table
 (defknown foreign-symbol-dataref-sap (simple-string)
   system-area-pointer
   (movable flushable))
@@ -1968,6 +1979,21 @@
   (values)
   ())
 (defknown style-warn (t &rest t) null ())
+;;; The following defknowns are essentially a workaround for a deficiency in
+;;; at least some versions of CCL which do not agree that NIL is legal here:
+;;; * (declaim (ftype (function () nil) missing-arg))
+;;; * (defun call-it (a) (if a 'ok (missing-arg)))
+;;; Compiler warnings :
+;;;   In CALL-IT: Conflicting type declarations for BUG
+;;;
+;;; Unfortunately it prints that noise at each call site.
+;;; Using DEFKNOWN we can make the proclamation effective when
+;;; running the cross-compiler but not when building it.
+;;; Alternatively we could use SB-XC:PROCLAIM, except that that
+;;; doesn't exist soon enough, and would need conditionals guarding
+;;; it, which is sort of the very thing this is trying to avoid.
+(defknown missing-arg () nil)
+(defknown give-up-ir1-transform (&rest t) nil)
 
 (defknown coerce-to-condition ((or condition symbol string function)
                                type-specifier symbol &rest t)
@@ -1986,24 +2012,24 @@
 
 ;;;; memory barriers
 
-(defknown sb!vm:%compiler-barrier () (values) ())
-(defknown sb!vm:%memory-barrier () (values) ())
-(defknown sb!vm:%read-barrier () (values) ())
-(defknown sb!vm:%write-barrier () (values) ())
-(defknown sb!vm:%data-dependency-barrier () (values) ())
+(defknown sb-vm:%compiler-barrier () (values) ())
+(defknown sb-vm:%memory-barrier () (values) ())
+(defknown sb-vm:%read-barrier () (values) ())
+(defknown sb-vm:%write-barrier () (values) ())
+(defknown sb-vm:%data-dependency-barrier () (values) ())
 
-#!+sb-safepoint
+#+sb-safepoint
 ;;; Note: This known function does not have an out-of-line definition;
 ;;; and if such a definition were needed, it would not need to "call"
 ;;; itself inline, but could be a no-op, because the compiler inserts a
 ;;; use of the VOP in the function prologue anyway.
-(defknown sb!kernel::gc-safepoint () (values) ())
+(defknown sb-kernel::gc-safepoint () (values) ())
 
 ;;;; atomic ops
 (defknown %compare-and-swap-svref (simple-vector index t t) t
     ())
 (defknown (%compare-and-swap-symbol-value
-           #!+x86-64 %cas-symbol-global-value)
+           #+x86-64 %cas-symbol-global-value)
     (symbol t t) t
     (unwind))
 (defknown (%atomic-dec-symbol-global-value %atomic-inc-symbol-global-value)
@@ -2018,31 +2044,31 @@
 ;;; Avoid a ton of FBOUNDP checks in the string stream constructors etc,
 ;;; by wiring in the needed functions instead of dereferencing their fdefns.
 (defknown (ill-in ill-bin ill-out ill-bout
-           sb!impl::string-inch sb!impl::string-in-misc
-           sb!impl::string-ouch sb!impl::string-sout sb!impl::string-out-misc
-           sb!impl::finite-base-string-ouch sb!impl::finite-base-string-out-misc
-           sb!impl::fill-pointer-ouch sb!impl::fill-pointer-sout
-           sb!impl::fill-pointer-misc
-           sb!impl::case-frob-upcase-out sb!impl::case-frob-upcase-sout
-           sb!impl::case-frob-downcase-out sb!impl::case-frob-downcase-sout
-           sb!impl::case-frob-capitalize-out sb!impl::case-frob-capitalize-sout
-           sb!impl::case-frob-capitalize-first-out sb!impl::case-frob-capitalize-first-sout
-           sb!impl::case-frob-capitalize-aux-out sb!impl::case-frob-capitalize-aux-sout
-           sb!impl::case-frob-misc
-           sb!pretty::pretty-out sb!pretty::pretty-misc) * *)
-(defknown sb!pretty::pretty-sout * * (recursive))
+           sb-impl::string-inch sb-impl::string-in-misc
+           sb-impl::string-ouch sb-impl::string-sout sb-impl::string-out-misc
+           sb-impl::finite-base-string-ouch sb-impl::finite-base-string-out-misc
+           sb-impl::fill-pointer-ouch sb-impl::fill-pointer-sout
+           sb-impl::fill-pointer-misc
+           sb-impl::case-frob-upcase-out sb-impl::case-frob-upcase-sout
+           sb-impl::case-frob-downcase-out sb-impl::case-frob-downcase-sout
+           sb-impl::case-frob-capitalize-out sb-impl::case-frob-capitalize-sout
+           sb-impl::case-frob-capitalize-first-out sb-impl::case-frob-capitalize-first-sout
+           sb-impl::case-frob-capitalize-aux-out sb-impl::case-frob-capitalize-aux-sout
+           sb-impl::case-frob-misc
+           sb-pretty::pretty-out sb-pretty::pretty-misc) * *)
+(defknown sb-pretty::pretty-sout * * (recursive))
 
 ;;;; PCL
 
-(defknown sb!pcl::pcl-instance-p (t) boolean
+(defknown sb-pcl::pcl-instance-p (t) boolean
   (movable foldable flushable))
-(defknown sb!impl::new-instance-hash-code ()
+(defknown sb-impl::new-instance-hash-code ()
   (and unsigned-byte fixnum (not (eql 0))))
 
 ;; FIXME: should T be be (OR INSTANCE FUNCALLABLE-INSTANCE) etc?
 (defknown slot-value (t symbol) t (any))
 (defknown (slot-boundp slot-exists-p) (t symbol) boolean)
-(defknown sb!pcl::set-slot-value (t symbol t) t (any))
+(defknown sb-pcl::set-slot-value (t symbol t) t (any))
 
 (defknown find-class (symbol &optional t lexenv-designator) (or class null) ())
 (defknown class-of (t) class (flushable))

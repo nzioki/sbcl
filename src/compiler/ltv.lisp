@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defknown %load-time-value (t) t (flushable movable))
 
@@ -38,9 +38,9 @@
             #+sb-xc-host
             ((cons (eql find-classoid-cell) (cons (cons (eql quote))))
              (aver (eq (getf (cddr form) :create) t))
-             'sb!kernel::classoid-cell))
+             'sb-kernel::classoid-cell))
           (fopcompile form nil t)
-          (values (sb!fasl::dump-pop *compile-object*) (specifier-type it)))
+          (values (sb-fasl::dump-pop *compile-object*) (specifier-type it)))
          (t
           (let ((lambda (compile-load-time-stuff form t)))
             (values (fasl-dump-load-time-value-lambda lambda *compile-object*
@@ -71,7 +71,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
                                       (specifier-type 'function))
                                      ((and (legal-fun-name-p op)
                                            (eq :declared (info :function :where-from op)))
-                                      (let ((ftype (proclaimed-ftype op)))
+                                      (let ((ftype (global-ftype op)))
                                         (if (fun-type-p ftype)
                                             (fun-type-returns ftype)
                                             *wild-type*)))
@@ -94,7 +94,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
              ;; KLUDGE: purify on cheneygc moves everything in code
              ;; constants into read-only space, value-cell breaks the
              ;; chain.
-             (cond #!-gencgc
+             (cond #-gencgc
                    ((not read-only-p)
                     `(make-value-cell ,form))
                    (t
@@ -102,31 +102,37 @@ guaranteed to never be modified, so it can be put in read-only storage."
           (unless (csubtypep type source-type)
             (setf type source-type))
           (let ((value-form
-                  (cond #!-gencgc
+                  (cond #-gencgc
                         ((not read-only-p)
                          `(value-cell-ref (%load-time-value ',handle)))
                         (t
                          `(%load-time-value ',handle)))))
             (the-in-policy type value-form **zero-typecheck-policy**
                            start next result)))
-        (let ((value
-                (flet ((eval-it (operator thing)
-                         (handler-case (funcall operator thing)
-                           (error (condition)
-                             (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
-                                             condition)))))
-                  (if (eq sb!ext:*evaluator-mode* :compile)
-                      ;; This call to EVAL actually means compile+eval.
-                      (eval-it 'eval form)
-                      (eval-it 'funcall (compile nil `(lambda () ,form)))))))
+        ;; When compiling to memory, L-T-V is almost like `(quote ,(eval form)),
+        ;; though see the :COMPILE-LOAD-TIME-VALUE-INTERPRETED-MODE regression test
+        ;; to understand why that is wrong: minimal compilation must occur.
+        ;; Incidentally, it is an extremely subtle issue as to whether ANSI intended
+        ;; to perform compile-time semantic processing of the L-T-V form in the
+        ;; current environment, but then execute in the null environment (obviously)
+        ;; versus do both in the null environment. The distinction is in whether
+        ;;  (LET ((X 3)) (MACROLET ((M () (HAIR))) (LOAD-TIME-VALUE (THING)))
+        ;; can make use of M. We choose to say that it can't.
+        (let ((value (let ((thunk ; Pass T for the EPHEMERAL flag.
+                            (compile-in-lexenv `(lambda () ,form) (make-null-lexenv)
+                                               nil nil nil t nil)))
+                       (handler-case (funcall thunk)
+                         (error (condition)
+                           (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
+                                           condition))))))
           (if read-only-p
               (ir1-convert start next result `',value)
-              #!-gencgc
+              #-gencgc
               (the-in-policy (ctype-of value)
                              `(value-cell-ref ,(make-value-cell value))
                              **zero-typecheck-policy**
                              start next result)
-              #!+gencgc
+              #+gencgc
               ;; Avoid complaints about constant modification
               (ir1-convert start next result `(ltv-wrapper ',value)))))))
 

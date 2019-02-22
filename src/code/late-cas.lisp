@@ -1,4 +1,4 @@
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defcas car (cons) %compare-and-swap-car)
 (defcas cdr (cons) %compare-and-swap-cdr)
@@ -8,16 +8,16 @@
 
 ;;; Out-of-line definitions for various primitive cas functions.
 (macrolet ((def (name lambda-list ref &optional set)
-             #!+compare-and-swap-vops
+             #+compare-and-swap-vops
              (declare (ignore ref set))
              `(defun ,name (,@lambda-list old new)
-                #!+compare-and-swap-vops
+                #+compare-and-swap-vops
                 (,name ,@lambda-list old new)
-                #!-compare-and-swap-vops
+                #-compare-and-swap-vops
                 (progn
-                  #!+sb-thread
+                  #+sb-thread
                   ,(error "No COMPARE-AND-SWAP-VOPS on a threaded build?")
-                  #!-sb-thread
+                  #-sb-thread
                   (let ((current (,ref ,@lambda-list)))
                     ;; Shouldn't this be inside a WITHOUT-INTERRUPTS ?
                     (when (eq current old)
@@ -28,7 +28,7 @@
   (def %compare-and-swap-car (cons) car)
   (def %compare-and-swap-cdr (cons) cdr)
   (def %instance-cas (instance index) %instance-ref %instance-set)
-  #!+(or x86-64 x86)
+  #+(or x86-64 x86)
   (def %raw-instance-cas/word (instance index)
        %raw-instance-ref/word
        %raw-instance-set/word)
@@ -42,16 +42,14 @@
 ;; This code would be more concise if workable versions
 ;; of +-MODFX, --MODFX were defined generically.
 (macrolet ((modular (fun a b)
-             #!+(or x86 x86-64)
-             `(,(let ((*package* (find-package "SB!VM")))
-                  (symbolicate fun "-MODFX"))
-                ,a ,b)
-             #!-(or x86 x86-64)
+             #+(or x86 x86-64)
+             `(,(package-symbolicate "SB-VM" fun "-MODFX") ,a ,b)
+             #-(or x86 x86-64)
              ;; algorithm of https://graphics.stanford.edu/~seander/bithacks
              `(let ((res (logand (,fun ,a ,b)
-                                 (ash sb!ext:most-positive-word
-                                      (- sb!vm:n-fixnum-tag-bits))))
-                    (m (ash 1 (1- sb!vm:n-fixnum-bits))))
+                                 (ash sb-ext:most-positive-word
+                                      (- sb-vm:n-fixnum-tag-bits))))
+                    (m (ash 1 (1- sb-vm:n-fixnum-bits))))
                 (- (logxor res m) m))))
 
   ;; Atomically frob the CAR or CDR of a cons, or a symbol-value.

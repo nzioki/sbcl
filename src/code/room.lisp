@@ -194,10 +194,6 @@
             (round-to-dualword (+ (* vector-data-offset n-word-bytes)
                                   n-data-octets)))))
 
-(defun code-component-size (x) ; in bytes
-  (declare (code-component x))
-  (round-to-dualword (+ (* (code-header-words x) n-word-bytes) (%code-code-size x))))
-
 (defun primitive-object-size (object)
   "Return number of bytes of heap or stack directly consumed by OBJECT"
   (if (is-lisp-pointer (get-lisp-obj-address object))
@@ -230,7 +226,7 @@
                                (nth-value 2 (reconstitute-vector
                                              object room-info))))))
                      (code-component
-                      (return-from primitive-object-size (code-component-size object)))
+                      (return-from primitive-object-size (code-object-size object)))
                      (t
                       ;; Other things (symbol, fdefn, value-cell, etc)
                       ;; don't have a sizer, so use GET-HEADER-DATA
@@ -290,7 +286,7 @@
            (let ((c (tagged-object other-pointer-lowtag)))
              (values c
                      code-header-widetag
-                     (code-component-size c))))
+                     (code-object-size c))))
 
           (:other
            (values (tagged-object other-pointer-lowtag)
@@ -540,7 +536,31 @@ We could try a few things to mitigate this:
                                     ,extra))))))
                  (map-objects-in-range fun start (range-end page-bytes-used)
                                        (< page-index initial-next-free-page))
-                 (setf start (range-end gencgc-card-bytes) span 0)))))))))
+                 ;; In a certain rare situation, we must restart the next loop iteration
+                 ;; at exactly PAGE-INDEX instead of 1+ PAGE-INDEX.
+                 ;; Normally the contents of PAGE-INDEX are always included in the
+                 ;; current range. But what if it contributed 0 bytes to the range?
+                 ;;
+                 ;;     N : #x8000 bytes used
+                 ;;   N+1 : #x8000 bytes used
+                 ;;   N+2 : 0 bytes used        <- PAGE-INDEX now points here
+                 ;;   N+3 : initially 0 bytes, then gets some bytes
+                 ;;
+                 ;; We invoked the map function with page_address(N) for #x10000 bytes.
+                 ;; Suppose that function consed a partly unboxed object starting on
+                 ;; page N+2 extending to page N+3, and that NEXT-FREE-PAGE was greater
+                 ;; than both to begin with, so the termination condition isn't in play.
+                 ;; In the best case scenario, resuming the scan at page N+3 (mid-object)
+                 ;; would read valid widetags, but in the worst case scenario, we get
+                 ;; random bits. Page N+2 needs a fighting chance to be the start of
+                 ;; a range, so go back 1 page if the current page had zero bytes used
+                 ;; and the span exceeded 1. That is, always make forward progress.
+                 (setq start (range-end (cond ((and (zerop page-bytes-used) (plusp span))
+                                               (decf page-index)
+                                               0)
+                                              (t
+                                               gencgc-card-bytes)))
+                       span 0)))))))))
 
   (do-rest-arg ((space) spaces)
     (if (eq space :dynamic)
@@ -1106,8 +1126,9 @@ We could try a few things to mitigate this:
                ;; and/or visit the slots of each simple-fun but not the fun per se.
                )
             ,.(make-case '(or float (complex float) bignum
-                              #+sb-simd-pack simd-pack
-                              system-area-pointer)) ; nothing to do
+                           #+sb-simd-pack simd-pack
+                           #+sb-simd-pack-256 simd-pack-256
+                           system-area-pointer)) ; nothing to do
             ,.(make-case 'weak-pointer `(weak-pointer-value ,obj))
             ,.(make-case 'ratio `(%numerator ,obj) `(%denominator ,obj))
             ;; Visitor won't be invoked on (COMPLEX float)
@@ -1307,6 +1328,19 @@ We could try a few things to mitigate this:
            (when (simple-fun-p object)
              (setq addr (get-lisp-obj-address (fun-code-header object))))
            (logand #xF (sap-ref-8 (int-sap (logandc2 addr lowtag-mask)) 3))))))
+
+;;; Show objects in a much simpler way than print-allocated-objects.
+;;; Probably don't use this for generation 0 of dynamic space. Other spaces are ok.
+;;; (And this is removed from the image; it's meant for developers)
+#+gencgc
+(defun show-generation-objs (gen space)
+  (let ((*print-pretty* nil))
+    (map-allocated-objects
+     (lambda (obj type size)
+       (declare (ignore type))
+       (when (= (generation-of obj) gen)
+         (format t "~x ~3x ~s~%" (get-lisp-obj-address obj) size obj)))
+     space)))
 
 ;;; Unfortunately this is a near total copy of the test in gc.impure.lisp
 (defun !ensure-genesis-code/data-separation ()

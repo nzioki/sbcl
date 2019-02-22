@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; data object ref/set stuff
 
@@ -25,15 +25,15 @@
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg null zero)))
-  (:info name offset lowtag #!+gengc remember)
+  (:info name offset lowtag #+gengc remember)
   (:ignore name)
   (:results)
   (:generator 1
-    #!+gengc
+    #+gengc
     (if remember
         (storew-and-remember-slot value object offset lowtag)
         (storew value object offset lowtag))
-    #!-gengc
+    #-gengc
     (storew value object offset lowtag)))
 
 (define-vop (init-slot set-slot)
@@ -184,7 +184,7 @@
     (inst addq bsp-tn (* 2 n-word-bytes) bsp-tn)
     (storew temp bsp-tn (- binding-value-slot binding-size))
     (storew symbol bsp-tn (- binding-symbol-slot binding-size))
-    (#!+gengc storew-and-remember-slot #!-gengc storew
+    (#+gengc storew-and-remember-slot #-gengc storew
              val symbol symbol-value-slot other-pointer-lowtag)))
 
 
@@ -193,7 +193,7 @@
   (:generator 0
     (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
     (loadw value bsp-tn (- binding-value-slot binding-size))
-    (#!+gengc storew-and-remember-slot #!-gengc storew
+    (#+gengc storew-and-remember-slot #-gengc storew
              value symbol symbol-value-slot other-pointer-lowtag)
     (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
     (storew zero-tn bsp-tn (- binding-value-slot binding-size))
@@ -217,7 +217,7 @@
       (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
       (loadw value bsp-tn (- binding-value-slot binding-size))
       (inst beq symbol skip)
-      (#!+gengc storew-and-remember-slot #!-gengc storew
+      (#+gengc storew-and-remember-slot #-gengc storew
                value symbol symbol-value-slot other-pointer-lowtag)
       (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
 
@@ -299,7 +299,7 @@
 
 ;;;; mutator accessing
 
-#!+gengc
+#+gengc
 (progn
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -307,7 +307,7 @@
   ;; would probably be nice to restore GENGC support so that the Alpha
   ;; doesn't have to crawl along with stop'n'copy. When we do, the CMU
   ;; CL code below will need updating to the SBCL way of looking at
-  ;; things, e.g. at least using "SB-KERNEL" or "SB!KERNEL" instead of
+  ;; things, e.g. at least using "SB-KERNEL" or "SB-KERNEL" instead of
   ;; :KERNEL. -- WHN 2001-05-08
   (error "This code is stale as of sbcl-0.6.12."))
 

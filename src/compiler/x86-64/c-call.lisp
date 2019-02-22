@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;; The MOVE-ARG vop is going to store args on the stack for
 ;; call-out. These tn's will be used for that. move-arg is normally
@@ -23,11 +23,11 @@
   (stack-frame-size 0))
 
 (defconstant max-int-args #.(length *c-call-register-arg-offsets*))
-(defconstant max-xmm-args #!+win32 4 #!-win32 8)
+(defconstant max-xmm-args #+win32 4 #-win32 8)
 
 (defun int-arg (state prim-type reg-sc stack-sc)
   (let ((reg-args (max (arg-state-register-args state)
-                       #!+win32 (arg-state-xmm-args state))))
+                       #+win32 (arg-state-xmm-args state))))
     (cond ((< reg-args max-int-args)
            (setf (arg-state-register-args state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc
@@ -48,7 +48,7 @@
 
 (defun float-arg (state prim-type reg-sc stack-sc)
   (let ((xmm-args (max (arg-state-xmm-args state)
-                        #!+win32 (arg-state-register-args state))))
+                        #+win32 (arg-state-register-args state))))
     (cond ((< xmm-args max-xmm-args)
            (setf (arg-state-xmm-args state) (1+ xmm-args))
            (make-wired-tn* prim-type reg-sc
@@ -131,24 +131,24 @@
 
 
 (deftransform %alien-funcall ((function type &rest args) * * :node node)
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
-         (env (sb!c::node-lexenv node))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
+         (env (sb-c::node-lexenv node))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
     (aver (= (length arg-types) (length args)))
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 64)))
+                           (> (sb-alien::alien-integer-type-bits type) 64)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 64)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 64)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
           (dolist (type arg-types)
             (let ((arg (gensym)))
               (lambda-vars arg)
               (cond ((and (alien-integer-type-p type)
-                          (> (sb!alien::alien-integer-type-bits type) 64))
+                          (> (sb-alien::alien-integer-type-bits type) 64))
                      ;; CLH: FIXME! This should really be
                      ;; #xffffffffffffffff. nyef says: "Passing
                      ;; 128-bit integers to ALIEN functions on x86-64
@@ -163,9 +163,9 @@
                      (new-args arg)
                      (new-arg-types type)))))
           (cond ((and (alien-integer-type-p result-type)
-                      (> (sb!alien::alien-integer-type-bits result-type) 64))
+                      (> (sb-alien::alien-integer-type-bits result-type) 64))
                  (let ((new-result-type
-                        (let ((sb!alien::*values-type-okay* t))
+                        (let ((sb-alien::*values-type-okay* t))
                           (parse-alien-type
                            (if (alien-integer-type-signed result-type)
                                '(values (unsigned 64) (signed 64))
@@ -188,7 +188,7 @@
                                        :arg-types (new-arg-types)
                                        :result-type result-type)
                                     ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 ;;; The ABI is vague about how signed sub-word integer return values
 ;;; are handled, but since gcc versions >=4.3 no longer do sign
@@ -234,7 +234,7 @@
   (:generator 2
    (inst mov res (make-fixup foreign-symbol :foreign))))
 
-#!+linkage-table
+#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -246,8 +246,23 @@
   (:generator 2
    (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
 
-#!+sb-safepoint
+#+sb-safepoint
 (defconstant thread-saved-csp-offset -1)
+
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+  (defun destroyed-c-registers ()
+    (let ((gprs (list rcx-offset rdx-offset
+                      #-win32 rsi-offset #-win32 rdi-offset
+                      r8-offset r9-offset r10-offset r11-offset))
+          (vars))
+      (append
+       (loop for gpr in gprs
+             collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
+                                  ,(car (push (gensym) vars))))
+       (loop for float to 15
+             collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
+                                  ,(car (push (gensym) vars))))
+       `((:ignore ,@vars))))))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg)
@@ -258,43 +273,43 @@
   ;; determine which alien was accessed in case it's undefined.
   (:temporary (:sc sap-reg :offset rbx-offset :from (:argument 0)) rbx)
   (:temporary (:sc unsigned-reg :offset rax-offset :to :result) rax)
-  #!+sb-safepoint
+  #+sb-safepoint
   (:temporary (:sc unsigned-stack :from :eval :to :result) pc-save)
   (:ignore results)
   (:vop-var vop)
-  (:save-p t)
   (:generator 0
     (move rbx function)
     (emit-c-call vop rax rbx args
-                 sb!alien::*alien-fun-type-varargs-default*
-                 #!+sb-safepoint pc-save)))
+                 sb-alien::*alien-fun-type-varargs-default*
+                 #+sb-safepoint pc-save))
+  . #.(destroyed-c-registers))
 
 ;;; Calls to C can generally be made without loading a register
 ;;; with the function. We receive the function name as an info argument.
-#!+sb-dynamic-core ;; broken when calling ldso-stubs
+#+sb-dynamic-core ;; broken when calling ldso-stubs
 (define-vop (call-out-named)
   (:args (args :more t))
   (:results (results :more t))
   (:info c-symbol varargsp)
   (:temporary (:sc unsigned-reg :offset rax-offset :to :result) rax)
-  #!+sb-safepoint
+  #+sb-safepoint
   (:temporary (:sc unsigned-stack :from :eval :to :result) pc-save)
   (:ignore results)
   (:vop-var vop)
-  (:save-p t)
   (:generator 0
-    (emit-c-call vop rax c-symbol args varargsp #!+sb-safepoint pc-save)))
+    (emit-c-call vop rax c-symbol args varargsp #+sb-safepoint pc-save))
+  . #.(destroyed-c-registers))
 
-(defun emit-c-call (vop rax fun args varargsp #!+sb-safepoint pc-save)
+(defun emit-c-call (vop rax fun args varargsp #+sb-safepoint pc-save)
   (declare (ignorable varargsp))
   ;; Current PC - don't rely on function to keep it in a form that
   ;; GC understands
-  #!+sb-safepoint
+  #+sb-safepoint
   (let ((label (gen-label)))
     (inst lea rax (rip-relative-ea label))
     (emit-label label)
     (move pc-save rax))
-  (when sb!c::*msan-unpoison*
+  (when sb-c::*msan-unpoison*
     (inst mov rax (thread-slot-ea thread-msan-param-tls-slot))
     ;; Unpoison parameters
     (do ((n 0 (+ n n-word-bytes))
@@ -302,7 +317,7 @@
         ((null arg))
       ;; KLUDGE: assume all parameters are 8 bytes or less
       (inst mov :qword (ea n rax) 0)))
-  #!-win32
+  #-win32
   ;; ABI: AL contains amount of arguments passed in XMM registers
   ;; for vararg calls.
   (when varargsp
@@ -311,10 +326,10 @@
                         while tn-ref
                         count (eq (sb-name (sc-sb (tn-sc (tn-ref-tn tn-ref))))
                                   'float-registers))))
-  #!+sb-safepoint
+  #+sb-safepoint
   ;; Store SP in thread struct
   (storew rsp-tn thread-base-tn thread-saved-csp-offset)
-  #!+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
+  #+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
   ;; From immobile space we use the "CALL rel32" format to the linkage
   ;; table jump, and from dynamic space we use "CALL [ea]" format
   ;; where ea is the address of the linkage table entry's operand.
@@ -322,12 +337,12 @@
   ;; one jump in a statically linked executable.
 
   (inst call (cond ((tn-p fun) fun)
-                   ((sb!c::code-immobile-p vop) (make-fixup fun :foreign))
+                   ((sb-c::code-immobile-p vop) (make-fixup fun :foreign))
                    (t (ea (make-fixup fun :foreign 8)))))
   ;; For the undefined alien error
   (note-this-location vop :internal-error)
-  #!+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
-  #!+sb-safepoint
+  #+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
+  #+sb-safepoint
   ;; Zero the saved CSP
   (inst xor (make-ea-for-object-slot thread-base-tn thread-saved-csp-offset 0)
         rsp-tn))
@@ -346,8 +361,8 @@
     (move result rsp-tn)))
 
 (macrolet ((alien-stack-ptr ()
-             #!+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
-             #!-sb-thread '(static-symbol-value-ea '*alien-stack-pointer*)))
+             #+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
+             #-sb-thread '(static-symbol-value-ea '*alien-stack-pointer*)))
   (define-vop (alloc-alien-stack-space)
     (:info amount)
     (:results (result :scs (sap-reg any-reg)))
@@ -385,24 +400,24 @@
                                :offset offset))))
     (let* ((segment (make-segment))
            (rax rax-tn)
-           #!+win32 (rcx rcx-tn)
-           #!-(and win32 sb-thread) (rdi rdi-tn)
-           #!-(and win32 sb-thread) (rsi rsi-tn)
+           #+win32 (rcx rcx-tn)
+           #-(and win32 sb-thread) (rdi rdi-tn)
+           #-(and win32 sb-thread) (rsi rsi-tn)
            (rdx rdx-tn)
            (rbp rbp-tn)
            (rsp rsp-tn)
-           #!+(and win32 sb-thread) (r8 r8-tn)
+           #+(and win32 sb-thread) (r8 r8-tn)
            (xmm0 float0-tn)
            ([rsp] (ea rsp))
            ;; How many arguments have been copied
            (arg-count 0)
            ;; How many arguments have been copied from the stack
-           (stack-argument-count #!-win32 0 #!+win32 4)
+           (stack-argument-count #-win32 0 #+win32 4)
            (gprs (mapcar (make-tn-maker 'any-reg) *c-call-register-arg-offsets*))
            (fprs (mapcar (make-tn-maker 'double-reg)
                          ;; Only 8 first XMM registers are used for
                          ;; passing arguments
-                         (subseq *float-regs* 0 #!-win32 8 #!+win32 4))))
+                         (subseq *float-regs* 0 #-win32 8 #+win32 4))))
       (assemble (segment 'nil)
         ;; Make room on the stack for arguments.
         (when argument-types
@@ -421,7 +436,7 @@
             (incf arg-count)
             (cond (integerp
                    (let ((gpr (pop gprs)))
-                     #!+win32 (pop fprs)
+                     #+win32 (pop fprs)
                      ;; Argument not in register, copy it from the old
                      ;; stack location to a temporary register.
                      (unless gpr
@@ -434,7 +449,7 @@
                   ((or (alien-single-float-type-p type)
                        (alien-double-float-type-p type))
                    (let ((fpr (pop fprs)))
-                     #!+win32 (pop gprs)
+                     #+win32 (pop gprs)
                      (cond (fpr
                             ;; Copy from float register to target location.
                             (inst movq target-tn fpr))
@@ -448,7 +463,7 @@
                   (t
                    (bug "Unknown alien floating point type: ~S" type)))))
 
-        #!-sb-thread
+        #-sb-thread
         (progn
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
           (inst mov rdx (fixnumize index))
@@ -473,23 +488,23 @@
           (inst mov rsp rbp)
           (inst pop rbp))
 
-        #!+sb-thread
+        #+sb-thread
         (progn
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-          (inst mov #!-win32 rdi #!+win32 rcx (fixnumize index))
+          (inst mov #-win32 rdi #+win32 rcx (fixnumize index))
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-          (inst mov #!-win32 rsi #!+win32 rdx rsp)
+          (inst mov #-win32 rsi #+win32 rdx rsp)
           ;; add room on stack for return value
           (inst sub rsp (if (evenp arg-count)
                             (* n-word-bytes 2)
                             n-word-bytes))
           ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-          (inst mov #!-win32 rdx #!+win32 r8 rsp)
+          (inst mov #-win32 rdx #+win32 r8 rsp)
           ;; Make new frame
           (inst push rbp)
           (inst mov  rbp rsp)
-          #!+win32 (inst sub rsp #x20)
-          #!+win32 (inst and rsp #x-20)
+          #+win32 (inst sub rsp #x20)
+          #+win32 (inst and rsp #x-20)
           ;; Call
           (inst mov rax (foreign-symbol-address "callback_wrapper_trampoline"))
           (inst call rax)
@@ -525,7 +540,7 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let ((buffer (sb!assem::segment-buffer segment)))
+      (let ((buffer (sb-assem::segment-buffer segment)))
         (make-static-vector (length buffer)
                             :element-type '(unsigned-byte 8)
                             :initial-contents buffer)))))

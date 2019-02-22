@@ -9,24 +9,24 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; We compile some trivial character operations via inline expansion.
-#!-sb-fluid
+#-sb-fluid
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
                  alphanumericp))
 (declaim (maybe-inline upper-case-p lower-case-p both-case-p
                        digit-char-p))
 
 (deftype char-code ()
-  `(integer 0 (,sb!xc:char-code-limit)))
+  `(integer 0 (,sb-xc:char-code-limit)))
 
 (define-load-time-global **unicode-character-name-huffman-tree** ())
 
 (declaim (inline pack-3-codepoints))
 (defun pack-3-codepoints (first &optional (second 0) (third 0))
   (declare (type (unsigned-byte 21) first second third))
-  (sb!c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
+  (sb-c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
 
 (macrolet ((frob ()
              (flet ((coerce-it (array)
@@ -151,7 +151,7 @@
                                   do
                                   (setf (aref unicode-table i) (cons upper lower))
                                   when
-                                  (flet (#!+sb-unicode
+                                  (flet (#+sb-unicode
                                          (both-case-p (code)
                                            (logbitp 7 (aref **character-misc-database**
                                                             (+ 5 (misc-index (code-char code)))))))
@@ -159,9 +159,9 @@
                                          (atom lower)
                                          ;; Some characters are only equal under unicode rules,
                                          ;; e.g. #\MICRO_SIGN and #\GREEK_CAPITAL_LETTER_MU
-                                         #!+sb-unicode
+                                         #+sb-unicode
                                          (both-case-p lower)
-                                         #!+sb-unicode
+                                         #+sb-unicode
                                          (both-case-p upper)))
                                   do
                                   (setf (aref table (* i 2)) lower
@@ -566,7 +566,7 @@ argument is an alphabetic character, A-Z or a-z; otherwise NIL."
         (page-var (gensym "PAGE")))
     `(block nil
        (locally
-           (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+           (declare (optimize (sb-c::insert-array-bounds-checks 0)))
          (let ((,code-var (char-code ,char)))
            (let* ((,shifted-var (ash ,code-var -6))
                   (,page-var (if (>= ,shifted-var (length **character-case-pages**))
@@ -675,17 +675,17 @@ is either numeric or alphabetic."
                      (and (< 463 sum 477))))))))
     (declare (inline base-char-equal-p))
     (cond ((eq c1 c2))
-          #!-sb-unicode
+          #-sb-unicode
           (t
            (base-char-equal-p))
-          #!+sb-unicode
+          #+sb-unicode
           ((base-char-p c1)
            (and (base-char-p c2)
                 (base-char-equal-p)))
-          #!+sb-unicode
+          #+sb-unicode
           ((base-char-p c2)
            nil)
-          #!+sb-unicode
+          #+sb-unicode
           (t
            (with-case-info (c1 index cases)
              (or (= (aref cases index) (char-code c2)) ;; lower case

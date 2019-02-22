@@ -7,11 +7,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant sb!assem:assem-scheduler-p t)
-(defconstant sb!assem:+inst-alignment-bytes+ 4)
-(defconstant sb!assem:+assem-max-locations+ 100)
+(defconstant sb-assem:assem-scheduler-p t)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
+(defconstant sb-assem:+assem-max-locations+ 100)
 
 (defconstant +backend-fasl-file-implementation+ :sparc)
 (defconstant +backend-page-bytes+ 8192)
@@ -112,11 +112,11 @@
 
 ;;;; Description of the target address space.
 
-#!+gencgc ; sensibly small read-only and static spaces
+#+gencgc ; sensibly small read-only and static spaces
 (!gencgc-space-setup #x0f800000 :dynamic-space-start #x30000000)
 
 ;;; Where to put the different spaces.  Must match the C code!
-#!+(and linux cheneygc)
+#+(and linux cheneygc)
 (progn
   (defconstant linkage-table-space-start #x0f800000)
   (defconstant linkage-table-space-end   #x10000000)
@@ -130,7 +130,7 @@
   (defparameter dynamic-0-space-start #x30000000)
   (defparameter dynamic-0-space-end   #x38000000))
 
-#!+(and sunos cheneygc) ; might as well start by trying the same numbers
+#+(and sunos cheneygc) ; might as well start by trying the same numbers
 (progn
   (defconstant linkage-table-space-start #x0f800000)
   (defconstant linkage-table-space-end   #x10000000)
@@ -144,7 +144,7 @@
   (defparameter dynamic-0-space-start    #x30000000)
   (defparameter dynamic-0-space-end      #x38000000))
 
-#!+(and netbsd cheneygc) ; Need a gap at 0x4000000 for shared libraries
+#+(and netbsd cheneygc) ; Need a gap at 0x4000000 for shared libraries
 (progn
   (defconstant linkage-table-space-start #x0f800000)
   (defconstant linkage-table-space-end   #x10000000)
@@ -172,7 +172,7 @@
   after-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  #!+gencgc allocation-trap
+  #+gencgc allocation-trap
   error-trap)
 
 ;;;; static symbols.
@@ -209,7 +209,7 @@
 ;;; allowing other architectures (which don't necessarily use traps
 ;;; for pseudo-atomic) to propagate a magic number to C land via
 ;;; sbcl.h.
-#!-linux
+#-linux
 (defconstant pseudo-atomic-trap #x10)
-#!+linux
+#+linux
 (defconstant pseudo-atomic-trap #x40)

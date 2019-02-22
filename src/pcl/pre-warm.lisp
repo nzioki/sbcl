@@ -1,6 +1,6 @@
 ;;;; In support of PCL we compile some things into the cold image.
 ;;;; Not only does this simplify the PCL bootstrap ever so slightly,
-;;;; it is nice to be able to test for types SB!PCL::%METHOD-FUNCTION
+;;;; it is nice to be able to test for types SB-PCL::%METHOD-FUNCTION
 ;;;; and CLASS (neither of which will have any instances too early).
 
 ;;;; This software is part of the SBCL system. See the README file for more
@@ -26,7 +26,7 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB!PCL")
+(in-package "SB-PCL")
 
 
 ;;; method function stuff.
@@ -95,7 +95,7 @@
 #+sb-xc-host
 (flet ((create-fake-classoid (name fun-p)
          (let* ((classoid (make-standard-classoid :name name))
-                (cell (sb!kernel::make-classoid-cell name classoid))
+                (cell (sb-kernel::make-classoid-cell name classoid))
                 (layout
                  (make-layout
                   :classoid classoid

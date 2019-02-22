@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defconstant-eqx lambda-list-parser-states
@@ -91,7 +91,7 @@
                ;; &OPTIONAL/&KEY message randomly repeated, especially if it's
                ;; someone else's code. Fwiw, 'full-eval' muffles warnings during
                ;; all calls to this parser anyway.
-               (silent (typep list '(cons (eql sb!pcl::.pv.))))
+               (silent (typep list '(cons (eql sb-pcl::.pv.))))
           &aux (seen 0) required optional rest more keys aux env whole tail
                (rest-bits 0))
   (declare (optimize speed))
@@ -112,14 +112,14 @@
              (probably-ll-keyword-p (arg)
                ;; Compiler doesn't see that the check is manually done. :-(
                #-sb-xc-host
-               (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+               (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                (and (symbolp arg)
                     (let ((name (symbol-name arg)))
                       (and (plusp (length name))
                            (char= (char name 0) #\&)))))
              (check-suspicious (kind form)
                (and (probably-ll-keyword-p form)
-                    (member form sb!xc:lambda-list-keywords)
+                    (member form sb-xc:lambda-list-keywords)
                     (report-suspicious kind form)))
              (report-suspicious (kind what)
                (style-warn-once list "suspicious ~A ~S in lambda list: ~S."
@@ -776,7 +776,7 @@
                                   def)))
              (cond ((not sup-p-var) (bind-pat var vals))
                    ((not (symbolp var))
-                    (let ((var-temp (sb!xc:gensym))
+                    (let ((var-temp (sb-xc:gensym))
                           (sup-p-temp (copy-symbol suppliedp)))
                       (bind `((,var-temp ,sup-p-temp) ,vals))
                       (descend var var-temp)
@@ -799,7 +799,7 @@
              ;; in theory, (MULTIPLE-VALUE-BIND () (EXPR) ...)
              ;; but in practice it becomes a binding of an ignored gensym.
              (let* ((bindings-p (or whole required opt rest keys))
-                    (temp (and bindings-p (sb!xc:gensym))))
+                    (temp (and bindings-p (sb-xc:gensym))))
                (bind `(,temp
                        ,(cond ((or emit-pre-test (ll-kwds-keyp llks))
                                (emit-ds-bind-check parsed-lambda-list input
@@ -849,7 +849,7 @@
              (dolist (elt keys)
                (multiple-value-bind (keyword var def sup-p-var)
                    (parse-key-arg-spec elt default-default)
-                 (let ((temp (sb!xc:gensym)))
+                 (let ((temp (sb-xc:gensym)))
                    (bind `(,temp (ds-getf ,input ',keyword)))
                    (bind-if :not `(eql ,temp 0) `(car (truly-the cons ,temp))
                             var sup-p-var def))))
@@ -899,22 +899,22 @@
       ;; ERROR. To ingrain that knowledge into the CHECK-DS-foo
       ;; functions is a bit of a hack, but to do otherwise
       ;; changes how DS-BIND has to expand.
-      (compiler-error 'sb!kernel::arg-count-error
+      (compiler-error 'sb-kernel::arg-count-error
                       :kind "special operator" :name name
                       :args input :lambda-list lambda-list
                       :minimum min :maximum max))
-     #!+sb-eval
+     #+sb-eval
      (:eval
-      (error 'sb!eval::arg-count-program-error
+      (error 'sb-eval::arg-count-program-error
              ;; This is stupid. Maybe we should just say
              ;;  "error parsing special form"?
              ;; It would be more sensible than mentioning
              ;; a random nonstandard macro.
-             :kind 'sb!eval::program-destructuring-bind
+             :kind 'sb-eval::program-destructuring-bind
              :args input :lambda-list lambda-list
              :minimum min :maximum max))
      (t
-      (error 'sb!kernel::arg-count-error
+      (error 'sb-kernel::arg-count-error
              :kind kind :name name
              :args input :lambda-list lambda-list
              :minimum min :maximum max)))))
@@ -956,7 +956,7 @@
       ;; but COERCE-TO-LIST is an inline function not yet defined, and
       ;; its subsequent definition would signal an inlining failure warning.
       (declare (notinline coerce))
-      (error 'sb!kernel::defmacro-lambda-list-broken-key-list-error
+      (error 'sb-kernel::defmacro-lambda-list-broken-key-list-error
              :kind kind :name name
              :problem problem
              :info (if (eq problem :unknown-keyword)
@@ -1158,7 +1158,7 @@
                                (car tail))))
           (append whole env (ds-lambda-list-variables parse nil)))
     ;; Maybe kill docstring, but only under the cross-compiler.
-    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq docstring nil)
+    #+(and (not sb-doc) sb-xc-host) (setq docstring nil)
     ;; Note that we *NEVER* declare macro lambdas as a toplevel named lambda.
     ;; Code such as:
     ;;  `(setf (symbol-function ',myfun) ,(make-macro-lambda whatever))
@@ -1177,7 +1177,7 @@
                   `((declare ,declared-lambda-list)))
               ,@(if outer-decls (list outer-decls))
               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
-              ,@(sb!c:macro-policy-decls)
+              ,@(sb-c:macro-policy-decls)
               (,@(if kind
                      `(named-ds-bind ,(if (eq kind :special-form)
                                           `(:special-form . ,name)

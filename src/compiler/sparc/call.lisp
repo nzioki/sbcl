@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
@@ -724,8 +724,8 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    ;; Get the symbol-value of SB!IMPL::*STEPPING*
-                    (load-symbol-value stepping sb!impl::*stepping*)
+                    ;; Get the symbol-value of SB-IMPL::*STEPPING*
+                    (load-symbol-value stepping sb-impl::*stepping*)
                     (inst cmp stepping zero-tn)
                     ;; If it's not null, trap.
                     (inst b :eq step-done-label)
@@ -1130,7 +1130,7 @@ default-value-8
 ;;; stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1178,7 +1178,7 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     (inst cmp stepping zero-tn)
     (inst b :eq DONE)
     (inst nop)

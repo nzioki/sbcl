@@ -13,10 +13,10 @@
 ;;;; more information.
 
 (unless (find-package "BEFORE-XC-TESTS")
-  (make-package "BEFORE-XC-TESTS" :use '("SB!XC" "SB!KERNEL" "SB!INT")))
-(do-external-symbols (s "SB!XC") ; Import all symbols from SB!XC, then use CL
+  (make-package "BEFORE-XC-TESTS" :use '("SB-XC" "SB-KERNEL" "SB-INT")))
+(do-external-symbols (s "SB-XC") ; Import all symbols from SB-XC, then use CL
   (shadowing-import s "BEFORE-XC-TESTS"))
-(import '(sb!kernel::type-union2) "BEFORE-XC-TESTS")
+(import '(sb-kernel::type-union2) "BEFORE-XC-TESTS")
 (cl:use-package '("COMMON-LISP") "BEFORE-XC-TESTS")
 
 (in-package "BEFORE-XC-TESTS")
@@ -193,14 +193,14 @@
 ;; the target compiler returns NIL for this CTYPEP call involving KEYWORDP.
 ;; therefore the cross-compiler should too.
 (assert (not (ctypep :x86 (specifier-type '(satisfies keywordp)))))
-(let* ((info (sb!int:info :function :info 'keywordp))
-       (attributes (sb!c::fun-info-attributes info)))
+(let* ((info (sb-int:info :function :info 'keywordp))
+       (attributes (sb-c::fun-info-attributes info)))
   (unwind-protect
        (progn
-         (setf (sb!c::fun-info-attributes info)
-               (logior attributes (sb!c::ir1-attributes sb!c::foldable)))
+         (setf (sb-c::fun-info-attributes info)
+               (logior attributes (sb-c::ir1-attributes sb-c::foldable)))
          (assert (ctypep :x86 (specifier-type '(satisfies keywordp)))))
-    (setf (sb!c::fun-info-attributes info) attributes)))
+    (setf (sb-c::fun-info-attributes info) attributes)))
 (assert (not (type= (specifier-type '(member :x86))
                     (specifier-type '(and (member :x86) (satisfies keywordp))))))
 #+nil
@@ -312,7 +312,7 @@
   (assert win))
 ;; Used to run out of stack.
 (multiple-value-bind (yes win)
-    (handler-bind ((sb!kernel::cross-type-giving-up #'muffle-warning))
+    (handler-bind ((sb-kernel::cross-type-giving-up #'muffle-warning))
       (subtypep 'null '(or unk0 unk1)))
   (assert (not yes))
   (assert (not win)))
@@ -376,3 +376,9 @@
 ;; but it should also be EQ to (MEMBER NIL T)
 (assert (eq (specifier-type '(member nil t)) (specifier-type 'boolean)))
 
+#+x86-64
+(progn
+  (assert (= (sb-vm::immediate-constant-sc #c(0.0f0 0.0f0))
+             sb-vm::fp-complex-single-zero-sc-number))
+  (assert (= (sb-vm::immediate-constant-sc #c(0.0d0 0.0d0))
+             sb-vm::fp-complex-double-zero-sc-number)))

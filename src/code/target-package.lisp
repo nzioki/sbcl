@@ -21,7 +21,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; Thread safety
 ;;;;
@@ -48,7 +48,8 @@
 ;;;; sufficient, though interaction between parallel intern and use-package
 ;;;; needs to be considered with some care.
 
-(define-load-time-global *package-graph-lock* nil)
+(!define-load-time-global *package-graph-lock*
+    #.(sb-thread:make-mutex :name "Package Graph Lock"))
 
 (defmacro with-package-graph ((&key) &body forms)
   `(flet ((thunk () ,@forms))
@@ -58,17 +59,95 @@
   (declare (function function))
   ;; FIXME: Since name conflicts can be signalled while holding the
   ;; mutex, user code can be run leading to lock ordering problems.
-  (sb!thread:with-recursive-lock (*package-graph-lock*)
+  (sb-thread:with-recursive-lock (*package-graph-lock*)
     (funcall function)))
 
 ;;; a map from package names to packages
 (define-load-time-global *package-names* nil)
 (declaim (type info-hashtable *package-names*))
 
+;;; a map of strings, each of which is a local nickname of some package,
+;;; to small integers. For a constant string name, it is faster to search
+;;; package local nicknames by the integer ID.
+;;; Keys are never deleted from this table.
+(define-load-time-global *package-nickname-ids* nil)
+(declaim (type (cons info-hashtable fixnum) *package-nickname-ids*))
+
+;;; PKGNICK objects are weak vectors, but weak-vector is not part of
+;;; the type system, so the constructor is handrolled.
+(defstruct (pkgnick (:type vector) (:constructor nil)
+                    (:copier nil) (:predicate nil))
+  ;; Type declarations are harmful in the sense that they slow down slot reads
+  ;; and they don't buy us anything in any of the code that consumes these values.
+  (actual  nil)                ; :type (or package null)
+  (name    nil :read-only t)   ; :type string
+  (id      nil :read-only t))  ; :type fixnum
+
+;;; Scan for KEY in the local-nicknames slot of PACKAGE.
+;;; If found, return two values: the package and the PKGNICK object.
+;;; Before returning a package, we check whether it was deleted (via DELETE-PACKAGE).
+;;; Deleted packages in non-matching entries are ignored; they do not imply culling,
+;;; but when we see a broken weak reference, we'll cull the entire list and retry.
+(defun pkg-search-localnicks (key package)
+  (declare (string key))
+  (labels ((deletedp (actual) (or (not actual) (not (package-%name actual))))
+           (cull (old)
+             ;; Cull out DELETE-PACKAGE deletions and broken weak references
+             (let* ((v (remove-if (lambda (entry) (deletedp (pkgnick-actual entry)))
+                                  (the simple-vector old)))
+                    ;; Downgrade a 0-length new vector to NIL.
+                    (new (when (plusp (length v)) v)))
+               ;; Update the entire list.  If this CAS loses ... oh well, it remains as-is
+               ;; and maybe gets fixed next time. Retry in the culled list though.
+               (cas (package-%local-nicknames package) old new)
+               new)))
+    (declare (inline deletedp))
+    (named-let retry ((vector (package-%local-nicknames package)))
+      (if vector
+          (dovector (entry vector (values nil nil))
+            (cond ((string= key (pkgnick-name entry))
+                   (return (let ((pkg (pkgnick-actual entry)))
+                             (if (deletedp pkg) (values nil nil) (values pkg entry)))))
+                  ((not (pkgnick-actual entry))
+                   (return (retry (cull vector))))))
+          (values nil nil)))))
+
+;;; Return a nickname for PACKAGE with respect to BASE.
+;;; This could in theory return a package that currently has no name. However,
+;;; at the time of the call to this function from OUTPUT-SYMBOL - the only
+;;; consumer - the symbol in question *did* have a non-nil package.
+;;; So whatever we say as far as nickname, if any, is fine.
+(defun package-local-nickname (package base)
+  (awhen (package-%local-nicknames base)
+    (dovector (entry it)
+      (when (eq (pkgnick-actual entry) package)
+        (return (pkgnick-name entry))))))
+
+;;; This would have to be bumped ~ 2*most-positive-fixnum times to overflow.
+(define-load-time-global *package-names-cookie* sb-xc:most-negative-fixnum)
+(declaim (fixnum *package-names-cookie*))
+
 (defmacro with-package-names ((table-var &key) &body body)
   `(let ((,table-var *package-names*))
-     (sb!thread::with-recursive-system-lock ((info-env-mutex ,table-var))
+     (sb-thread::with-recursive-system-lock ((info-env-mutex ,table-var))
        ,@body)))
+
+(defun make-pkgnick (actual nickname)
+  (let* ((id-map *package-nickname-ids*)
+         (id (info-puthash (car id-map)
+                           (logically-readonlyize (copy-seq nickname))
+                           (lambda (old) (or old (atomic-incf (cdr id-map))))))
+         (strong-string
+          ;; To ensure that the weak vector representing a PKGNICK does not drop the string
+          ;; in GC, we have to ensure that the string is EQ to a key in the name -> id map.
+          (with-package-names (table) ; just borrowing the lock
+           (block nil
+            (info-maphash (lambda (key value) ; exhaustive scan
+                            (declare (ignore value))
+                            (when (string= key nickname) (return key)))
+                          (car id-map))))))
+    (aver strong-string)
+    (make-weak-vector 3 :initial-contents `(,actual ,strong-string ,id))))
 
 (defmethod make-load-form ((p package) &optional environment)
   (declare (ignore environment))
@@ -156,7 +235,7 @@ of :INHERITED :EXTERNAL :INTERNAL."
               "(~D+~D)/~D [~@[~,3f words/sym,~]load=~,1f%]"
               n-live n-deleted n-cells
               (unless (zerop n-live)
-                (/ (* (1+ (/ sb!vm:n-word-bytes)) n-cells) n-live))
+                (/ (* (1+ (/ sb-vm:n-word-bytes)) n-cells) n-live))
               (* 100 (/ n-filled n-cells))))))
 
 ;;; the maximum load factor we allow in a package hashtable
@@ -305,10 +384,6 @@ error if any of PACKAGES is not a valid package designator."
        (unlock-package package)))))
 
 (defun package-lock-violation-p (package &optional (symbol nil symbolp))
-  ;; KLUDGE: (package-lock package) needs to be before
-  ;; comparison to *package*, since during cold init this gets
-  ;; called before *package* is bound -- but no package should
-  ;; be locked at that point.
   (and package
        (package-lock package)
        ;; In package or implementation package
@@ -323,16 +398,16 @@ error if any of PACKAGES is not a valid package designator."
 
 (defun lexically-unlocked-symbol-p (symbol)
   (member symbol
-          (if (boundp 'sb!c::*lexenv*)
-              (let ((list (sb!c::lexenv-disabled-package-locks sb!c::*lexenv*)))
+          (if (boundp 'sb-c::*lexenv*)
+              (let ((list (sb-c::lexenv-disabled-package-locks sb-c::*lexenv*)))
                 ;; The so-called LIST might be an interpreter env.
-                #!+sb-fasteval
+                #+sb-fasteval
                 (unless (listp list)
                   (return-from lexically-unlocked-symbol-p
-                    (sb!interpreter::lexically-unlocked-symbol-p
+                    (sb-interpreter::lexically-unlocked-symbol-p
                      symbol list)))
                 list)
-              sb!c::*disabled-package-locks*)))
+              sb-c::*disabled-package-locks*)))
 
 ;;;; more package-locking these are NOPs unless :sb-package-locks is
 ;;;; in target features. Cross-compiler NOPs for these are in cross-misc.
@@ -373,7 +448,7 @@ error if any of PACKAGES is not a valid package designator."
                    (list
                     (return-from assert-symbol-home-package-unlocked
                       name))))
-         (package (symbol-package symbol)))
+         (package (sb-xc:symbol-package symbol)))
     (when (package-lock-violation-p package symbol)
       (package-lock-violation package
                               :symbol symbol
@@ -417,9 +492,12 @@ See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (copy-tree
-   (package-%local-nicknames
-    (find-undeleted-package-or-lose package-designator))))
+  (collect ((result))
+    (awhen (package-%local-nicknames (find-undeleted-package-or-lose package-designator))
+      (dovector (x it (result))
+        (let ((pkg (pkgnick-actual x)))
+          (when (and pkg (package-%name pkg))
+            (result (cons (pkgnick-name x) pkg))))))))
 
 (defun signal-package-error (package format-control &rest format-args)
   (error 'simple-package-error
@@ -435,6 +513,17 @@ Experimental: interface subject to change."
           :format-control format-control
           :format-arguments format-args))
 
+(defmacro do-packages ((package) &body body)
+  ;; INFO-MAPHASH is not intrinsically threadsafe - but actually
+  ;; quite easy to fix - so meanwhile until it's fixed, grab the lock.
+  `(with-package-names (.table.)
+      (info-maphash
+       (lambda (.name. ,package)
+         (declare (ignore .name.))
+         (unless (or (listp ,package) (eq ,package :deleted))
+           ,@body))
+       .table.)))
+
 (defun package-locally-nicknamed-by-list (package-designator)
   "Returns a list of packages which have a local nickname for the designated
 package.
@@ -443,9 +532,14 @@ See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (copy-list
-   (package-%locally-nicknamed-by
-    (find-undeleted-package-or-lose package-designator))))
+  (let ((designee (find-undeleted-package-or-lose package-designator))
+        (result))
+    (do-packages (namer)
+      ;; NAMER will be added once only to the result if there is more
+      ;; than one nickname for designee.
+      (when (find designee (package-%local-nicknames namer) :key #'pkgnick-actual)
+        (push namer result)))
+    result))
 
 (defun add-package-local-nickname (local-nickname actual-package
                                    &optional (package-designator (sane-package)))
@@ -473,11 +567,18 @@ See also: PACKAGE-LOCAL-NICKNAMES, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
+  (prog1 (%add-package-local-nickname local-nickname actual-package
+                                      package-designator)
+    (atomic-incf *package-names-cookie*)))
+
+;;; This is called repeatedly by defpackage's UPDATE-PACKAGE.
+;;; We only need to bump the name cookie once. Synchronization of package lookups
+;;; is pretty weak in the sense that concurrent FIND-PACKAGE and alteration
+;;; of the name -> package association does not really promise much.
+(defun %add-package-local-nickname (local-nickname actual-package package-designator)
   (let* ((nick (string local-nickname))
          (actual (find-package-using-package actual-package nil))
-         (package (find-undeleted-package-or-lose package-designator))
-         (existing (package-%local-nicknames package))
-         (cell (assoc nick existing :test #'string=)))
+         (package (find-undeleted-package-or-lose package-designator)))
     (unless actual
       (signal-package-error
        package-designator
@@ -511,33 +612,36 @@ Experimental: interface subject to change."
        "Attempt to use ~A as a package local nickname (for ~A) in ~
         package nicknamed globally ~A."
        nick (package-name actual) nick))
-    (when (and cell (neq actual (cdr cell)))
-      (restart-case
-          (signal-package-error
-           actual
-           "~@<Cannot add ~A as local nickname for ~A in ~A: ~
-            already nickname for ~A.~:@>"
-           nick (package-name actual)
-           (package-name package) (package-name (cdr cell)))
-        (keep-old ()
-          :report (lambda (s)
-                    (format s "Keep ~A as local nicname for ~A."
-                            nick (package-name (cdr cell)))))
-        (change-nick ()
-          :report (lambda (s)
-                    (format s "Use ~A as local nickname for ~A instead."
-                            nick (package-name actual)))
-          (let ((old (cdr cell)))
-            (with-package-graph ()
-              (setf (package-%locally-nicknamed-by old)
-                    (delete package (package-%locally-nicknamed-by old)))
-              (push package (package-%locally-nicknamed-by actual))
-              (setf (cdr cell) actual)))))
-      (return-from add-package-local-nickname package))
-    (unless cell
-      (with-package-graph ()
-        (push (cons nick actual) (package-%local-nicknames package))
-        (push package (package-%locally-nicknamed-by actual))))
+    (multiple-value-bind (old-actual cell) (pkg-search-localnicks nick package)
+      (when (and old-actual (neq actual old-actual))
+         (restart-case
+             (signal-package-error
+              actual
+              "~@<Cannot add ~A as local nickname for ~A in ~A: ~
+               already nickname for ~A.~:@>"
+              nick (package-name actual) (package-name package) (package-name old-actual))
+          (keep-old ()
+           :report (lambda (s)
+                     (format s "Keep ~A as local nickname for ~A."
+                             nick (package-name old-actual))))
+          (change-nick ()
+            :report (lambda (s)
+                      (format s "Use ~A as local nickname for ~A instead."
+                              nick (package-name actual)))
+            ;; This is reasonably safe. The danger is that lazy culling might remove CELL,
+            ;; however OLD-ACTUAL was a valid package, so it should still be there.
+            (setf (pkgnick-actual cell) actual)))
+        (return-from %add-package-local-nickname package))
+      (unless cell
+        ;; Add new entry atomically (due to just-in-time culling of deleted
+        ;; entries which swaps the whole list). But note the bug: two threads
+        ;; can each succeed in pushing the same nickname.
+        ;; This function isn't really intended for use by multiple threads.
+        (let ((old (package-%local-nicknames package)))
+          (loop
+            (let ((new (concatenate 'vector (list (make-pkgnick actual nick)) old)))
+              (when (eq old (setf old (cas (package-%local-nicknames package) old new)))
+                (return)))))))
     package))
 
 (defun remove-package-local-nickname (old-nickname
@@ -550,19 +654,19 @@ See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 PACKAGE-LOCALLY-NICKNAMED-BY-LIST, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (let* ((nick (string old-nickname))
-         (package (find-undeleted-package-or-lose package-designator))
-         (existing (package-%local-nicknames package))
-         (cell (assoc nick existing :test #'string=)))
+  (binding* ((nick (string old-nickname))
+             (package (find-undeleted-package-or-lose package-designator))
+             ((named cell) (pkg-search-localnicks nick package)))
     (when cell
       (with-single-package-locked-error
-          (:package package "removing local nickname ~A for ~A"
-                    nick (cdr cell)))
-      (with-package-graph ()
-        (let ((old (cdr cell)))
-          (setf (package-%local-nicknames package) (delete cell existing))
-          (setf (package-%locally-nicknamed-by old)
-                (delete package (package-%locally-nicknamed-by old)))))
+          (:package package "removing local nickname ~A for ~A" nick named))
+      (let ((old (package-%local-nicknames package)))
+        (loop
+          (let* ((vector (remove cell old))
+                 (new (if (plusp (length vector)) vector)))
+            (when (eq old (setf old (cas (package-%local-nicknames package) old new)))
+              (return)))))
+      (atomic-incf *package-names-cookie*)
       t)))
 
 (defun %package-hashtable-symbol-count (table)
@@ -584,8 +688,8 @@ Experimental: interface subject to change."
 (define-condition bootstrap-package-not-found (condition)
   ((name :initarg :name :reader bootstrap-package-name)))
 (defun debootstrap-package (&optional condition)
-  (invoke-restart
-   (find-restart-or-control-error 'debootstrap-package condition)))
+  (declare (ignore condition))
+  (bug "No such thing as DEBOOTSTRAP-PACKAGE"))
 
 (defun find-package (package-designator)
   "If PACKAGE-DESIGNATOR is a package, it is returned. Otherwise PACKAGE-DESIGNATOR
@@ -619,6 +723,7 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 ;;; This is undocumented and unexported for now, but the idea is that by
 ;;; making this a generic function then packages with custom package classes
 ;;; could hook into this to provide their own resolution.
+;;; (Any such generic solution will turn the performance to crap, so let's not)
 (defun find-package-using-package (package-designator base)
   (typecase package-designator
     (package package-designator)
@@ -626,24 +731,11 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
     ;; to avoid consing a new simple-base-string if the designator is one
     ;; that would undergo coercion entailing allocation.
     ((or symbol string character)
-         (let ((string (string package-designator)))
-           (let* ((nicknames (when base
-                               (package-%local-nicknames base)))
-                  (nicknamed (when nicknames
-                               (cdr (assoc string nicknames :test #'string=))))
-                  (packageoid (or nicknamed (%get-package string *package-names*))))
-             (if (and (null packageoid)
-                      ;; FIXME: should never need 'debootstrap' hack
-                      (let ((mismatch (mismatch "SB!" string)))
-                        (and mismatch (= mismatch 3))))
-                 (restart-case
-                     (signal 'bootstrap-package-not-found :name string)
-                   (debootstrap-package ()
-                     (if (string= string "SB!XC")
-                         *cl-package*
-                         (find-package
-                          (substitute #\- #\! string :count 1)))))
-                 packageoid))))
+     (let ((string (string package-designator)))
+       (or (and base
+                (package-%local-nicknames base)
+                (pkg-search-localnicks string base))
+           (%get-package string *package-names*))))
     ;; Is there a fundamental reason we don't declare the FTYPE
     ;; of FIND-PACKAGE-USING-PACKAGE letting the compiler do the checking?
     (t (error 'type-error
@@ -902,6 +994,7 @@ implementation it is ~S." *!default-package-use-list*)
          ;; so that it synchronizes with RENAME-PACKAGE.
          (with-package-names (table)
            (%register-package table name package))
+         (atomic-incf *package-names-cookie*)
          (return package)))
      (bug "never")))
 
@@ -927,12 +1020,26 @@ implementation it is ~S." *!default-package-use-list*)
 ;;; Change the name if we can, blast any old nicknames and then
 ;;; add in any new ones.
 ;;;
-;;; FIXME: ANSI claims that NAME is a package designator (not just a
-;;; string designator -- weird). Thus, NAME could
-;;; be a package instead of a string. Presumably then we should not change
-;;; the package name if NAME is the same package that's referred to by PACKAGE.
-;;; If it's a *different* package, we should probably signal an error.
-;;; (perhaps (ERROR 'ANSI-WEIRDNESS ..):-)
+;;; The spec says that NAME is a package designator (not just a string designator)
+;;; which is weird, but potentially meaningful if assigning new global nicknames.
+;;; If not called for that purpose, then it's largely pointless, because you can't
+;;; rename to any package-designator other than itself without causing a conflict.
+;;; A survey of some other implementations suggests that we're in the minority
+;;; as to the legality of (RENAME-PACKAGE "A" (FIND-PACKAGE "A") '("A-NICK")).
+;;;
+;;; ABCL:
+;;;   The value #<PACKAGE A> is not of type (OR STRING SYMBOL CHARACTER).
+;;; CCL:
+;;;   Error: The value #<Package "A"> is not of the expected type (OR STRING SYMBOL CHARACTER).
+;;; CMUCL:
+;;;   #<The A package, 0/9 internal, 0/9 external> cannot be coerced to a string.
+;;; ECL:
+;;;   In function STRING, the value of the first argument is #<"A" package>
+;;;   which is not of the expected type STRING
+;;;
+;;; CLISP agrees with us that this usage is permitted. If the new "name" is a
+;;; different package, it is merely the same error as if any already-existing name
+;;; was given. I see no reason to be more strict than the spec would have it be.
 (defun rename-package (package-designator name &optional (nicknames ()))
   "Changes the name and nicknames for a package."
   (prog ((nicks (stringify-string-designators nicknames)))
@@ -962,6 +1069,7 @@ implementation it is ~S." *!default-package-use-list*)
            (setf (package-%name package) name
                  (package-%nicknames package) ()))
          (%enter-new-nicknames package nicks))
+       (atomic-incf *package-names-cookie*)
        (return package))))
 
 (defun delete-package (package-designator)
@@ -1002,14 +1110,6 @@ implementation it is ~S." *!default-package-use-list*)
                       (go :restart)))
                   (dolist (used (package-use-list package))
                     (unuse-package used package))
-                  (dolist (namer (package-%locally-nicknamed-by package))
-                    (setf (package-%local-nicknames namer)
-                          (delete package (package-%local-nicknames namer) :key #'cdr)))
-                  (setf (package-%locally-nicknamed-by package) nil)
-                  (dolist (cell (package-%local-nicknames package))
-                    (let ((actual (cdr cell)))
-                      (setf (package-%locally-nicknamed-by actual)
-                            (delete package (package-%locally-nicknamed-by actual)))))
                   (setf (package-%local-nicknames package) nil)
                   ;; FIXME: lacking a way to advise UNINTERN that this package
                   ;; is pending deletion, a large package conses successively
@@ -1025,6 +1125,7 @@ implementation it is ~S." *!default-package-use-list*)
                           ;; and blowing away the PACKAGE-HASHTABLES is just done
                           ;; for tidiness and to help the GC.
                           (package-%nicknames package) nil))
+                  (atomic-incf *package-names-cookie*)
                   (setf (package-%use-list package) nil
                         (package-tables package) #()
                         (package-%shadowing-symbols package) nil
@@ -1035,24 +1136,13 @@ implementation it is ~S." *!default-package-use-list*)
                 (return-from delete-package t)))))))
 ) ; end FLET
 
-(defmacro !do-packages ((package) &body body)
-  ;; INFO-MAPHASH is not intrinsically threadsafe - but actually
-  ;; quite easy to fix - so meanwhile until it's fixed, grab the lock.
-  `(with-package-names (.table.)
-      (info-maphash
-       (lambda (.name. ,package)
-         (declare (ignore .name.))
-         (unless (or (listp ,package) (eq ,package :deleted))
-           ,@body))
-       .table.)))
-
 (defun list-all-packages ()
   "Return a list of all existing packages."
   (let ((result ()))
-    (!do-packages (package) (push package result))
+    (do-packages (package) (push package result))
     result))
 
-(macrolet ((find/intern (function &rest more-args)
+(macrolet ((find/intern (function package-lookup &rest more-args)
              ;; Both %FIND-SYMBOL and %INTERN require a SIMPLE-STRING,
              ;; but accept a LENGTH. Given a non-simple string,
              ;; we need copy it only if the cumulative displacement
@@ -1078,21 +1168,41 @@ implementation it is ~S." *!default-package-use-list*)
                                     (- end start)))))
                 (truly-the
                  (values symbol (member :internal :external :inherited nil))
-                 (,function name length
-                            (find-undeleted-package-or-lose package)
-                            ,@more-args)))))
+                 (,function name length ,package-lookup ,@more-args)))))
 
   (defun intern (name &optional (package (sane-package)))
   "Return a symbol in PACKAGE having the specified NAME, creating it
   if necessary."
-    (find/intern %intern (if (base-string-p name) 'base-char 'character)))
+    (find/intern %intern
+                 ;; Avoid one function call if we have a known good package.
+                 (if (and (packagep package) (package-%name package))
+                     package
+                     (find-undeleted-package-or-lose package))
+                 (if (base-string-p name) 'base-char 'character)
+                 nil))
 
   (defun find-symbol (name &optional (package (sane-package)))
   "Return the symbol named STRING in PACKAGE. If such a symbol is found
   then the second value is :INTERNAL, :EXTERNAL or :INHERITED to indicate
   how the symbol is accessible. If no symbol is found then both values
   are NIL."
-    (find/intern %find-symbol)))
+    (find/intern %find-symbol
+                 ;; Avoid one function call if we have a known good package.
+                 (if (and (packagep package) (package-%name package))
+                     package
+                     (find-undeleted-package-or-lose package))))
+
+  (defun intern2 (name cell)
+    ;; INTERN2 will only receive a package object if it's one of the standard
+    ;; ones. Hence no check for PACKAGE-%NAME validity (i.e. non-deleted)
+    (find/intern %intern
+                 (if (packagep cell) cell (cached-find-package cell))
+                 (if (base-string-p name) 'base-char 'character)
+                 nil))
+
+  (defun find-symbol2 (name cell)
+    (find/intern %find-symbol ; likewise
+                 (if (packagep cell) cell (cached-find-package cell)))))
 
 ;;; If the symbol named by the first LENGTH characters of NAME doesn't exist,
 ;;; then create it, special-casing the keyword package.
@@ -1100,40 +1210,39 @@ implementation it is ~S." *!default-package-use-list*)
 ;;; The fasloader always supplies NAME as a (SIMPLE-ARRAY <ELT-TYPE> 1),
 ;;; but the reader uses a buffer of CHARACTER, which, based on a flag,
 ;;; can be demoted to an array of BASE-CHAR.
-(defun %intern (name length package elt-type)
+(defun %intern (name length package elt-type ignore-lock)
   (declare (simple-string name) (index length))
   (multiple-value-bind (symbol where) (%find-symbol name length package)
-    (cond (where
-           (values symbol where))
-          (t
-           ;; Let's try again with a lock: the common case has the
-           ;; symbol already interned, handled by the first leg of the
-           ;; COND, but in case another thread is interning in
-           ;; parallel we need to check after grabbing the lock.
-           (with-package-graph ()
-             (setf (values symbol where) (%find-symbol name length package))
-             (if where
-                 (values symbol where)
-                 (let* ((symbol-name
-                         (logically-readonlyize
-                          (replace (make-string length :element-type elt-type)
-                                   name))))
+    (if where
+        (values symbol where)
+        ;; Double-checked lock pattern: the common case has the symbol already interned,
+        ;; but in case another thread is interning in parallel we need to check after
+        ;; grabbing the lock.
+        (with-package-graph ()
+         (setf (values symbol where) (%find-symbol name length package))
+         (if where
+             (values symbol where)
+             (let* ((symbol-name
+                     (logically-readonlyize
+                      (replace (make-string length :element-type elt-type) name)))
+                    ;; optimistically create the symbol
+                    (symbol ; Symbol kind: 1=keyword, 2=other interned
+                     (%make-symbol (if (eq package *keyword-package*) 1 2) symbol-name))
+                    (table (cond ((eq package *keyword-package*)
+                                  (%set-symbol-value symbol symbol)
+                                  (package-external-symbols package))
+                                 (t
+                                  (package-internal-symbols package)))))
+               ;; Set the symbol's package before storing it into the package
+               ;; so that (symbol-package (intern x #<pkg>)) = #<pkg>.
+               ;; This matters in the case of concurrent INTERN.
+               (%set-symbol-package symbol package)
+               (if ignore-lock
+                   (add-symbol table symbol)
                    (with-single-package-locked-error
                        (:package package "interning ~A" symbol-name)
-                     (let ((symbol ; Symbol kind: 1=keyword, 2=other interned
-                            (%make-symbol (if (eq package *keyword-package*) 1 2)
-                                          symbol-name)))
-                       ;; Simultaneous INTERN calls must not return an incompletely
-                       ;; initialized object, so that
-                       ;; (symbol-package (intern x #<pkg>)) = #<pkg>
-                       (%set-symbol-package symbol package)
-                       (add-symbol (cond ((eq package *keyword-package*)
-                                          (%set-symbol-value symbol symbol)
-                                          (package-external-symbols package))
-                                         (t
-                                          (package-internal-symbols package)))
-                                   symbol)
-                       (values symbol nil))))))))))
+                     (add-symbol table symbol)))
+               (values symbol nil)))))))
 
 ;;; Check internal and external symbols, then scan down the list
 ;;; of hashtables for inherited symbols.
@@ -1286,7 +1395,7 @@ implementation it is ~S." *!default-package-use-list*)
                  (if presentp
                      (if (eq package-symbol chosen-symbol)
                          (shadow (list package-symbol) package) ; CLHS 11.1.1.2.5
-                         (if (eq (symbol-package package-symbol) package)
+                         (if (eq (sb-xc:symbol-package package-symbol) package)
                              (unintern package-symbol package) ; CLHS 11.1.1.2.5
                              (shadowing-import (list chosen-symbol) package)))
                      (shadowing-import (list chosen-symbol) package)))
@@ -1331,7 +1440,7 @@ uninterned."
                                   (package-internal-symbols package)
                                   (package-external-symbols package))
                               symbol)
-                 (if (eq (symbol-package symbol) package)
+                 (if (eq (sb-xc:symbol-package symbol) package)
                      (%set-symbol-package symbol nil))
                  t)
                 (t nil)))))))
@@ -1435,6 +1544,22 @@ uninterned."
 
 ;;; Check for name conflict caused by the import and let the user
 ;;; shadowing-import if there is.
+;;;
+;;; FIXME: we _might_ be wrong about importing into the KEYWORD package.
+;;; """
+;;; 11.1.2.3.1: Interning a Symbol in the KEYWORD Package
+;;; The KEYWORD package is treated differently than other packages in that special actions are taken
+;;; when a symbol is interned in it. In particular, when a symbol is interned in the KEYWORD package,
+;;; it is automatically made to be an external symbol and is automatically made to be a constant
+;;; variable with itself as a value.
+;;; """
+;;; It could be claimed that this use of the term "Interning" is specifically in
+;;; reference to the function INTERN, and not the general concept of interning.
+;;; Obviously we do make new keyword symbols external and constant.
+;;; But if it means interning in the sense of making a symbol accessible at all
+;;; in the keyword package, then IMPORT should share that characteristic of INTERN.
+;;; As noted at SB-INT:SELF-EVALUATING-P, there is precedent for it.
+;;;
 (defun import (symbols &optional (package (sane-package)))
   "Make SYMBOLS accessible as internal symbols in PACKAGE. If a symbol is
 already accessible then it has no effect. If a name conflict would result from
@@ -1442,7 +1567,7 @@ the importation, then a correctable error is signalled."
   (with-package-graph ()
     (let* ((package (find-undeleted-package-or-lose package))
            (symbols (symbol-listify symbols))
-           (homeless (remove-if #'symbol-package symbols))
+           (homeless (remove-if #'sb-xc:symbol-package symbols))
            (syms ()))
       (with-single-package-locked-error ()
         (dolist (sym symbols)
@@ -1613,7 +1738,7 @@ PACKAGE."
   "Return a list of all symbols in the system having the specified name."
   (let ((string (string string-or-symbol))
         (result ()))
-    (!do-packages (package)
+    (do-packages (package)
       (multiple-value-bind (symbol found) (find-symbol string package)
         (when found (pushnew symbol result))))
     result))
@@ -1640,7 +1765,7 @@ PACKAGE."
             (result nil))
         (do-symbols (symbol package)
           (when (and (or (not external-only)
-                         (and (eq (symbol-package symbol) package)
+                         (and (eq (sb-xc:symbol-package symbol) package)
                               (eq (nth-value 1 (find-symbol (symbol-name symbol)
                                                             package))
                                   :external)))
@@ -1675,13 +1800,14 @@ PACKAGE."
 ;;;; The shape of this list is ((package . (externals . internals)) ...)
 (defvar *!initial-symbols*)
 
+(defun pkg-name= (a b) (and (not (eql a 0)) (string= a b)))
 (defun !package-cold-init ()
-  (setf *package-graph-lock* (sb!thread:make-mutex :name "Package Graph Lock")
-        *package-names*
-        (make-info-hashtable
-         :comparator (named-lambda "PKG-NAME=" (a b)
-                       (and (not (eql a 0)) (string= a b)))
-         :hash-function #'sxhash))
+  (setf *package-names* (make-info-hashtable :comparator #'pkg-name=
+                                             :hash-function #'sxhash)
+        *package-nickname-ids*
+        (cons (make-info-hashtable :comparator #'pkg-name=
+                                   :hash-function #'sxhash)
+              1))
   (with-package-names (names)
     (dolist (spec *!initial-symbols*)
       (let ((pkg (car spec)) (symbols (cdr spec)))
@@ -1696,13 +1822,11 @@ PACKAGE."
           (setf (package-external-symbols pkg) (!make-table (first symbols))
                 (package-internal-symbols pkg) (!make-table (second symbols))))
         (setf (package-%local-nicknames pkg) nil
-              (package-%locally-nicknamed-by pkg) nil
               (package-source-location pkg) nil
               (info-gethash (package-%name pkg) names) pkg)
         (dolist (nick (package-%nicknames pkg))
           (setf (info-gethash nick names) (list pkg)))
-        (setf (package-lock pkg) nil
-              (package-%implementation-packages pkg) nil))))
+        (setf (package-%implementation-packages pkg) nil))))
 
   ;; pass 2 - set the 'tables' slots only after all tables have been made
   (dolist (spec *!initial-symbols*)
@@ -1791,7 +1915,7 @@ PACKAGE."
                                                (logand start-state 3))))))
                      (when (zerop index)
                        (return (advance start-state))))))
-          (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+          (declare (optimize (sb-c::insert-array-bounds-checks 0)))
           (if (logtest start-state +package-iter-check-shadows+)
               (let ((shadows (package-%shadowing-symbols (this-package))))
                 (scan (not (member sym shadows :test #'string=))))
@@ -1807,7 +1931,7 @@ PACKAGE."
                        ;; The warning is enough. It's ugly that both happen.
                        (warn "Compile-time package lock violation:~%  ~A"
                              condition)
-                       (sb!c:compiler-error condition))
+                       (sb-c:compiler-error condition))
                       (:eval
                        (eval-error condition))))))
     (with-single-package-locked-error (:symbol symbol control))))
@@ -1816,3 +1940,57 @@ PACKAGE."
   (package-doc-string x))
 (defmethod (setf documentation) (new-value (x package) (doc-type (eql 't)))
   (setf (package-doc-string x) new-value))
+
+;;; Given a cell containing memoization data for FIND-PACKAGE, perform that action
+;;; with as little work as possible.
+(defun cached-find-package (cell)
+  (declare (optimize speed))
+  (let ((memo (car cell)))
+    (declare (type (simple-vector 3) memo)) ; #(cookie nick-id #<weak-ptr #<pkg>>)
+    (when (eq (aref memo 0) *package-names-cookie*) ; valid cache entry
+      ;; This does not cull out entries containing broken weak references.
+      ;; PKG-SEARCH-LOCALNICKS will take care of them eventually.
+      (binding* ((nicks (package-%local-nicknames *package*) :exit-if-null)
+                 (nick-id (aref memo 1) :exit-if-null)
+                 (entry (find nick-id (the simple-vector nicks)
+                              :test #'eq :key #'pkgnick-id) :exit-if-null)
+                 (pkg (pkgnick-actual entry) :exit-if-null))
+        (when (package-%name pkg)
+          (return-from cached-find-package pkg)))
+      (let ((pkg (weak-pointer-value (aref memo 2))))
+        (when (and (packagep pkg) (package-%name pkg))
+          (return-from cached-find-package pkg))))
+    (let* ((string (cdr cell))
+           (nick-id (info-gethash string (car *package-nickname-ids*)))
+           (pkg (find-undeleted-package-or-lose string)))
+      (setf (car cell)
+            (vector *package-names-cookie* nick-id (make-weak-pointer pkg)))
+      pkg)))
+
+;;; We don't benefit from these transforms because any time we have a constant
+;;; package in our code, we refer to it via #.(FIND-PACKAGE).
+;;; This is a necessity due to the fact that historically all packages got renamed
+;;; during warm build, and all INTERN / FIND-SYMBOL calls had to continue to work.
+;;; Now we rename packages for the _next_ build, but the principle remains.
+(in-package "SB-C")
+(defun find-package-xform (package)
+  ;; If you make KEYWORD, CL, COMMON-LISP, CL-USER, or COMMON-LISP-USER
+  ;; a local nickname of something, I kinda think you deserve to lose,
+  ;; never mind that we permit it. You'll probably want to declare INTERN
+  ;; and FIND-SYMBOL as notinline.
+  (let* ((string (string (lvar-value package)))
+         (std-pkg (cond ((string= string "KEYWORD") "KEYWORD")
+                        ((or (string= string "COMMON-LISP") (string= string "CL"))
+                         "CL")
+                        ((or (string= string "COMMON-LISP-USER")
+                             (string= string "CL-USER"))
+                         "CL-USER"))))
+    (if std-pkg
+        `(load-time-value (find-package ,std-pkg) t)
+        `(load-time-value (cons (vector nil nil nil) ,string)))))
+
+(deftransform intern ((name package-name) (t (constant-arg string-designator)))
+  `(sb-impl::intern2 name ,(find-package-xform package-name)))
+
+(deftransform find-symbol ((name package-name) (t (constant-arg string-designator)))
+  `(sb-impl::find-symbol2 name ,(find-package-xform package-name)))

@@ -10,10 +10,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; HASH-TABLE is implemented as a STRUCTURE-OBJECT.
-(sb!xc:defstruct (hash-table (:copier nil)
+(sb-xc:defstruct (hash-table (:copier nil)
                              (:constructor %make-hash-table
                                (test
                                 test-fun
@@ -65,29 +65,30 @@
   (cache nil :type (or null index))
   ;; The index vector. This may be larger than the hash size to help
   ;; reduce collisions.
-  (index-vector nil :type (simple-array sb!vm:word (*)))
+  (index-vector nil :type (simple-array sb-vm:word (*)))
   ;; This table parallels the KV vector, and is used to chain together
   ;; the hash buckets and the free list. A slot will only ever be in
   ;; one of these lists.
-  (next-vector nil :type (simple-array sb!vm:word (*)))
+  (next-vector nil :type (simple-array sb-vm:word (*)))
   ;; This table parallels the KV table, and can be used to store the
   ;; hash associated with the key, saving recalculation. Could be
   ;; useful for EQL, and EQUAL hash tables. This table is not needed
   ;; for EQ hash tables, and when present the value of
   ;; +MAGIC-HASH-VECTOR-VALUE+ represents EQ-based hashing on the
   ;; respective key.
-  (hash-vector nil :type (or null (simple-array sb!vm:word (*))))
+  (hash-vector nil :type (or null (simple-array sb-vm:word (*))))
   ;; Used for locking GETHASH/(SETF GETHASH)/REMHASH
-  (lock (sb!thread:make-mutex :name "hash-table lock")
-        :type sb!thread:mutex :read-only t)
+  (lock (sb-thread:make-mutex :name "hash-table lock")
+        #-c-headers-only :type #-c-headers-only sb-thread:mutex
+        :read-only t)
   ;; List of values culled out during GC of weak hash table.
   (culled-values nil :type list)
   ;; For detecting concurrent accesses.
-  #!+sb-hash-table-debug
+  #+sb-hash-table-debug
   (signal-concurrent-access t :type (member nil t))
-  #!+sb-hash-table-debug
+  #+sb-hash-table-debug
   (reading-thread nil)
-  #!+sb-hash-table-debug
+  #+sb-hash-table-debug
   (writing-thread nil))
 
 ;; as explained by pmai on openprojects #lisp IRC 2002-07-30: #x80000000
@@ -96,7 +97,7 @@
 ;; The previous sentence was written when SBCL was 32-bit only. The value
 ;; now depends on the word size. It is propagated to C in genesis because
 ;; the generational garbage collector needs to know it.
-(defconstant +magic-hash-vector-value+ (ash 1 (1- sb!vm:n-word-bits)))
+(defconstant +magic-hash-vector-value+ (ash 1 (1- sb-vm:n-word-bits)))
 
 ;;; Return an association list representing the same data as HASH-TABLE.
 (defun %hash-table-alist (hash-table)

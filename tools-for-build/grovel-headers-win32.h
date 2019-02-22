@@ -1,5 +1,5 @@
 {
-    printf("(in-package \"SB!WIN32\")\n\n");
+    printf("(in-package \"SB-WIN32\")\n\n");
 
     defconstant ("input-record-size", sizeof (INPUT_RECORD));
 
@@ -109,6 +109,7 @@
 
     defconstant("error-io-pending", ERROR_IO_PENDING);
     defconstant("error-broken-pipe", ERROR_BROKEN_PIPE);
+    defconstant("error-no-data", ERROR_NO_DATA);
     defconstant("error-handle-eof", ERROR_HANDLE_EOF);
 
 
@@ -174,7 +175,7 @@
     defconstant("still-active", STILL_ACTIVE);
 
     /* FIXME: SB-UNIX and SB-WIN32 really need to be untangled. */
-    printf("(in-package \"SB!UNIX\")\n\n");
+    printf("(in-package \"SB-UNIX\")\n\n");
     printf(";;; Unix-like constants and types on Windows\n");
     defconstant("o_rdonly", _O_RDONLY);
     defconstant("o_wronly", _O_WRONLY);

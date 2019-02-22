@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 ;;;; various constants and essentially-constants
 
@@ -33,7 +33,7 @@
 ;;;   against.
 (defglobal *fasl-header-string-start-string* "# FASL")
 
-;;; a list of SB!XC:*FEATURES* flags which affect binary compatibility,
+;;; a list of SB-XC:*FEATURES* flags which affect binary compatibility,
 ;;; i.e. which must be the same between the SBCL which compiled the code
 ;;; and the SBCL which executes the code. This is a property of SBCL executables
 ;;; in the abstract, not of this particular SBCL executable,
@@ -43,13 +43,13 @@
     (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc
               :gencgc :msan :sb-safepoint :sb-safepoint-strictly
               :sb-dynamic-core)
-            #!+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
+            #+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
 
 ;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
 ;;; which are present in a particular compilation.
 (defun compute-features-affecting-fasl-format ()
   (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
-                                             sb!xc:*features*))
+                                             sb-xc:*features*))
                     #'string< :key #'symbol-name)))
     ;; Stringify the subset of *FEATURES* that affect fasl format.
     ;; A list would be the natural representation choice for this, but a string
@@ -174,7 +174,7 @@
   ;; function calls) while executing other FOPs. SKIP-UNTIL will
   ;; either contain the position where the skipping will stop, or
   ;; NIL if we're executing normally.
-  (skip-until nil))
+  (skip-until nil :type (or null fixnum)))
 (declaim (freeze-type fasl-input))
 
 ;;; Unique number assigned into high 4 bytes of 64-bit code size slot

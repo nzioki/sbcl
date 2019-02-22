@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (defun call-with-defining-class (kind name thunk)
   (declare (ignorable kind name))
@@ -36,10 +36,10 @@
   (flet ((proclaim-ftype-for-name (kind name type)
            (ecase kind
              (condition
-              (sb!xc:proclaim `(ftype ,(type-specifier type) ,name)))
+              (sb-xc:proclaim `(ftype ,(type-specifier type) ,name)))
              (class
               (when (eq (info :function :where-from name) :assumed)
-                (sb!c:proclaim-ftype name type nil :defined))))))
+                (sb-c:proclaim-ftype name type nil :defined))))))
 
     (defun preinform-compiler-about-accessors (kind readers writers)
       (flet ((inform (names type)
@@ -54,9 +54,9 @@
                        (let ((name (funcall key slot)))
                          (proclaim-ftype-for-name kind name type)))
                      slots)))
-        (inform slots #'sb!pcl::slot-reader-name reader-function-type)
-        (inform slots #'sb!pcl::slot-boundp-name reader-function-type)
-        (inform slots #'sb!pcl::slot-writer-name writer-function-type)))))
+        (inform slots #'sb-pcl::slot-reader-name reader-function-type)
+        (inform slots #'sb-pcl::slot-boundp-name reader-function-type)
+        (inform slots #'sb-pcl::slot-writer-name writer-function-type)))))
 
 (defun %%compiler-defclass (name readers writers slots)
   ;; ANSI says (Macro DEFCLASS, section 7.7) that DEFCLASS, if it

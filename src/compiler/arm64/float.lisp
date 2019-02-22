@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Move functions:
 
@@ -380,7 +380,7 @@
   (frob > :gt >/single-float >/double-float nil)
   (frob <= :le <=/single-float <=/double-float nil)
   (frob >= :ge >=/single-float >=/double-float nil)
-  (frob = :eq eql/single-float eql/double-float t))
+  (frob = :eq =/single-float =/double-float t))
 
 (define-vop (float-compare-zero)
   (:args (x))
@@ -567,6 +567,27 @@
           ;; explicit error than a silent miscompilation.
           (bug "Unable to extract single-float bits from ~S to ~S" float bits)))))))
 
+(define-vop (double-float-bits)
+  (:args (float :scs (double-reg descriptor-reg)))
+  (:results (bits :scs (signed-reg)))
+  (:arg-types double-float)
+  (:result-types signed-num)
+  (:translate double-float-bits)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 5
+    (sc-case float
+      (double-reg
+       (inst fmov bits float))
+      (double-stack
+        (inst ldr bits
+              (@ (current-nfp-tn vop)
+                 (load-store-offset (* (tn-offset float) n-word-bytes)))))
+      (descriptor-reg
+       (inst ldr bits
+             (@ float (- (* double-float-value-slot n-word-bytes)
+                         other-pointer-lowtag)))))))
+
 (define-vop (double-float-high-bits)
   (:args (float :scs (double-reg descriptor-reg)))
   (:results (hi-bits :scs (signed-reg)))
@@ -630,7 +651,7 @@
 
 ;;;; Float mode hackery:
 
-(sb!xc:deftype float-modes () '(unsigned-byte 32))
+(sb-xc:deftype float-modes () '(unsigned-byte 32))
 (defknown floating-point-modes () float-modes (flushable))
 (defknown ((setf floating-point-modes)) (float-modes)
   float-modes)

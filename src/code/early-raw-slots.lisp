@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; STRUCTURE-OBJECT supports placement of raw bits within the object
 ;;; to allow representation of native word and float-point types directly.
@@ -26,9 +26,12 @@
 ;;; EQUALP checking, to name a few) have to be able to determine for each
 ;;; slot whether it is a Lisp descriptor or just bits. This is done
 ;;; with the LAYOUT-BITMAP of an object's layout.
-;;; The bitmap stores a '1' for each bit representing a raw word,
-;;; and could be a BIGNUM given a spectacularly huge structure.
-
+;;;
+;;; The bitmap stores a 1 in each bit index corresponding to a tagged slot
+;;; index. If tagged slots follow raw slots and the the number of slots is
+;;; large, the bitmap could be a bignum.  As a special case, -1 represents
+;;; that all slots are tagged regardless of instance length.
+;;;
 ;;; Also note that there are possibly some alignment concerns which must
 ;;; be accounted for when DEFSTRUCT lays out slots,
 ;;; by injecting padding words appropriately.
@@ -37,12 +40,11 @@
 ;;; but this is considered a minor bug.
 
 ;; To utilize a word-sized slot in a defstruct without having to resort to
-;; writing (myslot :type (unsigned-byte #.sb!vm:n-word-bits)), or even
+;; writing (myslot :type (unsigned-byte #.sb-vm:n-word-bits)), or even
 ;; worse (:type #+sb-xc-host <sometype> #-sb-xc-host <othertype>),
 ;; these abstractions are provided as soon as the raw slots defs are.
-;; 'signed-word' is here for companionship - slots of that type are not raw.
-(def!type sb!vm:word () `(unsigned-byte ,sb!vm:n-word-bits))
-(def!type sb!vm:signed-word () `(signed-byte ,sb!vm:n-word-bits))
+(def!type sb-vm:word () `(unsigned-byte ,sb-vm:n-word-bits))
+(def!type sb-vm:signed-word () `(signed-byte ,sb-vm:n-word-bits))
 (defconstant +layout-all-tagged+ -1)
 
 ;; information about how a slot of a given DSD-RAW-TYPE is to be accessed
@@ -72,7 +74,7 @@
        (defun raw-slot-data-accessor-name (rsd)
          (%simple-fun-name (raw-slot-data-accessor-fun rsd))))
 
-#!-sb-fluid (declaim (freeze-type raw-slot-data))
+#-sb-fluid (declaim (freeze-type raw-slot-data))
 
 ;; Simulate DEFINE-LOAD-TIME-GLOBAL - always bound in the image
 ;; but not eval'd in the compiler.
@@ -98,25 +100,25 @@
                    ,@args :allow-other-keys t))))
     (let ((double-float-alignment
             ;; white list of architectures that can load unaligned doubles:
-            #!+(or x86 x86-64 ppc arm64) 1
+            #+(or x86 x86-64 ppc arm64) 1
             ;; at least sparc, mips and alpha can't:
-            #!-(or x86 x86-64 ppc arm64) 2))
+            #-(or x86 x86-64 ppc arm64) 2))
      (setq *raw-slot-data*
       (vector
-       (make-raw-slot-data :raw-type 'sb!vm:word
+       (make-raw-slot-data :raw-type 'sb-vm:word
                            :accessor-name '%raw-instance-ref/word
-                           :init-vop 'sb!vm::raw-instance-init/word
+                           :init-vop 'sb-vm::raw-instance-init/word
                            :n-words 1)
        ;; If this list of architectures is changed, then also change the test
        ;; for :DEFINE-STRUCTURE-SLOT-ADDRESSOR in raw-slots-interleaved.impure
-       #!+(or arm64 x86 x86-64)
-       (make-raw-slot-data :raw-type 'sb!vm:signed-word
+       #+(or arm64 x86 x86-64)
+       (make-raw-slot-data :raw-type 'sb-vm:signed-word
                            :accessor-name '%raw-instance-ref/signed-word
-                           :init-vop 'sb!vm::raw-instance-init/signed-word
+                           :init-vop 'sb-vm::raw-instance-init/signed-word
                            :n-words 1)
        (make-raw-slot-data :raw-type 'single-float
                            :accessor-name '%raw-instance-ref/single
-                           :init-vop 'sb!vm::raw-instance-init/single
+                           :init-vop 'sb-vm::raw-instance-init/single
                            ;; KLUDGE: On 64 bit architectures, we
                            ;; could pack two SINGLE-FLOATs into the
                            ;; same word if raw slots were indexed
@@ -130,28 +132,28 @@
                            :n-words 1)
        (make-raw-slot-data :raw-type 'double-float
                            :accessor-name '%raw-instance-ref/double
-                           :init-vop 'sb!vm::raw-instance-init/double
+                           :init-vop 'sb-vm::raw-instance-init/double
                            :alignment double-float-alignment
-                           :n-words (/ 8 sb!vm:n-word-bytes))
+                           :n-words (/ 8 sb-vm:n-word-bytes))
        (make-raw-slot-data :raw-type 'complex-single-float
                            :accessor-name '%raw-instance-ref/complex-single
-                           :init-vop 'sb!vm::raw-instance-init/complex-single
-                           :n-words (/ 8 sb!vm:n-word-bytes))
+                           :init-vop 'sb-vm::raw-instance-init/complex-single
+                           :n-words (/ 8 sb-vm:n-word-bytes))
        (make-raw-slot-data :raw-type 'complex-double-float
                            :accessor-name '%raw-instance-ref/complex-double
-                           :init-vop 'sb!vm::raw-instance-init/complex-double
+                           :init-vop 'sb-vm::raw-instance-init/complex-double
                            :alignment double-float-alignment
-                           :n-words (/ 16 sb!vm:n-word-bytes))
-       #!+long-float
+                           :n-words (/ 16 sb-vm:n-word-bytes))
+       #+long-float
        (make-raw-slot-data :raw-type long-float
                            :accessor-name '%raw-instance-ref/long
-                           :init-vop 'sb!vm::raw-instance-init/long
-                           :n-words #!+x86 3 #!+sparc 4)
-       #!+long-float
+                           :init-vop 'sb-vm::raw-instance-init/long
+                           :n-words #+x86 3 #+sparc 4)
+       #+long-float
        (make-raw-slot-data :raw-type complex-long-float
                            :accessor-name '%raw-instance-ref/complex-long
-                           :init-vop 'sb!vm::raw-instance-init/complex-long
-                           :n-words #!+x86 6 #!+sparc 8))))))
+                           :init-vop 'sb-vm::raw-instance-init/complex-long
+                           :n-words #+x86 6 #+sparc 8))))))
 
 #+sb-xc-host (!raw-slot-data-init)
 #+sb-xc
@@ -181,7 +183,7 @@
                          ;; target instances have an odd number of payload words.
                          `(logior (%instance-length ,instance) #-sb-xc-host 1)
                          `(%instance-length ,instance))))
-       (do ((,index-var sb!vm:instance-data-start (1+ ,index-var)))
+       (do ((,index-var sb-vm:instance-data-start (1+ ,index-var)))
            ((>= ,index-var ,limit))
          (declare (type index ,index-var))
          (when (logbitp ,index-var ,bitmap)

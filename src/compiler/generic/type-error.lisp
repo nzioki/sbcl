@@ -8,7 +8,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; (ARRAY NIL) stuff looks the same on all platforms
 ;;;
@@ -71,7 +71,7 @@
 
 (define-vop (type-check-error/c)
   (:policy :fast-safe)
-  (:translate sb!c::%type-check-error/c)
+  (:translate sb-c::%type-check-error/c)
   (:args (object :scs (descriptor-reg any-reg unsigned-reg signed-reg
                        character-reg constant)))
   (:arg-types * (:constant symbol) (:constant t))
@@ -85,7 +85,7 @@
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
 
-#!+immobile-space
+#+immobile-space
 (defun type-err-type-tn-loadp (thing)
   (cond ((sc-is thing immediate)
          (let ((obj (tn-value thing)))
@@ -109,7 +109,7 @@
                                                 unsigned-reg signed-reg constant
                                                 single-reg double-reg
                                                 complex-single-reg complex-double-reg)
-                                          #!+immobile-space
+                                          #+immobile-space
                                           ,@(if (eq name 'type-check-error)
                                                 `(:load-if (type-err-type-tn-loadp ,arg)))))
                                  args))
@@ -122,20 +122,20 @@
                 (:generator 1000
                   (error-call vop ',error ,@args)))))
   (def arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nil nargs)
+    sb-c::%arg-count-error nil nargs)
   (def local-arg-count-error local-invalid-arg-count-error
-    sb!c::%local-arg-count-error nil nargs fname)
-  (def type-check-error object-not-type-error sb!c::%type-check-error t
+    sb-c::%local-arg-count-error nil nargs fname)
+  (def type-check-error object-not-type-error sb-c::%type-check-error t
     object ptype)
-  (def layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error nil
+  (def layout-invalid-error layout-invalid-error sb-c::%layout-invalid-error nil
     object layout)
   (def odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error nil)
+    sb-c::%odd-key-args-error nil)
   (def unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error t key)
+    sb-c::%unknown-key-arg-error t key)
   (def nil-fun-returned-error nil-fun-returned-error nil nil fun)
-  (def failed-aver sb!kernel::failed-aver-error
-    sb!impl::%failed-aver
+  (def failed-aver sb-kernel::failed-aver-error
+    sb-impl::%failed-aver
     nil form))
 
 
@@ -154,7 +154,7 @@
   (encode-internal-error-args values))
 
 (defun encode-internal-error-args (values)
-  (sb!c::with-adjustable-vector (vector)
+  (sb-c::with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset

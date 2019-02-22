@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 #-sb-xc-host
 (defun machine-type ()
@@ -12,7 +12,7 @@
 (!with-bigvec-or-sap
 (defun fixup-code-object (code offset value kind flavor)
   (declare (ignore flavor))
-  (unless (zerop (rem offset sb!assem:+inst-alignment-bytes+))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let* ((sap (code-instructions code))
          (inst (sap-ref-32 sap offset)))
@@ -73,6 +73,6 @@
   (let* ((pc (context-pc context))
          (trap-number (logand (sap-ref-8 pc 3) #x1f)))
     (declare (type system-area-pointer pc))
-    (sb!kernel::decode-internal-error-args (sap+ pc 5) trap-number
+    (sb-kernel::decode-internal-error-args (sap+ pc 5) trap-number
                                            (sap-ref-8 pc 4))))
 ) ; end PROGN

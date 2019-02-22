@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DYNCOUNT")
+(in-package "SB-DYNCOUNT")
 
 #|
 comments from CMU CL:
@@ -29,7 +29,7 @@ comments from CMU CL:
 (defun make-hash-table-like (table)
   "Make a hash-table with the same test as table."
   (declare (type hash-table table))
-  (make-hash-table :test (sb!impl::hash-table-kind table)))
+  (make-hash-table :test (sb-impl::hash-table-kind table)))
 
 (defun hash-difference (table1 table2)
   "Return a hash-table containing only the entries in Table1 whose key is not
@@ -109,7 +109,7 @@ comments from CMU CL:
     (setf (vop-stats-cost res) cost)
     res))
 
-#!-sb-fluid (declaim (freeze-type dyncount-info vop-stats))
+#-sb-fluid (declaim (freeze-type dyncount-info vop-stats))
 
 ;;;    Add the Info into the cumulative result on the VOP name plist. We use
 ;;; plists so that we will touch minimal system code outside of this file
@@ -161,7 +161,7 @@ comments from CMU CL:
   (dohash ((k v) *backend-template-names* :locked t)
     (declare (ignore v))
     (remprop k 'vop-stats))
-  (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
@@ -176,7 +176,7 @@ comments from CMU CL:
   "Return a hash-table mapping string VOP names to VOP-STATS structures
    describing the VOPs executed. If clear is true, then reset all counts to
    zero as a side effect."
-  (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
@@ -199,9 +199,9 @@ comments from CMU CL:
 (defun find-info-for (function)
   (declare (type function function))
   (let* ((function (%primitive closure-fun function))
-         (component (sb!di::fun-code-header function)))
+         (component (sb-di::fun-code-header function)))
     (do ((end (code-header-words component))
-         (i sb!vm:code-constants-offset (1+ i)))
+         (i sb-vm:code-constants-offset (1+ i)))
         ((= end i))
       (let ((constant (code-header-ref component i)))
         (when (dyncount-info-p constant)
@@ -389,7 +389,7 @@ comments from CMU CL:
 (defun entry-report (entries cut-off compensated compare total-cost)
   (let ((counter (if (and cut-off (> (length entries) cut-off))
                      cut-off
-                     most-positive-fixnum)))
+                     sb-xc:most-positive-fixnum)))
   (dolist (entry entries)
     (let* ((cost (vop-stats-cost entry))
            (name (vop-stats-name entry))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun repeating-pattern-p (val)
   (declare (type (unsigned-byte 32) val))
@@ -172,7 +172,7 @@
   (:vop-var vop)
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (load-immediate-word y (tn-value x)))
           (t
            (load-constant vop x y)
@@ -237,7 +237,7 @@
     (inst adds temp x x)
     (inst adds :vc y temp temp)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1+ sb!xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
                    y)
     DONE))
 
@@ -246,7 +246,7 @@
     (inst adds temp x x)
     (inst adds :vc y temp temp)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1- sb!xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
                    y)
     DONE))
 

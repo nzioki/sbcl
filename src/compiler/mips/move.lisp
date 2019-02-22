@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 (define-move-fun (load-immediate 1) (vop x y)
@@ -124,7 +124,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst li y (tn-value x)))
           (t
            (loadw y code-tn (tn-offset x) other-pointer-lowtag)
@@ -208,7 +208,7 @@
     (inst beq temp done)
     (inst sll y x n-fixnum-tag-bits)
 
-    (load-constant vop (emit-constant (1+ sb!xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
                    y)
     (inst b done)
     (inst nop)
@@ -225,7 +225,7 @@
     (inst beq temp done)
     (inst sll y x n-fixnum-tag-bits)
 
-    (load-constant vop (emit-constant (1- sb!xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
                    y)
     (inst b done)
     (inst nop)

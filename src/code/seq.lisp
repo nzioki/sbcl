@@ -16,12 +16,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; utilities
 
 (defun %check-generic-sequence-bounds (seq start end)
-  (let ((length (sb!sequence:length seq)))
+  (let ((length (sb-sequence:length seq)))
     (if (<= 0 start (or end length) length)
         (or end length)
         (sequence-bounding-indices-bad-error seq start end))))
@@ -32,12 +32,12 @@
     `((count nil
              nil
              (etypecase count
-               (null (1- most-positive-fixnum))
+               (null (1- sb-xc:most-positive-fixnum))
                (fixnum (max 0 count))
                (integer (if (minusp count)
                             0
-                            (1- most-positive-fixnum))))
-             (mod #.sb!xc:most-positive-fixnum))
+                            (1- sb-xc:most-positive-fixnum))))
+             (mod #.sb-xc:most-positive-fixnum))
       ;; Entries for {start,end}{,1,2}
       ,@(mapcan (lambda (names)
                   (destructuring-bind (start end length sequence) names
@@ -92,18 +92,25 @@
               (rebindings/eager)
               ;; Things which may be used/are only used in certain
               ;; code paths (e.g. length).
-              (rebindings/lazy))
+              (rebindings/lazy)
+              (substs))
       (dolist (arg args)
         (let ((sym (if (listp arg) (car arg) arg)))
           (when (member sym '(function predicate key test test-not))
             (funargs sym)))
-        (case arg
-          ;; FIXME: make this robust.  And clean.
-          ((sequence sequence1 sequence2)
-           (let* ((length-var (ecase arg
-                                (sequence  'length)
-                                (sequence1 'length1)
-                                (sequence2 'length2)))
+        (cond
+          ((and (symbolp arg)
+                (search "SEQUENCE" (string arg)))
+           (let* ((length-var (ecase (char (string arg) (1- (length (string arg))))
+                                (#\E
+                                 'length)
+                                (#\1
+                                 ;; For *sequence-keyword-info*
+                                 (substs (cons arg 'sequence1))
+                                 'length1)
+                                (#\2
+                                 (substs (cons arg 'sequence2))
+                                 'length2)))
                   (cache-var (symbolicate length-var '#:-cache)))
              (new-args arg)
              (rebindings/eager `(,cache-var nil))
@@ -111,7 +118,7 @@
               `(,length-var (truly-the
                              index
                              (or ,cache-var (setf ,cache-var (length ,arg))))))))
-          ((function predicate)
+          ((memq arg '(function predicate))
            (new-args arg)
            (rebindings/eager `(,arg (%coerce-callable-to-fun ,arg))))
           (t
@@ -119,6 +126,8 @@
              (cond (info
                     (destructuring-bind (default supplied-p adjuster type) info
                       (new-args `(,arg ,default ,@(when supplied-p (list supplied-p))))
+                      (loop for (new . old) in (substs)
+                            do (setf adjuster (subst new old adjuster)))
                       (rebindings/eager `(,arg ,adjuster))
                       (new-declarations `(type ,type ,arg))))
                    (t (new-args arg)))))))
@@ -170,7 +179,7 @@
             ,vector-form))
          ,@(cond ((not other-form-p)
                   `((t
-                     (sb!c::%type-check-error ,sequence '(or list vector)
+                     (sb-c::%type-check-error ,sequence '(or list vector)
                                               nil))))
                  (other-form
                   `(((extended-sequence-p ,sequence)
@@ -178,8 +187,8 @@
                        (declare (ignorable ,sequence))
                        ,other-form))
                     (t
-                     (sb!c::%type-check-error/c
-                      ,sequence 'sb!kernel::object-not-sequence-error nil)))))))
+                     (sb-c::%type-check-error/c
+                      ,sequence 'sb-kernel::object-not-sequence-error nil)))))))
 
 ;;; Like SEQ-DISPATCH-CHECKING, but also assert that OTHER-FORM produces
 ;;; a sequence. This assumes that the containing function declares its
@@ -195,7 +204,7 @@
   `(seq-dispatch ,sequence
      (make-list ,length)
      (make-vector-like ,sequence ,length)
-     (sb!sequence:make-sequence-like ,sequence ,length)))
+     (sb-sequence:make-sequence-like ,sequence ,length)))
 
 (defun bad-sequence-type-error (type-spec)
   (declare (optimize allow-non-returning-tail-call))
@@ -251,8 +260,8 @@
                               ,expanded
                               (find-class ,expanded nil))
                           :exit-if-null)
-                  (,prototype (sb!mop:class-prototype
-                               (sb!pcl:ensure-class-finalized ,class))))
+                  (,prototype (sb-mop:class-prototype
+                               (sb-pcl:ensure-class-finalized ,class))))
          ,@(unless prototypep `((ignore ,prototype)))
          ,@body))))
 
@@ -338,7 +347,7 @@
   (seq-dispatch-checking sequence
                 (null sequence)
                 (zerop (length sequence))
-                (sb!sequence:emptyp sequence)))
+                (sb-sequence:emptyp sequence)))
 
 (defun elt (sequence index)
   "Return the element of SEQUENCE specified by INDEX."
@@ -352,11 +361,11 @@
                          (car list)))
                   (declare (type index count)))
                 (locally
-                    (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                    (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                   (when (>= index (length sequence))
                     (signal-index-too-large-error sequence index))
                   (aref sequence index))
-                (sb!sequence:elt sequence index)))
+                (sb-sequence:elt sequence index)))
 
 (defun %setelt (sequence index newval)
   "Store NEWVAL as the component of SEQUENCE specified by INDEX."
@@ -373,7 +382,7 @@
                   (when (>= index (length sequence))
                     (signal-index-too-large-error sequence index))
                   (setf (aref sequence index) newval))
-                (setf (sb!sequence:elt sequence index) newval)))
+                (setf (sb-sequence:elt sequence index) newval)))
 
 (defun length (sequence)
   "Return an integer that is the length of SEQUENCE."
@@ -381,7 +390,7 @@
   (seq-dispatch-checking sequence
                 (length sequence)
                 (length sequence)
-                (sb!sequence:length sequence)))
+                (sb-sequence:length sequence)))
 
 (defun make-sequence (result-type length &key (initial-element nil iep))
   "Return a sequence of the given RESULT-TYPE and LENGTH, with
@@ -417,7 +426,7 @@
                   (sequence-type-length-mismatch-error type length)))
              ((cons-type-p type)
               (multiple-value-bind (min exactp)
-                  (sb!kernel::cons-type-length-info type)
+                  (sb-kernel::cons-type-length-info type)
                 (if exactp
                     (unless (= length min)
                       (sequence-type-length-mismatch-error type length))
@@ -451,9 +460,9 @@
              ;; we manually assert that it returns a SEQUENCE.
              (the extended-sequence
                   (if iep
-                      (sb!sequence:make-sequence-like
+                      (sb-sequence:make-sequence-like
                        prototype length :initial-element initial-element)
-                      (sb!sequence:make-sequence-like
+                      (sb-sequence:make-sequence-like
                        prototype length)))))
           (t (bad-sequence-type-error (type-specifier type))))))
 
@@ -537,7 +546,7 @@
   (seq-dispatch-checking=>seq sequence
     (list-subseq* sequence start end)
     (vector-subseq* sequence start end)
-    (sb!sequence:subseq sequence start end)))
+    (sb-sequence:subseq sequence start end)))
 
 ;;;; COPY-SEQ
 
@@ -549,7 +558,7 @@
     (vector-subseq* sequence 0 nil)
     ;; Copying an extended sequence has to return an extended-sequence
     ;; and not just any SEQUENCE.
-    (the extended-sequence (values (sb!sequence:copy-seq sequence)))))
+    (the extended-sequence (values (sb-sequence:copy-seq sequence)))))
 
 (defun list-copy-seq* (sequence)
   (copy-list-macro sequence :check-proper-list t))
@@ -587,32 +596,32 @@
                 do (setf pointer (cdr (rplaca pointer item)))))))
   sequence)
 
-(define-load-time-global %%fill-bashers%% (make-array (1+ sb!vm:widetag-mask)))
+(define-load-time-global %%fill-bashers%% (make-array (1+ sb-vm:widetag-mask)))
 #.`(progn
-   ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
-           for et = (sb!vm:saetp-specifier saetp)
+   ,@(loop for saetp across sb-vm:*specialized-array-element-type-properties*
+           for et = (sb-vm:saetp-specifier saetp)
            if (or (null et)
-                  (sb!vm:valid-bit-bash-saetp-p saetp))
+                  (sb-vm:valid-bit-bash-saetp-p saetp))
            collect
            (multiple-value-bind (basher value-transform)
                (if et
-                   (sb!c::find-basher saetp)
+                   (sb-c::find-basher saetp)
                    '(lambda (item vector start length)
                      (declare (ignore item start length))
                      (data-nil-vector-ref (truly-the (simple-array nil (*)) vector) 0)))
              `(setf
-               (aref %%fill-bashers%% ,(sb!vm:saetp-typecode saetp))
+               (aref %%fill-bashers%% ,(sb-vm:saetp-typecode saetp))
                (cons #',basher
                      ,(if et
-                          `(lambda (sb!c::item)
-                             (declare (type ,et sb!c::item))
+                          `(lambda (sb-c::item)
+                             (declare (type ,et sb-c::item))
                              ,value-transform)
                           '#'identity))))
            else do
            ;; vector-fill* depends on this assertion
            (assert (member et '(t (complex double-float)
-                                #!-64-bit (complex single-float)
-                                #!-64-bit double-float)
+                                #-64-bit (complex single-float)
+                                #-64-bit double-float)
                            :test #'equal))))
 
 (defun vector-fill* (vector item start end)
@@ -644,11 +653,11 @@
                    (funcall (truly-the function (car (truly-the cons bashers)))
                             (funcall (truly-the function (cdr bashers)) item)
                             vector start (- end start)))
-                  #!-64-bit
-                  ((eq widetag sb!vm:simple-array-double-float-widetag)
+                  #-64-bit
+                  ((eq widetag sb-vm:simple-array-double-float-widetag)
                    (fill-float double-float))
-                  #!-64-bit
-                  ((eq widetag sb!vm:simple-array-complex-single-float-widetag)
+                  #-64-bit
+                  ((eq widetag sb-vm:simple-array-complex-single-float-widetag)
                    (fill-float (complex single-float)))
                   (t
                    (fill-float (complex double-float))))))))
@@ -664,7 +673,7 @@
     ;; DEFTRANSFORM for FILL will turn these into
     ;; calls to UB*-BASH-FILL.
     (etypecase data
-      #!+sb-unicode
+      #+sb-unicode
       ((simple-array character (*))
        (let ((item (locally (declare (optimize (safety 3)))
                      (the character item))))
@@ -680,22 +689,22 @@
   (seq-dispatch-checking=>seq sequence
    (list-fill* sequence item start end)
    (vector-fill* sequence item start end)
-   (sb!sequence:fill sequence item
+   (sb-sequence:fill sequence item
                      :start start
                      :end (%check-generic-sequence-bounds sequence start end))))
 
 
 (defmacro word-specialized-vector-tag-p (tag)
   `(or
-    ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
-            when (and (eq (sb!vm:saetp-n-bits saetp) sb!vm:n-word-bits)
-                      (not (eq (sb!vm:saetp-specifier saetp) t)))
-            collect `(eq ,tag ,(sb!vm:saetp-typecode saetp)))))
+    ,@(loop for saetp across sb-vm:*specialized-array-element-type-properties*
+            when (and (eq (sb-vm:saetp-n-bits saetp) sb-vm:n-word-bits)
+                      (not (eq (sb-vm:saetp-specifier saetp) t)))
+            collect `(eq ,tag ,(sb-vm:saetp-typecode saetp)))))
 
 ;;;; REPLACE
 (defun vector-replace (vector1 vector2 start1 start2 end1 diff)
   (declare ((or (eql -1) index) start1 start2 end1)
-           (optimize (sb!c::insert-array-bounds-checks 0))
+           (optimize (sb-c::insert-array-bounds-checks 0))
            ((integer -1 1) diff))
   (let ((tag1 (%other-pointer-widetag vector1))
         (tag2 (%other-pointer-widetag vector2)))
@@ -705,7 +714,7 @@
                       ((= index1 end1))
                     (declare (fixnum index1 index2))
                     ,@body)))
-      (cond ((= tag1 tag2 sb!vm:simple-vector-widetag)
+      (cond ((= tag1 tag2 sb-vm:simple-vector-widetag)
              (copy
               (setf (svref vector1 index1) (svref vector2 index2))))
             ;; TODO: can do the same with small specialized arrays
@@ -823,7 +832,7 @@
   (when (null source-end) (setq source-end (length source-sequence)))
   (vector-replace-from-vector))
 
-#!+sb-unicode
+#+sb-unicode
 (defun simple-character-string-replace-from-simple-character-string*
     (target-sequence source-sequence
      target-start target-end source-start source-end)
@@ -833,7 +842,7 @@
   (vector-replace-from-vector))
 
 (define-sequence-traverser replace
-    (sequence1 sequence2 &rest args &key start1 end1 start2 end2)
+    (target-sequence1 source-sequence2 &rest args &key start1 end1 start2 end2)
   "Destructively modifies SEQUENCE1 by copying successive elements
 into it from the SEQUENCE2.
 
@@ -842,13 +851,13 @@ from the subsequence bounded by START2 and END2. If these subsequences
 are not of the same length, then the shorter length determines how
 many elements are copied."
   (declare (truly-dynamic-extent args))
-  (declare (explicit-check sequence1 sequence2 :result))
+  (declare (explicit-check target-sequence1 source-sequence2 :result))
   (let* (;; KLUDGE: absent either rewriting FOO-REPLACE-FROM-BAR, or
          ;; excessively polluting DEFINE-SEQUENCE-TRAVERSER, we rebind
          ;; these things here so that legacy code gets the names it's
          ;; expecting.  We could use &AUX instead :-/.
-         (target-sequence sequence1)
-         (source-sequence sequence2)
+         (target-sequence target-sequence1)
+         (source-sequence source-sequence2)
          (target-start start1)
          (source-start start2)
          (target-end (or end1 length1))
@@ -867,8 +876,8 @@ many elements are copied."
     ;; If sequence1 was a list or vector, then sequence2 is an extended-sequence
     ;; or not a sequence. Either way, check it.
     (the sequence
-      (values (apply #'sb!sequence:replace sequence1
-                     (the sequence sequence2) args)))))
+      (values (apply #'sb-sequence:replace target-sequence1
+                     (the sequence source-sequence2) args)))))
 
 ;;;; REVERSE
 (defun reverse (sequence)
@@ -884,7 +893,7 @@ many elements are copied."
     ;; a CONSED-SEQUENCE, which precludes non-simple vectors.
     ;; But a CLOS sequence can apparently decide to return a LIST when
     ;; reversed. [Is that too weird? Make this EXTENDED-SEQUENCE maybe?]
-    (the consed-sequence (values (sb!sequence:reverse sequence)))))
+    (the consed-sequence (values (sb-sequence:reverse sequence)))))
 
 (defun list-reverse (list)
   (do ((new-list ()))
@@ -910,8 +919,8 @@ many elements are copied."
                       :check-fill-pointer t)
       (declare (ignore start))
       (let* ((tag (%other-pointer-widetag vector))
-             (new-vector (sb!vm::allocate-vector-with-widetag tag length nil)))
-        (cond ((= tag sb!vm:simple-vector-widetag)
+             (new-vector (sb-vm::allocate-vector-with-widetag tag length nil)))
+        (cond ((= tag sb-vm:simple-vector-widetag)
                (do ((left-index 0 (1+ left-index))
                     (right-index end))
                    ((= left-index length))
@@ -959,7 +968,7 @@ many elements are copied."
     (with-array-data ((vector vector) (start) (end)
                       :check-fill-pointer t)
       (let ((tag (%other-pointer-widetag vector)))
-        (cond ((= tag sb!vm:simple-vector-widetag)
+        (cond ((= tag sb-vm:simple-vector-widetag)
                (do ((left-index start (1+ left-index))
                     (right-index (1- end) (1- right-index)))
                    ((<= right-index left-index))
@@ -993,10 +1002,10 @@ many elements are copied."
     ;; The type deriver for this is 'result-type-first-arg',
     ;; meaning it should return definitely an EXTENDED-SEQUENCE
     ;; and not a list or vector.
-    (the extended-sequence (values (sb!sequence:nreverse sequence)))))
+    (the extended-sequence (values (sb-sequence:nreverse sequence)))))
 
 
-(defmacro sb!sequence:dosequence ((element sequence &optional return) &body body)
+(defmacro sb-sequence:dosequence ((element sequence &optional return) &body body)
   "Executes BODY with ELEMENT subsequently bound to each element of
   SEQUENCE, then returns RETURN."
   (multiple-value-bind (forms decls) (parse-body body nil)
@@ -1007,7 +1016,7 @@ many elements are copied."
              (dolist (,element ,sequence ,return) ,@body)
              (do-vector-data (,element ,sequence ,return) ,@body)
              (multiple-value-bind (,state ,limit ,from-end ,step ,endp ,elt)
-                 (sb!sequence:make-sequence-iterator ,sequence)
+                 (sb-sequence:make-sequence-iterator ,sequence)
                (declare (function ,step ,endp ,elt))
                (do ((,state ,state (funcall ,step ,sequence ,state ,from-end)))
                    ((funcall ,endp ,sequence ,state ,limit ,from-end)
@@ -1041,7 +1050,7 @@ many elements are copied."
                     ((= index total-length) result)
                   (declare (fixnum index))
                   (let ((sequence (car sequences)))
-                    (sb!sequence:dosequence (e sequence)
+                    (sb-sequence:dosequence (e sequence)
                       (setf (aref result index) e)
                       (incf index)))))
              (let ((length (length (car seqs))))
@@ -1054,10 +1063,10 @@ many elements are copied."
        (apply #'%concatenate-to-list sequences))
       ((vector simple-vector)
        (apply #'%concatenate-to-simple-vector sequences))
-      #!+sb-unicode
+      #+sb-unicode
       ((string simple-string)
        (apply #'%concatenate-to-string sequences))
-      ((simple-base-string #!-sb-unicode string #!-sb-unicode simple-string)
+      ((simple-base-string #-sb-unicode string #-sb-unicode simple-string)
        (apply #'%concatenate-to-base-string sequences))
       (t
        (let ((type (specifier-type result-type)))
@@ -1075,7 +1084,7 @@ many elements are copied."
                '())
               ((cons-type-p type)
                (multiple-value-bind (min exactp)
-                   (sb!kernel::cons-type-length-info type)
+                   (sb-kernel::cons-type-length-info type)
                  (let ((length (reduce #'+ sequences :key #'length)))
                    (if exactp
                        (unless (= length min)
@@ -1091,7 +1100,7 @@ many elements are copied."
               ;; This function has the EXPLICIT-CHECK declaration,
               ;; so we manually assert that it returns a SEQUENCE.
               (the extended-sequence
-                   (apply #'sb!sequence:concatenate prototype sequences))))
+                   (apply #'sb-sequence:concatenate prototype sequences))))
            (t
             (bad-sequence-type-error result-type))))))))
 
@@ -1100,7 +1109,7 @@ many elements are copied."
 (macrolet ((def (name element-type &rest dispatch)
              `(defun ,name (&rest sequences)
                 (declare (explicit-check)
-                         (optimize (sb!c::insert-array-bounds-checks 0)))
+                         (optimize (sb-c::insert-array-bounds-checks 0)))
                 (let ((length 0))
                   (declare (index length))
                   (do-rest-arg ((seq) sequences)
@@ -1115,11 +1124,11 @@ many elements are copied."
                           (replace result seq :start1 start)
                           (incf start length))))
                     result)))))
-  #!+sb-unicode
+  #+sb-unicode
   (def %concatenate-to-string character
     (simple-array character (*)) (simple-array base-char (*)))
   (def %concatenate-to-base-string base-char
-    (simple-array base-char (*)) #!+sb-unicode (simple-array character (*)))
+    (simple-array base-char (*)) #+sb-unicode (simple-array character (*)))
   (def %concatenate-to-simple-vector t simple-vector))
 
 (defun %concatenate-to-list (&rest sequences)
@@ -1127,7 +1136,7 @@ many elements are copied."
   (let* ((result (list nil))
          (splice result))
     (do-rest-arg ((sequence) sequences)
-      (sb!sequence:dosequence (e sequence)
+      (sb-sequence:dosequence (e sequence)
         (setf splice (cdr (rplacd splice (list e))))))
     (cdr result)))
 
@@ -1137,12 +1146,12 @@ many elements are copied."
     (declare (index length))
     (do-rest-arg ((seq) sequences)
       (incf length (length seq)))
-    (let ((result (sb!vm::allocate-vector-with-widetag widetag length nil))
+    (let ((result (sb-vm::allocate-vector-with-widetag widetag length nil))
           (setter (the function (svref %%data-vector-setters%% widetag)))
           (index 0))
       (declare (index index))
       (do-rest-arg ((seq) sequences)
-        (sb!sequence:dosequence (e seq)
+        (sb-sequence:dosequence (e seq)
           (funcall setter result index e)
           (incf index)))
       result)))
@@ -1155,7 +1164,7 @@ many elements are copied."
   (declare (dynamic-extent fun))
   (let ((reversed-result nil)
         (really-fun (%coerce-callable-to-fun fun)))
-    (sb!sequence:dosequence (element sequence)
+    (sb-sequence:dosequence (element sequence)
       (push (funcall really-fun element)
             reversed-result))
     (nreverse reversed-result)))
@@ -1166,7 +1175,7 @@ many elements are copied."
         (index 0)
         (really-fun (%coerce-callable-to-fun fun)))
     (declare (type index index))
-    (sb!sequence:dosequence (element sequence)
+    (sb-sequence:dosequence (element sequence)
       (setf (aref result index)
             (funcall really-fun element))
       (incf index))
@@ -1175,7 +1184,7 @@ many elements are copied."
   (declare (explicit-check))
   (declare (dynamic-extent fun))
   (let ((really-fun (%coerce-callable-to-fun fun)))
-    (sb!sequence:dosequence (element sequence)
+    (sb-sequence:dosequence (element sequence)
       (funcall really-fun element)))
   nil)
 
@@ -1189,7 +1198,7 @@ many elements are copied."
                             s
                             0
                             (multiple-value-list
-                             (sb!sequence:make-sequence-iterator s))))
+                             (sb-sequence:make-sequence-iterator s))))
                         sequences))
         (%apply-args (make-list (length sequences))))
     ;; this is almost efficient (except in the general case where we
@@ -1290,7 +1299,7 @@ many elements are copied."
                     ;; declaration, so we manually assert that it
                     ;; returns a SEQUENCE.
                     (the extended-sequence
-                         (apply #'sb!sequence:map
+                         (apply #'sb-sequence:map
                                 prototype really-fun sequences))))
                  (t
                   (bad-sequence-type-error result-type))))))
@@ -1372,7 +1381,7 @@ many elements are copied."
 ;;; safety is turned off for vectors and lists but kept for generic
 ;;; sequences.
 (defun map-into (result-sequence function &rest sequences)
-  (declare (optimize (sb!c::check-tag-existence 0)))
+  (declare (optimize (sb-c::check-tag-existence 0)))
   (declare (dynamic-extent function))
   (let ((really-fun (%coerce-callable-to-fun function)))
     (etypecase result-sequence
@@ -1400,15 +1409,15 @@ many elements are copied."
            (setf node (cdr node)))))
       (sequence
        (multiple-value-bind (iter limit from-end)
-           (sb!sequence:make-sequence-iterator result-sequence)
+           (sb-sequence:make-sequence-iterator result-sequence)
          (map-into-lambda sequences (&rest args)
            (declare (truly-dynamic-extent args) (optimize speed))
-           (when (sb!sequence:iterator-endp result-sequence
+           (when (sb-sequence:iterator-endp result-sequence
                                             iter limit from-end)
              (return-from map-into result-sequence))
-           (setf (sb!sequence:iterator-element result-sequence iter)
+           (setf (sb-sequence:iterator-element result-sequence iter)
                  (apply really-fun args))
-           (setf iter (sb!sequence:iterator-step result-sequence
+           (setf iter (sb-sequence:iterator-step result-sequence
                                                            iter from-end)))))))
   result-sequence)
 
@@ -1507,7 +1516,7 @@ many elements are copied."
                   (setq start (1+ start)))
                 (mumble-reduce function sequence key start end
                                initial-value aref)))))
-    (apply #'sb!sequence:reduce function sequence args)))
+    (apply #'sb-sequence:reduce function sequence args)))
 
 ;;;; DELETE
 
@@ -1632,7 +1641,7 @@ many elements are copied."
       (if from-end
           (normal-mumble-delete-from-end)
           (normal-mumble-delete)))
-    (apply #'sb!sequence:delete item sequence args)))
+    (apply #'sb-sequence:delete item sequence args)))
 
 (defmacro if-mumble-delete ()
   `(mumble-delete
@@ -1668,7 +1677,7 @@ many elements are copied."
       (if from-end
           (if-mumble-delete-from-end)
           (if-mumble-delete)))
-    (apply #'sb!sequence:delete-if predicate sequence args)))
+    (apply #'sb-sequence:delete-if predicate sequence args)))
 
 (defmacro if-not-mumble-delete ()
   `(mumble-delete
@@ -1704,7 +1713,7 @@ many elements are copied."
       (if from-end
           (if-not-mumble-delete-from-end)
           (if-not-mumble-delete)))
-    (apply #'sb!sequence:delete-if-not predicate sequence args)))
+    (apply #'sb-sequence:delete-if-not predicate sequence args)))
 
 ;;;; REMOVE
 
@@ -1866,7 +1875,7 @@ many elements are copied."
       (if from-end
           (normal-mumble-remove-from-end)
           (normal-mumble-remove)))
-    (apply #'sb!sequence:remove item sequence args)))
+    (apply #'sb-sequence:remove item sequence args)))
 
 (define-sequence-traverser remove-if
     (predicate sequence &rest args &key from-end start end count key)
@@ -1885,7 +1894,7 @@ many elements are copied."
       (if from-end
           (if-mumble-remove-from-end)
           (if-mumble-remove)))
-    (apply #'sb!sequence:remove-if predicate sequence args)))
+    (apply #'sb-sequence:remove-if predicate sequence args)))
 
 (define-sequence-traverser remove-if-not
     (predicate sequence &rest args &key from-end start end count key)
@@ -1904,7 +1913,7 @@ many elements are copied."
       (if from-end
           (if-not-mumble-remove-from-end)
           (if-not-mumble-remove)))
-    (apply #'sb!sequence:remove-if-not predicate sequence args)))
+    (apply #'sb-sequence:remove-if-not predicate sequence args)))
 
 ;;;; REMOVE-DUPLICATES
 
@@ -2056,7 +2065,7 @@ many elements are copied."
         (list-remove-duplicates* sequence test test-not
                                  start end key from-end))
     (vector-remove-duplicates* sequence test test-not start end key from-end)
-    (apply #'sb!sequence:remove-duplicates sequence args)))
+    (apply #'sb-sequence:remove-duplicates sequence args)))
 
 ;;;; DELETE-DUPLICATES
 (defun list-delete-duplicates* (list test test-not key from-end start end)
@@ -2132,7 +2141,7 @@ many elements are copied."
       (list-delete-duplicates* sequence test test-not
                                key from-end start end))
     (vector-delete-duplicates* sequence test test-not key from-end start end)
-    (apply #'sb!sequence:delete-duplicates sequence args)))
+    (apply #'sb-sequence:delete-duplicates sequence args)))
 
 ;;;; SUBSTITUTE
 
@@ -2253,9 +2262,9 @@ many elements are copied."
     ;; pointless, but also LIST-SUBSTITUTE* and VECTOR-SUBSTITUTE*
     ;; dispatch once per element on PRED's run-time identity.
     ,(ecase (cadr pred)
-       ((normal) `(apply #'sb!sequence:substitute new old sequence args))
-       ((if) `(apply #'sb!sequence:substitute-if new predicate sequence args))
-       ((if-not) `(apply #'sb!sequence:substitute-if-not new predicate sequence args)))))
+       ((normal) `(apply #'sb-sequence:substitute new old sequence args))
+       ((if) `(apply #'sb-sequence:substitute-if new predicate sequence args))
+       ((if-not) `(apply #'sb-sequence:substitute-if-not new predicate sequence args)))))
 
 (define-sequence-traverser substitute
     (new old sequence &rest args &key from-end test test-not
@@ -2321,7 +2330,7 @@ many elements are copied."
                                test test-not (1- end) (1- start) count key)
           (nvector-substitute* new old sequence 1
                                test test-not start end count key)))
-    (apply #'sb!sequence:nsubstitute new old sequence args)))
+    (apply #'sb-sequence:nsubstitute new old sequence args)))
 
 (defun nlist-substitute* (new old sequence test test-not start end count key)
   (declare (fixnum start count end)
@@ -2386,7 +2395,7 @@ many elements are copied."
                                   (1- end) (1- start) count key)
           (nvector-substitute-if* new predicate sequence 1
                                   start end count key)))
-    (apply #'sb!sequence:nsubstitute-if new predicate sequence args)))
+    (apply #'sb-sequence:nsubstitute-if new predicate sequence args)))
 
 (defun nlist-substitute-if* (new test sequence start end count key)
   (declare (type fixnum start end count)
@@ -2442,7 +2451,7 @@ many elements are copied."
                                       (1- end) (1- start) count key)
           (nvector-substitute-if-not* new predicate sequence 1
                                       start end count key)))
-    (apply #'sb!sequence:nsubstitute-if-not new predicate sequence args)))
+    (apply #'sb-sequence:nsubstitute-if-not new predicate sequence args)))
 
 (defun nlist-substitute-if-not* (new test sequence start end count key)
   (declare (type fixnum start end count)
@@ -2497,7 +2506,7 @@ many elements are copied."
                                                (frob sequence t)
                                                (frob sequence nil))))
                        (typecase sequence
-                         #!+sb-unicode
+                         #+sb-unicode
                          ((simple-array character (*)) (frob2))
                          ((simple-array base-char (*)) (frob2))
                          ,@(when bit-frob
@@ -2564,7 +2573,7 @@ many elements are copied."
                   item sequence from-end start end
                   (effective-find-position-key key)
                   (effective-find-position-test test test-not)))
-    (apply #'sb!sequence:find item sequence args)))
+    (apply #'sb-sequence:find item sequence args)))
 (defun position
     (item sequence &rest args &key from-end (start 0) end key test test-not)
   (declare (truly-dynamic-extent args))
@@ -2579,7 +2588,7 @@ many elements are copied."
                   item sequence from-end start end
                   (effective-find-position-key key)
                   (effective-find-position-test test test-not)))
-    (apply #'sb!sequence:position item sequence args)))
+    (apply #'sb-sequence:position item sequence args)))
 
 (defun find-if (predicate sequence &rest args &key from-end (start 0) end key)
   (declare (truly-dynamic-extent args))
@@ -2594,7 +2603,7 @@ many elements are copied."
                   (%coerce-callable-to-fun predicate)
                   sequence from-end start end
                   (effective-find-position-key key)))
-    (apply #'sb!sequence:find-if predicate sequence args)))
+    (apply #'sb-sequence:find-if predicate sequence args)))
 (defun position-if
     (predicate sequence &rest args &key from-end (start 0) end key)
   (declare (truly-dynamic-extent args))
@@ -2609,7 +2618,7 @@ many elements are copied."
                   (%coerce-callable-to-fun predicate)
                   sequence from-end start end
                   (effective-find-position-key key)))
-    (apply #'sb!sequence:position-if predicate sequence args)))
+    (apply #'sb-sequence:position-if predicate sequence args)))
 
 (defun find-if-not
     (predicate sequence &rest args &key from-end (start 0) end key)
@@ -2625,7 +2634,7 @@ many elements are copied."
                   (%coerce-callable-to-fun predicate)
                   sequence from-end start end
                   (effective-find-position-key key)))
-    (apply #'sb!sequence:find-if-not predicate sequence args)))
+    (apply #'sb-sequence:find-if-not predicate sequence args)))
 (defun position-if-not
     (predicate sequence &rest args &key from-end (start 0) end key)
   (declare (truly-dynamic-extent args))
@@ -2640,7 +2649,7 @@ many elements are copied."
                   (%coerce-callable-to-fun predicate)
                   sequence from-end start end
                   (effective-find-position-key key)))
-    (apply #'sb!sequence:position-if-not predicate sequence args)))
+    (apply #'sb-sequence:position-if-not predicate sequence args)))
 
 ;;;; COUNT-IF, COUNT-IF-NOT, and COUNT
 
@@ -2702,7 +2711,7 @@ many elements are copied."
         (if from-end
             (vector-count-if nil t predicate sequence)
             (vector-count-if nil nil predicate sequence)))
-      (apply #'sb!sequence:count-if predicate sequence args)))
+      (apply #'sb-sequence:count-if predicate sequence args)))
 
 (define-sequence-traverser count-if-not
     (predicate sequence &rest args &key from-end start end key)
@@ -2721,7 +2730,7 @@ many elements are copied."
         (if from-end
             (vector-count-if t t predicate sequence)
             (vector-count-if t nil predicate sequence)))
-      (apply #'sb!sequence:count-if-not predicate sequence args)))
+      (apply #'sb-sequence:count-if-not predicate sequence args)))
 
 (define-sequence-traverser count
     (item sequence &rest args &key from-end start end
@@ -2749,7 +2758,7 @@ many elements are copied."
           (if from-end
               (vector-count-if test-not-p t test sequence :two-arg-predicate item)
               (vector-count-if test-not-p nil test sequence :two-arg-predicate item)))
-        (apply #'sb!sequence:count item sequence args))))
+        (apply #'sb-sequence:count item sequence args))))
 
 ;;;; MISMATCH
 
@@ -2869,7 +2878,7 @@ many elements are copied."
   ;; If sequence1 was a list or vector, then sequence2 is an extended-sequence
   ;; or not a sequence. Either way, check it.
   (the (or index null)
-    (values (apply #'sb!sequence:mismatch sequence1
+    (values (apply #'sb-sequence:mismatch sequence1
                    (the sequence sequence2) args))))
 
 ;;; search comparison functions
@@ -2919,11 +2928,11 @@ many elements are copied."
          (search-compare-list-list ,main ,sub)
          (search-compare-list-vector ,main ,sub)
          ;; KLUDGE: just hack it together so that it works
-         (return-from search (apply #'sb!sequence:search sequence1 sequence2 args)))
+         (return-from search (apply #'sb-sequence:search ,sub ,main args)))
       `(seq-dispatch ,sub
          (search-compare-vector-list ,main ,sub ,index)
          (search-compare-vector-vector ,main ,sub ,index)
-         (return-from search (apply #'sb!sequence:search sequence1 sequence2 args)))))
+         (return-from search (apply #'sb-sequence:search ,sub ,main args)))))
 
 ;;;; SEARCH
 
@@ -2951,21 +2960,21 @@ many elements are copied."
              (return index2)))))
 
 (define-sequence-traverser search
-    (sequence1 sequence2 &rest args &key
+    (sub-sequence1 main-sequence2 &rest args &key
      from-end test test-not start1 end1 start2 end2 key)
   (declare (type fixnum start1 start2)
            (truly-dynamic-extent args))
-  (declare (explicit-check sequence2))
-  (seq-dispatch-checking sequence2
+  (declare (explicit-check main-sequence2))
+  (seq-dispatch-checking main-sequence2
     (let ((end1 (or end1 length1))
           (end2 (or end2 length2)))
       (declare (type index end1 end2))
-      (list-search sequence2 sequence1))
+      (list-search main-sequence2 sub-sequence1))
     (let ((end1 (or end1 length1))
           (end2 (or end2 length2)))
       (declare (type index end1 end2))
-      (vector-search sequence2 sequence1))
-    (apply #'sb!sequence:search sequence1 sequence2 args)))
+      (vector-search main-sequence2 sub-sequence1))
+    (apply #'sb-sequence:search sub-sequence1 main-sequence2 args)))
 
 ;;; FIXME: this was originally in array.lisp; it might be better to
 ;;; put it back there, and make DOSEQUENCE and SEQ-DISPATCH be in
@@ -2988,7 +2997,7 @@ many elements are copied."
                                        (error "malformed :INITIAL-CONTENTS: Dimension of ~
                                                axis ~W is ~W, but ~S is ~W long."
                                               axis k contents l)))
-                                   (sb!sequence:dosequence (content contents)
+                                   (sb-sequence:dosequence (content contents)
                                      ,next-layer)))))
                    ,start-recursion))))
 

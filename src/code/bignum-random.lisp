@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!BIGNUM")
+(in-package "SB-BIGNUM")
 
 ;;; Return T if the least significant N-BITS bits of BIGNUM are all
 ;;; zero, else NIL. If the integer-length of BIGNUM is less than N-BITS,
@@ -56,7 +56,7 @@
 (declaim (inline concatenate-random-bignum))
 (defun concatenate-random-bignum (random-chunk bit-count state)
   (declare (type bignum-element-type random-chunk)
-           (type (integer 0 #.sb!xc:most-positive-fixnum) bit-count)
+           (type (integer 0 #.sb-xc:most-positive-fixnum) bit-count)
            (type random-state state))
   (let* ((n-total-bits (+ 1 n-random-chunk-bits bit-count)) ; sign bit
          (length (ceiling n-total-bits digit-size))
@@ -133,11 +133,11 @@
 ;;;   generate and compare the complete random number and risk to reject
 ;;;   it.
 (defun %random-bignum (arg state)
-  (declare (type (integer #.(1+ sb!xc:most-positive-fixnum)) arg)
+  (declare (type (integer #.(1+ sb-xc:most-positive-fixnum)) arg)
            (type random-state state)
            (inline bignum-lower-bits-zero-p))
   (let ((n-bits (bignum-integer-length arg)))
-    (declare (type (integer #.sb!vm:n-fixnum-bits) n-bits))
+    (declare (type (integer #.sb-vm:n-fixnum-bits) n-bits))
     ;; Don't use (ZEROP (LOGAND ARG (1- ARG))) to test if ARG is a power
     ;; of two as that would cons.
     (cond ((bignum-lower-bits-zero-p arg (1- n-bits))

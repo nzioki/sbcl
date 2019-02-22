@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; cost estimation
 
@@ -47,8 +47,7 @@
         0)
       (when (eq type *empty-type*)
         0)
-      (let ((found (cdr (assoc type *backend-type-predicates*
-                               :test #'type=))))
+      (let ((found (backend-type-predicate type)))
         (if found
             (+ (fun-guessed-cost found) (fun-guessed-cost 'eq))
             nil))
@@ -139,7 +138,7 @@
          ;; weakening, so for integer types we simply collapse all
          ;; ranges into one.
          (weaken-integer-type type))
-        #!+sb-unicode
+        #+sb-unicode
         ((csubtypep type (specifier-type 'base-char))
          ;; Don't want to be putting CHARACTERs into BASE-STRINGs.
          (specifier-type 'base-char))
@@ -346,7 +345,7 @@
                    (remove-if (lambda (spec)
                                 (or (stringp spec)
                                     (typep spec '(cons (eql or)))))
-                              sb!c:+backend-internal-errors+
+                              sb-c:+backend-internal-errors+
                               :key #'car)))
            ;; This is effectively a compact read-only binned hashtable.
            (hashtable (make-array (logior (length entries) 1)
@@ -366,7 +365,7 @@
                    (cadr entry)))
            (remove-if-not (lambda (spec)
                             (typep spec '(cons (eql or))))
-                          sb!c:+backend-internal-errors+
+                          sb-c:+backend-internal-errors+
                           :key #'car)))
 (declaim (simple-vector **type-spec-unions-interr-symbols**))
 
@@ -375,9 +374,9 @@
 (defun %interr-symbol-for-union-type-spec (spec)
   (let* ((spec (cdr spec))
          (length (length spec))
-         (bit-map (if (> length sb!vm:n-fixnum-bits)
+         (bit-map (if (> length sb-vm:n-fixnum-bits)
                       (return-from %interr-symbol-for-union-type-spec)
-                      (1- (ash 1 (truly-the (integer 1 #.sb!vm:n-fixnum-bits)
+                      (1- (ash 1 (truly-the (integer 1 #.sb-vm:n-fixnum-bits)
                                             length))))))
     (declare (list spec))
     (loop for entry across **type-spec-unions-interr-symbols**
@@ -390,7 +389,7 @@
                   for position = (position element spec :test #'equal)
                   always position
                   do
-                  (setf (ldb (byte 1 (truly-the (integer 0 (#.sb!vm:n-fixnum-bits))
+                  (setf (ldb (byte 1 (truly-the (integer 0 (#.sb-vm:n-fixnum-bits))
                                                 position))
                              current-map)
                         0))
@@ -510,14 +509,14 @@
         (cond ((and (ref-p use) (constant-p (ref-leaf use)))
                (warn condition
                      :format-control "~:[This~;~:*~A~] is not a ~
-                       ~<~%~9T~:;~/sb!impl:print-type/:~>~% ~S"
+                       ~<~%~9T~:;~/sb-impl:print-type/:~>~% ~S"
                      :format-arguments
                      (list what atype (constant-value (ref-leaf use)))))
               (t
                (warn condition
                      :format-control
-                      "~:[Result~;~:*~A~] is a ~/sb!impl:print-type/, ~
-                       ~<~%~9T~:;not a ~/sb!impl:print-type/.~>"
+                      "~:[Result~;~:*~A~] is a ~/sb-impl:print-type/, ~
+                       ~<~%~9T~:;not a ~/sb-impl:print-type/.~>"
                      :format-arguments (list what dtype atype)))))))
   (values))
 
@@ -580,7 +579,7 @@
                  (when (policy cast (>= safety inhibit-warnings))
                    (compiler-notify
                     "type assertion too complex to check:~%~
-                    ~/sb!impl:print-type/."
+                    ~/sb-impl:print-type/."
                     (coerce-to-values (cast-asserted-type cast)))))
                (setf (cast-type-to-check cast) *wild-type*)
                (setf (cast-%type-check cast) nil)))))))

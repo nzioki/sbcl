@@ -9,40 +9,40 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; DYNAMIC-USAGE and friends
 
-#!+(and relocatable-heap gencgc)
-(define-alien-variable ("DYNAMIC_SPACE_START" sb!vm:dynamic-space-start) unsigned-long)
-#!-sb-fluid
+#+(and relocatable-heap gencgc)
+(define-alien-variable ("DYNAMIC_SPACE_START" sb-vm:dynamic-space-start) unsigned-long)
+#-sb-fluid
 (declaim (inline current-dynamic-space-start))
 (defun current-dynamic-space-start ()
-  #!+gencgc sb!vm:dynamic-space-start
-  #!-gencgc (extern-alien "current_dynamic_space" unsigned-long))
+  #+gencgc sb-vm:dynamic-space-start
+  #-gencgc (extern-alien "current_dynamic_space" unsigned-long))
 
-#!+(or x86 x86-64)
+#+(or x86 x86-64)
 (progn
   (declaim (inline dynamic-space-free-pointer))
   (defun dynamic-space-free-pointer ()
     (extern-alien "dynamic_space_free_pointer" system-area-pointer)))
 
-#!-sb-fluid
+#-sb-fluid
 (declaim (inline dynamic-usage))
-#!+gencgc
+#+gencgc
 (defun dynamic-usage ()
   (extern-alien "bytes_allocated" os-vm-size-t))
-#!-gencgc
+#-gencgc
 (defun dynamic-usage ()
   (truly-the word
-             (- (sap-int (sb!c::dynamic-space-free-pointer))
+             (- (sap-int (sb-c::dynamic-space-free-pointer))
                 (current-dynamic-space-start))))
 
 (defun static-space-usage ()
-  (- (sap-int sb!vm:*static-space-free-pointer*) sb!vm:static-space-start))
+  (- (sap-int sb-vm:*static-space-free-pointer*) sb-vm:static-space-start))
 
 (defun read-only-space-usage ()
-  (- (sap-int sb!vm:*read-only-space-free-pointer*) sb!vm:read-only-space-start))
+  (- (sap-int sb-vm:*read-only-space-free-pointer*) sb-vm:read-only-space-start))
 
 ;;; Convert the descriptor into a SAP. The bits all stay the same, we just
 ;;; change our notion of what we think they are.
@@ -50,13 +50,13 @@
 (defun descriptor-sap (x) (int-sap (get-lisp-obj-address x)))
 
 (defun control-stack-usage ()
-  #!-stack-grows-downward-not-upward
-  (sap- (control-stack-pointer-sap) (descriptor-sap sb!vm:*control-stack-start*))
-  #!+stack-grows-downward-not-upward
-  (sap- (descriptor-sap sb!vm:*control-stack-end*) (control-stack-pointer-sap)))
+  #-stack-grows-downward-not-upward
+  (sap- (control-stack-pointer-sap) (descriptor-sap sb-vm:*control-stack-start*))
+  #+stack-grows-downward-not-upward
+  (sap- (descriptor-sap sb-vm:*control-stack-end*) (control-stack-pointer-sap)))
 
 (defun binding-stack-usage ()
-  (sap- (binding-stack-pointer-sap) (descriptor-sap sb!vm:*binding-stack-start*)))
+  (sap- (binding-stack-pointer-sap) (descriptor-sap sb-vm:*binding-stack-start*)))
 
 ;;;; GET-BYTES-CONSED
 
@@ -96,18 +96,18 @@ run in any thread.")
 ;;;; internal GC
 
 (define-alien-routine collect-garbage int
-  (#!+gencgc last-gen #!-gencgc ignore int))
+  (#+gencgc last-gen #-gencgc ignore int))
 
-#!+(or sb-thread sb-safepoint)
+#+(or sb-thread sb-safepoint)
 (progn
   (define-alien-routine gc-stop-the-world void)
   (define-alien-routine gc-start-the-world void))
-#!-(or sb-thread sb-safepoint)
+#-(or sb-thread sb-safepoint)
 (progn
   (defun gc-stop-the-world ())
   (defun gc-start-the-world ()))
 
-#!+gencgc
+#+gencgc
 (progn
   (define-alien-variable ("gc_logfile" %gc-logfile) (* char))
   (defun (setf gc-logfile) (pathname)
@@ -133,9 +133,9 @@ statistics are appended to it."
 (defun dynamic-space-size ()
   "Size of the dynamic space in bytes."
   (extern-alien "dynamic_space_size" os-vm-size-t))
-#!+gencgc
-(define-symbol-macro sb!vm:dynamic-space-end
-  (+ (dynamic-space-size) sb!vm:dynamic-space-start))
+#+gencgc
+(define-symbol-macro sb-vm:dynamic-space-end
+  (+ (dynamic-space-size) sb-vm:dynamic-space-start))
 
 ;;;; SUB-GC
 
@@ -154,7 +154,7 @@ statistics are appended to it."
 
 ;;; For GENCGC all generations < GEN will be GC'ed.
 
-(define-load-time-global *already-in-gc* (sb!thread:make-mutex :name "GC lock"))
+(define-load-time-global *already-in-gc* (sb-thread:make-mutex :name "GC lock"))
 
 (defun sub-gc (gen)
   (cond (*gc-inhibit*
@@ -177,11 +177,11 @@ statistics are appended to it."
                       ;; turn is a type-error.
                       (when (plusp run-time)
                         (incf *gc-run-time* run-time)))
-                    #!+(and sb-thread sb-safepoint)
+                    #+(and sb-thread sb-safepoint)
                     (setf *stop-for-gc-pending* nil)
                     (setf *gc-pending* nil
                           new-usage (dynamic-usage))
-                    #!+sb-thread
+                    #+sb-thread
                     (aver (not *stop-for-gc-pending*))
                     (gc-start-the-world)
                     ;; In a multithreaded environment the other threads
@@ -200,9 +200,9 @@ statistics are appended to it."
            ;; Let's make sure we're not interrupted and that none of
            ;; the deadline or deadlock detection stuff triggers.
            (without-interrupts
-             (sb!thread::without-thread-waiting-for
+             (sb-thread::without-thread-waiting-for
                  (:already-without-interrupts t)
-               (let ((sb!impl::*deadline* nil)
+               (let ((sb-impl::*deadline* nil)
                      (epoch *gc-epoch*))
                  (loop
                   ;; GCing must be done without-gcing to avoid
@@ -215,7 +215,7 @@ statistics are appended to it."
                     ;; execute the remainder of the GC: stopping the
                     ;; world with interrupts disabled is the mother of
                     ;; all critical sections.
-                    (cond ((sb!thread:with-mutex (*already-in-gc* :wait-p nil)
+                    (cond ((sb-thread:with-mutex (*already-in-gc* :wait-p nil)
                              (unsafe-clear-roots gen)
                              (gc-stop-the-world)
                              t)
@@ -270,8 +270,8 @@ statistics are appended to it."
   ;; but it's not permissible to invoke CONDITION-NOTIFY from a
   ;; dying thread, so we still need the guard for that, but not
   ;; the guard for whether interupts are enabled.
-  (when (sb!thread:thread-alive-p sb!thread:*current-thread*)
-    (let ((threadp #!+sb-thread (%instancep sb!impl::*finalizer-thread*)))
+  (when (sb-thread:thread-alive-p sb-thread:*current-thread*)
+    (let ((threadp #+sb-thread (%instancep sb-impl::*finalizer-thread*)))
       (when threadp
         ;; It's OK to frob a condition variable regardless of
         ;; *allow-with-interrupts*, and probably OK to start a thread.
@@ -280,7 +280,7 @@ statistics are appended to it."
         ;; That's my excuse anyway, not having looked more in-depth.
         (run-pending-finalizers))
       (when *allow-with-interrupts*
-        (sb!thread::without-thread-waiting-for ()
+        (sb-thread::without-thread-waiting-for ()
          (with-interrupts
            (unless threadp
              (run-pending-finalizers))
@@ -288,7 +288,7 @@ statistics are appended to it."
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
-  #!+gencgc
+  #+gencgc
   "Initiate a garbage collection.
 
 The default is to initiate a nursery collection, which may in turn
@@ -298,7 +298,7 @@ used to specify the oldest generation guaranteed to be collected.
 
 On CheneyGC platforms arguments FULL and GEN take no effect: a full
 collection is always performed."
-  #!-gencgc
+  #-gencgc
   "Initiate a garbage collection.
 
 The collection is always a full collection.
@@ -309,15 +309,15 @@ which may in turn trigger a collection of one or more older
 generations as well. If FULL is true, all generations are collected.
 If GEN is provided, it can be used to specify the oldest generation
 guaranteed to be collected."
-  #!-gencgc (declare (ignore full))
-  (let (#!+gencgc (gen (if full sb!vm:+pseudo-static-generation+ gen)))
+  #-gencgc (declare (ignore full))
+  (let (#+gencgc (gen (if full sb-vm:+pseudo-static-generation+ gen)))
     (when (eq t (sub-gc gen))
       (post-gc))))
 
 (define-alien-routine scrub-control-stack void)
 
 (defun unsafe-clear-roots (gen)
-  #!-gencgc (declare (ignore gen))
+  #-gencgc (declare (ignore gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
   ;; as having these cons more than we have space left leads to huge
   ;; badness.
@@ -326,17 +326,17 @@ guaranteed to be collected."
   ;; removes duplicate entries.
   (scrub-power-cache)
   ;; Clear caches depending on the generation being collected.
-  #!+gencgc
+  #+gencgc
   (cond ((eql 0 gen)
          ;; Drop strings because the hash is pointer-hash
          ;; but there is no automatic cache rehashing after GC.
-         (sb!format::tokenize-control-string-cache-clear))
+         (sb-format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
-         (sb!format::tokenize-control-string-cache-clear)
+         (sb-format::tokenize-control-string-cache-clear)
          (ctype-of-cache-clear))
         (t
          (drop-all-hash-caches)))
-  #!-gencgc
+  #-gencgc
   (drop-all-hash-caches))
 
 ;;;; auxiliary functions
@@ -359,22 +359,22 @@ Note: currently changes to this value are lost when saving core."
 (declaim (inline maybe-handle-pending-gc))
 (defun maybe-handle-pending-gc ()
   (when (and (not *gc-inhibit*)
-             (or #!+sb-thread *stop-for-gc-pending*
+             (or #+sb-thread *stop-for-gc-pending*
                  *gc-pending*))
-    (sb!unix::receive-pending-interrupt)))
+    (sb-unix::receive-pending-interrupt)))
 
 ;;;; GENCGC specifics
 ;;;;
 ;;;; For documentation convenience, these have stubs on non-GENCGC platforms
 ;;;; as well.
-#!+gencgc
+#+gencgc
 (deftype generation-index ()
-  '(integer 0 #.sb!vm:+pseudo-static-generation+))
+  '(integer 0 #.sb-vm:+pseudo-static-generation+))
 
 ;;; FIXME: GENERATION (and PAGE, as seen in room.lisp) should probably be
 ;;; defined in Lisp, and written to header files by genesis, instead of this
 ;;; OAOOMiness -- this duplicates the struct definition in gencgc.c.
-#!+gencgc
+#+gencgc
 (define-alien-type generation
     (struct generation
             (bytes-allocated os-vm-size-t)
@@ -385,33 +385,33 @@ Note: currently changes to this value are lost when saving core."
             (cum-sum-bytes-allocated os-vm-size-t)
             (minimum-age-before-gc double)))
 
-#!+gencgc
+#+gencgc
 (define-alien-variable generations
-    (array generation #.(1+ sb!vm:+pseudo-static-generation+)))
+    (array generation #.(1+ sb-vm:+pseudo-static-generation+)))
 
 (macrolet ((def (slot doc &optional setfp)
              `(progn
                 (defun ,(symbolicate "GENERATION-" slot) (generation)
                   ,doc
-                  #!+gencgc
+                  #+gencgc
                   (declare (generation-index generation))
-                  #!-gencgc
+                  #-gencgc
                   (declare (ignore generation))
-                  #!-gencgc
+                  #-gencgc
                   (error "~S is a GENCGC only function and unavailable in this build"
                          ',slot)
-                  #!+gencgc
+                  #+gencgc
                   (slot (deref generations generation) ',slot))
                 ,@(when setfp
                         `((defun (setf ,(symbolicate "GENERATION-" slot)) (value generation)
-                            #!+gencgc
+                            #+gencgc
                             (declare (generation-index generation))
-                            #!-gencgc
+                            #-gencgc
                             (declare (ignore value generation))
-                            #!-gencgc
+                            #-gencgc
                             (error "(SETF ~S) is a GENCGC only function and unavailable in this build"
                                    ',slot)
-                            #!+gencgc
+                            #+gencgc
                             (setf (slot (deref generations generation) ',slot) value)))))))
   (def bytes-consed-between-gcs
       "Number of bytes that can be allocated to GENERATION before that
@@ -453,21 +453,21 @@ objects allocated to the generation have seen younger objects promoted to it.
 Available on GENCGC platforms only.
 
 Experimental: interface subject to change."
-    #!+gencgc
+    #+gencgc
     (declare (generation-index generation))
-    #!-gencgc (declare (ignore generation))
-    #!-gencgc
+    #-gencgc (declare (ignore generation))
+    #-gencgc
     (error "~S is a GENCGC only function and unavailable in this build."
            'generation-average-age)
-    #!+gencgc
+    #+gencgc
     (alien-funcall (extern-alien "generation_average_age"
                                  (function double generation-index-t))
                    generation))
 
-(declaim (inline sb!vm:is-lisp-pointer))
-(defun sb!vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
-  #!-64-bit (oddp addr)
-  #!+64-bit (not (logtest (logxor addr 3) 3)))
+(declaim (inline sb-vm:is-lisp-pointer))
+(defun sb-vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
+  #-64-bit (oddp addr)
+  #+64-bit (not (logtest (logxor addr 3) 3)))
 
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
@@ -481,14 +481,14 @@ Experimental: interface subject to change."
 ;;; If you wanted the object not to die or move, you should have held on tighter!
 (defun heap-allocated-p (x)
   (let ((addr (get-lisp-obj-address x)))
-    (and (sb!vm:is-lisp-pointer addr)
+    (and (sb-vm:is-lisp-pointer addr)
          (cond ((< (current-dynamic-space-start) addr
                    (sap-int (dynamic-space-free-pointer)))
                 :dynamic)
                ((immobile-space-addr-p addr) :immobile)
-               ((< sb!vm:read-only-space-start addr
-                   (sap-int sb!vm:*read-only-space-free-pointer*))
+               ((< sb-vm:read-only-space-start addr
+                   (sap-int sb-vm:*read-only-space-free-pointer*))
                 :read-only)
-               ((< sb!vm:static-space-start addr
-                   (sap-int sb!vm:*static-space-free-pointer*))
+               ((< sb-vm:static-space-start addr
+                   (sap-int sb-vm:*static-space-free-pointer*))
                 :static)))))

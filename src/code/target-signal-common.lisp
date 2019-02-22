@@ -8,7 +8,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 
-(in-package "SB!UNIX")
+(in-package "SB-UNIX")
 
 ;;; CMU CL comment:
 ;;;   Magically converted by the compiler into a break instruction.
@@ -23,8 +23,8 @@
        ;; the cache one) we can get a bogus metacircle if an interrupt
        ;; handler calls a GF that was being computed when the interrupt
        ;; hit.
-       ((sb!pcl::*cache-miss-values-stack* nil)
-        (sb!pcl::*dfun-miss-gfs-on-stack* nil))
+       ((sb-pcl::*cache-miss-values-stack* nil)
+        (sb-pcl::*dfun-miss-gfs-on-stack* nil))
      ,@body))
 
 (defun unblock-deferrable-signals ()
@@ -41,7 +41,7 @@
               (let (*unblock-deferrables-on-enabling-interrupts-p*)
                 (unblock-deferrable-signals)
                 (when (or *interrupt-pending*
-                          #!+sb-thruption *thruption-pending*)
+                          #+sb-thruption *thruption-pending*)
                   (receive-pending-interrupt))
                 (funcall function))
            (alien-funcall (extern-alien "block_deferrable_signals"
@@ -50,7 +50,7 @@
         (t
          (when (and enable-interrupts
                     (or *interrupt-pending*
-                        #!+sb-thruption *thruption-pending*))
+                        #+sb-thruption *thruption-pending*))
            (receive-pending-interrupt))
          (funcall function))))
 
@@ -64,9 +64,9 @@
     ;; previous signal handler when the next signal is delivered
     ;; provided there is no WITH-INTERRUPTS.
     (let ((*unblock-deferrables-on-enabling-interrupts-p* t)
-          (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'invoke-interruption)))
+          (sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint* 'invoke-interruption)))
       (with-interrupt-bindings
-        (sb!thread::without-thread-waiting-for (:already-without-interrupts t)
+        (sb-thread::without-thread-waiting-for (:already-without-interrupts t)
           (allow-with-interrupts
             (nlx-protect (funcall function)
               ;; We've been running with deferrables

@@ -32,7 +32,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 #-no-ansi-print-object
 (defmethod print-object ((x meta-info) stream)
@@ -90,16 +90,16 @@
 #-sb-xc
 (setf (get '!%define-info-type :sb-cold-funcall-handler/for-effect)
       (lambda (category kind type-spec checker validator default id)
-        ;; The SB!FASL: symbols are poor style, but the lesser evil.
+        ;; The SB-FASL: symbols are poor style, but the lesser evil.
         ;; If exported, then they'll stick around in the target image.
         ;; Perhaps SB-COLD should re-export some of these.
-        (declare (special sb!fasl::*dynamic* sb!fasl::*cold-layouts*))
-        (let ((layout (gethash 'meta-info sb!fasl::*cold-layouts*)))
-          (sb!fasl::cold-svset
-           (sb!fasl::cold-symbol-value '*info-types*)
+        (declare (special sb-fasl::*dynamic* sb-fasl::*cold-layouts*))
+        (let ((layout (gethash 'meta-info sb-fasl::*cold-layouts*)))
+          (sb-fasl::cold-svset
+           (sb-fasl::cold-symbol-value '*info-types*)
            id
-           (sb!fasl::write-slots
-            (sb!fasl::allocate-struct sb!fasl::*dynamic* layout)
+           (sb-fasl::write-slots
+            (sb-fasl::allocate-struct sb-fasl::*dynamic* layout)
             'meta-info ; give the type name in lieu of layout
             :category category :kind kind :type-spec type-spec
             :type-checker checker :validate-function validator
@@ -220,7 +220,7 @@
 ;;; If non-nil, *GLOBALDB-OBSERVER*'s CAR is a bitmask over info numbers
 ;;; for which you'd like to call the function in the CDR whenever info
 ;;; of that number is queried.
-(!defvar *globaldb-observer* nil)
+(defparameter *globaldb-observer* nil)
 (declaim (type (or (cons (unsigned-byte #.(ash 1 info-number-bits)) function)
                    null) *globaldb-observer*))
 #-sb-xc-host (declaim (always-bound *globaldb-observer*))
@@ -266,7 +266,7 @@
 
 ;;;; ":FUNCTION" subsection - Data pertaining to globally known functions.
 
-(define-info-type (:function :definition) :type-spec (or fdefn null))
+(define-info-type (:function :definition) :type-spec (or #-sb-xc-host fdefn null))
 
 ;;; the kind of functional object being described. If null, NAME isn't
 ;;; a known functional object.
@@ -284,7 +284,7 @@
 
 ;;; The deferred mode processor for fasteval special operators.
 ;;; Immediate processors are hung directly off symbols in a dedicated slot.
-#!+sb-fasteval
+#+sb-fasteval
 (define-info-type (:function :interpreter) :type-spec (or function null))
 
 ;;; Indicates whether the function is deprecated.
@@ -292,7 +292,7 @@
   :type-spec (or null deprecation-info))
 
 (declaim (ftype (sfunction (t) ctype)
-                specifier-type ctype-of sb!kernel::ctype-of-array))
+                specifier-type ctype-of sb-kernel::ctype-of-array))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -328,16 +328,16 @@
 ;;; expression, e.g. '(LAMBDA (X) (+ X 1)) or a lambda-with-lexenv.
 ;;; (B) List of arguments which could be dynamic-extent closures, and which
 ;;; we could, under suitable compilation policy, DXify in the caller
-;;; especially when compiling a NOTINLINE call to this function.
+;;; especially when open-coding a call to this function.
 ;;; If only (A) is stored, then this value is a list (the lambda expression).
 ;;; If only (B) is stored, then this is a DXABLE-ARGS.
 ;;; If both, this is an INLINING-DATA.
 (define-info-type (:function :inlining-data)
-    :type-spec (or list sb!c::dxable-args sb!c::inlining-data))
+    :type-spec (or list sb-c::dxable-args sb-c::inlining-data))
 
 ;;; This specifies whether this function may be expanded inline. If
 ;;; null, we don't care.
-(define-info-type (:function :inlinep) :type-spec sb!c::inlinep)
+(define-info-type (:function :inlinep) :type-spec sb-c::inlinep)
 
 ;;; Track how many times IR2 converted a call to this function as a full call
 ;;; that was not in the scope of a local or global notinline declaration.
@@ -357,6 +357,8 @@
 ;;; We don't actually have anything like that any more though.
 ;;; For user-defined functions, the invariant is maintained that at most
 ;;; one of :source-transform and an inline-expansion exist.
+;;; However, there is one exception: a structure constructor can have an
+;;; inline expansion and also store (#<dd> . :constructor) here.
 (define-info-type (:function :source-transform)
   :type-spec (or function null (cons atom atom)))
 
@@ -372,7 +374,7 @@
 
 ;;; If a function is "known" to the compiler, then this is a FUN-INFO
 ;;; structure containing the info used to special-case compilation.
-(define-info-type (:function :info) :type-spec (or sb!c::fun-info null))
+(define-info-type (:function :info) :type-spec (or sb-c::fun-info null))
 
 ;;; This is a type specifier <t> such that if an argument X to the function
 ;;; does not satisfy (TYPEP x <t>) then the function definitely returns NIL.
@@ -415,7 +417,7 @@
 (define-info-type (:variable :macro-expansion) :type-spec t)
 
 (define-info-type (:variable :alien-info)
-  :type-spec (or null sb!alien-internals:heap-alien-info))
+  :type-spec (or null sb-alien-internals:heap-alien-info))
 
 (define-info-type (:variable :documentation) :type-spec (or string null))
 
@@ -523,13 +525,13 @@
   :default :unknown)
 (define-info-type (:alien-type :translator) :type-spec (or function null))
 (define-info-type (:alien-type :definition)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :struct)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :union)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :enum)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
 (define-info-type (:setf :documentation) :type-spec (or string null))

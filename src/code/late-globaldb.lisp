@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;; Call FUNCTION once for each Name in globaldb that has information associated
 ;; with it, passing the function the Name as its only argument.
@@ -26,8 +26,8 @@
                         ;; Try to process each symbol at most once by associating it with
                         ;; a single package. If a symbol is apparently uninterned,
                         ;; always keep it since we can't know if it has been seen once.
-                        (when (or (not (symbol-package symbol))
-                                  (eq package (symbol-package symbol)))
+                        (when (or (not (sb-xc:symbol-package symbol))
+                                  (eq package (sb-xc:symbol-package symbol)))
                           (dolist (name (info-vector-name-list symbol))
                             (funcall function name))))))
               ,@(unless (equal situations '(:compile-toplevel))

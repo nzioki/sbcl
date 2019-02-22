@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;; The MOVE-ARG vop is going to store args on the stack for
 ;; call-out. These tn's will be used for that. move-arg is normally
@@ -37,7 +37,7 @@
                       sap-stack-sc-number
                       stack-frame-size)))
 
-#!+long-float
+#+long-float
 (define-alien-type-method (long-float :arg-tn) (type state)
   (declare (ignore type))
   (let ((stack-frame-size (arg-state-stack-frame-size state)))
@@ -87,7 +87,7 @@
     (make-wired-tn* 'system-area-pointer sap-reg-sc-number
                       (result-reg-offset num-results))))
 
-#!+long-float
+#+long-float
 (define-alien-type-method (long-float :result-tn) (type state)
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
@@ -128,24 +128,24 @@
 
 
 (deftransform %alien-funcall ((function type &rest args) * * :node node)
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
-         (env (sb!c::node-lexenv node))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
+         (env (sb-c::node-lexenv node))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
     (aver (= (length arg-types) (length args)))
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
           (dolist (type arg-types)
             (let ((arg (gensym)))
               (lambda-vars arg)
               (cond ((and (alien-integer-type-p type)
-                          (> (sb!alien::alien-integer-type-bits type) 32))
+                          (> (sb-alien::alien-integer-type-bits type) 32))
                      (new-args `(logand ,arg #xffffffff))
                      (new-args `(ash ,arg -32))
                      (new-arg-types (parse-alien-type '(unsigned 32) env))
@@ -156,9 +156,9 @@
                      (new-args arg)
                      (new-arg-types type)))))
           (cond ((and (alien-integer-type-p result-type)
-                      (> (sb!alien::alien-integer-type-bits result-type) 32))
+                      (> (sb-alien::alien-integer-type-bits result-type) 32))
                  (let ((new-result-type
-                        (let ((sb!alien::*values-type-okay* t))
+                        (let ((sb-alien::*values-type-okay* t))
                           (parse-alien-type
                            (if (alien-integer-type-signed result-type)
                                '(values (unsigned 32) (signed 32))
@@ -181,7 +181,7 @@
                                        :arg-types (new-arg-types)
                                        :result-type result-type)
                                     ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 ;;; The ABI is vague about how signed sub-word integer return values
 ;;; are handled, but since gcc versions >=4.3 no longer do sign
@@ -235,7 +235,7 @@
   (:generator 2
    (inst lea res (make-fixup foreign-symbol :foreign))))
 
-#!+linkage-table
+#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -258,7 +258,7 @@
      (let ((ea (ea-for-df-stack fp-temp)))
        (inst fstpd ea)
        (inst fldd ea)))
-    #!+long-float
+    #+long-float
     (long-reg  ; nothing to do!
      )))
 
@@ -269,9 +269,9 @@
   (:temporary (:sc unsigned-reg :offset eax-offset
                :from :eval :to :result) eax)
   (:temporary (:sc double-stack) fp-temp)
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset edi-offset) edi)
-  #!-sb-safepoint (:node-var node)
-  #!+sb-safepoint (:temporary (:sc unsigned-stack) pc-save)
+  #+sb-safepoint (:temporary (:sc unsigned-reg :offset edi-offset) edi)
+  #-sb-safepoint (:node-var node)
+  #+sb-safepoint (:temporary (:sc unsigned-stack) pc-save)
   (:vop-var vop)
   (:save-p t)
   (:ignore args)
@@ -284,11 +284,11 @@
             ;; calling routine irrespectively of SPACE and SPEED policy.
             ;; An inline version of said changes is left to the
             ;; sufficiently motivated maintainer.
-            #!-sb-safepoint (policy node (> space speed)))
+            #-sb-safepoint (policy node (> space speed)))
            ;; On safepoint builds, we need to stash the return address
            ;; on the "protected" part of the control stack so that it
            ;; doesn't move on us.  Pass the address of pc-save in EDI.
-           #!+sb-safepoint
+           #+sb-safepoint
            (inst lea edi (make-ea :dword :base ebp-tn
                                   :disp (frame-byte-offset (tn-offset pc-save))))
            (move eax function)
@@ -329,7 +329,7 @@
 (define-vop (set-fpu-word-for-c)
   (:node-var node)
   (:generator 0
-    (when (policy node (= sb!c::float-accuracy 3))
+    (when (policy node (= sb-c::float-accuracy 3))
       (inst sub esp-tn 4)
       (inst fnstcw (make-ea :word :base esp-tn))
       (inst wait)
@@ -340,7 +340,7 @@
 (define-vop (set-fpu-word-for-lisp)
   (:node-var node)
   (:generator 0
-    (when (policy node (= sb!c::float-accuracy 3))
+    (when (policy node (= sb-c::float-accuracy 3))
       (inst fnstcw (make-ea :word :base esp-tn))
       (inst wait)
       (inst and (make-ea :word :base esp-tn) #xfeff)
@@ -362,10 +362,10 @@
 
 (define-vop (alloc-alien-stack-space)
   (:info amount)
-  #!+sb-thread (:temporary (:sc unsigned-reg) temp)
+  #+sb-thread (:temporary (:sc unsigned-reg) temp)
   (:results (result :scs (sap-reg any-reg)))
   (:result-types system-area-pointer)
-  #!+sb-thread
+  #+sb-thread
   (:generator 0
     (aver (not (location= result esp-tn)))
     (unless (zerop amount)
@@ -375,7 +375,7 @@
                          :disp (make-ea-for-symbol-tls-index *alien-stack-pointer*))
           (inst sub EA delta :maybe-fs))))
     (load-tl-symbol-value result *alien-stack-pointer*))
-  #!-sb-thread
+  #-sb-thread
   (:generator 0
     (aver (not (location= result esp-tn)))
     (unless (zerop amount)
@@ -422,12 +422,12 @@ pointer to the arguments."
               (inst push eax)                       ; arg1
               (inst push (ash index 2))             ; arg0
 
-              #!+sb-thread
+              #+sb-thread
               (progn
                 (inst mov eax (foreign-symbol-address "callback_wrapper_trampoline"))
                 (inst call eax))
 
-              #!-sb-thread
+              #-sb-thread
               (progn
                 (inst push (make-ea :dword ; function
                                     :disp (static-fdefn-fun-addr 'enter-alien-callback)))
@@ -458,7 +458,7 @@ pointer to the arguments."
     (finalize-segment segment)
     ;; Now that the segment is done, convert it to a static
     ;; vector we can point foreign code to.
-    (let ((buffer (sb!assem::segment-buffer segment)))
+    (let ((buffer (sb-assem::segment-buffer segment)))
       (make-static-vector (length buffer)
                           :element-type '(unsigned-byte 8)
                           :initial-contents buffer))))

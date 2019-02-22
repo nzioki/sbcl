@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DISASSEM")
+(in-package "SB-DISASSEM")
 
 (defstruct (storage-info (:copier nil))
   (groups nil :type list)               ; alist of (name . location-group)
@@ -64,8 +64,8 @@
   ;; here first because sap-ref-dchunk reads a fixed length.
   (scratch-buf (make-array 8 :element-type '(unsigned-byte 8)))
   ;; what to align to in most cases
-  (alignment sb!vm:n-word-bytes :type alignment)
-  (byte-order sb!c:*backend-byte-order*
+  (alignment sb-vm:n-word-bytes :type alignment)
+  (byte-order sb-c:*backend-byte-order*
               :type (member :big-endian :little-endian))
   ;; for user code to track decoded bits, cleared each time after a
   ;; non-prefix instruction is processed

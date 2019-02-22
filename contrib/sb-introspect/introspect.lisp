@@ -524,7 +524,7 @@ value."
   "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."
   (flet ((ftype-of (function-designator)
            (type-specifier
-            (proclaimed-ftype function-designator))))
+            (global-ftype function-designator))))
     (etypecase function-designator
       (symbol
        (when (and (fboundp function-designator)

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
@@ -199,7 +199,7 @@
                                 :unknown-return))
     (inst compute-code code-tn lip lra-label)
     ;; Pick off the single-value case first.
-    (sb!assem:without-scheduling ()
+    (sb-assem:without-scheduling ()
 
       ;; Default register values for single-value return case.
       ;; The callee returns with condition bits CLEAR in the
@@ -542,7 +542,7 @@
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -905,7 +905,7 @@
                                                 (@ new-fp ,(* i n-word-bytes)))
                                          insts))
                                (storew cfp-tn new-fp ocfp-save-offset))
-                             '((inst mov nargs-pass (fixnumize nargs)))))
+                             '((load-immediate-word nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)
                             '((:load-return-pc
                                (error "RETURN-PC not in its passing location"))
@@ -926,9 +926,9 @@
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
                     (assemble ()
-                      #!-sb-thread
-                      (load-symbol-value tmp-tn sb!impl::*stepping*)
-                      #!+sb-thread
+                      #-sb-thread
+                      (load-symbol-value tmp-tn sb-impl::*stepping*)
+                      #+sb-thread
                       (loadw tmp-tn thread-tn thread-stepping-slot)
                       (inst cbz tmp-tn step-done-label)
                       ;; CONTEXT-PC will be pointing here when the
@@ -1169,9 +1169,9 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    #!-sb-thread
-    (load-symbol-value tmp-tn sb!impl::*stepping*)
-    #!+sb-thread
+    #-sb-thread
+    (load-symbol-value tmp-tn sb-impl::*stepping*)
+    #+sb-thread
     (loadw tmp-tn thread-tn thread-stepping-slot)
     (inst cbz tmp-tn DONE)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,

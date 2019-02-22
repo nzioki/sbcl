@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Allocator for the array header.
 (define-vop (make-array-header)
@@ -106,7 +106,7 @@
 
   (def-partial-data-vector-frobs simple-base-string character
     :byte nil character-reg)
-  #!+sb-unicode
+  #+sb-unicode
   (def-full-data-vector-frobs simple-character-string character character-reg)
 
   (def-partial-data-vector-frobs simple-array-unsigned-byte-7 positive-fixnum

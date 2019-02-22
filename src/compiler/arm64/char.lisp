@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Moves and coercions:
 
@@ -112,7 +112,7 @@
   (:conditional :lt))
 
 (defun char-immediate-p (char)
-  (add-sub-immediate-p (sb!xc:char-code char)))
+  (add-sub-immediate-p (sb-xc:char-code char)))
 
 (define-vop (character-compare/c)
   (:args (x :scs (character-reg)))
@@ -121,7 +121,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp x (sb!xc:char-code y))))
+    (inst cmp x (sb-xc:char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)
@@ -135,37 +135,34 @@
   (:translate char<)
   (:conditional :lt))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p)
   (:args (value :scs (any-reg descriptor-reg)))
   (:arg-types *)
   (:translate base-char-p)
   (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
   (:conditional :eq)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 4
     (inst and temp value (lognot #x7F00))
     (inst cmp temp character-widetag)))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p-character)
   (:args (value :scs (any-reg)))
   (:arg-types character)
   (:translate base-char-p)
   (:conditional :eq)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 3
     (inst tst value (lognot #x7FFF))))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p-character-reg)
   (:args (value :scs (character-reg)))
   (:arg-types character)
   (:translate base-char-p)
   (:conditional :lt)
-  (:save-p :compute-only)
   (:policy :fast-safe)
   (:generator 2
     (inst cmp value base-char-code-limit)))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; We often use a source-transform to do macro-like rewriting of an
 ;;;; ordinary function call. Source-transforms seem to pre-date the ANSI
@@ -64,7 +64,7 @@
                           (:preserve-whitespace 2)
                           (otherwise (return-from read-from-string form))))
                  (var (if (logbitp index seen)
-                          (let ((x (sb!xc:gensym "IGNORE")))
+                          (let ((x (sb-xc:gensym "IGNORE")))
                             (push x ignore)
                             x)
                           (setf seen (logior (ash 1 index) seen)

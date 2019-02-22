@@ -24,8 +24,8 @@
              (or (and (>= (length name) 1) (char= (char name 0) #\!))
                  (and (>= (length name) 2) (string= name "*!" :end1 2))
                  (memq symbol
-                       '(sb-c::sb!pcl sb-c::sb!impl sb-c::sb!kernel
-                         sb-c::sb!c sb-c::sb-int))))))
+                       '(sb-c::sb-pcl sb-c::sb-impl sb-c::sb-kernel
+                         sb-c::sb-c sb-c::sb-int))))))
     ;; A structure constructor name, in particular !MAKE-SAETP,
     ;; can't be uninterned if referenced by a defstruct-description.
     ;; So loop over all structure classoids and clobber any
@@ -76,6 +76,7 @@
   (labels ((possibly-ungood-package-reference (string)
              ;; We want to see nothing SB-package-like at all
              (or (search "sb-" string :test #'char-equal)
+                 ;; catch mistakes due to imitating the way things used to be
                  (search "sb!" string :test #'char-equal)))
            (possibly-format-control (string)
              (when (find #\~ string)
@@ -195,6 +196,7 @@ Please check that all strings which were not recognizable to the compiler
                (multiple-value-bind (type present)
                    (sb-int:info kind :type s)
                  (when (and present
+                            (sb-kernel:ctype-p type)
                             (sb-kernel:contains-unknown-type-p type))
                    (setf (sb-int:info kind :type s)
                          (sb-kernel:specifier-type (sb-kernel:type-specifier type)))
@@ -260,10 +262,6 @@ Please check that all strings which were not recognizable to the compiler
                             :key #'dsd-name)))
   (funcall #'(setf slot-value) 'character dsd 'sb-kernel::default))
 
-;;; Even if /SHOW output was wanted during build, it's probably
-;;; not wanted by default after build is complete. (And if it's
-;;; wanted, it can easily be turned back on.)
-#+sb-show (setf sb-int:*/show* nil)
 ;;; The system is complete now, all standard functions are
 ;;; defined.
 ;;; The call to CTYPE-OF-CACHE-CLEAR is probably redundant.
@@ -359,6 +357,8 @@ Please check that all strings which were not recognizable to the compiler
 ;; See comments in 'readtable.lisp'
 (setf (readtable-base-char-preference *readtable*) :symbols)
 
+#+sb-devel
+(sb-impl::%enter-new-nicknames (find-package :cl) '("SB-XC" "CL"))
 "done with warm.lisp, about to SAVE-LISP-AND-DIE"
 
 #|

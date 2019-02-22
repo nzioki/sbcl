@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!THREAD")
+(in-package "SB-THREAD")
 
 (!define-thread-local *current-thread* nil
       "Bound in each thread to the thread itself.")
@@ -21,7 +21,7 @@
   "Type of native threads which are attached to the runtime as Lisp threads
 temporarily.")
 
-#!+(and sb-safepoint-strictly (not win32))
+#+(and sb-safepoint-strictly (not win32))
 (defstruct (signal-handling-thread
              (:copier nil)
              (:include foreign-thread)
@@ -38,11 +38,11 @@ stale value, use MUTEX-OWNER instead."
   "Test whether the current thread is holding MUTEX."
   ;; This is about the only use for which a stale value of owner is
   ;; sufficient.
-  (eq sb!thread:*current-thread* (mutex-%owner mutex)))
+  (eq sb-thread:*current-thread* (mutex-%owner mutex)))
 
 (defsetf mutex-value set-mutex-value)
 
-(declaim (sb!ext:deprecated :final ("SBCL" "1.2.15") #'set-mutex-value))
+(declaim (sb-ext:deprecated :final ("SBCL" "1.2.15") #'set-mutex-value))
 
 ;;; SPINLOCK no longer exists as a type -- provided for backwards compatibility.
 
@@ -50,7 +50,7 @@ stale value, use MUTEX-OWNER instead."
   "Spinlock type."
   'mutex)
 
-(declaim (sb!ext:deprecated
+(declaim (sb-ext:deprecated
           :late ("SBCL" "1.0.53.11") (type spinlock :replacement mutex)))
 
 (define-deprecated-function :early "1.0.53.11" make-spinlock make-mutex (&key name)
@@ -79,7 +79,7 @@ stale value, use MUTEX-OWNER instead."
   `(with-mutex (,lock)
      ,@body))
 
-(declaim (sb!ext:deprecated
+(declaim (sb-ext:deprecated
           :early ("SBCL" "1.0.53.11")
           (function with-recursive-spinlock :replacement with-recursive-lock)
           (function with-spinlock :replacement with-mutex)))
@@ -186,7 +186,7 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
   (def call-with-system-mutex :without-gcing)
   (def call-with-system-mutex :allow-with-interrupts))
 
-#!-sb-thread
+#-sb-thread
 (progn
   (defun call-with-mutex (function mutex value waitp timeout)
     (declare (ignore mutex waitp timeout)
@@ -211,7 +211,7 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
     (without-gcing
       (funcall function))))
 
-#!+sb-thread
+#+sb-thread
 ;;; KLUDGE: These need to use DX-LET, because the cleanup form that
 ;;; closes over GOT-IT causes a value-cell to be allocated for it --
 ;;; and we prefer that to go on the stack since it can.

@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!X86-ASM")
+(in-package "SB-X86-ASM")
 
 ;;; Return the operand size based on the prefixes and width bit from
 ;;; the dstate.
@@ -98,10 +98,10 @@
   (declare (ignore dstate))
   (princ (aref (ecase width
                  ;; Notice that the this array is not the same
-                 ;; as SB!VM::+BYTE-REGISTER-NAMES+
+                 ;; as SB-VM::+BYTE-REGISTER-NAMES+
                  (:byte #(al cl dl bl ah ch dh bh))
-                 (:word sb!vm::+word-register-names+)
-                 (:dword sb!vm::+dword-register-names+))
+                 (:word sb-vm::+word-register-names+)
+                 (:dword sb-vm::+dword-register-names+))
                (if (eq width :byte) value (ash value 1)))
          stream)
   ;; XXX plus should do some source-var notes
@@ -218,8 +218,8 @@
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (let ((trap #!-ud2-breakpoints (byte-imm-code chunk dstate)
-                #!+ud2-breakpoints (word-imm-code chunk dstate)))
+    (let ((trap #-ud2-breakpoints (byte-imm-code chunk dstate)
+                #+ud2-breakpoints (word-imm-code chunk dstate)))
      (case trap
        (#.cerror-trap
         (nt "cerror trap")

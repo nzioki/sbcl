@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((null immediate zero)
@@ -129,7 +129,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst lr y (tn-value x)))
           (t
            (loadw y code-tn (tn-offset x) other-pointer-lowtag)
@@ -201,7 +201,7 @@
     (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
     (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
     (inst bns done)
-    (load-constant vop (emit-constant (1+ sb!xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
                    y)
     DONE))
 
@@ -213,7 +213,7 @@
     (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
     (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
     (inst bns done)
-    (load-constant vop (emit-constant (1- sb!xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
                    y)
     DONE))
 

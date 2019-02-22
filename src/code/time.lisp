@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun time-reinit ()
   (reinit-internal-real-time))
@@ -145,7 +145,7 @@ format."
   (multiple-value-bind (seconds-west daylight)
       (if time-zone
           (values (* time-zone 60 60) nil)
-          (sb!unix::get-timezone (truncate-to-unix-range universal-time)))
+          (sb-unix::get-timezone (truncate-to-unix-range universal-time)))
     (declare (fixnum seconds-west))
     (multiple-value-bind (weeks secs)
         (truncate (+ (- universal-time seconds-west) seconds-offset)
@@ -232,12 +232,12 @@ format."
     (if time-zone
         (setf encoded-time (+ second (* (+ minute (* (+ hours time-zone) 60)) 60)))
         (let* ((secwest-guess
-                 (sb!unix::get-timezone
+                 (sb-unix::get-timezone
                   (truncate-to-unix-range (* hours 60 60))))
                (guess (+ second (* 60 (+ minute (* hours 60)))
                          secwest-guess))
                (secwest
-                 (sb!unix::get-timezone
+                 (sb-unix::get-timezone
                   (truncate-to-unix-range guess))))
           (setf encoded-time (+ guess (- secwest secwest-guess)))))
     encoded-time))
@@ -317,16 +317,16 @@ normally during operations like SLEEP."
 
 (defun elapsed-cycles (h0 l0 h1 l1)
   (declare (ignorable h0 l0 h1 l1))
-  #!+cycle-counter
+  #+cycle-counter
   (+ (ash (- h1 h0) 32)
      (- l1 l0))
-  #!-cycle-counter
+  #-cycle-counter
   nil)
 (declaim (inline read-cycle-counter))
 (defun read-cycle-counter ()
-  #!+cycle-counter
-  (sb!vm::%read-cycle-counter)
-  #!-cycle-counter
+  #+cycle-counter
+  (sb-vm::%read-cycle-counter)
+  #-cycle-counter
   (values 0 0))
 
 ;;; This is so that we don't have to worry about the vagaries of
@@ -465,9 +465,9 @@ EXPERIMENTAL: Interface subject to change."
     (setq old-real-time (get-internal-real-time))
     (let ((start-gc-internal-run-time *gc-run-time*)
           (*eval-calls* 0)
-          (sb!c::*lambda-conversions* 0)
+          (sb-c::*lambda-conversions* 0)
           (aborted t))
-      (declare (special *eval-calls* sb!c::*lambda-conversions*))
+      (declare (special *eval-calls* sb-c::*lambda-conversions*))
       (multiple-value-bind (h0 l0) (read-cycle-counter)
         (unwind-protect
              (multiple-value-prog1 (apply fun arguments)
@@ -494,7 +494,7 @@ EXPERIMENTAL: Interface subject to change."
                     ;; cycle counting isn't supported everywhere.
                     (when cycles
                       (note :processor-cycles cycles #'zerop))
-                    (note :lambdas-converted sb!c::*lambda-conversions* #'zerop)
+                    (note :lambdas-converted sb-c::*lambda-conversions* #'zerop)
                     (note :eval-calls *eval-calls* #'zerop)
                     (note :gc-run-time-ms gc-internal-run-time)
                     (note :system-run-time-us system-run-time)

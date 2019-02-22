@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; a value for an optimization declaration
 (def!type policy-quality () '(integer 0 3))
@@ -187,11 +187,11 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
                            sum (ash #b01 (* i 2))))
         *policy* (copy-policy **baseline-policy**))
   (when baseline-qualities
-    (sb!xc:proclaim `(optimize ,@baseline-qualities))
+    (sb-xc:proclaim `(optimize ,@baseline-qualities))
     ;; Copy altered policy back as the baseline policy
     (setq **baseline-policy** (copy-policy *policy*)))
   (let ((*policy* *policy*))
-    (sb!xc:proclaim '(optimize (type-check 0)))
+    (sb-xc:proclaim '(optimize (type-check 0)))
     (setq **zero-typecheck-policy** *policy*)))
 
 ;;; Look up a named optimization quality in POLICY. This is only

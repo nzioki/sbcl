@@ -1,13 +1,13 @@
 ;;;; This is an automatically generated file, please do not hand-edit it.
 ;;;; See the program "grovel-headers.c".
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 ;;;flags for dlopen()
 (defconstant rtld-lazy 1) ; #x1
 (defconstant rtld-now 2) ; #x2
 (defconstant rtld-global 4) ; #x4
-(in-package "SB!UNIX")
+(in-package "SB-UNIX")
 
 ;;; select()
 (defconstant fd-setsize 1024) ; #x400
@@ -81,6 +81,7 @@
 (defconstant eexist 17) ; #x11
 (defconstant eloop 90) ; #x5a
 (defconstant espipe 29) ; #x1d
+(defconstant epipe 32) ; #x20
 (defconstant ewouldblock 11) ; #xb
 
 ;;; for wait3(2) in run-program.lisp
@@ -145,7 +146,7 @@
           (tv-sec (signed 32))
           (tv-nsec (signed 32))))
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; Our runtime types
 (define-alien-type os-vm-size-t (unsigned 32))

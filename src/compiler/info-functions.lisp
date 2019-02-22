@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; internal utilities defined in terms of INFO
 
@@ -142,11 +142,13 @@
     (if (info :function :assumed-type name)
         (clear-info :function :assumed-type name))))
 
-;;; Trivially wrap (INFO :FUNCTION :INLINING-DATA FUN-NAME)
-;;; to extract an inlineable lambda.
-;;; Secondary value is T only if an explicit expansion was stored, and NOT
-;;; an implicit expansion of a auto-defined product of DEFSTRUCT.
-(declaim (ftype (function ((or symbol cons)) (values list boolean))
+;;; Unpack (INFO :FUNCTION :INLINING-DATA FUN-NAME). If an explicit expansion
+;;; is not stored but FUN-NAME is a structure constructor, reconstitute the
+;;; expansion from the defstruct description. Secondary value is T if the expansion
+;;; was explicit. See SAVE-INLINE-EXPANSION-P for why we care.
+;;; (Essentially, once stored then always stored, lest inconsistency result)
+;;; If we have just a DXABLE-ARGS, or nothing at all, return NIL and NIL.
+(declaim (ftype (sfunction ((or symbol cons)) (values list boolean))
                 fun-name-inline-expansion))
 (defun fun-name-inline-expansion (fun-name)
   (multiple-value-bind (answer winp) (info :function :inlining-data fun-name)
@@ -155,12 +157,11 @@
       (inlining-data (setq answer (inlining-data-expansion answer)))
       (dxable-args   (setq answer nil winp nil)))
     (when (and (not winp) (symbolp fun-name))
-      (let ((info (info :function :type fun-name)))
-        (when (typep info 'defstruct-description)
-          (let ((spec (assq fun-name (dd-constructors info))))
+      (let ((info (info :function :source-transform fun-name)))
+        (when (typep info '(cons defstruct-description (eql :constructor)))
+          (let* ((dd (car info)) (spec (assq fun-name (dd-constructors dd))))
             (aver spec)
-            (setq answer `(lambda ,@(structure-ctor-lambda-parts
-                                     info (cdr spec))))))))
+            (setq answer `(lambda ,@(structure-ctor-lambda-parts dd (cdr spec))))))))
     (values answer winp)))
 (defun fun-name-dx-args (fun-name)
   (let ((answer (info :function :inlining-data fun-name)))
@@ -170,26 +171,26 @@
 ;;;; ANSI Common Lisp functions which are defined in terms of the info
 ;;;; database
 
-(defun sb!xc:macro-function (symbol &optional env)
+(defun sb-xc:macro-function (symbol &optional env)
   "If SYMBOL names a macro in ENV, returns the expansion function,
 else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
   ;; local function definitions (ordinary) can shadow a global macro
   (typecase env
-    #!+(and sb-fasteval (host-feature sb-xc))
-    (sb!interpreter:basic-env
+    #+(and sb-fasteval (not sb-xc-host))
+    (sb-interpreter:basic-env
      (multiple-value-bind (kind def)
-         (sb!interpreter:find-lexical-fun env symbol)
+         (sb-interpreter:find-lexical-fun env symbol)
        (when def
-         (return-from sb!xc:macro-function (when (eq kind :macro) def)))))
+         (return-from sb-xc:macro-function (when (eq kind :macro) def)))))
     (lexenv
      (let ((def (cdr (assoc symbol (lexenv-funs env)))))
        (when def
-         (return-from sb!xc:macro-function
+         (return-from sb-xc:macro-function
            (when (typep def '(cons (eql macro))) (cdr def)))))))
   (values (info :function :macro-function symbol)))
 
-(defun (setf sb!xc:macro-function) (function symbol &optional environment)
+(defun (setf sb-xc:macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
   (when environment
     ;; Note: Technically there could be an ENV optional argument to SETF
@@ -208,7 +209,7 @@ only."
     #-sb-xc-host (install-guard-function symbol `(:macro ,symbol)))
   function)
 
-(defun sb!xc:compiler-macro-function (name &optional env)
+(defun sb-xc:compiler-macro-function (name &optional env)
   "If NAME names a compiler-macro in ENV, return the expansion function, else
 return NIL. Can be set with SETF when ENV is NIL."
   (legal-fun-name-or-type-error name)
@@ -227,7 +228,7 @@ return NIL. Can be set with SETF when ENV is NIL."
     (values (info :function :compiler-macro-function name))))
 
 ;;; FIXME: we don't generate redefinition warnings for these.
-(defun (setf sb!xc:compiler-macro-function) (function name &optional env)
+(defun (setf sb-xc:compiler-macro-function) (function name &optional env)
   (declare (type (or symbol list) name)
            (type (or function null) function))
   (when env

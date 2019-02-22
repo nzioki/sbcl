@@ -7,24 +7,25 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!THREAD")
-
-(def!type thread-name () 'simple-string)
+(in-package "SB-THREAD")
 
 (defstruct (thread (:constructor %make-thread)
                    (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
-  (name          nil :type (or thread-name null))
+  (name          nil :type (or null simple-string)) ; some C code reads this
   (%alive-p      nil :type boolean)
   (%ephemeral-p  nil :type boolean)
-  #-sb-xc-host
   ;; 0 is used on thread-less builds
-  (os-thread  (ldb (byte sb!vm:n-word-bits 0) -1) :type sb!vm:word)
-  #-sb-xc-host
+  (os-thread  (ldb (byte sb-vm:n-word-bits 0) -1) :type sb-vm:word)
+  ;; Keep a copy of CONTROL-STACK-END from the "primitive" thread (C memory).
+  ;; Reading that memory for any thread except *CURRENT-THREAD* is not safe
+  ;; due to possible unmapping on thread death. Technically this is a fixed amount
+  ;; below PRIMITIVE-THREAD, but the exact offset varies by build configuration.
+  (stack-end 0 :type sb-vm:word)
   ;; Points to the SB-VM::THREAD primitive object.
   ;; Yes, there are three different thread structures.
-  (primitive-thread 0 :type sb!vm:word)
+  (primitive-thread 0 :type sb-vm:word)
   (interruptions nil :type list)
   ;; On succesful execution of the thread's lambda a list of values.
   (result 0)
@@ -46,13 +47,21 @@ any time."
 (def!struct (mutex (:constructor make-mutex (&key name))
                    (:copier nil))
   "Mutex type."
-  (name   nil :type (or null thread-name))
+  ;; C code could (but doesn't currently) access the name
+  (name   nil :type (or null simple-string))
   (%owner nil :type (or null thread))
-  #!+(and sb-thread sb-futex)
+  #+(and sb-thread sb-futex)
   (state    0 :type fixnum))
+(!set-load-form-method mutex (:xc))
+
+(def!struct (avlnode (:constructor avlnode (key data left right)))
+  (left  nil :read-only t)
+  (right nil :read-only t)
+  (key   0   :read-only t :type sb-vm:word)
+  data)
 
 ;; The host has a stub for this macro. The cross-compiler doesn't use
-;; it until it's seen. So no SB!XC:DEFMACRO needed
+;; it until it's seen. So no SB-XC:DEFMACRO needed
 #-sb-xc-host
 (defmacro with-system-mutex ((mutex &key without-gcing allow-with-interrupts)
                                     &body body)

@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Signalling an error when trying to print an error condition is
 ;;; generally a PITA, so whatever the failure encountered when
@@ -58,7 +58,7 @@
            "Read the content of STREAM into a buffer in order to count
 lines and columns."
            (unless (and old-position position
-                        (< position sb!xc:array-dimension-limit))
+                        (< position sb-xc:array-dimension-limit))
              (return-from read-content))
            (let ((content
                    (make-string position :element-type (stream-element-type stream))))

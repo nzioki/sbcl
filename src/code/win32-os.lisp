@@ -9,11 +9,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!SYS")
+(in-package "SB-SYS")
 
 ;;; Check that target machine features are set up consistently with
 ;;; this file.
-#!-win32 (error "missing :WIN32 feature")
+#-win32 (error "missing :WIN32 feature")
 
 (defun software-type ()
   "Return a string describing the supporting software."
@@ -26,7 +26,7 @@
       (setf *software-version*
             (multiple-value-bind
                   (major-version minor-version build-number platform-id csd-version)
-                (sb!win32:get-version-ex)
+                (sb-win32:get-version-ex)
               (declare (ignore platform-id))
               (format nil (if (zerop (length csd-version))
                               "~A.~A.~A"
@@ -35,7 +35,7 @@
 
 ;;; Return user time, system time, and number of page faults.
 (defun get-system-info ()
-  (sb!win32:with-process-times (creation-time exit-time kernel-time user-time)
+  (sb-win32:with-process-times (creation-time exit-time kernel-time user-time)
     (values (floor user-time 10) (floor kernel-time 10) 0)))
 
 ;;; support for CL:MACHINE-VERSION defined OAOO elsewhere

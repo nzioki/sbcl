@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!THREAD")
+(in-package "SB-THREAD")
 
 ;;; CAS Lock
 ;;;
@@ -36,7 +36,7 @@ WITH-CAS-LOCK can be entered recursively."
 (defmacro %with-cas-lock ((place) &body body &environment env)
   (with-unique-names (owner self)
     (multiple-value-bind (vars vals old new cas-form read-form)
-        (sb!ext:get-cas-expansion place env)
+        (sb-ext:get-cas-expansion place env)
       `(let* (,@(mapcar #'list vars vals)
               (,owner (progn
                         (barrier (:read))
@@ -54,7 +54,7 @@ WITH-CAS-LOCK can be entered recursively."
                                               (not (setf ,owner ,cas-form)))
                                     return t
                                     else
-                                    do (sb!ext:spin-loop-hint))
+                                    do (sb-ext:spin-loop-hint))
                         do (thread-yield)))
                 ,@body)
            (unless (eq ,owner ,self)
@@ -213,10 +213,10 @@ an error in that case."
   (thread-%ephemeral-p thread))
 
 ;; A thread is eligible for gc iff it has finished and there are no
-;; more references to it. This list is supposed to keep a reference to
-;; all running threads.
-(sb!ext:define-load-time-global *all-threads* ())
-(sb!ext:define-load-time-global *all-threads-lock* (make-mutex :name "all threads lock"))
+;; more references to it. This structure keeps a reference to
+;; all running threads ordered by stack base address.
+(sb-ext:define-load-time-global *all-threads* ())
+(sb-ext:define-load-time-global *all-threads-lock* (make-mutex :name "all threads lock"))
 
 (defvar *default-alloc-signal* nil)
 
@@ -228,62 +228,55 @@ an error in that case."
   "Return a list of the live threads. Note that the return value is
 potentially stale even before the function returns, as new threads may be
 created and old ones may exit at any time."
-  (with-all-threads-lock
-    (copy-list *all-threads*)))
+  ;; No lock needed, just an atomic read, since tree mutations can't happen.
+  ;; Of course by the time we're done collecting nodes, the tree can have
+  ;; been replaced by a different tree.
+  (barrier (:read))
+  (avltree-list *all-threads*))
 
 ;;; used by debug-int.lisp to access interrupt contexts
 
-#!-sb-thread
+#-sb-thread
 (progn
-  (declaim (inline sb!vm::current-thread-offset-sap))
-  (defun sb!vm::current-thread-offset-sap (n)
+  (declaim (inline sb-vm::current-thread-offset-sap))
+  (defun sb-vm::current-thread-offset-sap (n)
     (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
-                 (* n sb!vm:n-word-bytes))))
+                 (* n sb-vm:n-word-bytes))))
 
 (declaim (inline current-thread-sap))
 (defun current-thread-sap ()
-  #!+sb-thread
-  (sb!vm::current-thread-offset-sap sb!vm::thread-this-slot)
-  #!-sb-thread
+  #+sb-thread
+  (sb-vm::current-thread-offset-sap sb-vm::thread-this-slot)
+  #-sb-thread
   (int-sap 0))
 
 (declaim (inline current-thread-os-thread))
 (defun current-thread-os-thread ()
-  #!+sb-thread
-  (sap-int (sb!vm::current-thread-offset-sap sb!vm::thread-os-thread-slot))
-  #!-sb-thread
+  #+sb-thread
+  (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-os-thread-slot))
+  #-sb-thread
   0)
 
-(sb!ext:define-load-time-global *stack-addr-table* nil)
-(sb!ext:define-load-time-global *initial-thread* nil)
-(sb!ext:define-load-time-global *make-thread-lock* nil)
-
-(defun note-stack-range (thread table)
-  (let ((start (get-lisp-obj-address sb!vm:*control-stack-start*))
-        (end (get-lisp-obj-address sb!vm:*control-stack-end*)))
-    (multiple-value-bind (new-tree insertedp)
-        ;; We're within the scope of all-threads-lock here.
-        (treap-insert table start (cons end thread))
-      (aver insertedp)
-      (setq *stack-addr-table* new-tree))))
+(sb-ext:define-load-time-global *initial-thread* nil)
+(sb-ext:define-load-time-global *make-thread-lock* nil)
 
 (defun init-initial-thread ()
   (/show0 "Entering INIT-INITIAL-THREAD")
-  (setf sb!impl::*exit-lock* (make-mutex :name "Exit Lock")
+  (setf sb-impl::*exit-lock* (make-mutex :name "Exit Lock")
         *make-thread-lock* (make-mutex :name "Make-Thread Lock"))
   (let ((thread (%make-thread :name "main thread"
                               :%alive-p t)))
     (setf (thread-os-thread thread) (current-thread-os-thread)
+          (thread-stack-end thread) (get-lisp-obj-address sb-vm:*control-stack-end*)
           (thread-primitive-thread thread) (sap-int (current-thread-sap))
           *initial-thread* thread
           *current-thread* thread)
-    (setq sb!impl::*treap-random-state* (make-random-state *random-state*))
     (grab-mutex (thread-result-lock *initial-thread*))
-    (note-stack-range thread nil)
     ;; Either *all-threads* is empty or it contains exactly one thread
     ;; in case we are in reinit since saving core with multiple
     ;; threads doesn't work.
-    (setq *all-threads* (list thread))))
+    (setq *all-threads*
+          (avl-insert nil (get-lisp-obj-address sb-vm:*control-stack-start*) thread))))
 
 (defun main-thread ()
   "Returns the main thread of the process."
@@ -315,7 +308,7 @@ See also: ABORT-THREAD and SB-EXT:EXIT."
                                      but exit was not allowed.~:@>"
                     :format-arguments (list values)
                     :thread self))
-           (sb!ext:exit :code 0))
+           (sb-ext:exit :code 0))
           (t
            (throw '%return-from-thread (values-list values))))))
 
@@ -344,7 +337,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
              (error 'simple-thread-error
                     :format-control "~@<Tried to abort initial thread, but ~
                                      exit was not allowed.~:@>"))
-           (sb!ext:exit :code 1))
+           (sb-ext:exit :code 1))
           (t
            ;; We /could/ use TOPLEVEL-CATCHER or %END-OF-THE-WORLD as well, but
            ;; this seems tidier. Those to are a bit too overloaded already.
@@ -355,14 +348,14 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 
 (define-alien-routine "kill_safely"
     int
-  (os-thread #!-alpha unsigned #!+alpha unsigned-int)
+  (os-thread #-alpha unsigned #+alpha unsigned-int)
   (signal int))
 
 (define-alien-routine "wake_thread"
     int
   (os-thread unsigned))
 
-#!+sb-thread
+#+sb-thread
 (progn
   ;; FIXME it would be good to define what a thread id is or isn't
   ;; (our current assumption is that it's a fixnum).  It so happens
@@ -380,7 +373,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
   (defun block-deferrable-signals ()
     (%block-deferrable-signals 0 0))
 
-  #!+sb-futex
+  #+sb-futex
   (progn
     (declaim (inline futex-wait %futex-wait futex-wake))
 
@@ -400,7 +393,7 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
     `(let* ((,n-thread ,thread)
             (,n-lock ,lock)
             (,n-timeout ,(when timeoutp
-                           `(or ,timeout sb!impl::*deadline*)))
+                           `(or ,timeout sb-impl::*deadline*)))
             (,new (if ,n-timeout
                       ;; Using CONS tells the rest of the system there's a
                       ;; timeout in place, so it isn't considered a deadlock.
@@ -424,9 +417,9 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 (setf (documentation 'make-mutex 'function) "Create a mutex."
       (documentation 'mutex-name 'function) "The name of the mutex. Setfable.")
 
-#!+(and sb-thread sb-futex)
+#+(and sb-thread sb-futex)
 (progn
-  (locally (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
+  (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
     (define-structure-slot-addressor mutex-state-address
         :structure mutex
         :slot state))
@@ -443,21 +436,21 @@ this function returns), it is intended for informative purposes. For
 testing whether the current thread is holding a mutex see
 HOLDING-MUTEX-P."
   ;; Make sure to get the current value.
-  (sb!ext:compare-and-swap (mutex-%owner mutex) nil nil))
+  (sb-ext:compare-and-swap (mutex-%owner mutex) nil nil))
 
-(sb!ext:define-load-time-global **deadlock-lock** nil)
+(sb-ext:define-load-time-global **deadlock-lock** nil)
 
-#!+(or (not sb-thread) sb-futex)
+#+(or (not sb-thread) sb-futex)
 (defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."
-  (name nil :type (or null thread-name))
-  #!+(and sb-thread sb-futex)
+  (name nil :type (or null string))
+  #+(and sb-thread sb-futex)
   (token nil))
 
-#!+(and sb-thread (not sb-futex))
+#+(and sb-thread (not sb-futex))
 (defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."
-  (name nil :type (or null thread-name))
+  (name nil :type (or null string))
   ;; For WITH-CAS-LOCK: because CONDITION-WAIT must be able to call
   ;; %WAITQUEUE-WAKEUP without re-aquiring the mutex, we need a separate
   ;; lock. In most cases this should be uncontested thanks to the mutex --
@@ -568,9 +561,9 @@ HOLDING-MUTEX-P."
       (loop with max-ticks = (max 100000 (min (* 2 try-ticks)
                                               (expt 10 7)))
             for scale of-type fixnum = 1
-            then (let ((x (logand most-positive-fixnum (* 2 scale))))
+            then (let ((x (logand sb-xc:most-positive-fixnum (* 2 scale))))
                    (if (> scale x)
-                       most-positive-fixnum
+                       sb-xc:most-positive-fixnum
                        x))
             do (try)
                (let* ((now (get-tick))
@@ -590,7 +583,7 @@ HOLDING-MUTEX-P."
                         (multiple-value-bind (sec nsec)
                             (truncate (* 1000 sleep) (expt 10 9))
                           (with-interrupts
-                            (sb!unix:nanosleep sec nsec))))
+                            (sb-unix:nanosleep sec nsec))))
                        (t
                         (return-from %%wait-for nil))))))))
 
@@ -608,7 +601,7 @@ HOLDING-MUTEX-P."
                (signal-deadline)
                (go :restart)))))))
 
-(defmacro sb!ext:wait-for (test-form &key timeout)
+(defmacro sb-ext:wait-for (test-form &key timeout)
   "Wait until TEST-FORM evaluates to true, then return its primary value.
 If TIMEOUT is provided, waits at most approximately TIMEOUT seconds before
 returning NIL.
@@ -632,13 +625,13 @@ returns NIL each time."
             (,deadline
               (when ,sec
                 (+ (get-internal-real-time)
-                   (round (* ,seconds internal-time-units-per-second))))))
+                   (round (* ,seconds sb-xc:internal-time-units-per-second))))))
        (flet ((,name ()
                 (when ,deadline
                   (let ((,time-left (- ,deadline (get-internal-real-time))))
                     (if (plusp ,time-left)
                         (* (coerce ,time-left 'single-float)
-                           (load-time-value (/ 1.0f0 internal-time-units-per-second) t))
+                           (load-time-value (/ 1.0f0 sb-xc:internal-time-units-per-second) t))
                         0)))))
          ,@body))))
 
@@ -648,56 +641,56 @@ returns NIL each time."
   (let ((old (mutex-%owner mutex)))
     (when (eq new-owner old)
       (error "Recursive lock attempt ~S." mutex))
-    #!-sb-thread
+    #-sb-thread
     (when old
       (error "Strange deadlock on ~S in an unithreaded build?" mutex))
-    #!-(and sb-thread sb-futex)
+    #-(and sb-thread sb-futex)
     (and (not old)
          ;; Don't even bother to try to CAS if it looks bad.
-         (not (sb!ext:compare-and-swap (mutex-%owner mutex) nil new-owner)))
-    #!+(and sb-thread sb-futex)
+         (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil new-owner)))
+    #+(and sb-thread sb-futex)
     ;; From the Mutex 2 algorithm from "Futexes are Tricky" by Ulrich Drepper.
-    (when (eql +lock-free+ (sb!ext:compare-and-swap (mutex-state mutex)
+    (when (eql +lock-free+ (sb-ext:compare-and-swap (mutex-state mutex)
                                                     +lock-free+
                                                     +lock-taken+))
-      (let ((prev (sb!ext:compare-and-swap (mutex-%owner mutex) nil new-owner)))
+      (let ((prev (sb-ext:compare-and-swap (mutex-%owner mutex) nil new-owner)))
         (when prev
           (bug "Old owner in free mutex: ~S" prev))
         t))))
 
-#!+sb-thread
+#+sb-thread
 (defun %%wait-for-mutex (mutex new-owner to-sec to-usec stop-sec stop-usec)
   (declare (type mutex mutex) (optimize (speed 3)))
-  (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
-  #!-sb-futex
+  (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
+  #-sb-futex
   (declare (ignore to-sec to-usec))
-  #!-sb-futex
+  #-sb-futex
   (flet ((cas ()
            (loop repeat 100
                  when (and (progn
                              (barrier (:read))
                              (not (mutex-%owner mutex)))
-                           (not (sb!ext:compare-and-swap (mutex-%owner mutex) nil
+                           (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil
                                                          new-owner)))
                  do (return-from cas t)
                  else
                  do
-                    (sb!ext:spin-loop-hint))
+                    (sb-ext:spin-loop-hint))
            ;; Check for pending interrupts.
            (with-interrupts nil)))
     (declare (dynamic-extent #'cas))
     (%%wait-for #'cas stop-sec stop-usec))
-  #!+sb-futex
+  #+sb-futex
   ;; This is a fairly direct translation of the Mutex 2 algorithm from
   ;; "Futexes are Tricky" by Ulrich Drepper.
   (flet ((maybe (old)
            (when (eql +lock-free+ old)
-             (let ((prev (sb!ext:compare-and-swap (mutex-%owner mutex)
+             (let ((prev (sb-ext:compare-and-swap (mutex-%owner mutex)
                                                   nil new-owner)))
                (when prev
                  (bug "Old owner in free mutex: ~S" prev))
                (return-from %%wait-for-mutex t)))))
-    (prog ((old (sb!ext:compare-and-swap (mutex-state mutex)
+    (prog ((old (sb-ext:compare-and-swap (mutex-state mutex)
                                          +lock-free+ +lock-taken+)))
        ;; Got it right off the bat?
        (maybe old)
@@ -705,7 +698,7 @@ returns NIL each time."
        ;; Mark it as contested, and sleep. (Exception: it was just released.)
        (when (or (eql +lock-contested+ old)
                  (not (eql +lock-free+
-                           (sb!ext:compare-and-swap
+                           (sb-ext:compare-and-swap
                             (mutex-state mutex) +lock-taken+ +lock-contested+))))
          (when (eql 1 (with-pinned-objects (mutex)
                         (futex-wait (mutex-state-address mutex)
@@ -719,17 +712,17 @@ returns NIL each time."
            (return-from %%wait-for-mutex nil)))
        ;; Try to get it, still marking it as contested.
        (maybe
-        (sb!ext:compare-and-swap (mutex-state mutex) +lock-free+ +lock-contested+))
+        (sb-ext:compare-and-swap (mutex-state mutex) +lock-free+ +lock-contested+))
        ;; Update timeout if necessary.
        (when stop-sec
          (setf (values to-sec to-usec)
-               (sb!impl::relative-decoded-times stop-sec stop-usec)))
+               (sb-impl::relative-decoded-times stop-sec stop-usec)))
        ;; Spin.
        (go :retry))))
 
-#!+sb-thread
+#+sb-thread
 (defun %wait-for-mutex (mutex self timeout to-sec to-usec stop-sec stop-usec deadlinep)
-  (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
+  (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
   (with-deadlocks (self mutex timeout)
     (with-interrupts (check-deadlock))
     (tagbody
@@ -748,7 +741,7 @@ returns NIL each time."
   (declare (ignorable waitp timeout))
   (let ((new-owner (or new-owner *current-thread*)))
     (or (%try-mutex mutex new-owner)
-        #!+sb-thread
+        #+sb-thread
         (when waitp
           (multiple-value-call #'%wait-for-mutex
             mutex new-owner timeout (decode-timeout timeout))))))
@@ -791,7 +784,7 @@ Notes:
   (declare (ignorable waitp timeout))
   (let ((self *current-thread*))
     (or (%try-mutex mutex self)
-        #!+sb-thread
+        #+sb-thread
         (when waitp
           (multiple-value-call #'%wait-for-mutex
             mutex self timeout (decode-timeout timeout))))))
@@ -810,7 +803,7 @@ IF-NOT-OWNER is :FORCE)."
   (declare (type mutex mutex))
   ;; Order matters: set owner to NIL before releasing state.
   (let* ((self *current-thread*)
-         (old-owner (sb!ext:compare-and-swap (mutex-%owner mutex) self nil)))
+         (old-owner (sb-ext:compare-and-swap (mutex-%owner mutex) self nil)))
     (unless (eq self old-owner)
       (ecase if-not-owner
         ((:punt) (return-from release-mutex nil))
@@ -821,20 +814,20 @@ IF-NOT-OWNER is :FORCE)."
       ;; FIXME: Is a :memory barrier too strong here?  Can we use a :write
       ;; barrier instead?
       (barrier (:memory)))
-    #!+(and sb-thread sb-futex)
+    #+(and sb-thread sb-futex)
     (when old-owner
       ;; FIXME: once ATOMIC-INCF supports struct slots with word sized
       ;; unsigned-byte type this can be used:
       ;;
-      ;;     (let ((old (sb!ext:atomic-incf (mutex-state mutex) -1)))
+      ;;     (let ((old (sb-ext:atomic-incf (mutex-state mutex) -1)))
       ;;       (unless (eql old +lock-free+)
       ;;         (setf (mutex-state mutex) +lock-free+)
       ;;         (with-pinned-objects (mutex)
       ;;           (futex-wake (mutex-state-address mutex) 1))))
-      (let ((old (sb!ext:compare-and-swap (mutex-state mutex)
+      (let ((old (sb-ext:compare-and-swap (mutex-state mutex)
                                           +lock-taken+ +lock-free+)))
         (when (eql old +lock-contested+)
-          (sb!ext:compare-and-swap (mutex-state mutex)
+          (sb-ext:compare-and-swap (mutex-state mutex)
                                    +lock-contested+ +lock-free+)
           (with-pinned-objects (mutex)
             (futex-wake (mutex-state-address mutex) 1))))
@@ -843,7 +836,7 @@ IF-NOT-OWNER is :FORCE)."
 
 ;;;; Waitqueues/condition variables
 
-#!+(and sb-thread (not sb-futex))
+#+(and sb-thread (not sb-futex))
 (progn
   (defun %waitqueue-enqueue (thread queue)
     (setf (thread-waiting-for thread) queue)
@@ -885,7 +878,7 @@ IF-NOT-OWNER is :FORCE)."
                              (setf (waitqueue-%head queue) (cdr head)))
                          (car head)))
           while next
-          do (when (eq queue (sb!ext:compare-and-swap
+          do (when (eq queue (sb-ext:compare-and-swap
                               (thread-waiting-for next) queue nil))
                (decf n)))
     nil))
@@ -897,8 +890,8 @@ IF-NOT-OWNER is :FORCE)."
 (setf (documentation 'waitqueue-name 'function) "The name of the waitqueue. Setfable."
       (documentation 'make-waitqueue 'function) "Create a waitqueue.")
 
-#!+(and sb-thread sb-futex)
-(locally (declare (sb!ext:muffle-conditions sb!ext:compiler-note))
+#+(and sb-thread sb-futex)
+(locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
   (define-structure-slot-addressor waitqueue-token-address
       :structure waitqueue
       :slot token))
@@ -906,21 +899,22 @@ IF-NOT-OWNER is :FORCE)."
 (declaim (inline %condition-wait))
 (defun %condition-wait (queue mutex
                         timeout to-sec to-usec stop-sec stop-usec deadlinep)
-  #!-sb-thread
+  #-sb-thread
   (declare (ignore queue mutex to-sec to-usec stop-sec stop-usec deadlinep))
-  #!-sb-thread
-  (sb!ext:wait-for nil :timeout timeout) ; Yeah...
-  #!+sb-thread
+  #-sb-thread
+  (sb-ext:wait-for nil :timeout timeout) ; Yeah...
+  #+sb-thread
   (let ((me *current-thread*))
     (barrier (:read))
-    (aver (eq me (mutex-%owner mutex)))
+    (unless (eq me (mutex-%owner mutex))
+      (error "The current thread is not holding ~s." mutex))
     (let ((status :interrupted))
       ;; Need to disable interrupts so that we don't miss grabbing
       ;; the mutex on our way out.
       (without-interrupts
         (unwind-protect
              (progn
-               #!-sb-futex
+               #-sb-futex
                (progn
                  (%with-cas-lock ((waitqueue-%owner queue))
                    (%waitqueue-enqueue me queue))
@@ -934,7 +928,7 @@ IF-NOT-OWNER is :FORCE)."
                              (allow-with-interrupts
                                (%%wait-for #'wakeup stop-sec stop-usec)))
                            :timeout)))
-               #!+sb-futex
+               #+sb-futex
                (with-pinned-objects (queue me)
                  (setf (waitqueue-token queue) me)
                  (release-mutex mutex)
@@ -959,7 +953,7 @@ IF-NOT-OWNER is :FORCE)."
                           ;;  0 = normal wakeup
                           ;;  2 = EINTR, a spurious wakeup
                           :ok)))))
-          #!-sb-futex
+          #-sb-futex
           (%with-cas-lock ((waitqueue-%owner queue))
             (if (eq queue (thread-waiting-for me))
                 (%waitqueue-drop me queue)
@@ -971,7 +965,7 @@ IF-NOT-OWNER is :FORCE)."
           ;; already past the requested timeout.
           (when (and (eq :ok status) to-sec)
             (setf (values to-sec to-usec)
-                  (sb!impl::relative-decoded-times stop-sec stop-usec))
+                  (sb-impl::relative-decoded-times stop-sec stop-usec))
             (when (and (zerop to-sec) (not (plusp to-usec)))
               (setf status :timeout)))
           ;; If we ran into deadline, try to get the mutex before
@@ -1002,7 +996,7 @@ IF-NOT-OWNER is :FORCE)."
         (:ok
          (if timeout
              (multiple-value-bind (sec usec)
-                 (sb!impl::relative-decoded-times stop-sec stop-usec)
+                 (sb-impl::relative-decoded-times stop-sec stop-usec)
                (values t sec usec))
              t))
         (:timeout
@@ -1065,19 +1059,18 @@ associated data:
 
 IMPORTANT: The same mutex that is used in the corresponding CONDITION-WAIT
 must be held by this thread during this call."
-  #!-sb-thread
+  #-sb-thread
   (declare (ignore queue n))
-  #!-sb-thread
+  #-sb-thread
   (error "Not supported in unithread builds.")
-  #!+sb-thread
+  #+sb-thread
   (declare (type (and fixnum (integer 1)) n))
-  (/show0 "Entering CONDITION-NOTIFY")
-  #!+sb-thread
+  #+sb-thread
   (progn
-    #!-sb-futex
+    #-sb-futex
     (with-cas-lock ((waitqueue-%owner queue))
       (%waitqueue-wakeup queue n))
-    #!+sb-futex
+    #+sb-futex
     (progn
     ;; No problem if >1 thread notifies during the comment in condition-wait:
     ;; as long as the value in queue-data isn't the waiting thread's id, it
@@ -1100,7 +1093,7 @@ must be held by this thread during this call."
                     ;; On a 64-bit platform truncating M-P-F to an int
                     ;; results in -1, which wakes up only one thread.
                     (ldb (byte 29 0)
-                         most-positive-fixnum)))
+                         sb-xc:most-positive-fixnum)))
 
 
 ;;;; Semaphores
@@ -1111,9 +1104,9 @@ must be held by this thread during this call."
   "Semaphore type. The fact that a SEMAPHORE is a STRUCTURE-OBJECT
 should be considered an implementation detail, and may change in the
 future."
-  (name    nil :type (or null thread-name) :read-only t)
+  (name    nil :type (or null string) :read-only t)
   (%count    0 :type (integer 0))
-  (waitcount 0 :type sb!vm:word)
+  (waitcount 0 :type sb-vm:word)
   (mutex (make-mutex :name "semaphore lock") :read-only t)
   (queue (make-waitqueue) :read-only t))
 
@@ -1201,7 +1194,7 @@ WAIT-ON-SEMAPHORE or TRY-SEMAPHORE."
                 ;; in parallel using ATOMIC-DECF. No danger over
                 ;; overflow, since there it at most one increment per
                 ;; thread waiting on the semaphore.
-                (sb!ext:atomic-incf (semaphore-waitcount semaphore))
+                (sb-ext:atomic-incf (semaphore-waitcount semaphore))
                 (loop until (>= (setf old-count (semaphore-%count semaphore)) n)
                    do (multiple-value-bind (wakeup-p remaining-sec remaining-usec)
                           (%condition-wait
@@ -1218,7 +1211,7 @@ WAIT-ON-SEMAPHORE or TRY-SEMAPHORE."
                 (success (- old-count n)))
            ;; Need to use ATOMIC-DECF as we may unwind without the
            ;; lock being held!
-           (sb!ext:atomic-decf (semaphore-waitcount semaphore))))))))
+           (sb-ext:atomic-decf (semaphore-waitcount semaphore))))))))
 
 (declaim (ftype (sfunction (semaphore &key
                                       (:n (integer 1))
@@ -1327,22 +1320,21 @@ on this semaphore, then N of them is woken up."
       (call-with-new-session (function ,fb-name)))))
 
 ;;; Remove thread from its session, if it has one.
-#!+sb-thread
+#+sb-thread
 (defun handle-thread-exit (thread control-stack-start)
   (/show0 "HANDLING THREAD EXIT")
   (when *exit-in-process*
     (%exit))
   ;; Lisp-side cleanup
   (with-all-threads-lock
-    (setq *stack-addr-table* (treap-delete control-stack-start *stack-addr-table*))
     (setf (thread-%alive-p thread) nil)
     (setf (thread-os-thread thread)
-          (ldb (byte sb!vm:n-word-bits 0) -1))
-    (setq *all-threads* (delq1 thread *all-threads*))
+          (ldb (byte sb-vm:n-word-bits 0) -1))
+    (setq *all-threads* (avl-delete control-stack-start *all-threads*))
     (when *session*
       (%delete-thread-from-session thread *session*))))
 
-(defvar sb!ext:*invoke-debugger-hook* nil
+(defvar sb-ext:*invoke-debugger-hook* nil
   "This is either NIL or a designator for a function of two arguments,
    to be run when the debugger is about to be entered.  The function is
    run with *INVOKE-DEBUGGER-HOOK* bound to NIL to minimize recursive
@@ -1358,17 +1350,17 @@ on this semaphore, then N of them is woken up."
   ;; being spawned, and guarantees that *ALL-THREADS*
   ;; is up to date.
   (with-deadline (:seconds nil :override t)
-    (sb!impl::finalizer-thread-stop)
+    (sb-impl::finalizer-thread-stop)
     (grab-mutex *make-thread-lock*)
-    (let ((timeout sb!ext:*exit-timeout*)
+    (let ((timeout sb-ext:*exit-timeout*)
           (code *exit-in-process*)
           (current *current-thread*)
           (joinees nil)
           (main nil))
       ;; Don't invoke the debugger on errors in cleanup forms in unwind-protect
-      (setf sb!ext:*invoke-debugger-hook*
+      (setf sb-ext:*invoke-debugger-hook*
             (lambda (c h)
-              (sb!debug::debugger-disabled-hook c h :quit nil)
+              (sb-debug::debugger-disabled-hook c h :quit nil)
               (abort-thread :allow-exit t)))
       (dolist (thread (list-all-threads))
         (cond ((eq thread current))
@@ -1392,7 +1384,7 @@ on this semaphore, then N of them is woken up."
                main
                (lambda ()
                  (setf *exit-in-process* (list code))
-                 (throw 'sb!impl::%end-of-the-world t)))
+                 (throw 'sb-impl::%end-of-the-world t)))
             (interrupt-thread-error ()))
           ;; Normally this never finishes, as once the main-thread unwinds we
           ;; exit with the right code, but if times out before that happens,
@@ -1422,8 +1414,8 @@ thread is not the foreground thread."
   "Returns T if thread had been running in background, NIL if it was
 interactive."
   (declare (ignore stream))
-  #!-sb-thread nil
-  #!+sb-thread
+  #-sb-thread nil
+  #+sb-thread
   (prog1
       (with-session-lock (*session*)
         (not (member *current-thread*
@@ -1431,8 +1423,8 @@ interactive."
     (get-foreground)))
 
 (defun get-foreground ()
-  #!-sb-thread t
-  #!+sb-thread
+  #-sb-thread t
+  #+sb-thread
   (let ((session *session*)
         (was-foreground t))
     (loop
@@ -1460,9 +1452,9 @@ interactive."
 (defun release-foreground (&optional next)
   "Background this thread.  If NEXT is supplied, arrange for it to
 have the foreground next."
-  #!-sb-thread (declare (ignore next))
-  #!-sb-thread nil
-  #!+sb-thread
+  #-sb-thread (declare (ignore next))
+  #-sb-thread nil
+  #+sb-thread
   (let ((session *session*))
     (with-session-lock (session)
       (symbol-macrolet
@@ -1486,28 +1478,28 @@ session."
 
 (defun make-listener-thread (tty-name)
   (aver (probe-file tty-name))
-  (let* ((in (sb!unix:unix-open (namestring tty-name) sb!unix:o_rdwr #o666))
-         (out (sb!unix:unix-dup in))
-         (err (sb!unix:unix-dup in)))
+  (let* ((in (sb-unix:unix-open (namestring tty-name) sb-unix:o_rdwr #o666))
+         (out (sb-unix:unix-dup in))
+         (err (sb-unix:unix-dup in)))
     (labels ((thread-repl ()
-               (sb!unix::unix-setsid)
-               (let* ((sb!impl::*stdin*
+               (sb-unix::unix-setsid)
+               (let* ((sb-impl::*stdin*
                        (make-fd-stream in :input t :buffering :line
                                        :dual-channel-p t))
-                      (sb!impl::*stdout*
+                      (sb-impl::*stdout*
                        (make-fd-stream out :output t :buffering :line
                                               :dual-channel-p t))
-                      (sb!impl::*stderr*
+                      (sb-impl::*stderr*
                        (make-fd-stream err :output t :buffering :line
                                               :dual-channel-p t))
-                      (sb!impl::*tty*
+                      (sb-impl::*tty*
                        (make-fd-stream err :input t :output t
                                               :buffering :line
                                               :dual-channel-p t))
-                      (sb!impl::*descriptor-handlers* nil))
+                      (sb-impl::*descriptor-handlers* nil))
                  (with-new-session ()
                    (unwind-protect
-                        (sb!impl::toplevel-repl nil)
+                        (sb-impl::toplevel-repl nil)
                      (flush-standard-output-streams))))))
       (make-thread #'thread-repl))))
 
@@ -1520,28 +1512,31 @@ session."
 ;;; All threads other than the initial thread DO start via this function.
 ;;; The initial thread has its own way of doing things, which ends up calling
 ;;; INIT-INITIAL-THREAD.  It might be nice to come up with some better naming.
-#!+sb-thread
+#+sb-thread
 (defun initial-thread-function-trampoline (thread setup-sem real-function arguments)
   ;; Can't initiate GC before *current-thread* is set, otherwise the
   ;; locks grabbed by SUB-GC wouldn't function.
   ;; Other threads can GC with impunity.
   (setf *current-thread* thread ; is thread-local already
         (thread-os-thread thread) (current-thread-os-thread)
+        (thread-stack-end thread) (get-lisp-obj-address sb-vm:*control-stack-end*)
         (thread-primitive-thread thread) (sap-int (current-thread-sap)))
   ;; *ALLOC-SIGNAL* is made thread-local by create_thread_struct()
   ;; so this assigns into TLS, not the global value.
-  (setf sb!vm:*alloc-signal* *default-alloc-signal*)
+  (setf sb-vm:*alloc-signal* *default-alloc-signal*)
   (with-mutex ((thread-result-lock thread))
-    (let* ((thread-list (list thread thread))
-           (session-cons (cdr thread-list)))
-      (with-all-threads-lock
-        (note-stack-range thread *stack-addr-table*)
-        (setf (cdr thread-list) *all-threads*
-              *all-threads* thread-list))
-      (let ((session *session*))
+    (with-all-threads-lock
+        (let ((addr (get-lisp-obj-address sb-vm:*control-stack-start*)))
+          ;; If ADDR exists, then we have a bug in the thread exit handler.
+          ;; The workaround here would be to delete the old thread first,
+          ;; but I'd rather find out about the bug than bury it.
+          (aver (not (avl-find addr *all-threads*)))
+          (setq *all-threads* (avl-insert *all-threads* addr thread))))
+    (let ((session *session*)
+          (session-cons (list thread)))
         (with-session-lock (session)
           (setf (cdr session-cons) (session-threads session)
-                (session-threads session) session-cons))))
+                (session-threads session) session-cons)))
     (setf (thread-%alive-p thread) t)
 
     (when setup-sem
@@ -1553,8 +1548,8 @@ session."
     ;; Using handling-end-of-the-world would be a bit tricky
     ;; due to other catches and interrupts, so we essentially
     ;; re-implement it here. Once and only once more.
-    (catch 'sb!impl::toplevel-catcher
-      (catch 'sb!impl::%end-of-the-world
+    (catch 'sb-impl::toplevel-catcher
+      (catch 'sb-impl::%end-of-the-world
         (catch '%abort-thread
           (restart-bind ((abort
                            (lambda ()
@@ -1566,19 +1561,19 @@ session."
             (without-interrupts
               (unwind-protect
                    (with-local-interrupts
-                     (sb!unix::unblock-deferrable-signals)
+                     (sb-unix::unblock-deferrable-signals)
                      (setf (thread-result thread)
                            (prog1
                                (multiple-value-list
                                 (unwind-protect
                                      (catch '%return-from-thread
-                                       (sb!c::inspect-unwinding
+                                       (sb-c::inspect-unwinding
                                         (apply real-function arguments)
-                                        #'sb!di::catch-runaway-unwind))
+                                        #'sb-di::catch-runaway-unwind))
                                   (when *exit-in-process*
-                                    (sb!impl::call-exit-hooks))))
-                             #!+sb-safepoint
-                             (sb!kernel::gc-safepoint))))
+                                    (sb-impl::call-exit-hooks))))
+                             #+sb-safepoint
+                             (sb-kernel::gc-safepoint))))
                 ;; we're going down, can't handle interrupts
                 ;; sanely anymore. gc remains enabled.
                 (block-deferrable-signals)
@@ -1588,11 +1583,11 @@ session."
                 ;; interupts to be lost: sigint comes to
                 ;; mind.
                 (setq *interrupt-pending* nil)
-                #!+sb-thruption
+                #+sb-thruption
                 (setq *thruption-pending* nil)
                 (handle-thread-exit thread
                                     (get-lisp-obj-address
-                                     sb!vm:*control-stack-start*)))))))))
+                                     sb-vm:*control-stack-start*)))))))))
   (values))
 
 (defun make-thread (function &key name arguments ephemeral)
@@ -1605,14 +1600,14 @@ Invoking the initial ABORT restart established by MAKE-THREAD
 terminates the thread.
 
 See also: RETURN-FROM-THREAD, ABORT-THREAD."
-  #!-sb-thread (declare (ignore function name arguments ephemeral))
-  #!-sb-thread (error "Not supported in unithread builds.")
-  #!+sb-thread (assert (or (atom arguments)
+  #-sb-thread (declare (ignore function name arguments ephemeral))
+  #-sb-thread (error "Not supported in unithread builds.")
+  #+sb-thread (assert (or (atom arguments)
                            (null (cdr (last arguments))))
                        (arguments)
                        "Argument passed to ~S, ~S, is an improper list."
                        'make-thread arguments)
-  #!+sb-thread
+  #+sb-thread
   (let ((thread (%make-thread :name name :%ephemeral-p ephemeral)))
     (declare (inline make-semaphore
                      make-waitqueue
@@ -1620,14 +1615,14 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
     (let* ((setup-sem (make-semaphore :name "Thread setup semaphore"))
            (real-function (coerce function 'function))
            (arguments     (ensure-list arguments))
-           #!+(or win32 darwin)
-           (fp-modes (dpb 0 sb!vm:float-sticky-bits ;; clear accrued bits
-                          (sb!vm:floating-point-modes))))
+           #+(or win32 darwin)
+           (fp-modes (dpb 0 sb-vm:float-sticky-bits ;; clear accrued bits
+                          (sb-vm:floating-point-modes))))
       (declare (dynamic-extent setup-sem))
       (dx-flet ((initial-thread-function ()
                   ;; Inherit parent thread's FP modes
-                  #!+(or win32 darwin)
-                  (setf (sb!vm:floating-point-modes) fp-modes)
+                  #+(or win32 darwin)
+                  (setf (sb-vm:floating-point-modes) fp-modes)
                   ;; As it is, this lambda must not cons until we are
                   ;; ready to run GC. Be careful.
                   (initial-thread-function-trampoline thread setup-sem
@@ -1699,7 +1694,7 @@ subject to change."
   (terminate-thread thread))
 
 #-sb-xc-host
-(declaim (sb!ext:deprecated
+(declaim (sb-ext:deprecated
           :late ("SBCL" "1.2.15")
           (function destroy-thread :replacement terminate-thread)))
 
@@ -1708,7 +1703,7 @@ subject to change."
      ,@body))
 
 ;;; Called from the signal handler.
-#!-(or sb-thruption win32)
+#-(or sb-thruption win32)
 (defun run-interruption ()
   (let ((interruption (with-interruptions-lock (*current-thread*)
                         (pop (thread-interruptions *current-thread*)))))
@@ -1717,11 +1712,11 @@ subject to change."
     ;; OS's point of view the signal we are in the handler for is no
     ;; longer pending, so the signal will not be lost.
     (when (thread-interruptions *current-thread*)
-      (kill-safely (thread-os-thread *current-thread*) sb!unix:sigpipe))
+      (kill-safely (thread-os-thread *current-thread*) sb-unix:sigpipe))
     (when interruption
       (funcall interruption))))
 
-#!+sb-thruption
+#+sb-thruption
 (defun run-interruption (*current-internal-error-context*)
   (in-interruption () ;the non-thruption code does this in the signal handler
     (let ((interruption (with-interruptions-lock (*current-thread*)
@@ -1800,14 +1795,14 @@ the state of a thread:
   (interrupt-thread thread #'break)
 
 Short version: be careful out there."
-  #!+(and (not sb-thread) win32)
-  #!+(and (not sb-thread) win32)
+  #+(and (not sb-thread) win32)
+  #+(and (not sb-thread) win32)
   (declare (ignore thread))
   (with-interrupt-bindings
     (with-interrupts (funcall function)))
-  #!-(and (not sb-thread) win32)
+  #-(and (not sb-thread) win32)
   (let ((os-thread (thread-os-thread thread)))
-    (cond ((= os-thread (ldb (byte sb!vm:n-word-bits 0) -1))
+    (cond ((= os-thread (ldb (byte sb-vm:n-word-bits 0) -1))
            (error 'interrupt-thread-error :thread thread))
           (t
            (let (invoked)
@@ -1879,13 +1874,13 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
 ;;; are an SBCL developer, are doing something that you should discuss
 ;;; with an SBCL developer first, or are doing something that you
 ;;; should probably discuss with a professional psychiatrist first
-#!+sb-thread
+#+sb-thread
 (progn
 
-  (sb!ext:define-load-time-global sb!vm::*free-tls-index* 0)
+  (sb-ext:define-load-time-global sb-vm::*free-tls-index* 0)
   ;; Keep in sync with 'compiler/generic/parms.lisp'
-  #!+ppc ; only PPC uses a separate symbol for the TLS index lock
-  (!define-load-time-global sb!vm::*tls-index-lock* 0)
+  #+ppc ; only PPC uses a separate symbol for the TLS index lock
+  (!define-load-time-global sb-vm::*tls-index-lock* 0)
 
   (defun %symbol-value-in-thread (symbol thread)
     ;; Prevent the thread from dying completely while we look for the TLS
@@ -1895,8 +1890,8 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
           (let ((val (sap-ref-lispobj (int-sap (thread-primitive-thread thread))
                                       (get-lisp-obj-address (symbol-tls-index symbol)))))
             (case (get-lisp-obj-address val)
-              (#.sb!vm:no-tls-value-marker-widetag (values nil :no-tls-value))
-              (#.sb!vm:unbound-marker-widetag (values nil :unbound-in-thread))
+              (#.sb-vm:no-tls-value-marker-widetag (values nil :no-tls-value))
+              (#.sb-vm:unbound-marker-widetag (values nil :unbound-in-thread))
               (t (values val :ok))))
           (values nil :thread-dead))))
 
@@ -1922,19 +1917,19 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
     ;; *FREE-TLS-INDEX* - which is only manipulated by machine code  - is an
     ;; offset from thread base to the next usable TLS cell as a byte offset
     ;; (raw value) manifesting in Lisp as a fixnum.
-    ;; The sign bit of sb!vm::*free-tls-index* is a semaphore,
+    ;; The sign bit of sb-vm::*free-tls-index* is a semaphore,
     ;; except on PPC where it isn't, but masking is fine in any case.
-    (do ((index (- (ash (logand sb!vm::*free-tls-index* most-positive-fixnum)
-                        sb!vm:n-fixnum-tag-bits)
-                   sb!vm:n-word-bytes)
-                (- index sb!vm:n-word-bytes))
+    (do ((index (- (ash (logand sb-vm::*free-tls-index* sb-xc:most-positive-fixnum)
+                        sb-vm:n-fixnum-tag-bits)
+                   sb-vm:n-word-bytes)
+                (- index sb-vm:n-word-bytes))
          ;; (There's no reason this couldn't work on any thread now.)
          (sap (int-sap (thread-primitive-thread *current-thread*)))
          (list))
-        ((< index (ash tls-index-start sb!vm:word-shift)) list)
+        ((< index (ash tls-index-start sb-vm:word-shift)) list)
       (let ((obj (sap-ref-lispobj sap index)))
         (when (and obj ; don't bother returning NIL
-                   (sb!vm:is-lisp-pointer (get-lisp-obj-address obj))
+                   (sb-vm:is-lisp-pointer (get-lisp-obj-address obj))
                    (not (memq obj list)))
           (push obj list))))))
 
@@ -1952,7 +1947,7 @@ Can also be used with SETF to change the thread-local value of SYMBOL.
 SYMBOL-VALUE-IN-THREAD is primarily intended as a debugging tool, and not as a
 mechanism for inter-thread communication."
   (declare (symbol symbol) (thread thread))
-  #!+sb-thread
+  #+sb-thread
   (multiple-value-bind (res status) (%symbol-value-in-thread symbol thread)
     (if (eq :ok status)
         (values res t)
@@ -1962,7 +1957,7 @@ mechanism for inter-thread communication."
                    :thread thread
                    :info (list :read status))
             (values nil nil))))
-  #!-sb-thread
+  #-sb-thread
   (if (boundp symbol)
       (values (symbol-value symbol) t)
       (if errorp
@@ -1974,7 +1969,7 @@ mechanism for inter-thread communication."
 
 (defun (setf symbol-value-in-thread) (value symbol thread &optional (errorp t))
   (declare (symbol symbol) (thread thread))
-  #!+sb-thread
+  #+sb-thread
   (multiple-value-bind (res status) (%set-symbol-value-in-thread symbol thread value)
     (if (eq :ok status)
         (values res t)
@@ -1984,7 +1979,7 @@ mechanism for inter-thread communication."
                    :thread thread
                    :info (list :write status))
             (values nil nil))))
-  #!-sb-thread
+  #-sb-thread
   (if (boundp symbol)
       (values (setf (symbol-value symbol) value) t)
       (if errorp
@@ -2000,9 +1995,9 @@ mechanism for inter-thread communication."
 
 (defun thread-stepping ()
   (sap-ref-lispobj (current-thread-sap)
-                   (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes)))
+                   (* sb-vm::thread-stepping-slot sb-vm:n-word-bytes)))
 
 (defun (setf thread-stepping) (value)
   (setf (sap-ref-lispobj (current-thread-sap)
-                         (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes))
+                         (* sb-vm::thread-stepping-slot sb-vm:n-word-bytes))
         value))

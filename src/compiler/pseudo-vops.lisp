@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; This notes the place at which the environment is properly
 ;;; initialized, for debug-info purposes.
@@ -42,4 +42,4 @@
 (define-vop (mark-covered)
   (:info path)
   (:generator 0
-    (sb!assem::%inst 'sb!assem:.coverage-mark path)))
+    (sb-assem::%inst 'sb-assem:.coverage-mark path)))

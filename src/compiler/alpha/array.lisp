@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; allocator for the array header
 (define-vop (make-array-header)
@@ -43,7 +43,7 @@
 
 (define-full-setter %set-array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum %set-array-dimension #!+gengc nil)
+  (any-reg) positive-fixnum %set-array-dimension #+gengc nil)
 
 (define-vop (array-rank-vop)
   (:translate %array-rank)
@@ -251,8 +251,8 @@
                                   (unless (and (sc-is value immediate)
                                                (= (tn-value value)
                                                   ,(1- (ash 1 bits))))
-                                    (cond #!+#.(cl:if
-                                                (cl:= sb!vm:n-word-bits sb!vm:n-machine-word-bits)
+                                    (cond #+#.(cl:if
+                                                (cl:= sb-vm:n-word-bits sb-vm:n-machine-word-bits)
                                                 '(and) '(or))
                                           ((= extra ,(1- elements-per-word))
                                            (inst sll old ,bits old)
@@ -300,7 +300,7 @@
 
   (def-partial-data-vector-frobs simple-base-string character :byte nil
     character-reg)
-  #!+sb-unicode ; FIXME: what about when a word is 64 bits?
+  #+sb-unicode ; FIXME: what about when a word is 64 bits?
   (def-full-data-vector-frobs simple-character-string character character-reg)
 
   (def-partial-data-vector-frobs simple-array-unsigned-byte-7 positive-fixnum

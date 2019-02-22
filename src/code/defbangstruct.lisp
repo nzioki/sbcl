@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; Has the type system been properly initialized? (I.e. is it OK to
 ;;; use it?)
@@ -34,9 +34,9 @@
   (defvar *delayed-def!structs* nil))
 
 ;;; a helper function for DEF!STRUCT in the #+SB-XC-HOST case: Return
-;;; DEFSTRUCT-style arguments with any class names in the SB!XC
+;;; DEFSTRUCT-style arguments with any class names in the SB-XC
 ;;; package (i.e. the name of the class being defined, and/or the
-;;; names of classes in :INCLUDE clauses) converted from SB!XC::FOO to
+;;; names of classes in :INCLUDE clauses) converted from SB-XC::FOO to
 ;;; CL::FOO.
 #+sb-xc-host
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -56,8 +56,10 @@
                          ,(uncross included-name)
                          ,@rest))
                    option)))
-          `((,(uncross name)
-             ,@(mapcar #'uncross-option options))
+          ;; Attempting to define a type named by a CL symbol is an error.
+          ;; Therefore NAME is wrong if it uncrosses to something other than itself.
+          (assert (eq (uncross name) name))
+          `((,name ,@(mapcar #'uncross-option options))
             ,@slots-and-doc))))))
 
 ;;; DEF!STRUCT defines a structure for both the host and target.
@@ -88,13 +90,13 @@
           (if (boundp '*delayed-def!structs*)
               `(push (make-delayed-def!struct :args ',u)
                      *delayed-def!structs*)
-              `(sb!xc:defstruct ,@u)))
+              `(sb-xc:defstruct ,@u)))
        ',name)))
 #-sb-xc-host
 (defmacro def!struct (&rest args) `(defstruct ,@args))
 
 ;;; When building the cross-compiler, this function has to be called
-;;; some time after SB!XC:DEFSTRUCT is set up, in order to take care
+;;; some time after SB-XC:DEFSTRUCT is set up, in order to take care
 ;;; of any processing which had to be delayed until then.
 #+sb-xc-host
 (defun force-delayed-def!structs ()
@@ -108,7 +110,7 @@
                     ;; functional primitives corresponding to the
                     ;; DEFSTRUCT macro, it seems to me that EVAL is
                     ;; required in there somewhere..
-                    (eval `(sb!xc:defstruct ,@(delayed-def!struct-args x)))))
+                    (eval `(sb-xc:defstruct ,@(delayed-def!struct-args x)))))
                 (reverse *delayed-def!structs*))
         ;; We shouldn't need this list any more. Making it unbound
         ;; serves as a signal to DEF!STRUCT that it needn't delay

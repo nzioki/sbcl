@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Moves and coercions:
 
@@ -136,7 +136,7 @@
   (:note "inline comparison")
   (:variant-vars condition not-condition)
   (:generator 2
-    (inst cmplwi x (sb!xc:char-code y))
+    (inst cmplwi x (sb-xc:char-code y))
     (inst b? (if not-p not-condition condition) target)))
 
 (define-vop (fast-char=/character/c character-compare/c)

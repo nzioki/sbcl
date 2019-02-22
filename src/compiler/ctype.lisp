@@ -16,7 +16,7 @@
 ;;;; probably be good to rename this file to "call-type.lisp" or
 ;;;; "ir1-type.lisp" or something.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (declaim (type (or function null) *lossage-fun* *unwinnage-fun* *ctype-test-fun*))
 
@@ -123,9 +123,9 @@
                (keyp (fun-type-keyp type))
                (fun (combination-fun call))
                (caller (loop for annotation in (lvar-annotations fun)
-                         when (typep annotation 'lvar-function-designator-annotation)
-                         do (setf *compiler-error-context* annotation)
-                         return (lvar-function-designator-annotation-caller annotation))))
+                             when (typep annotation 'lvar-function-designator-annotation)
+                             do (setf *compiler-error-context* annotation)
+                                (return (lvar-function-designator-annotation-caller annotation)))))
           (cond
             ((report-arg-count-mismatch (nth-value 1 (lvar-fun-type fun))
                                         caller type nargs nil
@@ -160,12 +160,14 @@
               and i from 1
               do (check-arg-type arg *wild-type* i)))
     (awhen (lvar-fun-name (combination-fun call) t)
-      (let ((type (info :function :type it)))
-        (validate-test-and-test-not call)
-        ;; One more check for structure constructors:
-        (when (typep type 'defstruct-description)
-          (awhen (assq it (dd-constructors type))
-            (check-structure-constructor-call call type (cdr it))))))
+      (validate-test-and-test-not call)
+      (let ((xform (info :function :source-transform it)))
+        ;; One more check for structure constructors, because satisfying the
+        ;; ftype is not sufficient to ensure that slots get valid defaults.
+        (when (typep xform '(cons defstruct-description (eql :constructor)))
+          (let ((dd (car xform)))
+            (awhen (assq it (dd-constructors dd))
+              (check-structure-constructor-call call dd (cdr it)))))))
     (cond (*lossage-detected* (values nil t unknown-keys))
           (*unwinnage-detected* (values nil nil unknown-keys))
           (t (values t t unknown-keys)))))
@@ -213,12 +215,12 @@
                                   (dsd-default slot))))
                 ;; Return T if value-form definitely does not satisfy
                 ;; the type-check for DSD. Return NIL if we can't decide.
-                (when (if (sb!xc:constantp initform)
-                          (not (sb!xc:typep (constant-form-value initform)
+                (when (if (sb-xc:constantp initform)
+                          (not (sb-xc:typep (constant-form-value initform)
                                             (dsd-type slot)))
                           ;; Find uses of nil-returning functions as defaults,
                           ;; like ERROR and MISSING-ARG.
-                          (and (sb!kernel::dd-null-lexenv-p dd)
+                          (and (sb-kernel::dd-null-lexenv-p dd)
                                (listp initform)
                                (let ((f (car initform)))
                                  ;; Don't examine :function :type of macros!
@@ -396,10 +398,10 @@ and no value was provided for it." name))))))))))
 (defstruct (approximate-fun-type (:copier nil))
   ;; the smallest and largest numbers of arguments that this function
   ;; has been called with.
-  (min-args sb!xc:call-arguments-limit
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+  (min-args sb-xc:call-arguments-limit
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   (max-args 0
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   ;; a list of lists of the all the types that have been used in each
   ;; argument position
   (types () :type list)
@@ -417,7 +419,7 @@ and no value was provided for it." name))))))))))
   ;; The position at which this keyword appeared. 0 if it appeared as the
   ;; first argument, etc.
   (position (missing-arg)
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   ;; a list of all the argument types that have been used with this keyword
   (types nil :type list)
   ;; true if this keyword has appeared only in calls with an obvious
@@ -717,7 +719,7 @@ and no value was provided for it." name))))))))))
            ((lambda-var-arg-info arg)
             (let* ((info (lambda-var-arg-info arg))
                    (default (arg-info-default info))
-                   (def-type (when (sb!xc:constantp default)
+                   (def-type (when (sb-xc:constantp default)
                                (ctype-of (constant-form-value default)))))
               (ecase (arg-info-kind info)
                 (:keyword
@@ -843,10 +845,10 @@ and no value was provided for it." name))))))))))
                         (when (and unwinnage-fun
                                    (not (csubtypep (leaf-type var) type)))
                           (funcall unwinnage-fun
-                                   (sb!format:tokens
+                                   (sb-format:tokens
                                       "Assignment to argument: ~S~%  ~
                                        prevents use of assertion from function ~
-                                       type ~A:~% ~/sb!impl:print-type/~%")
+                                       type ~A:~% ~/sb-impl:print-type/~%")
                                    (leaf-debug-name var) where type)))
                        ((and (listp really-assert) ; (:NOT . ,vars)
                              (member (lambda-var-%source-name var)
@@ -862,9 +864,9 @@ and no value was provided for it." name))))))))))
                                                       type-returns)))
            (note-lossage
             "The result type from ~A:~%  ~
-             ~/sb!impl:print-type/~@
+             ~/sb-impl:print-type/~@
              conflicts with the definition's result type:~%  ~
-             ~/sb!impl:print-type/"
+             ~/sb-impl:print-type/"
             where type-returns dtype)
            nil)
           (t
@@ -886,7 +888,7 @@ and no value was provided for it." name))))))))))
         (explicit-check (getf (functional-plist fun) 'explicit-check)))
     (if (eq where :declared)
         (let ((type
-               (massage-global-definition-type (proclaimed-ftype name) fun)))
+               (massage-global-definition-type (global-ftype name) fun)))
           (setf (leaf-type fun) type)
           (assert-definition-type
            fun type
@@ -922,9 +924,10 @@ and no value was provided for it." name))))))))))
 
 ;;; Call FUN with (arg-lvar arg-type lvars &optional annotation)
 (defun map-combination-args-and-types (fun call &optional info
-                                                          unknown-keys-fun)
+                                                          unknown-keys-fun
+                                                          declared-only)
   (declare (type function fun) (type combination call))
-  (binding* ((type (lvar-fun-type (combination-fun call)))
+  (binding* ((type (lvar-fun-type (combination-fun call) declared-only declared-only))
              (nil (fun-type-p type) :exit-if-null)
              (annotation (and info
                               (fun-info-annotation info)))
@@ -1055,7 +1058,9 @@ and no value was provided for it." name))))))))))
                     (not trusted))
                (reoptimize-lvar arg)))
            call
-           info))))
+           info
+           nil
+           t))))
   (values))
 
 ;;;; FIXME: Move to some other file.
@@ -1066,13 +1071,13 @@ and no value was provided for it." name))))))))))
       (let ((sources (lvar-all-sources tag)))
         (if (singleton-p sources)
             (compiler-style-warn
-              "~@<Using ~S of type ~/sb!impl:print-type/ as ~
+              "~@<Using ~S of type ~/sb-impl:print-type/ as ~
                a catch tag (which tends to be unportable because THROW ~
                and CATCH use EQ comparison)~@:>"
              (first sources) (lvar-type tag))
             (compiler-style-warn
               "~@<Using ~{~S~^~#[~; or ~:;, ~]~} in ~S of type ~
-               ~/sb!impl:print-type/ as a catch tag (which tends to be ~
+               ~/sb-impl:print-type/ as a catch tag (which tends to be ~
                unportable because THROW and CATCH use EQ comparison)~@:>"
              (rest sources) (first sources) (lvar-type tag)))))))
 
@@ -1085,7 +1090,7 @@ and no value was provided for it." name))))))))))
                 :format-control
                 "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
                    ~I~_is not of the declared return type of the function ~
-                   ~2I~_~/sb!impl:print-type-specifier/.~:>"
+                   ~2I~_~/sb-impl:print-type-specifier/.~:>"
                 :format-arguments (list values
                                         (first detail) code-context
                                         atype)))
@@ -1097,7 +1102,7 @@ and no value was provided for it." name))))))))))
                     :format-control
                     "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
                      ~I~_is not of type ~
-                    ~2I~_~/sb!impl:print-type-specifier/.~:>"
+                    ~2I~_~/sb-impl:print-type-specifier/.~:>"
                     :format-arguments (list values
                                             (first detail) code-context
                                             atype))
@@ -1108,7 +1113,7 @@ and no value was provided for it." name))))))))))
                     "~@<Values ~2I~_[~{~S~^ ~}] ~
                    ~I~_from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
                    ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is not of type ~
-                   ~2I~_~/sb!impl:print-type-specifier/.~:>"
+                   ~2I~_~/sb-impl:print-type-specifier/.~:>"
                     :format-arguments (list values
                                             (rest detail) (first detail)
                                             code-context
@@ -1119,7 +1124,7 @@ and no value was provided for it." name))))))))))
                 :expected-type atype
                 :format-control
                 "~@<Value of ~S in ~_~A ~I~_is ~2I~_~S, ~
-                   ~I~_not a ~2I~_~/sb!impl:print-type-specifier/.~:@>"
+                   ~I~_not a ~2I~_~/sb-impl:print-type-specifier/.~:@>"
                 :format-arguments (list (car detail) code-context
                                         (car values)
                                         atype)))
@@ -1130,7 +1135,7 @@ and no value was provided for it." name))))))))))
                 :format-control
                 "~@<Value from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
                    ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is ~2I~_~S, ~
-                   ~I~_not a ~2I~_~/sb!impl:print-type-specifier/.~:@>"
+                   ~I~_not a ~2I~_~/sb-impl:print-type-specifier/.~:@>"
                 :format-arguments (list (rest detail) (first detail) code-context
                                         (car values)
                                         atype)))))
@@ -1145,7 +1150,7 @@ and no value was provided for it." name))))))))))
                  :format-control
                  "~@<Derived type of ~S is ~2I~_~S, ~
                     ~I~_conflicting with the declared function return type ~
-                    ~2I~_~/sb!impl:print-type-specifier/.~@:>"
+                    ~2I~_~/sb-impl:print-type-specifier/.~@:>"
                  :format-arguments (list detail dtype atype)))
           ((singleton-p detail)
            (let ((detail (first detail)))
@@ -1154,22 +1159,22 @@ and no value was provided for it." name))))))))))
                        :format-control
                        "~@<Constant ~2I~_~S ~Iconflicts with its ~
                             asserted type ~
-                            ~2I~_~/sb!impl:print-type-specifier/.~@:>"
+                            ~2I~_~/sb-impl:print-type-specifier/.~@:>"
                        :format-arguments (list (constant-form-value detail) atype))
                  (warn condition
                        :format-control
                        "~@<Derived type of ~S is ~2I~_~S, ~
                             ~I~_conflicting with its asserted type ~
-                            ~2I~_~/sb!impl:print-type-specifier/.~@:>"
+                            ~2I~_~/sb-impl:print-type-specifier/.~@:>"
                        :format-arguments (list detail dtype atype)))))
           (t
            (warn condition
                  :format-control
                  "~@<Derived type of ~2I~_~{~S~^~#[~; and ~:;, ~
                       ~]~} ~I~_in ~2I~_~S ~I~_is ~
-                      ~2I~_~/sb!impl:print-type-specifier/, ~
+                      ~2I~_~/sb-impl:print-type-specifier/, ~
                       ~I~_conflicting with their asserted type ~
-                      ~2I~_~/sb!impl:print-type-specifier/.~@:>"
+                      ~2I~_~/sb-impl:print-type-specifier/.~@:>"
                  :format-arguments (list (rest detail) (first detail)
                                          dtype atype))))))
 

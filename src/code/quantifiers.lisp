@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; quantifiers
 
@@ -15,19 +15,19 @@
 ;;; arbitrary sequence arguments, both in the full call case and in
 ;;; the open code case.
 (flet ((expand (pred sequences test found-result unfound-result)
-         (unless (proper-list-of-length-p sequences 1 call-arguments-limit)
+         (unless (proper-list-of-length-p sequences 1 sb-xc:call-arguments-limit)
            (return-from expand (values nil t))) ; give up
          (binding* ((elements (make-gensym-list (length sequences)))
                     ((bind-fun call-it) (funarg-bind/call-forms pred elements))
-                    (blockname (sb!xc:gensym "BLOCK"))
-                    (wrapper (sb!xc:gensym "WRAPPER"))
-                    (value (sb!xc:gensym "VAL")))
+                    (blockname (sb-xc:gensym "BLOCK"))
+                    (wrapper (sb-xc:gensym "WRAPPER"))
+                    (value (sb-xc:gensym "VAL")))
              (let ((form
                     `(block ,blockname
                        ;; Does DX actually help? INLINE should win anyway.
                        (dx-flet ((,wrapper (,@elements)
                                   (declare (optimize
-                                            (sb!c::check-tag-existence 0)))
+                                            (sb-c::check-tag-existence 0)))
                                   (let ((,value ,call-it))
                                     (,test ,value
                                       (return-from ,blockname
@@ -62,7 +62,7 @@
                 ;; compiler hacking right now, so I'll just work
                 ;; around the apparent problem by using a compiler
                 ;; macro instead. -- WHN 20000410
-                  (sb!c:define-source-transform ,name (pred &rest sequences)
+                  (sb-c:define-source-transform ,name (pred &rest sequences)
                     (expand pred sequences
                             ',found-test ',found-result ',unfound-result))
                   #-sb-xc-host ; don't redefine CL builtins!

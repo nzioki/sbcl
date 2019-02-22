@@ -56,6 +56,7 @@
 #include "var-io.h"
 #include "immobile-space.h"
 #include "unaligned.h"
+#include "code.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -855,6 +856,9 @@ varyobj_points_to_younger_p(lispobj* obj, int gen, int keep_gen, int new_gen,
                widetag == FUNCALLABLE_INSTANCE_WIDETAG) {
         // both of these have non-descriptor bits in at least one word,
         // thus precluding a simple range scan.
+        // Due to ignored address bounds, in the rare case of a FIN or fdefn in varyobj
+        // subspace and spanning cards, we might say that neither card can be protected,
+        // when one or the other could be. Not a big deal.
         return fixedobj_points_to_younger_p(obj, sizetab[widetag](obj),
                                             gen, keep_gen, new_gen);
     } else if (widetag == SIMPLE_VECTOR_WIDETAG) {
@@ -1064,8 +1068,9 @@ static void make_filler(void* where, int nbytes)
         lose("can't place filler @ %p - too small", where);
     else { // Create a filler object.
         struct code* code  = (struct code*)where;
-        code->header       = CODE_HEADER_WIDETAG; // 0 boxed words
-        code->code_size    = make_fixnum(nbytes);
+        code->header       = ((uword_t)nbytes << (CODE_HEADER_SIZE_SHIFT-WORD_SHIFT))
+                             | CODE_HEADER_WIDETAG;
+        code->boxed_size   = 0;
         code->debug_info   = varyobj_holes;
         varyobj_holes      = (lispobj)code;
     }
@@ -1476,33 +1481,13 @@ lispobj* AMD64_SYSV_ABI alloc_fixedobj(int nwords, uword_t header)
                               header);
 }
 
-#include "genesis/vector.h"
-#include "genesis/instance.h"
-lispobj AMD64_SYSV_ABI alloc_layout(lispobj slots)
+lispobj AMD64_SYSV_ABI alloc_layout()
 {
-    struct vector* v = VECTOR(slots);
-    // If INSTANCE_DATA_START is 0, subtract 1 word for the header.
-    // If 1, subtract 2 words: 1 for the header and 1 for the layout.
-    if (v->length != make_fixnum(LAYOUT_SIZE - INSTANCE_DATA_START - 1))
-        lose("bad arguments to alloc_layout");
-    struct instance* l = (struct instance*)
-      alloc_immobile_obj(MAKE_ATTR(LAYOUT_ALIGN / N_WORD_BYTES,
-                                   ALIGN_UP(LAYOUT_SIZE,2),
-                                   0),
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-                         (LAYOUT_OF_LAYOUT << 32) |
-#endif
-                         (LAYOUT_SIZE-1)<<N_WIDETAG_BITS | INSTANCE_WIDETAG);
-#ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-    l->slots[0] = LAYOUT_OF_LAYOUT;
-#endif
-    memcpy(&l->slots[INSTANCE_DATA_START], v->data,
-           (LAYOUT_SIZE - INSTANCE_DATA_START - 1)*N_WORD_BYTES);
-
-    // Possible efficiency win: make the "wasted" bytes after the layout into a
-    // simple unboxed array so that heap-walking can skip in one step.
-    // Probably only a performance issue for MAP-ALLOCATED-OBJECTS,
-    // since scavenging know to skip by the object alignment anyway.
+    lispobj* l =
+        alloc_immobile_obj(MAKE_ATTR(LAYOUT_ALIGN / N_WORD_BYTES,
+                                     ALIGN_UP(LAYOUT_SIZE,2),
+                                     0),
+                           (LAYOUT_SIZE-1)<<N_WIDETAG_BITS | INSTANCE_WIDETAG);
     return make_lispobj(l, INSTANCE_POINTER_LOWTAG);
 }
 
@@ -1692,9 +1677,9 @@ static void fixup_space(lispobj* where, size_t n_words)
           break;
         case CODE_HEADER_WIDETAG:
           // Fixup the constant pool.
-          adjust_words(where+1, code_header_words(header_word)-1, 0);
-          // Fixup all embedded simple-funs
           code = (struct code*)where;
+          adjust_words(where+2, code_header_words(code)-2, 0);
+          // Fixup all embedded simple-funs
           for_each_simple_fun(i, f, code, 1, {
               f->self = adjust_fun_entrypoint(f->self);
               adjust_words(SIMPLE_FUN_SCAV_START(f), SIMPLE_FUN_SCAV_NWORDS(f), 0);
@@ -1903,7 +1888,7 @@ static boolean executable_object_p(lispobj* obj)
 {
     int widetag = widetag_of(obj);
     return widetag == FDEFN_WIDETAG ||
-        (widetag == CODE_HEADER_WIDETAG && code_header_words(*obj) == 4
+        (widetag == CODE_HEADER_WIDETAG && code_header_words((struct code*)obj) >= 3
          && lowtag_of(((struct code*)obj)->debug_info) == FUN_POINTER_LOWTAG)
         || widetag == FUNCALLABLE_INSTANCE_WIDETAG;
 }
@@ -2287,7 +2272,7 @@ static void apply_absolute_fixups(lispobj fixups, struct code* code)
 {
     struct varint_unpacker unpacker;
     varint_unpacker_init(&unpacker, fixups);
-    char* instructions = (char*)((lispobj*)code + code_header_words(code->header));
+    char* instructions = code_text_start(code);
     int prev_loc = 0, loc;
     // The unpacker will produce successive values followed by a zero. There may
     // be a second data stream for the relative fixups which we ignore.

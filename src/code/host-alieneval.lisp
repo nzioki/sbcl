@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (/show0 "host-alieneval.lisp 15")
 
@@ -22,7 +22,7 @@
 
 (defun guess-alignment (bits)
   (cond ((null bits) nil)
-        #!-(or (and x86 (not win32)) (and ppc darwin)) ((> bits 32) 64)
+        #-(or (and x86 (not win32)) (and ppc darwin)) ((> bits 32) 64)
         ((> bits 16) 32)
         ((> bits 8) 16)
         ((> bits 1) 8)
@@ -55,7 +55,7 @@
            (create-alien-type-class-if-necessary ',name ',defstruct-name
                                                  ',(or include 'root)))
          (setf (info :source-location :alien-type ',name)
-               (sb!c:source-location))
+               (sb-c:source-location))
          (def!struct (,defstruct-name
                         (:include ,include-defstruct
                                   (class ',name)
@@ -100,11 +100,11 @@
 ;;; Parse TYPE as an alien type specifier and return the resultant
 ;;; ALIEN-TYPE structure.
 (defun parse-alien-type (type env)
-  (declare (type sb!kernel:lexenv-designator env))
+  (declare (type sb-kernel:lexenv-designator env))
   (if (consp type)
       (let ((translator (info :alien-type :translator (car type))))
         (unless translator
-          (error "unknown alien type: ~/sb!impl:print-type-specifier/"
+          (error "unknown alien type: ~/sb-impl:print-type-specifier/"
                  type))
         (funcall translator type env))
       (ecase (info :alien-type :kind type)
@@ -112,19 +112,19 @@
          (let ((translator (info :alien-type :translator type)))
            (unless translator
              (error "no translator for primitive alien type ~
-                      ~/sb!impl:print-type-specifier/"
+                      ~/sb-impl:print-type-specifier/"
                     type))
            (funcall translator (list type) env)))
         (:defined
          (or (info :alien-type :definition type)
-             (error "no definition for alien type ~/sb!impl:print-type-specifier/"
+             (error "no definition for alien type ~/sb-impl:print-type-specifier/"
                     type)))
         (:unknown
-         (error "unknown alien type: ~/sb!impl:print-type-specifier/"
+         (error "unknown alien type: ~/sb-impl:print-type-specifier/"
                 type)))))
 
 (defun auxiliary-alien-type (kind name env)
-  (declare (type sb!kernel:lexenv-designator env))
+  (declare (type sb-kernel:lexenv-designator env))
   (flet ((aux-defn-matches (x)
            (and (eq (first x) kind) (eq (second x) name))))
     (let ((in-auxiliaries
@@ -135,7 +135,7 @@
           (info :alien-type kind name)))))
 
 (defun (setf auxiliary-alien-type) (new-value kind name env)
-  (declare (type sb!kernel:lexenv-designator env))
+  (declare (type sb-kernel:lexenv-designator env))
   (flet ((aux-defn-matches (x)
            (and (eq (first x) kind) (eq (second x) name))))
     (when (find-if #'aux-defn-matches *new-auxiliary-types*)
@@ -197,14 +197,14 @@
   (defun %define-alien-type (name new source-location)
     (ecase (info :alien-type :kind name)
       (:primitive
-       (error "~/sb!impl:print-type-specifier/ is a built-in alien type."
+       (error "~/sb-impl:print-type-specifier/ is a built-in alien type."
               name))
       (:defined
        (let ((old (info :alien-type :definition name)))
          (unless (or (null old) (alien-type-= new old))
            (warn "redefining ~S to be:~% ~
-                   ~/sb!impl:print-type-specifier/,~%was~% ~
-                   ~/sb!impl:print-type-specifier/"
+                   ~/sb-impl:print-type-specifier/,~%was~% ~
+                   ~/sb-impl:print-type-specifier/"
                  name
                  (unparse-alien-type new)
                  (unparse-alien-type old)))))
@@ -221,7 +221,7 @@
 
 (defmethod print-object ((type alien-type) stream)
   (print-unreadable-object (type stream :type t)
-    (sb!impl:print-type-specifier stream (unparse-alien-type type))))
+    (sb-impl:print-type-specifier stream (unparse-alien-type type))))
 
 ;;;; the SAP type
 
@@ -229,7 +229,7 @@
 
 (define-alien-type-translator system-area-pointer ()
   (make-alien-system-area-pointer-type
-   :bits sb!vm:n-machine-word-bits))
+   :bits sb-vm:n-machine-word-bits))
 
 (define-alien-type-method (system-area-pointer :unparse) (type)
   (declare (ignore type))
@@ -254,7 +254,7 @@
 
 (define-alien-type-method (system-area-pointer :extract-gen) (type sap offset)
   (declare (ignore type))
-  `(sap-ref-sap ,sap (/ ,offset sb!vm:n-byte-bits)))
+  `(sap-ref-sap ,sap (/ ,offset sb-vm:n-byte-bits)))
 
 ;;;; the ALIEN-VALUE type
 
@@ -372,7 +372,7 @@
 ;;;; default methods
 
 (defun missing-alien-operation-error (type operation)
-  (error "Cannot ~A aliens of type ~/sb!impl:print-type-specifier/."
+  (error "Cannot ~A aliens of type ~/sb-impl:print-type-specifier/."
          operation type))
 
 (define-alien-type-method (root :unparse) (type)
@@ -433,13 +433,13 @@
 (define-alien-type-class (integer)
   (signed t :type (member t nil)))
 
-(define-alien-type-translator signed (&optional (bits sb!vm:n-word-bits))
+(define-alien-type-translator signed (&optional (bits sb-vm:n-word-bits))
   (make-alien-integer-type :bits bits))
 
-(define-alien-type-translator integer (&optional (bits sb!vm:n-word-bits))
+(define-alien-type-translator integer (&optional (bits sb-vm:n-word-bits))
   (make-alien-integer-type :bits bits))
 
-(define-alien-type-translator unsigned (&optional (bits sb!vm:n-word-bits))
+(define-alien-type-translator unsigned (&optional (bits sb-vm:n-word-bits))
   (make-alien-integer-type :bits bits :signed nil))
 
 (define-alien-type-method (integer :unparse) (type)
@@ -464,18 +464,18 @@
   ;; of return values and override the naturalize method to perform
   ;; the sign extension (in compiler/target/c-call.lisp).
   (ecase context
-    ((:normal #!-(or alpha x86 x86-64) :result)
+    ((:normal #-(or alpha x86 x86-64) :result)
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (alien-integer-type-bits type)))
-    #!+(or alpha x86 x86-64)
+    #+(or alpha x86 x86-64)
     (:result
      (list (if (alien-integer-type-signed type) 'signed-byte 'unsigned-byte)
            (max (alien-integer-type-bits type)
-                sb!vm:n-machine-word-bits)))))
+                sb-vm:n-machine-word-bits)))))
 
 ;;; As per the comment in the :ALIEN-REP method above, this is defined
 ;;; elsewhere for alpha and x86oids.
-#!-(or alpha x86 x86-64)
+#-(or alpha x86 x86-64)
 (define-alien-type-method (integer :naturalize-gen) (type alien)
   (declare (ignore type))
   alien)
@@ -499,7 +499,7 @@
             (32 'sap-ref-32)
             (64 'sap-ref-64)))))
     (if ref-fun
-        `(,ref-fun ,sap (/ ,offset sb!vm:n-byte-bits))
+        `(,ref-fun ,sap (/ ,offset sb-vm:n-byte-bits))
         (error "cannot extract ~W-bit integers"
                (alien-integer-type-bits type)))))
 
@@ -509,7 +509,7 @@
 
 ;;; FIXME: Check to make sure that we aren't attaching user-readable
 ;;; stuff to CL:BOOLEAN in any way which impairs ANSI compliance.
-(define-alien-type-translator boolean (&optional (bits sb!vm:n-word-bits))
+(define-alien-type-translator boolean (&optional (bits sb-vm:n-word-bits))
   (make-alien-boolean-type :bits bits :signed nil))
 
 (define-alien-type-method (boolean :unparse) (type)
@@ -521,7 +521,7 @@
 
 (define-alien-type-method (boolean :naturalize-gen) (type alien)
   (let ((bits (alien-boolean-type-bits type)))
-    (if (= bits sb!vm:n-word-bits)
+    (if (= bits sb-vm:n-word-bits)
         `(not (zerop ,alien))
         `(logtest ,alien ,(ldb (byte bits 0) -1)))))
 
@@ -693,7 +693,7 @@
 
 (define-alien-type-method (single-float :extract-gen) (type sap offset)
   (declare (ignore type))
-  `(sap-ref-single ,sap (/ ,offset sb!vm:n-byte-bits)))
+  `(sap-ref-single ,sap (/ ,offset sb-vm:n-byte-bits)))
 
 (define-alien-type-class (double-float :include (float (bits 64))
                                        :include-args (type)))
@@ -703,13 +703,13 @@
 
 (define-alien-type-method (double-float :extract-gen) (type sap offset)
   (declare (ignore type))
-  `(sap-ref-double ,sap (/ ,offset sb!vm:n-byte-bits)))
+  `(sap-ref-double ,sap (/ ,offset sb-vm:n-byte-bits)))
 
 
 ;;;; the POINTER type
 
 (define-alien-type-class (pointer :include (alien-value (bits
-                                                         sb!vm:n-machine-word-bits)))
+                                                         sb-vm:n-machine-word-bits)))
   (to nil :type (or alien-type null)))
 
 (define-alien-type-translator * (to &environment env)
@@ -768,15 +768,15 @@
 
 (define-alien-type-method (mem-block :extract-gen) (type sap offset)
   (declare (ignore type))
-  `(sap+ ,sap (truncate ,offset sb!vm:n-byte-bits)))
+  `(sap+ ,sap (truncate ,offset sb-vm:n-byte-bits)))
 
 (define-alien-type-method (mem-block :deposit-gen) (type sap offset value)
   (let ((bits (alien-mem-block-type-bits type)))
     (unless bits
       (error "can't deposit aliens of type ~S (unknown size)" type))
-    `(sb!kernel:system-area-ub8-copy ,value 0 ,sap
-      (truncate ,offset sb!vm:n-byte-bits)
-      ',(truncate bits sb!vm:n-byte-bits))))
+    `(sb-kernel:system-area-ub8-copy ,value 0 ,sap
+      (truncate ,offset sb-vm:n-byte-bits)
+      ',(truncate bits sb-vm:n-byte-bits))))
 
 ;;;; the ARRAY type
 
@@ -862,7 +862,7 @@
 ;;; MAKE-ALIEN-RECORD-TYPE to %MAKE-ALIEN-RECORD-TYPE and use
 ;;; ENSURE-ALIEN-RECORD-TYPE instead. --NS 20040729
 (defun parse-alien-record-type (kind name fields env)
-  (declare (type sb!kernel:lexenv-designator env))
+  (declare (type sb-kernel:lexenv-designator env))
   (flet ((frob-type (type new-fields alignment bits)
            (setf (alien-record-type-fields type) new-fields
                  (alien-record-type-alignment type) alignment
@@ -1123,7 +1123,7 @@
 
 ;;;; the ADDR macro
 
-(sb!xc:defmacro addr (expr &environment env)
+(sb-xc:defmacro addr (expr &environment env)
   "Return an Alien pointer to the data addressed by Expr, which must be a call
    to SLOT or DEREF, or a reference to an Alien variable."
   (let ((form (%macroexpand expr env)))
@@ -1155,7 +1155,7 @@
 (push '("SB-ALIEN" define-alien-type-class define-alien-type-method)
       *!removable-symbols*)
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun extern-alien-name (name)
  (handler-case (coerce name 'base-string)
@@ -1174,7 +1174,7 @@
 ;;; as opposed to C's "extern"). The table contains symbols known at
 ;;; the time that the program was built, but not symbols defined in
 ;;; object files which have been loaded dynamically since then.
-#!-sb-dynamic-core
+#-sb-dynamic-core
 (progn
   (declaim (type hash-table *static-foreign-symbols*))
   (defvar *static-foreign-symbols* (make-hash-table :test 'equal)))

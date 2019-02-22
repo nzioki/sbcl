@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!WIN32")
+(in-package "SB-WIN32")
 
 ;;;
 ;;; An awful lot of this stuff is stubbed out for now. We basically
@@ -38,7 +38,7 @@
 (defun sigint-%break (format-string &rest format-arguments)
   (flet ((break-it ()
            (apply #'%break 'sigint format-string format-arguments)))
-    (sb!thread:interrupt-thread (sb!thread::foreground-thread) #'break-it)))
+    (sb-thread:interrupt-thread (sb-thread::foreground-thread) #'break-it)))
 ||#
 
 ;;; Map Windows Exception code to condition names: symbols or strings
@@ -55,7 +55,7 @@
      (cons +exception-flt-denormal-operand+  'floating-point-exception)
      (cons +exception-flt-stack-check+       'floating-point-exception)
      ;; Stack overflow
-     (cons +exception-stack-overflow+        'sb!kernel::control-stack-exhausted)
+     (cons +exception-stack-overflow+        'sb-kernel::control-stack-exhausted)
      ;; Various
      (cons-name +exception-single-step+)
      (cons +exception-access-violation+ 'memory-fault-error)
@@ -92,22 +92,32 @@
                       (* char))
            c-string))))
 
+(define-condition exception (error)
+  ((code :initarg :code :reader exception-code)
+   (context :initarg :context :reader exception-context)
+   (record :initarg :record :reader exception-record))
+  (:report (lambda (c s)
+             (format s "An exception occurred in context ~S: ~S. (Exception code: ~S)"
+                     (exception-context c)
+                     (exception-record c)
+                     (exception-code c)))))
+
 ;;; Actual exception handler. We hit something the runtime doesn't
 ;;; want to or know how to deal with (that is, not a sigtrap or gc wp
 ;;; violation), so it calls us here.
-(defun sb!kernel:handle-win32-exception (context-sap exception-record-sap)
+(defun sb-kernel:handle-win32-exception (context-sap exception-record-sap)
   (let* ((record (deref (sap-alien exception-record-sap (* (struct exception-record)))))
          (code (slot record 'exception-code))
          (condition-name (cdr (assoc code *exception-code-map*)))
-         (sb!debug:*stack-top-hint* (sb!kernel:find-interrupted-frame)))
+         (sb-debug:*stack-top-hint* (sb-kernel:find-interrupted-frame)))
     (cond ((stringp condition-name)
            (error condition-name))
           ((and condition-name
                 (subtypep condition-name 'arithmetic-error))
            (multiple-value-bind (op operands)
-               (sb!di::decode-arithmetic-error-operands context-sap)
+               (sb-di::decode-arithmetic-error-operands context-sap)
              ;; Reset the accumulated exceptions
-             (setf (ldb sb!vm:float-sticky-bits (sb!vm:floating-point-modes)) 0)
+             (setf (ldb sb-vm:float-sticky-bits (sb-vm:floating-point-modes)) 0)
              (error condition-name :operation op
                                    :operands operands)))
           ((eq condition-name 'memory-fault-error)
@@ -118,13 +128,14 @@
           ((= code +dbg-printexception-c+)
            (dbg-printexception-c record))
           (t
-           (error "An exception occurred in context ~S: ~S. (Exception code: ~S)"
-                  context-sap exception-record-sap code)))))
+           (cerror "Return from the exception handler"
+                   'exception :context context-sap :record exception-record-sap
+                              :code code)))))
 
 
-(in-package "SB!UNIX")
+(in-package "SB-UNIX")
 
-(defun sb!kernel:signal-cold-init-or-reinit ()
+(defun sb-kernel:signal-cold-init-or-reinit ()
   "Enable all the default signals that Lisp knows how to deal with."
   (unblock-deferrable-signals)
   (values))

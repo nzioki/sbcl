@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 #-sb-assembling ; avoid redefinition warning
 (progn
@@ -24,8 +24,8 @@
   (inst test :byte temp fixnum-tag-mask))
 
 (defun !static-fun-addr (name)
-  #!+immobile-code (make-fixup name :static-call)
-  #!-immobile-code (ea (+ nil-value (static-fun-offset name))))
+  #+immobile-code (make-fixup name :static-call)
+  #-immobile-code (ea (+ nil-value (static-fun-offset name))))
 
 (defun !call-static-fun (fun arg-count)
   (inst push rbp-tn)

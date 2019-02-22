@@ -46,7 +46,7 @@
 ;;; fail to infer (< I FIXNUM): it does not understand that this
 ;;; constraint follows from (TYPEP I (INTEGER 0 0)).
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; *CONSTRAINT-UNIVERSE* gets bound in IR1-PHASES to a fresh,
 ;;; zero-length, non-zero-total-size vector-with-fill-pointer.
@@ -300,7 +300,7 @@
   (etypecase y
     (ctype
        (awhen (lambda-var-ctype-constraints x)
-         (dolist (con (gethash (sb!kernel::type-class-info y) it) nil)
+         (dolist (con (gethash (sb-kernel::type-class-info y) it) nil)
            (when (and (eq (constraint-kind con) kind)
                       (eq (constraint-not-p con) not-p)
                       (type= (constraint-y con) y))
@@ -345,7 +345,7 @@
       (ctype
        (let ((index (ensure-hash (lambda-var-ctype-constraints x)))
              (vec   (ensure-vec  (lambda-var-inheritable-constraints x))))
-         (push con (gethash (sb!kernel::type-class-info y) index))
+         (push con (gethash (sb-kernel::type-class-info y) index))
          (vector-push-extend con vec)))
       (lvar
        (let ((index (ensure-hash (lambda-var-eq-constraints x))))
@@ -545,7 +545,7 @@
 
 ;;; If REF is to a LAMBDA-VAR with CONSTRAINTs (i.e. we can do flow
 ;;; analysis on it), then return the LAMBDA-VAR, otherwise NIL.
-#!-sb-fluid (declaim (inline ok-ref-lambda-var))
+#-sb-fluid (declaim (inline ok-ref-lambda-var))
 (defun ok-ref-lambda-var (ref)
   (declare (type ref ref))
   (let ((leaf (ref-leaf ref)))
@@ -976,10 +976,10 @@
              ;; type propagation for classes is not as important anyway.
              (cond #-sb-xc-host
                    ((and
-                     (eq sb!pcl::**boot-state** 'sb!pcl::complete)
+                     (eq sb-pcl::**boot-state** 'sb-pcl::complete)
                      (block nil
                        (let ((standard-object (find-classoid 'standard-object)))
-                         (sb!kernel::map-type
+                         (sb-kernel::map-type
                           (lambda (type)
                             (when (and (classoid-p type)
                                        (csubtypep type standard-object))

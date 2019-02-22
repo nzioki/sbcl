@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Instruction-like macros.
 
@@ -42,7 +42,7 @@
                                           "SYMBOL-"
                                           (string slot)
                                           "-SLOT")
-                             (find-package "SB!VM"))))
+                             (find-package "SB-VM"))))
          `(progn
             (defmacro ,loader (reg symbol)
               `(inst ld ,reg null-tn
@@ -140,7 +140,7 @@
 ;;;; applied.  The amount of space to be allocated is SIZE bytes (which
 ;;;; must be a multiple of the lisp object size).
 (defmacro allocation (result-tn size lowtag &key stack-p temp-tn)
-  #!+gencgc
+  #+gencgc
   ;; A temp register is needed to do inline allocation.  TEMP-TN, in
   ;; this case, can be any register, since it holds a double-word
   ;; aligned address (essentially a fixnum).
@@ -165,8 +165,8 @@
       ;; For the benefit of future historians, this is how CMUCL does the
       ;; align-csp (I think their version is branch free only because
       ;; they simply don't worry about zeroing the pad word):
-      #+nil (inst add ,temp-tn csp-tn sb!vm:lowtag-mask)
-      #+nil (inst andn ,temp-tn sb!vm:lowtag-mask)
+      #+nil (inst add ,temp-tn csp-tn sb-vm:lowtag-mask)
+      #+nil (inst andn ,temp-tn sb-vm:lowtag-mask)
 
       ;; Set the result to temp-tn, with appropriate lowtag
       (inst or ,result-tn csp-tn ,lowtag)
@@ -177,7 +177,7 @@
       ;; Need to rearrange this code.
       (inst add csp-tn ,size))
 
-     #!-gencgc
+     #-gencgc
      ;; Normal allocation to the heap -- cheneygc version.
      ;;
      ;; On cheneygc, the alloc-tn currently has the pseudo-atomic bit.
@@ -190,7 +190,7 @@
      ;;
      ;; Otherwise, we need to zap out the lowtag from alloc-tn, and then
      ;; or in the lowtag.
-     #!-gencgc
+     #-gencgc
      (t
       (inst andn ,result-tn alloc-tn lowtag-mask)
       (inst or ,result-tn ,lowtag)
@@ -201,7 +201,7 @@
      ;; No need to worry about lowtag bits matching up here, since
      ;; alloc-tn is just a "pseudo-atomic-bit-tn" now and we don't read
      ;; it.
-     #!+gencgc
+     #+gencgc
      (t
       (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
       (loadw ,result-tn ,temp-tn 0)     ;boxed_region.free_pointer

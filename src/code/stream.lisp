@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; standard streams
 
@@ -87,20 +87,18 @@
 
 ;;; stream manipulation functions
 
-;;; SYNONYM-STREAM type is needed by ANSI-STREAM-{INPUT,OUTPUT}-STREAM-P
-(defstruct (synonym-stream (:include ansi-stream
-                                     (in #'synonym-in)
-                                     (bin #'synonym-bin)
-                                     (n-bin #'synonym-n-bin)
-                                     (out #'synonym-out)
-                                     (bout #'synonym-bout)
-                                     (sout #'synonym-sout)
-                                     (misc #'synonym-misc))
-                           (:constructor make-synonym-stream (symbol))
-                           (:copier nil))
-  ;; This is the symbol, the value of which is the stream we are synonym to.
-  (symbol nil :type symbol :read-only t))
-(declaim (freeze-type synonym-stream))
+(defstruct (broadcast-stream (:include ansi-stream
+                                       (out #'broadcast-out)
+                                       (bout #'broadcast-bout)
+                                       (sout #'broadcast-sout)
+                                       (misc #'broadcast-misc))
+                             (:constructor %make-broadcast-stream
+                                           (streams))
+                             (:copier nil)
+                             (:predicate nil))
+  ;; a list of all the streams we broadcast to
+  (streams () :type list :read-only t))
+(declaim (freeze-type broadcast-stream))
 
 (defun maybe-resolve-synonym-stream (stream)
   (labels ((recur (stream)
@@ -196,10 +194,10 @@
   (ef-char-size (get-external-format external-format)))
 
 ;;; Call the MISC method with the :FILE-POSITION operation.
-#!-sb-fluid (declaim (inline ansi-stream-file-position))
+#-sb-fluid (declaim (inline ansi-stream-file-position))
 (defun ansi-stream-file-position (stream position)
   (declare (type stream stream))
-  (declare (type (or index (alien sb!unix:unix-offset) (member nil :start :end))
+  (declare (type (or index (alien sb-unix:unix-offset) (member nil :start :end))
                  position))
   ;; FIXME: It would be good to comment on the stuff that is done here...
   ;; FIXME: This doesn't look interrupt safe.
@@ -210,11 +208,11 @@
     (t
      (let ((res (funcall (ansi-stream-misc stream) stream :file-position nil)))
        (when res
-         #!-sb-unicode
+         #-sb-unicode
          (- res
             (- +ansi-stream-in-buffer-length+
                (ansi-stream-in-index stream)))
-         #!+sb-unicode
+         #+sb-unicode
          (let ((char-size (if (fd-stream-p stream)
                               (fd-stream-char-size stream)
                               (external-format-char-size (stream-external-format stream)))))
@@ -321,7 +319,7 @@
             (progn (done-with-fast-read-char)
                    (eof-or-lose stream eof-error-p (values eof-value t))))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-line))
+#-sb-fluid (declaim (inline ansi-stream-read-line))
 (defun ansi-stream-read-line (stream eof-error-p eof-value recursive-p)
   (declare (ignore recursive-p))
   (if (ansi-stream-cin-buffer stream)
@@ -372,9 +370,9 @@
 
 ;;; We proclaim them INLINE here, then proclaim them NOTINLINE later on,
 ;;; so, except in this file, they are not inline by default, but they can be.
-#!-sb-fluid (declaim (inline read-char unread-char read-byte listen))
+#-sb-fluid (declaim (inline read-char unread-char read-byte listen))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-char))
+#-sb-fluid (declaim (inline ansi-stream-read-char))
 (defun ansi-stream-read-char (stream eof-error-p eof-value recursive-p)
   (declare (ignore recursive-p))
   (prepare-for-fast-read-char stream
@@ -396,7 +394,7 @@
               (eof-or-lose stream eof-error-p eof-value)
               (the character char))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-unread-char))
+#-sb-fluid (declaim (inline ansi-stream-unread-char))
 (defun ansi-stream-unread-char (character stream)
   (let ((index (1- (ansi-stream-in-index stream)))
         (buffer (ansi-stream-cin-buffer stream)))
@@ -422,7 +420,7 @@
         (stream-unread-char stream character)))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-listen))
+#-sb-fluid (declaim (inline ansi-stream-listen))
 (defun ansi-stream-listen (stream)
   (or (/= (the fixnum (ansi-stream-in-index stream))
           +ansi-stream-in-buffer-length+)
@@ -440,7 +438,7 @@
         ;; Fall through to Gray streams FUNDAMENTAL-STREAM case.
         (stream-listen stream))))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-char-no-hang))
+#-sb-fluid (declaim (inline ansi-stream-read-char-no-hang))
 (defun ansi-stream-read-char-no-hang (stream eof-error-p eof-value recursive-p)
   (if (funcall (ansi-stream-misc stream) stream :listen)
       ;; On T or :EOF get READ-CHAR to do the work.
@@ -462,7 +460,7 @@
               (eof-or-lose stream eof-error-p eof-value)
               (the (or character null) char))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-clear-input))
+#-sb-fluid (declaim (inline ansi-stream-clear-input))
 (defun ansi-stream-clear-input (stream)
   (setf (ansi-stream-in-index stream) +ansi-stream-in-buffer-length+)
   (funcall (ansi-stream-misc stream) stream :clear-input))
@@ -476,17 +474,13 @@
         (stream-clear-input stream)))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-read-byte))
+#-sb-fluid (declaim (inline ansi-stream-read-byte))
 (defun ansi-stream-read-byte (stream eof-error-p eof-value recursive-p)
   ;; Why the "recursive-p" parameter?  a-s-r-b is funcall'ed from
   ;; a-s-read-sequence and needs a lambda list that's congruent with
   ;; that of a-s-read-char
   (declare (ignore recursive-p))
   (with-fast-read-byte (t stream eof-error-p eof-value)
-    ;; FIXME: the overhead of the UNWIND-PROTECT inserted by
-    ;; WITH-FAST-READ-BYTE significantly impacts the time taken
-    ;; by single byte reads. For this use-case we could
-    ;; probably just change it to a PROG1.
     (fast-read-byte)))
 
 (defun read-byte (stream &optional (eof-error-p t) eof-value)
@@ -509,7 +503,7 @@
 ;;; some cases, but it wasn't being used in SBCL, so it was dropped.
 ;;; If we ever need it, it could be added later as a new variant N-BIN
 ;;; method (perhaps N-BIN-ASAP?) or something.
-#!-sb-fluid (declaim (inline read-n-bytes))
+#-sb-fluid (declaim (inline read-n-bytes))
 (defun read-n-bytes (stream buffer start numbytes &optional (eof-error-p t))
   (if (ansi-stream-p stream)
       (ansi-stream-read-n-bytes stream buffer start numbytes eof-error-p)
@@ -627,12 +621,12 @@
           (t
            (when (/= start +ansi-stream-in-buffer-extra+)
              (#.(let* ((n-character-array-bits
-                        (sb!vm:saetp-n-bits
+                        (sb-vm:saetp-n-bits
                          (find 'character
-                               sb!vm:*specialized-array-element-type-properties*
-                               :key #'sb!vm:saetp-specifier)))
+                               sb-vm:*specialized-array-element-type-properties*
+                               :key #'sb-vm:saetp-specifier)))
                        (bash-function (intern (format nil "UB~D-BASH-COPY" n-character-array-bits)
-                                              (find-package "SB!KERNEL"))))
+                                              (find-package "SB-KERNEL"))))
                   bash-function)
                 ibuf +ansi-stream-in-buffer-extra+
                 ibuf start
@@ -672,7 +666,7 @@
   (with-out-stream stream (ansi-stream-out #\newline) (stream-terpri))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-fresh-line))
+#-sb-fluid (declaim (inline ansi-stream-fresh-line))
 (defun ansi-stream-fresh-line (stream)
   (unless (eql (charpos stream) 0)
     (funcall (ansi-stream-out stream) stream #\newline)
@@ -686,7 +680,7 @@
         ;; must be Gray streams FUNDAMENTAL-STREAM
         (stream-fresh-line stream))))
 
-#!-sb-fluid (declaim (inline ansi-stream-write-string))
+#-sb-fluid (declaim (inline ansi-stream-write-string))
 (defun ansi-stream-write-string (string stream start end)
   (with-array-data ((data string) (offset-start start)
                     (offset-end end)
@@ -824,20 +818,6 @@
       (stream-element-type stream)))))
 
 ;;;; broadcast streams
-
-(defstruct (broadcast-stream (:include ansi-stream
-                                       (out #'broadcast-out)
-                                       (bout #'broadcast-bout)
-                                       (sout #'broadcast-sout)
-                                       (misc #'broadcast-misc))
-                             (:constructor %make-broadcast-stream
-                                           (streams))
-                             (:copier nil)
-                             (:predicate nil))
-  ;; a list of all the streams we broadcast to
-  (streams () :type list :read-only t))
-
-(declaim (freeze-type broadcast-stream))
 
 (defun make-broadcast-stream (&rest streams)
   (unless streams
@@ -1405,7 +1385,7 @@
                 ;; It doesn't help anything to declare this slot's type.
                 ;; Readers don't really benefit, and the public constructor
                 ;; checks for validity.
-                #|:type (or #!+sb-unicode (eql :default) type-specifier)|#
+                #|:type (or #+sb-unicode (eql :default) type-specifier)|#
                 :read-only t))
 
 (declaim (freeze-type string-output-stream))
@@ -1500,11 +1480,11 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
 (defun string-sout (stream string start end)
   (declare (type simple-string string)
            (type index start end))
-  #!+sb-unicode
-  (when (and (typep string 'sb!kernel:simple-character-string)
+  #+sb-unicode
+  (when (and (typep string 'sb-kernel:simple-character-string)
              (eq (string-output-stream-element-type stream) 'base-char))
     (do ((i (1- end) (1- i))) ((< i start))
-      (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+      (declare (optimize (sb-c::insert-array-bounds-checks 0)))
       (the base-char (char string i))))
   (let* ((full-length (- end start))
          (length full-length)
@@ -1521,7 +1501,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
      :more
        (when (plusp here)
          (string-dispatch
-              (simple-character-string simple-base-string sb!kernel::simple-array-nil)
+              (simple-character-string simple-base-string sb-kernel::simple-array-nil)
               string
             (replace buffer string :start1 pointer :start2 start :end2 stop))
          (setf (string-output-stream-pointer stream) (+ here pointer)))
@@ -1634,7 +1614,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
          (prev (nreverse (string-output-stream-prev stream)))
          (this (string-output-stream-buffer stream))
          (next (string-output-stream-next stream))
-         #!+sb-unicode
+         #+sb-unicode
          (element-type
           (if (eq element-type :default)
               (if (or next
@@ -1707,7 +1687,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
     result))
 
 (defun finite-base-string-ouch (stream character)
-  (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
   (let ((pointer (finite-base-string-output-stream-pointer stream))
         (buffer (finite-base-string-output-stream-buffer stream)))
     (cond ((= pointer (length buffer))

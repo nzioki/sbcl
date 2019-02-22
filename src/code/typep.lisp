@@ -7,9 +7,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-;;; (Note that when cross-compiling, SB!XC:TYPEP is interpreted as a
+;;; (Note that when cross-compiling, SB-XC:TYPEP is interpreted as a
 ;;; test that the host Lisp object OBJECT translates to a target SBCL
 ;;; type TYPE. This behavior is needed e.g. to test for the validity
 ;;; of numeric subtype bounds read when cross-compiling.)
@@ -33,7 +33,8 @@
   (%%typep object (specifier-type specifier)))
 
 (defun %%typep (object type &optional (strict t))
-  (declare (type ctype type))
+ (declare (type ctype type))
+ (named-let recurse ((object object) (type type))
   (etypecase type
     (named-type
      (ecase (named-type-name type)
@@ -127,57 +128,59 @@
      (when (member-type-member-p object type)
        t))
     (classoid
-     #+sb-xc-host (ctypep object type)
      ;; It might be more efficient to check that OBJECT is either INSTANCEP
      ;; or FUNCALLABLE-INSTANCE-P before making this call.
      ;; But doing that would change the behavior if %%TYPEP were ever called
      ;; with a built-in classoid whose members are not instances.
      ;; e.g. (%%typep (find-fdefn 'car) (specifier-type 'fdefn))
      ;; I'm not sure if that can happen.
-     #-sb-xc-host (classoid-typep (layout-of object) type object))
+     (classoid-typep (layout-of object) type object))
     (union-type
-     (some (lambda (union-type-type) (%%typep object union-type-type strict))
+     (some (lambda (union-type-type) (recurse object union-type-type))
            (union-type-types type)))
     (intersection-type
-     (every (lambda (intersection-type-type)
-              (%%typep object intersection-type-type strict))
+     (every (lambda (intersection-type-type) (recurse object intersection-type-type))
             (intersection-type-types type)))
     (cons-type
      (and (consp object)
-          (%%typep (car object) (cons-type-car-type type) strict)
-          (%%typep (cdr object) (cons-type-cdr-type type) strict)))
-    #!+sb-simd-pack
+          (recurse (car object) (cons-type-car-type type))
+          (recurse (cdr object) (cons-type-cdr-type type))))
+    #+sb-simd-pack
     (simd-pack-type
      (and (simd-pack-p object)
           (let* ((tag (%simd-pack-tag object))
                  (name (nth tag *simd-pack-element-types*)))
             (not (not (member name (simd-pack-type-element-type type)))))))
+    #+sb-simd-pack-256
+    (simd-pack-256-type
+     (and (simd-pack-256-p object)
+          (let* ((tag (%simd-pack-256-tag object))
+                 (name (nth tag *simd-pack-element-types*)))
+            (not (not (member name (simd-pack-256-type-element-type type)))))))
     (character-set-type
      (and (characterp object)
-         (let ((code (char-code object))
-               (pairs (character-set-type-pairs type)))
-           (dolist (pair pairs nil)
-             (destructuring-bind (low . high) pair
-               (when (<= low code high)
-                 (return t)))))))
+          (let ((code (char-code object))
+                (pairs (character-set-type-pairs type)))
+            (dolist (pair pairs nil)
+              (destructuring-bind (low . high) pair
+                (when (<= low code high)
+                  (return t)))))))
     (unknown-type
-     ;; dunno how to do this ANSIly -- WHN 19990413
-     #+sb-xc-host (error "stub: %%TYPEP UNKNOWN-TYPE in xcompilation host")
      ;; Parse it again to make sure it's really undefined.
      (let ((reparse (specifier-type (unknown-type-specifier type))))
        (if (typep reparse 'unknown-type)
            (error "unknown type specifier: ~S"
                   (unknown-type-specifier reparse))
-           (%%typep object reparse strict))))
+           (recurse object reparse))))
     (negation-type
-     (not (%%typep object (negation-type-type type) strict)))
+     (not (recurse object (negation-type-type type))))
     (hairy-type
      ;; Now the tricky stuff.
      (let* ((hairy-spec (hairy-type-specifier type))
             (symbol (car hairy-spec)))
        (ecase symbol
          (and
-          (every (lambda (spec) (%%typep object (specifier-type spec) strict))
+          (every (lambda (spec) (recurse object (specifier-type spec)))
                  (rest hairy-spec)))
          ;; Note: it should be safe to skip OR here, because union
          ;; types can always be represented as UNION-TYPE in general
@@ -186,19 +189,22 @@
          (not
           (unless (proper-list-of-length-p hairy-spec 2)
             (error "invalid type specifier: ~S" hairy-spec))
-          (not (%%typep object (specifier-type (cadr hairy-spec)) strict)))
+          (not (recurse object (specifier-type (cadr hairy-spec)))))
          (satisfies
           (unless (proper-list-of-length-p hairy-spec 2)
             (error "invalid type specifier: ~S" hairy-spec))
           (and (funcall (symbol-function (cadr hairy-spec)) object) t)))))
     (alien-type-type
-     (sb!alien-internals:alien-typep object (alien-type-type-alien-type type)))
+     (sb-alien-internals:alien-typep object (alien-type-type-alien-type type)))
     (fun-type
-     (if strict
-         (error "Function types are not a legal argument to TYPEP:~%  ~S"
-                (type-specifier type))
-         (and (functionp object)
-              (csubtypep (specifier-type (sb!impl::%fun-type object)) type))))))
+     (case strict
+      ((functionp) (functionp object)) ; least strict
+      ((nil) ; medium strict
+       (and (functionp object)
+            (csubtypep (specifier-type (sb-impl::%fun-type object)) type)))
+      (t ; strict
+       (error "Function types are not a legal argument to TYPEP:~%  ~S"
+              (type-specifier type))))))))
 
 (defun cached-typep (cache object)
   (let* ((type (cdr cache))
@@ -225,7 +231,7 @@
                     (lambda (cache object)
                       (%%typep object (cdr (truly-the cons cache)))))))
           (setf (cdr cache) ctype)
-          (sb!thread:barrier (:write))
+          (sb-thread:barrier (:write))
           (setf (car cache) fun)
           (funcall fun cache object)))))
 

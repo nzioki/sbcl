@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!EVAL")
+(in-package "SB-EVAL")
 
 ;; (declaim (optimize (speed 3) (debug 1) (safety 1)))
 
@@ -19,20 +19,31 @@
 (defvar *symbol-macro* (gensym "SYMBOL-MACRO"))
 (defvar *not-present* (gensym "NOT-PRESENT"))
 
-(define-condition interpreted-program-error (program-error simple-condition sb!impl::encapsulated-condition)
+;;; Wow is this horrible!  We have two different condition classes named
+;;; INTERPRETED-PROGRAM-ERROR which are no way obviously to be preferred
+;;; in one situation versus another, other than to say that one bit of code
+;;; wants one definition and one bit of code wants the other.
+;;; I can understand the concept of namespaces as collision avoidance device
+;;; for two different libraries each of which wants to lay claim to a certain
+;;; popular name for a thing, but this is all SBCL stuff pertaining to the
+;;; evaluator (the evaluator predating sb-fasteval) defining two incompatible
+;;; conditions both for the * SAME * evaluator. Wtf???
+;;; I suppose it's worth mentioning that we could "fix" this naming problem
+;;; by removing the older evaluator once and for all.
+(define-condition interpreted-program-error (program-error simple-condition sb-impl::encapsulated-condition)
   ()
   (:report (lambda (condition stream)
              (if (slot-boundp condition 'condition)
                  (progn
                    (format stream "Error evaluating a form:~% ~A"
-                           (sb!impl::encapsulated-condition condition)))
+                           (sb-impl::encapsulated-condition condition)))
                  (format stream "Error evaluating a form:~% ~?"
                          (simple-condition-format-control condition)
                          (simple-condition-format-arguments condition))))))
 
 ;;; ANSI defines that program syntax errors should be of type
 ;;; PROGRAM-ERROR.  Therefore...
-(define-condition arg-count-program-error (sb!kernel::arg-count-error
+(define-condition arg-count-program-error (sb-kernel::arg-count-error
                                            program-error)
   ())
 
@@ -57,7 +68,7 @@
   ;; (:EVAL) is a dummy context. We don't have enough information to
   ;; show the operator name without using debugger internals to get the stack frame.
   ;; It would be easier to make the name an argument to this macro.
-  `(sb!int:binding* ,(sb!c::expand-ds-bind lambda-list arg-list t nil '(:eval))
+  `(binding* ,(sb-c::expand-ds-bind lambda-list arg-list t nil '(:eval))
      ,@body))
 
 (defun ip-error (format-control &rest format-arguments)
@@ -90,7 +101,7 @@
              ;; with non-macro functions will be too hairy to compile.
              (if (eq (cdr binding) *macro*)
                  (cons (car binding)
-                       (cons 'sb!sys:macro
+                       (cons 'sb-sys:macro
                              (cdr (assoc (car binding) new-expanders))))
                  (cons (car binding)
                        :bogus)))
@@ -98,20 +109,20 @@
              ;; And likewise for symbol macros.
              (if (eq (cdr binding) *symbol-macro*)
                  (cons (car binding)
-                       (cons 'sb!sys:macro
+                       (cons 'sb-sys:macro
                              (cdr (assoc (car binding) new-symbol-expansions))))
                  (cons (car binding)
                        :bogus))))
-    (let ((lexenv (sb!c::internal-make-lexenv
+    (let ((lexenv (sb-c::internal-make-lexenv
                    (nconc-2 (mapcar #'to-native-funs new-funs)
-                            (sb!c::lexenv-funs old-lexenv))
+                            (sb-c::lexenv-funs old-lexenv))
                    (nconc-2 (mapcar #'to-native-vars new-vars)
-                            (sb!c::lexenv-vars old-lexenv))
+                            (sb-c::lexenv-vars old-lexenv))
                    nil nil nil nil nil nil
-                   (sb!c::lexenv-handled-conditions old-lexenv)
-                   (sb!c::lexenv-disabled-package-locks old-lexenv)
-                   (sb!c::lexenv-policy old-lexenv) ; = (OR %POLICY *POLICY*)
-                   (sb!c::lexenv-user-data old-lexenv)
+                   (sb-c::lexenv-handled-conditions old-lexenv)
+                   (sb-c::lexenv-disabled-package-locks old-lexenv)
+                   (sb-c::lexenv-policy old-lexenv) ; = (OR %POLICY *POLICY*)
+                   (sb-c::lexenv-user-data old-lexenv)
                    old-lexenv)))
       (dolist (declaration declarations)
         (unless (consp declaration)
@@ -119,8 +130,8 @@
                     declaration (cons 'declare declarations)))
         (case (car declaration)
           ((optimize)
-           (setf (sb!c::lexenv-%policy lexenv)
-                 (copy-structure (sb!c::lexenv-%policy lexenv)))
+           (setf (sb-c::lexenv-%policy lexenv)
+                 (copy-structure (sb-c::lexenv-%policy lexenv)))
            (dolist (element (cdr declaration))
              (multiple-value-bind (quality value)
                  (if (not (consp element)) ; FIXME: OAOOM w/'proclaim'
@@ -128,27 +139,27 @@
                      (program-destructuring-bind (quality value)
                          element
                        (values quality value)))
-               (sb!int:acond
-                ((sb!c::policy-quality-name-p quality)
-                 (sb!c::alter-policy (sb!c::lexenv-%policy lexenv)
-                                     sb!int:it value))
+               (acond
+                ((sb-c::policy-quality-name-p quality)
+                 (sb-c::alter-policy (sb-c::lexenv-%policy lexenv)
+                                     it value))
                 (t (warn "ignoring unknown optimization quality ~S in ~S"
                          quality (cons 'declare declarations)))))))
           (muffle-conditions
-           (setf (sb!c::lexenv-handled-conditions lexenv)
-                 (sb!c::process-muffle-conditions-decl
+           (setf (sb-c::lexenv-handled-conditions lexenv)
+                 (sb-c::process-muffle-conditions-decl
                   declaration
-                  (sb!c::lexenv-handled-conditions lexenv))))
+                  (sb-c::lexenv-handled-conditions lexenv))))
           (unmuffle-conditions
-           (setf (sb!c::lexenv-handled-conditions lexenv)
-                 (sb!c::process-unmuffle-conditions-decl
+           (setf (sb-c::lexenv-handled-conditions lexenv)
+                 (sb-c::process-unmuffle-conditions-decl
                   declaration
-                  (sb!c::lexenv-handled-conditions lexenv))))
-          ((disable-package-locks sb!ext:enable-package-locks)
-           (setf (sb!c::lexenv-disabled-package-locks lexenv)
-                 (sb!c::process-package-lock-decl
+                  (sb-c::lexenv-handled-conditions lexenv))))
+          ((disable-package-locks sb-ext:enable-package-locks)
+           (setf (sb-c::lexenv-disabled-package-locks lexenv)
+                 (sb-c::process-package-lock-decl
                   declaration
-                  (sb!c::lexenv-disabled-package-locks lexenv))))))
+                  (sb-c::lexenv-disabled-package-locks lexenv))))))
       lexenv)))
 
 (defstruct (env
@@ -182,27 +193,27 @@
 
 (defun make-null-environment ()
   (%make-env nil nil nil nil nil nil nil nil
-             (sb!c::internal-make-lexenv
+             (sb-c::internal-make-lexenv
               nil nil nil
               nil nil nil nil nil nil nil
-              sb!c::*policy*
+              sb-c::*policy*
               nil nil)))
 
 ;;; Augment ENV with a special or lexical variable binding
 (declaim (inline push-var))
 (defun push-var (name value env)
   (push (cons name value) (env-vars env))
-  (push (cons name :bogus) (sb!c::lexenv-vars (env-native-lexenv env))))
+  (push (cons name :bogus) (sb-c::lexenv-vars (env-native-lexenv env))))
 
 ;;; Augment ENV with a local function binding
 (declaim (inline push-fun))
 (defun push-fun (name value calling-env body-env)
   (when (fboundp name)
-    (let ((sb!c:*lexenv* (env-native-lexenv calling-env)))
+    (let ((sb-c:*lexenv* (env-native-lexenv calling-env)))
       (program-assert-symbol-home-package-unlocked
        :eval name "binding ~A as a local function")))
   (push (cons name value) (env-funs body-env))
-  (push (cons name :bogus) (sb!c::lexenv-funs (env-native-lexenv body-env))))
+  (push (cons name :bogus) (sb-c::lexenv-funs (env-native-lexenv body-env))))
 
 (defmethod print-object ((env env) stream)
   (print-unreadable-object (env stream :type t :identity t)))
@@ -234,7 +245,7 @@
 ;;; to MAKE-ENV.
 (defun special-bindings (specials env)
   (mapcar #'(lambda (var)
-              (let ((sb!c:*lexenv* (env-native-lexenv env)))
+              (let ((sb-c:*lexenv* (env-native-lexenv env)))
                 (program-assert-symbol-home-package-unlocked
                  :eval var "declaring ~A special"))
               (cons var *special*))
@@ -243,7 +254,7 @@
 ;;; Return true if SYMBOL has been declared special either globally
 ;;; or is in the DECLARED-SPECIALS list.
 (defun specialp (symbol declared-specials)
-  (let ((type (sb!int:info :variable :kind symbol)))
+  (let ((type (info :variable :kind symbol)))
     (cond
       ((eq type :constant)
        ;; Horrible place for this, but it works.
@@ -294,12 +305,12 @@
   (multiple-value-bind (llks required optional rest keyword aux)
       ;; FIXME: shouldn't this just pass ":silent t" ?
       (handler-bind ((style-warning #'muffle-warning))
-        (sb!int:parse-lambda-list lambda-list))
+        (parse-lambda-list lambda-list))
     (let* ((original-arguments arguments)
            (rest-p (not (null rest)))
            (rest (car rest))
-           (keyword-p (sb!int:ll-kwds-keyp llks))
-           (allow-other-keys-p (sb!int:ll-kwds-allowp llks))
+           (keyword-p (ll-kwds-keyp llks))
+           (allow-other-keys-p (ll-kwds-allowp llks))
            (arguments-present (length arguments))
            (required-length (length required))
            (optional-length (length optional))
@@ -508,12 +519,12 @@
           ((eq (cdr binding) *symbol-macro*)
            (error "Tried to set a symbol-macrolet!"))
           (t (setf (cdr binding) value)))
-        (case (sb!int:info :variable :kind symbol)
+        (case (info :variable :kind symbol)
           (:macro (error "Tried to set a symbol-macrolet!"))
-          (:alien (let ((type (sb!int:info :variable :alien-info symbol)))
-                    (setf (sb!alien::%heap-alien type) value)))
+          (:alien (let ((type (info :variable :alien-info symbol)))
+                    (setf (sb-alien::%heap-alien type) value)))
           (t
-           (let ((type (sb!c::info :variable :type symbol)))
+           (let ((type (sb-c::info :variable :type symbol)))
              (when type
                (let ((type-specifier (type-specifier type)))
                  (unless (typep value type-specifier)
@@ -535,9 +546,9 @@
            (values (cdr (get-symbol-expansion-binding symbol env))
                    :expansion))
           (t (values (cdr binding) :variable)))
-        (case (sb!int:info :variable :kind symbol)
+        (case (info :variable :kind symbol)
           (:macro (values (macroexpand-1 symbol) :expansion))
-          (:alien (values (sb!alien-internals:alien-value symbol) :variable))
+          (:alien (values (sb-alien-internals:alien-value symbol) :variable))
           (t (values (symbol-value symbol) :variable))))))
 
 ;;; Retrieve the function/macro binding of the symbol NAME in
@@ -558,7 +569,7 @@
 ;;; Return true if EXP is a lambda form.
 (defun lambdap (exp)
   (case (car exp)
-    ((lambda sb!int:named-lambda) t)))
+    ((lambda named-lambda) t)))
 
 ;;; Split off the declarations (and the docstring, if
 ;;; DOC-STRING-ALLOWED is true) from the actual forms of BODY.
@@ -583,7 +594,7 @@
           ((and (consp (car form)) (eql (caar form) 'declare))
            (when (eq lambda-list :unspecified)
              (dolist (item (cdar form))
-               (when (and (consp item) (eq (car item) 'sb!c::lambda-list))
+               (when (and (consp item) (eq (car item) 'sb-c::lambda-list))
                  (setq lambda-list (second item)))))
            (setf declarations (append declarations (cdar form))))
           (t (return (values form documentation declarations lambda-list))))
@@ -592,13 +603,13 @@
 ;;; Create an interpreted function from the lambda-form EXP evaluated
 ;;; in the environment ENV.
 (defun eval-lambda (exp env)
-  (sb!int:binding* (((name rest)
-                     (case (car exp)
-                      ((lambda) (values nil (cdr exp)))
-                      ((sb!int:named-lambda) (values (second exp) (cddr exp)))))
-                    (lambda-list (car rest))
-                    ((forms documentation declarations debug-lambda-list)
-                     (parse-lambda-headers (cdr rest) :doc-string-allowed t)))
+  (binding* (((name rest)
+              (case (car exp)
+                ((lambda) (values nil (cdr exp)))
+                ((named-lambda) (values (second exp) (cddr exp)))))
+             (lambda-list (car rest))
+             ((forms documentation declarations debug-lambda-list)
+              (parse-lambda-headers (cdr rest) :doc-string-allowed t)))
        (make-interpreted-function :name name
                                   :lambda-list lambda-list
                                   :debug-lambda-list
@@ -606,7 +617,7 @@
                                       lambda-list debug-lambda-list)
                                   :env env :body forms
                                   :documentation documentation
-                                  :source-location (sb!c::make-definition-source-location)
+                                  :source-location (sb-c::make-definition-source-location)
                                   :declarations declarations)))
 
 (defun eval-progn (body env)
@@ -678,7 +689,7 @@
   (program-destructuring-bind (name lambda-list &body local-body) function-def
     (multiple-value-bind (local-body documentation declarations)
         (parse-lambda-headers local-body :doc-string-allowed t)
-      (%eval `#'(sb!int:named-lambda ,name ,lambda-list
+      (%eval `#'(named-lambda ,name ,lambda-list
                   ,@(if documentation
                         (list documentation)
                         nil)
@@ -735,9 +746,8 @@
 ;; definition form FUNCTION-DEF.
 (defun eval-local-macro-def (function-def env)
   (program-destructuring-bind (name lambda-list &body local-body) function-def
-    (%eval (sb!int:make-macro-lambda nil ; the lambda is anonymous.
-                                     lambda-list local-body
-                                     'macrolet name)
+    (%eval (make-macro-lambda nil ; the lambda is anonymous.
+                              lambda-list local-body 'macrolet name)
            env)))
 
 (defun eval-macrolet (body env)
@@ -746,7 +756,7 @@
              (cons (car macro-def) *macro*))
            (generate-mbinding (macro-def)
              (let ((name (car macro-def))
-                   (sb!c:*lexenv* (env-native-lexenv env)))
+                   (sb-c:*lexenv* (env-native-lexenv env)))
                (when (fboundp name)
                  (program-assert-symbol-home-package-unlocked
                   :eval name "binding ~A as a local macro"))
@@ -770,9 +780,9 @@
              (cons (car binding) *symbol-macro*))
            (generate-sm-binding (binding)
              (let ((name (car binding))
-                   (sb!c:*lexenv* (env-native-lexenv env)))
+                   (sb-c:*lexenv* (env-native-lexenv env)))
                (when (or (boundp name)
-                         (eq (sb!int:info :variable :kind name) :macro))
+                         (eq (info :variable :kind name) :macro))
                  (program-assert-symbol-home-package-unlocked
                   :eval name "binding ~A as a local symbol-macro"))
                (cons name (second binding)))))
@@ -990,7 +1000,7 @@
   (program-destructuring-bind (values &body body) args
     (if (null values)
         (eval-progn body env)
-        (sb!sys:with-pinned-objects ((%eval (car values) env))
+        (sb-sys:with-pinned-objects ((%eval (car values) env))
           (eval-with-pinned-objects (cons (cdr values) body) env)))))
 
 (defvar *eval-dispatch-functions* nil)
@@ -1040,7 +1050,7 @@
        ((truly-the)            (eval-the (cdr exp) env))
        ;; Not a special form, but a macro whose expansion wouldn't be
        ;; handled correctly by the evaluator.
-       ((sb!sys:with-pinned-objects) (eval-with-pinned-objects (cdr exp) env))
+       ((sb-sys:with-pinned-objects) (eval-with-pinned-objects (cdr exp) env))
        (t
         (let ((dispatcher (getf *eval-dispatch-functions* (car exp))))
           (cond
@@ -1124,7 +1134,7 @@
              :format-arguments
              (list function)))
     (values
-     `(sb!int:named-lambda ,(interpreted-function-name function)
+     `(named-lambda ,(interpreted-function-name function)
           ,(interpreted-function-lambda-list function)
         (declare ,@(interpreted-function-declarations function))
         ,@(interpreted-function-body function))
@@ -1133,15 +1143,15 @@
 ;;; Convert a compiler LEXENV to an interpreter ENV. This is needed
 ;;; for EVAL-IN-LEXENV.
 (defun make-env-from-native-environment (lexenv)
-  (let ((native-funs (sb!c::lexenv-funs lexenv))
-        (native-vars (sb!c::lexenv-vars lexenv)))
+  (let ((native-funs (sb-c::lexenv-funs lexenv))
+        (native-vars (sb-c::lexenv-vars lexenv)))
     (flet ((is-macro (thing)
-             (and (consp thing) (eq (car thing) 'sb!sys:macro))))
-      (when (or (sb!c::lexenv-blocks lexenv)
-                (sb!c::lexenv-cleanup lexenv)
-                (sb!c::lexenv-lambda lexenv)
-                (sb!c::lexenv-tags lexenv)
-                (sb!c::lexenv-type-restrictions lexenv)
+             (and (consp thing) (eq (car thing) 'sb-sys:macro))))
+      (when (or (sb-c::lexenv-blocks lexenv)
+                (sb-c::lexenv-cleanup lexenv)
+                (sb-c::lexenv-lambda lexenv)
+                (sb-c::lexenv-tags lexenv)
+                (sb-c::lexenv-type-restrictions lexenv)
                 (find-if-not #'is-macro native-funs :key #'cdr)
                 (find-if-not #'is-macro native-vars :key #'cdr))
         (error 'compiler-environment-too-complex-error
@@ -1172,17 +1182,17 @@
 
 (defun eval-in-native-environment (form lexenv)
   (handler-bind
-      ((sb!impl::eval-error
+      ((sb-impl::eval-error
          (lambda (condition)
            (error 'interpreted-program-error
-                  :condition (sb!int:encapsulated-condition condition)
+                  :condition (encapsulated-condition condition)
                   :form form))))
-    (sb!c:with-compiler-error-resignalling
+    (sb-c:with-compiler-error-resignalling
       (handler-case
           (let ((env (make-env-from-native-environment lexenv)))
             (%eval form env))
         (compiler-environment-too-complex-error (condition)
           (declare (ignore condition))
-          (sb!int:style-warn 'lexical-environment-too-complex
-                             :form form :lexenv lexenv)
-          (sb!int:simple-eval-in-lexenv form lexenv))))))
+          (style-warn 'lexical-environment-too-complex
+                      :form form :lexenv lexenv)
+          (simple-eval-in-lexenv form lexenv))))))

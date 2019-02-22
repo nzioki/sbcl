@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; moves and coercions
 
@@ -141,9 +141,9 @@
   (:variant-vars cond)
   (:generator 2
     (ecase cond
-      (:eq (inst cmpeq x (sb!xc:char-code y) temp))
-      (:lt (inst cmplt x (sb!xc:char-code y) temp))
-      (:gt (inst cmple x (sb!xc:char-code y) temp)))
+      (:eq (inst cmpeq x (sb-xc:char-code y) temp))
+      (:lt (inst cmplt x (sb-xc:char-code y) temp))
+      (:gt (inst cmple x (sb-xc:char-code y) temp)))
     (if not-p
         (if (eq cond :gt)
             (inst bne temp target)

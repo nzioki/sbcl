@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; default initfiles
 
@@ -19,11 +19,11 @@
   (or (let ((sbcl-homedir (sbcl-homedir-pathname)))
         (when sbcl-homedir
           (probe-file (merge-pathnames "sbclrc" sbcl-homedir))))
-      #!+win32
+      #+win32
       (merge-pathnames "sbcl\\sbclrc"
-                       (sb!win32::get-folder-pathname
-                        sb!win32::csidl_common_appdata))
-      #!-win32
+                       (sb-win32::get-folder-pathname
+                        sb-win32::csidl_common_appdata))
+      #-win32
       "/etc/sbclrc"))
 
 (defun userinit-pathname ()
@@ -89,7 +89,7 @@ means to wait indefinitely.")
           (unwind-protect
                (progn
                  (flush-standard-output-streams)
-                 (sb!thread::%exit-other-threads)
+                 (sb-thread::%exit-other-threads)
                  (setf ok t))
             (os-exit code :abort (not ok)))))))
 
@@ -103,7 +103,7 @@ means to wait indefinitely.")
                                             (denominator seconds))
     (values quot
             (* rem
-               #.(if (sb!xc:typep 1000000000 'fixnum)
+               #.(if (sb-xc:typep 1000000000 'fixnum)
                      '(truncate 1000000000 (denominator seconds))
                      ;; Can't truncate a bignum by a fixnum without consing
                      '(* 10 (truncate 100000000 (denominator seconds))))))))
@@ -119,9 +119,9 @@ means to wait indefinitely.")
                                                     (load-time-value 1f9 t))))))))
     (declare (inline split-float))
     (typecase seconds
-      ((single-float 0f0 #.(float sb!xc:most-positive-fixnum 1f0))
+      ((single-float 0f0 #.(float sb-xc:most-positive-fixnum 1f0))
        (split-float))
-      ((double-float 0d0 #.(float sb!xc:most-positive-fixnum 1d0))
+      ((double-float 0d0 #.(float sb-xc:most-positive-fixnum 1d0))
        (split-float))
       (ratio
        (split-ratio-for-sleep seconds))
@@ -137,31 +137,31 @@ means to wait indefinitely.")
   ;; can actually have a reason to sleep for over 3 years?
   (loop while (> sec (expt 10 8))
      do (decf sec (expt 10 8))
-       (sb!unix:nanosleep (expt 10 8) 0))
-  (sb!unix:nanosleep sec nsec))
+       (sb-unix:nanosleep (expt 10 8) 0))
+  (sb-unix:nanosleep sec nsec))
 
 (declaim (inline %sleep))
-#!-win32
+#-win32
 (defun %sleep (seconds)
   (typecase seconds
     (double-float
-     (sb!unix::nanosleep-double seconds))
+     (sb-unix::nanosleep-double seconds))
     (single-float
-     (sb!unix::nanosleep-float seconds))
+     (sb-unix::nanosleep-float seconds))
     (integer
      (%nanosleep seconds 0))
     (t
      (multiple-value-call #'%nanosleep (split-ratio-for-sleep seconds)))))
 
-#!+(and win32 sb-thread)
+#+(and win32 sb-thread)
 (defun %sleep (seconds)
   (if (integerp seconds)
       (%nanosleep seconds 0)
       (multiple-value-call #'%nanosleep (split-seconds-for-sleep seconds))))
 
-#!+(and win32 (not sb-thread))
+#+(and win32 (not sb-thread))
 (defun %sleep (seconds)
-  (sb!win32:millisleep (truncate (* seconds 1000))))
+  (sb-win32:millisleep (truncate (* seconds 1000))))
 
 (defun sleep (seconds)
   "This function causes execution to be suspended for SECONDS. SECONDS may be
@@ -181,11 +181,11 @@ any non-negative real number."
             ;; use the largest representable value in that case.
             (timeout (or (seconds-to-maybe-internal-time seconds)
                          (* safe-internal-seconds-limit
-                            internal-time-units-per-second))))
+                            sb-xc:internal-time-units-per-second))))
         (labels ((sleep-for-a-bit (remaining)
                    (multiple-value-bind
                          (timeout-sec timeout-usec stop-sec stop-usec deadlinep)
-                       (decode-timeout (/ remaining internal-time-units-per-second))
+                       (decode-timeout (/ remaining sb-xc:internal-time-units-per-second))
                      (declare (ignore stop-sec stop-usec))
                      ;; Sleep until either the timeout or the deadline
                      ;; expires.
@@ -302,11 +302,12 @@ any non-negative real number."
            ;; Scripts don't need to be stylish or fast, but silence is usually a
            ;; desirable quality...
            (handler-bind (((or style-warning compiler-note) #'muffle-warning)
-                          (stream-error (lambda (e)
-                                          ;; Shell-style.
-                                          (when (member (stream-error-stream e)
-                                                        (list *stdout* *stdin* *stderr*))
-                                            (exit)))))
+                          ((or broken-pipe end-of-file)
+                            (lambda (e)
+                              ;; Shell-style.
+                              (when (member (stream-error-stream e)
+                                            (list *stdout* *stdin* *stderr*))
+                                (exit)))))
              ;; Let's not use the *TTY* for scripts, ok? Also, normally we use
              ;; synonym streams, but in order to have the broken pipe/eof error
              ;; handling right we want to bind them for scripts.
@@ -320,7 +321,7 @@ any non-negative real number."
       (if (eq t script)
           (load-script *stdin*)
           (with-open-file (f (native-pathname script) :element-type :default)
-            (sb!fasl::maybe-skip-shebang-line f)
+            (sb-fasl::maybe-skip-shebang-line f)
             (load-script f))))))
 
 ;; Errors while processing the command line cause the system to EXIT,
@@ -484,7 +485,7 @@ any non-negative real number."
                        (cond (stream
                               (dx-flet ((thunk ()
                                           (load-as-source stream :context kind)))
-                                (sb!fasl::call-with-load-bindings #'thunk stream)))
+                                (sb-fasl::call-with-load-bindings #'thunk stream)))
                              (specified-pathname
                               (cerror "Ignore missing init file"
                                       "The specified ~A file ~A was not found."
@@ -594,8 +595,8 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
                    ;; In the event of a control-stack-exhausted-error, we
                    ;; should have unwound enough stack by the time we get
                    ;; here that this is now possible.
-                   #!-win32
-                   (sb!kernel::reset-control-stack-guard-page)
+                   #-win32
+                   (sb-kernel::reset-control-stack-guard-page)
                    (funcall repl-fun noprint)
                    (critically-unreachable "after REPL")))))))))
 
@@ -625,7 +626,7 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
    (unwind-protect
         (progn
           (scrub-control-stack)
-          (sb!thread::get-foreground)
+          (sb-thread::get-foreground)
           (unless noprint
             (flush-standard-output-streams)
             (funcall *repl-prompt-fun* *standard-output*)
@@ -656,4 +657,4 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
 
 ;;; a convenient way to get into the assembly-level debugger
 (defun %halt ()
-  (%primitive sb!c:halt))
+  (%primitive sb-c:halt))

@@ -11,17 +11,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ; ok, so we're supposed to use our instruction scheduler, but we don't,
 ; because of "needs a little more work in the assembler"
-(defconstant sb!assem:assem-scheduler-p nil)
-(defconstant sb!assem:+inst-alignment-bytes+ 4)
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
 ;;; needs a little more work in the assembler, to realise that the
 ;;; delays requested here are not mandatory, so that the assembler
 ;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
 ;;; 2003-09-08
-#+nil (defconstant sb!assem:+assem-max-locations+ 70)
+#+nil (defconstant sb-assem:+assem-max-locations+ 70)
 
 (defconstant +backend-fasl-file-implementation+ :ppc)
   ;; On Linux, the ABI specifies the page size to be 4k-64k, use the
@@ -29,7 +29,7 @@
   ;; find out whether using exact multiples of the page size actually
   ;; matters in the few places where that's done, or whether we could
   ;; just use 4k everywhere.
-(defconstant +backend-page-bytes+ #!+linux 65536 #!-linux 4096)
+(defconstant +backend-page-bytes+ #+linux 65536 #-linux 4096)
 
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
@@ -115,7 +115,7 @@
 ;;;; Where to put the different spaces.
 
 ;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#!-gencgc
+#-gencgc
 (progn
   (defconstant read-only-space-start #x04000000)
   (defconstant read-only-space-end   #x07ff8000)
@@ -126,26 +126,26 @@
   (defconstant linkage-table-space-end   #x0b000000))
 
 ;;; While on gencgc we don't.
-#!+gencgc
+#+gencgc
 (!gencgc-space-setup #x04000000
                      :dynamic-space-start
-                     #!+linux   #x4f000000
-                     #!+netbsd  #x4f000000
-                     #!+openbsd #x4f000000
-                     #!+darwin  #x10000000)
+                     #+linux   #x4f000000
+                     #+netbsd  #x4f000000
+                     #+openbsd #x4f000000
+                     #+darwin  #x10000000)
 
 (defconstant linkage-table-entry-size 16)
 
-#!+linux
+#+linux
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x66fff000)))
 
-#!+netbsd
+#+netbsd
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x66fff000)))
@@ -157,16 +157,16 @@
 ;;; FIXME: MAXDSIZ is a kernel parameter, and can vary as high as 1GB.
 ;;; These parameters should probably be tested under such a configuration,
 ;;; as rare as it might or might not be.
-#!+openbsd
+#+openbsd
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x5cfff000)))
 
-#!+darwin
+#+darwin
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
     (defparameter dynamic-0-space-start #x10000000)
     (defparameter dynamic-0-space-end   #x3ffff000)))

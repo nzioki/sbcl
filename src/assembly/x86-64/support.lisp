@@ -7,12 +7,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun invoke-asm-routine (inst routine vop)
   (declare (ignorable vop))
   (let ((fixup
-         (cond ((sb!c::code-immobile-p vop)
+         (cond ((sb-c::code-immobile-p vop)
                 (make-fixup routine :assembly-routine))
                (t
                 (ea (make-fixup routine :assembly-routine*))))))

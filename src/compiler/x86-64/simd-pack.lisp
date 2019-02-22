@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun ea-for-sse-stack (tn &optional (base rbp-tn))
   (ea (frame-byte-offset (1+ (tn-offset tn))) base))
@@ -210,15 +210,13 @@
     (inst punpcklqdq dst tmp)))
 
 #-sb-xc-host
-(declaim (inline %make-simd-pack-ub32))
-#-sb-xc-host
-(defun %make-simd-pack-ub32 (w x y z)
-  (declare (type (unsigned-byte 32) w x y z))
-  (%make-simd-pack-ub64 (logior w (ash x 32))
-                        (logior y (ash z 32))))
-
-#-sb-xc-host
 (progn
+  (declaim (inline %make-simd-pack-ub32))
+  (defun %make-simd-pack-ub32 (w x y z)
+    (declare (type (unsigned-byte 32) w x y z))
+    (%make-simd-pack-ub64 (logior w (ash x 32))
+                          (logior y (ash z 32))))
+
   (declaim (inline %simd-pack-ub32s %simd-pack-ub64s))
   (defun %simd-pack-ub32s (pack)
     (declare (type simd-pack pack))
@@ -292,14 +290,14 @@
                      (inst movss dst tmp)))))
 
 #-sb-xc-host
+(progn
 (declaim (inline %simd-pack-singles))
-#-sb-xc-host
 (defun %simd-pack-singles (pack)
   (declare (type simd-pack pack))
   (values (%simd-pack-single-item pack 0)
           (%simd-pack-single-item pack 1)
           (%simd-pack-single-item pack 2)
-          (%simd-pack-single-item pack 3)))
+          (%simd-pack-single-item pack 3))))
 
 (defknown %simd-pack-double-item
   (simd-pack (integer 0 1)) double-float (flushable))
@@ -327,9 +325,9 @@
            (inst movsd dst tmp)))))
 
 #-sb-xc-host
+(progn
 (declaim (inline %simd-pack-doubles))
-#-sb-xc-host
 (defun %simd-pack-doubles (pack)
   (declare (type simd-pack pack))
   (values (%simd-pack-double-item pack 0)
-          (%simd-pack-double-item pack 1)))
+          (%simd-pack-double-item pack 1))))

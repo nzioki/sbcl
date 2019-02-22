@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; type frobbing VOPs
 
@@ -66,6 +66,16 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst srl res n-widetag-bits res)))
+
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -75,19 +85,6 @@
   (:generator 6
     (loadw res x 0 other-pointer-lowtag)
     (inst srl res n-widetag-bits res)))
-
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:temporary (:sc non-descriptor-reg) temp)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res n-widetag-bits res)
-    (inst li short-header-max-words temp)
-    (inst and res temp res)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -177,19 +174,17 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst srl ndescr n-widetag-bits ndescr)
-    (inst sll ndescr word-shift ndescr)
+    (loadw ndescr code code-boxed-size-slot other-pointer-lowtag)
     (inst addq ndescr offset ndescr)
     (inst subq ndescr (- other-pointer-lowtag fun-pointer-lowtag) ndescr)
     (inst addq code ndescr func)))
 
 ;;;; other random VOPs.
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst gentrap pending-interrupt-trap)))
 

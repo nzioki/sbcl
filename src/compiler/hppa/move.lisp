@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((null zero immediate)
@@ -137,7 +137,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst li (tn-value x) y))
           (t
            (loadw y code-tn (tn-offset x) other-pointer-lowtag)
@@ -212,7 +212,7 @@
     ;; the bignum-construction, doing the shift in the delay slot.
     (inst comb := temp zero-tn done)
     (inst sll x n-fixnum-tag-bits y)
-    (load-constant vop (emit-constant (1+ sb!xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
                    y)
     DONE))
 
@@ -226,7 +226,7 @@
     ;; the bignum-construction, doing the shift in the delay slot.
     (inst comb := temp zero-tn done)
     (inst sll x n-fixnum-tag-bits y)
-    (load-constant vop (emit-constant (1- sb!xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
                    y)
     DONE))
 

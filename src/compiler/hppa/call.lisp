@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
@@ -750,7 +750,7 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    (load-symbol-value stepping sb!impl::*stepping*)
+                    (load-symbol-value stepping sb-impl::*stepping*)
                     ;; If it's not zero, trap.
                     (inst comb := stepping zero-tn step-done-label :nullify t)
                     ;; CONTEXT-PC will be pointing here when the
@@ -1174,7 +1174,7 @@ default-value-8
 ;;;
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1214,7 +1214,7 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     ;; If it's not zero, trap.
     (inst comb := stepping zero-tn DONE :nullify t)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,

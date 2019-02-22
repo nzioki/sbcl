@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun load-immediate-word (y val)
   (cond ((typep val '(unsigned-byte 16))
@@ -20,6 +20,13 @@
          (inst movn y (ldb (byte 64 0) (lognot val))))
         ((encode-logical-immediate val)
          (inst orr y zr-tn val))
+        ((loop for i below 64 by 16
+               for part = (ldb (byte 16 i) val)
+               for zeroed = (dpb 0 (byte 16 i) val)
+               thereis (cond ((encode-logical-immediate zeroed)
+                              (inst orr y zr-tn zeroed)
+                              (inst movk y part i)
+                              t))))
         ((minusp val)
          (loop with first = t
                for i below 64 by 16
@@ -49,7 +56,7 @@
          (load-immediate-word temp x))))
 
 (define-move-fun (load-immediate 1) (vop x y)
-  ((null immediate)
+  ((immediate)
    (any-reg descriptor-reg))
   (let ((val (tn-value x)))
     (etypecase val
@@ -61,8 +68,6 @@
        (let* ((codepoint (char-code val))
               (encoded-character (dpb codepoint (byte 24 8) character-widetag)))
          (load-immediate-word y encoded-character)))
-      (null
-       (move y null-tn))
       (symbol
        (load-symbol y val)))))
 
@@ -119,7 +124,7 @@
 ;;;; The Move VOP:
 (define-vop (move)
   (:args (x :target y
-            :scs (any-reg descriptor-reg null)
+            :scs (any-reg descriptor-reg)
             :load-if (not (or (location= x y)
                               (and (sc-is x immediate)
                                    (eql (tn-value x) 0))))))
@@ -144,7 +149,7 @@
 ;;; frame for argument or known value passing.
 (define-vop (move-arg)
   (:args (x :target y
-            :scs (any-reg descriptor-reg null))
+            :scs (any-reg descriptor-reg))
          (fp :scs (any-reg)
              :load-if (not (sc-is y any-reg descriptor-reg))))
   (:results (y))
@@ -161,9 +166,9 @@
 
 ;;; Use LDP/STP when possible
 (defun load-store-two-words (vop1 vop2)
-  (let ((register-sb (sb-or-lose 'sb!vm::registers))
+  (let ((register-sb (sb-or-lose 'sb-vm::registers))
         used-load-tn)
-    (declare (notinline sb!c::vop-name)) ; too late
+    (declare (notinline sb-c::vop-name)) ; too late
     (labels ((register-p (tn)
                (and (tn-p tn)
                     (eq (sc-sb (tn-sc tn)) register-sb)))
@@ -171,11 +176,11 @@
                (and (tn-p tn)
                     (sc-is tn control-stack)))
              (source (vop)
-               (tn-ref-tn (sb!c::vop-args  vop)))
+               (tn-ref-tn (sb-c::vop-args  vop)))
              (dest (vop)
-               (tn-ref-tn (sb!c::vop-results vop)))
+               (tn-ref-tn (sb-c::vop-results vop)))
              (load-tn (vop)
-               (tn-ref-load-tn (sb!c::vop-args vop)))
+               (tn-ref-load-tn (sb-c::vop-args vop)))
              (suitable-offsets-p (tn1 tn2)
                (and (= (abs (- (tn-offset tn1)
                                (tn-offset tn2)))
@@ -186,8 +191,6 @@
                                       n-word-bits)))
              (load-arg (x load-tn)
                (sc-case x
-                 (null
-                  (lambda () null-tn))
                  ((constant immediate control-stack)
                   (let ((load-tn (if (and used-load-tn
                                           (location= used-load-tn load-tn))
@@ -275,18 +278,18 @@
                       (inst ldp dest1 dest2
                             (@ fp (* (tn-offset source1) n-word-bytes)))
                       t))))
-      (case (sb!c::vop-name vop1)
+      (case (sb-c::vop-name vop1)
         (move
          (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))
-        (sb!c::move-operand
-         (cond ((and (equal (sb!c::vop-codegen-info vop1)
-                            (sb!c::vop-codegen-info vop2))
-                     (memq (car (sb!c::vop-codegen-info vop1))
+        (sb-c::move-operand
+         (cond ((and (equal (sb-c::vop-codegen-info vop1)
+                            (sb-c::vop-codegen-info vop2))
+                     (memq (car (sb-c::vop-codegen-info vop1))
                            '(load-stack store-stack)))
                 (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))))
         (move-arg
-         (let ((fp1 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop1))))
-               (fp2 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop2))))
+         (let ((fp1 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop1))))
+               (fp2 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop2))))
                (dest1 (dest vop1))
                (dest2 (dest vop2)))
            (when (eq fp1 fp2)
@@ -295,7 +298,7 @@
                         (stack-p dest2))
                    fp1
                    cfp-tn)
-               (tn-ref-load-tn (tn-ref-across (sb!c::vop-args vop1)))))))))))
+               (tn-ref-load-tn (tn-ref-across (sb-c::vop-args vop1)))))))))))
 
 
 ;;;; ILLEGAL-MOVE
@@ -338,7 +341,7 @@
   (:vop-var vop)
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (load-immediate-word y (tn-value x)))
           (t
            (load-constant vop x y)
@@ -406,7 +409,7 @@
   (:generator 4
     (inst adds y x x)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1+ sb!xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
                    y)
     DONE))
 
@@ -414,7 +417,7 @@
   (:generator 4
     (inst adds y x x)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1- sb!xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
                    y)
     DONE))
 

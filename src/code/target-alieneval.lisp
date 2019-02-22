@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (/show0 "target-alieneval.lisp 15")
 
@@ -40,7 +40,7 @@
                      ~:@_  (\"alien_name\" LISP-NAME)~
                      ~:@_  FOO-BAR                - equivalent to (\"foo_bar\" FOO-BAR)~
                      ~:@_  \"foo_bar\"              - equivalent to (\"foo_bar\" FOO-BAR)~:@>")))
-      (etypecase name
+      (typecase name
        (string
         (values (guess-lisp-name-from-alien-name name)
                 (coerce name 'simple-string)))
@@ -66,11 +66,11 @@ is guessed from the one supplied."
         `(eval-when (:compile-toplevel :load-toplevel :execute)
            ,@(when *new-auxiliary-types*
                `((%def-auxiliary-alien-types ',*new-auxiliary-types*
-                                             (sb!c:source-location))))
+                                             (sb-c:source-location))))
            (%define-alien-variable ',lisp-name
                                    ',alien-name
                                    ',alien-type
-                                   (sb!c:source-location)))))))
+                                   (sb-c:source-location)))))))
 
 ;;; Do the actual work of DEFINE-ALIEN-VARIABLE.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -155,8 +155,8 @@ This is SETFable."
                                  (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
                            ,@body)))
                       (:local
-                       (let* ((var (sb!xc:gensym "VAR"))
-                              (initval (if initial-value (sb!xc:gensym "INITVAL")))
+                       (let* ((var (sb-xc:gensym "VAR"))
+                              (initval (if initial-value (sb-xc:gensym "INITVAL")))
                               (info (make-local-alien-info :type alien-type))
                               (inner-body
                                 `((note-local-alien-type ',info ,var)
@@ -183,7 +183,7 @@ This is SETFable."
               ;; expanding into non-standard special forms.
               ;; And the LET has to look exactly like this, not LET*
               ;; and no other bindings.
-              `((let ((sb!c:*alien-stack-pointer* sb!c:*alien-stack-pointer*))
+              `((let ((sb-c:*alien-stack-pointer* sb-c:*alien-stack-pointer*))
                   ,@body)))
              (t
               body))))))
@@ -193,12 +193,12 @@ This is SETFable."
 (defmethod print-object ((value alien-value) stream)
   ;; Don't use ":TYPE T" here - TYPE-OF isn't what we want.
   (print-unreadable-object (value stream)
-    (format stream "~S ~S #X~8,'0X ~S ~/sb!impl:print-type-specifier/"
+    (format stream "~S ~S #X~8,'0X ~S ~/sb-impl:print-type-specifier/"
             'alien-value
             :sap (sap-int (alien-value-sap value))
             :type (unparse-alien-type (alien-value-type value)))))
 
-#!-sb-fluid (declaim (inline null-alien))
+#-sb-fluid (declaim (inline null-alien))
 (defun null-alien (x)
   "Return true if X (which must be an ALIEN pointer) is null, false otherwise."
   (zerop (sap-int (alien-sap x))))
@@ -289,39 +289,38 @@ Examples:
                                        (the index ,size-expr)))
                        ',(make-alien-pointer-type :to alien-type)))))))
 
-(defun malloc-error (bytes errno)
+(defun malloc-error (bytes)
   (error 'simple-storage-condition
          :format-control "~A: malloc() of ~S bytes failed."
-         :format-arguments (list (strerror errno) bytes)))
+         :format-arguments (list (strerror (get-errno)) bytes)))
 
 ;;; Allocate a block of memory at least BYTES bytes long and return a
 ;;; system area pointer to it.
-#!-sb-fluid (declaim (inline %make-alien))
+#-sb-fluid (declaim (inline %make-alien))
 (defun %make-alien (bytes)
   (declare (type index bytes)
-           (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
+           (optimize (sb-c:alien-funcall-saves-fp-and-pc 0)))
   (let ((sap (alien-funcall (extern-alien "malloc"
                                           (function system-area-pointer size-t))
                             bytes)))
-    (if (and (not (eql 0 bytes)) (eql 0 (sap-int sap)))
-        (malloc-error bytes (get-errno))
+    (if (and (eql 0 (sap-int sap)) (not (eql 0 bytes)))
+        (malloc-error bytes)
         sap)))
 
-#!+c-stack-is-control-stack
+#+c-stack-is-control-stack
 (declaim (inline invoke-with-saved-fp))
 ;;; On :c-stack-is-control-stack platforms, this DEFUN must appear prior to the
 ;;; first cross-compile-time use of ALIEN-FUNCALL, the transform of which is
 ;;; an invocation of INVOKE-WITH-SAVED-FP, which should be inlined.
-;;; Makes no sense when compiling for the host.
-#!+(and c-stack-is-control-stack (host-feature sb-xc))
+#+c-stack-is-control-stack
 (defun invoke-with-saved-fp (fn)
   (declare #-sb-xc-host (muffle-conditions compiler-note)
            (optimize (speed 3)))
   ;; No need to link to the previous value, it can be fetched from the binding stack.
-  (let ((*saved-fp* (sb!c::current-fp-fixnum)))
+  (let ((*saved-fp* (sb-c::current-fp-fixnum)))
     (funcall fn)))
 
-#!-sb-fluid (declaim (inline free-alien))
+#-sb-fluid (declaim (inline free-alien))
 (defun free-alien (alien)
   "Dispose of the storage pointed to by ALIEN. The ALIEN must have been
 allocated by MAKE-ALIEN, MAKE-ALIEN-STRING or malloc(3)."
@@ -343,7 +342,7 @@ allocated by MAKE-ALIEN, MAKE-ALIEN-STRING or malloc(3)."
                                    :null-terminate null-terminate))
          (count (length octets))
          (buf (%make-alien count)))
-    (sb!kernel:copy-ub8-to-system-area octets 0 buf 0 count)
+    (sb-kernel:copy-ub8-to-system-area octets 0 buf 0 count)
     (values buf count)))
 
 (defun make-alien-string (string &rest rest
@@ -424,7 +423,7 @@ null byte."
        (let* ((field (slot-or-lose type slot))
               (offset (alien-record-field-offset field))
               (field-type (alien-record-field-type field)))
-         (%sap-alien (sap+ (alien-sap alien) (/ offset sb!vm:n-byte-bits))
+         (%sap-alien (sap+ (alien-sap alien) (/ offset sb-vm:n-byte-bits))
                      (make-alien-pointer-type :to field-type)))))))
 
 ;;;; the DEREF operator
@@ -494,7 +493,7 @@ null byte."
   (declare (type alien-value alien)
            (type list indices))
   (multiple-value-bind (target-type offset) (deref-guts alien indices)
-    (%sap-alien (sap+ (alien-value-sap alien) (/ offset sb!vm:n-byte-bits))
+    (%sap-alien (sap+ (alien-value-sap alien) (/ offset sb-vm:n-byte-bits))
                 (make-alien-pointer-type :to target-type))))
 
 ;;;; accessing heap alien variables
@@ -605,8 +604,8 @@ null byte."
         (values (ceiling bits
                          (ecase units
                            (:bits 1)
-                           (:bytes sb!vm:n-byte-bits)
-                           (:words sb!vm:n-word-bits))))
+                           (:bytes sb-vm:n-byte-bits)
+                           (:words sb-vm:n-word-bits))))
         (error "unknown size for alien type ~S"
                (unparse-alien-type alien-type)))))
 
@@ -627,7 +626,7 @@ null byte."
 (defun-cached (coerce-to-interpreted-function
                :hash-bits 8 :hash-function #'globaldb-sxhashoid)
     ((lambda-form equal))
-  (let (#!+(or sb-eval sb-fasteval)
+  (let (#+(or sb-eval sb-fasteval)
         (*evaluator-mode* :interpret))
     (coerce lambda-form 'function)))
 
@@ -680,11 +679,11 @@ type specifies the argument and result types."
        (let ((stub (alien-fun-type-stub type)))
          (unless stub
            (setf stub
-                 (let ((fun (sb!xc:gensym "FUN"))
+                 (let ((fun (sb-xc:gensym "FUN"))
                        (parms (make-gensym-list (length args))))
                    (compile nil
                             `(lambda (,fun ,@parms)
-                               (declare (optimize (sb!c::insert-step-conditions 0)))
+                               (declare (optimize (sb-c::insert-step-conditions 0)))
                                (declare (type (alien ,type) ,fun))
                                (alien-funcall ,fun ,@parms)))))
            (setf (alien-fun-type-stub type) stub))

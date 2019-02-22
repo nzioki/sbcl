@@ -7,11 +7,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant sb!assem:assem-scheduler-p t)
-(defconstant sb!assem:+inst-alignment-bytes+ 4)
-(defconstant sb!assem:+assem-max-locations+ 68)
+(defconstant sb-assem:assem-scheduler-p t)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
+(defconstant sb-assem:+assem-max-locations+ 68)
 
 (defconstant +backend-fasl-file-implementation+ :mips)
 
@@ -74,7 +74,7 @@
 
 ;;;; Description of the target address space.
 
-#!+irix
+#+irix
 (progn
   ;; Where to put the different spaces.
   ;; Old definitions, might be still relevant for an IRIX port.
@@ -88,7 +88,7 @@
   (defparameter dynamic-0-space-start #x08000000)
   (defparameter dynamic-0-space-end   #x0c000000))
 
-#!+linux
+#+linux
 (progn
   ;; Where to put the address spaces on Linux.
   ;;

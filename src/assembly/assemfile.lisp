@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; If non-NIL, emit assembly code. If NIL, emit VOP templates.
 (defvar *emit-assembly-code-not-vops-p* nil)
@@ -35,34 +35,32 @@
          (*asmstream* asmstream)
          (*adjustable-vectors* nil))
     (unwind-protect
-        (let ((*features* (cons :sb-assembling *features*)))
+        (let ((sb-xc:*features* (cons :sb-assembling sb-xc:*features*))
+              (*readtable* sb-cold:*xc-readtable*))
           (load (merge-pathnames name (make-pathname :type "lisp")))
           ;; Leave room for the indirect call table. relocate_heap() in
           ;; 'coreparse' finds the end with a 0 word so add 1 extra word.
-          #!+(or x86 x86-64)
+          #+(or x86 x86-64)
           (emit (asmstream-data-section asmstream)
                 `(.skip ,(* (align-up (1+ (length *entry-points*)) 2)
-                            sb!vm:n-word-bytes)))
+                            sb-vm:n-word-bytes)))
           (when (emit-inline-constants)
             ;; Ensure alignment to double-Lispword in case a raw constant
             ;; causes misalignment, as actually happens on ARM64.
             ;; You might think one Lispword is aligned enough, but it isn't,
             ;; because to created a tagged pointer to an asm routine,
             ;; the base address must have all 0s in the tag bits.
-            ;; Note that for ordinary code components, alignment is ensured
-            ;; by SIMPLE-FUN-HEADER-WORD.
+            ;; Note that for code components that contain simple-funs,
+            ;; alignment is ensured by SIMPLE-FUN-HEADER-WORD.
             (emit (asmstream-data-section asmstream)
-                  `(.align ,sb!vm:n-lowtag-bits)))
-          (let ((segment
-                 (assemble-sections
-                  (make-segment :inst-hook (default-segment-inst-hook)
-                                :run-scheduler nil)
-                  (asmstream-data-section asmstream)
-                  (asmstream-code-section asmstream)
-                  (asmstream-elsewhere-section asmstream))))
+                  `(.align ,sb-vm:n-lowtag-bits)))
+          (let ((segment (assemble-sections
+                          asmstream nil
+                          (make-segment :inst-hook (default-segment-inst-hook)
+                                        :run-scheduler nil))))
             (dump-assembler-routines segment
                                      (segment-buffer segment)
-                                     (sb!assem::segment-fixup-notes segment)
+                                     (sb-assem::segment-fixup-notes segment)
                                      *entry-points*
                                      lap-fasl-output))
           (setq won t))
@@ -145,13 +143,13 @@
          ;; ARM. See the comment in arm/assem-rtns that says it expects THROW to
          ;; drop through into UNWIND. That wouldn't work if the code emitted
          ;; by GENERATE-ERROR-CODE were interposed between those.
-         #!-arm
+         #-arm
          (let ((asmstream *asmstream*))
            (join-sections (asmstream-code-section asmstream)
                           (asmstream-elsewhere-section asmstream)))
-         (emit-alignment sb!vm:n-lowtag-bits
+         (emit-alignment sb-vm:n-lowtag-bits
                          ;; EMIT-LONG-NOP does not exist for (not x86-64)
-                         #!+x86-64 :long-nop))
+                         #+x86-64 :long-nop))
        (when *compile-print*
          (format *error-output* "~S assembled~%" ',name)))))
 
@@ -217,15 +215,15 @@
                       :key #'car)
          (:generator ,cost
            ,@(mapcar (lambda (arg)
-                       #!+(or hppa alpha) `(move ,(reg-spec-name arg)
+                       #+(or hppa alpha) `(move ,(reg-spec-name arg)
                                                  ,(reg-spec-temp arg))
-                       #!-(or hppa alpha) `(move ,(reg-spec-temp arg)
+                       #-(or hppa alpha) `(move ,(reg-spec-temp arg)
                                                  ,(reg-spec-name arg)))
                      args)
            ,@call-sequence
            ,@(mapcar (lambda (res)
-                       #!+(or hppa alpha) `(move ,(reg-spec-temp res)
+                       #+(or hppa alpha) `(move ,(reg-spec-temp res)
                                                  ,(reg-spec-name res))
-                       #!-(or hppa alpha) `(move ,(reg-spec-name res)
+                       #-(or hppa alpha) `(move ,(reg-spec-name res)
                                                  ,(reg-spec-temp res)))
                      results))))))

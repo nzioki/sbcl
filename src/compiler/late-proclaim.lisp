@@ -12,12 +12,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (!begin-collecting-cold-init-forms)
 
 (!cold-init-forms (aver *type-system-initialized*))
-(!cold-init-forms (mapcar #'sb!xc:proclaim *queued-proclaims*))
+(!cold-init-forms (mapcar #'sb-xc:proclaim *queued-proclaims*))
 ;;; We only need this once, then it's set up for good.  We keep it
 ;;; around in the cross-compiler mostly so that we can inspect its
 ;;; value.

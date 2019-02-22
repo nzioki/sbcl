@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; the branch VOP
 
@@ -79,7 +79,7 @@
             ;; FIXME: Can't use CMOV with byte registers, and characters live
             ;; in such outside of unicode builds. A better solution then just
             ;; disabling MOVE-IF/CHAR should be possible, though.
-            #!+sb-unicode
+            #+sb-unicode
             (character character-reg move-if/char)
 
             ((single-float complex-single-float
@@ -95,8 +95,8 @@
 
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
-  (let* ((ptype (sb!c::tn-primitive-type dst-tn))
-         (name  (sb!c::primitive-type-name ptype))
+  (let* ((ptype (sb-c::tn-primitive-type dst-tn))
+         (name  (sb-c::primitive-type-name ptype))
          (param (cdr (or (assoc name *cmov-ptype-representation-vop*)
                          '(t descriptor-reg move-if/t)))))
     (when param
@@ -187,7 +187,7 @@
   (def-move-if move-if/unsigned unsigned-num unsigned-reg unsigned-stack)
   (def-move-if move-if/signed signed-num signed-reg signed-stack)
   ;; FIXME: See *CMOV-PTYPE-REPRESENTATION-VOP* above.
-  #!+sb-unicode
+  #+sb-unicode
   (def-move-if move-if/char character character-reg character-stack)
   (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
 
@@ -245,7 +245,11 @@
 
 (define-vop (%instance-ref-eq)
   (:args (instance :scs (descriptor-reg))
-         (x :scs (descriptor-reg immediate)))
+         (x :scs (descriptor-reg any-reg)
+            :load-if (or (not (sc-is x immediate))
+                         (typep (tn-value x)
+                                '(and integer
+                                  (not (signed-byte #.(- 32 n-fixnum-tag-bits))))))))
   (:arg-types * (:constant (unsigned-byte 16)) *)
   (:info slot)
   (:translate %instance-ref-eq)

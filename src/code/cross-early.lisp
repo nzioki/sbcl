@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; The STRUCTURE!OBJECT abstract class is the base of the hierarchy
 ;;; of objects that need to be identifiable as SBCL system objects
@@ -26,10 +26,17 @@
 ;;; may then have to wade through some irrelevant warnings).
 (declaim (declaration inhibit-warnings))
 
-;;; SB!C::LAMBDA-LIST declarations can be ignored.
+;;; SB-C::LAMBDA-LIST declarations can be ignored.
 ;;; Cross-compilation does not rely on introspection for anything.
-(declaim (declaration sb!c::lambda-list))
+(declaim (declaration sb-c::lambda-list))
 
 (declaim (declaration explicit-check always-bound))
 
-(defgeneric sb!xc:make-load-form (obj &optional env))
+(defgeneric sb-xc:make-load-form (obj &optional env))
+
+;;; There's no real reason that the cross-compiler shouldn't get the
+;;; same macro as the target for this, except that the host doesn't
+;;; compile 'cl-specials', and it's kind of unlikely that we'd have
+;;; our own sources not fail in make-host-1 using illegal designators.
+;;; As to make-host-2, well, it's not a user-facing problem.
+(defmacro check-designator (&rest junk) (declare (ignore junk)))

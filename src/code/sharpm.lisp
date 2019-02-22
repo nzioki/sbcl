@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (declaim (special *read-suppress*))
 
@@ -70,7 +70,7 @@
                                  1 0)))
                 (i 0 (1+ i)))
                ((= i input-len) bvec)
-             (declare (index i) (optimize (sb!c::insert-array-bounds-checks 0)))
+             (declare (index i) (optimize (sb-c::insert-array-bounds-checks 0)))
              (let ((char (char bstring i)))
                (setf (elt bvec i)
                      (case char
@@ -294,8 +294,8 @@
                     (unless (eq old new)
                       (setf (%instance-ref tree i) new)))))
                ((typep tree 'funcallable-instance)
-                (do ((i sb!vm:instance-data-start (1+ i))
-                     (end (- (1+ (get-closure-length tree)) sb!vm:funcallable-instance-info-offset)))
+                (do ((i sb-vm:instance-data-start (1+ i))
+                     (end (- (1+ (get-closure-length tree)) sb-vm:funcallable-instance-info-offset)))
                     ((= i end))
                   (let* ((old (%funcallable-instance-info tree i))
                          (new (circle-subst circle-table old)))
@@ -414,7 +414,7 @@
         #'(lambda (decoding-error)
             (declare (ignorable decoding-error))
             (style-warn
-             'sb!kernel::character-decoding-error-in-dispatch-macro-char-comment
+             'sb-kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
     (let ((stream (in-stream-from-designator stream)))

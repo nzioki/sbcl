@@ -9,29 +9,29 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Return the number of bytes needed for the current non-descriptor
 ;;; stack frame.  Non-descriptor stack frames must be multiples of 16
 ;;; bytes under the PPC SVr4 ABI (though the EABI may be less
 ;;; restrictive).  On linux, two words are reserved for the stack
-;;; backlink and saved LR (see SB!VM::NUMBER-STACK-DISPLACEMENT).
+;;; backlink and saved LR (see SB-VM::NUMBER-STACK-DISPLACEMENT).
 
 (defconstant +stack-alignment-bytes+
   ;; Duh.  PPC Linux (and VxWorks) adhere to the EABI.
-  #!-darwin 7
+  #-darwin 7
   ;; But Darwin doesn't
-  #!+darwin 15)
+  #+darwin 15)
 
 (defstruct arg-state
   (gpr-args 0)
   (fpr-args 0)
   ;; SVR4 [a]abi wants two words on stack (callee saved lr,
   ;; backpointer).
-  #!-darwin (stack-frame-size 2)
+  #-darwin (stack-frame-size 2)
   ;; PowerOpen ABI wants 8 words on the stack corresponding to GPR3-10
   ;; in addition to the 6 words of link area (see number-stack-displacement)
-  #!+darwin (stack-frame-size (+ 8 6)))
+  #+darwin (stack-frame-size (+ 8 6)))
 
 (defun int-arg (state prim-type reg-sc stack-sc)
   (let ((reg-args (arg-state-gpr-args state)))
@@ -62,7 +62,7 @@
 ;;;   Excess floats stored on the stack are stored as floats.
 ;;;
 ;;; We follow gcc.
-#!-darwin
+#-darwin
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
   (let* ((fprs (arg-state-fpr-args state)))
@@ -78,7 +78,7 @@
 ;;; If a single-float arg has to go on the stack, it's promoted to
 ;;; double.  That way, C programs can get subtle rounding errors when
 ;;; unrelated arguments are introduced.
-#!+darwin
+#+darwin
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
   (let* ((fprs (arg-state-fpr-args state))
@@ -99,7 +99,7 @@
              (incf (arg-state-stack-frame-size state))
              (make-wired-tn* 'single-float single-stack-sc-number stack-offset))))))
 
-#!-darwin
+#-darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
   (let* ((fprs (arg-state-fpr-args state)))
@@ -114,7 +114,7 @@
              (setf (arg-state-stack-frame-size state) (+ stack-offset 2))
              (make-wired-tn* 'double-float double-stack-sc-number stack-offset))))))
 
-#!+darwin
+#+darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
   (let ((fprs (arg-state-fpr-args state))
@@ -153,7 +153,7 @@
     (0 nl0-offset)
     (1 nl1-offset)))
 
-;;; FIXME: These #!-DARWIN methods should be adjusted to take a state
+;;; FIXME: These #-DARWIN methods should be adjusted to take a state
 ;;; argument, firstly because that's our "official" API (see
 ;;; src/code/host-alieneval) and secondly because that way we can
 ;;; probably have less duplication of code.  -- CSR, 2003-07-29
@@ -208,10 +208,10 @@
 ;;; Sort out long longs, by splitting them up.  However, need to take
 ;;; care about register/stack alignment and whether they will fully
 ;;; fit into registers or must go on the stack.
-#!-darwin
+#-darwin
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type))
          (gprs 0)
@@ -222,16 +222,16 @@
     ;; and results.
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
           (dolist (type arg-types)
             (let ((arg (gensym)))
               (lambda-vars arg)
               (cond ((and (alien-integer-type-p type)
-                          (> (sb!alien::alien-integer-type-bits type) 32))
+                          (> (sb-alien::alien-integer-type-bits type) 32))
                      (when (or
                             (oddp gprs)
                             (and
@@ -277,9 +277,9 @@
                      (new-args arg)
                      (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -302,12 +302,12 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
-#!+darwin
+#+darwin
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
     (aver (= (length arg-types) (length args)))
@@ -315,16 +315,16 @@
     ;; and results.
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
                  (dolist (type arg-types)
                    (let ((arg (gensym)))
                      (lambda-vars arg)
                      (cond ((and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type) 32))
+                                 (> (sb-alien::alien-integer-type-bits type) 32))
                             ;; 64-bit long long types are stored in
                             ;; consecutive locations, most significant word
                             ;; first (big-endian).
@@ -338,9 +338,9 @@
                             (new-args arg)
                             (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -363,7 +363,7 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
@@ -376,7 +376,7 @@
   (:generator 2
     (inst lr res  (make-fixup foreign-symbol :foreign))))
 
-#!+linkage-table
+#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -454,11 +454,11 @@
 (progn
   (defun alien-callback-accessor-form (type sap offset)
     (let ((parsed-type (parse-alien-type type nil)))
-      (cond ((sb!alien::alien-integer-type-p parsed-type)
+      (cond ((sb-alien::alien-integer-type-p parsed-type)
              ;; Unaligned access is slower, but possible, so this is nice and
              ;; simple. Also, we're a big-endian machine, so we need to get
              ;; byte offsets correct.
-             (let ((bits (sb!alien::alien-type-bits parsed-type)))
+             (let ((bits (sb-alien::alien-type-bits parsed-type)))
                (let ((byte-offset
                       (cond ((< bits n-word-bits)
                              (- n-word-bytes
@@ -473,17 +473,17 @@
   ;;; The "Mach-O Runtime Conventions" document for OS X almost
   ;;; specifies the calling convention (it neglects to mention that
   ;;; the linkage area is 24 bytes).
-  #!+darwin
+  #+darwin
   (defconstant n-foreign-linkage-area-bytes 24)
 
   ;;; On linux only use 8 bytes for LR and Back chain.  JRXR
   ;;; 2006/11/10.
-  #!-darwin
+  #-darwin
   (defconstant n-foreign-linkage-area-bytes 8)
 
   ;;; Returns a vector in static space containing machine code for the
   ;;; callback wrapper.  Linux version.  JRXR.  2006/11/13
-  #!-darwin
+  #-darwin
   (defun alien-callback-assembler-wrapper (index result-type argument-types)
     (flet ((make-gpr (n)
              (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
@@ -652,8 +652,8 @@
               (load-address-into
                r0
                (foreign-symbol-address
-                #!-sb-thread "funcall3"
-                #!+sb-thread "callback_wrapper_trampoline"))
+                #-sb-thread "funcall3"
+                #+sb-thread "callback_wrapper_trampoline"))
               (inst mtlr r0)
               (inst blrl)
 
@@ -663,13 +663,13 @@
               (inst lwz r0 stack-pointer (* 2 n-word-bytes))
               (inst mtlr r0)
               (cond
-                ((sb!alien::alien-single-float-type-p result-type)
+                ((sb-alien::alien-single-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfs f1 stack-pointer (- return-area-pos))))
-                ((sb!alien::alien-double-float-type-p result-type)
+                ((sb-alien::alien-double-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfd f1 stack-pointer (- return-area-pos))))
-                ((sb!alien::alien-void-type-p result-type)
+                ((sb-alien::alien-void-type-p result-type)
                  ;; Nothing to do
                  )
                 (t
@@ -687,7 +687,7 @@
 
         ;; Now that the segment is done, convert it to a static
         ;; vector we can point foreign code to.
-        (let* ((buffer (sb!assem::segment-buffer segment))
+        (let* ((buffer (sb-assem::segment-buffer segment))
                (vector (make-static-vector (length buffer)
                                            :element-type '(unsigned-byte 8)
                                            :initial-contents buffer))
@@ -702,7 +702,7 @@
 
   ;;; Returns a vector in static space containing machine code for the
   ;;; callback wrapper
-  #!+darwin
+  #+darwin
   (defun alien-callback-assembler-wrapper (index result-type argument-types)
     (flet ((make-gpr (n)
              (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
@@ -806,13 +806,13 @@
               (inst lwz r0 sp (* 2 n-word-bytes))
               (inst mtlr r0)
               (cond
-                ((sb!alien::alien-single-float-type-p result-type)
+                ((sb-alien::alien-single-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfs f1 sp (- (* n-return-area-words n-word-bytes)))))
-                ((sb!alien::alien-double-float-type-p result-type)
+                ((sb-alien::alien-double-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfd f1 sp (- (* n-return-area-words n-word-bytes)))))
-                ((sb!alien::alien-void-type-p result-type)
+                ((sb-alien::alien-void-type-p result-type)
                  ;; Nothing to do
                  )
                 (t
@@ -829,7 +829,7 @@
         (finalize-segment segment)
         ;; Now that the segment is done, convert it to a static
         ;; vector we can point foreign code to.
-        (let* ((buffer (sb!assem::segment-buffer segment))
+        (let* ((buffer (sb-assem::segment-buffer segment))
                (vector (make-static-vector (length buffer)
                                            :element-type '(unsigned-byte 8)
                                            :initial-contents buffer))

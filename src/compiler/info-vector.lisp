@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; This file implements abstract types which map globaldb Info-Number/Name
 ;;;; pairs to data values. The database itself is defined in 'globaldb'.
@@ -95,10 +95,10 @@
 ;; or 10 in a fixnum on 64-bit machines (regardless of n-fixnum-tag-bits).
 ;; The eval-when seems to be necessary for building with CCL as host.
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +infos-per-word+ (floor sb!vm:n-fixnum-bits info-number-bits)))
+  (defconstant +infos-per-word+ (floor sb-vm:n-fixnum-bits info-number-bits)))
 
 ;; Descriptors are target fixnums
-(deftype info-descriptor () `(signed-byte ,sb!vm:n-fixnum-bits))
+(deftype info-descriptor () `(signed-byte ,sb-vm:n-fixnum-bits))
 
 ;; An empty info-vector. Its 0th field describes that there are no more fields.
 (defconstant-eqx +nil-packed-infos+ #(0) #'equalp)
@@ -148,9 +148,9 @@
 ;; conditionalized out for platforms other than x86[-64].
 ;; It looks like it ought to work whether or not there are vops.
 (defmacro make-info-descriptor (val shift)
-  (if (> sb!vm:n-fixnum-bits 30)
+  (if (> sb-vm:n-fixnum-bits 30)
       `(ash ,val ,shift)
-      `(logior (if (logbitp (- 29 ,shift) ,val) sb!xc:most-negative-fixnum 0)
+      `(logior (if (logbitp (- 29 ,shift) ,val) sb-xc:most-negative-fixnum 0)
                (ash ,val ,shift))))
 
 ;; Convert unpacked vector to packed vector.
@@ -578,9 +578,9 @@
              ;; legitimates (BOUNDP <f>) via DEFINE-FUNCTION-NAME-SYNTAX.
              ;; Especially important since BOUNDP is an external of CL.
              (setq kind (case (car last)
-                          (sb!pcl::reader !+pcl-reader-name+)
-                          (sb!pcl::writer !+pcl-writer-name+)
-                          (sb!pcl::boundp !+pcl-boundp-name+))))
+                          (sb-pcl::reader !+pcl-reader-name+)
+                          (sb-pcl::writer !+pcl-writer-name+)
+                          (sb-pcl::boundp !+pcl-boundp-name+))))
         ;; The first return value is what matters to WITH-GLOBALDB-NAME
         ;; for deciding whether the name is "simple".
         ;; Return the KIND first, just in case somehow we end up with
@@ -594,9 +594,9 @@
 ;; This operation is not invoked in normal use of globaldb.
 ;; It is only for mapping over all names.
 (defun construct-globaldb-name (aux-symbol stem)
-  (cond ((eq aux-symbol !+pcl-reader-name+) (sb!pcl::slot-reader-name stem))
-        ((eq aux-symbol !+pcl-writer-name+) (sb!pcl::slot-writer-name stem))
-        ((eq aux-symbol !+pcl-boundp-name+) (sb!pcl::slot-boundp-name stem))
+  (cond ((eq aux-symbol !+pcl-reader-name+) (sb-pcl::slot-reader-name stem))
+        ((eq aux-symbol !+pcl-writer-name+) (sb-pcl::slot-writer-name stem))
+        ((eq aux-symbol !+pcl-boundp-name+) (sb-pcl::slot-boundp-name stem))
         (t (list aux-symbol stem)))) ; something like (SETF frob)
 
 ;; Call FUNCTION with each piece of info in packed VECT using ROOT-SYMBOL
@@ -689,7 +689,7 @@ This is interpreted as
                        (cond ((not (cdr ,rest))
                               (setq ,key2 (car ,key1) ,key1 (car ,rest))
                               (and (symbolp ,key1) (symbolp ,key2) ,rest))
-                             ((eq (car ,key1) 'sb!pcl::slot-accessor)
+                             ((eq (car ,key1) 'sb-pcl::slot-accessor)
                               (multiple-value-setq (,key2 ,key1)
                                 (pcl-global-accessor-name-p ,key1))))))))
            ,simple
@@ -783,7 +783,7 @@ This is interpreted as
   ;; there is mostly no such thing as purely compile-time info for methods.
   #+nil ; So I can easily re-enable this to figure out what's going on.
   (when (and (consp name)
-             (memq (car name) '(sb!pcl::slow-method sb!pcl::fast-method))
+             (memq (car name) '(sb-pcl::slow-method sb-pcl::fast-method))
              (some #'consp (car (last name))))
     (let ((i (aref *info-types* info-number)))
       (warn "Globaldb storing info for ~S~% ~S ~S~% -> ~S"

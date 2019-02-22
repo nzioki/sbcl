@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We make a pass over the component's environments, assigning argument
 ;;; passing locations and return conventions and TNs for local variables.
@@ -63,7 +63,7 @@
            ;; live over the dynamic contour of the physenv.
            (setf (tn-sc res) (if ptype-info
                                  (second ptype-info)
-                                 (sc-or-lose 'sb!vm::control-stack)))
+                                 (sc-or-lose 'sb-vm::control-stack)))
            (physenv-live-tn res (lambda-physenv fun)))
 
           (debug-variable-p

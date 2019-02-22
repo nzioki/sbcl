@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ARM64-ASM")
+(in-package "SB-ARM64-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
@@ -19,13 +19,13 @@
             negative-add-sub-immediate-p
             encode-logical-immediate fixnum-encode-logical-immediate
             ldr-str-offset-encodable ldp-stp-offset-p
-            bic-mask extend lsl lsr asr ror @) "SB!VM")
+            bic-mask extend lsl lsr asr ror @) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::*register-names*
-            sb!vm::add-sub-immediate
-            sb!vm::32-bit-reg sb!vm::single-reg sb!vm::double-reg
-            sb!vm::complex-single-reg sb!vm::complex-double-reg
-            sb!vm::tmp-tn sb!vm::zr-tn sb!vm::nsp-offset)))
+  (import '(sb-vm::*register-names*
+            sb-vm::add-sub-immediate
+            sb-vm::32-bit-reg sb-vm::single-reg sb-vm::double-reg
+            sb-vm::complex-single-reg sb-vm::complex-double-reg
+            sb-vm::tmp-tn sb-vm::zr-tn sb-vm::nsp-offset)))
 
 
 
@@ -47,7 +47,7 @@
     (:al . 14))
   #'equal)
 
-(defconstant-eqx sb!vm::+condition-name-vec+
+(defconstant-eqx sb-vm::+condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
@@ -58,7 +58,7 @@
   (cdr (assoc condition +conditions+ :test #'eq)))
 
 (defun invert-condition (condition)
-  (aref sb!vm::+condition-name-vec+
+  (aref sb-vm::+condition-name-vec+
         (logxor 1 (conditional-opcode condition))))
 
 ;;;; disassembler field definitions
@@ -129,11 +129,11 @@
 
 (defun register-p (thing)
   (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'sb!vm::registers)))
+       (eq (sb-name (sc-sb (tn-sc thing))) 'sb-vm::registers)))
 
 (defun fp-register-p (thing)
   (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'sb!vm::float-registers)))
+       (eq (sb-name (sc-sb (tn-sc thing))) 'sb-vm::float-registers)))
 
 (defun reg-size (tn)
   (if (sc-is tn 32-bit-reg)
@@ -369,7 +369,7 @@
                                    (car pieces)))
                   forms)))
         `(defun ,(symbolicate "EMIT-" name) (segment ,@(arg-names))
-           (declare (type sb!assem:segment segment) ,@(arg-types))
+           (declare (type sb-assem:segment segment) ,@(arg-types))
            ,@(ecase *backend-byte-order*
                (:little-endian (nreverse forms))
                (:big-endian forms))
@@ -962,21 +962,14 @@
   (imm :field (byte 16 5) :type 'unsigned-immediate)
   (rd :field (byte 5 0) :type 'reg))
 
-(defmacro process-null-sc (reg)
-  `(setf ,reg (if (and (tn-p ,reg)
-                       (eq 'null (sc-name (tn-sc ,reg))))
-                  sb!vm::null-tn
-                  ,reg)))
-
 (define-instruction-macro mov-sp (rd rm)
   `(inst add ,rd ,rm 0))
 
 (define-instruction-macro mov (rd rm)
   `(let ((rd ,rd)
          (rm ,rm))
-     (process-null-sc rm)
      (if (integerp rm)
-         (sb!vm::load-immediate-word rd rm)
+         (sb-vm::load-immediate-word rd rm)
          (inst orr rd zr-tn rm))))
 
 (define-instruction movn (segment rd imm &optional (shift 0))
@@ -1303,7 +1296,6 @@
              (typep qout '(unsigned-byte 12))))))
 
 (defun emit-load-store (size opc segment dst address)
-  (process-null-sc dst)
   (let* ((base (memory-operand-base address))
          (offset (memory-operand-offset address))
          (mode (memory-operand-mode address))
@@ -1658,9 +1650,9 @@
   (:emitter
    (emit-uncond-branch-reg segment 1 (tn-offset register))))
 
-(define-instruction ret (segment &optional (register sb!vm::lr-tn))
+(define-instruction ret (segment &optional (register sb-vm::lr-tn))
   (:printer uncond-branch-reg ((op #b10)))
-  (:printer uncond-branch-reg ((op #b10) (rn sb!vm::lr-offset))
+  (:printer uncond-branch-reg ((op #b10) (rn sb-vm::lr-offset))
             '(:name))
   (:emitter
    (emit-uncond-branch-reg segment #b10 (tn-offset register))))
@@ -2506,7 +2498,7 @@
          (aver (integerp value))
          (cons type value))
         (:base-char
-         #!+sb-unicode (aver (typep value 'base-char))
+         #+sb-unicode (aver (typep value 'base-char))
          (cons :byte (char-code value)))
         (:character
          (aver (characterp value))
@@ -2518,8 +2510,7 @@
         (:double-float
          (aver (typep value 'double-float))
          (cons (if alignedp :oword :qword)
-               (ldb (byte 64 0) (logior (ash (double-float-high-bits value) 32)
-                                        (double-float-low-bits value)))))
+               (ldb (byte 64 0) (double-float-bits value))))
         (:complex-single-float
          (aver (typep value '(complex single-float)))
          (cons (if alignedp :oword :qword)
@@ -2530,12 +2521,8 @@
         (:complex-double-float
          (aver (typep value '(complex double-float)))
          (cons :oword
-               (logior (ash (double-float-high-bits (imagpart value)) 96)
-                       (ash (double-float-low-bits (imagpart value)) 64)
-                       (ash (ldb (byte 32 0)
-                                 (double-float-high-bits (realpart value)))
-                            32)
-                       (double-float-low-bits (realpart value)))))
+               (logior (ash (ldb (byte 64 0) (double-float-bits (imagpart value))) 64)
+                       (ldb (byte 64 0) (double-float-bits (realpart value))))))
         (:fixup
          (cons :fixup value))))))
 

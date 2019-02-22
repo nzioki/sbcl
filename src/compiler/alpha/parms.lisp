@@ -7,10 +7,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant sb!assem:assem-scheduler-p nil)
-(defconstant sb!assem:+inst-alignment-bytes+ 4)
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
 
 (defconstant +backend-fasl-file-implementation+ :alpha)
 
@@ -111,7 +111,7 @@
 ;;; Where to put the different spaces.
 ;;;
 
-#!+linux
+#+linux
 (progn
   (defconstant read-only-space-start #x20000000)
   (defconstant read-only-space-end   #x24000000))

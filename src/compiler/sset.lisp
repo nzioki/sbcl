@@ -17,7 +17,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information. (This file no)
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Each structure that may be placed in a SSET must include the
 ;;; SSET-ELEMENT structure. We allow an initial value of NIL to mean
@@ -66,16 +66,16 @@
                         (the fixnum (ash result -5)))))
   #-sb-xc-host
   (let ((result (sset-element-number element)))
-    (declare (type sb!vm:word result))
+    (declare (type sb-vm:word result))
     ;; We only use the low-order bits.
     (macrolet ((set-result (form)
-                 `(setf result (ldb (byte #.sb!vm:n-word-bits 0) ,form))))
+                 `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
       (set-result (+ result (ash result -19)))
       (set-result (logxor result (ash result -13)))
       (set-result (+ result (ash result -9)))
       (set-result (logxor result (ash result -5)))
       (set-result (+ result (ash result -2)))
-      (logand sb!xc:most-positive-fixnum result))))
+      (logand sb-xc:most-positive-fixnum result))))
 
 ;;; Secondary hash (for double hash probing). Needs to return an odd
 ;;; number.

@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (defglobal *alien-type-classes* (make-hash-table :test 'eq))
 
@@ -59,9 +59,9 @@
       `(eval-when (:compile-toplevel :load-toplevel :execute)
          ,@(when *new-auxiliary-types*
              `((%def-auxiliary-alien-types ',*new-auxiliary-types*
-                                           (sb!c:source-location))))
+                                           (sb-c:source-location))))
          ,@(when name
-             `((%define-alien-type ',name ',alien-type (sb!c:source-location))))))))
+             `((%define-alien-type ',name ',alien-type (sb-c:source-location))))))))
 
 (defstruct (alien-type-class (:copier nil))
   (name nil :type symbol)
@@ -141,7 +141,7 @@
          ;; Only pin things on GENCGC, since on CHENEYGC it'd imply
          ;; disabling the GC.  Which is something we don't want to do
          ;; every time we're calling to C.
-         #!+gencgc
+         #+gencgc
          (loop for variable in variables
             for type in types
             when (invoke-alien-type-method :deport-pin-p type)

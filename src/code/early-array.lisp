@@ -7,14 +7,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(defconstant sb!xc:array-rank-limit 65529
+(defconstant sb-xc:array-rank-limit 65529
   "the exclusive upper bound on the rank of an array")
 
 ;;; - 2 to leave space for the array header
-(defconstant sb!xc:array-dimension-limit (- sb!xc:most-positive-fixnum 2)
+(defconstant sb-xc:array-dimension-limit (- sb-xc:most-positive-fixnum 2)
   "the exclusive upper bound on any given dimension of an array")
 
-(defconstant sb!xc:array-total-size-limit (- sb!xc:most-positive-fixnum 2)
+(defconstant sb-xc:array-total-size-limit (- sb-xc:most-positive-fixnum 2)
   "the exclusive upper bound on the total number of elements in an array")

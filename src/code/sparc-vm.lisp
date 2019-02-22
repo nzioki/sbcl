@@ -8,7 +8,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; See x86-vm.lisp for a description of this.
 #-sb-xc-host
@@ -21,7 +21,7 @@
 (defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
-  (unless (zerop (rem offset sb!assem:+inst-alignment-bytes+))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
     (ecase kind
@@ -68,13 +68,13 @@
 ;;; the same format as returned by FLOATING-POINT-MODES.
 
 ;;; Under SunOS, we have a straightforward implementation in C:
-#!+sunos
+#+sunos
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
     (unsigned 32)
   (context (* os-context-t)))
 
 ;;; Under Linux, we have to contend with utterly broken signal handling.
-#!+linux
+#+linux
 (defun context-floating-point-modes (context)
   (declare (ignore context))
   (warn "stub CONTEXT-FLOATING-POINT-MODES")
@@ -86,5 +86,5 @@
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 3)))
     (declare (type system-area-pointer pc))
-    (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
+    (sb-kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
 ) ; end PROGN

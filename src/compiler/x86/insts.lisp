@@ -10,16 +10,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!X86-ASM")
+(in-package "SB-X86-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
   (import '(conditional-opcode
             register-p ; FIXME: rename to GPR-P
-            make-ea ea-disp width-bits) "SB!VM")
+            make-ea ea-disp width-bits) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::frame-byte-offset sb!vm::ebp-tn
-            sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
+  (import '(sb-vm::frame-byte-offset sb-vm::ebp-tn
+            sb-vm::registers sb-vm::float-registers sb-vm::stack))) ; SB names
 
 (deftype reg () '(unsigned-byte 3))
 
@@ -172,14 +172,14 @@
     (:le . 14) (:ng . 14)
     (:nle . 15) (:g . 15))
   #'equal)
-(defconstant-eqx sb!vm::+condition-name-vec+
+(defconstant-eqx sb-vm::+condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
-(define-arg-type condition-code :printer sb!vm::+condition-name-vec+)
+(define-arg-type condition-code :printer sb-vm::+condition-name-vec+)
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
@@ -582,11 +582,11 @@
         (t
          (format stream "~A PTR [" (symbol-name (ea-size ea)))
          (when (ea-base ea)
-           (write-string (sb!c::location-print-name (ea-base ea)) stream)
+           (write-string (sb-c::location-print-name (ea-base ea)) stream)
            (when (ea-index ea)
              (write-string "+" stream)))
          (when (ea-index ea)
-           (write-string (sb!c::location-print-name (ea-index ea)) stream))
+           (write-string (sb-c::location-print-name (ea-index ea)) stream))
          (unless (= (ea-scale ea) 1)
            (format stream "*~A" (ea-scale ea)))
          (typecase (ea-disp ea)
@@ -679,7 +679,7 @@
 (defun dword-reg-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (eq (sb!c:sc-operand-size (tn-sc thing)) :dword)))
+       (eq (sb-c:sc-operand-size (tn-sc thing)) :dword)))
 
 (defun register-p (thing)
   (and (tn-p thing)
@@ -700,7 +700,7 @@
 (defun operand-size (thing)
   (typecase thing
     (tn
-     (or (sb!c:sc-operand-size (tn-sc thing))
+     (or (sb-c:sc-operand-size (tn-sc thing))
          (error "can't tell the size of ~S ~S" thing (sc-name (tn-sc thing)))))
     (ea
      (ea-size thing))
@@ -737,7 +737,7 @@
   (ecase name
     ((nil))
     (:lock
-     #!+sb-thread
+     #+sb-thread
      (emit-byte segment #xf0))
     (:fs
      (emit-byte segment #x64))
@@ -1727,17 +1727,17 @@
 ;;;; interrupt instructions
 
 (define-instruction break (segment &optional (code nil codep))
-  #!-ud2-breakpoints (:printer byte-imm ((op #xCC))
+  #-ud2-breakpoints (:printer byte-imm ((op #xCC))
                                '(:name :tab code) :control #'break-control)
-  #!+ud2-breakpoints (:printer word-imm ((op #x0B0F))
+  #+ud2-breakpoints (:printer word-imm ((op #x0B0F))
                                '(:name :tab code) :control #'break-control)
   (:emitter
-   #!-ud2-breakpoints (emit-byte segment #xCC)
+   #-ud2-breakpoints (emit-byte segment #xCC)
    ;; On darwin, trap handling via SIGTRAP is unreliable, therefore we
    ;; throw a sigill with 0x0b0f instead and check for this in the
    ;; SIGILL handler and pass it on to the sigtrap handler if
    ;; appropriate
-   #!+ud2-breakpoints (emit-word segment #x0B0F)
+   #+ud2-breakpoints (emit-word segment #x0B0F)
    (when codep (emit-byte segment (the (unsigned-byte 8) code)))))
 
 (define-instruction int (segment number)
@@ -2516,7 +2516,7 @@
          (aver (integerp value))
          (cons type value))
       ((:base-char)
-         #!+sb-unicode (aver (typep value 'base-char))
+         #+sb-unicode (aver (typep value 'base-char))
          (cons :byte (char-code value)))
       ((:character)
          (aver (characterp value))
@@ -2568,7 +2568,7 @@
 ;;; of confusion I have about what is allowed to reach the instruction
 ;;; emitter as a raw fixup, a fixup wrapped in an EA, a label wrapped
 ;;; in a fixup wrapped in an EA etc.
-(defun sb!assem::%mark-used-labels (operand)
+(defun sb-assem::%mark-used-labels (operand)
   (named-let recurse ((operand operand))
     (etypecase operand
       ((or integer tn keyword null))
@@ -2585,9 +2585,9 @@
                ((consp offset)
                 (setf (label-usedp (car offset)) t))))))))
 
-(defun sb!c::branch-opcode-p (mnemonic)
+(defun sb-c::branch-opcode-p (mnemonic)
   (member mnemonic (load-time-value
-                    (mapcar #'sb!assem::op-encoder-name
+                    (mapcar #'sb-assem::op-encoder-name
                             '(call ret jmp jecxz break int iret
                               loop loopz loopnz syscall
                               byte word dword)) ; unexplained phenomena
@@ -2595,7 +2595,7 @@
 
 ;; Replace the INST-INDEXth element in INST-BUFFER with an instruction
 ;; to store a coverage mark in the OFFSETth byte beyond LABEL.
-(defun sb!c::replace-coverage-instruction (inst-buffer inst-index label offset)
+(defun sb-c::replace-coverage-instruction (inst-buffer inst-index label offset)
   (setf (svref inst-buffer inst-index)
         `(mov ,(make-ea :byte
                         :disp (make-fixup nil

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Space optimization: As the upper 32 bits of (tagged or untagged)
 ;;; characters are always zero many operations can be done on 32-bit
@@ -151,7 +151,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp x (sb!xc:char-code y))))
+    (inst cmp x (sb-xc:char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)
@@ -165,7 +165,7 @@
   (:translate char>)
   (:conditional :a))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p)
   (:args (value :scs (any-reg descriptor-reg)))
   (:arg-types *)
@@ -178,7 +178,7 @@
     (inst lea :dword temp (ea (- character-widetag) value))
     (inst test :dword temp (lognot #x7F00))))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p-character)
   (:args (value :scs (any-reg)))
   (:arg-types character)
@@ -189,7 +189,7 @@
   (:generator 3
     (inst test :dword value (lognot #x7FFF))))
 
-#!+sb-unicode
+#+sb-unicode
 (define-vop (base-char-p-character-reg)
   (:args (value :scs (character-reg)))
   (:arg-types character)

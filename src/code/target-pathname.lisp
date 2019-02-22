@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defstruct (logical-host
              (:copier nil)
@@ -71,7 +71,7 @@
 ;;; Unobvious order of execution of TLFs in cold-init is one potential problem,
 ;;; but there could be other issues as well, like maybe we're unsealing classes
 ;;; because the FREEZE-TYPE was wrong to begin with. (So why no warnings then?)
-#!-sb-fluid (declaim (freeze-type logical-pathname logical-host))
+#-sb-fluid (declaim (freeze-type logical-pathname logical-host))
 
 (defmethod make-load-form ((logical-host logical-host) &optional env)
   (declare (ignore env))
@@ -477,7 +477,7 @@
 ;;; A two-level lookup is used- it works better than mixing all
 ;;; pathname components into a hash key.
 (define-load-time-global *pathnames* (make-array 211 :initial-element nil))
-(define-load-time-global *pathnames-lock* (sb!thread:make-mutex :name "Pathnames"))
+(define-load-time-global *pathnames-lock* (sb-thread:make-mutex :name "Pathnames"))
 
 (defun %make-pathname (host device directory name type version)
   (if (or device (neq host *physical-host*))
@@ -531,7 +531,7 @@
             ;; on the double-check, allocate it now
             (let ((pathname (%%make-pathname *physical-host* nil (car dir-holder)
                                              name type version)))
-              (sb!thread::with-system-mutex (*pathnames-lock*)
+              (sb-thread::with-system-mutex (*pathnames-lock*)
                 (when (>= n-candidates 10)
                   ;; Rehash into a larger vector
                   (let* ((old-len (length vector))

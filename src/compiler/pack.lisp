@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!REGALLOC")
+(in-package "SB-REGALLOC")
 
 ;;; for debugging: some parameters controlling which optimizations we
 ;;; attempt
@@ -777,7 +777,7 @@
           (when (eq (vop-info-save-p (vop-info vop)) t)
             (let ((penalty (+ save-penalty (vop-depth-cost vop))))
               (do-live-tns (tn (vop-save-set vop) block)
-                #!-fp-and-pc-standard-save
+                #-fp-and-pc-standard-save
                 (let ((save-tn (tn-save-tn tn)))
                   (when (and save-tn (eq :specified-save (tn-kind save-tn)))
                     ;; If we're expecting to spill a TN with a
@@ -808,7 +808,7 @@
 ;;; through and force TNs with specified save locations (OCFP and LRA
 ;;; save locations) to the stack if they are going to be spilled.  See
 ;;; the comment in ASSIGN-TN-COSTS for consequences of not doing so.
-#!-fp-and-pc-standard-save
+#-fp-and-pc-standard-save
 (defun maybe-force-specified-saves-to-stack (component)
   (do-ir2-blocks (block component)
     (do ((vop (ir2-block-start-vop block) (vop-next vop)))
@@ -955,7 +955,7 @@
 ;;;
 ;;; We return a conflicting TN if there is a conflict.
 (defun load-tn-offset-conflicts-in-sb (op sb offset)
-  (declare (type tn-ref op) (type sb!c::finite-sb-template sb) (type index offset))
+  (declare (type tn-ref op) (type sb-c::finite-sb-template sb) (type index offset))
   (aver (eq (sb-kind sb) :finite))
   (let ((vop (tn-ref-vop op)))
     (labels ((tn-overlaps (tn)
@@ -1031,7 +1031,7 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (if (and (eq (tn-sc tn) sc)
-                 (sc-locations-member (the sb!vm:finite-sc-offset loc)
+                 (sc-locations-member (the sb-vm:finite-sc-offset loc)
                                       (sc-locations sc))
                  (not (load-tn-conflicts-in-sc op sc loc nil)))
             loc
@@ -1049,7 +1049,7 @@
       (let* ((tn (tn-ref-tn target))
              (loc (tn-offset tn)))
         (when (and (eq (sc-sb sc) (sc-sb (tn-sc tn)))
-                   (sc-locations-member (the sb!vm:finite-sc-offset loc)
+                   (sc-locations-member (the sb-vm:finite-sc-offset loc)
                                         (sc-locations sc))
                    (not (load-tn-conflicts-in-sc op sc loc nil)))
               (return-from select-load-tn-location loc)))))
@@ -1184,7 +1184,7 @@
 ;;; the restriction, we pack a Load-TN and load the operand into it.
 ;;; If a load-tn has already been allocated, we can assume that the
 ;;; restriction is satisfied.
-#!-sb-fluid (declaim (inline check-operand-restrictions))
+#-sb-fluid (declaim (inline check-operand-restrictions))
 (defun check-operand-restrictions (scs ops)
   (declare (list scs) (type (or tn-ref null) ops))
 
@@ -1321,7 +1321,7 @@
                           &rest keys &key limit reads writes)
                          &body body)
   (declare (ignore limit reads writes))
-  (let ((callback (sb!xc:gensym "CALLBACK")))
+  (let ((callback (sb-xc:gensym "CALLBACK")))
     `(flet ((,callback (,target-variable)
               ,@body))
        (declare (dynamic-extent #',callback))
@@ -1467,7 +1467,7 @@
     ;; For non-x86 ports the presence of a save-tn associated with a
     ;; tn is used to identify the old-fp and return-pc tns. It depends
     ;; on the old-fp and return-pc being passed in registers.
-    #!-fp-and-pc-standard-save
+    #-fp-and-pc-standard-save
     (when (and (not (eq (tn-kind tn) :specified-save))
                (conflicts-in-sc original sc offset))
       (error "~S is wired to a location that it conflicts with." tn))
@@ -1494,7 +1494,7 @@
     ;; the stack so the above hack for the other ports does not always
     ;; work. Here the old-fp and return-pc tns are identified by being
     ;; on the stack in their standard save locations.
-    #!+fp-and-pc-standard-save
+    #+fp-and-pc-standard-save
     (when (and (not (and
                      (= (sc-number sc) #.(sc+offset-scn old-fp-passing-offset))
                      (= offset #.(sc+offset-offset old-fp-passing-offset))))
@@ -1506,7 +1506,7 @@
              tn offset sc (tn-kind tn)))
 
     (unless (eq (sb-kind sb) :unbounded)
-      (setf (ldb (byte 1 (truly-the sb!vm:finite-sc-offset offset))
+      (setf (ldb (byte 1 (truly-the sb-vm:finite-sc-offset offset))
                  (finite-sb-wired-map sb))
             1))
     (add-location-conflicts original sc offset)))
@@ -1570,7 +1570,7 @@
       (walk-tn-refs (tn-reads tn))
       (walk-tn-refs (tn-writes tn))
       (if (eql path t)
-          most-positive-fixnum
+          sb-xc:most-positive-fixnum
           (length path)))))
 
 (declaim (type (member :iterative :greedy :adaptive)
@@ -1613,7 +1613,7 @@
          ;; be packed on the stack, and which are important not to spill.
          (if *pack-assign-costs*
              (assign-tn-costs component)
-             #!-fp-and-pc-standard-save
+             #-fp-and-pc-standard-save
              (maybe-force-specified-saves-to-stack component))
 
          ;; Actually allocate registers for most TNs. After this, only

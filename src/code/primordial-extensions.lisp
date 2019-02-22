@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Helper for making the DX closure allocation in macros expanding
 ;;; to CALL-WITH-FOO less ugly.
@@ -61,7 +61,7 @@
                           (stem (if (every #'alpha-char-p symbol-name)
                                     symbol-name
                                     (string (gensymify* symbol-name "-")))))
-                     `(,symbol (sb!xc:gensym ,stem))))
+                     `(,symbol (sb-xc:gensym ,stem))))
                  symbols)
      ,@body))
 
@@ -69,24 +69,22 @@
 ;;; macros and other code-manipulating code.)
 (defun make-gensym-list (n &optional name)
   (let ((arg (if name (string name) "G")))
-    (loop repeat n collect (sb!xc:gensym arg))))
+    (loop repeat n collect (sb-xc:gensym arg))))
 
 ;;;; miscellany
 
 ;;; Lots of code wants to get to the KEYWORD package or the
-;;; COMMON-LISP package without a lot of fuss, so we cache them in
-;;; variables on the host, or use L-T-V forms on the target.
-(macrolet ((def-it (sym expr)
-             #+sb-xc-host
-             `(progn (declaim (type package ,sym))
-                     (defvar ,sym ,expr))
-             #-sb-xc-host
-             ;; We don't need to declaim the type. FIND-PACKAGE
-             ;; returns a package, and L-T-V propagates types.
-             ;; It's ugly how it achieves that, but it's a separate concern.
-             `(define-symbol-macro ,sym (load-time-value ,expr t))))
-  (def-it *cl-package* (find-package "COMMON-LISP"))
-  (def-it *keyword-package* (find-package "KEYWORD")))
+;;; COMMON-LISP package without going through FIND-PACKAGE, so we refer to them
+;;; as constants which is ever so slightly more efficient than a defglobal.
+;;; DEFINE-SYMBOL-MACRO should be ok in any host lisp. We used to distrust it,
+;;; but it is specified by CLHS, as are package constants, so there should
+;;; be no need to fear this idiom.
+(macrolet ((def-it (sym name) `(define-symbol-macro ,sym ,(find-package name))))
+  ;; *CL-PACKAGE* is always COMMON-LISP, not XC-STRICT-CL on the host, because the latter
+  ;; is just a means to avoid inheriting symbols that are not supposed to be in the CL:
+  ;; package but might be due to non-ansi-compliance of the host.
+  (def-it *cl-package* "COMMON-LISP")
+  (def-it *keyword-package* "KEYWORD"))
 
 (declaim (inline singleton-p))
 (defun singleton-p (list)
@@ -94,8 +92,8 @@
 
 (defun gensymify (x)
   (if (symbolp x)
-      (sb!xc:gensym (symbol-name x))
-      (sb!xc:gensym)))
+      (sb-xc:gensym (symbol-name x))
+      (sb-xc:gensym)))
 
 (labels ((symbol-concat (package &rest things)
            (dx-let ((strings (make-array (length things)))
@@ -108,7 +106,7 @@
                              (l (length s)))
                         (setf (svref strings index) s)
                         (incf length l)
-                        #!+sb-unicode
+                        #+sb-unicode
                         (when (and (typep s '(array character (*)))
                                    ;; BASE-CHAR-p isn't a standard predicate.
                                    ;; and host ignores ELT-TYPE anyway.
@@ -124,13 +122,13 @@
                  (setq name (make-array length :element-type elt-type)))
                (dotimes (index (length things)
                                (if package
-                                   (values (%intern name length package elt-type))
+                                   (values (%intern name length package elt-type nil))
                                    (make-symbol name)))
                  (let ((s (svref strings index)))
                    (replace name s :start1 start)
                    (incf start (length s)))))))
-         #+sb-xc-host (%intern (name length package elt-type)
-                        (declare (ignore length elt-type))
+         #+sb-xc-host (%intern (name length package elt-type dummy)
+                        (declare (ignore length elt-type dummy))
                         ;; Copy, in case the host respects the DX declaration,
                         ;; but does not copy, which makes our assumption wrong.
                         (intern (copy-seq name) package)))
@@ -179,8 +177,7 @@
           (t
            ;; We're in the undefined behavior zone. First, munge the
            ;; system back into a defined state.
-           (let ((really-package
-                  (load-time-value (find-package :cl-user) t)))
+           (let ((really-package #.(find-package :cl-user)))
              (setf *package* really-package)
              ;; Then complain.
              (error 'simple-type-error
@@ -266,16 +263,18 @@
                  (acond ,@rest)))))))
 
 ;; This is not an 'extension', but is needed super early, so ....
-(defmacro sb!xc:defconstant (name value &optional (doc nil docp))
+(defmacro sb-xc:defconstant (name value &optional (doc nil docp))
   "Define a global constant, saying that the value is constant and may be
   compiled into code. If the variable already has a value, and this is not
   EQL to the new value, the code is not portable (undefined behavior). The
   third argument is an optional documentation string for the variable."
+  (check-designator name defconstant)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (sb!c::%defconstant ',name ,value (sb!c:source-location)
+     (sb-c::%defconstant ',name ,value (sb-c:source-location)
                          ,@(and docp `(',doc)))))
 
 (defvar *!removable-symbols* nil)
+(push '("SB-INT" check-designator) *!removable-symbols*)
 
 (defun %defconstant-eqx-value (symbol expr eqx)
   (declare (type function eqx))
@@ -316,17 +315,17 @@
 ;;; The extra magic is that we need to discern between constants simple enough
 ;;; to assigned during genesis (cold-load) from those assigned in cold-init.
 ;;; This choice informs the compiler how to emit references to the symbol.
-(defvar sb!c::*!const-value-deferred* '())
+(defvar sb-c::*!const-value-deferred* '())
 #-sb-xc-host
 (eval-when (:compile-toplevel)
-  (sb!xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
-    (let ((constp (sb!xc:constantp expr)))
+  (sb-xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
+    (let ((constp (sb-xc:constantp expr)))
       `(progn
          (eval-when (:compile-toplevel)
-           (sb!xc:defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx))
+           (sb-xc:defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx))
            ,@(unless constp
-               `((push ',symbol sb!c::*!const-value-deferred*))))
+               `((push ',symbol sb-c::*!const-value-deferred*))))
          (eval-when (:load-toplevel)
-           (sb!c::%defconstant ',symbol
+           (sb-c::%defconstant ',symbol
              ,(if constp `',(constant-form-value expr) expr)
-             (sb!c:source-location) ,@(when doc (list doc))))))))
+             (sb-c:source-location) ,@(when doc (list doc))))))))

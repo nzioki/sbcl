@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (!defstruct-with-alternate-metaclass condition
   :slot-names (assigned-slots hash)
@@ -30,7 +30,7 @@
                    :inherits (map 'vector #'find-layout (cons t inherits))
                    :depthoid -1
                    ;; 2 declared slots, plus the layout if it takes a slot
-                   :length (+ sb!vm:instance-data-start 2))
+                   :length (+ sb-vm:instance-data-start 2))
                  nil nil))))
   ;; These are grotesquely OAOO-violating, but on the bright side,
   ;; compilation will fail if the subsequent real definition differs,
@@ -46,7 +46,7 @@
   (def parse-deprecated-type (condition) condition)
   (def serious-condition (condition) condition)
   (def error (serious-condition) condition serious-condition)
-  (def sb!di:debug-condition (serious-condition) condition serious-condition)
+  (def sb-di:debug-condition (serious-condition) condition serious-condition)
   (def stream-error (error) condition serious-condition error)
   (def reference-condition (condition) condition)
   )

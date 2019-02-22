@@ -65,14 +65,18 @@
                 cl:-
                 cl:/
                 cl://
-                cl:///)))
+                cl:///
+                ;; extension/internal specials are also proclaimed early
+                ;; to benefit from always-bound and precomputed TLS index.
+                sb-kernel:*current-level-in-print*
+                sb-ext:*print-vector-length*)))
     `(progn
        (declaim (special ,@list)
-                (sb!ext:always-bound ,@list))
+                (sb-ext:always-bound ,@list))
        (eval-when (:compile-toplevel :load-toplevel)
          (dolist (symbol ',list)
-           (declare (notinline (setf sb!int:info))) ; skirt failure-to-inline warning
-           (setf (sb!int:info :variable :wired-tls symbol) t)))))
+           (declare (notinline (setf sb-int:info))) ; skirt failure-to-inline warning
+           (setf (sb-int:info :variable :wired-tls symbol) t)))))
 
 (declaim (type t cl:+ cl:++ cl:+++ cl:- cl:* cl:** cl:***))
 
@@ -85,7 +89,7 @@
                          cl:*print-readably* cl:*read-eval*
                          cl:*read-suppress*))
 
-(declaim (type sb!pretty::pprint-dispatch-table cl:*print-pprint-dispatch*))
+(declaim (type sb-pretty::pprint-dispatch-table cl:*print-pprint-dispatch*))
 
 (declaim (type readtable cl:*readtable*))
 
@@ -98,7 +102,7 @@
 
 (declaim (type list cl:/ cl:// cl:/// cl:*features* cl:*modules*))
 
-(declaim (type sb!kernel:type-specifier cl:*break-on-signals*))
+(declaim (type sb-kernel:type-specifier cl:*break-on-signals*))
 
 (declaim (type package cl:*package*))
 
@@ -123,6 +127,7 @@
 
 (declaim (type (or unsigned-byte null)
                        cl:*print-length*
+                       sb-ext:*print-vector-length*
                        cl:*print-level*
                        cl:*print-lines*
                        cl:*print-miser-width*
@@ -140,7 +145,31 @@
 ;;;; These have alternate definitions (in cross-misc) which rely on
 ;;;; the underlying host DEFVAR when building the cross-compiler.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
+
+;;; Generate a consistent error message for all the standard
+;;; defining macros when given an invalid NAME argument.
+;;; DEFCLASS has its own thing, which is CHECK-CLASS-NAME.
+;;; [This is possibly the wrong place for this, but it's needed
+;;; earlier than anything else, even primordial-extensions.]
+(defmacro check-designator (name macro &optional (arg-reference "NAME"))
+  (multiple-value-bind (predicate explanation)
+      (case macro
+        ((defun defgeneric defmethod define-compiler-macro)
+         (values 'legal-fun-name-p "function name"))
+        (t
+         (values 'symbolp "symbol")))
+    ;; If we decide that the correct behavior is to actually macroexpand
+    ;; and then fail later, well, I suppose we could express all macros
+    ;; such that they perform their LEGAL-FUN-NAME-P/SYMBOLP check as part
+    ;; of the ordinary code, as in:
+    ;;  (DEFPARAMETER "foo" 3) -> (%defparameter (the symbol '"foo") ...)
+    ;; which seems at least slightly preferable to failing in the
+    ;; internal function that would store the globaldb info.
+    `(unless (,predicate ,name)
+       (error ,(format nil "The ~A argument to ~A, ~~S, is not a ~A."
+                       arg-reference macro explanation)
+              ,name))))
 
 (defmacro defglobal (name value &optional (doc nil docp))
   "Defines NAME as a global variable that is always bound. VALUE is evaluated
@@ -152,15 +181,17 @@ locally bound, declared special, defined as constants, and neither bound
 nor defined as symbol macros.
 
 See also the declarations SB-EXT:GLOBAL and SB-EXT:ALWAYS-BOUND."
+  (check-designator name defglobal)
   (let ((boundp (make-symbol "BOUNDP")))
     `(progn
        (eval-when (:compile-toplevel)
          (let ((,boundp (boundp ',name)))
            (%compiler-defglobal ',name :always-bound
-                                (unless ,boundp ,value) (not ,boundp))))
-       (let ((,boundp (%boundp ',name)))
-         (%defglobal ',name (unless ,boundp ,value) ,boundp ',doc ,docp
-                     (sb!c:source-location))))))
+                                (not ,boundp) (unless ,boundp ,value))))
+       (%defglobal ',name
+                   (if (%boundp ',name) (make-unbound-marker) ,value)
+                   (sb-c:source-location)
+                   ,@(and docp `(',doc))))))
 
 (defmacro define-load-time-global (name value &optional (doc nil docp))
   "Defines NAME as a global variable that is always bound. VALUE is evaluated
@@ -170,10 +201,11 @@ Attempts to read NAME at compile-time will signal an UNBOUND-VARIABLE error
 unless it has otherwise been assigned a value.
 
 See also DEFGLOBAL which assigns the VALUE at compile-time too."
-  (let ((boundp (make-symbol "BOUNDP")))
-    `(progn
-       (eval-when (:compile-toplevel)
-         (%compiler-defglobal ',name :eventually nil nil))
-       (let ((,boundp (%boundp ',name)))
-         (%defglobal ',name (unless ,boundp ,value) ,boundp ',doc ,docp
-                     (sb!c:source-location))))))
+  (check-designator name define-load-time-global)
+  `(progn
+     (eval-when (:compile-toplevel)
+       (%compiler-defglobal ',name :eventually nil nil))
+     (%defglobal ',name
+                 (if (%boundp ',name) (make-unbound-marker) ,value)
+                 (sb-c:source-location)
+                 ,@(and docp `(',doc)))))

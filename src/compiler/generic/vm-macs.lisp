@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; other miscellaneous stuff
 
@@ -88,9 +88,9 @@
                        pointer
                        &allow-other-keys)
             (if (atom spec) (list spec) spec)
-          #!-alpha
+          #-alpha
           (declare (ignorable pointer))
-          #!+alpha
+          #+alpha
           (when pointer
             ;; Pointer values on ALPHA are 64 bits wide, and
             ;; double-word aligned.  We may also wish to have such a
@@ -132,7 +132,7 @@
              `(progn
                 (defknown ,cas-trans (,type ,slot-type ,slot-type)
                     ,slot-type ())
-                #!+compare-and-swap-vops
+                #+compare-and-swap-vops
                 (def-casser ',cas-trans ,offset ,lowtag))))
           (when init
             (inits (cons init offset)))
@@ -187,15 +187,15 @@
 ;;; storage class. Applies to all backends.
 (defconstant sc-number-limit 62)
 (defconstant sc-number-bits (integer-length (1- sc-number-limit)))
-(def!type sb!c::sc-number () `(integer 0 (,sc-number-limit)))
+(def!type sb-c::sc-number () `(integer 0 (,sc-number-limit)))
 
 (defconstant sc-offset-limit (ash 1 21))
 (defconstant sc-offset-bits (integer-length (1- sc-offset-limit)))
 (deftype sc-offset () `(integer 0 (,sc-offset-limit)))
 
 (defconstant finite-sc-offset-limit
-  #!-(or sparc alpha hppa) 32
-  #!+(or sparc alpha hppa) 64)
+  #-(or sparc alpha hppa) 32
+  #+(or sparc alpha hppa) 64)
 (defconstant finite-sc-offset-bits
   (integer-length (1- finite-sc-offset-limit)))
 (deftype finite-sc-offset () `(integer 0 (,finite-sc-offset-limit)))
@@ -203,7 +203,7 @@
 
 ;;;; stuff for defining reffers and setters
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defun def-reffer (name offset lowtag)
   (let ((fun-info (fun-info-or-lose name)))
@@ -240,7 +240,7 @@
                                                  lowtag inits))))))
   name)
 
-#!+compare-and-swap-vops ; same as IR2-CONVERT-CASSER
+#+compare-and-swap-vops ; same as IR2-CONVERT-CASSER
 (defun def-casser (name offset lowtag)
   (let ((fun-info (fun-info-or-lose name)))
     (setf (fun-info-ir2-convert fun-info)
@@ -332,7 +332,7 @@
   (check-type kind (member :untagged :tagged))
   (when lambda-list-p
     (dolist (arg lambda-list)
-      (when (member arg sb!xc:lambda-list-keywords)
+      (when (member arg sb-xc:lambda-list-keywords)
         (error "Lambda list keyword ~S is not supported for modular ~
                 function lambda lists." arg)))))
 

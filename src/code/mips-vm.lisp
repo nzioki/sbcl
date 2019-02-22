@@ -1,6 +1,6 @@
 ;;; This file contains the MIPS specific runtime stuff.
 ;;;
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 #-sb-xc-host
@@ -15,7 +15,7 @@
 (defun fixup-code-object (code offset value kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
-  (unless (zerop (rem offset sb!assem:+inst-alignment-bytes+))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
     (ecase kind
@@ -85,5 +85,5 @@
          (offset (if (logbitp 31 cause) 4 0))
          (trap-number (ldb (byte 8 6) (sap-ref-32 pc offset))))
     (declare (type system-area-pointer pc))
-    (sb!kernel::decode-internal-error-args (sap+ pc (+ offset 4)) trap-number)))
+    (sb-kernel::decode-internal-error-args (sap+ pc (+ offset 4)) trap-number)))
 ) ; end PROGN

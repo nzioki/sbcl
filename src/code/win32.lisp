@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!WIN32")
+(in-package "SB-WIN32")
 
 ;;; Alien definitions for commonly used Win32 types.  Woe unto whoever
 ;;; tries to untangle this someday for 64-bit Windows.
@@ -25,11 +25,11 @@
 (define-alien-type lispbool (boolean 32))
 
 (define-alien-type system-string
-                   #!-sb-unicode c-string
-                   #!+sb-unicode (c-string :external-format :ucs-2))
+                   #-sb-unicode c-string
+                   #+sb-unicode (c-string :external-format :ucs-2))
 
-(define-alien-type tchar #!-sb-unicode char
-                         #!+sb-unicode (unsigned 16))
+(define-alien-type tchar #-sb-unicode char
+                         #+sb-unicode (unsigned 16))
 
 (defconstant default-environment-length 1024)
 
@@ -169,32 +169,32 @@
 
 ;;;; System Functions
 
-#!-sb-thread
+#-sb-thread
 (define-alien-routine ("Sleep" millisleep) void
   (milliseconds dword))
 
-#!+sb-thread
-(defun sb!unix:nanosleep (sec nsec)
+#+sb-thread
+(defun sb-unix:nanosleep (sec nsec)
   (let ((*allow-with-interrupts* *interrupts-enabled*))
     (without-interrupts
-      (let ((timer (sb!impl::os-create-wtimer)))
-        (sb!impl::os-set-wtimer timer sec nsec)
+      (let ((timer (sb-impl::os-create-wtimer)))
+        (sb-impl::os-set-wtimer timer sec nsec)
         (unwind-protect
              (do () ((with-local-interrupts
-                       (zerop (sb!impl::os-wait-for-wtimer timer)))))
-          (sb!impl::os-close-wtimer timer))))))
+                       (zerop (sb-impl::os-wait-for-wtimer timer)))))
+          (sb-impl::os-close-wtimer timer))))))
 
 (define-alien-routine ("win32_wait_object_or_signal" wait-object-or-signal)
     dword
   (handle handle))
 
-#!+sb-unicode
+#+sb-unicode
 (progn
   (defvar *ansi-codepage* nil)
   (defvar *oem-codepage* nil)
   (defvar *codepage-to-external-format* (make-hash-table)))
 
-#!+sb-unicode
+#+sb-unicode
 (dolist
     (cp '(;;037       IBM EBCDIC - U.S./Canada
           (437 :CP437) ;; OEM - United States
@@ -348,7 +348,7 @@
           (65001 :UTF8))) ;; Unicode UTF-8
   (setf (gethash (car cp) *codepage-to-external-format*) (cadr cp)))
 
-#!+sb-unicode
+#+sb-unicode
 ;; FIXME: Something odd here: why are these two #+SB-UNICODE, whereas
 ;; the console just behave differently?
 (progn
@@ -371,7 +371,7 @@
 ;; http://msdn.microsoft.com/library/en-us/dllproc/base/getconsolecp.asp
 (declaim (ftype (function () keyword) console-input-codepage))
 (defun console-input-codepage ()
-  (or #!+sb-unicode
+  (or #+sb-unicode
       (gethash (alien-funcall (extern-alien "GetConsoleCP" (function UINT)))
                *codepage-to-external-format*)
       :latin-1))
@@ -379,7 +379,7 @@
 ;; http://msdn.microsoft.com/library/en-us/dllproc/base/getconsoleoutputcp.asp
 (declaim (ftype (function () keyword) console-output-codepage))
 (defun console-output-codepage ()
-  (or #!+sb-unicode
+  (or #+sb-unicode
       (gethash (alien-funcall
                 (extern-alien "GetConsoleOutputCP" (function UINT)))
                *codepage-to-external-format*)
@@ -393,18 +393,8 @@
   `(prog1 (cast ,value ,type)
      (,free-function ,value)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-(defmacro with-funcname ((name description) &body body)
-  `(let
-     ((,name (etypecase ,description
-               (string ,description)
-               (cons (destructuring-bind (s &optional c) ,description
-                       (format nil "~A~A" s
-                               (if c #!-sb-unicode "A" #!+sb-unicode "W" "")))))))
-     ,@body)))
-
 (defmacro make-system-buffer (x)
- `(make-alien char #!+sb-unicode (ash ,x 1) #!-sb-unicode ,x))
+ `(make-alien char #+sb-unicode (ash ,x 1) #-sb-unicode ,x))
 
 (defmacro with-handle ((var initform
                             &key (close-operator 'close-handle))
@@ -418,49 +408,51 @@
              (,close-operator ,var))))))
 
 (define-alien-type pathname-buffer
-    (array char #.(ash (1+ max_path) #!+sb-unicode 1 #!-sb-unicode 0)))
+    (array char #.(ash (1+ max_path) #+sb-unicode 1 #-sb-unicode 0)))
 
 (define-alien-type long-pathname-buffer
-    #!+sb-unicode (array char 65536)
-    #!-sb-unicode pathname-buffer)
+    #+sb-unicode (array char 65536)
+    #-sb-unicode pathname-buffer)
 
 (defmacro decode-system-string (alien)
   `(cast (cast ,alien (* char)) system-string))
 
-;;; FIXME: The various FOO-SYSCALL-BAR macros, and perhaps some other
-;;; macros in this file, are only used in this file, and could be
-;;; implemented using SB!XC:DEFMACRO wrapped in EVAL-WHEN.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun win-funcname (description)
+    (etypecase description
+      (string description)
+      (cons (destructuring-bind (s &optional c) description
+              (format nil "~A~A" s
+                      (if c #-sb-unicode "A" #+sb-unicode "W" "")))))))
 
 (defmacro syscall ((name ret-type &rest arg-types) success-form &rest args)
-  (with-funcname (sname name)
-    `(locally
-       (declare (optimize (sb!c::float-accuracy 0)))
-       (let ((result (alien-funcall
-                       (extern-alien ,sname
-                                     (function ,ret-type ,@arg-types))
-                       ,@args)))
-         (declare (ignorable result))
-         ,success-form))))
+  `(locally
+       (declare (optimize (sb-c::float-accuracy 0)))
+     (let ((result (alien-funcall
+                    (extern-alien ,(win-funcname name)
+                                  (function ,ret-type ,@arg-types))
+                    ,@args)))
+       (declare (ignorable result))
+       ,success-form)))
 
 ;;; This is like SYSCALL, but if it fails, signal an error instead of
 ;;; returning error codes. Should only be used for syscalls that will
 ;;; never really get an error.
 (defmacro syscall* ((name &rest arg-types) success-form &rest args)
-  (with-funcname (sname name)
+  (let ((sname (win-funcname name)))
     `(locally
-       (declare (optimize (sb!c::float-accuracy 0)))
+         (declare (optimize (sb-c::float-accuracy 0)))
        (let ((result (alien-funcall
-                       (extern-alien ,sname (function bool ,@arg-types))
-                       ,@args)))
+                      (extern-alien ,sname (function bool ,@arg-types))
+                      ,@args)))
          (when (zerop result)
            (win32-error ,sname))
          ,success-form))))
 
 (defmacro with-sysfun ((func name ret-type &rest arg-types) &body body)
-  (with-funcname (sname name)
-    `(with-alien ((,func (function ,ret-type ,@arg-types)
-                         :extern ,sname))
-       ,@body)))
+  `(with-alien ((,func (function ,ret-type ,@arg-types)
+                       :extern ,(win-funcname name)))
+     ,@body))
 
 (defmacro void-syscall* ((name &rest arg-types) &rest args)
   `(syscall* (,name ,@arg-types) (values t 0) ,@args))
@@ -497,7 +489,7 @@
 (defun get-folder-pathname (csidl)
   (parse-native-namestring (get-folder-namestring csidl)))
 
-(defun sb!unix:posix-getcwd ()
+(defun sb-unix:posix-getcwd ()
   (with-alien ((apath pathname-buffer))
     (with-sysfun (afunc ("GetCurrentDirectory" t) dword dword (* char))
       (let ((ret (alien-funcall afunc (1+ max_path) (cast apath (* char)))))
@@ -509,21 +501,21 @@
               (cast-and-free apath))
             (decode-system-string apath))))))
 
-(defun sb!unix:unix-mkdir (name mode)
-  (declare (type sb!unix:unix-pathname name)
-           (type sb!unix:unix-file-mode mode)
+(defun sb-unix:unix-mkdir (name mode)
+  (declare (type sb-unix:unix-pathname name)
+           (type sb-unix:unix-file-mode mode)
            (ignore mode))
   (syscall (("CreateDirectory" t) lispbool system-string (* t))
            (values result (if result 0 (get-last-error)))
            name nil))
 
-(defun sb!unix:unix-rename (name1 name2)
-  (declare (type sb!unix:unix-pathname name1 name2))
+(defun sb-unix:unix-rename (name1 name2)
+  (declare (type sb-unix:unix-pathname name1 name2))
   (syscall (("MoveFile" t) lispbool system-string system-string)
            (values result (if result 0 (get-last-error)))
            name1 name2))
 
-(defun sb!unix::posix-getenv (name)
+(defun sb-unix::posix-getenv (name)
   (declare (type simple-string name))
   (with-alien ((aenv (* char) (make-system-buffer default-environment-length)))
     (with-sysfun (afunc ("GetEnvironmentVariable" t)
@@ -548,7 +540,7 @@
 ;;;; Process time information
 
 (defconstant 100ns-per-internal-time-unit
-  (/ 10000000 sb!xc:internal-time-units-per-second))
+  (/ 10000000 sb-xc:internal-time-units-per-second))
 
 ;; FILETIME
 ;; The FILETIME structure is a 64-bit value representing the number of
@@ -630,11 +622,10 @@
 ;;            (addr epoch)
 ;;            (addr filetime)))
 (defconstant +unix-epoch-filetime+ 116444736000000000)
-(defconstant +filetime-unit+ (* 100ns-per-internal-time-unit
-                                internal-time-units-per-second))
+(defconstant +filetime-unit+ 10000000)
 (defconstant +common-lisp-epoch-filetime-seconds+ 9435484800)
 
-#!-sb-fluid
+#-sb-fluid
 (declaim (inline get-time-of-day))
 (defun get-time-of-day ()
   "Return the number of seconds and microseconds since the beginning of the
@@ -643,8 +634,7 @@ UNIX epoch: January 1st 1970."
     (syscall (("GetSystemTimeAsFileTime") void (* filetime))
              (multiple-value-bind (sec 100ns)
                  (floor (- system-time +unix-epoch-filetime+)
-                        (* 100ns-per-internal-time-unit
-                           internal-time-units-per-second))
+                        +filetime-unit+)
                (values sec (floor 100ns 10)))
              (addr system-time))))
 
@@ -772,7 +762,7 @@ absense."
 ;;
 ;; DFL: Merged this function because it seems useful to me.  But
 ;; shouldn't we then define it on actual POSIX, too?
-(defun (setf sb!unix::posix-getenv) (new-value name)
+(defun (setf sb-unix::posix-getenv) (new-value name)
   (if (setenv name new-value)
       new-value
       (posix-getenv name)))
@@ -795,7 +785,7 @@ absense."
     (dwMinorVersion dword)
     (dwBuildNumber dword)
     (dwPlatformId dword)
-    (szCSDVersion (array char #!-sb-unicode 128 #!+sb-unicode 256))))
+    (szCSDVersion (array char #-sb-unicode 128 #+sb-unicode 256))))
 
 (defun get-version-ex ()
   (with-alien ((info (struct OSVERSIONINFO)))
@@ -846,8 +836,8 @@ absense."
         (values -1 0))))
 
 ;; File mapping support routines
-(define-alien-routine (#!+sb-unicode "CreateFileMappingW"
-                       #!-sb-unicode "CreateFileMappingA"
+(define-alien-routine (#+sb-unicode "CreateFileMappingW"
+                       #-sb-unicode "CreateFileMappingA"
                        create-file-mapping)
     handle
   (handle handle)
@@ -893,11 +883,11 @@ absense."
 (defconstant file-share-write #x02)
 
 ;; CreateFile (the real file-opening workhorse).
-(define-alien-routine (#!+sb-unicode "CreateFileW"
-                       #!-sb-unicode "CreateFileA"
+(define-alien-routine (#+sb-unicode "CreateFileW"
+                       #-sb-unicode "CreateFileA"
                        create-file)
     handle
-  (name (c-string #!+sb-unicode #!+sb-unicode :external-format :ucs-2))
+  (name (c-string #+sb-unicode #+sb-unicode :external-format :ucs-2))
   (desired-access dword)
   (share-mode dword)
   (security-attributes (* t))
@@ -912,11 +902,11 @@ absense."
 
 ;; GetFileAttribute is like a tiny subset of fstat(),
 ;; enough to distinguish directories from anything else.
-(define-alien-routine (#!+sb-unicode "GetFileAttributesW"
-                       #!-sb-unicode "GetFileAttributesA"
+(define-alien-routine (#+sb-unicode "GetFileAttributesW"
+                       #-sb-unicode "GetFileAttributesA"
                        get-file-attributes)
     dword
-  (name (c-string #!+sb-unicode #!+sb-unicode :external-format :ucs-2)))
+  (name (c-string #+sb-unicode #+sb-unicode :external-format :ucs-2)))
 
 (define-alien-routine ("CloseHandle" close-handle) bool
   (handle handle))
@@ -926,19 +916,19 @@ absense."
   (handle handle)
   (flags int))
 
-;; Intended to be an imitation of sb!unix:unix-open based on
+;; Intended to be an imitation of sb-unix:unix-open based on
 ;; CreateFile, as complete as possibly.
 ;; FILE_FLAG_OVERLAPPED is a must for decent I/O.
 
 (defun unixlike-open (path flags &key revertable
                                       overlapped)
-  (declare (type sb!unix:unix-pathname path)
+  (declare (type sb-unix:unix-pathname path)
            (type fixnum flags))
   (let* ((disposition-flags
            (logior
-            (if (logtest sb!unix:o_creat flags) #b100 0)
-            (if (logtest sb!unix:o_excl flags) #b010 0)
-            (if (logtest sb!unix:o_trunc flags) #b001 0)))
+            (if (logtest sb-unix:o_creat flags) #b100 0)
+            (if (logtest sb-unix:o_excl flags) #b010 0)
+            (if (logtest sb-unix:o_trunc flags) #b001 0)))
          (create-disposition
            ;; there are 8 combinations of creat|excl|trunc, some of
            ;; them are equivalent. Case stmt below maps them to 5
@@ -953,7 +943,7 @@ absense."
             (create-file path
                          (logior
                           (if revertable #x10000 0)
-                          (if (logtest sb!unix:o_append flags)
+                          (if (logtest sb-unix:o_append flags)
                               access-file-append-data
                               0)
                           (ecase (logand 3 flags)
@@ -995,7 +985,7 @@ absense."
              ;; our desire to do so to the runtime?
              ;;   -- DFL
              ;;
-             (set-file-pointer-ex handle 0 (if (logtest sb!unix::o_append flags) 2 0))
+             (set-file-pointer-ex handle 0 (if (logtest sb-unix::o_append flags) 2 0))
              (values handle 0))))))
 
 (define-alien-routine ("closesocket" close-socket) int (handle handle))
@@ -1118,7 +1108,7 @@ absense."
       allow
       (win32-error '(setf inheritable-handle-p))))
 
-(defun sb!unix:unix-dup (fd)
+(defun sb-unix:unix-dup (fd)
   (let ((me (get-current-process)))
     (multiple-value-bind (duplicated handle)
         (duplicate-handle me fd me 0 t +duplicate-same-access+)
@@ -1128,7 +1118,7 @@ absense."
 
 (defun call-with-crt-fd (thunk handle &optional (flags 0))
   (multiple-value-bind (duplicate errno)
-      (sb!unix:unix-dup handle)
+      (sb-unix:unix-dup handle)
     (if duplicate
         (let ((fd (open-osfhandle duplicate flags)))
           (unwind-protect (funcall thunk fd)
@@ -1142,8 +1132,8 @@ absense."
   (length dword)
   (buffer (* t)))
 
-(define-alien-routine (#!-sb-unicode "CryptAcquireContextA"
-                       #!+sb-unicode "CryptAcquireContextW"
+(define-alien-routine (#-sb-unicode "CryptAcquireContextA"
+                       #+sb-unicode "CryptAcquireContextW"
                        %crypt-acquire-context) lispbool
   (handle handle :out)
   (container system-string)

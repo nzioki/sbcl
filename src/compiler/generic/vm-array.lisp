@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defstruct (specialized-array-element-type-properties
             (:conc-name saetp-)
@@ -61,21 +61,21 @@
          ;; for an initial element for (ARRAY NIL). -- CSR, 2002-03-07
          (nil #:mu 0 simple-array-nil
               :complex-typecode #.complex-vector-nil-widetag)
-         #!-sb-unicode
+         #-sb-unicode
          (character ,(code-char 0) 8 simple-base-string
                     ;; (SIMPLE-BASE-STRINGs are stored with an extra
                     ;; trailing #\NULL for convenience in calling out
                     ;; to C.)
                     :n-pad-elements 1
                     :complex-typecode #.complex-base-string-widetag)
-         #!+sb-unicode
+         #+sb-unicode
          (base-char ,(code-char 0) 8 simple-base-string
                     ;; (SIMPLE-BASE-STRINGs are stored with an extra
                     ;; trailing #\NULL for convenience in calling out
                     ;; to C.)
                     :n-pad-elements 1
                     :complex-typecode #.complex-base-string-widetag)
-         #!+sb-unicode
+         #+sb-unicode
          (character ,(code-char 0) 32 simple-character-string
                     :n-pad-elements 1
                     :complex-typecode #.complex-character-string-widetag)
@@ -98,39 +98,39 @@
          ((unsigned-byte 8) 0 8 simple-array-unsigned-byte-8)
          ((unsigned-byte 15) 0 16 simple-array-unsigned-byte-15)
          ((unsigned-byte 16) 0 16 simple-array-unsigned-byte-16)
-         #!-64-bit
+         #-64-bit
          ((unsigned-byte #.n-positive-fixnum-bits)
           0 32 simple-array-unsigned-fixnum
           :fixnum-p t)
          ((unsigned-byte 31) 0 32 simple-array-unsigned-byte-31)
          ((unsigned-byte 32) 0 32 simple-array-unsigned-byte-32)
-         #!+64-bit
+         #+64-bit
          ((unsigned-byte #.n-positive-fixnum-bits)
           0 64 simple-array-unsigned-fixnum
           :fixnum-p t)
-         #!+64-bit
+         #+64-bit
          ((unsigned-byte 63) 0 64 simple-array-unsigned-byte-63)
-         #!+64-bit
+         #+64-bit
          ((unsigned-byte 64) 0 64 simple-array-unsigned-byte-64)
          ((signed-byte 8) 0 8 simple-array-signed-byte-8)
          ((signed-byte 16) 0 16 simple-array-signed-byte-16)
          ;; KLUDGE: See the comment in PRIMITIVE-TYPE-AUX,
          ;; compiler/generic/primtype.lisp, for why this is FIXNUM and
          ;; not (SIGNED-BYTE 30)
-         #!-64-bit
+         #-64-bit
          (fixnum 0 32 simple-array-fixnum :fixnum-p t)
          ((signed-byte 32) 0 32 simple-array-signed-byte-32)
          ;; KLUDGE: see above KLUDGE for the 32-bit case
-         #!+64-bit
+         #+64-bit
          (fixnum 0 64 simple-array-fixnum :fixnum-p t)
-         #!+64-bit
+         #+64-bit
          ((signed-byte 64) 0 64 simple-array-signed-byte-64)
          ((complex single-float) #C(0.0f0 0.0f0) 64
           simple-array-complex-single-float)
          ((complex double-float) #C(0.0d0 0.0d0) 128
           simple-array-complex-double-float)
-         #!+long-float
-         ((complex long-float) #C(0.0l0 0.0l0) #!+x86 192 #!+sparc 256
+         #+long-float
+         ((complex long-float) #C(0.0l0 0.0l0) #+x86 192 #+sparc 256
           simple-array-complex-long-float)
          (t 0 #.n-word-bits simple-vector))))
 
@@ -157,14 +157,14 @@
        (<= (saetp-n-bits saetp) n-word-bits)))
 
 #+sb-xc-host
-(defvar sb!kernel::*specialized-array-element-types*
+(defvar sb-kernel::*specialized-array-element-types*
   (map 'list
        #'saetp-specifier
        *specialized-array-element-type-properties*))
 
 #-sb-xc-host
-(!define-load-time-global sb!kernel::*specialized-array-element-types*
-            '#.sb!kernel::*specialized-array-element-types*)
+(!define-load-time-global sb-kernel::*specialized-array-element-types*
+            '#.sb-kernel::*specialized-array-element-types*)
 
 (define-load-time-global *vector-without-complex-typecode-infos*
   #+sb-xc-host
@@ -187,16 +187,16 @@
        0)) ;; because of NIL
 
 (defun saetp-index-or-lose (element-type)
-  (or (position element-type sb!vm:*specialized-array-element-type-properties*
-                :key #'sb!vm:saetp-specifier :test #'equal)
+  (or (position element-type sb-vm:*specialized-array-element-type-properties*
+                :key #'sb-vm:saetp-specifier :test #'equal)
       (error "No saetp for ~S" element-type)))
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defun find-saetp (element-type)
-  (find element-type sb!vm:*specialized-array-element-type-properties*
-        :key #'sb!vm:saetp-specifier :test #'equal))
+  (find element-type sb-vm:*specialized-array-element-type-properties*
+        :key #'sb-vm:saetp-specifier :test #'equal))
 
 (defun find-saetp-by-ctype (ctype)
-  (find ctype sb!vm:*specialized-array-element-type-properties*
-        :key #'sb!vm:saetp-ctype :test #'csubtypep))
+  (find ctype sb-vm:*specialized-array-element-type-properties*
+        :key #'sb-vm:saetp-ctype :test #'csubtypep))

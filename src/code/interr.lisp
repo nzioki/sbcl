@@ -10,12 +10,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; internal errors
 
 (macrolet ((def-it ()
-             (let ((n (1+ (position-if 'stringp sb!c:+backend-internal-errors+
+             (let ((n (1+ (position-if 'stringp sb-c:+backend-internal-errors+
                                        :key #'car :from-end t))))
                `(progn
                   (defconstant n-internal-error-handlers ,n)
@@ -33,7 +33,7 @@
         (error "Update (DEFUN INTERNAL-ERROR) for ~D error arguments" max))))
   `(setf (svref **internal-error-handlers** ,(error-number-or-lose name))
          (named-lambda ,(string name) (,@args)
-           (declare (optimize (sb!c::verify-arg-count 0)))
+           (declare (optimize (sb-c::verify-arg-count 0)))
            ,@body)))
 
 ;;; Backtrace code may want to know the error that caused
@@ -44,11 +44,11 @@
 (defvar *current-internal-trap-number*)
 (defvar *current-internal-error-args*)
 
-#!+undefined-fun-restarts
+#+undefined-fun-restarts
 (defun restart-undefined (name condition fdefn-or-symbol context)
   (multiple-value-bind (tn-offset pc-offset)
       (if context
-          (sb!c::decode-restart-location context)
+          (sb-c::decode-restart-location context)
           (car *current-internal-error-args*))
     (labels ((retry-value (value)
                (or (typecase value
@@ -72,7 +72,7 @@
              (set-value (function retrying)
                (if retrying
                    (retry-value function)
-                   (sb!di::sub-set-debug-var-slot
+                   (sb-di::sub-set-debug-var-slot
                     nil tn-offset
                     (retry-value function)
                     *current-internal-error-context*)))
@@ -99,7 +99,7 @@
                               :interactive read-evaluated-form
                               (set-value value retrying)))
                         (unless retrying
-                          (sb!vm::incf-context-pc *current-internal-error-context*
+                          (sb-vm::incf-context-pc *current-internal-error-context*
                                                   pc-offset))))
                      (t
                       (restart-case (error condition)
@@ -137,60 +137,60 @@
            (make-condition 'undefined-function
                            :name name
                            :not-yet-loaded
-                           (cond ((member name sb!c::*fun-names-in-this-file*
+                           (cond ((member name sb-c::*fun-names-in-this-file*
                                           :test #'equal)
                                   t)
-                                 ((and (boundp 'sb!c:*lexenv*)
-                                       (sb!c::fun-locally-defined-p
-                                        name sb!c:*lexenv*))
+                                 ((and (boundp 'sb-c:*lexenv*)
+                                       (sb-c::fun-locally-defined-p
+                                        name sb-c:*lexenv*))
                                   :local))))
-         #!+undefined-fun-restarts
+         #+undefined-fun-restarts
          context)
-    (cond #!+undefined-fun-restarts
-          ((or (= *current-internal-trap-number* sb!vm:cerror-trap)
-               (integerp (setf context (sb!di:error-context))))
+    (cond #+undefined-fun-restarts
+          ((or (= *current-internal-trap-number* sb-vm:cerror-trap)
+               (integerp (setf context (sb-di:error-context))))
            (restart-undefined name condition fdefn-or-symbol context))
           (t
            (error condition)))))
 
-#!+(or arm arm64 x86-64)
+#+(or arm arm64 x86-64)
 (deferr undefined-alien-fun-error (address)
   (error 'undefined-alien-function-error
          :name
-         (or (sb!di:error-context
-              (sb!di:frame-down sb!debug:*stack-top-hint*))
+         (or (sb-di:error-context
+              (sb-di:frame-down sb-debug:*stack-top-hint*))
              (and (integerp address)
                   (sap-foreign-symbol (int-sap address))))))
 
-#!-(or arm arm64 x86-64)
+#-(or arm arm64 x86-64)
 (defun undefined-alien-fun-error ()
   (error 'undefined-alien-function-error))
 
 (deferr invalid-arg-count-error (nargs)
   (let* ((frame (find-interrupted-frame))
-         (name (sb!di:debug-fun-name (sb!di:frame-debug-fun frame))))
-    (when (typep name '(cons (eql sb!pcl::fast-method)))
+         (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame))))
+    (when (typep name '(cons (eql sb-pcl::fast-method)))
       (decf nargs 2)))
   (restart-case
       (%program-error "invalid number of arguments: ~S" nargs)
-    #!+(or x86-64 arm64)
+    #+(or x86-64 arm64)
     (replace-function (value)
       :report (lambda (stream)
                 (format stream "Call a different function with the same arguments"))
       :interactive read-evaluated-form
-      (sb!vm::context-call-function *current-internal-error-context*
+      (sb-vm::context-call-function *current-internal-error-context*
                                     (fdefinition value)))
-    #!+(or x86-64 arm64)
+    #+(or x86-64 arm64)
     (call-form (form)
       :report (lambda (stream)
                 (format stream "Call a different form"))
       :interactive read-evaluated-form
-      (sb!vm::context-call-function *current-internal-error-context*
+      (sb-vm::context-call-function *current-internal-error-context*
                                     (lambda ()
                                       ;; Don't invoke the compiler in
                                       ;; case it's dealing with an
                                       ;; error within the compiler
-                                      (let (#!+(or sb-eval sb-fasteval)
+                                      (let (#+(or sb-eval sb-fasteval)
                                             (*evaluator-mode* :interpret))
                                         (eval form)))
                                     0))))
@@ -205,22 +205,22 @@
 
 (defun restart-unbound (symbol condition context)
   (multiple-value-bind (tn-offset pc-offset)
-      (sb!c::decode-restart-location context)
+      (sb-c::decode-restart-location context)
     (labels ((retry-value (value)
                (multiple-value-bind (type defined)
                    (info :variable :type symbol)
                  (if (and defined
                           (not (ctypep value type)))
-                     (still-bad (sb!format:tokens
+                     (still-bad (sb-format:tokens
                                  "Type mismatch when restarting unbound symbol error:~@
                                  ~s is not of type ~/sb-impl:print-type/")
                                 value type)
                      value)))
              (set-value (value &optional set-symbol)
-               (sb!di::sub-set-debug-var-slot
+               (sb-di::sub-set-debug-var-slot
                 nil tn-offset (retry-value value)
                 *current-internal-error-context*)
-               (sb!vm::incf-context-pc *current-internal-error-context*
+               (sb-vm::incf-context-pc *current-internal-error-context*
                                        pc-offset)
                (when set-symbol
                  (set symbol value))
@@ -253,12 +253,12 @@
       (try condition))))
 
 (deferr unbound-symbol-error (symbol)
-  (let* ((context (sb!di:error-context))
+  (let* ((context (sb-di:error-context))
          (condition (make-condition 'unbound-variable
                                     :name symbol
                                     :not-yet-loaded
-                                    (cond ((and (boundp 'sb!c:*lexenv*)
-                                                (sb!c:lexenv-find symbol vars))
+                                    (cond ((and (boundp 'sb-c:*lexenv*)
+                                                (sb-c:lexenv-find symbol vars))
                                            :local)))))
     (if context
         (restart-unbound symbol condition context)
@@ -271,13 +271,13 @@
 
 (deferr unseen-throw-tag-error (tag)
   (let ((text "attempt to THROW to a tag that does not exist: ~S"))
-    #!+sb-fasteval
+    #+sb-fasteval
     (when (listp tag)
       (binding* ((frame (find-interrupted-frame))
-                 (name (sb!di:debug-fun-name (sb!di:frame-debug-fun frame)))
+                 (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
                  (down (and (eq name 'throw) ; is this tautological ?
-                            (sb!di:frame-down frame)) :exit-if-null))
-        (case (sb!di:debug-fun-name (sb!di:frame-debug-fun down))
+                            (sb-di:frame-down frame)) :exit-if-null))
+        (case (sb-di:debug-fun-name (sb-di:frame-debug-fun down))
          ((return-from)
           (setq text "attempt to RETURN-FROM an exited block: ~S"
                      ;; block name was wrapped in a cons
@@ -319,7 +319,7 @@
                                (layout-proper-name type))
                               (t
                                type))
-             :context (sb!di:error-context))))
+             :context (sb-di:error-context))))
 
 (deferr layout-invalid-error (object layout)
   (error 'layout-invalid
@@ -330,14 +330,14 @@
   (%program-error "odd number of &KEY arguments"))
 
 (deferr unknown-key-arg-error (key-name)
-  (let ((context (sb!di:error-context)))
+  (let ((context (sb-di:error-context)))
     (if (integerp context)
         (restart-case
             (error 'unknown-keyword-argument :name key-name)
           (continue ()
             :report (lambda (stream)
                       (format stream "Ignore all unknown keywords"))
-            (sb!vm::incf-context-pc *current-internal-error-context*
+            (sb-vm::incf-context-pc *current-internal-error-context*
                                     context)))
         (error 'unknown-keyword-argument :name key-name))))
 
@@ -353,7 +353,7 @@
   ;; without it signalling an error is more than likely to end in a
   ;; recursive error.
   (%primitive print "Thread local storage exhausted.")
-  (sb!impl::%halt))
+  (sb-impl::%halt))
 
 (deferr failed-aver-error (form)
   (bug "~@<failed AVER: ~2I~_~S~:>" form))
@@ -363,32 +363,32 @@
 ;;; This is needed for restarting XEPs, which do not bind anything but
 ;;; also do not save their own BSP, and we need to discard the
 ;;; bindings made by the error handling machinery.
-#!+unwind-to-frame-and-call-vop
+#+unwind-to-frame-and-call-vop
 (defvar *interr-current-bsp* nil)
 
 (defun internal-error (context continuable)
   (declare (type system-area-pointer context))
   (declare (ignore continuable))
-  (let (#!+unwind-to-frame-and-call-vop
+  (let (#+unwind-to-frame-and-call-vop
         (*interr-current-bsp*
           ;; Needs to be done before anything is bound
-          (%primitive sb!c:current-binding-pointer)))
+          (%primitive sb-c:current-binding-pointer)))
     (infinite-error-protect
      (let ((alien-context (sap-alien context (* os-context-t))))
        (multiple-value-bind (error-number arguments
                              *current-internal-trap-number*)
-           (sb!vm::with-pinned-context-code-object (alien-context)
-             (sb!vm:internal-error-args alien-context))
+           (sb-vm::with-pinned-context-code-object (alien-context)
+             (sb-vm:internal-error-args alien-context))
          (with-interrupt-bindings
-           (let ((sb!debug:*stack-top-hint* (find-interrupted-frame))
+           (let ((sb-debug:*stack-top-hint* (find-interrupted-frame))
                  (*current-internal-error* error-number)
                  (*current-internal-error-args* arguments)
                  (*current-internal-error-context* alien-context)
-                 (fp (int-sap (sb!vm:context-register alien-context
-                                                      sb!vm::cfp-offset))))
+                 (fp (int-sap (sb-vm:context-register alien-context
+                                                      sb-vm::cfp-offset))))
              (if (and (>= error-number (length **internal-error-handlers**))
-                      (< error-number (length sb!c:+backend-internal-errors+)))
-                 (let ((context (sb!di:error-context)))
+                      (< error-number (length sb-c:+backend-internal-errors+)))
+                 (let ((context (sb-di:error-context)))
                    (if (typep context '(cons (eql :struct-read)))
                        ;; This was shoehorned into being a "type error"
                        ;; which isn't the best way to explain it to the user.
@@ -407,10 +407,10 @@
                                   :datum (make-unbound-marker)
                                   :expected-type (if dsd (dsd-type dsd) 't))))
                        (error 'type-error
-                              :datum (sb!di::sub-access-debug-var-slot
+                              :datum (sb-di::sub-access-debug-var-slot
                                       fp (first arguments) alien-context)
                               :expected-type
-                              (car (svref sb!c:+backend-internal-errors+
+                              (car (svref sb-c:+backend-internal-errors+
                                           error-number))
                               :context context)))
                  (let ((handler
@@ -420,7 +420,7 @@
                      ((functionp handler)
                       ;; INTERNAL-ERROR-ARGS supplies the right amount of arguments
                       (macrolet ((arg (n)
-                                   `(sb!di::sub-access-debug-var-slot
+                                   `(sb-di::sub-access-debug-var-slot
                                      fp (nth ,n arguments) alien-context)))
                         (ecase (length arguments)
                           (0 (funcall handler))
@@ -434,7 +434,7 @@
                              :format-arguments
                              (list error-number
                                    (mapcar (lambda (sc+offset)
-                                             (sb!di::sub-access-debug-var-slot
+                                             (sb-di::sub-access-debug-var-slot
                                               fp sc+offset alien-context))
                                            arguments))))
                      (t                 ; wtf?
@@ -444,26 +444,26 @@
                              (list error-number
                                    handler
                                    (mapcar (lambda (sc+offset)
-                                             (sb!di::sub-access-debug-var-slot
+                                             (sb-di::sub-access-debug-var-slot
                                               fp sc+offset alien-context))
                                            arguments))))))))))))))
 
 (defun control-stack-exhausted-error ()
-  (let ((sb!debug:*stack-top-hint* nil))
+  (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
      (format *error-output*
              "Control stack guard page temporarily disabled: proceed with caution~%")
      (error 'control-stack-exhausted))))
 
 (defun binding-stack-exhausted-error ()
-  (let ((sb!debug:*stack-top-hint* nil))
+  (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
      (format *error-output*
              "Binding stack guard page temporarily disabled: proceed with caution~%")
      (error 'binding-stack-exhausted))))
 
 (defun alien-stack-exhausted-error ()
-  (let ((sb!debug:*stack-top-hint* nil))
+  (let ((sb-debug:*stack-top-hint* nil))
     (infinite-error-protect
      (format *error-output*
              "Alien stack guard page temporarily disabled: proceed with caution~%")
@@ -485,19 +485,19 @@
   (declare (fixnum available requested))
   (infinite-error-protect
    (let ((*heap-exhausted-error-available-bytes*
-           (ash available sb!vm:n-fixnum-tag-bits))
+           (ash available sb-vm:n-fixnum-tag-bits))
          (*heap-exhausted-error-requested-bytes*
-           (ash requested sb!vm:n-fixnum-tag-bits)))
+           (ash requested sb-vm:n-fixnum-tag-bits)))
      (error *heap-exhausted-error-condition*))))
 
 (defun undefined-alien-variable-error ()
   (declare (optimize allow-non-returning-tail-call))
   (error 'undefined-alien-variable-error))
 
-#!-win32
+#-win32
 (defun memory-fault-error (context-sap address-sap)
   (declare (ignore context-sap))
-  (let ((sb!debug:*stack-top-hint* (find-interrupted-frame)))
+  (let ((sb-debug:*stack-top-hint* (find-interrupted-frame)))
     (error 'memory-fault-error
            :address (sap-int address-sap))))
 
@@ -510,4 +510,4 @@
    (let ((context (sap-alien context-sap (* os-context-t))))
      (error 'breakpoint-error
             :context context
-            :address (sap-int (sb!vm:context-pc context))))))
+            :address (sap-int (sb-vm:context-pc context))))))

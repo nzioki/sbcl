@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; utilities
 
@@ -95,7 +95,7 @@
     (link-blocks node-block next-block)))
 
 ;;; an annotated lvar's primitive-type
-#!-sb-fluid (declaim (inline lvar-ptype))
+#-sb-fluid (declaim (inline lvar-ptype))
 (defun lvar-ptype (lvar)
   (declare (type lvar lvar))
   (ir2-lvar-primitive-type (lvar-info lvar)))
@@ -325,32 +325,41 @@
   (declare (type mv-combination call))
   (setf (basic-combination-kind call) :local)
   (setf (node-tail-p call) nil)
-  (let ((args (basic-combination-args call)))
+  (let ((args (basic-combination-args call))
+        (vars (lambda-vars
+               (ref-leaf (lvar-use (basic-combination-fun call))))))
     (if (singleton-p args)
         (annotate-fixed-values-lvar
          (first args)
          (mapcar (lambda (var)
                    (cond
                      ;; Needs support from the CALL VOPs, default-unknown-values specifically
-                     #!+(or x86-64 arm64)
+                     #+(or x86-64 arm64)
                      ((not (lambda-var-refs var))
                       nil)
                      (t
                       (primitive-type (basic-var-type var)))))
-                 (lambda-vars
-                  (ref-leaf (lvar-use (basic-combination-fun call))))))
+                 vars)
+         (mapcar #'basic-var-type vars))
         (let ((types (mapcar (lambda (var)
-                               (primitive-type (basic-var-type var)))
-                             (lambda-vars
-                              (ref-leaf (lvar-use (basic-combination-fun call)))))))
+                               (cons (primitive-type (basic-var-type var))
+                                     (basic-var-type var)))
+                             vars)))
           (dolist (arg args)
-            (annotate-fixed-values-lvar
-             arg
-             (loop repeat (nth-value 1 (values-types
-                                        (lvar-derived-type arg)))
-                   collect (if types
-                               (pop types)
-                               *backend-t-primitive-type*)))))))
+            (collect ((lvar-types)
+                      (primitive-types))
+              (let ((n-values (nth-value 1 (values-types
+                                            (lvar-derived-type arg)))))
+                (loop repeat n-values
+                      for (prim-type . lvar-type) = (pop types)
+                      do
+                      (primitive-types (or prim-type
+                                           *backend-t-primitive-type*))
+                      (lvar-types (or lvar-type
+                                      *universal-type*)))
+                (annotate-fixed-values-lvar
+                 arg
+                 (primitive-types) (lvar-types))))))))
   (values))
 
 ;;; We force all the argument lvars to use the unknown values
@@ -496,7 +505,7 @@
          (flet ((type-p (value type)
                   (if (typep type '(cons (eql satisfies)))
                       (funcall (second type) value)
-                      (sb!xc:typep value type))))
+                      (sb-xc:typep value type))))
           (cond (lvar
                  (and (constant-lvar-p lvar)
                       (type-p (lvar-value lvar) (cdr restr))))
@@ -844,7 +853,7 @@
                     (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
                      (eq name (leaf-source-name funleaf))
-                     (not (sb!vm::static-fdefn-offset name))
+                     (not (sb-vm::static-fdefn-offset name))
                      (let ((info (basic-combination-fun-info call)))
                        (not (or (fun-info-ir2-convert info)
                                 (ir1-attributep (fun-info-attributes info)

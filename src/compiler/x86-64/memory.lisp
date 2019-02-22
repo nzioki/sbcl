@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun symbol-slot-ea (symbol slot)
   (ea (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
@@ -104,7 +104,7 @@
     (sc-case value
      (immediate
       (let ((k (tn-value value)))
-        (inst mov result (fixnumize (if (= k most-negative-fixnum) k (- k))))))
+        (inst mov result (fixnumize (if (= k sb-xc:most-negative-fixnum) k (- k))))))
      (t
       (move result value)
       (inst neg result)))
@@ -150,7 +150,7 @@
                    (const (if (sc-is delta immediate)
                               (fixnumize ,(if (eq inherit 'cell-xsub)
                                               `(let ((x (tn-value delta)))
-                                                 (if (= x most-negative-fixnum)
+                                                 (if (= x sb-xc:most-negative-fixnum)
                                                      x (- x)))
                                               `(tn-value delta)))))
                    (retry (gen-label)))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defconstant-eqx +policy-primary-qualities+
         #(;; ANSI standard qualities
@@ -68,7 +68,7 @@
 
 ;;; The LEXENV represents the lexical environment used for IR1 conversion.
 ;;; (This is also what shows up as an ENVIRONMENT value in macroexpansion.)
-#!-sb-fluid (declaim (inline internal-make-lexenv)) ; only called in one place
+#-sb-fluid (declaim (inline internal-make-lexenv)) ; only called in one place
 (defstruct (lexenv
              (:include abstract-lexenv)
              #-no-ansi-print-object

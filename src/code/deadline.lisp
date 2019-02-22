@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (declaim (inline make-deadline))
 (defstruct (deadline
@@ -32,7 +32,7 @@
 (declaim (inline seconds-to-internal-time))
 (defun seconds-to-internal-time (seconds)
   (the internal-time
-       (values (truncate (* seconds sb!xc:internal-time-units-per-second)))))
+       (values (truncate (* seconds sb-xc:internal-time-units-per-second)))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute) ; for "#."
 (defconstant safe-internal-seconds-limit
@@ -43,8 +43,8 @@
     ;;
     ;; doesn't go beyond the INTERNAL-TIME range due to rounding
     ;; errors.
-    (floor (ash 1 (1- sb!kernel::internal-time-bits))
-           sb!xc:internal-time-units-per-second)))
+    (floor (ash 1 (1- sb-kernel::internal-time-bits))
+           sb-xc:internal-time-units-per-second)))
 
 (declaim (inline seconds-to-maybe-internal-time))
 (defun seconds-to-maybe-internal-time (seconds)
@@ -111,10 +111,10 @@ Experimental."
 (declaim (inline decode-internal-time))
 (defun decode-internal-time (time)
   "Returns internal time value TIME decoded into seconds and microseconds."
-  (declare (type sb!kernel:internal-time time))
+  (declare (type sb-kernel:internal-time time))
   (multiple-value-bind (sec frac)
-      (truncate time sb!xc:internal-time-units-per-second)
-    (values sec (* frac sb!unix::micro-seconds-per-internal-time-unit))))
+      (truncate time sb-xc:internal-time-units-per-second)
+    (values sec (* frac sb-unix::micro-seconds-per-internal-time-unit))))
 
 (defun signal-timeout (datum &rest arguments)
   "Signals a timeout condition while inhibiting further timeouts due to
@@ -143,7 +143,7 @@ for calling this when a deadline is reached."
           (defer-deadline (&optional (seconds seconds))
             :report "Defer the deadline for SECONDS more."
             :interactive (lambda ()
-                           (sb!int:read-evaluated-form
+                           (read-evaluated-form
                             "By how many seconds shall the deadline ~
                              be deferred?: "))
             (setf *deadline*
@@ -174,7 +174,7 @@ CONDITION, or return NIL if the restart is not found."
 ABS-SEC and ABS-USEC and current real time.
 
 If ABS-SEC and ABS-USEC are in the past, 0 0 is returned."
-  (declare (type sb!kernel:internal-seconds abs-sec)
+  (declare (type sb-kernel:internal-seconds abs-sec)
            (type (mod 1000000) abs-usec))
   (binding* (((now-sec now-usec)
               (decode-internal-time (get-internal-real-time)))
@@ -197,9 +197,9 @@ If ABS-SEC and ABS-USEC are in the past, 0 0 is returned."
 ;;; If SECONDS is NIL and there is no *DEADLINE* all returned values
 ;;; are NIL.
 (declaim (ftype (function ((or null (real 0)))
-                          (values (or null sb!kernel:internal-seconds)
+                          (values (or null sb-kernel:internal-seconds)
                                   (or null (mod 1000000))
-                                  (or null sb!kernel:internal-seconds)
+                                  (or null sb-kernel:internal-seconds)
                                   (or null (mod 1000000))
                                   t))
                 decode-timeout))

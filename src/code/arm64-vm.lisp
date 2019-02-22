@@ -1,6 +1,6 @@
 ;;; This file contains the ARM specific runtime stuff.
 ;;;
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 #-sb-xc-host
 (defun machine-type ()
@@ -15,7 +15,7 @@
 (defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
-  (unless (zerop (rem offset sb!assem:+inst-alignment-bytes+))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
     (ecase kind
@@ -83,7 +83,7 @@
     (declare (type system-area-pointer pc))
     (if (= trap-number invalid-arg-count-trap)
         (values error-number '(#.arg-count-sc) trap-number)
-        (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number error-number))))
+        (sb-kernel::decode-internal-error-args (sap+ pc 4) trap-number error-number))))
 ) ; end PROGN
 
 ;;; Undo the effects of XEP-ALLOCATE-FRAME
