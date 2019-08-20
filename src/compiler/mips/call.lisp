@@ -119,7 +119,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
+    (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Compute CODE from the address of this entry point.
     (let ((entry-point (gen-label)))
@@ -766,7 +766,7 @@ default-value-8
                     (inst nop)
                     ;; CONTEXT-PC will be pointing here when the
                     ;; interrupt is handled, not after the BREAK.
-                    (note-this-location vop :step-before-vop)
+                    (note-this-location vop :internal-error)
                     (inst break (reg-tn-encoding callable-tn)
                           single-step-around-trap)
                     (emit-label step-done-label))))
@@ -777,11 +777,11 @@ default-value-8
                     (descriptor-reg (move name-pass name))
                     (control-stack
                      (inst lw name-pass cfp-tn
-                           (ash (tn-offset name) word-shift))
+                           (tn-byte-offset name))
                      (do-next-filler))
                     (constant
                      (inst lw name-pass code-tn
-                           (- (ash (tn-offset name) word-shift)
+                           (- (tn-byte-offset name)
                               other-pointer-lowtag))
                      (do-next-filler)))
                   ;; The step instrumenting must be done after
@@ -797,11 +797,11 @@ default-value-8
                     (descriptor-reg (move lexenv arg-fun))
                     (control-stack
                      (inst lw lexenv cfp-tn
-                           (ash (tn-offset arg-fun) word-shift))
+                           (tn-byte-offset arg-fun))
                      (do-next-filler))
                     (constant
                      (inst lw lexenv code-tn
-                           (- (ash (tn-offset arg-fun) word-shift)
+                           (- (tn-byte-offset arg-fun)
                               other-pointer-lowtag))
                      (do-next-filler)))
                   (inst lw function lexenv
@@ -813,7 +813,7 @@ default-value-8
                   ;; is calculated.
                   (insert-step-instrumenting function)
                   (inst addu entry-point function
-                        (- (ash simple-fun-code-offset word-shift)
+                        (- (ash simple-fun-insts-offset word-shift)
                            fun-pointer-lowtag))))
                (:direct
                 `((inst lw entry-point null-tn (static-fun-offset fun)))))
@@ -1255,7 +1255,7 @@ default-value-8
     (inst nop)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,
     ;; not after the BREAK.
-    (note-this-location vop :step-before-vop)
+    (note-this-location vop :internal-error)
     ;; CALLEE-REGISTER-OFFSET isn't needed for before-traps, so we
     ;; can just use a bare SINGLE-STEP-BEFORE-TRAP as the code.
     (inst break 0 single-step-before-trap)

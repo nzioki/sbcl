@@ -6,6 +6,7 @@
 #include "sbcl.h"
 #include "lispregs.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/fdefn.h"
 #include "genesis/simple-fun.h"
 #include "genesis/return-pc.h"
@@ -111,7 +112,7 @@ call_into_lisp:
 
 	/* Indirect the closure */
 	ldw	CLOSURE_FUN_OFFSET(0,reg_LEXENV),reg_CODE
-  addi  SIMPLE_FUN_CODE_OFFSET,reg_CODE,reg_LIP
+  addi  SIMPLE_FUN_INSTS_OFFSET,reg_CODE,reg_LIP
 
 #ifdef LISP_FEATURE_HPUX
   /*  Get the stub address, ie assembly-routine return-from-lisp */
@@ -450,7 +451,7 @@ SingleStepTraps:
 	.align	8
 	.export fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.word	RETURN_PC_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	/* multiple value return point -- just jump to trap. */
 	b,n	fun_end_breakpoint_trap
 	/* single value return point -- convert to multiple w/ n=1 */

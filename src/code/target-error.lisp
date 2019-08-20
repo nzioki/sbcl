@@ -224,25 +224,32 @@ with that condition (or with no condition) will be returned."
           (funcall function condition)))))
 
 
-(defun assert-error (assertion &optional args-and-values places datum &rest arguments)
-  (let ((cond (if datum
-                  (apply #'coerce-to-condition
-                         datum 'simple-error 'error arguments)
-                  (make-condition
-                   'simple-error
-                   :format-control "~@<The assertion ~S failed~:[.~:; ~
-                                    with ~:*~{~{~S = ~S~}~^, ~}.~]~:@>"
-                   :format-arguments (list assertion args-and-values)))))
-    (restart-case
-        (error cond)
-      (continue ()
-        :report (lambda (stream)
-                  (format stream "Retry assertion")
-                  (if places
-                      (format stream " with new value~P for ~{~S~^, ~}."
-                              (length places) places)
-                      (format stream ".")))
-        nil))))
+(defun assert-error (assertion &rest rest)
+  (let* ((rest rest)
+         (n-args-and-values (if (fixnump (car rest))
+                                (* (pop rest) 2)
+                                0))
+         (args-and-values (subseq rest 0 n-args-and-values)))
+    (destructuring-bind (&optional places datum &rest arguments)
+        (subseq rest n-args-and-values)
+      (let ((cond (if datum
+                      (apply #'coerce-to-condition
+                             datum 'simple-error 'error arguments)
+                      (make-condition
+                       'simple-error
+                       :format-control "~@<The assertion ~S failed~:[.~:; ~
+                                           with ~:*~{~S = ~S~^, ~}.~]~:@>"
+                       :format-arguments (list assertion args-and-values)))))
+        (restart-case
+            (error cond)
+          (continue ()
+            :report (lambda (stream)
+                      (format stream "Retry assertion")
+                      (if places
+                          (format stream " with new value~P for ~{~S~^, ~}."
+                                  (length places) places)
+                          (format stream ".")))
+            nil))))))
 
 ;;; READ-EVALUATED-FORM is used as the interactive method for restart cases
 ;;; setup by the Common Lisp "casing" (e.g., CCASE and CTYPECASE) macros
@@ -250,16 +257,27 @@ with that condition (or with no condition) will be returned."
 (defun read-evaluated-form (&optional (prompt-control nil promptp)
                             &rest prompt-args)
   (apply #'format *query-io*
-         (if promptp prompt-control "~&Type a form to be evaluated: ")
+         (if promptp prompt-control "~&Enter a form to be evaluated: ")
          prompt-args)
   (finish-output *query-io*)
   (list (eval (read *query-io*))))
 
+(defun read-evaluated-form-of-type (type &optional (prompt-control nil promptp)
+                                    &rest prompt-args)
+  (loop (apply #'format *query-io*
+               (if promptp prompt-control "~&Enter a form evaluating to a value of type ~a: ")
+               (if promptp prompt-args (list type)))
+        (finish-output *query-io*)
+        (let ((result (eval (read *query-io*))))
+          (when (typep result type)
+            (return (list result)))
+          (format *query-io* "~s is not of type ~s" result type))))
+
 ;;; Same as above but returns multiple values
 (defun mv-read-evaluated-form (&optional (prompt-control nil promptp)
-                            &rest prompt-args)
+                               &rest prompt-args)
   (apply #'format *query-io*
-         (if promptp prompt-control "~&Type a form to be evaluated: ")
+         (if promptp prompt-control "~&Enter a form to be evaluated: ")
          prompt-args)
   (finish-output *query-io*)
   (multiple-value-list (eval (read *query-io*))))

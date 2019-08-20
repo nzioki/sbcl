@@ -88,6 +88,10 @@
 ;; is in the collection specified by the second arg.
 (defknown %other-pointer-subtype-p (t list) boolean
   (movable foldable flushable always-translatable))
+
+;;; Predicates that don't accept T for the first argument type
+(defknown (float-infinity-p float-nan-p float-infinity-or-nan-p)
+  (float) boolean (movable foldable flushable))
 
 ;;;; miscellaneous "sub-primitives"
 
@@ -149,6 +153,11 @@
 ;;; This unconventional setter returns its first arg, not the newval.
 (defknown set-header-data
     (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) t)
+;;; Perform a bitwise OR or AND-not of the existing header data with
+;;; the new bits and return no value.
+(defknown (set-header-bits unset-header-bits)
+  (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (values)
+  ())
 #+64-bit
 (progn
 (defknown sb-vm::get-header-data-high (t) (unsigned-byte 32) (flushable))
@@ -183,7 +192,7 @@
   ())
 (defknown %set-funcallable-instance-layout (funcallable-instance layout) layout
   ())
-(defknown %instance-length (instance) index
+(defknown %instance-length (instance) (integer 0 #.sb-vm:short-header-max-words)
   (foldable flushable))
 (defknown %instance-cas (instance index t t) t ())
 (defknown %instance-ref (instance index) t
@@ -236,7 +245,8 @@
 ;;; Allocate an unboxed, non-fancy vector with type code TYPE, length LENGTH,
 ;;; and WORDS words long. Note: it is your responsibility to ensure that the
 ;;; relation between LENGTH and WORDS is correct.
-(defknown allocate-vector ((unsigned-byte 8) index
+;;; The extra bit beyond N_WIDETAG_BITS is for the vector weakness flag.
+(defknown allocate-vector ((unsigned-byte 9) index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
                            (and index
@@ -260,6 +270,13 @@
 
 (defknown make-weak-pointer (t) weak-pointer
   (flushable))
+
+(defknown make-weak-vector (index &key (:initial-element t)
+                                       (:initial-contents t))
+  simple-vector (flushable)
+  :derive-type (lambda (call)
+                 (derive-make-array-type (first (combination-args call))
+                                         't nil nil nil call)))
 
 (defknown %make-complex (real real) complex
   (flushable movable))
@@ -353,8 +370,11 @@
     system-area-pointer
     (flushable))
 
-(defknown ensure-symbol-tls-index (symbol) (and fixnum unsigned-byte))
-
+#+sb-thread
+(progn (defknown ensure-symbol-tls-index (symbol)
+         (and fixnum unsigned-byte)) ; not flushable
+       (defknown symbol-tls-index (symbol)
+         (and fixnum unsigned-byte) (flushable)))
 
 ;;;; debugger support
 
@@ -439,8 +459,7 @@
   (values bignum-element-type bignum-element-type)
   (foldable flushable movable))
 
-(defknown %fixnum-digit-with-correct-sign (bignum-element-type)
-  (signed-byte #.sb-vm:n-word-bits)
+(defknown %fixnum-digit-with-correct-sign (bignum-element-type) sb-vm:signed-word
   (foldable flushable movable))
 
 (defknown (%ashl %ashr %digit-logical-shift-right)
@@ -527,7 +546,7 @@
 (defknown %set-funcallable-instance-info (function index t) t ())
 
 #+sb-fasteval
-(defknown sb-interpreter:fun-proto-fn (sb-interpreter:interpreted-function)
+(defknown sb-interpreter:fun-proto-fn (interpreted-function)
   sb-interpreter::interpreted-fun-prototype (flushable))
 
 
@@ -552,8 +571,11 @@
   (movable foldable flushable))
 
 #+64-bit
+(progn
+(defknown %make-double-float ((signed-byte 64)) double-float
+  (movable flushable))
 (defknown double-float-bits (double-float) (signed-byte 64)
-  (movable foldable flushable))
+  (movable foldable flushable)))
 
 (defknown double-float-high-bits (double-float) (signed-byte 32)
   (movable foldable flushable))
@@ -566,33 +588,33 @@
   (movable foldable flushable))
 
 (defknown (%sin %cos %tanh %sin-quick %cos-quick)
-  (double-float) (double-float -1.0d0 1.0d0)
+  (double-float) (double-float $-1.0d0 $1.0d0)
   (movable foldable flushable))
 
 (defknown (%asin %atan)
   (double-float)
-  (double-float #.(coerce (- (/ pi 2)) 'double-float)
-                #.(coerce (/ pi 2) 'double-float))
+  (double-float #.(coerce (sb-xc:- (sb-xc:/ sb-xc:pi 2)) 'double-float)
+                #.(coerce (sb-xc:/ sb-xc:pi 2) 'double-float))
   (movable foldable flushable))
 
 (defknown (%acos)
-  (double-float) (double-float 0.0d0 #.(coerce pi 'double-float))
+  (double-float) (double-float $0.0d0 #.(coerce sb-xc:pi 'double-float))
   (movable foldable flushable))
 
 (defknown (%cosh)
-  (double-float) (double-float 1.0d0)
+  (double-float) (double-float $1.0d0)
   (movable foldable flushable))
 
 (defknown (%acosh %exp %sqrt)
-  (double-float) (double-float 0.0d0)
+  (double-float) (double-float $0.0d0)
   (movable foldable flushable))
 
 (defknown %expm1
-  (double-float) (double-float -1d0)
+  (double-float) (double-float $-1d0)
   (movable foldable flushable))
 
 (defknown (%hypot)
-  (double-float double-float) (double-float 0d0)
+  (double-float double-float) (double-float $0d0)
   (movable foldable flushable))
 
 (defknown (%pow)
@@ -601,8 +623,8 @@
 
 (defknown (%atan2)
   (double-float double-float)
-  (double-float #.(coerce (- pi) 'double-float)
-                #.(coerce pi 'double-float))
+  (double-float #.(coerce (sb-xc:- sb-xc:pi) 'double-float)
+                #.(coerce sb-xc:pi 'double-float))
   (movable foldable flushable))
 
 (defknown (%scalb)

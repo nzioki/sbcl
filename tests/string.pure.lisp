@@ -11,8 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package "CL-USER")
-
 ;;; basic non-destructive case operations
 (with-test (:name (string-upcase string-downcase string-capitalize :smoke))
   (assert (string= (string-upcase     "This is a test.") "THIS IS A TEST."))
@@ -209,3 +207,8 @@
                        expected))))
     (check 'string-equal     t)
     (check 'string-not-equal nil)))
+
+(with-test (:name :write-to-string-base-stringize)
+  (let ((result (funcall (checked-compile `(lambda (x) (write-to-string x))) 33d0)))
+    (assert (equal result "33.0d0"))
+    (assert (typep result 'simple-base-string))))

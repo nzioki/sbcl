@@ -60,32 +60,41 @@
 #+#.(cl:if (cl:find-package "HOST-SB-POSIX") '(and) '(or))
 (defun parallel-make-host-1 (max-jobs)
   (let ((subprocess-count 0)
-        (subprocess-list nil))
+        (subprocess-list nil)
+        stop)
     (flet ((wait ()
              (multiple-value-bind (pid status) (host-sb-posix:wait)
                (format t "~&; Subprocess ~D exit status ~D~%"  pid status)
+               (unless (zerop status)
+                 (setf stop t))
                (setq subprocess-list (delete pid subprocess-list)))
              (decf subprocess-count)))
-      (do-stems-and-flags (stem flags 1)
-        (unless (position :not-host flags)
-          (when (>= subprocess-count max-jobs)
-            (wait))
-          (let ((pid (host-sb-posix:fork)))
-            (when (zerop pid)
-              (in-host-compilation-mode
-               (lambda () (compile-stem stem flags :host-compile)))
-              ;; FIXME: convey exit code based on COMPILE result.
-              (sb-cold::exit-process 0))
-            (push pid subprocess-list)
-            (incf subprocess-count)
-            ;; Do not wait for the compile to finish. Just load as source.
-            (let ((source (merge-pathnames (stem-remap-target stem)
-                                           (make-pathname :type "lisp"))))
-              (let ((host-sb-ext:*evaluator-mode* :interpret))
-                (in-host-compilation-mode
-                 (lambda ()
-                   (load source :verbose t :print nil))))))))
-      (loop (if (plusp subprocess-count) (wait) (return)))))
+      (host-sb-ext:disable-debugger)
+      (unwind-protect
+           (do-stems-and-flags (stem flags 1)
+             (unless (position :not-host flags)
+               (when (>= subprocess-count max-jobs)
+                 (wait))
+               (when stop
+                 (return))
+               (let ((pid (host-sb-posix:fork)))
+                 (when (zerop pid)
+                   (in-host-compilation-mode
+                    (lambda () (compile-stem stem flags :host-compile)))
+                   ;; FIXME: convey exit code based on COMPILE result.
+                   (sb-cold::exit-process 0))
+                 (push pid subprocess-list)
+                 (incf subprocess-count)
+                 ;; Do not wait for the compile to finish. Just load as source.
+                 (let ((source (merge-pathnames (stem-remap-target stem)
+                                                (make-pathname :type "lisp"))))
+                   (let ((host-sb-ext:*evaluator-mode* :interpret))
+                     (in-host-compilation-mode
+                      (lambda ()
+                        (load source :verbose t :print nil))))))))
+        (loop (if (plusp subprocess-count) (wait) (return)))
+        (when stop
+          (sb-cold::exit-process 1)))))
 
   ;; We want to load compiled files, because that's what this function promises.
   ;; Reloading is tricky because constructors for interned ctypes will construct
@@ -94,14 +103,7 @@
   ;; So wipe everything out that causes problems down the line.
   ;; (Or perhaps we could make their effects idempotent)
   (format t "~&; Parallel build: Clearing globaldb~%")
-  (do-all-symbols (s)
-    (when (get s :sb-xc-globaldb-info)
-      (remf (symbol-plist s) :sb-xc-globaldb-info)))
-  (fill (symbol-value 'sb-impl::*info-types*) nil)
-  (clrhash (symbol-value 'sb-kernel::*forward-referenced-layouts*))
-  (setf (symbol-value 'sb-kernel:*type-system-initialized*) nil)
-  (makunbound 'sb-c::*backend-primitive-type-names*)
-  (makunbound 'sb-c::*backend-primitive-type-aliases*)
+  (funcall (intern "ANNIHILATE-GLOBALDB" "SB-C"))
 
   (format t "~&; Parallel build: Reloading compilation artifacts~%")
   ;; Now it works to load fasls.
@@ -129,13 +131,32 @@
   ;; routines.
   (if (and (make-host-1-parallelism)
            (eq load-or-cload-stem #'host-cload-stem))
-      (funcall (intern "PARALLEL-MAKE-HOST-1" 'sb-cold)
-               (make-host-1-parallelism))
-      (do-stems-and-flags (stem flags 1)
-        (unless (find :not-host flags)
-          (funcall load-or-cload-stem stem flags)
-          (when (member :sb-show sb-xc:*features*)
-            (warn-when-cl-snapshot-diff *cl-snapshot*)))))
+      (progn
+        ;; Multiprocess build uses the in-memory math ops cache but not
+        ;; the persistent cache file because we don't need each child
+        ;; to be forced to read the file. Moreover, newly inserted values
+        ;; can not propagate back to this process. And we can't read the
+        ;; file up front because the reading function - though simple -
+        ;; isn't defined until we compile src/code/cross-float.
+        (funcall (intern "PARALLEL-MAKE-HOST-1" 'sb-cold)
+                 (make-host-1-parallelism))
+        ;; Flush the math ops cache. Why: loading fasls after parallel compile
+        ;; causes some entries to be inserted, but without first prefilling
+        ;; the cache from disk. Thus we have an incorrect opinion of whether the
+        ;; in-memory view has strictly more values than on disk. This would cause
+        ;; WITH-MATH-JOURNAL around loading of the "tests/*.before-xc.lisp" files
+        ;; to behave wrong. It would initially observe the cache to have N (say 50)
+        ;; entries instead of the much larger number of disk entries. Then after
+        ;; the tests, it would observe a few more (say 70 total) entries, which,
+        ;; because it is more, completely overwrite the disk cache that should have
+        ;; had over 500 entries. So it would lose entries. CLRHASH fixes that.
+        (clrhash *math-ops-memoization*))
+      (with-math-journal
+       (do-stems-and-flags (stem flags 1)
+         (unless (find :not-host flags)
+           (funcall load-or-cload-stem stem flags)
+           (when (member :sb-show sb-xc:*features*)
+             (funcall 'warn-when-cl-snapshot-diff *cl-snapshot*))))))
 
   ;; If the cross-compilation host is SBCL itself, we can use the
   ;; PURIFY extension to freeze everything in place, reducing the

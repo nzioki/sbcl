@@ -296,7 +296,7 @@ happens. Server returns T if something happened and NIL otherwise. Timeout
            (decode-internal-time
             (seconds-to-internal-time *periodic-polling-period*))
          (if to-sec
-             (loop repeat (/ (+ to-sec (/ to-usec 1e6))
+             (loop repeat (/ (+ to-sec (/ to-usec $1e6))
                              *periodic-polling-period*)
                    thereis (sub-sub-serve-event p-sec p-usec)
                    do (funcall *periodic-polling-function*))
@@ -338,8 +338,7 @@ happens. Server returns T if something happened and NIL otherwise. Timeout
                                     (addr read-fds)
                                     (addr write-fds)
                                     nil to-sec to-usec)
-        #+win32
-        (declare (ignore err))
+        (declare (ignorable err)) ; unused if win32
         ;; Now see what it was (if anything)
         (cond ((not value)
                ;; Interrupted or one of the file descriptors is bad.

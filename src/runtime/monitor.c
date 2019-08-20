@@ -331,11 +331,8 @@ print_context(os_context_t *context)
 
     for (i = 0; i < NREGS; i++) {
         printf("%s:\t", lisp_register_names[i]);
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-        brief_print((lispobj)(*os_context_register_addr(context, i*2)));
-#else
         brief_print((lispobj)(*os_context_register_addr(context,i)));
-#endif
+
     }
 #if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_PPC)
     printf("DAR:\t\t 0x%08lx\n", (unsigned long)(*os_context_register_addr(context, 41)));
@@ -493,7 +490,7 @@ ldb_monitor()
 {
     jmp_buf oldbuf;
 
-    bcopy(curbuf, oldbuf, sizeof(oldbuf));
+    memcpy(oldbuf, curbuf, sizeof(oldbuf));
 
     printf("Welcome to LDB, a low-level debugger for the Lisp runtime environment.\n");
 
@@ -503,7 +500,7 @@ ldb_monitor()
 
     done = 0;
 
-    bcopy(oldbuf, curbuf, sizeof(curbuf));
+    memcpy(curbuf, oldbuf, sizeof(curbuf));
 }
 
 void

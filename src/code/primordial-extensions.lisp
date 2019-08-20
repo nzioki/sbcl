@@ -95,6 +95,7 @@
       (sb-xc:gensym (symbol-name x))
       (sb-xc:gensym)))
 
+(eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
 (labels ((symbol-concat (package &rest things)
            (dx-let ((strings (make-array (length things)))
                     (length 0)
@@ -147,7 +148,7 @@
   ;; consistency with the above would not be particularly enlightening
   ;; as to how it isn't just GENSYMIFY]
   (defun gensymify* (&rest things)
-    (apply #'symbol-concat nil things)))
+    (apply #'symbol-concat nil things))))
 
 ;;; Access *PACKAGE* in a way which lets us recover when someone has
 ;;; done something silly like (SETF *PACKAGE* :CL-USER) in unsafe code.
@@ -244,6 +245,13 @@
 (defun ensure-list (thing)
   (if (listp thing) thing (list thing)))
 
+(defun recons (old-cons car cdr)
+  "If CAR is eq to the car of OLD-CONS and CDR is eq to the CDR, return
+  OLD-CONS, otherwise return (cons CAR CDR)."
+  (if (and (eq car (car old-cons)) (eq cdr (cdr old-cons)))
+      old-cons
+      (cons car cdr)))
+
 ;;; Anaphoric macros
 (defmacro awhen (test &body body)
   `(let ((it ,test))
@@ -261,6 +269,28 @@
                       `(let ((it ,it)) (declare (ignorable it)) ,@body)
                       it)
                  (acond ,@rest)))))))
+
+;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
+;;; Otherwise, evaluate DEFAULT, store the resulting value in
+;;; HASH-TABLE and return two values: 1) the result of evaluating
+;;; DEFAULT 2) NIL.
+;;; If ATOMICP is true, perform the lookup and potential update
+;;; atomically.
+(defmacro ensure-gethash (key hash-table &optional default atomicp)
+  (check-type atomicp boolean)
+  (with-unique-names (n-key n-hash-table value foundp)
+    (flet ((probe-and-update (&optional update)
+             `(multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
+                (if ,foundp
+                    (values ,value t)
+                    ,(or update
+                         `(values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
+      `(let ((,n-key ,key)
+             (,n-hash-table ,hash-table))
+         ,(if atomicp
+              (probe-and-update `(with-locked-system-table (,n-hash-table)
+                                   ,(probe-and-update)))
+              (probe-and-update))))))
 
 ;; This is not an 'extension', but is needed super early, so ....
 (defmacro sb-xc:defconstant (name value &optional (doc nil docp))

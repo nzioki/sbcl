@@ -229,18 +229,24 @@
      %%data-vector-setters/check-bounds%%))
   #'equalp)
 
-;;; Number of entries in the thread local storage. Limits the number
-;;; of symbols with thread local bindings.
-(defconstant tls-size 4096)
 ;;; Refer to the lengthy comment in 'src/runtime/interrupt.h' about
 ;;; the choice of this number. Rather than have to two copies
 ;;; of the comment, please see that file before adjusting this.
 (defconstant max-interrupts 1024)
+;;; Thread slots accessed at negative indices relative to struct thread.
+;;; These slots encroach on the interrupt contexts- the maximum that
+;;; can actually be stored is decreased by this amount.
+;;; sb-safepoint puts the safepoint page immediately preceding the
+;;; thread structure, so this trick doesn't work.
+(defconstant thread-header-slots
+  (+ #+(and x86-64 (not sb-safepoint)) 16))
 
 #+gencgc
 (progn
   (defconstant +highest-normal-generation+ 5)
   (defconstant +pseudo-static-generation+ 6))
+
+(defparameter *runtime-asm-routines* nil)
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

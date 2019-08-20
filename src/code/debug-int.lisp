@@ -477,17 +477,16 @@
 
 ;;;; frames
 
-;;; This is used in FIND-ESCAPED-FRAME and with the bogus components
-;;; and LRAs used for :FUN-END breakpoints. When a component's
-;;; debug-info slot is :BOGUS-LRA, then the REAL-LRA-SLOT contains the
-;;; real component to continue executing, as opposed to the bogus
-;;; component which appeared in some frame's LRA location.
-(defconstant real-lra-slot
-  ;; FIXME: this isn't really right, because the 'fixups' slot
-  ;; is already accounted for in the fixed part of the code header.
-  ;; X86 stores a fixup vector at the first constant slot
-  #-x86 sb-vm:code-constants-offset
-  #+x86 (1+ sb-vm:code-constants-offset))
+;;; This is used in FIND-ESCAPED-FRAME and with the "breakpoint return" objects
+;;; and LRAs used for :FUN-END breakpoints. When a code object's
+;;; debug-info slot is :BPT-LRA, then the REAL-LRA-SLOT contains the
+;;; real location to continue executing, as opposed to the intermediary object
+;;; which appeared in some frame's LRA location.
+;;; NB: If you change change REAL-LRA-SLOT, then you must also change
+;;; "#define REAL_LRA_SLOT" in breakpoint.c. These have unfortunately
+;;; different values, because this slot is relative to the object base
+;;; address, whereas the one in C is an index into code->constants.
+(defconstant real-lra-slot sb-vm:code-constants-offset)
 
 #-sb-fluid (declaim (inline control-stack-pointer-valid-p))
 (defun control-stack-pointer-valid-p (x &optional (aligned t))
@@ -605,15 +604,12 @@
 
 (defun compute-lra-data-from-pc (pc)
   (declare (type system-area-pointer pc))
+  ;; While theoretically we should inhibit GC any time we search the heap,
+  ;; in practice this function can only be called for code that is somewhere
+  ;; on the stack, and therefore conservatively pinned.
   (let ((code (code-header-from-pc pc)))
-    (when code
-       (let* ((code-header-len (* (code-header-words code) sb-vm:n-word-bytes))
-              (pc-offset (- (sap-int pc)
-                            (- (get-lisp-obj-address code)
-                               sb-vm:other-pointer-lowtag)
-                            code-header-len)))
-         ;;(format t "c-lra-fpc ~A ~A ~A~%" pc code pc-offset)
-         (values pc-offset code)))))
+    (values (if code (sap- pc (code-instructions code)) nil)
+            code)))
 
 ;;; Check for a valid return address - it could be any valid C/Lisp
 ;;; address.
@@ -680,8 +676,7 @@
 
 (defun walk-binding-stack (symbol function)
   (let* (#+sb-thread
-         (tls-index #+sb-thread
-                    (get-lisp-obj-address (symbol-tls-index symbol)))
+         (tls-index (symbol-tls-index symbol))
          (current-value
            #+sb-thread
            (sap-ref-lispobj (sb-thread::current-thread-sap) tls-index)
@@ -853,7 +848,7 @@
                           nil)))
             (find-escaped-frame caller))
       (if (and (code-component-p code)
-               (eq (%code-debug-info code) :bogus-lra))
+               (eq (%code-debug-info code) :bpt-lra))
           (let ((real-lra (code-header-ref code real-lra-slot)))
             (compute-calling-frame caller real-lra up-frame))
           (let ((d-fun (case code
@@ -889,10 +884,9 @@
       (cond (code
              ;; If it's escaped it may be a function end breakpoint trap.
              (when (and (code-component-p code)
-                        (eq (%code-debug-info code) :bogus-lra))
-               ;; If :bogus-lra grab the real lra.
-               (setq pc-offset (code-header-ref
-                                code (1+ real-lra-slot)))
+                        (eq (%code-debug-info code) :bpt-lra))
+               ;; If :bpt-lra grab the real lra.
+               (setq pc-offset (code-header-ref code (1+ real-lra-slot)))
                (setq code (code-header-ref code real-lra-slot))
                (aver code)))
             ((not escaped)
@@ -926,9 +920,9 @@
 
 (defun nth-interrupt-context (n)
   (declare (muffle-conditions compiler-note))
-  (declare (type (mod #.sb-vm::max-interrupts) n)
+  (declare (type (mod #.(- sb-vm:max-interrupts sb-vm::thread-header-slots)) n)
            (optimize (speed 3) (safety 0)))
-  (let* ((n (- -1 n
+  (let* ((n (- -1 (+ sb-vm::thread-header-slots n)
                #+sb-safepoint
                ;; the C safepoint page
                (/ sb-c:+backend-page-bytes+ n-word-bytes)))
@@ -947,10 +941,6 @@
   (find-dynamic-foreign-symbol-address name)
   #-sb-dynamic-core
   (foreign-symbol-address name))
-
-;;;; See above.
-(defun static-foreign-symbol-sap (name)
-  (int-sap (static-foreign-symbol-address name)))
 
 (defun catch-runaway-unwind (block)
   (declare (ignorable block))
@@ -981,17 +971,16 @@
 
 (defun code-pc-offset (pc code)
   (declare (type code-component code))
-  (let ((code-header-len (* (code-header-words code)
-                            n-word-bytes)))
-    (with-pinned-objects (code)
-      (let ((pc-offset (- (sap-int pc)
-                          (- (get-lisp-obj-address code)
-                             other-pointer-lowtag)
-                          code-header-len))
-            (code-size (%code-text-size code)))
-        (values pc-offset
-                (<= 0 pc-offset code-size)
-                code-size)))))
+  ;; We wrap WITH-PINNED-OBJECTS around CODE, but in truth this can go wrong if the
+  ;; code was transported after taking a PC and before getting here. i.e. there is
+  ;; nothing to be gained by arranging that while we calculate CODE-INSTRUCTIONS
+  ;; the code can't move if it already moved.
+  ;; The precisely GCed backends would be a lot more correct with respect to
+  ;; debug-related stuff if we just never move code that is on-stack.
+  (let ((pc-offset (with-pinned-objects (code)
+                     (sap- pc (code-instructions code))))
+        (code-size (%code-text-size code)))
+    (values pc-offset (<= 0 pc-offset code-size) code-size)))
 
 (defun context-code-pc-offset (context code)
   (code-pc-offset (context-pc context) code))
@@ -1078,9 +1067,8 @@
               (setf pc-offset 0))))
         (/noshow0 "returning from FIND-ESCAPED-FRAME")
         (return
-          (if (eq (%code-debug-info code) :bogus-lra)
-              (let ((real-lra (code-header-ref code
-                                               real-lra-slot)))
+          (if (eq (%code-debug-info code) :bpt-lra)
+              (let ((real-lra (code-header-ref code real-lra-slot)))
                 (values (lra-code-header real-lra)
                         (get-header-data real-lra)
                         nil))
@@ -1167,37 +1155,31 @@ register."
 ;;;; frame utilities
 
 (defun compiled-debug-fun-from-pc (debug-info pc &optional escaped)
-  (let* ((fun-map (sb-c::compiled-debug-info-fun-map debug-info))
-         (len (length fun-map)))
-    (declare (type simple-vector fun-map))
-    (if (= len 1)
-        (svref fun-map 0)
-        (let* ((i 1)
-               (first-elsewhere-pc (sb-c::compiled-debug-fun-elsewhere-pc
-                                    (svref fun-map 0)))
+  (let* ((fun-map (sb-c::compiled-debug-info-fun-map debug-info)))
+    (if (sb-c::compiled-debug-fun-next fun-map)
+        (let* ((first-elsewhere-pc (sb-c::compiled-debug-fun-elsewhere-pc fun-map))
                (elsewhere-p
                  (if escaped ;; See the comment below
                      (>= pc first-elsewhere-pc)
                      (> pc first-elsewhere-pc))))
-          (declare (type index i))
-          (loop
-           (when (or (= i len)
-                     (let ((next-pc (if elsewhere-p
-                                        (sb-c::compiled-debug-fun-elsewhere-pc
-                                         (svref fun-map (1+ i)))
-                                        (svref fun-map i))))
-                       (if escaped
-                           (< pc next-pc)
-                           ;; Non-escaped frame means that this frame calls something.
-                           ;; And the PC points to where something should return.
-                           ;; The return adress may be in the next
-                           ;; function, e.g. in local tail calls the
-                           ;; function will be entered just after the
-                           ;; CALL.
-                           ;; See debug.impure.lisp/:local-tail-call for a test-case
-                           (<= pc next-pc))))
-             (return (svref fun-map (1- i))))
-           (incf i 2))))))
+          (loop for fun = fun-map then next
+                for next = (sb-c::compiled-debug-fun-next fun)
+                when (or (not next)
+                         (let ((next-pc (if elsewhere-p
+                                            (sb-c::compiled-debug-fun-elsewhere-pc next)
+                                            (sb-c::compiled-debug-fun-offset next))))
+                           (if escaped
+                               (< pc next-pc)
+                               ;; Non-escaped frame means that this frame calls something.
+                               ;; And the PC points to where something should return.
+                               ;; The return adress may be in the next
+                               ;; function, e.g. in local tail calls the
+                               ;; function will be entered just after the
+                               ;; CALL.
+                               ;; See debug.impure.lisp/:local-tail-call for a test-case
+                               (<= pc next-pc))))
+                return fun))
+        fun-map)))
 
 ;;; This returns a COMPILED-DEBUG-FUN for COMPONENT and PC. We fetch the
 ;;; SB-C::DEBUG-INFO and run down its FUN-MAP to get a
@@ -1217,7 +1199,7 @@ register."
                                                       sb-vm::undefined-alien-tramp))
                                       "undefined function")
                                      (routine)))))
-     ((eq info :bogus-lra)
+     ((eq info :bpt-lra)
       (make-bogus-debug-fun "function end breakpoint"))
      (t
       (make-compiled-debug-fun (compiled-debug-fun-from-pc info pc escaped) component)))))
@@ -1420,7 +1402,7 @@ register."
             ;; Find a variable named FUN.
             (awhen (car (debug-fun-symbol-vars debug-fun 'sb-interpreter::fun))
               (let ((val (debug-var-value it frame))) ; Ensure it's a function
-                (when (typep val 'sb-interpreter:interpreted-function)
+                (when (typep val 'interpreted-function)
                   (%fun-name val))))))) ; Get its name
        ((sb-c::compiled-debug-fun-closure-save compiler-debug-fun)
         (%fun-name
@@ -1436,13 +1418,14 @@ register."
   (let ((simple-fun (%fun-fun fun)))
     (let* ((name (%simple-fun-name simple-fun))
            (component (fun-code-header simple-fun))
-           (res (find-if
-                 (lambda (x)
-                   (and (sb-c::compiled-debug-fun-p x)
-                        (eq (sb-c::compiled-debug-fun-name x) name)
-                        (eq (sb-c::compiled-debug-fun-kind x) nil)))
-                 (sb-c::compiled-debug-info-fun-map
-                  (%code-debug-info component)))))
+           (res (loop for fmap-entry = (sb-c::compiled-debug-info-fun-map
+                                        (%code-debug-info component))
+                      then next
+                      for next = (sb-c::compiled-debug-fun-next fmap-entry)
+                      when (and (eq (sb-c::compiled-debug-fun-name fmap-entry) name)
+                                (eq (sb-c::compiled-debug-fun-kind fmap-entry) nil))
+                      return fmap-entry
+                      while next)))
       (if res
           (make-compiled-debug-fun res component)
           ;; KLUDGE: comment from CMU CL:
@@ -1720,7 +1703,10 @@ register."
 (defun parse-debug-blocks (debug-fun)
   (etypecase debug-fun
     (compiled-debug-fun
-     (parse-compiled-debug-blocks debug-fun))
+     (let ((parsed (parse-compiled-debug-blocks debug-fun)))
+       (if (equalp parsed #())
+           (debug-signal 'no-debug-blocks :debug-fun debug-fun)
+           parsed)))
     (bogus-debug-fun
      (debug-signal 'no-debug-blocks :debug-fun debug-fun))))
 
@@ -1745,7 +1731,9 @@ register."
            (last-pc 0)
            result-blocks
            (block (make-compiled-debug-block))
-           locations)
+           locations
+           prev-live
+           prev-form-number)
       (flet ((new-block ()
                (when locations
                  (setf (compiled-debug-block-code-locations block)
@@ -1761,17 +1749,27 @@ register."
            (return))
          (let* ((flags (aref+ blocks i))
                 (kind (svref sb-c::+compiled-code-location-kinds+
-                             (ldb (byte 4 0) flags)))
+                             (ldb (byte 3 0) flags)))
                 (pc (+ last-pc
                        (sb-c:read-var-integerf blocks i)))
+                (equal-live (logtest sb-c::compiled-code-location-equal-live flags))
                 (form-number
-                  (if (logtest sb-c::compiled-code-location-zero-form-number flags)
-                      0
-                      (sb-c:read-var-integerf blocks i)))
+                  (cond ((logtest sb-c::compiled-code-location-zero-form-number flags)
+                         0)
+                        ((and equal-live
+                              (logtest sb-c::compiled-code-location-live flags))
+                         prev-form-number)
+                        (t
+                         (setf prev-form-number
+                               (sb-c:read-var-integerf blocks i)))))
                 (live-set
-                  (if (logtest sb-c::compiled-code-location-live flags)
-                      (sb-c:read-packed-bit-vector live-set-len blocks i)
-                      (make-array (* live-set-len 8) :element-type 'bit)))
+                  (cond (equal-live
+                         prev-live)
+                        ((logtest sb-c::compiled-code-location-live flags)
+                         (setf prev-live
+                               (sb-c:read-packed-bit-vector live-set-len blocks i)))
+                        (t
+                         (make-array (* live-set-len 8) :element-type 'bit))))
                 (step-info
                   (if (logtest sb-c::compiled-code-location-stepping flags)
                       (sb-c:read-var-string blocks i)
@@ -2550,7 +2548,7 @@ register."
       (#.sb-vm:sap-reg-sc-number
        (set-escaped-value (sap-int value)))
       (#.sb-vm:signed-reg-sc-number
-       (set-escaped-value (logand value (1- (ash 1 sb-vm:n-word-bits)))))
+       (set-escaped-value (logand value most-positive-word)))
       (#.sb-vm:unsigned-reg-sc-number
        (set-escaped-value value))
       #-(or x86 x86-64)
@@ -3038,16 +3036,19 @@ register."
 (defstruct (fun-end-cookie
             (:print-object (lambda (obj str)
                              (print-unreadable-object (obj str :type t))))
-            (:constructor make-fun-end-cookie (bogus-lra debug-fun))
+            (:constructor make-fun-end-cookie (bpt-lra debug-fun))
             (:copier nil))
-  ;; a pointer to the bogus-lra created for :FUN-END breakpoints
-  (bogus-lra nil :read-only t)
+  ;; a pointer to the bpt-lra created for :FUN-END breakpoints
+  (bpt-lra nil :read-only t)
   ;; the DEBUG-FUN associated with this cookie
   (debug-fun nil :read-only t))
 
-;;; This maps bogus-lra-components to cookies, so that
+;;; This maps bpt-lra objects to cookies, so that
 ;;; HANDLE-FUN-END-BREAKPOINT can find the appropriate cookie for the
 ;;; breakpoint hook.
+;;; FIXME: assuming the preceding comment is correct, this seems an incredibly bad
+;;; way to store the data. Why not just allocate an additional boxed slot in every
+;;; bpt-lra object to store its cookies? Why use a hash table?
 (define-load-time-global *fun-end-cookies*
     (make-hash-table :test 'eq :synchronized t))
 
@@ -3065,8 +3066,7 @@ register."
     (declare (ignore breakpoint)
              (type frame frame))
     (multiple-value-bind (lra component offset)
-        (make-bogus-lra
-         (frame-saved-lra frame debug-fun))
+        (make-bpt-lra (frame-saved-lra frame debug-fun))
       (setf (frame-saved-lra frame debug-fun) lra)
       (let ((end-bpts (breakpoint-%info starter-bpt)))
         (let ((data (breakpoint-data component offset)))
@@ -3090,7 +3090,7 @@ register."
 ;;; repeated parsing of the stack and consing when asking whether a
 ;;; series of cookies is valid.
 (defun fun-end-cookie-valid-p (frame cookie)
-  (let ((lra (fun-end-cookie-bogus-lra cookie)))
+  (let ((lra (fun-end-cookie-bpt-lra cookie)))
     (do ((frame frame (frame-down frame)))
         ((not frame) nil)
       (when (and (compiled-frame-p frame)
@@ -3173,11 +3173,11 @@ register."
   (setf (breakpoint-status breakpoint) :active)
   (without-interrupts
    (unless (breakpoint-data-breakpoints data)
-     (setf (breakpoint-data-instruction data)
-           (without-gcing
-            (breakpoint-install (get-lisp-obj-address
-                                 (breakpoint-data-component data))
-                                (breakpoint-data-offset data)))))
+     (let ((code (breakpoint-data-component data)))
+       (with-pinned-objects (code)
+         (setf (breakpoint-data-instruction data)
+               (breakpoint-install (get-lisp-obj-address code)
+                                   (breakpoint-data-offset data))))))
    (setf (breakpoint-data-breakpoints data)
          (append (breakpoint-data-breakpoints data) (list breakpoint)))
    (setf (breakpoint-internal-data breakpoint) data)))
@@ -3213,11 +3213,11 @@ register."
         (setf (breakpoint-internal-data breakpoint) nil)
         (setf (breakpoint-data-breakpoints data) bpts)
         (unless bpts
-          (without-gcing
-           (breakpoint-remove (get-lisp-obj-address
-                               (breakpoint-data-component data))
-                              (breakpoint-data-offset data)
-                              (breakpoint-data-instruction data)))
+          (let ((code (breakpoint-data-component data)))
+            (with-pinned-objects (code)
+              (breakpoint-remove (get-lisp-obj-address code)
+                                 (breakpoint-data-offset data)
+                                 (breakpoint-data-instruction data))))
           (delete-breakpoint-data data))))
   (setf (breakpoint-status breakpoint) :inactive)
   breakpoint)
@@ -3296,7 +3296,15 @@ register."
 ;;; This returns the BREAKPOINT-DATA object associated with component cross
 ;;; offset. If none exists, this makes one, installs it, and returns it.
 (defun breakpoint-data (component offset &optional (create t))
+  (aver component)
   (flet ((install-breakpoint-data ()
+           ;; Well, this has at least these three problems if not more:
+           ;; 1. For the double-checked lock pattern to be correct we have to
+           ;;    re-check whether a key is in the table within the scope of the lock.
+           ;; 2. The push should probably be a PUSHNEW, but even better, it too
+           ;;    needs to be locked or else dups can occur. Maybe use our newfangled
+           ;;    ordered lockfree linked lists.
+           ;; 3. The hash-table should probably be weak keyed
            (when create
              (let ((data (make-breakpoint-data component offset)))
                (push (cons offset data)
@@ -3449,54 +3457,70 @@ register."
             results))
     (nreverse results)))
 
-;;;; MAKE-BOGUS-LRA (used for :FUN-END breakpoints)
+;;;; MAKE-BPT-LRA (used for :FUN-END breakpoints)
 
-(defconstant bogus-lra-constants
-  (+ sb-vm:code-constants-offset
-     #-(or x86-64 x86) 1
-     ;; Wtf???
-     #+x86-64 2
-     ;; FIXME: 'fixups' already accounted for in header.
-     ;; One more for a fixup vector
-     #+x86 3))
-
-;;; Make a bogus LRA object that signals a breakpoint trap when
-;;; returned to. If the breakpoint trap handler returns, REAL-LRA is
-;;; returned to. Three values are returned: the bogus LRA object, the
-;;; code component it is part of, and the PC offset for the trap
-;;; instruction.
-(defun make-bogus-lra (real-lra)
-  (without-gcing
+;;; Make a breakpoint LRA object that signals a breakpoint trap when returned to.
+;;; If the breakpoint trap handler returns, REAL-LRA is returned to.
+;;; Three values are returned: the new LRA object, the code component it is part of,
+;;; and the PC offset for the trap instruction.
+;;; Note: you can't cache these, because object identity confers a full dynamic
+;;; state of the program, not merely a return PC location.
+;;; (I tried changing this to DEFUN-CACHED, which failed a regression test)
+(defun make-bpt-lra (real-lra)
+  (declare (type #-(or x86 x86-64) lra #+(or x86 x86-64) system-area-pointer real-lra))
+  (macrolet ((symbol-addr (name)
+               ;; "static" is not really correct if #+sb-dynamic-core
+               `(static-foreign-symbol-address ,name))
+             (trap-offset ()
+               `(- (symbol-addr "fun_end_breakpoint_trap") src-start)))
     ;; These are really code labels, not variables: but this way we get
     ;; their addresses.
-    (let* ((src-start (static-foreign-symbol-sap "fun_end_breakpoint_guts"))
-           (src-end (static-foreign-symbol-sap "fun_end_breakpoint_end"))
-           (trap-loc (static-foreign-symbol-sap "fun_end_breakpoint_trap"))
-           (length (sap- src-end src-start))
+    (let* ((src-start (symbol-addr "fun_end_breakpoint_guts"))
+           (length (the index (- (symbol-addr "fun_end_breakpoint_end")
+                                 src-start)))
            (code-object
-             ;; 2 extra bytes to represent CODE-N-ENTRIES (which is zero)
-             (sb-c:allocate-code-object nil bogus-lra-constants (+ length 2)))
-           (dst-start (code-instructions code-object)))
-      (declare (type system-area-pointer
-                     src-start src-end dst-start trap-loc)
-               (type index length))
-      (setf (%code-debug-info code-object) :bogus-lra)
-      (system-area-ub8-copy src-start 0 dst-start 0 length)
+            (sb-c:allocate-code-object
+             nil
+             ;; For non-x86: a single boxed constant holds the true LRA.
+             ;; For x86[-64]: one boxed constant holds the code object to which
+             ;; to return, and one holds the displacement into that object.
+             ;; Ensure required boxed header alignment.
+             (align-up (+ sb-vm:code-constants-offset 1 #+(or x86-64 x86) 1)
+                       sb-c::code-boxed-words-align)
+             ;; 2 extra raw bytes represent CODE-N-ENTRIES (which is zero)
+             (+ length 2))))
+      (setf (%code-debug-info code-object) :bpt-lra)
+      (with-pinned-objects (code-object)
+        (system-area-ub8-copy (int-sap src-start) 0
+                              (code-instructions code-object) 0 length))
       #+(or x86 x86-64)
       (multiple-value-bind (offset code) (compute-lra-data-from-pc real-lra)
-        (setf (code-header-ref code-object real-lra-slot) code)
-        (setf (code-header-ref code-object (1+ real-lra-slot)) offset)
-        (values dst-start code-object (sap- trap-loc src-start)))
+        (setf (code-header-ref code-object real-lra-slot) code
+              (code-header-ref code-object (1+ real-lra-slot)) offset)
+        ;; Holy hell, returning a SAP looks GC-unsafe, but it's sort of OK.
+        ;; It points into CODE-OBJECT which is implicitly pinned.
+        ;; WITHOUT-GCING which formerly enclosed this function was disingenuous
+        ;; because we escaped from its scope when returning the SAP.
+        (values (code-instructions code-object) code-object (trap-offset)))
       #-(or x86 x86-64)
-      (let ((new-lra (make-lisp-obj (+ (sap-int dst-start)
-                                       sb-vm:other-pointer-lowtag))))
-        (setf (code-header-ref code-object real-lra-slot) real-lra)
-        (sb-vm:sanctify-for-execution code-object)
+      (progn
         ;; We used to set the header value of the LRA here to the
         ;; offset from the enclosing component to the LRA header, but
         ;; MAKE-LISP-OBJ actually checks the value before we get a
         ;; chance to set it, so it's now done in arch-assem.S.
-        (values new-lra code-object (sap- trap-loc src-start))))))
+        ;; KLUDGE: The preceding concern is rendered irrelevant by
+        ;; use of unsafe %MAKE-LISP-OBJ, but we do still copy the lisp header
+        ;; from arch-assem.S which is horrible. Either that assembly code
+        ;; should be emitted as Lisp asm routine so that it has access to
+        ;; SB-VM:CODE-CONSTANTS-OFFSET, or we should emit the header.
+        ;; The issue is that the backpointer (word count) from the LRA to
+        ;; its containing code object has to be right.
+        (setf (code-header-ref code-object real-lra-slot) real-lra)
+        (values (with-pinned-objects (code-object)
+                  (%make-lisp-obj (logior (sap-int (code-instructions code-object))
+                                          sb-vm:other-pointer-lowtag)))
+                (sb-vm:sanctify-for-execution code-object)
+                (trap-offset))))))
 
 ;;;; miscellaneous
 

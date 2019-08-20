@@ -42,13 +42,12 @@
                   (*source-info* (or source-info
                                   (make-lisp-source-info
                                    form :parent *source-info*)))
-                  (*toplevel-lambdas* ())
-                  (*block-compile* nil)
                   (*allow-instrumenting* nil)
-                  (*compiler-coverage-metadata* nil)
-                  (*msan-unpoison*
-                   (and (member :msan *features*)
-                        (find-dynamic-foreign-symbol-address "__msan_unpoison")))
+                  (*compilation*
+                   (make-compilation
+                    :msan-unpoison
+                    (and (member :msan *features*)
+                         (find-dynamic-foreign-symbol-address "__msan_unpoison"))))
                   (*current-path* nil)
                   (*last-message-count* (list* 0 nil nil))
                   (*last-error-context* nil)
@@ -135,19 +134,11 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
       (if (compiled-function-p definition)
           (values definition nil nil)
           (multiple-value-bind (sexpr lexenv)
-              (typecase definition
-                #+sb-fasteval
-                (sb-interpreter:interpreted-function
-                 (sb-interpreter:prepare-for-compile definition))
-                #+sb-eval
-                (sb-eval:interpreted-function
-                 (sb-eval:prepare-for-compile definition))
-                (t
-                 (values definition (make-null-lexenv))))
-            (multiple-value-bind (compiled-definition warnings-p failure-p)
-                (compile-in-lexenv (the cons sexpr) lexenv name nil nil nil nil)
-              (aver (typep compiled-definition 'compiled-function))
-              (values compiled-definition warnings-p failure-p))))
+              (if (not (typep definition 'interpreted-function))
+                  (values (the cons definition) (make-null-lexenv))
+                  #+(or sb-eval sb-fasteval)
+                  (prepare-for-compile definition))
+            (compile-in-lexenv sexpr lexenv name nil nil nil nil)))
     (values (cond (name
                    (if (and (symbolp name) (macro-function name))
                        (setf (macro-function name) compiled-definition)

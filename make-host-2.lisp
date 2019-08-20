@@ -49,7 +49,7 @@
 (do-all-symbols (s)
   (when (and (sb-int:info :function :inlinep s)
              (eq (sb-int:info :function :where-from s) :assumed))
-      (warn "Did you forget to define ~S?" s)))
+      (error "INLINE declaration for an undefined function: ~S?" s)))
 
 ;; enable this too see which vops were or weren't used
 #+nil
@@ -64,7 +64,7 @@
     (sb-int:call-with-each-globaldb-name
      (lambda (name)
        (let* ((cell (sb-int:info :function :emitted-full-calls name))
-              (inlinep (eq (sb-int:info :function :inlinep name) :inline))
+              (inlinep (eq (sb-int:info :function :inlinep name) 'inline))
               (source-xform (sb-int:info :function :source-transform name))
               (info (sb-int:info :function :info name)))
          (if (and cell

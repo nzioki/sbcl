@@ -1,7 +1,7 @@
 #!/bin/sh -e
 
 git config --global core.autocrlf false
-git clone https://gitlab.common-lisp.net/ansi-test/ansi-test.git
+git clone https://github.com/sbcl/ansi-test.git
 
 cd ansi-test
 ../../run-sbcl.sh --lose-on-corruption --disable-ldb \
@@ -17,6 +17,7 @@ cd ansi-test
  "FORMAT.B.29" "FORMAT.D.27" "FORMAT.D.28" "FORMAT.D.29" "FORMAT.F.45"
  "FORMAT.F.46" "FORMAT.F.46B" "FORMAT.F.5" "FORMAT.F.8" "FORMAT.O.27"
  "FORMAT.O.28" "FORMAT.O.29" "FORMAT.R.37" "FORMAT.R.38" "FORMAT.S.29"
+ "FORMAT.E.1" "FORMAT.E.2" "FORMAT.E.26"
  "FORMAT.X.27" "FORMAT.X.28" "FORMAT.X.29" "FORMATTER.A.57" "FORMATTER.A.58"
  "FORMATTER.B.27" "FORMATTER.B.28" "FORMATTER.B.29" "FORMATTER.D.27"
  "FORMATTER.D.28" "FORMATTER.D.29" "FORMATTER.F.45" "FORMATTER.F.46"

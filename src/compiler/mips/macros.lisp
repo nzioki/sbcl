@@ -79,7 +79,7 @@ byte-ordering issues."
 (defmacro lisp-jump (function lip)
   "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
   `(progn
-     (inst addu ,lip ,function (- (ash simple-fun-code-offset word-shift)
+     (inst addu ,lip ,function (- (ash simple-fun-insts-offset word-shift)
                                    fun-pointer-lowtag))
      (inst j ,lip)
      (move code-tn ,function t)))
@@ -156,7 +156,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
          (pseudo-atomic (,flag-tn)
            (align-csp ,temp-tn)
            (inst or ,result-tn csp-tn ,lowtag)
-           (inst li ,temp-tn (logior (ash (1- ,size) n-widetag-bits) ,type-code))
+           (inst li ,temp-tn (compute-object-header ,size ,type-code))
            (inst addu csp-tn (pad-data-block ,size))
            (storew ,temp-tn ,result-tn 0 ,lowtag)
            ,@body)
@@ -166,7 +166,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
            ;; we need to subtract the pseudo-atomic bit.
            (inst or ,result-tn alloc-tn ,lowtag)
            (unless (logbitp 0 ,lowtag) (inst subu ,result-tn 1))
-           (inst li ,temp-tn (logior (ash (1- ,size) n-widetag-bits) ,type-code))
+           (inst li ,temp-tn (compute-object-header ,size ,type-code))
            (storew ,temp-tn ,result-tn 0 ,lowtag)
            ,@body))))
 
@@ -250,8 +250,8 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
 
 ;;;; memory accessor vop generators
 
-(deftype load/store-index (scale lowtag min-offset
-                                 &optional (max-offset min-offset))
+(sb-xc:deftype load/store-index (scale lowtag min-offset
+                                  &optional (max-offset min-offset))
   `(integer ,(- (truncate (+ (ash 1 16)
                              (* min-offset n-word-bytes)
                              (- lowtag))

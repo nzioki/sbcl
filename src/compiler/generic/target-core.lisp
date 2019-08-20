@@ -35,9 +35,7 @@
   ;; If somebody tries (TRACE LENGTH) for example, it should not cause
   ;; compilations to fail on account of LENGTH becoming a closure.
   (defun sb-vm::function-raw-address (name &aux (fun (fdefinition name)))
-    (cond ((not fun)
-           (error "Can't statically link to undefined function ~S" name))
-          ((not (immobile-space-obj-p fun))
+    (cond ((not (immobile-space-obj-p fun))
            (error "Can't statically link to ~S: code is movable" name))
           ((neq (fun-subtype fun) sb-vm:simple-fun-widetag)
            (error "Can't statically link to ~S: non-simple function" name))
@@ -54,8 +52,7 @@
          (ash sb-vm:fdefn-raw-addr-slot sb-vm:word-shift)
          (- sb-vm:other-pointer-lowtag)))))
 
-(flet ((fixup (code-obj offset sym kind flavor layout-finder
-               preserved-lists statically-link-p)
+(flet ((fixup (code-obj offset sym kind flavor preserved-lists statically-link-p)
          (declare (ignorable statically-link-p))
          ;; PRESERVED-LISTS is a vector of lists of locations (by kind)
          ;; at which fixup must be re-applied after code movement.
@@ -71,9 +68,11 @@
                    (:foreign (foreign-symbol-address sym))
                    (:foreign-dataref (foreign-symbol-address sym t))
                    (:code-object (get-lisp-obj-address code-obj))
-                   (:symbol-tls-index (ensure-symbol-tls-index sym))
-                   (:layout (get-lisp-obj-address (funcall layout-finder sym)))
-                   (:immobile-object (get-lisp-obj-address sym))
+                   #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index sym))
+                   (:layout (get-lisp-obj-address
+                             (if (symbolp sym) (find-layout sym) sym)))
+                   (:immobile-symbol (get-lisp-obj-address sym))
+                   (:symbol-value (get-lisp-obj-address (symbol-global-value sym)))
                    #+immobile-code
                    (:named-call
                     (when statically-link-p
@@ -110,7 +109,7 @@
                    #+(or x86 x86-64)
                    (%make-lisp-obj
                     (truly-the word (+ (get-lisp-obj-address fun)
-                                       (ash sb-vm:simple-fun-code-offset sb-vm:word-shift)
+                                       (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift)
                                        (- sb-vm:fun-pointer-lowtag))))
                    ;; non-x86 backends store the function itself (what else?) in 'self'
                    #-(or x86 x86-64) fun)
@@ -124,14 +123,14 @@
          #-(or x86 x86-64)
          (sb-vm:sanctify-for-execution code-obj)))
 
-  (defun apply-fasl-fixups (fop-stack code-obj &aux (top (svref fop-stack 0)))
+  (defun apply-fasl-fixups (fop-stack code-obj n-fixups &aux (top (svref fop-stack 0)))
     (dx-let ((preserved (make-array 4 :initial-element nil)))
       (macrolet ((pop-fop-stack () `(prog1 (svref fop-stack top) (decf top))))
-        (dotimes (i (pop-fop-stack) (setf (svref fop-stack 0) top))
+        (dotimes (i n-fixups (setf (svref fop-stack 0) top))
           (multiple-value-bind (offset kind flavor)
               (sb-fasl::!unpack-fixup-info (pop-fop-stack))
             (fixup code-obj offset (pop-fop-stack) kind flavor
-                   #'find-layout preserved nil))))
+                   preserved nil))))
       (finish-fixups code-obj preserved)))
 
   (defun apply-core-fixups (fixup-notes code-obj)
@@ -144,11 +143,6 @@
                  (fixup-name fixup)
                  (fixup-note-kind note)
                  (fixup-flavor fixup)
-               ;; Compiling to memory creates layout fixups with the name being
-               ;; an instance of LAYOUT, not a symbol. Those probably should be
-               ;; :IMMOBILE-OBJECT fixups. But since they're not, inform the
-               ;; fixupper not to call find-layout on them.
-                 #'identity
                  preserved t)))
       (finish-fixups code-obj preserved))))
 
@@ -206,12 +200,17 @@
       (let* ((entries (ir2-component-entries 2comp))
              (fun-index (length entries)))
         (dolist (entry-info entries)
-          (let ((fun (%code-entry-point code-obj (decf fun-index))))
-            (setf (%simple-fun-name fun) (entry-info-name entry-info))
-            (setf (%simple-fun-arglist fun) (entry-info-arguments entry-info))
-            (setf (%simple-fun-type fun) (entry-info-type entry-info))
-            (apply #'set-simple-fun-info fun
-                   (entry-info-form/doc/xrefs entry-info))
+          (let ((fun (%code-entry-point code-obj (decf fun-index)))
+                (w (+ sb-vm:code-constants-offset
+                      (* sb-vm:code-slots-per-simple-fun fun-index))))
+            (setf (code-header-ref code-obj (+ w sb-vm:simple-fun-name-slot))
+                  (entry-info-name entry-info)
+                  (code-header-ref code-obj (+ w sb-vm:simple-fun-arglist-slot))
+                  (entry-info-arguments entry-info)
+                  (code-header-ref code-obj (+ w sb-vm:simple-fun-source-slot))
+                  (entry-info-form/doc entry-info)
+                  (code-header-ref code-obj (+ w sb-vm:simple-fun-info-slot))
+                  (entry-info-type/xref entry-info))
             (note-fun entry-info fun object))))
 
       (push debug-info (core-object-debug-info object))

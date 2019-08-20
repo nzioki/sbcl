@@ -73,8 +73,8 @@
     (if (and olayout
              (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
-        (make-layout :classoid (make-undefined-classoid name)
-                     :%flags +condition-layout-flag+
+        (make-layout (make-undefined-classoid name)
+                     :flags +condition-layout-flag+
                      :inherits new-inherits
                      :depthoid -1
                      :length (layout-length cond-layout)))))
@@ -1085,12 +1085,26 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
       (list '(:ansi-cl :function adjust-array))))
 
 (define-condition index-too-large-error (type-error)
-  ()
+  ((sequence :initarg :sequence))
   (:report
    (lambda (condition stream)
-     (format stream
-             "The index ~S is too large."
-             (type-error-datum condition)))))
+     (let ((sequence (slot-value condition 'sequence))
+           (index (type-error-datum condition)))
+       (if (vectorp sequence)
+           (format stream "Invalid index ~W for ~S ~@[with fill-pointer ~a~], ~
+                           should be a non-negative integer below ~W."
+                   index
+                   (type-of sequence)
+                   (and (array-has-fill-pointer-p sequence)
+                        (fill-pointer sequence))
+                   (length sequence))
+           (format stream
+                   "The index ~S is too large for a ~a of length ~s."
+                   index
+                   (if (listp sequence)
+                       "list"
+                       "sequence")
+                   (length sequence)))))))
 
 (define-condition bounding-indices-bad-error (reference-condition type-error)
   ((object :reader bounding-indices-bad-object :initarg :object))
@@ -1179,7 +1193,10 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
 
 (define-condition simple-package-error (simple-condition package-error) ())
 
+(define-condition package-does-not-exist (simple-package-error) ())
+
 (define-condition simple-reader-package-error (simple-reader-error package-error) ())
+(define-condition reader-package-does-not-exist (simple-reader-package-error package-does-not-exist) ())
 
 (define-condition reader-eof-error (end-of-file)
   ((context :reader reader-eof-error-context :initarg :context))
@@ -1377,14 +1394,12 @@ handled by any other handler, it will be muffled.")
 ;;;; Deciding which redefinitions are "interesting".
 
 (defun function-file-namestring (function)
-  #+sb-eval
-  (when (typep function 'sb-eval:interpreted-function)
+  (when (typep function 'interpreted-function)
     (return-from function-file-namestring
+      #+sb-eval
       (sb-c:definition-source-location-namestring
-          (sb-eval:interpreted-function-source-location function))))
-  #+sb-fasteval
-  (when (typep function 'sb-interpreter:interpreted-function)
-    (return-from function-file-namestring
+          (sb-eval:interpreted-function-source-location function))
+      #+sb-fasteval
       (awhen (sb-interpreter:fun-source-location function)
         (sb-c:definition-source-location-namestring it))))
   (let* ((fun (%fun-fun function))
@@ -1404,9 +1419,7 @@ handled by any other handler, it will be muffled.")
           (typep new '(not compiled-function)))
      ;; fin->regular is interesting except for interpreted->compiled.
      (and (typep new '(not funcallable-instance))
-          (typep old '(and funcallable-instance
-                       #+sb-fasteval (not sb-interpreter:interpreted-function)
-                       #+sb-eval (not sb-eval:interpreted-function))))
+          (typep old '(and funcallable-instance (not interpreted-function))))
      ;; different file or unknown location is interesting.
      (let* ((old-namestring (function-file-namestring old))
             (new-namestring (function-file-namestring new)))
@@ -1501,6 +1514,10 @@ the usual naming convention (names like *FOO*) for special variables"
 
 (define-condition asterisks-around-constant-variable-name
     (dubious-asterisks-around-variable-name)
+  ())
+
+(define-condition &optional-and-&key-in-lambda-list
+    (style-warning simple-condition)
   ())
 
 ;; We call this UNDEFINED-ALIEN-STYLE-WARNING because there are some

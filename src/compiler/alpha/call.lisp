@@ -109,7 +109,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
+    (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Compute CODE from the address of this entry point.
     (let ((entry-point (gen-label)))
@@ -739,11 +739,11 @@ default-value-8
                     (descriptor-reg (move name name-pass))
                     (control-stack
                      (inst ldl name-pass
-                           (ash (tn-offset name) word-shift) cfp-tn)
+                           (tn-byte-offset name) cfp-tn)
                      (do-next-filler))
                     (constant
                      (inst ldl name-pass
-                           (- (ash (tn-offset name) word-shift)
+                           (- (tn-byte-offset name)
                               other-pointer-lowtag) code-tn)
                      (do-next-filler)))
                   (inst ldl entry-point
@@ -755,11 +755,11 @@ default-value-8
                     (descriptor-reg (move arg-fun lexenv))
                     (control-stack
                      (inst ldl lexenv
-                           (ash (tn-offset arg-fun) word-shift) cfp-tn)
+                           (tn-byte-offset arg-fun) cfp-tn)
                      (do-next-filler))
                     (constant
                      (inst ldl lexenv
-                           (- (ash (tn-offset arg-fun) word-shift)
+                           (- (tn-byte-offset arg-fun)
                               other-pointer-lowtag) code-tn)
                      (do-next-filler)))
                   #-gengc
@@ -770,7 +770,7 @@ default-value-8
                   (do-next-filler)
                   #-gengc
                   (inst addq function
-                        (- (ash simple-fun-code-offset word-shift)
+                        (- (ash simple-fun-insts-offset word-shift)
                            fun-pointer-lowtag) entry-point)
                   #+gengc
                   (inst ldl entry-point
@@ -1211,4 +1211,4 @@ default-value-8
   (:vop-var vop)
   (:generator 3
     ;; Stub! See the PPC backend for an example.
-    (note-this-location vop :step-before-vop)))
+    (note-this-location vop :internal-error)))

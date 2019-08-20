@@ -21,7 +21,7 @@
   ;; Imports from SB-VM into this package
   #+sb-simd-pack-256
   (import '(sb-vm::int-avx2-reg sb-vm::double-avx2-reg sb-vm::single-avx2-reg))
-  (import '(sb-vm::tn-reg sb-vm::reg-name
+  (import '(sb-vm::tn-byte-offset sb-vm::tn-reg sb-vm::reg-name
             sb-vm::frame-byte-offset sb-vm::rip-tn sb-vm::rbp-tn
             #+avx2 sb-vm::avx2-reg
             sb-vm::registers sb-vm::float-registers sb-vm::stack))) ; SB names
@@ -1259,7 +1259,7 @@
         ;; word index -1 from the origin label, and so on.
         (emit-ea segment
                  (rip-relative-ea (segment-origin segment) ; = word index 0
-                                  (- (* (tn-offset thing) n-word-bytes)
+                                  (- (tn-byte-offset thing)
                                      (component-header-length)))
                  reg :remaining-bytes remaining-bytes))))
     (ea
@@ -1543,7 +1543,7 @@
                   ((and (fixup-p src)
                         (member (fixup-flavor src)
                                 '(:named-call :static-call :assembly-routine
-                                  :layout :immobile-object :foreign)))
+                                  :layout :immobile-symbol :foreign)))
                    (emit-prefixes segment dst nil :dword)
                    (emit-byte+reg segment #xB8 dst)
                    (emit-absolute-fixup segment src))
@@ -1578,7 +1578,7 @@
             ;; low enough addresses that this works.
             (aver (member (fixup-flavor src)
                           '(:foreign :foreign-dataref :symbol-tls-index
-                            :assembly-routine :layout :immobile-object)))
+                            :assembly-routine :layout :immobile-symbol)))
             (emit-prefixes segment dst nil size)
             (emit-byte segment #xC7)
             (emit-ea segment dst #b000)
@@ -1846,7 +1846,7 @@
              (emit-byte segment it))
             ((or (integerp src)
                  (and (fixup-p src)
-                      (memq (fixup-flavor src) '(:layout :immobile-object))))
+                      (memq (fixup-flavor src) '(:layout :immobile-symbol))))
              (emit-prefixes segment dst nil size :lock lockp)
              (cond ((accumulator-p dst)
                     (emit-byte segment
@@ -2440,7 +2440,7 @@
   (declare (type sb-assem:segment segment)
            (type index amount))
   ;; Pack all instructions into one byte vector to save space.
-  (let* ((bytes #.(!coerce-to-specialized
+  (let* ((bytes #.(sb-xc:coerce
                           #(#x90
                             #x66 #x90
                             #x0f #x1f #x00
@@ -2450,7 +2450,7 @@
                             #x0f #x1f #x80 #x00 #x00 #x00 #x00
                             #x0f #x1f #x84 #x00 #x00 #x00 #x00 #x00
                             #x66 #x0f #x1f #x84 #x00 #x00 #x00 #x00 #x00)
-                          '(unsigned-byte 8)))
+                          '(vector (unsigned-byte 8))))
          (max-length (isqrt (* 2 (length bytes)))))
     (loop
       (let* ((count (min amount max-length))
@@ -2487,11 +2487,7 @@
 
 (define-instruction simple-fun-header-word (segment)
   (:emitter
-   (emit-header-data segment
-                     (logior simple-fun-widetag
-                             #+(and compact-instance-header sb-xc-host)
-                             (ash function-layout 32)))))
-
+   (emit-header-data segment simple-fun-widetag)))
 
 ;;;; Instructions required to do floating point operations using SSE
 
@@ -3369,29 +3365,22 @@
     (typecase first
       (single-float (setf constant (list :single-float first)))
       (double-float (setf constant (list :double-float first)))
-      .
-      #+sb-xc-host
-      ((complex
-        ;; It's an error (perhaps) on the host to use simd-pack type.
-        ;; [and btw it's disconcerting that this isn't an ETYPECASE.]
-        (error "xc-host can't reference complex float")))
-      #-sb-xc-host
-      (((complex single-float)
-        (setf constant (list :complex-single-float first)))
-       ((complex double-float)
-        (setf constant (list :complex-double-float first)))
-       #+sb-simd-pack
-       (simd-pack
-        (setq constant
-              (list :sse (logior (%simd-pack-low first)
-                                 (ash (%simd-pack-high first) 64)))))
-       #+sb-simd-pack-256
-       (simd-pack-256
-        (setq constant
-              (list :avx2 (logior (%simd-pack-256-0 first)
-                                  (ash (%simd-pack-256-1 first) 64)
-                                  (ash (%simd-pack-256-2 first) 128)
-                                  (ash (%simd-pack-256-3 first) 192))))))))
+      ((complex single-float)
+       (setf constant (list :complex-single-float first)))
+      ((complex double-float)
+       (setf constant (list :complex-double-float first)))
+      #+(and sb-simd-pack (not sb-xc-host))
+      (simd-pack
+       (setq constant
+             (list :sse (logior (%simd-pack-low first)
+                                (ash (%simd-pack-high first) 64)))))
+      #+(and sb-simd-pack-256 (not sb-xc-host))
+      (simd-pack-256
+       (setq constant
+             (list :avx2 (logior (%simd-pack-256-0 first)
+                                 (ash (%simd-pack-256-1 first) 64)
+                                 (ash (%simd-pack-256-2 first) 128)
+                                 (ash (%simd-pack-256-3 first) 192)))))))
   (destructuring-bind (type value) constant
     (ecase type
       ((:byte :word :dword :qword)

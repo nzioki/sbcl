@@ -419,9 +419,6 @@ else
     case $sbcl_arch in
         x86|x86-64|arm64)
             case $sbcl_os in
-    # Be aware that if you use multiple threads on Darwin,
-    # it works well enough when threads don't interact much, but
-    # you might encounter https://bugs.launchpad.net/sbcl/+bug/901441
                 linux|darwin)
                     WITH_FEATURES="$WITH_FEATURES :sb-thread"
             esac
@@ -561,10 +558,10 @@ case "$sbcl_os" in
         printf ' :bsd' >> $ltf
         printf ' :darwin' >> $ltf
         if [ $sbcl_arch = "x86" ]; then
-            printf ' :mach-exception-handler :restore-fs-segment-register-from-tls :ud2-breakpoints' >> $ltf
+            printf ' :mach-exception-handler :restore-fs-segment-register-from-tls' >> $ltf
         fi
         if [ $sbcl_arch = "x86-64" ]; then
-            printf ' :mach-exception-handler :ud2-breakpoints' >> $ltf
+            printf ' :mach-exception-handler' >> $ltf
             darwin_version=`uname -r`
             darwin_version_major=${DARWIN_VERSION_MAJOR:-${darwin_version%%.*}}
     
@@ -718,6 +715,12 @@ elif [ "$sbcl_arch" = "ppc64" ]; then
     # (Sufficiently new glibc uses the correct definition, which is the same as
     # 2.3.1, so define our constant for that)
     echo '#define GLIBC231_STYLE_UCONTEXT 1' > src/runtime/ppc-linux-mcontext.h
+elif [ "$sbcl_arch" = "riscv" ]; then
+    printf ' :64-bit :64-bit-registers' >> $ltf
+    printf ' :gencgc' >> $ltf
+    printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
+    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
+    printf ' :linkage-table' >> $ltf
 elif [ "$sbcl_arch" = "sparc" ]; then
     # Test the compiler in order to see if we are building on Sun
     # toolchain as opposed to GNU binutils, and write the appropriate

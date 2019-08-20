@@ -50,6 +50,7 @@
   (def set-header-data (x val))
   (def widetag-of)
   (def %other-pointer-widetag)
+  (def pointer-hash)
   (def vector-sap)
   (def binding-stack-pointer-sap  ())
   ;; x86 uses a plain old inline function for 'dynamic_space_free_pointer'
@@ -59,11 +60,6 @@
   (def sb-c:safe-fdefn-fun)
   (def fun-subtype)
   (def simple-fun-p)
-  (def %simple-fun-arglist)
-  (def (setf %simple-fun-arglist) (new-value func))
-  (def %simple-fun-name)
-  (def (setf %simple-fun-name) (new-value func))
-  (def %simple-fun-info)
   (def closurep)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
@@ -103,6 +99,11 @@
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
   (def %set-funcallable-instance-info (fin i new-value))
+  #+(and compact-instance-header x86-64) (def layout-of)
+  #+64-bit (def layout-depthoid)
+  ;; lists
+  (def %rplaca (x val))
+  (def %rplacd (x val))
 
   #+compare-and-swap-vops
   (def* (%array-atomic-incf/word (array index diff))
@@ -133,9 +134,14 @@
   (def %set-stack-ref (s n value))
   (def fun-code-header)
   (def sb-vm::symbol-extra)
+  #+sb-thread (def sb-kernel:symbol-tls-index)
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
-  (def get-lisp-obj-address))
+  (def get-lisp-obj-address)
+  #+x86-64
+  (def single-float-copysign (float float2))
+  #+x86-64
+  (def single-float-sign))
 
 (defun spin-loop-hint ()
   "Hints the processor that the current thread is spin-looping."

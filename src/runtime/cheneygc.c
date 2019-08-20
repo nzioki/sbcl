@@ -178,17 +178,10 @@ collect_garbage(generation_index_t ignore)
 #endif
 
     scan_binding_stack();
-    /* Scan the weak pointers. */
-#ifdef PRINTNOISE
-    printf("Scanning weak hash tables ...\n");
-#endif
-    cull_weak_hash_tables(weak_ht_alivep_funs);
 
-    /* Scan the weak pointers. */
-#ifdef PRINTNOISE
-    printf("Scanning weak pointers ...\n");
-#endif
-    scan_weak_pointers();
+    smash_weak_pointers();
+    gc_dispose_private_pages();
+    cull_weak_hash_tables(weak_ht_alivep_funs);
 
     /* Flip spaces. */
 #ifdef PRINTNOISE
@@ -268,7 +261,6 @@ scavenge_newspace(void)
         here = next;
     } while (new_space_free_pointer > here ||
              (test_weak_triggers(0, 0) && new_space_free_pointer > here));
-    gc_dispose_private_pages();
     /* printf("done with newspace\n"); */
 }
 
@@ -470,13 +462,6 @@ sword_t scav_code_header(lispobj *where, lispobj header)
 
     /* Scavenge the boxed section of the code data block. */
     scavenge(where + 2, n_header_words - 2);
-
-    /* Scavenge the boxed section of each function object in the
-     * code data block. */
-    for_each_simple_fun(i, function_ptr, code, 1, {
-        scavenge(SIMPLE_FUN_SCAV_START(function_ptr),
-                 SIMPLE_FUN_SCAV_NWORDS(function_ptr));
-    })
 
     return code_total_nwords(code);
 }

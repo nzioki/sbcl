@@ -174,10 +174,8 @@ page_index_t page_table_pages;
 struct page *page_table;
 lispobj gc_object_watcher;
 int gc_traceroot_criterion;
-#ifdef PIN_GRANULARITY_LISPOBJ
 int gc_n_stack_pins;
 struct hopscotch_table pinned_objects;
-#endif
 
 /* This is always 0 except during gc_and_save() */
 lispobj lisp_init_function;
@@ -1639,7 +1637,6 @@ maybe_adjust_large_object(page_index_t first_page, sword_t nwords)
     bytes_allocated -= bytes_freed;
 }
 
-#ifdef PIN_GRANULARITY_LISPOBJ
 /* After scavenging of the roots is done, we go back to the pinned objects
  * and look within them for pointers. While heap_scavenge() could certainly
  * do this, it would potentially lead to extra work, since we can't know
@@ -1663,6 +1660,50 @@ scavenge_pinned_ranges()
     }
 }
 
+/* visit_freed_objects() was designed to support post-GC actions such as
+ * recycling of unused symbol TLS indices. However, I could not make this work
+ * as claimed at the time that it gets called, so at best this is reserved
+ * for debugging, and only when you can tolerate some inaccuracy.
+ *
+ * The problem is that oldspace pages which were not pinned should eventually
+ * be scanned en masse using contiguous blocks as large as possible without
+ * encroaching on pinned pages. But we need to visit the dead objects on partially
+ * pinned pages prior to turning those objects into page-filling objects.
+ * Based on a real-life example, finding a correct approach is difficult.
+ * Consider three pages all having the same scan_start of 0x1008e78000,
+ * with the final page and only the final containing a pinned object:
+ *
+ *   start: 0x1008e78000       0x1008e80000       0x1008e88000
+ *                                                 pin: 0x1008e8bec0
+ *          ^------------------+------------------|
+ * There is a page-spanning (SIMPLE-ARRAY (UNSIGNED-BYTE 64) 8192)
+ * from 0x1008e78000 to 0x1008E88010 (exclusive). The penultimate word
+ * of that array appears to be a valid widetag:
+ *
+ *   0x1008e88000: 0x0000000000001df1
+ *   0x1008e88008: 0x0000000000000000
+ * followed by:
+ *   0x1008e88010: 0x0000001006c798c7  CONS
+ *   0x1008e88018: 0x0000001008e88447
+ *   0x1008e88020: 0x00000000000000ad  (SIMPLE-ARRAY (UNSIGNED-BYTE 64) 32)
+ *   0x1008e88028: 0x0000000000000040
+ *   ... pretty much anything in here ...
+ *   0x1008e8bec0:                     any valid pinned object
+ *
+ * Page wiping ignores the pages based at 0x1008e78000 and 0x1008e80000
+ * and it is only concerned with the range from 0x1008e88000..0x1008e8bec0
+ * which becomes filler. The question is how to traverse objects in the filled
+ * range. You can't start scanning dead objects at the page base address
+ * of the final page because that would parse these objects as:
+ *
+ *   0x1008e88000: 0x0000000000001df1 (complex-vector-nil) ; 30 words
+ *   0x1008e880f0: any random garbage
+ *
+ * But if you scan from the correct scan start of 0x1008e78000 then how do you
+ * know to skip that page later (in free_oldspace), as it is entirely in oldspace,
+ * but partially visited already? This what in malloc/free terms would be
+ * a "double free", and there is no obvious solution to that.
+ */
 void visit_freed_objects(char __attribute__((unused)) *start,
                          sword_t __attribute__((unused)) nbytes)
 {
@@ -1898,10 +1939,6 @@ pin_object(lispobj object)
             pin_object(next | INSTANCE_POINTER_LOWTAG);
     }
 }
-#else
-#  define scavenge_pinned_ranges()
-#  define wipe_nonpinned_words()
-#endif
 
 /* Take a possible pointer to a Lisp object and mark its page in the
  * page_table so that it will not be relocated during a GC.
@@ -2053,7 +2090,7 @@ update_page_write_prot(page_index_t page)
             // underlying code object since the alleged header might not be one.
             int pointee_gen = gen; // Make comparison fail if we fall through
             if (functionp((lispobj)ptr) && header_widetag(header) == SIMPLE_FUN_WIDETAG) {
-                lispobj* code = fun_code_header((lispobj)ptr - FUN_POINTER_LOWTAG);
+                lispobj* code = fun_code_header(FUNCTION((lispobj)ptr));
                 // This is a heuristic, since we're not actually looking for
                 // an object boundary. Precise scanning of 'page' would obviate
                 // the guard conditions here.
@@ -2085,6 +2122,12 @@ static inline boolean large_simple_vector_p(page_index_t page) {
     if (!page_single_obj_p(page))
         return 0;
     lispobj header = *(lispobj *)page_address(page);
+    // For hash-table vectors which are neither weak nor address-sensitive,
+    // it certainly would be possible to treat the vector as VectorNormal,
+    // though we'd lose out on the optimization that scans only below the
+    // high-water mark which is in general a good thing.  Perhaps if the
+    // ratio of HWM to total size warrants it, we should prefer to use the
+    // large_simple_vector optimization instead.
     return header_widetag(header) == SIMPLE_VECTOR_WIDETAG &&
         is_vector_subtype(header, VectorNormal);
 }
@@ -2287,7 +2330,7 @@ static void gc_close_all_regions()
 
 /* Do a complete scavenge of the newspace generation. */
 static void
-scavenge_newspace_generation(generation_index_t generation)
+scavenge_newspace(generation_index_t generation)
 {
     /* Flush the current regions updating the page table. */
     gc_close_all_regions();
@@ -2365,9 +2408,6 @@ scavenge_newspace_generation(generation_index_t generation)
     new_areas = NULL;
     new_areas_index = 0;
 
-    /* Return private-use pages to the general pool so that Lisp can have them */
-    gc_dispose_private_pages();
-
 #ifdef SC_NS_GEN_CK
     {
         page_index_t i;
@@ -2378,7 +2418,7 @@ scavenge_newspace_generation(generation_index_t generation)
                 && (page_table[i].gen == generation)
                 && (page_table[i].write_protected_cleared != 0)
                 && (page_table[i].pinned == 0)) {
-                lose("write protected page %d written to in scavenge_newspace_generation\ngeneration=%d pin=%d\n",
+                lose("write protected page %d written to in scavenge_newspace\ngeneration=%d pin=%d\n",
                      i, generation, page_table[i].pinned);
             }
         }
@@ -2691,8 +2731,12 @@ verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
         } else if (!(other_immediate_lowtag_p(widetag)
                      && lowtag_for_widetag[widetag>>2])) {
             lose("Unhandled widetag %d at %p", widetag, where);
-        } else if (unboxed_obj_widetag_p(widetag)) {
+        } else if (leaf_obj_widetag_p(widetag)) {
             count = sizetab[widetag](where);
+            if (strict_containment && gencgc_verbose
+                && widetag == SAP_WIDETAG && where[1])
+                fprintf(stderr, "\nStrange SAP %p -> %p\n",
+                        where, (void*)where[1]);
         } else switch(widetag) {
                 /* boxed or partially boxed objects */
                 lispobj layout_word;
@@ -2747,9 +2791,6 @@ verify_range(lispobj *where, sword_t nwords, struct verify_state *state)
                         function_layout((lispobj*)fheaderp);
                     gc_assert(!layout || layout == LAYOUT_OF_FUNCTION);
 #endif
-                    verify_range(SIMPLE_FUN_SCAV_START(fheaderp),
-                                 SIMPLE_FUN_SCAV_NWORDS(fheaderp),
-                                 state);
                 });
 #if CODE_PAGES_USE_SOFT_PROTECTION
                 generation_index_t my_gen = gen_of((lispobj)where);
@@ -3024,7 +3065,7 @@ move_pinned_pages_to_newspace()
 
 /* Garbage collect a generation. If raise is 0 then the remains of the
  * generation are not raised to the next generation. */
-static void NO_SANITIZE_ADDRESS
+static void NO_SANITIZE_ADDRESS NO_SANITIZE_MEMORY
 garbage_collect_generation(generation_index_t generation, int raise)
 {
     page_index_t i;
@@ -3046,11 +3087,9 @@ garbage_collect_generation(generation_index_t generation, int raise)
          gc_assert(generations[SCRATCH_GENERATION].bytes_allocated == 0);
     }
 
-#ifdef PIN_GRANULARITY_LISPOBJ
     hopscotch_reset(&pinned_objects);
     // for traceroot, which reads n_stack_pins from the previous GC cycle
     gc_n_stack_pins = 0;;
-#endif
 
     /* Set the global src and dest. generations */
     if (generation < PSEUDO_STATIC_GENERATION) {
@@ -3177,13 +3216,28 @@ garbage_collect_generation(generation_index_t generation, int raise)
 # endif
             if (!esp || esp == (void*) -1)
                 UNKNOWN_STACK_POINTER_ERROR("garbage_collect", th);
+
+            // Words on the stack which point into the stack are likely
+            // frame pointers or alien or DX object pointers. In any case
+            // there's no need to call preserve_pointer on them since
+            // they definitely don't point to the heap.
+            // See the picture at create_thread_struct() as a reminder.
+            lispobj exclude_from = (lispobj)th->control_stack_start;
+            lispobj exclude_to = (lispobj)th + dynamic_values_bytes;
+
             // This loop would be more naturally expressed as
             //  for (ptr = esp; ptr < th->control_stack_end; ++ptr)
             // However there is a very subtle problem with that: 'esp = &raise'
             // is not necessarily properly aligned to be a stack pointer!
             void **ptr;
             for (ptr = ((void **)th->control_stack_end)-1; ptr >= (void**)esp;  ptr--) {
-                preserve_pointer(*ptr);
+                lispobj word = (lispobj)*ptr;
+                // Also note that we can eliminate small fixnums from consideration
+                // since there is no memory on the 0th page.
+                // (most OSes don't let users map memory there, though they used to).
+                if (word >= BACKEND_PAGE_BYTES &&
+                    !(exclude_from <= word && word < exclude_to))
+                    preserve_pointer((void*)word);
             }
         }
     }
@@ -3245,6 +3299,8 @@ garbage_collect_generation(generation_index_t generation, int raise)
         union interrupt_handler handler = interrupt_handlers[i];
         if (!ARE_SAME_HANDLER(handler.c, SIG_IGN) &&
             !ARE_SAME_HANDLER(handler.c, SIG_DFL) &&
+            // BUG: if a C function pointer can be misaligned such that it
+            // looks to satisfy functionp() then we do the wrong thing.
             is_lisp_pointer(handler.lisp)) {
             if (compacting_p())
                 scavenge((lispobj *)(interrupt_handlers + i), 1);
@@ -3307,11 +3363,14 @@ garbage_collect_generation(generation_index_t generation, int raise)
 
     /* Finally scavenge the new_space generation. Keep going until no
      * more objects are moved into the new generation */
-    scavenge_newspace_generation(new_space);
+    scavenge_newspace(new_space);
 
     scan_binding_stack();
+    smash_weak_pointers();
+    /* Return private-use pages to the general pool so that Lisp can have them */
+    gc_dispose_private_pages();
     cull_weak_hash_tables(weak_ht_alivep_funs);
-    scan_weak_pointers();
+
     wipe_nonpinned_words();
     // Do this last, because until wipe_nonpinned_words() happens,
     // not all page table entries have the 'gen' value updated,
@@ -3319,9 +3378,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
     sweep_immobile_space(raise);
 
     ASSERT_REGIONS_CLOSED();
-#ifdef PIN_GRANULARITY_LISPOBJ
     hopscotch_log_stats(&pinned_objects, "pins");
-#endif
 
     /* Free the pages in oldspace, but not those marked pinned. */
     free_oldspace();
@@ -3718,10 +3775,8 @@ static void gc_allocate_ptes()
     gc_assert(page_table);
 
     weakobj_init();
-#ifdef PIN_GRANULARITY_LISPOBJ
     hopscotch_create(&pinned_objects, HOPSCOTCH_HASH_FUN_DEFAULT, 0 /* hashset */,
                      32 /* logical bin count */, 0 /* default range */);
-#endif
 
     scavtab[WEAK_POINTER_WIDETAG] = scav_weak_pointer;
 
@@ -4089,6 +4144,8 @@ gc_and_save(char *filename, boolean prepend_runtime,
     {
         int i;
         for (i=0; i<NSIG; ++i)
+            // BUG: if a C function pointer can be misaligned such that it
+            // looks to satisfy functionp() then we do the wrong thing.
             if (functionp(interrupt_handlers[i].lisp))
                 interrupt_handlers[i].lisp = 0;
     }
@@ -4281,10 +4338,9 @@ void gc_show_pte(lispobj obj)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     page = find_varyobj_page_index((void*)obj);
     if (page>=0) {
-        extern unsigned char* varyobj_page_gens;
         printf("page %ld (v) ss=%p gens %x%s\n", page,
                varyobj_scan_start(page),
-               varyobj_page_gens[page],
+               varyobj_pages[page].generations,
                card_protected_p((void*)obj)? " WP":"");
         return;
     }
@@ -4345,12 +4401,6 @@ sword_t scav_code_header(lispobj *object, lispobj header)
         sword_t n_header_words = code_header_words((struct code *)object);
         scavenge(object + 2, n_header_words - 2);
 
-        /* Scavenge the boxed section of each function object in the
-         * code data block. */
-        for_each_simple_fun(i, function_ptr, (struct code *)object, 1, {
-            scavenge(SIMPLE_FUN_SCAV_START(function_ptr),
-                     SIMPLE_FUN_SCAV_NWORDS(function_ptr));
-        })
         /* If my_gen is other than newspace, then scan for old->young
          * pointers. If my_gen is newspace, there can be no such pointers
          * because newspace is the lowest numbered generation post-GC
@@ -4360,12 +4410,6 @@ sword_t scav_code_header(lispobj *object, lispobj header)
             for (where= object + 2; where < end; ++where)
                 if (is_lisp_pointer(ptr = *where) && obj_gen_lessp(ptr, my_gen))
                     goto done;
-            for_each_simple_fun(i, function_ptr, (struct code *)object, 0, {
-                end = (lispobj*)function_ptr->code;
-                for (where = SIMPLE_FUN_SCAV_START(function_ptr); where < end; ++where)
-                    if (is_lisp_pointer(ptr = *where) && obj_gen_lessp(ptr, my_gen))
-                        goto done;
-            })
         }
         CLEAR_WRITTEN_FLAG(object);
     } else {

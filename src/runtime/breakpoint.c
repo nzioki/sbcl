@@ -25,19 +25,7 @@
 #include "code.h"
 #include "genesis/fdefn.h"
 
-#ifdef LISP_FEATURE_X86_64
 #define REAL_LRA_SLOT 0
-#define KNOWN_RETURN_P_SLOT 2
-#define BOGUS_LRA_CONSTANTS 3
-#elif defined(LISP_FEATURE_X86)
-#define REAL_LRA_SLOT 1
-#define KNOWN_RETURN_P_SLOT 3
-#define BOGUS_LRA_CONSTANTS 4
-#else
-#define REAL_LRA_SLOT 0
-#define KNOWN_RETURN_P_SLOT 1
-#define BOGUS_LRA_CONSTANTS 2
-#endif
 
 static void *compute_pc(lispobj code_obj, int pc_offset)
 {
@@ -89,7 +77,7 @@ lispobj find_code(os_context_t *context)
         return code - HeaderValue(header)*sizeof(lispobj);
 #else
     lispobj codeptr =
-        (lispobj)component_ptr_from_pc((lispobj *)(*os_context_pc_addr(context)));
+        (lispobj)component_ptr_from_pc((char *)(*os_context_pc_addr(context)));
 
     if (codeptr == 0)
         return NIL;

@@ -18,7 +18,7 @@
     ((def (&rest situations)
        `(eval-when ,situations
           (defun call-with-each-globaldb-name (fun-designator)
-            (let ((function (coerce fun-designator 'function)))
+            (let ((function (cl:coerce fun-designator 'function)))
               (with-package-iterator (iter (list-all-packages) :internal :external)
                 (loop (multiple-value-bind (winp symbol access package) (iter)
                         (declare (ignore access))
@@ -41,3 +41,10 @@
   ;; to detect possible inlining failures
   (def :compile-toplevel)
   (def :load-toplevel :execute))
+
+;;; This check is most effective when placed in the final cross-compiled file.
+;;; Parallelized build effectively skips this, but oh well.
+(loop for (object . hash) in '#.sb-c::*sxhash-crosscheck*
+      unless (= (sxhash object) hash)
+      do (error "SB-XC:SXHASH computed wrong answer for ~S. Got ~x should be ~x"
+                object hash (sxhash object)))

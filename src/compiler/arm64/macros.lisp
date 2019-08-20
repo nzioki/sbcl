@@ -92,7 +92,7 @@
          (lip ,lip))
      (aver (sc-is lip interior-reg))
      (inst add lip function
-           (- (ash simple-fun-code-offset word-shift)
+           (- (ash simple-fun-insts-offset word-shift)
               fun-pointer-lowtag))
      (inst br lip)))
 
@@ -124,7 +124,7 @@
 
 ;;; Move a stack TN to a register and vice-versa.
 (defun load-stack-offset (reg stack stack-tn)
-  (inst ldr reg (@ stack (load-store-offset (* (tn-offset stack-tn) n-word-bytes)))))
+  (inst ldr reg (@ stack (load-store-offset (tn-byte-offset stack-tn)))))
 
 (defmacro load-stack-tn (reg stack)
   `(let ((reg ,reg)
@@ -134,7 +134,7 @@
         (load-stack-offset reg cfp-tn stack)))))
 
 (defun store-stack-offset (reg stack stack-tn)
-  (let ((offset (* (tn-offset stack-tn) n-word-bytes)))
+  (let ((offset (tn-byte-offset stack-tn)))
     (inst str reg (@ stack (load-store-offset offset)))))
 
 (defmacro store-stack-tn (stack reg)
@@ -277,8 +277,7 @@
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
        (when ,type-code
-         (load-immediate-word ,flag-tn (+ (ash (1- ,size) n-widetag-bits)
-                                          ,type-code))
+         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
          (storew ,flag-tn ,result-tn 0 ,lowtag))
        ,@body)))
 

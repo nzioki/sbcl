@@ -11,6 +11,18 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+;;; Some of the tests herein try to read this file after we mess up *D-P-D*
+;;; (to place temp files in TMPDIR). So stash the truename for later use.
+(defvar *this-file* (truename "stream.impure.lisp"))
+
+#-win32
+(let ((dir (posix-getenv "TMPDIR")))
+  (setq *default-pathname-defaults*
+        (if dir
+            (parse-native-namestring dir nil #P"" :as-directory t)
+            #P"/tmp/")))
+(require :sb-posix)
+
 ;;; type errors for inappropriate stream arguments, fixed in
 ;;; sbcl-0.7.8.19
 (with-test (:name (make-two-way-stream type-error))
@@ -66,7 +78,7 @@
 
 ;;; improper buffering on (SIGNED-BYTE 8) streams (fixed by David Lichteblau):
 (with-test (:name (write-byte (unsigned-byte 8) read-byte (signed-byte 8)))
-  (let ((p "signed-byte-8-test.data"))
+  (let ((p (scratch-file-name)))
     (with-open-file (s p
                        :direction :output
                        :element-type '(unsigned-byte 8)
@@ -79,7 +91,7 @@
 ;;; :IF-EXISTS got :ERROR and NIL the wrong way round (reported by
 ;;; Milan Zamazal)
 (with-test (:name (open :if-exists :error))
-  (let* ((p "this-file-will-exist")
+  (let* ((p (scratch-file-name))
          (stream (open p :direction :output :if-exists :error)))
     (assert (null (with-open-file (s p :direction :output :if-exists nil) s)))
     (assert-error
@@ -99,7 +111,7 @@
 
 ;;; bidirectional streams getting confused about their position
 (with-test (:name (:direction :io))
-  (let ((p "bidirectional-stream-test"))
+  (let ((p (scratch-file-name)))
     (with-open-file (s p :direction :output :if-exists :supersede)
       (with-standard-io-syntax
         (format s "~S ~S ~S~%" 'these 'are 'symbols)))
@@ -115,7 +127,7 @@
 
 ;;; :DIRECTION :IO didn't work on non-existent pathnames
 (with-test (:name (with-open-file :direction :io :non-existent-pathname))
-  (let ((p "direction-io-test"))
+  (let ((p (scratch-file-name)))
     (ignore-errors (delete-file p))
     (with-open-file (s p :direction :io)
       (format s "1")
@@ -136,7 +148,7 @@
     (assert (= 0 (file-position s)))))
 
 (with-test (:name (file-position broadcast-stream 2))
-  (let ((p "broadcast-stream-test"))
+  (let ((p (scratch-file-name)))
     (ignore-errors (delete-file p))
     (with-open-file (f p :direction :output)
       (let ((s (make-broadcast-stream f)))
@@ -151,7 +163,7 @@
 ;;; CLOSING a non-new streams should not delete them, and superseded
 ;;; files should be restored.
 (with-test (:name :test-file-for-close-should-not-delete :fails-on :win32)
-  (let ((test "test-file-for-close-should-not-delete"))
+  (let ((test (scratch-file-name)))
     (macrolet ((test-mode (mode)
                           `(progn
                              (catch :close-test-exit
@@ -176,7 +188,8 @@
 ;;; test for read-write invariance of signed bytes, from Bruno Haible
 ;;; cmucl-imp 2004-09-06
 (defun bin-stream-test (&key (size (integer-length most-positive-fixnum))
-                        (type 'unsigned-byte) (file-name "stream-impure.tmp")
+                             (type 'unsigned-byte)
+                             (file-name (scratch-file-name))
                         (num-bytes 10)
                         (bytes (if (eq type 'signed-byte)
                                    (loop :repeat num-bytes :collect
@@ -219,7 +232,7 @@
 ;;; READ-N-BYTES, ANSI-STREAM-READ-BYTE, ANSI-STREAM-READ-BYTE.
 
 (with-test (:name (read-sequence type-error))
-  (let ((pathname "read-sequence.data"))
+  (let ((pathname (scratch-file-name)))
 
     ;; Create the binary data.
     (with-open-file (stream pathname
@@ -339,7 +352,7 @@
 ;;; (trace sb-impl::output-unsigned-byte-full-buffered sb-impl::output-signed-byte-full-buffered sb-impl::output-raw-bytes)
 
 (with-test (:name (write-sequence type-error))
-  (let ((pathname "write-sequence.data")
+  (let ((pathname (scratch-file-name))
         (generic-sequence (make-array 1 :initial-contents '(255)))
         (generic-character-sequence (make-array 1 :initial-element #\a))
         (generic-mixed-sequence (make-array 2 :initial-element #\a))
@@ -447,7 +460,7 @@
 ;;; to test on 64 bit platforms
 (with-test (:name (:write-char :long-lines :stream-ouput-column)
             :skipped-on :64-bit)
-  (let ((test "long-lines-write-test.tmp"))
+  (let ((test (scratch-file-name)))
     (unwind-protect
          (with-open-file (f test
                             :direction :output
@@ -473,16 +486,17 @@
 ;;; read-sequence misreported the amount read and lost position
 (with-test (:name (read-sequence :read-elements))
   (let ((string (make-array (* 3 sb-impl::+ansi-stream-in-buffer-length+)
-                            :element-type 'character)))
+                            :element-type 'character))
+        (file (scratch-file-name)))
     (dotimes (i (length string))
       (setf (char string i) (code-char (mod i char-code-limit))))
-    (with-open-file (f "read-sequence-character-test-data.tmp"
+    (with-open-file (f file
                        :if-exists :supersede
                        :direction :output
                        :external-format :utf-8)
       (write-sequence string f))
     (let ((copy
-            (with-open-file (f "read-sequence-character-test-data.tmp"
+            (with-open-file (f file
                                :if-does-not-exist :error
                                :direction :input
                                :external-format :utf-8)
@@ -494,7 +508,7 @@
                            (assert (<= (incf total n-read) (length string)))
                         while (and (= n-read 128))))))))
       (assert (equal copy string)))
-    (delete-file "read-sequence-character-test-data.tmp")))
+    (delete-file file)))
 
 ;;; ANSI-STREAM-OUTPUT-STREAM-P used to assume that a SYNONYM-STREAM's
 ;;; target was an ANSI stream, but it could be a user-defined stream,
@@ -520,7 +534,7 @@
 ;;; READ-LINE on ANSI-STREAM did not return T for the last line
 ;;; (reported by Yoshinori Tahara)
 (with-test (:name (read-line :last-line))
-  (let ((pathname "test-read-line-eol"))
+  (let ((pathname (scratch-file-name)))
     (with-open-file (out pathname :direction :output :if-exists :supersede)
       (format out "a~%b"))
     (let ((result (with-open-file (in pathname)
@@ -533,18 +547,18 @@
 ;;; READ-LINE used to work on closed streams because input buffers were left in place
 (with-test (:name (close read-line :bug-425))
   ;; Normal close
-  (let ((f (open "stream.impure.lisp" :direction :input)))
+  (let ((f (open *this-file* :direction :input)))
     (assert (stringp (read-line f)))
     (close f)
     (assert-error (read-line f) sb-int:closed-stream-error))
   ;; Abort
-  (let ((f (open "stream.impure.lisp" :direction :input)))
+  (let ((f (open *this-file* :direction :input)))
     (assert (stringp (read-line f nil nil)))
     (close f :abort t)
     (assert-error (read-line f) sb-int:closed-stream-error)))
 
 (with-test (:name :regression-1.0.12.22)
-  (with-open-file (s "stream.impure.lisp" :direction :input)
+  (with-open-file (s *this-file* :direction :input)
     (let ((buffer (make-string 20)))
       (assert (= 2 (read-sequence buffer s :start 0 :end 2)))
       (assert (= 3 (read-sequence buffer s :start 2 :end 3)))
@@ -557,7 +571,7 @@
 ;;; READ-SEQUENCE into a byte buffer would lose when attempting to
 ;;; store the character in the vector.
 (with-test (:name (:bivalent stream unread-char read-byte))
-  (let ((pathname "bivalent-stream-unread-char-test.tmp"))
+  (let ((pathname (scratch-file-name)))
     (with-open-file (s pathname
                        :element-type :default
                        :direction :io :if-exists :rename)
@@ -568,7 +582,7 @@
     (delete-file pathname)))
 
 (with-test (:name (:bivalent stream unread-char read-sequence))
-  (let ((pathname "bivalent-stream-unread-char-test.tmp"))
+  (let ((pathname (scratch-file-name)))
     (with-open-file (s pathname
                        :element-type :default
                        :direction :io :if-exists :rename)
@@ -581,7 +595,7 @@
 
 (with-test (:name (:bivalent stream unread-char read-byte :utf8)
             :skipped-on (:not :sb-unicode))
-  (let ((pathname "bivalent-stream-unread-char-test.tmp"))
+  (let ((pathname (scratch-file-name)))
     (with-open-file (s pathname
                        :element-type :default
                        :direction :io :if-exists :rename
@@ -594,7 +608,7 @@
 
 (with-test (:name (:bivalent stream unread-char read-sequence :utf8)
             :skipped-on (:not :sb-unicode))
-  (let ((pathname "bivalent-stream-unread-char-test.tmp"))
+  (let ((pathname (scratch-file-name)))
     (with-open-file (s pathname
                        :element-type :default
                        :direction :io :if-exists :rename
@@ -607,7 +621,7 @@
     (delete-file pathname)))
 
 (with-test (:name (delete-file :on stream))
-  (with-open-file (f "delete-file-on-stream-test.tmp"
+  (with-open-file (f (scratch-file-name)
                      :direction :io)
     (delete-file f)
     #-win32
@@ -635,15 +649,11 @@
       (read-char-no-hang stream)
       (assert (< (- (get-universal-time) time) 2)))))
 
-(require :sb-posix)
 #-win32
 (with-test (:name (open :interrupt) :skipped-on :win32)
-  (let ((fifo nil)
-        (to 0))
-    (unwind-protect
-         (progn
+  (let ((to 0))
+    (with-scratch-file (fifo)
            ;; Make a FIFO
-           (setf fifo (sb-posix:mktemp "SBCL-fifo.XXXXXXX"))
            (sb-posix:mkfifo fifo (logior sb-posix:s-iwusr sb-posix:s-irusr))
            ;; Try to open it (which hangs), and interrupt ourselves with a timer,
            ;; continue (this used to result in an error due to open(2) returning with
@@ -661,50 +671,62 @@
                    :timeout
                    :wtf))
              (error (e)
-               e)))
-      (when fifo
-        (ignore-errors (delete-file fifo))))))
+               e)))))
 
+;; We used to not return from read on a named pipe unless the external-format
+;; routine had filled an input buffer. Now we'll return as soon as a request
+;; is satisfied, or on EOF. (https://bugs.launchpad.net/sbcl/+bug/643686)
 #-win32
 (with-test (:name :overeager-character-buffering :skipped-on :win32)
-  (let ((fifo nil)
+  (let ((use-threads #+sb-thread t)
         (proc nil))
-    (maphash
-     (lambda (format _)
-       (declare (ignore _))
-       ;; (format t "trying ~A~%" format)
-       ;; (finish-output t)
-       (unwind-protect
+    (sb-int:dohash ((format _) sb-impl::*external-formats*)
+      (declare (ignore _))
+      (with-scratch-file (fifo)
+        (unwind-protect
             (progn
-              (setf fifo (sb-posix:mktemp "SBCL-fifo-XXXXXXX"))
               (sb-posix:mkfifo fifo (logior sb-posix:s-iwusr sb-posix:s-irusr))
               ;; KLUDGE: because we have both ends in the same process, we would
               ;; need to use O_NONBLOCK, but this works too.
-              (setf proc
-                    (run-program "/bin/sh"
-                                 (list "-c"
-                                       (format nil "cat > ~A" (native-namestring fifo)))
-                                 :input :stream
-                                 :wait nil
-                                 :external-format format))
-              (write-line "foobar" (process-input proc))
-              (finish-output (process-input proc))
+              ;; Prefer to use threads rather than processes, as the test
+              ;; execute significantly faster.
+              ;; Note also that O_NONBLOCK would probably counteract the original
+              ;; bug, so it's better that we eschew O_NONBLOCK.
+              (cond (use-threads
+                     (setf proc
+                           (make-kill-thread
+                            (lambda ()
+                              (with-open-file (f fifo :direction :output
+                                                      :if-exists :overwrite
+                                                      :external-format format)
+                                (write-line "foobar" f)
+                                (finish-output f)
+                                (sleep most-positive-fixnum))))))
+                    (t
+                     (setf proc
+                           (run-program "/bin/sh"
+                                   (list "-c"
+                                         (format nil "cat > ~A" (native-namestring fifo)))
+                                   :input :stream
+                                   :wait nil
+                                   :external-format format))
+                     (write-line "foobar" (process-input proc))
+                     (finish-output (process-input proc))))
+              ;; Whether we're using threads or processes, the writer isn't
+              ;; injecting any more input, but isn't indicating EOF either.
               (with-open-file (f fifo :direction :input :external-format format)
                 (assert (equal "foobar" (read-line f)))))
-         (when proc
-           (ignore-errors
-             (close (process-input proc) :abort t)
-             (process-wait proc))
-           (ignore-errors (process-close proc))
-           (setf proc nil))
-         (when fifo
-           (ignore-errors (delete-file fifo))
-           (setf fifo nil))))
-     sb-impl::*external-formats*)))
+          (when proc
+            (cond (use-threads (sb-thread:terminate-thread proc))
+                  (t (ignore-errors
+                      (close (process-input proc) :abort t)
+                      (process-wait proc))
+                     (ignore-errors (process-close proc))))
+            (setf proc nil)))))))
 
 (with-test (:name :bug-657183 :skipped-on (not :sb-unicode))
   #+sb-unicode
-  (let ((name (merge-pathnames "stream-impure.temp-test"))
+  (let ((name (scratch-file-name))
         (text '(#\GREEK_SMALL_LETTER_LAMDA
                 #\JAPANESE_BANK_SYMBOL
                 #\Space
@@ -735,7 +757,7 @@
       (ignore-errors (delete-file name)))))
 
 (with-test (:name :bug-561642)
-  (let ((p "bug-561642-test.tmp"))
+  (let ((p (scratch-file-name)))
     (unwind-protect
          (progn
            (with-open-file (f p
@@ -759,11 +781,15 @@
                (assert (eql 9 p2)))))
       (ignore-errors (delete-file p)))))
 
+(defun mock-fd-stream-in-fun (stream eof-err-p eof-val)
+  (sb-impl::eof-or-lose stream eof-err-p eof-val))
+(declaim (ftype function mock-fd-stream-n-bin-fun))
+
 (defstruct (mock-fd-stream
             (:constructor %make-mock-fd-stream (buffer-chain))
             (:include sb-impl::ansi-stream
-                      (in #'mock-fd-stream-in)
-                      (n-bin #'mock-fd-stream-n-bin)
+                      (in #'mock-fd-stream-in-fun)
+                      (n-bin #'mock-fd-stream-n-bin-fun)
                       (cin-buffer
                        (make-array sb-impl::+ansi-stream-in-buffer-length+
                                    :element-type 'character))))
@@ -774,10 +800,7 @@
   (%make-mock-fd-stream
    (mapcar (lambda (x) (substitute #\Newline #\| x)) buffer-chain)))
 
-(defun mock-fd-stream-in (stream eof-err-p eof-val)
-  (sb-impl::eof-or-lose stream eof-err-p eof-val))
-
-(defun mock-fd-stream-n-bin (stream char-buf start count eof-err-p)
+(defun mock-fd-stream-n-bin-fun (stream char-buf start count eof-err-p)
   (cond ((mock-fd-stream-buffer-chain stream)
          (let* ((chars (pop (mock-fd-stream-buffer-chain stream)))
                 (n-chars (length chars)))

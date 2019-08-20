@@ -174,7 +174,7 @@ evaluated as a PROGN."
   (or
    ;; the normal reason for saving the inline expansion
    (let ((inlinep (info :function :inlinep name)))
-     (member inlinep '(:inline :maybe-inline)))
+     (member inlinep '(inline maybe-inline)))
    ;; another reason for saving the inline expansion: If the
    ;; ANSI-recommended idiom
    ;;   (DECLAIM (INLINE FOO))
@@ -304,8 +304,13 @@ evaluated as a PROGN."
        (%compiler-defvar ',var))
      (%defvar ',var
               (sb-c:source-location)
-              ,@(and valp
-                     `((unless (%boundp ',var) ,val)))
+              ,@(cond ((not valp)
+                       nil)
+                      ((constantp val)
+                       ;; No need to avoid evaluation if it's a constant.
+                       `(',(constant-form-value val)))
+                      (val
+                       `((unless (%boundp ',var) ,val))))
               ,@(and docp
                      `(',doc)))))
 

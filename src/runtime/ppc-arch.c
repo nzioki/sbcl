@@ -58,9 +58,6 @@
 /* Magic encoding for the instruction used for traps. */
 #define TRAP_INSTRUCTION(trap) ((3<<26) | (6 << 21) | (trap))
 
-void arch_init() {
-}
-
 os_vm_address_t
 arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
@@ -275,10 +272,10 @@ allocation_trap_p(os_context_t * context)
     unsigned __attribute__((unused)) dst;
 
     /*
-     * First, the instruction has to be a TWLGE temp, NL3, which has the
+     * First, the instruction has to be a TWLGT temp, NL3, which has the
      * format.
-     * | 6| 5| 5 | 5 | 10|1|  width
-     * |31|5 |dst|src|  4|0|  field
+     * | 6| 5| 5 | 5 | 10|1|  field width
+     * |31| 1|dst|src|  4|0|  value
      */
     pc = (unsigned int *) (*os_context_pc_addr(context));
     inst = *pc;
@@ -290,7 +287,7 @@ allocation_trap_p(os_context_t * context)
     opcode = inst >> 26;
     src = (inst >> 11) & 0x1f;
     dst = (inst >> 16) & 0x1f;
-    if ((opcode == 31) && (src == reg_NL3) && (5 == ((inst >> 21) & 0x1f))
+    if ((opcode == 31) && (src == reg_NL3) && (1 == ((inst >> 21) & 0x1f))
         && (4 == ((inst >> 1) & 0x3ff))) {
         /*
          * We got the instruction.  Now, look back to make sure it was

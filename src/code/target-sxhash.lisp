@@ -11,9 +11,6 @@
 
 (in-package "SB-IMPL")
 
-(defun pointer-hash (key)
-  (pointer-hash key))
-
 ;;; the depthoid explored when calculating hash values
 ;;;
 ;;; "Depthoid" here is a sort of mixture of what Common Lisp ordinarily calls
@@ -70,6 +67,17 @@
          (xor (logand 608948948376289905 sb-xc:most-positive-fixnum))
          (xy (logand (+ (* x mul) y) sb-xc:most-positive-fixnum)))
     (logand (logxor xor xy (ash xy -5)) sb-xc:most-positive-fixnum)))
+
+;;; Same as above, but don't mask computations to n-positive-fixnum-bits.
+(declaim (inline word-mix))
+(defun word-mix (x y)
+  (declare (optimize (speed 3)))
+  (declare (type word x y))
+  (declare (muffle-conditions compiler-note))
+  (let* ((mul (logand 3622009729038463111 most-positive-word))
+         (xor (logand 608948948376289905 most-positive-word))
+         (xy (logand (+ (* x mul) y) most-positive-word)))
+    (logand (logxor xor xy (ash xy -5)) most-positive-word)))
 
 ;; Return a number that increments by 1 for each word-pair allocation,
 ;; barring complications such as exhaustion of the current page.
@@ -128,7 +136,7 @@
              (set-result (form)
                `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
     (let ((result 238625159)) ; (logandc2 most-positive-fixnum (sxhash #\S)) on 32 bits
-      (declare (type (unsigned-byte #.sb-vm:n-word-bits) result))
+      (declare (type word result))
       ;; Avoid accessing elements of a (simple-array nil (*)).
       ;; The expansion of STRING-DISPATCH involves ETYPECASE,
       ;; so we can't simply omit one case. Therefore that macro
@@ -339,8 +347,8 @@
                (symbol (sxhash x)) ; through DEFTRANSFORM
                (fixnum (sxhash x)) ; through DEFTRANSFORM
                (instance
-                (typecase x
-                  (pathname
+                (case (layout-flags (%instance-layout x))
+                  (#.(logior +pathname-layout-flag+ +structure-layout-flag+)
                    ;; Pathnames are EQUAL if all the components are EQUAL, so
                    ;; we hash all of the components of a pathname together.
                    (let ((hash (sxhash-recurse (pathname-host x) depthoid)))
@@ -354,22 +362,14 @@
                                                       nil
                                                       version)
                                                   depthoid)))))
-                  (layout
-                   ;; LAYOUTs have an easily-accesible hash value: we
-                   ;; might as well use it.  It's not actually uniform
-                   ;; over the space of hash values (it excludes 0 and
-                   ;; some of the larger numbers) but it's better than
-                   ;; simply returning the same value for all LAYOUT
-                   ;; objects, as the next branch would do.
-                   (layout-clos-hash x))
-                  (structure-object
-                   (logxor 422371266
-                           ;; FIXME: why not (LAYOUT-CLOS-HASH ...) ?
-                           (sxhash      ; through DEFTRANSFORM
-                            (classoid-name
-                             (layout-classoid (%instance-layout x))))))
-                  (condition (!condition-hash x))
-                  (t (std-instance-hash x))))
+                  (#.+structure-layout-flag+
+                   (typecase x
+                     (layout (layout-clos-hash x))
+                     (t (logxor 422371266
+                                (layout-clos-hash (%instance-layout x))))))
+                  (#.+condition-layout-flag+ (!condition-hash x))
+                  (#.+pcl-object-layout-flag+ (std-instance-hash x))
+                  (t 0))) ; can't get here
                (array
                 (typecase x
                   ;; If we could do something smart for widetag-based jump tables,
@@ -556,12 +556,8 @@
                             ((float-infinity-p key)
                              ;; {single,double}-float infinities are EQUALP
                              (if (minusp key)
-                                 (load-time-value
-                                  (sxhash (symbol-value 'sb-ext:single-float-negative-infinity))
-                                  t)
-                                 (load-time-value
-                                  (sxhash (symbol-value 'sb-ext:single-float-positive-infinity))
-                                  t)))
+                                 (sxhash sb-ext:single-float-negative-infinity)
+                                 (sxhash sb-ext:single-float-positive-infinity)))
                             (t
                              (multiple-value-bind (q r) (floor key)
                                (if (zerop (the ,type r))

@@ -82,7 +82,8 @@
 ;;; but there's really no easy way to do that at present.
 (defconstant dchunk-bits
   #+x86-64 56
-  #-x86-64 sb-vm:n-word-bits)
+  #+ppc64 32
+  #-(or x86-64 ppc64) sb-vm:n-word-bits)
 
 (deftype dchunk ()
   `(unsigned-byte ,dchunk-bits))
@@ -723,13 +724,6 @@
 
 ;;;; some simple functions that help avoid consing when we're just
 ;;;; recursively filtering things that usually don't change
-
-(defun recons (old-cons car cdr)
-  "If CAR is eq to the car of OLD-CONS and CDR is eq to the CDR, return
-  OLD-CONS, otherwise return (cons CAR CDR)."
-  (if (and (eq car (car old-cons)) (eq cdr (cdr old-cons)))
-      old-cons
-      (cons car cdr)))
 
 (defun sharing-mapcar (fun list)
   (declare (type function fun))

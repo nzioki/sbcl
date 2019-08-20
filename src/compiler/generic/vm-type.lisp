@@ -65,25 +65,20 @@
 
 ;;; an index into an integer
 (sb-xc:deftype bit-index ()
-  `(integer 0 #.(* (1- (ash 1 (- sb-vm:n-word-bits sb-vm:n-widetag-bits)))
-                   sb-vm:n-word-bits)))
+  `(integer 0 ,(* (1- (ash 1 (- sb-vm:n-word-bits sb-vm:n-widetag-bits)))
+                  sb-vm:n-word-bits)))
 
 
 ;;;; hooks into the type system
 
 (sb-xc:deftype unboxed-array (&optional dims)
-  (collect ((types (list 'or)))
-    (dolist (type *specialized-array-element-types*)
-      (when (subtypep type '(or integer character float (complex float)))
-        (types `(array ,type ,dims))))
-    (types)))
-
+  (cons 'or (mapcar (lambda (type) `(array ,type ,dims))
+                    '#.(delete t (map 'list 'sb-vm:saetp-specifier
+                                      sb-vm:*specialized-array-element-type-properties*)))))
 (sb-xc:deftype simple-unboxed-array (&optional dims)
-  (collect ((types (list 'or)))
-    (dolist (type *specialized-array-element-types*)
-      (when (subtypep type '(or integer character float (complex float)))
-        (types `(simple-array ,type ,dims))))
-    (types)))
+  (cons 'or (mapcar (lambda (type) `(simple-array ,type ,dims))
+                    '#.(delete t (map 'list 'sb-vm:saetp-specifier
+                                      sb-vm:*specialized-array-element-type-properties*)))))
 
 (sb-xc:deftype complex-vector (&optional element-type length)
   `(and (vector ,element-type ,length) (not simple-array)))
@@ -306,7 +301,7 @@
                     ;; could be done, but probably no merit to implementing
                     ;; maybe/definitely-complex wild-type.
                     (unless (array-type-complexp x)
-                      (map 'list #'sb-vm::saetp-typecode
+                      (map 'list #'sb-vm:saetp-typecode
                            sb-vm:*specialized-array-element-type-properties*))
                     (let ((saetp
                            (find
@@ -355,16 +350,6 @@
   (let ((where (info :variable :wired-tls symbol)))
     (or (fixnump where) ; thread slots
         (eq where :always-thread-local)))) ; everything else
-
-(sb-xc:deftype load/store-index (scale lowtag min-offset
-                                 &optional (max-offset min-offset))
-  `(integer ,(- (truncate (+ (ash 1 16)
-                             (* min-offset sb-vm:n-word-bytes)
-                             (- lowtag))
-                          scale))
-            ,(truncate (- (+ (1- (ash 1 16)) lowtag)
-                          (* max-offset sb-vm:n-word-bytes))
-                       scale)))
 
 #+(or x86 x86-64)
 (defun sb-vm::displacement-bounds (lowtag element-size data-offset)

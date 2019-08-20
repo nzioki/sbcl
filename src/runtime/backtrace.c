@@ -32,7 +32,7 @@
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
 #include "thread.h"
-#include "gc-internal.h"
+#include "gc.h"
 #include "code.h"
 #include "var-io.h"
 
@@ -54,23 +54,18 @@ sbcl_putwc(wchar_t c, FILE *file)
 #endif
 }
 
-unsigned int decode_elsewhere_pc(lispobj packed_integer)
+static int decode_locs(lispobj packed_integer, int *offset, int *elsewhere)
 {
     struct varint_unpacker unpacker;
-    int value;
     varint_unpacker_init(&unpacker, packed_integer);
-    varint_unpack(&unpacker, &value);
-    return value;
+    return varint_unpack(&unpacker, offset) && varint_unpack(&unpacker, elsewhere);
 }
 
 struct compiled_debug_fun *
 debug_function_from_pc (struct code* code, void *pc)
 {
-    uword_t offset = (char*)pc - code_text_start(code);
-    struct compiled_debug_fun *df;
+    sword_t offset = (char*)pc - code_text_start(code);
     struct compiled_debug_info *di;
-    struct vector *v;
-    int i, len;
 
     if (!instancep(code->debug_info))
         return NULL;
@@ -80,33 +75,26 @@ debug_function_from_pc (struct code* code, void *pc)
     if (!instancep(di->fun_map))
         return NULL;
 
-    v = VECTOR(di->fun_map);
-
-    len = fixnum_value(v->length);
-
-    if (!instancep(v->data[0]))
+    struct compiled_debug_fun *df = (struct compiled_debug_fun*)native_pointer(di->fun_map);
+    int begin, end, elsewhere_begin, elsewhere_end;
+    if (!decode_locs(df->encoded_locs, &begin, &elsewhere_begin))
         return NULL;
-
-    df = (struct compiled_debug_fun *) native_pointer(v->data[0]);
-
-    if (len == 1)
-        return df;
-
-    for (i = 1;; i += 2) {
-        unsigned next_pc;
-
-        if (i == len)
-            return ((struct compiled_debug_fun *) native_pointer(v->data[i - 1]));
-
-        if (offset >= (uword_t)decode_elsewhere_pc(df->encoded_locs)) {
-            struct compiled_debug_fun *p
-                = ((struct compiled_debug_fun *) native_pointer(v->data[i + 1]));
-            next_pc = decode_elsewhere_pc(p->encoded_locs);
-        } else
-            next_pc = fixnum_value(v->data[i]);
-
-        if (offset < next_pc)
-            return ((struct compiled_debug_fun *) native_pointer(v->data[i - 1]));
+    while (df) {
+        struct compiled_debug_fun *next;
+        if (df->next != NIL) {
+            next = (struct compiled_debug_fun*) native_pointer(df->next);
+            if (!decode_locs(next->encoded_locs, &end, &elsewhere_end))
+                return NULL;
+        } else {
+            next = 0;
+            end = elsewhere_end = code_text_size(code);
+        }
+        if ((begin <= offset && offset < end) ||
+            (elsewhere_begin <= offset && offset < elsewhere_end))
+            return df;
+        begin = end;
+        elsewhere_begin = elsewhere_end;
+        df = next;
     }
 
     return NULL;
@@ -217,7 +205,7 @@ print_entry_points (struct code *code, FILE *f)
             fprintf(f, "%p: bogus function entry", fun);
             return;
         }
-        print_entry_name(fun->name, f);
+        print_entry_name(code->constants[CODE_SLOTS_PER_SIMPLE_FUN*index], f);
         if ((index + 1) < n_funs) fprintf(f, ", ");
     });
 }
@@ -255,7 +243,9 @@ struct call_info {
     int pc; /* Note: this is the trace file offset, not the actual pc. */
 };
 
-#define HEADER_LENGTH(header) ((header)>>8)
+// simple-fun headers have a pointer to layout-of-function in the
+// upper bytes if words are 8 bytes, so mask off those bytes.
+#define HEADER_LENGTH(header) (((header)>>8) & FUN_HEADER_NWORDS_MASK)
 
 static int previous_info(struct call_info *info);
 
@@ -375,19 +365,14 @@ previous_info(struct call_info *info)
         }
     } else if (fixnump(lra)) {
         info->code = (struct code*)native_pointer(this_frame->code);
+        // FIXME: is this right? fixnumish LRAs are based off the object base address
+        // and not the code text start?
         info->pc = (uword_t)(info->code + lra);
         info->lra = NIL;
     } else {
         info->code = code_pointer(lra);
-
         if (info->code != NULL)
-            info->pc = (uword_t)native_pointer(info->lra) -
-                (uword_t)info->code -
-#ifndef LISP_FEATURE_ALPHA
-                (HEADER_LENGTH(info->code->header) * sizeof(lispobj));
-#else
-        (HEADER_LENGTH(((struct code *)info->code)->header) * sizeof(lispobj));
-#endif
+            info->pc = (char*)native_pointer(info->lra) - code_text_start(info->code);
         else
             info->pc = 0;
     }
@@ -426,7 +411,7 @@ lisp_backtrace(int nframes)
             printf(" <no LRA>");
 
         if (info.pc)
-            printf(" pc = %p", (void*)(long)info.pc);
+            printf(" pc_ofs = %p", (void*)(long)info.pc);
         putchar('\n');
 
     } while (i++ < nframes && previous_info(&info));
@@ -532,11 +517,11 @@ describe_thread_state(void)
     printf("Pending handler = %p\n", data->pending_handler);
 }
 
-static void print_backtrace_frame(void *pc, void *fp, int i, FILE *f) {
+static void print_backtrace_frame(char *pc, void *fp, int i, FILE *f) {
     lispobj *p;
     fprintf(f, "%4d: ", i);
 
-    p = component_ptr_from_pc((lispobj *) pc);
+    p = component_ptr_from_pc(pc);
 
     if (p) {
         struct code *cp = (struct code *) p;

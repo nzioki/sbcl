@@ -607,7 +607,7 @@
        ;; If range is at least 20% dense, use vector mapping. Crossover
        ;; point solely on basis of space would be 25%. Vector mapping
        ;; is always faster, so give the benefit of the doubt.
-       ((< 0.2 (/ (float (length from-alist)) (float (1+ (- max min)))))
+       ((>= (/ (length from-alist) (1+ (- max min))) 2/10)
         ;; If offset is small and ignorable, ignore it to save time.
         (when (< 0 min 10) (setq min 0))
         (let ((to (make-array (1+ (- max min)))))
@@ -1158,9 +1158,9 @@
 (in-package "SB-IMPL")
 
 (defun extern-alien-name (name)
- (handler-case (coerce name 'base-string)
-   (error ()
-     (error "invalid external alien name: ~S" name))))
+  (handler-case (cl:coerce name 'base-string)
+    (error ()
+      (error "invalid external alien name: ~S" name))))
 
 (declaim (ftype (sfunction (string hash-table) (or integer null))
                 find-foreign-symbol-in-table))

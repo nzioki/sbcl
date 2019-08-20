@@ -21,8 +21,8 @@
 (define-source-transform compiled-function-p (x)
   (once-only ((x x))
     `(and (functionp ,x)
-          #+sb-fasteval (not (sb-interpreter:interpreted-function-p ,x))
-          #+sb-eval (not (sb-eval:interpreted-function-p ,x)))))
+          #+(or sb-fasteval sb-eval)
+          (not (typep ,x 'interpreted-function)))))
 
 (define-source-transform char-int (x)
   `(char-code ,x))
@@ -450,8 +450,11 @@
                     (end-1 (floor (1- length) sb-vm:n-word-bits)))
                    ((>= i end-1)
                     (let* ((extra (1+ (mod (1- length) sb-vm:n-word-bits)))
-                           (mask (ash #.(1- (ash 1 sb-vm:n-word-bits))
-                                      (- extra sb-vm:n-word-bits)))
+                           ;; Why do we need to mask anything? Do we allow use of
+                           ;; the extra bits to record data steganographically?
+                           ;; Or maybe we didn't zero-fill trailing bytes of stack-allocated
+                           ;; bit-vectors?
+                           (mask (ash sb-ext:most-positive-word (- extra sb-vm:n-word-bits)))
                            (numx
                             (logand
                              (ash mask
@@ -497,8 +500,7 @@
              ;; Does it have to do with %shrink-vector, perhaps?
              ;; Some rationale would be nice...
              (let* ((extra (1+ (mod (1- length) sb-vm:n-word-bits)))
-                    (mask (ash #.(1- (ash 1 sb-vm:n-word-bits))
-                               (- extra sb-vm:n-word-bits)))
+                    (mask (ash most-positive-word (- extra sb-vm:n-word-bits)))
                     ;; The above notwithstanding, for big-endian wouldn't it
                     ;; be possible to write this expression as a single shift?
                     ;;  (LOGAND MOST-POSITIVE-WORD (ASH most-positive-word (- n-word-bits extra)))
@@ -529,8 +531,8 @@
   (let ((value (if (constant-lvar-p item)
                    (if (= (lvar-value item) 0)
                        0
-                       #.(1- (ash 1 sb-vm:n-word-bits)))
-                   `(if (= item 0) 0 #.(1- (ash 1 sb-vm:n-word-bits))))))
+                       most-positive-word)
+                   `(if (= item 0) 0 ,most-positive-word))))
     `(let ((length (length sequence))
            (value ,value))
        (if (= length 0)
@@ -663,37 +665,37 @@
 ;;; generate efficient code.
 
 (define-source-transform word-logical-not (x)
-  `(logand (lognot (the sb-vm:word ,x)) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (lognot (the sb-vm:word ,x)) ,most-positive-word))
 
 (deftransform word-logical-and ((x y))
   '(logand x y))
 
 (deftransform word-logical-nand ((x y))
-  '(logand (lognand x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (lognand x y) ,most-positive-word))
 
 (deftransform word-logical-or ((x y))
   '(logior x y))
 
 (deftransform word-logical-nor ((x y))
-  '(logand (lognor x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (lognor x y) ,most-positive-word))
 
 (deftransform word-logical-xor ((x y))
   '(logxor x y))
 
 (deftransform word-logical-eqv ((x y))
-  '(logand (logeqv x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (logeqv x y) ,most-positive-word))
 
 (deftransform word-logical-orc1 ((x y))
-  '(logand (logorc1 x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (logorc1 x y) ,most-positive-word))
 
 (deftransform word-logical-orc2 ((x y))
-  '(logand (logorc2 x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (logorc2 x y) ,most-positive-word))
 
 (deftransform word-logical-andc1 ((x y))
-  '(logand (logandc1 x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (logandc1 x y) ,most-positive-word))
 
 (deftransform word-logical-andc2 ((x y))
-  '(logand (logandc2 x y) #.(1- (ash 1 sb-vm:n-word-bits))))
+  `(logand (logandc2 x y) ,most-positive-word))
 
 
 ;;; There are two different ways the multiplier can be recoded. The

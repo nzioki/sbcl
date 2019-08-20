@@ -345,22 +345,45 @@
   (move block uwp)
   ;; Set next unwind protect context.
   (loadw uwp uwp unwind-block-uwp-slot)
-  (store-tl-symbol-value uwp *current-unwind-protect-block*)
 
   DO-EXIT
+
+  ;; Need to perform unbinding before unlinking the UWP so that if
+  ;; interrupted here it can still run the clean up form. While the
+  ;; cleanup form itself cannot be protected from interrupts (can't
+  ;; run it twice) one of the variables being unbound can be
+  ;; *interrupts-enabled*
+  (loadw where block unwind-block-bsp-slot)
+  (unbind-to-here where symbol value temp-reg-tn zero)
+
+  (store-tl-symbol-value uwp *current-unwind-protect-block*)
 
   (loadw rbp-tn block unwind-block-cfp-slot)
 
   (loadw uwp block unwind-block-current-catch-slot)
   (store-tl-symbol-value uwp *current-catch-block*)
 
-  (loadw where block unwind-block-bsp-slot)
-  (unbind-to-here where symbol value uwp zero)
+
   ;; Uwp-entry expects some things in known locations so that they can
   ;; be saved on the stack: the block in rdx-tn, start in rbx-tn, and
   ;; count in rcx-tn.
 
   (inst jmp (ea (* unwind-block-entry-pc-slot n-word-bytes) block)))
+
+#+sb-assembling
+(defun ensure-thread-base-tn-loaded ()
+  #-sb-thread
+  (progn
+    ;; Load THREAD-BASE-TN from the all_threads. Does not need to be spilled
+    ;; to stack, because we do do not give the register allocator access to it.
+    ;; And call_into_lisp saves it as per convention, not that it matters,
+    ;; because there's no way to get back into C code anyhow.
+    #+sb-dynamic-core
+    (progn
+      (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
+      (inst mov thread-base-tn (ea thread-base-tn)))
+    #-sb-dynamic-core
+    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign)))))
 
 ;;; Perform a store to code, updating the GC page (card) protection bits.
 ;;; This is not a "good" implementation of soft card marking.
@@ -382,29 +405,19 @@
   (inst push rdi-tn)
   ;; stack: spill[2], ret-pc, object, index, value-to-store
 
-  #-sb-thread
-  (progn
-    ;; Load THREAD-BASE-TN from the all_threads. Does not need to be spilled
-    ;; to stack, because we do do not give the register allocator access to it.
-    ;; And call_into_lisp saves it as per convention, not that it matters,
-    ;; because there's no way to get back into C code anyhow.
-    #+sb-dynamic-core
-    (progn
-      (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
-      (inst mov thread-base-tn (ea thread-base-tn)))
-    #-sb-dynamic-core
-    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign))))
-
-  (inst mov temp-reg-tn (ea 24 rsp-tn))
-  (inst sub temp-reg-tn (thread-slot-ea thread-varyobj-space-addr-slot))
-  (inst shr temp-reg-tn (1- (integer-length immobile-card-bytes)))
+  (ensure-thread-base-tn-loaded)
   (pseudo-atomic ()
     (assemble ()
-      (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
-      (inst jmp :ae try-dynamic-space)
-      (inst mov rdi-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-      (inst bts :dword (ea rdi-tn) temp-reg-tn :lock)
-      (inst jmp store)
+      #+immobile-space
+      (progn
+        (inst mov temp-reg-tn (ea 24 rsp-tn))
+        (inst sub temp-reg-tn (thread-slot-ea thread-varyobj-space-addr-slot))
+        (inst shr temp-reg-tn (1- (integer-length immobile-card-bytes)))
+        (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
+        (inst jmp :ae try-dynamic-space)
+        (inst mov rdi-tn (thread-slot-ea thread-varyobj-card-marks-slot))
+        (inst bts :dword (ea rdi-tn) temp-reg-tn :lock)
+        (inst jmp store))
 
       TRY-DYNAMIC-SPACE
       (inst mov temp-reg-tn (ea 24 rsp-tn)) ; reload
@@ -442,27 +455,26 @@
   (inst pop rax-tn)
   (inst ret 24)) ; remove 3 stack args
 
+;;; Currently the only objects for which it is necessary to call TOUCH-GC-CARD
+;;; are those on varyobj pages. Therefore if no immobile-space feature, skip it.
+;;; This is not the situation for pages of code, where we manually toggle dynamic space
+;;; card marks so that when recording code coverage we don't incur the cost of a kernel
+;;; signal on a page that was otherwise untouched.
 #+sb-assembling
 (define-assembly-routine (touch-gc-card (:return-style :none)) ()
   ;; stack: ret-pc, object
-  #-sb-thread
+  #+immobile-space
   (progn
-    #+sb-dynamic-core
-    (progn
-      (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
-      (inst mov thread-base-tn (ea thread-base-tn)))
-    #-sb-dynamic-core
-    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign))))
-  (inst mov temp-reg-tn (ea 8 rsp-tn))
-  (inst sub temp-reg-tn (thread-slot-ea thread-varyobj-space-addr-slot))
-  (inst shr temp-reg-tn (integer-length (1- immobile-card-bytes)))
-  (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
-  (inst jmp :ae DONE)
+   (ensure-thread-base-tn-loaded)
+   (inst mov temp-reg-tn (ea 8 rsp-tn))
+   (inst sub temp-reg-tn (thread-slot-ea thread-varyobj-space-addr-slot))
+   (inst shr temp-reg-tn (integer-length (1- immobile-card-bytes)))
+   (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
+   (inst jmp :ae DONE)
 
-  (inst push rax-tn)
-  (inst mov rax-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-  (inst bts :dword (ea rax-tn) temp-reg-tn :lock)
-  (inst pop rax-tn)
-
+   (inst push rax-tn)
+   (inst mov rax-tn (thread-slot-ea thread-varyobj-card-marks-slot))
+   (inst bts :dword (ea rax-tn) temp-reg-tn :lock)
+   (inst pop rax-tn))
   DONE
   (inst ret 8)) ; remove 1 stack arg

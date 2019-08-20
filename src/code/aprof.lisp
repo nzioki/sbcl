@@ -85,6 +85,7 @@
                 #:|push| #:|pop| #:|or| #:|call| #:|break|))
 
 (in-package #:sb-aprof)
+(setf (system-package-p *package*) t)
 
 (defstruct (alloc (:constructor make-alloc (bytes count type pc)))
   bytes count type pc)
@@ -164,7 +165,7 @@
 (defun layout-name (ptr)
   (if (eql (valid-lisp-pointer-p (int-sap ptr)) 0)
       'structure
-      (classoid-name (layout-classoid (make-lisp-obj ptr)))))
+      (layout-classoid-name (make-lisp-obj ptr))))
 
 ;;; map-segment-instructions is really deficient in providing an intelligent
 ;;; decoding of the bits, as they're wired into the instruction printer.
@@ -359,7 +360,13 @@
                                   (advance +state-widetag-only+)
                                   (setq widetag (if (eq (inst-operand-size dstate) :qword)
                                                     :variable
-                                                    (logand (reg/mem-imm-data 0 dstate) #xFF))))
+                                                    (logand (reg/mem-imm-data 0 dstate) #xFF)))
+                                  ;; Done, unless we need to scan more in order to infer the layout
+                                  (when (and (integerp widetag)
+                                             (not (member widetag `(,sb-vm:funcallable-instance-widetag
+                                                                    ,sb-vm:instance-widetag))))
+                                    (return-from infer-type
+                                      (values (aref *tag-to-type* widetag) size))))
                                  ((and (eql (machine-ea-base ea) target-reg)
                                        (not (machine-ea-index ea))
                                        (machine-ea-disp ea))) ; ignore
@@ -504,17 +511,15 @@
                   (when (<= (car v) pc-offs (cadr v))
                     (return k)))
                 (car di)))
-      (let* ((funmap (sb-c::compiled-debug-info-fun-map di))
-             (i (- (length funmap) 2)))
-        (when (= i -1)
-          (aver (typep (aref funmap 0) 'sb-c::compiled-debug-fun-toplevel))
+      (let* ((funmap (sb-c::compiled-debug-info-fun-map di)))
+        (unless (sb-c::compiled-debug-fun-next funmap)
+          (aver (typep funmap 'sb-c::compiled-debug-fun-toplevel))
           (return-from pc-offs-to-fun-name :toplevel))
-        (sb-c::compiled-debug-fun-name
-         (svref funmap (loop (when (>= pc-offs (svref funmap i))
-                               (return (1+ i)))
-                             (when (= i 1)
-                               (return 0))
-                             (decf i 2)))))))
+        (loop for fun = funmap then next
+              for next = (sb-c::compiled-debug-fun-next fun)
+              when (or (not next)
+                       (< (sb-c::compiled-debug-fun-offset next) pc-offs))
+              return (sb-c::compiled-debug-fun-name fun)))))
 
 (defun aprof-collect (stream)
   (let* ((metadata *allocation-profile-metadata*)
@@ -623,14 +628,14 @@
           (incf sum-pct (float (/ bytes total-bytes)))
           ;; Show summary for the function
           (cond ((not detail)
-                 (format stream " ~5,1,2f      ~5,1,2f ~12d~15d   ~a~%"
+                 (format stream " ~5,1,2f      ~5,1,2f ~12d~15d   ~s~%"
                          (/ bytes total-bytes)
                          sum-pct
                          bytes
                          (reduce #'+ data :key #'alloc-count)
                          name))
                 (t
-                 (format stream " ~5,1,2f   ~12d   ~:[~10@t~;~:*~10d~]~@[~14@a~]    ~a~@[ - ~a~]~%"
+                 (format stream " ~5,1,2f   ~12d   ~:[~10@t~;~:*~10d~]~@[~14@a~]    ~s~@[ - ~s~]~%"
                          (/ bytes total-bytes)
                          bytes
                          (if (cdr data) nil (alloc-count (car data)))
@@ -642,7 +647,7 @@
                          )))
           (when (and detail (cdr data))
             (dolist (point data)
-              (format stream "     ~5,1,2f ~12d ~10d~@[~14x~]~@[        ~a~]~%"
+              (format stream "     ~5,1,2f ~12d ~10d~@[~14x~]~@[        ~s~]~%"
                         (/ (alloc-bytes point) bytes) ; fraction within function
                         (alloc-bytes point)
                         (alloc-count point)

@@ -58,7 +58,6 @@
 (defconstant single-float-normal-exponent-min 1)
 (defconstant single-float-normal-exponent-max 254)
 (defconstant single-float-hidden-bit (ash 1 23))
-(defconstant single-float-trapping-nan-bit (ash 1 22))
 
 (defconstant double-float-bias 1022)
 (defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
@@ -66,7 +65,6 @@
 (defconstant double-float-normal-exponent-min 1)
 (defconstant double-float-normal-exponent-max #x7FE)
 (defconstant double-float-hidden-bit (ash 1 20))
-(defconstant double-float-trapping-nan-bit (ash 1 19))
 
 (defconstant single-float-digits
   (+ (byte-size single-float-significand-byte) 1))
@@ -121,15 +119,9 @@
   (defconstant linkage-table-space-end   #x0b000000))
 
 ;;; While on gencgc we don't.
-#+gencgc
-(!gencgc-space-setup #x04000000
-                     :dynamic-space-start
-                     #+linux   #x4f000000
-                     #+netbsd  #x4f000000
-                     #+openbsd #x4f000000
-                     #+darwin  #x10000000)
+#+gencgc (!gencgc-space-setup #x04000000 :dynamic-space-start #x1000000000)
 
-(defconstant linkage-table-entry-size 16)
+(defconstant linkage-table-entry-size 24)
 
 #+linux
 (progn
@@ -189,7 +181,18 @@
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
 (defconstant-eqx +static-symbols+
- `#(,@+common-static-symbols+)
+ `#(,@+common-static-symbols+
+    ;; The C TLS pointer is technically a "reserved" register and may not be used
+    ;; by application code for anything, except that we do use it.
+    ;; You can't even run single-threaded C code if it has the wrong value.
+    ;; (At minimum, lazy binding of C symbols via the PLT needs it.)
+    ;; To avoid wasting a register, we should use the same register as the
+    ;; lisp thread, from which we can recover the C thread,
+    ;; and vice versa. Actually that may not be legal either - it might be
+    ;; that signal handlers need the correct value in r13, I don't know.
+    ;; ("Reserved" could rightly mean: touch it at all, and you die)
+    ;; We store the r13 value in a static lisp symbol.
+    r13-value)
   #'equalp)
 
 (defconstant-eqx +static-fdefns+

@@ -743,7 +743,7 @@
 ;;; arguments.
 (defoptimizer (%%primitive ir2-convert) ((template info &rest args) call block)
   (declare (ignore args))
-  (let* ((template (lvar-value template))
+  (let* ((template (gethash (lvar-value template) *backend-template-names*))
          (info (lvar-value info))
          (lvar (node-lvar call))
          (rtypes (template-result-types template))
@@ -764,7 +764,7 @@
 
 (defoptimizer (%%primitive derive-type) ((template info &rest args))
   (declare (ignore info args))
-  (let ((type (template-type (lvar-value template))))
+  (let ((type (template-type (gethash (lvar-value template) *backend-template-names*))))
     (if (fun-type-p type)
         (fun-type-returns type)
         *wild-type*)))
@@ -1739,13 +1739,17 @@ not stack-allocated LVAR ~S." source-lvar)))))
              (2lvar (lvar-info lvar)))
     (ecase (ir2-lvar-kind 2lvar)
       (:fixed
-       ;; KLUDGE: this is very much unsafe, and can leak random stack values.
-       ;; OTOH, I think the :FIXED case can only happen with (safety 0) in the
-       ;; first place.
-       ;;  -PK
        (loop for loc in (ir2-lvar-locs 2lvar)
              for idx upfrom 0
-             do (vop sb-vm::more-arg node block
+             unless (eq (tn-kind loc) :unused)
+             do #+(vop-named sb-vm::more-arg-or-nil)
+                (vop sb-vm::more-arg-or-nil node block
+                     (lvar-tn node block context)
+                     (lvar-tn node block count)
+                     idx
+                     loc)
+                #-(vop-named sb-vm::more-arg-or-nil)
+                (vop sb-vm::more-arg node block
                      (lvar-tn node block context)
                      (emit-constant idx)
                      loc)))
@@ -1779,7 +1783,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
 ;;; This is trivial, given our assumption of a shallow-binding
 ;;; implementation.
 (defoptimizer (%special-bind ir2-convert) ((var value) node block)
-  (let ((name (leaf-source-name (lvar-value var))))
+  (let ((name (lvar-value var)))
     ;; Emit either BIND or DYNBIND, preferring BIND if both exist.
     ;; If only one exists, it's DYNBIND.
     ;; Even if the backend supports load-time TLS index assignment,
@@ -2193,7 +2197,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                   (vop count-me
                        first-node
                        2block
-                       #+sb-dyncount *dynamic-counts-tn* #-sb-dyncount nil
+                       *dynamic-counts-tn*
                        num))))
               #+sb-safepoint
               (let ((first-node (block-start-node block)))

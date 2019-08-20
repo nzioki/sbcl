@@ -162,7 +162,6 @@ Other commands:
                       (return loc))))
         (cond ((and (not (debug-block-elsewhere-p block))
                     start)
-               (format *debug-io* "~%unknown location: using block start~%")
                start)
               (t
                loc)))
@@ -1776,8 +1775,7 @@ forms that explicitly control this kind of evaluation.")
            ;; On unithreaded X86 *BINDING-STACK-POINTER* and
            ;; *CURRENT-CATCH-BLOCK* are negative, so we need to jump through
            ;; some hoops to make these calculated values negative too.
-           (ash (truly-the (signed-byte #.sb-vm:n-word-bits)
-                           (sap-int sap))
+           (ash (truly-the sb-vm:signed-word (sap-int sap))
                 (- sb-vm::n-fixnum-tag-bits))))
     ;; To properly unwind the stack, we need three pieces of information:
     ;;   * The unwind block that should be active after the unwind

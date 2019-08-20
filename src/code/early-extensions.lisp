@@ -16,7 +16,7 @@
 ;;; A number that can represent an index into a vector, including
 ;;; one-past-the-end
 (deftype array-range ()
-  '(integer 0 #.sb-xc:array-dimension-limit))
+  `(integer 0 ,sb-xc:array-dimension-limit))
 
 ;;; a type used for indexing into sequences, and for related
 ;;; quantities like lengths of lists and other sequences.
@@ -55,22 +55,15 @@
 
 ;;; CHAR-CODE values for ASCII characters which we care about but
 ;;; which aren't defined in section "2.1.3 Standard Characters" of the
-;;; ANSI specification for Lisp
-;;;
-;;; KLUDGE: These are typically used in the idiom (CODE-CHAR
-;;; FOO-CHAR-CODE). I suspect that the current implementation is
-;;; expanding this idiom into a full call to CODE-CHAR, which is an
-;;; annoying overhead. I should check whether this is happening, and
-;;; if so, perhaps implement a DEFTRANSFORM or something to stop it.
-;;; (or just find a nicer way of expressing characters portably?) --
-;;; WHN 19990713
+;;; ANSI specification for Lisp.
+;;; These are typically used in the idiom (CODE-CHAR FOO-CHAR-CODE)
 (defconstant bell-char-code 7)
 (defconstant backspace-char-code 8)
 (defconstant tab-char-code 9)
 (defconstant line-feed-char-code 10)
 (defconstant form-feed-char-code 12)
 (defconstant return-char-code 13)
-(defconstant escape-char-code 27)
+(defconstant escape-char-code 27) ; unused
 (defconstant rubout-char-code 127)
 
 ;;;; type-ish predicates
@@ -133,25 +126,6 @@
      (>= (length sequence) length))
     (sequence
      (>= (length sequence) length))))
-
-;;; Is X is a positive prime integer?
-(defun positive-primep (x)
-  ;; This happens to be called only from one place in sbcl-0.7.0, and
-  ;; only for fixnums, we can limit it to fixnums for efficiency. (And
-  ;; if we didn't limit it to fixnums, we should use a cleverer
-  ;; algorithm, since this one scales pretty badly for huge X.)
-  (declare (fixnum x))
-  (if (<= x 5)
-      (and (>= x 2) (/= x 4))
-      (and (not (evenp x))
-           (not (zerop (rem x 3)))
-           (do ((q 6)
-                (r 1)
-                (inc 2 (logxor inc 6)) ;; 2,4,2,4...
-                (d 5 (+ d inc)))
-               ((or (= r 0) (> d q)) (/= r 0))
-             (declare (fixnum inc))
-             (multiple-value-setq (q r) (truncate x d))))))
 
 ;;; Could this object contain other objects? (This is important to
 ;;; the implementation of things like *PRINT-CIRCLE* and the dumper.)
@@ -273,21 +247,6 @@
     (when (and (eq (car pair) item) (not (null pair)))
       (return pair))))
 
-;;; like (DELETE .. :TEST #'EQ):
-;;;   Delete all LIST entries EQ to ITEM (destructively modifying
-;;;   LIST), and return the modified LIST.
-(defun delq (item list)
-  (declare (explicit-check))
-  (let ((list list))
-    (do ((x list (cdr x))
-         (splice '()))
-        ((endp x) list)
-      (cond ((eq item (car x))
-             (if (null splice)
-                 (setq list (cdr x))
-                 (rplacd splice (cdr x))))
-            (t (setq splice x)))))) ; Move splice along to include element.
-
 ;;; Delete just one item
 (defun delq1 (item list)
   (do ((prev nil x)
@@ -298,15 +257,6 @@
           (return (cdr x))
           (rplacd prev (cdr x)))
       (return list))))
-
-;;; like (POSITION .. :TEST #'EQ):
-;;;   Return the position of the first element EQ to ITEM.
-(defun posq (item list)
-  (do ((i list (cdr i))
-       (j 0 (1+ j)))
-      ((null i))
-    (when (eq (car i) item)
-      (return j))))
 
 (declaim (inline neq))
 (defun neq (x y)
@@ -373,19 +323,6 @@
                (error "malformed plist, odd number of elements"))
              (setq ,val (pop ,tail))
              (progn ,@body)))))
-
-;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
-;;; Otherwise, evaluate DEFAULT, store the resulting value in
-;;; HASH-TABLE and return two values: 1) the result of evaluating
-;;; DEFAULT 2) NIL.
-(defmacro ensure-gethash (key hash-table &optional default)
-  (with-unique-names (n-key n-hash-table value foundp)
-    `(let ((,n-key ,key)
-           (,n-hash-table ,hash-table))
-       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
-         (if ,foundp
-             (values ,value t)
-             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 ;;; (binding* ({(names initial-value [flag])}*) body)
 ;;; FLAG may be NIL or :EXIT-IF-NULL
@@ -790,33 +727,6 @@ NOTE: This interface is experimental and subject to change."
           (t
            (return)))))
 
-;;;; package idioms
-
-;;; Note: Almost always you want to use FIND-UNDELETED-PACKAGE-OR-LOSE
-;;; instead of this function. (The distinction only actually matters when
-;;; PACKAGE-DESIGNATOR is actually a deleted package, and in that case
-;;; you generally do want to signal an error instead of proceeding.)
-(defun %find-package-or-lose (package-designator)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
-  (or (find-package package-designator)
-      (error 'simple-package-error
-             :package package-designator
-             :format-control "The name ~S does not designate any package."
-             :format-arguments (list package-designator))))
-
-;;; ANSI specifies (in the section for FIND-PACKAGE) that the
-;;; consequences of most operations on deleted packages are
-;;; unspecified. We try to signal errors in such cases.
-(defun find-undeleted-package-or-lose (package-designator)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
-  (let ((maybe-result (%find-package-or-lose package-designator)))
-    (if (package-%name maybe-result)    ; if not deleted
-        maybe-result
-        (error 'simple-package-error
-               :package maybe-result
-               :format-control "The package ~S has been deleted."
-               :format-arguments (list maybe-result)))))
-
 ;;;; various operations on names
 
 ;;; Is NAME a legal variable/function name?
@@ -947,6 +857,7 @@ NOTE: This interface is experimental and subject to change."
 ;;; The "more or less" bit is that the no-bound-at-all case is
 ;;; represented by NIL (not by * as in ANSI type specifiers); and in
 ;;; this case we return NIL.
+(declaim (ftype (sfunction (t) (or null real)) type-bound-number))
 (defun type-bound-number (x)
   (if (consp x)
       (destructuring-bind (result) x result)
@@ -963,16 +874,6 @@ NOTE: This interface is experimental and subject to change."
       (if (consp bound)
           (list (c (car bound)))
           (c bound)))))
-
-;;; some commonly-occurring CONSTANTLY forms
-(macrolet ((def-constantly-fun (name constant-expr)
-             `(progn
-                (declaim (ftype (sfunction * (eql ,constant-expr)) ,name))
-                (setf (symbol-function ',name)
-                      (constantly ,constant-expr)))))
-  (def-constantly-fun constantly-t t)
-  (def-constantly-fun constantly-nil nil)
-  (def-constantly-fun constantly-0 0))
 
 
 ;;;; utilities for two-VALUES predicates
@@ -1166,32 +1067,22 @@ NOTE: This interface is experimental and subject to change."
 (defun print-type (stream type &optional colon at)
   (print-type-specifier stream (type-specifier type) colon at)))
 
-(declaim (ftype (sfunction (index &key (:comma-interval (and (integer 1) index))) index)
-                decimal-with-grouped-digits-width))
-(defun decimal-with-grouped-digits-width (value &key (comma-interval 3))
-  (let ((digits (length (write-to-string value :base 10))))
-    (+ digits (floor (1- digits) comma-interval))))
-
 
 ;;;; Deprecating stuff
 
 (deftype deprecation-state ()
   '(member :early :late :final))
 
-(deftype deprecation-software-and-version ()
-  '(or string (cons string (cons string null))))
-
 (defun normalize-deprecation-since (since)
-  (unless (typep since 'deprecation-software-and-version)
-    (error 'simple-type-error
+  (typecase since
+    (string (values nil since))
+    ((cons string (cons string null)) (values (car since) (cadr since)))
+    (t (error 'simple-type-error
            :datum since
-           :expected-type 'deprecation-software-and-version
+           :expected-type '(or string (cons string (cons string null)))
            :format-control "~@<The value ~S does not designate a ~
                             version or a software name and a version.~@:>"
-           :format-arguments (list since)))
-  (if (typep since 'string)
-      (values nil since)
-      (values-list since)))
+           :format-arguments (list since)))))
 
 (defun normalize-deprecation-replacements (replacements)
   (if (or (not (listp replacements))
@@ -1268,21 +1159,6 @@ NOTE: This interface is experimental and subject to change."
                   (eq type-specifier (find-class name nil)))
          (%check-deprecated-type name))))))
 
-;; This is the moral equivalent of a warning from /usr/bin/ld that
-;; "gets() is dangerous." You're informed by both the compiler and linker.
-(defun loader-deprecation-warn (stuff whence)
-  ;; Stuff is a list: ((<state> name . category) ...)
-  ;; For now we only deal with category = :FUNCTION so we ignore it.
-  (let ((warning-class
-         ;; We're only going to warn once (per toplevel form),
-         ;; so pick the most stern warning applicable.
-         (if (every (lambda (x) (eq (car x) :early)) stuff)
-             'simple-style-warning 'simple-warning)))
-    (warn warning-class
-          :format-control "Reference to deprecated function~P ~S~@[ from ~S~]"
-          :format-arguments
-          (list (length stuff) (mapcar #'second stuff) whence))))
-
 ;;; STATE is one of
 ;;;
 ;;;   :EARLY, for a compile-time style-warning.
@@ -1321,29 +1197,6 @@ NOTE: This interface is experimental and subject to change."
 ;;; - SB-C::STACK-ALLOCATE-VECTOR (policy)         since 1.0.19.7            -> Final: anytime
 ;;; - SB-C::STACK-ALLOCATE-VALUE-CELLS (policy)    since 1.0.19.7            -> Final: anytime
 
-(sb-cold:preserving-host-function
-(defun print-deprecation-replacements (stream replacements &optional colonp atp)
-  (declare (ignore colonp atp))
-  ;; I don't think this is callable during cross-compilation, is it?
-  ;; Anyway, the format string tokenizer can not handle APPLY on its own.
-  (apply #'format stream
-         (sb-format:tokens "~#[~;~
-             Use ~/sb-ext:print-symbol-with-prefix/ instead.~;~
-             Use ~/sb-ext:print-symbol-with-prefix/ or ~
-             ~/sb-ext:print-symbol-with-prefix/ instead.~:;~
-             Use~@{~#[~; or~] ~
-             ~/sb-ext:print-symbol-with-prefix/~^,~} instead.~
-           ~]")
-         replacements)))
-
-(defun print-deprecation-message (namespace name software version
-                                  &optional replacements stream)
-  (format stream
-           "The ~(~A~) ~/sb-ext:print-symbol-with-prefix/ has been ~
-            deprecated as of ~@[~A ~]version ~A.~
-            ~@[~2%~/sb-impl::print-deprecation-replacements/~]"
-          namespace name software version replacements))
-
 (defun setup-function-in-final-deprecation
     (software version name replacement-spec)
   #+sb-xc-host (declare (ignore software version name replacement-spec))
@@ -1372,45 +1225,6 @@ NOTE: This interface is experimental and subject to change."
     (software version name replacement-spec)
   (declare (ignore software version replacement-spec))
   (%compiler-deftype name (constant-type-expander name t) nil))
-
-(defmacro define-deprecated-function (state version name replacements lambda-list
-                                      &body body)
-  (declare (type deprecation-state state)
-           (type string version)
-           (type function-name name)
-           (type (or function-name list) replacements)
-           (type list lambda-list)
-           #+sb-xc-host (ignore version replacements))
-  `(progn
-     #-sb-xc-host
-     (declaim (deprecated
-               ,state ("SBCL" ,version)
-               (function ,name ,@(when replacements
-                                   `(:replacement ,replacements)))))
-     ,(ecase state
-        ((:early :late)
-         `(defun ,name ,lambda-list
-            ,@body))
-        ((:final)
-         `',name))))
-
-(defmacro define-deprecated-variable (state version name
-                                      &key (value nil valuep) replacement)
-  (declare (type deprecation-state state)
-           (type string version)
-           (type symbol name)
-           #+sb-xc-host (ignore version replacement))
-  `(progn
-     #-sb-xc-host
-     (declaim (deprecated
-               ,state ("SBCL" ,version)
-               (variable ,name ,@(when replacement
-                                   `(:replacement ,replacement)))))
-     ,(ecase state
-        ((:early :late)
-         `(defvar ,name ,@(when valuep (list value))))
-        ((:final)
-         `',name))))
 
 ;; Given DECLS as returned by from parse-body, and SYMBOLS to be bound
 ;; (with LET, MULTIPLE-VALUE-BIND, etc) return two sets of declarations:
@@ -1510,15 +1324,6 @@ NOTE: This interface is experimental and subject to change."
          (values members (or (not (listp tail))
                              (and (>= count max-length) :maybe)))))))
 
-;;; Default evaluator mode (interpeter / compiler)
-
-(declaim (type (member :compile #+(or sb-eval sb-fasteval) :interpret)
-               *evaluator-mode*))
-(defparameter *evaluator-mode* :compile ; initialized by genesis
-  "Toggle between different evaluator implementations. If set to :COMPILE,
-an implementation of EVAL that calls the compiler will be used. If set
-to :INTERPRET, an interpreter will be used.")
-(declaim (always-bound *evaluator-mode*))
 ;; This is not my preferred name for this function, but chosen for harmony
 ;; with everything else that refers to these as 'hash-caches'.
 ;; Hashing is just one particular way of memoizing, and it would have been
@@ -1558,6 +1363,33 @@ to :INTERPRET, an interpreter will be used.")
                                 (length cache))))
                   short-name))))))
 
+;;; Just like WITH-OUTPUT-TO-STRING but doesn't close the stream,
+;;; producing more compact code.
+(defmacro with-simple-output-to-string
+    ((var &optional string (element-type :default)) &body body)
+  ;; Don't need any fancy type-specifier parsing. Uses of this macro
+  ;; are confined to our own code. So the element-type is literally
+  ;; either :DEFAULT or BASE-CHAR.
+  (aver (member element-type '(base-char :default)))
+  (multiple-value-bind (forms decls) (parse-body body nil)
+    (if string
+        `(let ((,var (make-fill-pointer-output-stream ,string)))
+           ,@decls
+           ,@forms)
+        ;; Why not dxify this stream?
+        `(let ((,var #+sb-xc-host (make-string-output-stream)
+                     #-sb-xc-host
+                     ,(case element-type
+                        ;; Non-unicode doesn't have %MAKE-DEFAULT-STRING-OSTREAM
+                        #+sb-unicode
+                        (:default '(%make-default-string-ostream))
+                        ;; and this macro is never employed to make streams
+                        ;; that can only return CHARACTER string.
+                        (t '(%make-base-string-ostream)))))
+           ,@decls
+           ,@forms
+           (get-output-stream-string ,var)))))
+
 (in-package "SB-KERNEL")
 
 (defun fp-zero-p (x)
@@ -1567,22 +1399,6 @@ to :INTERPRET, an interpreter will be used.")
     #+long-float
     (long-float (zerop x))
     (t nil)))
-
-(defun neg-fp-zero (x)
-  (etypecase x
-    (single-float
-     (if (eql x 0.0f0)
-         (make-unportable-float :single-float-negative-zero)
-         0.0f0))
-    (double-float
-     (if (eql x 0.0d0)
-         (make-unportable-float :double-float-negative-zero)
-         0.0d0))
-    #+long-float
-    (long-float
-     (if (eql x 0.0l0)
-         (make-unportable-float :long-float-negative-zero)
-         0.0l0))))
 
 (declaim (inline schwartzian-stable-sort-list))
 (defun schwartzian-stable-sort-list (list comparator &key key)
@@ -1609,25 +1425,6 @@ to :INTERPRET, an interpreter will be used.")
                            vector))
              (sorted (stable-sort wrapped comparator :key #'cdr)))
         (map-into sorted #'car sorted))))
-
-;;; Just like WITH-OUTPUT-TO-STRING but doesn't close the stream,
-;;; producing more compact code.
-(defmacro with-simple-output-to-string
-    ((var &optional string)
-     &body body)
-  (multiple-value-bind (forms decls) (parse-body body nil)
-    (if string
-        `(let ((,var (sb-impl::make-fill-pointer-output-stream ,string)))
-           ,@decls
-           ,@forms)
-        `(let ((,var #+sb-xc-host (make-string-output-stream)
-                     #-sb-xc-host (sb-impl::%make-string-output-stream
-                                   (or #-sb-unicode 'character :default)
-                                   #'sb-impl::string-ouch)))
-
-           ,@decls
-           ,@forms
-           (get-output-stream-string ,var)))))
 
 ;;; Ensure basicness if possible, and simplicity always
 (defun possibly-base-stringize (s)

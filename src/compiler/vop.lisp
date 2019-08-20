@@ -383,11 +383,16 @@
   (name "<not computed>" :type (or simple-string list symbol))
   ;; the argument list that the function was defined with.
   (arguments nil :type list)
+  ;; source form and/or docstring
+  (form/doc nil :type (or list string (cons t string)))
   ;; a function type specifier representing the arguments and results
   ;; of this function
   (type 'function :type (or list (member function)))
-  ;; source form and/or docstring and/or xref information for the XEP
-  (form/doc/xrefs nil :type (or null simple-vector string cons)))
+  (xref))
+(defun entry-info-type/xref (entry)
+  (let ((type (entry-info-type entry))
+        (xref (entry-info-xref entry)))
+    (if (and type xref) (cons type xref) (or type xref))))
 
 ;;; An IR2-PHYSENV is used to annotate non-LET LAMBDAs with their
 ;;; passing locations. It is stored in the PHYSENV-INFO.
@@ -710,7 +715,6 @@
   ;; encodes the source ref (shifted 8, it is also encoded in
   ;; MAX-VOP-TN-REFS) and the dest ref index.
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1))))
-(!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 ;; These printers follow the definition of VOP-INFO because they
 ;; want to inline VOP-INFO-NAME, and it's less code to move them here
@@ -1051,7 +1055,11 @@
   (sc nil :type (or storage-class null))
   ;; the offset within the SB that this TN is packed into. This is what
   ;; indicates that the TN is packed
-  (offset nil :type (or index null))
+  ;; The integer bound ensures that TN-BYTE-OFFSET remains a fixnum.
+  ;; The default stack size is 2MB, so this is plenty big.
+  (offset nil :type (or null
+                        (unsigned-byte #.(- sb-vm:n-positive-fixnum-bits
+                                            sb-vm:word-shift))))
   ;; some kind of info about how important this TN is
   (cost 0 :type fixnum)
   ;; If a :ENVIRONMENT or :DEBUG-ENVIRONMENT TN, this is the
@@ -1062,7 +1070,7 @@
 
 (declaim (freeze-type tn))
 (defmethod print-object ((tn tn) stream)
-  (cond ((not (boundp 'sb-c::*compiler-ir-obj-map*))
+  (cond ((not (boundp '*compilation*))
          (print-unreadable-object (tn stream :type t :identity t)))
         (t
          (print-unreadable-object (tn stream :type t)

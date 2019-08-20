@@ -52,9 +52,13 @@
           when (typep fun type)
           collect fun)))
 
+;;; Return a subset of the code constants for FUN's code but excluding
+;;; constants that are present on behalf of %SIMPLE-FUN-foo accessors.
 (defun find-code-constants (fun &key (type t))
   (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+    (loop for i from (+ sb-vm:code-constants-offset
+                        (* (code-n-entries code) sb-vm:code-slots-per-simple-fun))
+          below (code-header-words code)
           for c = (code-header-ref code i)
           for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
                           (value-cell-ref c)
@@ -103,7 +107,7 @@
 
 (defun file-compile (toplevel-forms &key load
                                          before-load)
-  (let* ((lisp (merge-pathnames "file-compile-tmp.lisp"))
+  (let* ((lisp (test-util:scratch-file-name "lisp"))
          (fasl (compile-file-pathname lisp))
          (error-stream (make-string-output-stream)))
     (unwind-protect
@@ -131,10 +135,16 @@
                 (let ((*print-right-margin* 120))
                   (disassemble function :stream s))))
         (n 0))
-    (with-input-from-string (s code)
-      (loop for line = (read-line s nil nil)
-            while line
-            when (and (search name line)
-                      (search "FDEFN" line))
-            do (incf n)))
-    n))
+    (flet ((asm-line-calls-name-p (line name)
+             (dolist (herald '("#<FDEFN" "#<SB-KERNEL:FDEFN" "#<FUNCTION"))
+               (let ((pos (search herald line)))
+                 (when pos
+                   (return (string= (subseq line
+                                            (+ pos (length herald) 1)
+                                            (1- (length line)))
+                                    name)))))))
+      (with-input-from-string (s code)
+        (loop for line = (read-line s nil nil)
+              while line
+              when (asm-line-calls-name-p line name) do (incf n)))
+      n)))

@@ -721,7 +721,7 @@ unless :NAMED is also specified.")))
            (proto-classoid
             (if (dd-class-p dd)
                 (let* ((classoid (make-structure-classoid :name (dd-name dd)))
-                       (layout (make-layout :classoid classoid :inherits inherits)))
+                       (layout (make-layout classoid :inherits inherits)))
                   (setf (layout-invalid layout) nil
                         (classoid-layout classoid) layout)
                   classoid))))
@@ -786,10 +786,17 @@ unless :NAMED is also specified.")))
                            spec)))
 
     (when (find name (dd-slots defstruct) :test #'string= :key #'dsd-name)
-      ;; TODO: indicate whether name is a duplicate in the directly
-      ;; specified slots vs. exists in the ancestor and so should
-      ;; be in the (:include ...) clause instead of where it is.
-      (%program-error "duplicate slot name ~S" name))
+      (let* ((parent (find-defstruct-description (first (dd-include defstruct))))
+             (included? (find name
+                              (dd-slots parent)
+                              :key #'dsd-name
+                              :test #'string=)))
+        (if included?
+          (%program-error "slot name ~s duplicated via included ~a"
+                          name
+                          (dd-name parent))
+          (%program-error "duplicate slot name ~S" name))))
+
     (setf accessor-name (if (dd-conc-name defstruct)
                             (symbolicate (dd-conc-name defstruct) name)
                             name))
@@ -816,7 +823,7 @@ unless :NAMED is also specified.")))
       ;;x(when (and (fboundp accessor-name)
       ;;x           (not (accessor-inherited-data accessor-name defstruct)))
       ;;x  (style-warn "redefining ~/sb-ext:print-symbol-with-prefix/ ~
-      ;;                in DEFSTRUCT" accessor-name)))
+      ;;                in DEFSTRUCT" accessor-name))
       ;; which was done until sbcl-0.8.11.18 or so, is wrong: it causes
       ;; a warning at MACROEXPAND time, when instead the warning should
       ;; occur not just because the code was constructed, but because it
@@ -1364,14 +1371,16 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;; would be possible in as much as it won't harm the garbage collector.
 ;;; Harm potentially results from turning a raw word into a tagged word.
 (defun mutable-layout-p (old-layout new-layout)
-  (let ((old-bitmap (layout-bitmap old-layout))
-        (new-bitmap (layout-bitmap new-layout)))
-    (aver (= old-bitmap (dd-bitmap (layout-info old-layout))))
-    (aver (= new-bitmap (dd-bitmap (layout-info new-layout))))
-    (dotimes (i (dd-length (layout-info old-layout)) t)
-      (when (and (logbitp i new-bitmap) ; a tagged (i.e. scavenged) slot
-                 (not (logbitp i old-bitmap))) ; that was opaque bits
-        (return nil)))))
+  (if (layout-info old-layout)
+      (let ((old-bitmap (layout-bitmap old-layout))
+            (new-bitmap (layout-bitmap new-layout)))
+        (aver (= old-bitmap (dd-bitmap (layout-info old-layout))))
+        (aver (= new-bitmap (dd-bitmap (layout-info new-layout))))
+        (dotimes (i (dd-length (layout-info old-layout)) t)
+          (when (and (logbitp i new-bitmap) ; a tagged (i.e. scavenged) slot
+                     (not (logbitp i old-bitmap))) ; that was opaque bits
+            (return nil))))
+      t))
 
 ;;; This function is called when we are incompatibly redefining a
 ;;; structure CLASS to have the specified NEW-LAYOUT. We signal an
@@ -1490,8 +1499,8 @@ or they must be declared locally notinline at each call site.~@:>"
             (when (or (not old-layout) *type-system-initialized*)
               (macrolet ((inherit (n) `(if (> depthoid ,n) (svref inherits ,n) 0)))
                 (let ((depthoid (length inherits)))
-                  (make-layout :classoid classoid
-                               :%flags flags
+                  (make-layout classoid
+                               :flags flags
                                :inherits inherits
                                :depthoid depthoid
                                :depth2-ancestor (inherit 2)
@@ -1878,7 +1887,7 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;; functionality of !DEFINE-PRIMITIVE-OBJECT..)
 
 ;;; The complete list of alternate-metaclass DEFSTRUCTs:
-;;;   CONDITION SB-EVAL:INTERPRETED-FUNCTION
+;;;   CONDITION SB-KERNEL:INTERPRETED-FUNCTION
 ;;;   SB-PCL::STANDARD-INSTANCE SB-PCL::STANDARD-FUNCALLABLE-INSTANCE
 ;;;   SB-PCL::CTOR SB-PCL::%METHOD-FUNCTION
 ;;;
@@ -2107,8 +2116,7 @@ or they must be declared locally notinline at each call site.~@:>"
 
 ;;; We require that MAKE-LOAD-FORM-SAVING-SLOTS produce deterministic output
 ;;; and that its output take a particular recognizable form so that it can
-;;; be optimized into a sequence of fasl ops. MAKE-LOAD-FORM no longer returns
-;;; a magic keyword except for the special case of :IGNORE-IT.
+;;; be optimized into a sequence of fasl ops.
 ;;; The cross-compiler depends critically on optimizing the resulting sexprs
 ;;; so that the host can load cold objects, which it could not do
 ;;; if constructed by machine code for the target.
@@ -2157,10 +2165,10 @@ or they must be declared locally notinline at each call site.~@:>"
                                   'sb-pcl:+slot-unbound+) into vals
                       finally (return `(sb-pcl::set-slots ,object ,names ,@vals)))))))
 
-;;; Call MAKE-LOAD-FORM inside a condition handler in case the method fails.
+;;; Call MAKE-LOAD-FORM inside a condition handler in case the method fails,
+;;; returning its two values on success.
 ;;; If the resulting CREATION-FORM and INIT-FORM are equivalent to those
-;;; returned from MAKE-LOAD-FORM-SAVING-SLOTS, return 'SB-FASL::FOP-STRUCT.
-;;; If the object can be ignored, return :IGNORE-IT and NIL.
+;;; returned from MAKE-LOAD-FORM-SAVING-SLOTS, return NIL and 'SB-FASL::FOP-STRUCT.
 (defun sb-c::%make-load-form (constant)
   (flet ((canonical-p (inits dsds object &aux reader)
            ;; Return T if (but not only-if) INITS came from M-L-F-S-S.
@@ -2186,8 +2194,7 @@ or they must be declared locally notinline at each call site.~@:>"
     (multiple-value-bind (creation-form init-form)
         (handler-case (sb-xc:make-load-form constant (make-null-lexenv))
           (error (condition) (sb-c:compiler-error condition)))
-      (cond ((eq creation-form :ignore-it) (values :ignore-it nil))
-            ((and (listp creation-form)
+      (cond ((and (listp creation-form)
                   (typep constant 'structure-object)
                   (typep creation-form
                          '(cons (eql new-instance) (cons symbol null)))
@@ -2196,7 +2203,7 @@ or they must be declared locally notinline at each call site.~@:>"
                   (canonical-p (cdr init-form)
                                (dd-slots (layout-info (%instance-layout constant)))
                                constant))
-             (values 'sb-fasl::fop-struct nil))
+             (values nil 'sb-fasl::fop-struct))
             (t
              (values creation-form init-form))))))
 

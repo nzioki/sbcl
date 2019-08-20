@@ -37,7 +37,7 @@
   (:import-from "SB-X86-64-ASM" #:near-jump-displacement #:mov #:|call|)
   (:import-from "SB-IMPL" #:package-hashtable #:package-%name
                 #:package-hashtable-cells
-                #:hash-table-table #:hash-table-number-entries))
+                #:hash-table-pairs #:hash-table-%count))
 
 (in-package "SB-EDITCORE")
 
@@ -309,38 +309,57 @@
 (defun fun-name-from-core (name core)
   (remove-name-junk (%fun-name-from-core name core)))
 
+;;; A problem: COMPILED-DEBUG-FUN-ENCODED-LOCS (a packed integer) might be a
+;;; bignum - in fact probably is. If so, it points into the target core.
+;;; So we have to produce a new instance with an ENCODED-LOCS that
+;;; is the translation of the bignum, and call the accessor on that.
+;;; The accessors for its sub-fields are abstract - we don't know where the
+;;; fields are so we can't otherwise unpack them. (See CDF-DECODE-LOCS if
+;;; you really need to know)
+(defun cdf-offset (compiled-debug-fun spaces)
+  ;; (Note that on precisely GC'd platforms, this operation is dangerous,
+  ;; but no more so than everything else in this file)
+  (let ((locs (sb-c::compiled-debug-fun-encoded-locs compiled-debug-fun)))
+    (sb-c::compiled-debug-fun-offset
+     (if (fixnump locs)
+         compiled-debug-fun
+         (sb-c::make-compiled-debug-fun
+          :name nil :encoded-locs (translate locs spaces))))))
+
 ;;; Return a list of ((NAME START . END) ...)
 ;;; for each C symbol that should be emitted for this code object.
 ;;; Start and and are relative to the object's base address,
-;;; not the start of its instructions.
+;;; not the start of its instructions. Hence we add HEADER-BYTES
+;;; too all the PC offsets.
 (defun code-symbols (code core &aux (spaces (core-spaces core)))
-  (let ((fun-map (translate
+  (let ((cdf (translate
                   (sb-c::compiled-debug-info-fun-map
                    (truly-the sb-c::compiled-debug-info
                               (translate (sb-kernel:%code-debug-info code) spaces)))
                   spaces))
         (header-bytes (* (sb-kernel:code-header-words code) sb-vm:n-word-bytes))
+        (start-pc 0)
         (blobs))
-    (do ((i 0 (+ i 2)))
-        ((>= i (length fun-map)))
-      (let ((name (fun-name-from-core
-                   (sb-c::compiled-debug-fun-name
-                    (truly-the sb-c::compiled-debug-fun
-                               (translate (aref fun-map i) spaces)))
-                   core))
-            (start-pc (if (= i 0)
-                          0
-                          (+ header-bytes (aref fun-map (1- i)))))
-            (end-pc (if (< (1+ i) (length fun-map))
-                        (+ header-bytes (aref fun-map (1+ i)))
-                        (code-object-size code))))
+    (loop
+      (let* ((name (fun-name-from-core
+                    (sb-c::compiled-debug-fun-name
+                     (truly-the sb-c::compiled-debug-fun cdf))
+                    core))
+             (next (when (%instancep (sb-c::compiled-debug-fun-next cdf))
+                     (translate (sb-c::compiled-debug-fun-next cdf) spaces)))
+             (end-pc (if next
+                         (+ header-bytes (cdf-offset next spaces))
+                         (code-object-size code))))
         (unless (= end-pc start-pc)
           ;; Collapse adjacent address ranges named the same.
           ;; Use EQUALP instead of EQUAL to compare names
           ;; because instances of CORE-SYMBOL are not interned objects.
           (if (and blobs (equalp (caar blobs) name))
               (setf (cddr (car blobs)) end-pc)
-              (push (list* name start-pc end-pc) blobs)))))
+              (push (list* name start-pc end-pc) blobs)))
+        (if next
+            (setq cdf next start-pc end-pc)
+            (return))))
     (nreverse blobs)))
 
 (defstruct (descriptor (:constructor make-descriptor (bits)))
@@ -356,9 +375,9 @@
 
 (defun target-hash-table-alist (table spaces)
   (let ((table (truly-the hash-table (translate table spaces))))
-    (let ((cells (the simple-vector (translate (hash-table-table table) spaces))))
+    (let ((cells (the simple-vector (translate (hash-table-pairs table) spaces))))
       (collect ((pairs))
-        (do ((count (hash-table-number-entries table) (1- count))
+        (do ((count (hash-table-%count table) (1- count))
              (i 2 (+ i 2)))
             ((zerop count)
              (pairs))
@@ -715,7 +734,7 @@
 ;;; the contents into the assembly file.
 ;;;   ({:data | :padding} . N) | (start-pc . end-pc)
 (defun get-text-ranges (code spaces)
-    (let ((map (translate (sb-c::compiled-debug-info-fun-map
+    (let ((cdf (translate (sb-c::compiled-debug-info-fun-map
                            (truly-the sb-c::compiled-debug-info
                                       (translate (%code-debug-info code) spaces)))
                           spaces))
@@ -727,11 +746,12 @@
       (when (plusp start-pc)
         (aver (zerop (rem start-pc n-word-bytes)))
         (push `(:data . ,(ash start-pc (- word-shift))) blobs))
-      (do ((i 0 (+ i 2)))
-          ((>= i (length map)) (nreverse blobs))
-        (let ((end-pc (if (< (1+ i) (length map))
-                          (svref map (1+ i))
-                          (%code-text-size code))))
+      (loop
+        (let* ((next (when (%instancep (sb-c::compiled-debug-fun-next cdf))
+                       (translate (sb-c::compiled-debug-fun-next cdf) spaces)))
+               (end-pc (if next
+                           (cdf-offset next spaces)
+                           (%code-text-size code))))
           (cond
             ((= start-pc end-pc)) ; crazy shiat. do not add to blobs
             ((<= start-pc next-simple-fun-pc-offs (1- end-pc))
@@ -757,7 +777,9 @@
             (t
              (let ((current-blob (car blobs)))
                (setf (cdr current-blob) end-pc)))) ; extend this blob
-          (setq start-pc end-pc)))))
+          (unless next
+            (return (nreverse blobs)))
+          (setq cdf next start-pc end-pc)))))
 
 (defun c-symbol-quote (name)
   (concatenate 'string '(#\") name '(#\")))
@@ -781,10 +803,10 @@
     (loop
       (destructuring-bind (start . end) (pop ranges)
         (setq max-end end)
-        (funcall dumpwords (+ text start) simple-fun-code-offset output
-                 #(nil #.(format nil ".+~D" (* (1- simple-fun-code-offset)
+        (funcall dumpwords (+ text start) simple-fun-insts-offset output
+                 #(nil #.(format nil ".+~D" (* (1- simple-fun-insts-offset)
                                              n-word-bytes))))
-        (incf start (* simple-fun-code-offset n-word-bytes))
+        (incf start (* simple-fun-insts-offset n-word-bytes))
         ;; Pass the current physical address at which to disassemble,
         ;; the notional core address (which changes after linker relocation),
         ;; and the length.
@@ -1060,10 +1082,10 @@
                 nwords)
         (when (plusp nwords)
           (format output " .fill ~d~%" (* nwords n-word-bytes))))))
-  ;; Extend with .5 MB of filler
+  ;; Extend with 1 MB of filler
   (format output " .fill ~D~%~alisp_code_end:
  .size lisp_jit_code, .-lisp_jit_code~%"
-          (* 512 1024) label-prefix)
+          (* 1024 1024) label-prefix)
   (values core total-code-size n-linker-relocs))
 
 ;;;; ELF file I/O
@@ -1225,7 +1247,7 @@
                                       ; symbol table -- ^ ^ -- for which section
              (:note ".note.GNU-stack" ,+sht-null+     0 0 0 1  0)))
          (string-table
-          (string-table (append '("__lisp_code_start") (map 'list #'second sections))))
+          (string-table (append '("lisp_code_start") (map 'list #'second sections))))
          (strings (cdr string-table))
          (padded-strings-size (align-up (length strings) 8))
          (symbols-size (* 2 sym-entry-size))
@@ -1416,7 +1438,7 @@
               (return-from scan-obj))
              (#.simple-vector-widetag
               (let ((len (length (the simple-vector obj))))
-                (when (eql (logand (get-header-data obj) #xFF) vector-valid-hashing-subtype)
+                (when (eql (logand (get-header-data obj) #xFF) vector-addr-hashing-subtype)
                   (do ((i 2 (+ i 2)) (needs-rehash))
                       ((= i len)
                        (when needs-rehash
@@ -1578,7 +1600,7 @@
 ;;; is for linking in to a binary that needs no "--core" argument.
 (defun split-core
     (input-pathname asm-pathname
-     &key enable-pie (verbose t)
+     &key enable-pie (verbose nil)
      &aux (split-core-pathname
            (merge-pathnames (make-pathname :type "core") asm-pathname))
           (elf-core-pathname
@@ -1836,7 +1858,7 @@
 (defun cl-user::elfinate (&optional (args (cdr sb-ext:*posix-argv*)))
   (cond ((string= (car args) "split")
          (pop args)
-         (let (pie sizes)
+         (let (pie)
            (loop (cond ((string= (car args) "--pie")
                         (setq pie t)
                         (pop args))

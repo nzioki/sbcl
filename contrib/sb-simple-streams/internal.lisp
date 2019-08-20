@@ -44,8 +44,7 @@
 (defun buffer-copy (src soff dst doff length)
   (declare (type simple-stream-buffer src dst)
            (type fixnum soff doff length))
-  ;; FIXME: Should probably be with-pinned-objects
-  (sb-sys:without-gcing
+  (sb-sys:with-pinned-objects (src dst)
    (sb-kernel:system-area-ub8-copy (buffer-sap src) soff
                                    (buffer-sap dst) doff
                                    length)))
@@ -364,8 +363,9 @@
                                       (t (return (- -10 errno)))))
                                ((zerop count) (return -1))
                                (t (return count)))))))))))
-        (t (%read-vector buffer fd start end :byte-8
-                         (if blocking :bnb nil)))))))
+        (t ;; (%read-vector buffer fd start end :byte-8
+           ;;               (if blocking :bnb nil))
+         )))))
 
 (defun write-octets (stream buffer start end blocking)
   (declare (type simple-stream stream)
@@ -700,3 +700,4 @@
 
 (define-filespec pathname (string)
   (pathname string))
+

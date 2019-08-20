@@ -17,7 +17,7 @@
 ;;; For lists and non-pointers, return the low 8 descriptor bits.
 ;;; We need not return exactly list-pointer-lowtag for lists - the high 4 bits
 ;;; are arbitrary. Similarly we don't care that fixnums return other than 0.
-;;; Provided that the result is the correct index to **built-in-class-codes**
+;;; Provided that the result is the correct index to **PRIMITIVE-OBJECT-LAYOUTS**
 ;;; everything works out fine.  All backends should follow this simpler model,
 ;;; but might or might not opt to use the same technique of producing a native
 ;;; pointer and doing one memory access for all 3 non-list pointer types.
@@ -46,12 +46,35 @@
     (inst movzx '(:byte :dword) result object)
     DONE))
 
+(macrolet ((read-depthoid ()
+             `(ea (- (+ 4 (ash (+ instance-slots-offset
+                                  (get-dsd-index layout sb-kernel::%bits))
+                               word-shift))
+                     instance-pointer-lowtag)
+                  layout)))
+  (define-vop (layout-depthoid)
+    (:translate layout-depthoid)
+    (:policy :fast-safe)
+    (:args (layout :scs (descriptor-reg)))
+    (:results (res :scs (any-reg)))
+    (:result-types fixnum)
+    (:generator 1 (inst movsx '(:dword :qword) res (read-depthoid))))
+  (define-vop (sb-c::layout-depthoid-gt)
+    (:translate sb-c::layout-depthoid-gt)
+    (:policy :fast-safe)
+    (:args (layout :scs (descriptor-reg)))
+    (:info k)
+    (:arg-types * (:constant (unsigned-byte 16)))
+    (:conditional :g)
+    (:generator 1 (inst cmp :dword (read-depthoid) (fixnumize k)))))
+
 #+compact-instance-header
 ;; ~20 instructions vs. 35
 (define-vop (layout-of) ; no translation
     (:policy :fast-safe)
+    (:translate layout-of)
     (:args (object :scs (descriptor-reg))
-           (layouts :scs (constant)))
+           #+nil (layouts :scs (constant)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
     (:generator 6
@@ -79,13 +102,22 @@
       (inst jmp  :eq NULL)
       (inst movzx '(:byte :dword) rax object)
       LOAD-FROM-VECTOR
-      (inst mov  result layouts)
-      (inst mov  :dword result
-            (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
-                result rax 8))
+      #+nil ;; old way
+      (progn
+        (inst mov  result layouts)
+        (inst mov  :dword result
+              (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
+                  result rax 8)))
+      ;; new way
+      (inst mov :dword result
+            (ea (make-fixup '**primitive-object-layouts**
+                           :symbol-value
+                           (- (ash vector-data-offset word-shift)
+                              other-pointer-lowtag))
+                nil rax 8)) ; no base register
       (inst jmp  done)
       NULL
-      (inst mov  result (make-fixup (find-layout 'null) :layout))
+      (inst mov  result (make-fixup 'null :layout))
       DONE))
 
 (macrolet ((load-type (target source lowtag)
@@ -143,12 +175,34 @@
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)
     (move res x)))
+(define-vop (set-header-bits)
+  (:translate set-header-bits)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types t (:constant t))
+  (:info bits)
+  (:generator 1
+    (if (typep bits '(unsigned-byte 8))
+        (inst or :byte (ea (- 1 other-pointer-lowtag) x) bits)
+        (inst or :dword (ea (- other-pointer-lowtag) x) (ash bits n-widetag-bits)))))
+(define-vop (unset-header-bits)
+  (:translate unset-header-bits)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types t (:constant t))
+  (:info bits)
+  (:generator 1
+    (if (typep bits '(unsigned-byte 8))
+        (inst and :byte (ea (- 1 other-pointer-lowtag) x) (lognot bits))
+        (inst and :dword (ea (- other-pointer-lowtag) x)
+              (lognot (ash bits n-widetag-bits))))))
+
 ;;; Set the bit indicating that instances of this type require
 ;;; special treatment of slot index 0.
 (define-vop (set-custom-gc-scavenge-bit)
   (:args (x :scs (descriptor-reg)))
   (:generator 1
-    (inst or :byte (ea (- 3 instance-pointer-lowtag) x) #x80)))
+    (inst or :byte (ea (- 2 instance-pointer-lowtag) x) #x80)))
 
 (define-vop (get-header-data-high)
   (:translate get-header-data-high)
@@ -262,7 +316,7 @@
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst lea result
-          (ea  (- fun-pointer-lowtag (* simple-fun-code-offset n-word-bytes))
+          (ea  (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes))
                result))))
 
 ;;;; symbol frobbing
@@ -477,3 +531,14 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
    (move b ebx)
    (move c ecx)
    (move d edx)))
+
+(define-vop (set-fdefn-has-static-callers)
+  (:args (fdefn :scs (descriptor-reg)))
+  (:generator 1
+    ;; atomic because the immobile gen# is in the same byte
+    (inst or :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80 :lock)))
+(define-vop (unset-fdefn-has-static-callers)
+  (:args (fdefn :scs (descriptor-reg)))
+  (:generator 1
+    ;; atomic because the immobile gen# is in the same byte
+    (inst and :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f :lock)))

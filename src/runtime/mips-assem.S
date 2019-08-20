@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/simple-fun.h"
 #include "genesis/static-symbols.h"
@@ -175,7 +176,7 @@ symbol:
 	/* Indirect closure */
 	lw	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
 
-	addu	reg_LIP, reg_CODE, SIMPLE_FUN_CODE_OFFSET
+	addu	reg_LIP, reg_CODE, SIMPLE_FUN_INSTS_OFFSET
 
 	/* Mark us as in Lisp land. */
 	sw	zero, foreign_function_call_active
@@ -381,7 +382,7 @@ lra:	.word	RETURN_PC_WIDETAG
 	.align  3 /* minimum alignment for a lisp object */
 	LEAF(fun_end_breakpoint_guts)
 	.set    noreorder
-	.word   RETURN_PC_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	b       multiple_value_return
 	 nop
 	.set    reorder

@@ -383,17 +383,19 @@
 
 ;;; Print the fun-header (entry-point) pseudo-instruction at the
 ;;; current location in DSTATE to STREAM.
-(defun fun-header-hook (stream dstate)
+(defun fun-header-hook (fun-index stream dstate)
   (declare (type (or null stream) stream)
            (type disassem-state dstate))
   (unless (null stream)
     (let* ((seg (dstate-segment dstate))
            (code (seg-code seg))
-           (woffs (ash (segment-offs-to-code-offs (dstate-cur-offs dstate) seg)
-                       (- sb-vm:word-shift))) ; bytes -> words
+           (woffs (+ sb-vm:code-constants-offset (* fun-index sb-vm:code-slots-per-simple-fun)))
            (name (code-header-ref code (+ woffs sb-vm:simple-fun-name-slot)))
            (args (code-header-ref code (+ woffs sb-vm:simple-fun-arglist-slot)))
-           (type (code-header-ref code (+ woffs sb-vm:simple-fun-type-slot))))
+           (info (code-header-ref code (+ woffs sb-vm:simple-fun-info-slot)))
+           (type (typecase info
+                   ((cons t simple-vector) (car info))
+                   ((not simple-vector) info))))
       ;; if the function's name conveys its args, don't show ARGS too
       (format stream ".~A ~S~:[~:A~;~]" 'entry name
               (and (typep name '(cons (eql lambda) (cons list)))
@@ -403,7 +405,7 @@
               (format stream "~:S" type)) ; use format to print NIL as ()
             dstate)))
   (incf (dstate-next-offs dstate)
-        (words-to-bytes sb-vm:simple-fun-code-offset)))
+        (words-to-bytes sb-vm:simple-fun-insts-offset)))
 
 ;;; Return ADDRESS aligned *upward* to a SIZE byte boundary.
 ;;; KLUDGE: should be ALIGN-UP but old Slime uses it
@@ -952,7 +954,7 @@
              `(let ((*print-pretty* t)
                     (*print-lines* 2)
                     (*print-length* 4)
-                    (*print-level* 3))
+                    (*print-level* 4))
                 ,@body)))
 
 ;;; Print a newline to STREAM, inserting any pending notes in DSTATE
@@ -1049,7 +1051,10 @@
                           (incf (dstate-next-offs dstate) offset))
                  :offset 0) ; at 0 bytes into this seg, skip OFFSET bytes
                 (seg-hooks segment)))
-        (push (make-offs-hook :offset offset :fun #'fun-header-hook)
+        (push (make-offs-hook
+               :offset offset
+               :fun (let ((i i)) ; capture the _current_ I, not the final value
+                      (lambda (stream dstate) (fun-header-hook i stream dstate))))
               (seg-hooks segment))))))
 
 ;;; A SAP-MAKER is a no-argument function that returns a SAP.
@@ -1128,7 +1133,8 @@
                                  (sap-int (funcall sap-maker)))
            :hooks hooks
            :code code
-           :initial-offset initial-offset))) ; an offset into CODE
+           :initial-offset initial-offset ; an offset into CODE
+           :debug-fun debug-fun)))
     (add-debugging-hooks segment debug-fun source-form-cache)
     (when code
       (add-fun-header-hooks segment))
@@ -1144,7 +1150,29 @@
            (type offset offset))
   (apply #'make-segment code
          (code-sap-maker code offset) length
+         ;; For displaying PCs as if the code object's instruction area
+         ;; had an origin address of 0, uncomment this next line:
+         ;; :virtual-location offset
          :code code :initial-offset offset args))
+
+;;; Show the compiled debug function chain
+(defun show-cdf-chain (code)
+  (let* ((cdf
+          (sb-c::compiled-debug-info-fun-map
+           (sb-kernel:%code-debug-info (sb-kernel:fun-code-header #'open))))
+         (ct 0))
+    (format t "begin      end   startPC  elsewhere~%")
+    (loop
+      (incf ct)
+      (let ((begin (sb-c::compiled-debug-fun-offset cdf))
+            (end (1- (acond ((sb-c::compiled-debug-fun-next cdf)
+                             (sb-c::compiled-debug-fun-offset it))
+                            (t
+                             (%code-text-size code)))))
+            (elsewhere (sb-c::compiled-debug-fun-elsewhere-pc cdf))
+            (start-pc (sb-c::compiled-debug-fun-start-pc cdf)))
+        (format t "~5x .. ~5x     ~5x      ~5x~%" begin end start-pc elsewhere)
+        (unless (setq cdf (sb-c::compiled-debug-fun-next cdf)) (return ct))))))
 
 (defun make-memory-segment (code address &rest args)
   (declare (type address address))
@@ -1405,22 +1433,8 @@
     (setf (seg-storage-info segment)
           (storage-info-for-debug-fun debug-fun))
     (when *disassemble-annotate*
-      (add-source-tracking-hooks segment debug-fun sfcache))
-    (let ((kind (debug-fun-kind debug-fun)))
-      (flet ((add-new-hook (n)
-               (push (make-offs-hook
-                      :offset 0
-                      :fun (lambda (stream dstate)
-                             (declare (ignore stream))
-                             (note n dstate)))
-                     (seg-hooks segment))))
-        (case kind
-          (:external)
-          ((nil)
-           (add-new-hook "no-arg-parsing entry point"))
-          (t
-           (add-new-hook (lambda (stream)
-                           (format stream "~S entry point" kind)))))))))
+      (add-source-tracking-hooks segment debug-fun sfcache))))
+
 
 ;;; Return a list of the segments of memory containing machine code
 ;;; instructions for FUNCTION.
@@ -1430,61 +1444,61 @@
          (code (fun-code-header function))
          (fun-map (code-fun-map code))
          (fname (%simple-fun-name function))
-         (sfcache (make-source-form-cache)))
-    (let ((first-block-seen-p nil)
-          (nil-block-seen-p nil)
-          (last-offset 0)
-          (last-debug-fun nil)
-          (segments nil))
-      (flet ((add-seg (offs len df)
-               (when (> len 0)
-                 (push (make-code-segment code offs len
-                                          :debug-fun df
-                                          :source-form-cache sfcache)
-                       segments))))
-        (dotimes (fmap-index (length fun-map))
-          (let ((fmap-entry (aref fun-map fmap-index)))
-            (etypecase fmap-entry
-              (integer
-               (when first-block-seen-p
-                 (add-seg last-offset
-                          (- fmap-entry last-offset)
-                          last-debug-fun)
-                 (setf last-debug-fun nil))
-               (setf last-offset fmap-entry))
-              (sb-c::compiled-debug-fun
-               (let ((name (sb-c::compiled-debug-fun-name fmap-entry))
-                     (kind (sb-c::compiled-debug-fun-kind fmap-entry)))
-                 #+nil
-                 (format t ";;; SAW ~S ~S ~S,~S ~W,~W~%"
-                         name kind first-block-seen-p nil-block-seen-p
-                         last-offset
-                         (sb-c::compiled-debug-fun-start-pc fmap-entry))
-                 (cond (#+nil (eq last-offset fun-offset)
-                        (and (equal name fname)
-                             (null kind)
-                             (not first-block-seen-p))
-                              (setf first-block-seen-p t))
-                       ((eq kind :external)
-                        (when first-block-seen-p
-                          (return)))
-                       ((eq kind nil)
-                        (when nil-block-seen-p
-                          (return))
-                        (when first-block-seen-p
-                          (setf nil-block-seen-p t))))
-                 (setf last-debug-fun
-                       (sb-di::make-compiled-debug-fun fmap-entry code)))))))
-        (let ((max-offset (%code-text-size code)))
-          (when (and first-block-seen-p last-debug-fun)
-            (add-seg last-offset
-                     (- max-offset last-offset)
-                     last-debug-fun))
-          (if (null segments) ; FIXME: when does this happen? Comment PLEASE
-              (let ((offs (fun-insts-offset function)))
-                (list
-                 (make-code-segment code offs (- max-offset offs))))
-              (nreverse segments)))))))
+         (sfcache (make-source-form-cache))
+         (first-block-seen-p nil)
+         (nil-block-seen-p nil)
+         (last-offset 0)
+         (last-debug-fun nil)
+         (segments nil))
+    (flet ((add-seg (offs len df)
+             (when (> len 0)
+               (push (make-code-segment code offs len
+                                        :debug-fun df
+                                        :source-form-cache sfcache)
+                     segments))))
+      (loop for fmap-entry = fun-map then next
+            for offset = (sb-c::compiled-debug-fun-offset fmap-entry)
+            for next = (sb-c::compiled-debug-fun-next fmap-entry)
+            do
+            (when first-block-seen-p
+              (add-seg last-offset
+                       (- offset last-offset)
+                       last-debug-fun)
+              (setf last-debug-fun nil))
+            (setf last-offset offset)
+            (let ((name (sb-c::compiled-debug-fun-name fmap-entry))
+                  (kind (sb-c::compiled-debug-fun-kind fmap-entry)))
+              #+nil
+              (format t ";;; SAW ~S ~S ~S,~S ~W,~W~%"
+                      name kind first-block-seen-p nil-block-seen-p
+                      last-offset
+                      (sb-c::compiled-debug-fun-start-pc fmap-entry))
+              (cond (#+nil (eq last-offset fun-offset)
+                     (and (equal name fname)
+                          (null kind)
+                          (not first-block-seen-p))
+                     (setf first-block-seen-p t))
+                    ((eq kind :external)
+                     (when first-block-seen-p
+                       (return)))
+                    ((eq kind nil)
+                     (when nil-block-seen-p
+                       (return))
+                     (when first-block-seen-p
+                       (setf nil-block-seen-p t))))
+              (setf last-debug-fun
+                    (sb-di::make-compiled-debug-fun fmap-entry code)))
+            while next)
+      (let ((max-offset (%code-text-size code)))
+        (when (and first-block-seen-p last-debug-fun)
+          (add-seg last-offset
+                   (- max-offset last-offset)
+                   last-debug-fun))
+        (if (null segments) ; FIXME: when does this happen? Comment PLEASE
+            (let ((offs (fun-insts-offset function)))
+              (list
+               (make-code-segment code offs (- max-offset offs))))
+            (nreverse segments))))))
 
 ;;; Return a list of the segments of memory containing machine code
 ;;; instructions for the code-component CODE. If START-OFFSET and/or
@@ -1517,20 +1531,22 @@
                                           :debug-fun df
                                           :source-form-cache sfcache)
                        segments)))))
-          (dovector (fun-map-entry (code-fun-map code))
-            (etypecase fun-map-entry
-             (integer
-              (add-seg last-offset (- fun-map-entry last-offset)
+      (loop for fmap-entry = (code-fun-map code) then next
+            for offset = (sb-c::compiled-debug-fun-offset fmap-entry)
+            for next = (sb-c::compiled-debug-fun-next fmap-entry)
+            do
+            (unless (zerop offset)
+              (add-seg last-offset (- offset last-offset)
                        last-debug-fun)
               (setf last-debug-fun nil)
-              (setf last-offset fun-map-entry))
-             (sb-c::compiled-debug-fun
-              (setf last-debug-fun
-                    (sb-di::make-compiled-debug-fun fun-map-entry code)))))
-          (when last-debug-fun
-            (add-seg last-offset
-                     (- (%code-text-size code) last-offset)
-                     last-debug-fun)))
+              (setf last-offset offset))
+            (setf last-debug-fun
+                  (sb-di::make-compiled-debug-fun fmap-entry code))
+            (unless next
+              (add-seg last-offset
+                       (- (%code-text-size code) last-offset)
+                       last-debug-fun))
+            while next))
     (nreverse segments)))
 
 ;;; Compute labels for all the memory segments in SEGLIST and adds
@@ -1581,25 +1597,40 @@
     (let ((n-segments (length segments))
           (first (car segments))
           (last (car (last segments))))
-      ;; One origin per segment is printed. As with the per-line display,
-      ;; the segment is thought of as immovable for rendering of addresses,
-      ;; though in fact the disassembler transiently allows movement.
-      (format stream "~&; Size: ~a bytes. Origin: #x~x~@[ (segment 1 of ~D)~]"
-              (reduce #'+ segments :key #'seg-length)
-              (seg-virtual-location first)
-              (if (> n-segments 1) n-segments))
-      (set-location-printing-range dstate
-                                   (seg-virtual-location first)
-                                   (- (+ (seg-virtual-location last)
-                                         (seg-length last))
-                                      (seg-virtual-location first)))
-      (setf (dstate-output-state dstate) :beginning)
-      (let ((i 0))
-        (dolist (seg segments)
-          (when (> (incf i) 1)
-            (format stream "~&; Origin #x~x (segment ~D of ~D)"
-                    (seg-virtual-location seg) i n-segments))
-          (disassemble-segment seg stream dstate))))))
+      (flet ((print-segment-name (segment)
+               (let* ((debug-fun (seg-debug-fun segment))
+                      (name (and debug-fun (debug-fun-name debug-fun))))
+                 (when name
+                   (format stream " ~Vt ; " *disassem-note-column*)
+                   (typecase (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun)
+                     (sb-c::compiled-debug-fun-external
+                      (format stream "(XEP ~s)" name))
+                     (sb-c::compiled-debug-fun-optional
+                      (format stream "(&OPTIONAL ~s)" name))
+                     (sb-c::compiled-debug-fun-more
+                      (format stream "(&MORE ~s)" name))
+                     (t (prin1 name stream)))))))
+        ;; One origin per segment is printed. As with the per-line display,
+        ;; the segment is thought of as immovable for rendering of addresses,
+        ;; though in fact the disassembler transiently allows movement.
+        (format stream "~&; Size: ~a bytes. Origin: #x~x~@[ (segment 1 of ~D)~]"
+                (reduce #'+ segments :key #'seg-length)
+                (seg-virtual-location first)
+                (if (> n-segments 1) n-segments))
+        (print-segment-name (first segments))
+        (set-location-printing-range dstate
+                                     (seg-virtual-location first)
+                                     (- (+ (seg-virtual-location last)
+                                           (seg-length last))
+                                        (seg-virtual-location first)))
+        (setf (dstate-output-state dstate) :beginning)
+        (let ((i 0))
+          (dolist (seg segments)
+            (when (> (incf i) 1)
+              (format stream "~&; Origin #x~x (segment ~D of ~D)"
+                      (seg-virtual-location seg) i n-segments)
+              (print-segment-name seg))
+            (disassemble-segment seg stream dstate)))))))
 
 
 ;;;; top level functions
@@ -1619,6 +1650,8 @@
 
 (defun valid-extended-function-designators-for-disassemble-p (thing)
   (typecase thing
+    ((or (cons (eql lambda)) interpreted-function)
+     (compile nil thing))
     ((satisfies legal-fun-name-p)
      (compiled-funs-or-lose (or (and (symbolp thing) (macro-function thing))
                                 (fdefinition thing))
@@ -1626,12 +1659,8 @@
     (sb-pcl::%method-function
          ;; in a %METHOD-FUNCTION, the user code is in the fast function, so
          ;; we to disassemble both.
-         ;; FIXME: interpreted methods need to be compiled as above.
+         ;; FIXME: interpreted methods need to get compiled.
          (list thing (sb-pcl::%method-function-fast-function thing)))
-    ((or (cons (eql lambda))
-         #+sb-fasteval sb-interpreter:interpreted-function
-         #+sb-eval sb-eval:interpreted-function)
-     (compile nil thing))
     (function thing)
     (t nil)))
 
@@ -1804,12 +1833,12 @@
 ;;; access function.
 (defun grok-nil-indexed-symbol-slot-ref (byte-offset)
   (declare (type offset byte-offset))
-  (grok-symbol-slot-ref (+ sb-vm::nil-value byte-offset)))
+  (grok-symbol-slot-ref (+ sb-vm:nil-value byte-offset)))
 
 ;;; Return the Lisp object located BYTE-OFFSET from NIL.
 (defun get-nil-indexed-object (byte-offset)
   (declare (type offset byte-offset))
-  (make-lisp-obj (+ sb-vm::nil-value byte-offset)))
+  (make-lisp-obj (+ sb-vm:nil-value byte-offset)))
 
 ;;; Return two values; the Lisp object located at BYTE-OFFSET in the
 ;;; constant area of the code-object in the current segment and T, or
@@ -1867,7 +1896,7 @@
     (loop for name across sb-vm::+all-static-fdefns+
           for address =
           #+immobile-code (sb-vm::function-raw-address name)
-          #-immobile-code (+ sb-vm::nil-value (sb-vm::static-fun-offset name))
+          #-immobile-code (+ sb-vm:nil-value (sb-vm::static-fun-offset name))
           do (setf (gethash address addr->name) name))
     ;; Not really a routine, but it uses the similar logic for annotations
     #+sb-safepoint
@@ -2086,7 +2115,7 @@
     (return-from maybe-note-static-symbol))
   (let ((symbol
          (block found
-           (when (eq address sb-vm::nil-value)
+           (when (eq address sb-vm:nil-value)
              (return-from found nil))
            (when (< address (sap-int sb-vm:*static-space-free-pointer*))
              (dovector (symbol sb-vm:+static-symbols+)

@@ -109,27 +109,6 @@
     (assert (= (nth-value 1 (return-a-ton-of-values)) 1))
     (assert (= (nth-value 4000 (return-a-ton-of-values)) 4000))))
 
-(defstruct (a-test-structure-foo
-            (:constructor make-a-foo-1)
-            (:constructor make-a-foo-2 (b &optional a)))
-  (a 0 :type symbol)
-  (b nil :type integer))
-
-(with-test (:name :improperly-initialized-slot-warns)
-  ;; should warn because B's default is NIL, not an integer.
-  (compiles-with-warning '(lambda () (make-a-foo-1 :a 'what)))
-  ;; should warn because A's default is 0
-  (compiles-with-warning '(lambda () (make-a-foo-2 3))))
-
-(with-test (:name (inline structure :ctor :no declaim))
-  (let ((f (checked-compile '(lambda ()
-                               (make-a-foo-1 :a 'wat :b 3)))))
-    (assert (ctu:find-named-callees f)))
-  (let ((f (checked-compile '(lambda ()
-                               (declare (inline make-a-foo-1))
-                               (make-a-foo-1 :a 'wat :b 3)))))
-    (assert (not (ctu:find-named-callees f)))))
-
 (with-test (:name :internal-name-p :skipped-on :sb-xref-for-internals)
   (assert (sb-c::internal-name-p 'sb-int:neq)))
 
@@ -227,14 +206,15 @@
                   :skipped-on (not (and :x86-64 :immobile-space)))
   (let ((addr-of-pathname-layout
          (write-to-string
-          (sb-kernel:get-lisp-obj-address (sb-kernel:find-layout 'pathname))
+          (sb-kernel:get-lisp-obj-address
+           (sb-kernel:find-layout 'hash-table))
           :base 16 :radix t))
         (count 0))
     ;; The constant should appear in two CMP instructions
     (dolist (line (split-string
                    (with-output-to-string (s)
                      (let ((sb-disassem:*disassem-location-column-width* 0))
-                       (disassemble 'pathnamep :stream s)))
+                       (disassemble 'hash-table-p :stream s)))
                    #\newline))
       (when (and (search "CMP" line) (search addr-of-pathname-layout line))
         (incf count)))
@@ -1366,6 +1346,15 @@
 (with-test (:name (compile sleep float :infinity :lp-1754081))
   (checked-compile '(lambda () (sleep single-float-positive-infinity)))
   (checked-compile '(lambda () (sleep double-float-positive-infinity))))
+;;; And it didn't work at all after the fix for aforementioned
+(with-test (:name :sleep-float-transform
+                  :skipped-on (and :win32 (not :sb-thread)))
+  (let* ((xform (car (sb-c::fun-info-transforms (sb-int:info :function :info 'sleep))))
+         (type (car (sb-kernel:fun-type-required (sb-c::transform-type xform)))))
+    (assert (sb-kernel:constant-type-p type))
+    ;; CONSTANT-TYPE isn't actually testable through CTYPEP.
+    ;; So pull out the actual type as the compiler would do.
+    (assert (sb-kernel:ctypep 1.5 (sb-kernel:constant-type-type type)))))
 
 (with-test (:name :atanh-type-derivation)
   (checked-compile-and-assert
@@ -1957,33 +1946,6 @@
          (aref a (+ x (- y z))))
     ((#(1 2 3) 1 0 0) 2)))
 
-(defstruct %instance-ref-eq (n 0))
-
-(with-test (:name :%instance-ref-eq-immediately-used)
-  (checked-compile-and-assert
-   ()
-   `(lambda (s)
-      (let ((n (%instance-ref-eq-n s)))
-        (incf (%instance-ref-eq-n s))
-        (eql n 0)))
-   (((make-%instance-ref-eq)) t)))
-
-(with-test (:name :%instance-ref-eq-load-immediate)
-  (checked-compile-and-assert
-   ()
-   `(lambda (s)
-      (eql (%instance-ref-eq-n s)
-           most-positive-fixnum))
-   (((make-%instance-ref-eq :n most-positive-fixnum)) t)
-   (((make-%instance-ref-eq :n -1)) nil))
-  (checked-compile-and-assert
-   ()
-   `(lambda (s)
-      (eql (%instance-ref-eq-n s)
-           (1- (expt 2 31))))
-   (((make-%instance-ref-eq :n (1- (expt 2 31)))) t)
-   (((make-%instance-ref-eq :n -1)) nil)))
-
 (with-test (:name :convert-mv-bind-to-let-multiple-uses)
   (checked-compile-and-assert
    ()
@@ -2258,34 +2220,6 @@
           (funcall x)))
     (() (condition 'control-error))))
 
-(declaim (inline make-mystruct))
-(macrolet ((def-mystruct () `(defstruct mystruct a b c)))
-  (def-mystruct)) ; MAKE-MYSTRUCT captures a lexenv (rather pointlessly)
-
-;;; Assert that throwaway code in compiled macrolets does not go in immobile space
-#+immobile-space
-(with-test (:name :macrolet-not-immobile-space :serial t
-            :skipped-on :interpreter)
-  (labels ((count-code-objects ()
-             (length (sb-vm::list-allocated-objects
-                      :immobile
-                      :test (lambda (x)
-                              (and (sb-kernel:code-component-p x)
-                                   (/= (sb-kernel:generation-of x)
-                                       sb-vm:+pseudo-static-generation+))))))
-           (test (lambda)
-             (let* ((start-count (count-code-objects))
-                    (result
-                     (let ((sb-c::*compile-to-memory-space* :immobile))
-                       (compile nil lambda)))
-                    (end-count (count-code-objects)))
-               (assert (= end-count (1+ start-count)))
-               result)))
-    ;; Test 1: simple macrolet
-    (test '(lambda (x) (macrolet ((baz (arg) `(- ,arg))) (list (baz x)))))
-    ;; Test 2: inline a function that captured a macrolet
-    (test '(lambda (x) (make-mystruct :a x)))))
-
 (with-test (:name :inlining-multiple-refs)
   (checked-compile
    `(lambda (x)
@@ -2310,3 +2244,208 @@
                   (proc y)))))
         t)
     ((1 2) t)))
+
+(with-test (:name :car-type-on-or-null)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            '(lambda (x)
+              (declare (type (or null (cons fixnum)) x))
+              (if x
+                  (car x)
+                  0))))
+          '(function ((or null (cons fixnum t))) (values fixnum &optional)))))
+
+(with-test (:name :nlx-entry-zero-values)
+  (checked-compile-and-assert
+      ()
+      '(lambda (x)
+        (multiple-value-call (lambda (&optional x) x)
+          (block nil
+            (funcall (eval (lambda ()
+                             (return (if x
+                                         (values)
+                                         10))))))))
+    ((t) nil)
+    ((nil) 10)))
+
+(with-test (:name :find-test-to-eq-with-key)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (position (1- (expt x 64)) '((#xFFFFFFFFFFFFFFFF)) :key #'car))
+   ((2) 0)
+   ((1) nil)))
+
+(with-test (:name :maybe-infer-iteration-var-type-on-union)
+  (checked-compile-and-assert
+      (:allow-notes nil :optimize '(:speed 3 :compilation-speed 1 :space 1))
+      `(lambda (a)
+         (loop repeat (if a 2 0) count 1))
+    ((t) 2)
+    ((nil) 0)))
+
+(with-test (:name :maybe-infer-iteration-var-type-on-union.2)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (let ((v4 (the (or (single-float (1.0) (3.0)) (single-float 4.0 5.0)) a)))
+           (incf v4 1.0)))
+      ((4.0) 5.0)))
+
+(with-test (:name :derive-array-rank-negation)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((not (simple-array * (* *))) a))
+      (eql (array-rank a) 2))
+   (((make-array '(2 2) :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((not (simple-array fixnum (* *))) a))
+      (eql (array-rank a) 2))
+   (((make-array '(2 2))) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((not (and (array * (* *)) (not simple-array))) a))
+      (eql (array-rank a) 2))
+   (((make-array '(2 2))) t)))
+
+(with-test (:name :derive-array-rank-negation.2)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            '(lambda (x)
+              (declare ((and simple-array
+                         (not (simple-array * (* *))))
+                        x))
+              (eql (array-rank x) 2))))
+          '(function ((and simple-array (not (simple-array * (* *)))))
+            (values null &optional)))))
+
+(with-test (:name :known-fun-no-fdefn)
+  (assert (not (ctu:find-named-callees
+                (checked-compile
+                 '(lambda () #'+))))))
+
+(with-test (:name :double-float-p-weakening)
+  (checked-compile-and-assert
+   (:optimize '(:speed 3 :safety 1))
+   '(lambda (x)
+     (declare (double-float x))
+     x)
+   ((0.0) (condition 'type-error))
+      ((1d0) 1d0)))
+
+#+sb-unicode
+(with-test (:name :base-char-p-constraint-propagation)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            '(lambda (x)
+              (if (sb-kernel:base-char-p x)
+                  (characterp x)
+                  t))))
+          '(function (t) (values (member t) &optional)))))
+
+(declaim (inline inline-fun-arg-mismatch))
+(defun inline-fun-arg-mismatch (x)
+  (declare (optimize (debug 0)))
+  x)
+
+(with-test (:name :inline-fun-arg-mismatch)
+  (checked-compile-and-assert
+      (:allow-warnings '(or sb-int:local-argument-mismatch
+                         #+interpreter simple-warning)) ;; why?
+      '(lambda ()
+        (multiple-value-call #'inline-fun-arg-mismatch 1 2))
+    (() (condition 'program-error))))
+
+(with-test (:name :principal-lvar-ref-use-loop)
+  (checked-compile-and-assert ()
+   '(lambda (vector)
+     (labels ((f (count)
+                (when (< (aref vector 0) count)
+                  (f count))))))
+   ((1) nil)))
+
+(with-test (:name (:mv-call :more-arg))
+  (checked-compile-and-assert
+   ()
+   '(lambda (&rest rest)
+     (multiple-value-bind (a b c) (values-list rest)
+       (declare (ignore c))
+       (list a b)))
+   ((1 3) '(1 3) :test #'equal)))
+
+(with-test (:name (:mv-call :more-arg-unused)
+            ;; needs SB-VM::MORE-ARG-OR-NIL VOP
+            :broken-on (not (or :x86-64 :x86 :ppc :arm :arm64 :riscv)))
+  (checked-compile-and-assert
+   ()
+   '(lambda (&rest rest)
+     (multiple-value-bind (a b) (values-list rest)
+       (list a b)))
+   (() '(nil nil) :test #'equal)
+   ((1) '(1 nil) :test #'equal)
+   ((1 3) '(1 3) :test #'equal)))
+
+(with-test (:name :truncate-deriver-on-number-type)
+  (checked-compile-and-assert
+   ()
+   '(lambda (i)
+     (truncate
+      (labels ((f (&optional (o i))
+                 (declare (ignore o))
+                 (complex 0 0)))
+        (declare (dynamic-extent (function f)))
+        (the integer
+             (multiple-value-call #'f (values))))
+      3))
+   ((0) (values 0 0))))
+
+(with-test (:name :signum-type-deriver)
+  (checked-compile-and-assert
+   ()
+   '(lambda (n)
+     (typep (signum n) 'complex))
+   ((#C(1 2)) t)
+   ((1d0) nil)
+   ((10) nil)))
+
+(with-test (:name :array-header-p-derivation)
+  (checked-compile-and-assert
+   ()
+   '(lambda (q)
+     (and (typep q '(not simple-array))
+      (sb-kernel:array-header-p q)))
+   ((10) nil)
+   (((make-array 10 :adjustable t)) t)))
+
+(with-test (:name :phase-type-derivation)
+  (checked-compile-and-assert
+   ()
+   '(lambda (x)
+     (= (phase (the (integer -1 0) x))
+      (coerce pi 'single-float)))
+   ((-1) t)
+   ((0) nil)))
+
+(with-test (:name :maybe-negate-check-fun-type)
+  (checked-compile-and-assert
+   ()
+   '(lambda (m)
+     (declare ((or (function (number)) (eql #.#'symbolp)) m))
+     (the (member 3/4 4/5 1/2 #.#'symbolp) m))
+   ((#'symbolp) #'symbolp)))
+
+(with-test (:name :lvar-fun-type-on-literal-funs)
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+      (declare (type (or null string) p))
+      (locally (declare (optimize (space 0)))
+        (stable-sort p ,#'string<)))
+   (((copy-seq "acb")) "abc" :test #'equal)))

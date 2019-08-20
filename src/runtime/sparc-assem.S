@@ -11,10 +11,11 @@
 #include "globals.h"
 #include "sbcl.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
-#include "genesis/simple-fun.h"	
+#include "genesis/simple-fun.h"
 
 #define load(sym, reg) \
         sethi %hi(sym), reg; ld [reg+%lo(sym)], reg
@@ -86,7 +87,7 @@ call_into_lisp:
         /* Indirect closure */
         ld      [reg_LEXENV+CLOSURE_FUN_OFFSET], reg_CODE
 
-        jmp     reg_CODE+SIMPLE_FUN_CODE_OFFSET
+        jmp     reg_CODE+SIMPLE_FUN_INSTS_OFFSET
         nop
 
         .align  8
@@ -218,7 +219,7 @@ call_into_c:
 	.align	8
 	.global	fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.word	RETURN_PC_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	b	1f
 	nop
 	mov	reg_CSP, reg_OCFP

@@ -114,6 +114,11 @@
   ;; explicit displacement of 0.  Using INDEX as base avoids the extra byte.
   (ea index thread-base-tn))
 
+;;; assert that alloc-region->free_pointer and ->end_addr can be accessed
+;;; using a single byte displacement from thread-base-tn
+(eval-when (:compile-toplevel)
+  (aver (<= (1+ thread-alloc-region-slot) 15)))
+
 (defun thread-slot-ea (slot-index)
   (ea (ash slot-index word-shift) thread-base-tn))
 
@@ -223,6 +228,16 @@
          (emit-safepoint)))))
 
 ;;;; indexed references
+
+(sb-xc:deftype load/store-index (scale lowtag min-offset
+                                 &optional (max-offset min-offset))
+  `(integer ,(- (truncate (+ (ash 1 16)
+                             (* min-offset sb-vm:n-word-bytes)
+                             (- lowtag))
+                          scale))
+            ,(truncate (- (+ (1- (ash 1 16)) lowtag)
+                          (* max-offset sb-vm:n-word-bytes))
+                       scale)))
 
 (defmacro define-full-compare-and-swap
     (name type offset lowtag scs el-type &optional translate)

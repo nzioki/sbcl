@@ -67,6 +67,7 @@
 #include "genesis/fdefn.h"
 #include "genesis/simple-fun.h"
 #include "genesis/cons.h"
+#include "genesis/vector.h"
 
 /*
  * This is a workaround for some slightly silly Linux/GNU Libc
@@ -760,7 +761,7 @@ fake_foreign_function_call(os_context_t *context)
     check_blockables_blocked_or_lose(0);
 
     /* Get current Lisp state from context. */
-#if defined(LISP_FEATURE_ARM) && !defined(LISP_FEATURE_GENCGC)
+#if (defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)) && !defined(LISP_FEATURE_GENCGC)
     dynamic_space_free_pointer = SymbolValue(ALLOCATION_POINTER, thread);
 #endif
 #ifdef reg_ALLOC
@@ -804,8 +805,9 @@ fake_foreign_function_call(os_context_t *context)
     context_index =
         fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
-    if (context_index >= MAX_INTERRUPTS) {
-        lose("maximum interrupt nesting depth (%d) exceeded\n", MAX_INTERRUPTS);
+    if (context_index >= (MAX_INTERRUPTS-THREAD_HEADER_SLOTS)) {
+        lose("maximum interrupt nesting depth (%d) exceeded\n",
+             MAX_INTERRUPTS-THREAD_HEADER_SLOTS);
     }
 
     bind_variable(FREE_INTERRUPT_CONTEXT_INDEX,
@@ -874,7 +876,7 @@ undo_fake_foreign_function_call(os_context_t __attribute__((unused)) *context)
      * not updating them. */
     thread->pseudo_atomic_bits = 0;
 #endif
-#if defined(LISP_FEATURE_ARM) && !defined(LISP_FEATURE_GENCGC)
+#if (defined(LISP_FEATURE_ARM) || defined (LISP_FEATURE_RISCV)) && !defined(LISP_FEATURE_GENCGC)
     SetSymbolValue(ALLOCATION_POINTER, dynamic_space_free_pointer, thread);
 #endif
 }
@@ -895,13 +897,7 @@ interrupt_internal_error(os_context_t *context, boolean continuable)
         lose("internal error too early in init, can't recover\n");
     }
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals(0, 0);
-#endif
-
-#if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
     thread_sigmask(SIG_SETMASK, os_context_sigmask_addr(context), 0);
-#endif
 
 #if defined(LISP_FEATURE_LINUX) && defined(LISP_FEATURE_MIPS)
     /* Workaround for blocked SIGTRAP. */
@@ -1158,6 +1154,8 @@ interrupt_handle_now(int signal, siginfo_t *info, os_context_t *context)
          * support decides to pass on it. */
         lose("no handler for signal %d in interrupt_handle_now(..)\n", signal);
 
+        // BUG: if a C function pointer can be misaligned such that it
+        // looks to satisfy functionp() then we do the wrong thing.
     } else if (functionp(handler.lisp)) {
         /* Once we've decided what to do about contexts in a
          * return-elsewhere world (the original context will no longer
@@ -1255,8 +1253,8 @@ maybe_defer_handler(void *handler, struct interrupt_data *data,
     if ((read_TLS(INTERRUPTS_ENABLED,thread) == NIL) ||
         in_leaving_without_gcing_race_p(thread)) {
         FSHOW_SIGNAL((stderr,
-                      "/maybe_defer_handler(%x,%d): deferred (RACE=%d)\n",
-                      (unsigned int)handler,signal,
+                      "/maybe_defer_handler(%p,%d): deferred (RACE=%d)\n",
+                      handler,signal,
                       in_leaving_without_gcing_race_p(thread)));
         store_signal_data_for_later(data,handler,signal,info,context);
         write_TLS(INTERRUPT_PENDING, T,thread);
@@ -1268,8 +1266,8 @@ maybe_defer_handler(void *handler, struct interrupt_data *data,
      * may succeed even when context is null (gencgc alloc()) */
     if (arch_pseudo_atomic_atomic(context)) {
         FSHOW_SIGNAL((stderr,
-                      "/maybe_defer_handler(%x,%d): deferred(PA)\n",
-                      (unsigned int)handler,signal));
+                      "/maybe_defer_handler(%p,%d): deferred(PA)\n",
+                      handler,signal));
         store_signal_data_for_later(data,handler,signal,info,context);
         arch_set_pseudo_atomic_interrupted(context);
         check_interrupt_context_or_lose(context);
@@ -1279,8 +1277,8 @@ maybe_defer_handler(void *handler, struct interrupt_data *data,
     check_interrupt_context_or_lose(context);
 
     FSHOW_SIGNAL((stderr,
-                  "/maybe_defer_handler(%x,%d): not deferred\n",
-                  (unsigned int)handler,signal));
+                  "/maybe_defer_handler(%p,%d): not deferred\n",
+                  handler,signal));
     return 0;
 }
 
@@ -1464,7 +1462,11 @@ interrupt_handle_now_handler(int signal, siginfo_t *info, void *void_context)
 extern int *context_eflags_addr(os_context_t *context);
 #endif
 
+#ifdef CALL_INTO_LISP
+#define call_into_lisp ((lispobj(*)(lispobj fun, lispobj *args, int nargs))SYMBOL(CALL_INTO_LISP)->value)
+#else
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs);
+#endif
 extern void post_signal_tramp(void);
 extern void call_into_lisp_tramp(void);
 
@@ -1479,7 +1481,7 @@ arrange_return_to_c_function(os_context_t *context,
 #endif
 #if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
     void * fun=native_pointer(function);
-    void *code = &(((struct simple_fun *) fun)->code);
+    void *code = &(((struct simple_fun *) fun)->insts);
 #endif
 
     /* Build a stack frame showing `interrupted' so that the
@@ -1651,7 +1653,7 @@ arrange_return_to_c_function(os_context_t *context,
     *os_context_npc_addr(context) =
         4 + *os_context_pc_addr(context);
 #endif
-#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_ARM64)
+#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_RISCV)
     *os_context_register_addr(context,reg_CODE) =
         (os_context_register_t)((char*)fun + FUN_POINTER_LOWTAG);
 #endif
@@ -1729,7 +1731,17 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
          * protection so the error handler has some headroom, protect the
          * previous page so that we can catch returns from the guard page
          * and restore it. */
-        if (lose_on_corruption_p || gc_active_p) {
+        if (gc_active_p) {
+            fake_foreign_function_call(context);
+            lose("Control stack exhausted with gc_active_p, fault: %p, PC: %p",
+                 addr, (void*)*os_context_pc_addr(context));
+        }
+        if (arch_pseudo_atomic_atomic(context)) {
+            fake_foreign_function_call(context);
+            lose("Control stack exhausted while pseudo-atomic, fault: %p, PC: %p",
+                 addr, (void*)*os_context_pc_addr(context));
+        }
+        if (lose_on_corruption_p) {
             fake_foreign_function_call(context);
             lose("Control stack exhausted, fault: %p, PC: %p",
                  addr, (void*)*os_context_pc_addr(context));
@@ -1890,6 +1902,16 @@ see_if_sigaction_nodefer_works(void)
 
 #undef SA_NODEFER_TEST_BLOCK_SIGNAL
 #undef SA_NODEFER_TEST_KILL_SIGNAL
+
+extern void restore_sbcl_signals () {
+    int signal;
+    for (signal = 0; signal < NSIG; signal++) {
+        interrupt_handler_t handler = interrupt_low_level_handlers[signal];
+        if (handler) {
+            undoably_install_low_level_interrupt_handler(signal, handler);
+        }
+    }
+}
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
 
@@ -2059,12 +2081,12 @@ undoably_install_low_level_interrupt_handler (int signal,
 /* This is called from Lisp. */
 uword_t
 install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
+                lispobj ohandler, // (SIMPLE-VECTOR 1) as a tagged pointer
                 int __attribute__((unused)) synchronous)
 {
 #ifndef LISP_FEATURE_WIN32
     struct sigaction sa;
     sigset_t old;
-    union interrupt_handler oldhandler;
 
     FSHOW((stderr, "/entering POSIX install_handler(%d, ..)\n", signal));
 
@@ -2073,9 +2095,10 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
     FSHOW((stderr, "/interrupt_low_level_handlers[signal]=%p\n",
            interrupt_low_level_handlers[signal]));
     if (interrupt_low_level_handlers[signal]==0) {
-        if (ARE_SAME_HANDLER(handler, SIG_DFL) ||
-            ARE_SAME_HANDLER(handler, SIG_IGN))
-            sa.sa_sigaction = (void (*)(int, siginfo_t*, void*))handler;
+        if (handler == 0)
+            sa.sa_sigaction = (void (*)(int, siginfo_t*, void*))SIG_DFL;
+        else if ((lispobj)handler == 1)
+            sa.sa_sigaction = (void (*)(int, siginfo_t*, void*))SIG_IGN;
 #ifdef LISP_FEATURE_SB_SAFEPOINT_STRICTLY
         else if (signal == SIGPROF)
             sa.sa_sigaction = sigprof_handler_trampoline;
@@ -2096,14 +2119,37 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
         sigaction(signal, &sa, NULL);
     }
 
-    oldhandler = interrupt_handlers[signal];
+    // We can GC-safely read interrupt_low_level_handlers[signal] and assign
+    // into ohandler despite that the C stack and registers are not roots on
+    // precise GC. That is, if GC were to occur as depicted:
+    //   obj = old_handler
+    //   -- GC signal occurs here --
+    //   result = obj
+    // then the register or stack word holding 'obj' could be obsolete.
+    // But that won't happen- the STOP_FOR_GC signal is currently blocked
+    // due to the block_blockable_signals() at the top of this function.
+    // However, there is an unlikely other reason for a wrong result -
+    // if the C function address does not have at least N_FIXNUM_TAG_BITS
+    // of alignment, then we say that it was NIL instead of a fixnum.
+    lispobj obj = interrupt_handlers[signal].lisp;
+    uword_t result = -1;
+    if ((void*)obj == (void*)SIG_DFL)
+        result = 0;
+    else if ((void*)obj == (void*)SIG_IGN)
+        result = 1;
+    else if (ohandler) // only store into 'ohandler' when it was supplied
+        VECTOR(ohandler)->data[0] = (functionp(obj)||fixnump(obj)) ? obj : NIL;
+
     interrupt_handlers[signal].c = handler;
 
     thread_sigmask(SIG_SETMASK, &old, 0);
 
     FSHOW((stderr, "/leaving POSIX install_handler(%d, ..)\n", signal));
 
-    return (uword_t)oldhandler.lisp;
+    // After the thread's signal mask is restored to the mask in 'old',
+    // it is not possible to GC-safely refer to a Lisp function from C code,
+    // which is to say, naively utilizing "return obj;" would be wrong.
+    return result;
 #else
     /* Probably-wrong Win32 hack */
     return 0;
@@ -2234,9 +2280,9 @@ handle_memory_fault_emulation_trap(os_context_t *context)
 #endif /* C_STACK_IS_CONTROL_STACK */
     /* On x86oids, we're in handle_memory_fault_emulation_trap().
      * On real computers, we're still in lisp_memory_fault_error(). */
-#ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals(0, 0);
-#endif
+
+    thread_sigmask(SIG_SETMASK, os_context_sigmask_addr(context), 0);
+
     DX_ALLOC_SAP(context_sap, context);
     DX_ALLOC_SAP(fault_address_sap, addr);
     funcall2(StaticSymbolFunction(MEMORY_FAULT_ERROR),
@@ -2250,13 +2296,9 @@ unhandled_trap_error(os_context_t *context)
 {
     DX_ALLOC_SAP(context_sap, context);
     fake_foreign_function_call(context);
-#ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals(0, 0);
-#endif
 
-#if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
     thread_sigmask(SIG_SETMASK, os_context_sigmask_addr(context), 0);
-#endif
+
     funcall1(StaticSymbolFunction(UNHANDLED_TRAP_ERROR), context_sap);
     lose("UNHANDLED-TRAP-ERROR fell through");
 }

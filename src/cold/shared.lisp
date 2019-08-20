@@ -255,9 +255,9 @@
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
-         ("(and cheneygc (not (or alpha arm hppa mips ppc sparc)))"
+         ("(and cheneygc (not (or alpha arm hppa mips ppc riscv sparc)))"
           ":CHENEYGC not supported on selected architecture")
-         ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64)))"
+         ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64 riscv)))"
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
@@ -291,6 +291,11 @@
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
          ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
+         ("(and int4-breakpoints x86)"
+          ;; 0xCE is a perfectly good 32-bit instruction,
+          ;; unlike on x86-64 where it is illegal. It's therefore
+          ;; confusing to allow this feature in a 32-bit build.
+          ":INT4-BREAKPOINTS are incompatible with x86")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
@@ -368,6 +373,9 @@
     ;; just to avoid that ugly mess.
     nil))
 
+;;; The specialized array registry has file-wide scope. Hacking that aspect
+;;; into the xc build scaffold seemed slightly easier than hacking the
+;;; compiler (i.e. making the registry a slot of the fasl-output struct)
 (defvar *array-to-specialization* (make-hash-table :test #'eq))
 
 (defmacro do-stems-and-flags ((stem flags build-phase) &body body)
@@ -659,3 +667,85 @@
              (funcall *target-compile-file* filename))))
 (compile 'target-compile-file)
 
+;;;; Floating-point number reader interceptor
+
+(defvar *choke-on-host-irrationals* t)
+(defun install-read-interceptor ()
+  ;; Intercept READ to catch inadvertent use of host floating-point literals.
+  ;; This prevents regressions in the portable float logic and allows passing
+  ;; characters to a floating-point library if we so choose.
+  ;; Only do this for new enough SBCL.
+  ;; DO-INSTANCE-TAGGED-SLOT was defined circa Nov 2014 and VERSION>= was defined
+  ;; ca. Nov 2013, but got moved from SB-IMPL or SB-C (inadvertently perhaps).
+  ;; It is not critical that this be enabled on all possible build hosts.
+  #+#.(cl:if (cl:and (cl:find-package "SB-C")
+                     (cl:find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                     (cl:funcall (cl:find-symbol "VERSION>=" "SB-C")
+                                 (cl:funcall (cl:find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                                             (cl:lisp-implementation-version))
+                                 '(1 4 6)))
+             '(and)
+             '(or))
+  (labels ((contains-irrational (x)
+             (typecase x
+               (cons (or (contains-irrational (car x))
+                         (contains-irrational (cdr x))))
+               (simple-vector (some #'contains-irrational x))
+               ;; We use package literals -- see e.g. SANE-PACKAGE - which
+               ;; must be treated as opaque, but COMMAs should not be opaque.
+               ;; There are also a few uses of "#.(find-layout)".
+               ;; However, the target-num objects should also be opaque
+               ;; and, testing for those types before the structure is defined
+               ;; is not fun. Other than moving the definitions into here
+               ;; from cross-early, there's no good way. But 'chill'
+               ;; should not define those structures.
+               ((and structure-object (not package))
+                (let ((type-name (string (type-of x))))
+                  ;; This "LAYOUT" refers to *our* object, not host-sb-kernel:layout.
+                  (unless (member type-name '("LAYOUT" "FLOAT" "COMPLEXNUM")
+                                  :test #'string=)
+                    ;(Format t "visit a ~/host-sb-ext:print-symbol-with-prefix/~%" (type-of x))
+                    ;; This generalizes over any structure. I need it because we
+                    ;; observe instances of SB-IMPL::COMMA and also HOST-SB-IMPL::COMMA.
+                    ;; (primordial-extensions get compiled before 'backq' is installed)
+                    (sb-kernel:do-instance-tagged-slot (i x)
+                      (when (contains-irrational (sb-kernel:%instance-ref x i))
+                        (return-from contains-irrational t))))))
+               ((or cl:complex cl:float)
+                x)))
+           (reader-intercept (f &optional stream (errp t) errval recursive)
+             (let* ((form (funcall f stream errp errval recursive))
+                    (bad-atom (and (not recursive) ; avoid checking inner forms
+                                   (not (eq form errval))
+                                   *choke-on-host-irrationals*
+                                   (contains-irrational form))))
+               (when bad-atom
+                 (setq *choke-on-host-irrationals* nil) ; one shot, otherwise tough to debug
+                 (error "Oops! didn't expect to read ~s containing ~s" form bad-atom))
+               form)))
+    (unless (sb-kernel:closurep (symbol-function 'read))
+      (sb-int:encapsulate 'read-preserving-whitespace 'protect #'reader-intercept)
+      (sb-int:encapsulate 'read 'protect #'reader-intercept)
+      (format t "~&; Installed READ interceptor~%"))))
+(compile 'install-read-interceptor)
+
+(defvar *math-ops-memoization* (make-hash-table :test 'equal))
+(defmacro with-math-journal (&body body)
+  `(let* ((table *math-ops-memoization*)
+          (memo (cons table (hash-table-count table))))
+     (assert (atom table)) ; prevent nested use of this macro
+     ;; Don't intercept READ until just-in-time, so that "chill" doesn't
+     ;; annoyingly get the interceptor installed.
+     (install-read-interceptor)
+     (let ((*math-ops-memoization* memo))
+       ,@body)
+     (when nil ; *compile-verbose*
+       (funcall (intern "SHOW-INTERNED-NUMBERS" "SB-IMPL") *standard-output*))
+     (when (> (hash-table-count table) (cdr memo))
+       (let ((filename "float-math.lisp-expr"))
+         (with-open-file (stream filename :direction :output
+                                          :if-exists :supersede)
+           (funcall (intern "DUMP-MATH-MEMOIZATION-TABLE" "SB-IMPL")
+                    table stream))
+         (format t "~&; wrote ~a - ~d entries"
+                 filename (hash-table-count table))))))

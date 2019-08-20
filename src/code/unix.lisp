@@ -355,9 +355,8 @@ corresponds to NAME, or NIL if there is none."
 #-win32
 (defun unix-mkdir (name mode)
   (declare (type unix-pathname name)
-           (type unix-file-mode mode)
-           #+win32 (ignore mode))
-  (void-syscall ("mkdir" c-string #-win32 int) name #-win32 mode))
+           (type unix-file-mode mode))
+  (void-syscall ("mkdir" c-string int) name mode))
 
 ;;; Given a C char* pointer allocated by malloc(), free it and return a
 ;;; corresponding Lisp string (or return NIL if the pointer is a C NULL).
@@ -388,16 +387,16 @@ corresponds to NAME, or NIL if there is none."
   ;;
   ;; Signal an error at compile-time, since it's needed for the
   ;; runtime to start up
-  #-(or android linux openbsd freebsd netbsd sunos darwin hpux win32 dragonfly)
+  #-(or android linux openbsd freebsd netbsd sunos darwin hpux dragonfly)
   #.(error "POSIX-GETCWD is not implemented.")
   (or
-   #+(or linux openbsd freebsd netbsd sunos darwin hpux win32 dragonfly)
+   #+(or linux openbsd freebsd netbsd sunos darwin hpux dragonfly)
    (newcharstar-string (alien-funcall (extern-alien "getcwd"
                                                     (function (* char)
                                                               (* char)
                                                               size-t))
                                       nil
-                                      #+(or linux openbsd freebsd netbsd darwin win32 dragonfly) 0
+                                      #+(or linux openbsd freebsd netbsd darwin dragonfly) 0
                                       #+(or sunos hpux) 1025))
    #+android
    (with-alien ((ptr (array char #.path-max)))
@@ -543,7 +542,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 ;;; This is like getrusage(2), except it returns only the system and
 ;;; user time, and returns the seconds and microseconds as separate
 ;;; values.
-#-sb-fluid (declaim (inline unix-fast-getrusage))
+#-win32 (declaim (inline unix-fast-getrusage))
 #-win32
 (defun unix-fast-getrusage (who)
   (declare (values (member t)
@@ -620,6 +619,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
               (events  short)           ; requested events
               (revents short)))         ; returned events
 
+  (declaim (inline unix-poll))
   (defun unix-poll (pollfds nfds to-msec)
     (declare (fixnum nfds to-msec))
     (when (and (minusp to-msec) (not *interrupts-enabled*))
@@ -1082,7 +1082,6 @@ the UNIX epoch (January 1st 1970.)"
                    system-real-time-values))
 
   (defun system-real-time-values ()
-    #+win32 (declare (notinline get-time-of-day)) ; forward ref
     (multiple-value-bind (sec usec) (get-time-of-day)
       (declare (type unsigned-byte sec) (type (unsigned-byte 31) usec))
       (values sec (truncate usec micro-seconds-per-internal-time-unit))))

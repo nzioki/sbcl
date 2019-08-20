@@ -438,13 +438,12 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-mop:method-specializers object))
                            (sb-mop:method-specializers object)))))
        source))
-    #+sb-eval
-    (sb-eval:interpreted-function
+    (interpreted-function
+     #+sb-eval
      (let ((source (translate-source-location
                     (sb-eval:interpreted-function-source-location object))))
-       source))
-    #+sb-fasteval
-    (sb-interpreter:interpreted-function
+       source)
+     #+sb-fasteval
      (translate-source-location (sb-interpreter:fun-source-location object)))
     (function
      (find-function-definition-source object))
@@ -878,7 +877,6 @@ Experimental: interface subject to change."
                  (t
                   ;; KLUDGE: INTERRUPT-THREAD is Not Nice (tm), but
                   ;; the alternative would be stopping the world...
-                  #+sb-thread
                   (let ((sem (sb-thread:make-semaphore))
                         (refs nil))
                     (handler-case
@@ -915,7 +913,7 @@ Experimental: interface subject to change."
            (call (fun-code-header object)))
          (call (%simple-fun-name object))
          (call (%simple-fun-arglist object))
-         (call (%simple-fun-type object))
+         (call (%simple-fun-source object))
          (call (%simple-fun-info object)))
         (symbol
          ;; We use :override here because (apparently) the intent is

@@ -163,6 +163,12 @@
       (sleep 1)
       (assert gc-happend))))
 
+
+#+immobile-space
+(with-test (:name :generation-of-fdefn)
+  (assert (= (sb-kernel:generation-of (sb-kernel::find-fdefn 'car))
+             sb-vm:+pseudo-static-generation+)))
+
 ;;; SB-EXT:GENERATION-* accessors returned bogus values for generation > 0
 (with-test (:name :bug-529014 :skipped-on (not :gencgc))
   (loop for i from 0 to sb-vm:+pseudo-static-generation+
@@ -175,47 +181,9 @@
         (assert (= (sb-ext:generation-minimum-age-before-gc i) 0.75))
         (assert (= (sb-ext:generation-number-of-gcs-before-promotion i) 1))))
 
-(defun stress-gc ()
-  ;; Kludge or not?  I don't know whether the smaller allocation size
-  ;; for sb-safepoint is a legitimate correction to the test case, or
-  ;; rather hides the actual bug this test is checking for...  It's also
-  ;; not clear to me whether the issue is actually safepoint-specific.
-  ;; But the main problem safepoint-related bugs tend to introduce is a
-  ;; delay in the GC triggering -- and if bug-936304 fails, it also
-  ;; causes bug-981106 to fail, even though there is a full GC in
-  ;; between, which makes it seem unlikely to me that the problem is
-  ;; delay- (and hence safepoint-) related. --DFL
-  (let* ((x (make-array (truncate #-sb-safepoint (* 0.2 (dynamic-space-size))
-                                  #+sb-safepoint (* 0.1 (dynamic-space-size))
-                                  sb-vm:n-word-bytes))))
-    (elt x 0)))
-
-(with-test (:name :bug-936304)
-  (gc :full t)
-  (assert (eq :ok (handler-case
-                       (progn
-                         (loop repeat 50 do (stress-gc))
-                         :ok)
-                     (storage-condition ()
-                       :oom)))))
-
-(with-test (:name :bug-981106)
-  (gc :full t)
-  (assert (eq :ok
-               (handler-case
-                   (dotimes (runs 100 :ok)
-                     (let* ((n (truncate (dynamic-space-size) 1200))
-                            (len (length
-                                  (with-output-to-string (string)
-                                    (dotimes (i n)
-                                      (write-sequence "hi there!" string))))))
-                       (assert (eql len (* n (length "hi there!"))))))
-                 (storage-condition ()
-                   :oom)))))
-
 (with-test (:name :gc-logfile :skipped-on (not :gencgc))
   (assert (not (gc-logfile)))
-  (let ((p #p"gc.log"))
+  (let ((p (scratch-file-name "log")))
     (assert (not (probe-file p)))
     (assert (equal p (setf (gc-logfile) p)))
     (gc)
@@ -363,9 +331,11 @@
 (defvar *foo*)
 #+gencgc
 (with-test (:name :traceroot-simple-fun)
+  ;; Tracing a path to a simple fun wasn't working at some point
+  ;; because of failure to employ fun_code_header in the right place.
   (setq *foo* (compile nil '(lambda () 42)))
   (let ((wp (sb-ext:make-weak-pointer *foo*)))
-    (assert (eql (sb-ext:search-roots wp) 1))))
+    (assert (sb-ext:search-roots wp :oldest nil))))
 
 #+gencgc
 (with-test (:name :traceroot-ignore-immediate)
@@ -383,4 +353,67 @@
     (loop (compile nil `(lambda () (print 20)))
           (unless (sb-thread:thread-alive-p gc-thread)
             (return)))
+    (sb-thread:join-thread gc-thread)))
+
+(defun get-shared-library-maps ()
+  (let (result)
+    #+linux
+    (with-open-file (f "/proc/self/maps")
+      (loop (let ((line (read-line f nil)))
+              (unless line (return))
+              (when (and (search "r-xp" line) (search ".so" line))
+                (let ((p (position #\- line)))
+                  (let ((start (parse-integer line :end p :radix 16))
+                        (end (parse-integer line :start (1+ p) :radix 16
+                                                 :junk-allowed t)))
+                    (push `(,start . ,end) result)))))))
+    #+darwin
+    (let ((p (run-program "/usr/bin/vmmap" (list (write-to-string (sb-unix:unix-getpid)))
+                          :output :stream
+                          :wait nil)))
+      (with-open-stream (s (process-output p))
+        (loop (let ((line (read-line s)))
+                (when (search "regions for" line) (return))))
+        (assert (search "REGION TYPE" (read-line s)))
+        (loop (let ((line (read-line s)))
+                (when (zerop (length line)) (return))
+                (when (search ".dylib" line)
+                  (let ((c (search "00-00" line)))
+                    (assert c)
+                    (let ((start (parse-integer line :start (+ c 2 (- 16)) :radix 16
+                                                     :junk-allowed t))
+                          (end (parse-integer line :start (+ c 3) :radix 16
+                                                   :junk-allowed t)))
+                      (push `(,start . ,end) result)))))))
+      (process-wait p))
+    result))
+
+;;; Change 7143001bbe7d50c6 contained little to no rationale for why Darwin could
+;;; deadlock, and how adding a WITHOUT-GCING to SAP-FOREIGN-SYMBOL fixed anything.
+;;; Verify that it works fine while invoking GC in another thread
+;;; despite removal of the mysterious WITHOUT-GCING.
+#+sb-thread
+(with-test (:name :sap-foreign-symbol-no-deadlock)
+  (let* ((worker-thread
+          (sb-thread:make-thread
+           (lambda (ranges)
+             (dolist (range ranges)
+               (let ((start (car range))
+                     (end (cdr range))
+                     (prevsym "")
+                     (nsyms 0))
+                 (loop for addr from start to end by 8
+                       do (let ((sym (sb-sys:sap-foreign-symbol (sb-sys:int-sap addr))))
+                            (when (and sym (string/= sym prevsym))
+                              (incf nsyms)
+                              (setq prevsym sym))))
+                 #+nil (format t "~x ~x: ~d~%" start end nsyms))))
+           :arguments (list (get-shared-library-maps))))
+         (working t)
+         (gc-thread
+          (sb-thread:make-thread
+           (lambda ()
+             (loop while working do (gc) (sleep .001))))))
+    (sb-thread:join-thread worker-thread)
+    (setq working nil)
     (sb-thread:join-thread gc-thread)))

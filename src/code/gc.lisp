@@ -369,7 +369,7 @@ Note: currently changes to this value are lost when saving core."
 ;;;; as well.
 #+gencgc
 (deftype generation-index ()
-  '(integer 0 #.sb-vm:+pseudo-static-generation+))
+  `(integer 0 ,sb-vm:+pseudo-static-generation+))
 
 ;;; FIXME: GENERATION (and PAGE, as seen in room.lisp) should probably be
 ;;; defined in Lisp, and written to header files by genesis, instead of this
@@ -463,11 +463,6 @@ Experimental: interface subject to change."
     (alien-funcall (extern-alien "generation_average_age"
                                  (function double generation-index-t))
                    generation))
-
-(declaim (inline sb-vm:is-lisp-pointer))
-(defun sb-vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
-  #-64-bit (oddp addr)
-  #+64-bit (not (logtest (logxor addr 3) 3)))
 
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)

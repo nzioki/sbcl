@@ -56,12 +56,15 @@
   ;; references an immobile-space (but not static-space) object.
   ;; Note that:
   ;;  (1) Call fixups occur in both :RELATIVE and :ABSOLUTE kinds.
-  ;;      We can ignore the :RELATIVE kind, except for foreign call.
+  ;;      We can ignore the :RELATIVE kind, except for foreign call,
+  ;;      as those point to the linkage table which has an absolute address
+  ;;      and therefore might change in displacement from the call site
+  ;;      if the immobile code space is relocated on startup.
   ;;  (2) :STATIC-CALL fixups point to immobile space, not static space.
   #+immobile-space
   (return-from fixup-code-object
     (case flavor
-      ((:named-call :layout :immobile-object ; -> fixedobj subspace
+      ((:named-call :layout :immobile-symbol :symbol-value ; -> fixedobj subspace
         :assembly-routine :assembly-routine* :static-call) ; -> varyobj subspace
        (if (eq kind :absolute) :absolute))
       (:foreign
@@ -72,7 +75,7 @@
        (if (eq kind :relative) :relative))))
   nil) ; non-immobile-space builds never record code fixups
 
-#+(or darwin linux openbsd win32)
+#+(or darwin linux openbsd win32 sunos)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
@@ -81,11 +84,11 @@
 
 (defun context-float-register (context index format)
   (declare (ignorable context index))
-  #-(or darwin linux openbsd win32)
+  #-(or darwin linux openbsd win32 sunos)
   (progn
     (warn "stub CONTEXT-FLOAT-REGISTER")
     (coerce 0 format))
-  #+(or darwin linux openbsd win32)
+  #+(or darwin linux openbsd win32 sunos)
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
@@ -164,7 +167,7 @@
 (defconstant trampoline-entry-offset n-word-bytes)
 (defun fun-immobilize (fun)
   (let ((code (truly-the (values code-component &optional)
-                         (sb-vm::alloc-immobile-trampoline))))
+                         (alloc-immobile-trampoline))))
     (setf (%code-debug-info code) fun)
     (let ((sap (sap+ (code-instructions code) trampoline-entry-offset))
           (ea (+ (logandc2 (get-lisp-obj-address code) lowtag-mask)
@@ -209,11 +212,24 @@
      (setf (sap-ref-word sap insts-offs) #xFFFFFFE9058B48 ; MOV RAX,[RIP-23]
            (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
 
+(defun fdefn-has-static-callers (fdefn)
+  (declare (type fdefn fdefn))
+  (with-pinned-objects (fdefn)
+    (logbitp 7 (sap-ref-8 (int-sap (get-lisp-obj-address fdefn))
+                          (- 1 other-pointer-lowtag)))))
+
+(defun set-fdefn-has-static-callers (fdefn newval)
+  (declare (type fdefn fdefn) (type bit newval))
+  (if (= newval 0)
+      (%primitive unset-fdefn-has-static-callers fdefn)
+      (%primitive set-fdefn-has-static-callers fdefn))
+  fdefn)
+
 (defun %set-fdefn-fun (fdefn fun)
   (declare (type fdefn fdefn) (type function fun)
            (values function))
-  (unless (eql (sb-vm::fdefn-has-static-callers fdefn) 0)
-    (sb-vm::remove-static-links fdefn))
+  (when (fdefn-has-static-callers fdefn)
+    (remove-static-links fdefn))
   (let ((trampoline (when (fun-requires-simplifying-trampoline-p fun)
                       (fun-immobilize fun)))) ; a newly made CODE object
     (with-pinned-objects (fdefn trampoline fun)
@@ -243,7 +259,7 @@
                       (ash jmp-operand 8)
                       (ash #xA890 40) ; "NOP ; TEST %AL, #xNN"
                       (ash tagged-ptr-bias 56))))
-        (%primitive sb-vm::set-fdefn-fun fdefn fun instruction))))
+        (%primitive set-fdefn-fun fdefn fun instruction))))
   fun)
 
 ) ; end PROGN
@@ -299,7 +315,6 @@
 ;;; it is impossible to distinguish fdefns that point to the same called function.
 ;;; FIXME: It would be a nice to remove the uniqueness constraint, either
 ;;; by recording ay ambiguous fdefns, or just recording all replacements.
-;;; Perhaps we could remove the static linker mutex as well?
 (defun call-direct-p (fun code-header-funs)
   #-immobile-code (declare (ignore fun code-header-funs))
   #+immobile-code
@@ -322,10 +337,7 @@
 
 ;;; Remove calls via fdefns from CODE when compiling into memory.
 (defun statically-link-code-obj (code fixups)
-  (declare (ignorable fixups))
-  (unless (and (immobile-space-obj-p code)
-               (fboundp 'sb-vm::remove-static-links))
-    (return-from statically-link-code-obj))
+  (declare (ignorable code fixups))
   #+immobile-code
   (let ((insts (code-instructions code))
         (fdefns)) ; group by fdefn
@@ -351,7 +363,7 @@
                   ;; A MOV will always load the address of the fdefn.
                   (when (eql (logior (sap-ref-8 insts (1- offset)) 1) #xE9)
                     ;; Set the statically-linked flag
-                    (setf (sb-vm::fdefn-has-static-callers fdefn) 1)
+                    (sb-vm::set-fdefn-has-static-callers fdefn 1)
                     ;; Change the machine instruction
                     (setf (signed-sap-ref-32 insts offset)
                           (- entry (+ (sap-int (sap+ insts offset)) 4)))))))))))))

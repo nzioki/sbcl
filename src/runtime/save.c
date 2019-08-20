@@ -38,7 +38,9 @@
 #include "pseudo-atomic.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
+#include "genesis/vector.h"
 #include "immobile-space.h"
+#include "search.h"
 
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
 # include <zlib.h>
@@ -54,9 +56,10 @@ write_memsize_options(FILE *file)
 {
     core_entry_elt_t optarray[RUNTIME_OPTIONS_WORDS] = {
       RUNTIME_OPTIONS_MAGIC,
-      4, // number of words in this core header entry
+      5, // number of words in this core header entry
       dynamic_space_size,
-      thread_control_stack_size
+      thread_control_stack_size,
+      dynamic_values_bytes
     };
 
     if (RUNTIME_OPTIONS_WORDS !=
@@ -222,6 +225,15 @@ void unwind_binding_stack()
     unbind_to_here((lispobj *)th->binding_stack_start,th);
     write_TLS(CURRENT_CATCH_BLOCK, 0, th); // If set to 0 on start, why here too?
     write_TLS(CURRENT_UNWIND_PROTECT_BLOCK, 0, th);
+    unsigned int hint = 0;
+    char symbol_name[] = "*SAVE-LISP-CLOBBERED-GLOBALS*";
+    lispobj* sym = find_symbol(symbol_name, sb_kernel_package(), &hint);
+    lispobj value;
+    int i;
+    if (!sym || !simple_vector_p(value = ((struct symbol*)sym)->value))
+        fprintf(stderr, "warning: bad value in %s\n", symbol_name);
+    else for(i=fixnum_value(VECTOR(value)->length)-1; i>=0; --i)
+        SYMBOL(VECTOR(value)->data[i])->value = UNBOUND_MARKER_WIDETAG;
     if (verbose) printf("done]\n");
 }
 

@@ -164,7 +164,15 @@
                    (cdr (leaf-refs leaf)))
               (coerce-to-values
                (if (eq :declared (leaf-where-from leaf))
-                   (leaf-type leaf)
+                   (let ((leaf-type (leaf-type leaf))
+                         (cons-type (specifier-type 'cons)))
+                     ;; If LEAF-TYPE is (or null some-cons-type) and
+                     ;; DERIVED-TYPE is known to be non-null, use
+                     ;; SOME-CONS-TYPE in that case, because a cons
+                     ;; can't become null.
+                     (if (csubtypep derived-type cons-type)
+                         (type-intersection leaf-type cons-type)
+                         leaf-type))
                    (conservative-type derived-type)))
               derived-values-type))
         derived-values-type)))
@@ -860,7 +868,7 @@
             (when (and (ref-p use)
                        (lambda-p (ref-leaf use))
                        (neq (leaf-extent (lambda-parent (ref-leaf use)))
-                            :always-dynamic))
+                            'truly-dynamic-extent))
               (unless received-args
                 (setq received-args
                       (make-gensym-list (length (combination-args node))))
@@ -1006,7 +1014,7 @@
                                (fname (lvar-fun-name lvar t)))
                           (format *trace-output*
                                   "~&trying transform ~s for ~s"
-                                  (transform-function x) fname)))
+                                  (transform-type x) fname)))
                       (unless (ir1-transform node x)
                         (when (eq *show-transforms-p* :all)
                           (format *trace-output*
@@ -1084,7 +1092,7 @@
 ;;; or known:
 ;;; -- If a DEFINED-FUN should be inline expanded, then convert
 ;;;    the expansion and change the call to call it. Expansion is
-;;;    enabled if :INLINE or if SPACE=0. If the FUNCTIONAL slot is
+;;;    enabled if INLINE or if SPACE=0. If the FUNCTIONAL slot is
 ;;;    true, we never expand, since this function has already been
 ;;;    converted. Local call analysis will duplicate the definition
 ;;;    if necessary. We claim that the parent form is LABELS for
@@ -1101,12 +1109,12 @@
          (leaf (when (ref-p ref) (ref-leaf ref)))
          (inlinep (if (defined-fun-p leaf)
                       (defined-fun-inlinep leaf)
-                      :no-chance)))
+                      'no-chance)))
     (cond
       (unknown-keys
        (setf (basic-combination-kind call) :unknown-keys)
        (values leaf nil))
-      ((eq inlinep :notinline)
+      ((eq inlinep 'notinline)
        (let ((info (info :function :info (leaf-source-name leaf))))
          (when info
            (setf (basic-combination-fun-info call) info))
@@ -1115,9 +1123,9 @@
                  (eq (global-var-kind leaf) :global-function)))
        (values leaf nil))
       ((and (ecase inlinep
-              (:inline t)
-              (:no-chance nil)
-              ((nil :maybe-inline) (policy call (zerop space))))
+              (inline t)
+              (no-chance nil)
+              ((nil maybe-inline) (policy call (zerop space))))
             (defined-fun-p leaf)
             (defined-fun-inline-expansion leaf)
             (inline-expansion-ok call))
@@ -1125,16 +1133,16 @@
        ;; site in this component, we point this REF to the functional. If not,
        ;; we convert the expansion.
        ;;
-       ;; For :INLINE case local call analysis will copy the expansion later,
-       ;; but for :MAYBE-INLINE and NIL cases we only get one copy of the
+       ;; For INLINE case local call analysis will copy the expansion later,
+       ;; but for MAYBE-INLINE and NIL cases we only get one copy of the
        ;; expansion per component.
        ;;
-       ;; FIXME: We also convert in :INLINE & FUNCTIONAL-KIND case below. What
+       ;; FIXME: We also convert in INLINE & FUNCTIONAL-KIND case below. What
        ;; is it for?
        (with-ir1-environment-from-node call
          (let ((fun (defined-fun-functional leaf)))
            (if (or (not fun)
-                   (and (eq inlinep :inline) (functional-kind fun)))
+                   (and (eq inlinep 'inline) (functional-kind fun)))
                ;; Convert.
                (let* ((name (leaf-source-name leaf))
                       (res (ir1-convert-inline-expansion
@@ -1648,6 +1656,39 @@
                   (reoptimize-lvar lvar)))))))
       (values))))
 
+;;; Turn (or (integer 1 1) (integer 3 3)) to (integer 1 3)
+(defun weaken-numeric-union-type (type)
+  (if (union-type-p type)
+      (let ((low  nil)
+            (high nil)
+            class
+            (format :no))
+        (dolist (part (union-type-types type)
+                      (make-numeric-type :class class
+                                         :format format
+                                         :low low
+                                         :high high))
+          (unless (and (numeric-type-real-p part)
+                       (if class
+                           (eql (numeric-type-class part) class)
+                           (setf class (numeric-type-class part)))
+                       (cond ((eq format :no)
+                              (setf format (numeric-type-format part))
+                              t)
+                             ((eql (numeric-type-format part) format))))
+            (return type))
+          (let ((this-low (numeric-type-low part))
+                (this-high (numeric-type-high part)))
+            (unless (and this-low this-high)
+              (return type))
+            (when (consp this-low)
+              (setf this-low (car this-low)))
+            (when (consp this-high)
+              (setf this-high (car this-high)))
+            (setf low  (min this-low  (or low  this-low))
+                  high (max this-high (or high this-high))))))
+      type))
+
 ;;; Iteration variable: exactly one SETQ of the form:
 ;;;
 ;;; (let ((var initial))
@@ -1675,7 +1716,8 @@
                              (eq (ref-leaf first) var))))
               :exit-if-null)
              (step-type (lvar-type (second +-args)))
-             (set-type (lvar-type (set-value set))))
+             (set-type (lvar-type (set-value set)))
+             (initial-type (weaken-numeric-union-type initial-type)))
     (when (and (numeric-type-p initial-type)
                (numeric-type-p step-type)
                (or (numeric-type-equal initial-type step-type)
@@ -1784,7 +1826,7 @@
       (lambda-var
        (null (lambda-var-sets leaf)))
       (defined-fun
-       (not (eq (defined-fun-inlinep leaf) :notinline)))
+       (not (eq (defined-fun-inlinep leaf) 'notinline)))
       (global-var
        (case (global-var-kind leaf)
          (:global-function

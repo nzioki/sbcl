@@ -73,7 +73,11 @@ static void xgetbv(unsigned *eax, unsigned *edx)
             : "c" (0));
 }
 
-void arch_init(void)
+#define VECTOR_FILL_T "VECTOR-FILL/T"
+
+// Poke in a byte that changes an opcode to enable faster vector fill.
+// Using fixed offsets and bytes is no worse than what we do elsewhere.
+void tune_asm_routines_for_microarch(void)
 {
     unsigned int eax, ebx, ecx, edx;
 
@@ -93,17 +97,9 @@ void arch_init(void)
             }
         }
     }
-}
-
-#define VECTOR_FILL_T "VECTOR-FILL/T"
-
-// Poke in a byte that changes an opcode to enable faster vector fill.
-// Using fixed offsets and bytes is no worse than what we do elsewhere.
-void tune_asm_routines_for_microarch(void)
-{
+    SetSymbolValue(CPUID_FN1_ECX, (lispobj)make_fixnum(cpuid_fn1_ecx), 0);
     // I don't know if this works on Windows
 #ifndef _MSC_VER
-    unsigned int eax, ebx, ecx, edx;
     cpuid(0, 0, &eax, &ebx, &ecx, &edx);
     if (eax >= 7) {
         cpuid(7, 0, &eax, &ebx, &ecx, &edx);
@@ -143,13 +139,15 @@ arch_get_bad_addr(int __attribute__((unused)) sig,
 os_context_register_t *
 context_eflags_addr(os_context_t *context)
 {
-#if defined __linux__ || defined __sun
+#if defined __linux__
     /* KLUDGE: As of kernel 2.2.14 on Red Hat 6.2, there's code in the
      * <sys/ucontext.h> file to define symbolic names for offsets into
      * gregs[], but it's conditional on __USE_GNU and not defined, so
      * we need to do this nasty absolute index magic number thing
      * instead. */
     return (os_context_register_t*)&context->uc_mcontext.gregs[17];
+#elif defined LISP_FEATURE_SUNOS
+    return &context->uc_mcontext.gregs[REG_RFL];
 #elif defined LISP_FEATURE_FREEBSD || defined(__DragonFly__)
     return &context->uc_mcontext.mc_rflags;
 #elif defined LISP_FEATURE_DARWIN
@@ -630,7 +628,7 @@ static boolean instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 
 // logical index 'index' in the metadata array stores the code component
 // and pc-offset relative to the component base address
-static void record_pc(uword_t* pc, unsigned int index, boolean sizedp)
+static void record_pc(char* pc, unsigned int index, boolean sizedp)
 {
     lispobj *code = component_ptr_from_pc(pc);
     if (!code) {
@@ -649,7 +647,7 @@ static void record_pc(uword_t* pc, unsigned int index, boolean sizedp)
         ensure_region_closed(code_region);
         int ret = thread_mutex_unlock(&free_pages_lock);
         gc_assert(ret == 0);
-        code = component_ptr_from_pc((lispobj*)pc);
+        code = component_ptr_from_pc(pc);
     }
 #endif
     struct vector* v = VECTOR(alloc_profile_data);
@@ -685,7 +683,7 @@ allocation_tracker_counted(uword_t* sp)
         if (!__sync_bool_compare_and_swap(pc, word_at_pc, new_inst))
             lose("alloc profiler failed to rewrite instruction @ %p", pc);
         if (index != 2)
-            record_pc(pc, index, 0);
+            record_pc((char*)pc, index, 0);
     }
     int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
     gc_assert(ret == 0);
@@ -724,7 +722,7 @@ allocation_tracker_sized(uword_t* sp)
             !__sync_bool_compare_and_swap(pc,   word_at_pc,    new_inst1))
             lose("alloc profiler failed to rewrite instructions @ %p", pc);
         if (index != 0) // can't record a PC for the overflow counts
-            record_pc(pc, index, 1);
+            record_pc((char*)pc, index, 1);
     }
     int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
     gc_assert(ret == 0);

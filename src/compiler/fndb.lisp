@@ -99,6 +99,8 @@
   (or classoid null) ())
 (defknown classoid-of (t) classoid (flushable))
 (defknown layout-of (t) layout (flushable))
+#+64-bit (defknown layout-depthoid (layout) fixnum (flushable always-translatable))
+(defknown layout-depthoid-gt (layout integer) boolean (flushable))
 (defknown copy-structure (structure-object) structure-object
   (flushable)
   :derive-type #'result-type-first-arg)
@@ -187,7 +189,7 @@
 (defknown sb-vm::%%make-symbol (simple-string) symbol (flushable))
 (defknown copy-symbol (symbol &optional t) symbol (flushable))
 (defknown gensym (&optional (or string unsigned-byte)) symbol ())
-(defknown sb-xc:symbol-package (symbol) (or package null) (flushable))
+(defknown symbol-package (symbol) (or package null) (flushable))
 (defknown keywordp (t) boolean (flushable))       ; If someone uninterns it...
 
 ;;;; from the "Packages" chapter:
@@ -307,7 +309,7 @@
 #+sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
 (defknown (sin cos) (number)
-  (or (float -1.0 1.0) (complex float))
+  (or (float $-1.0 $1.0) (complex float))
   (movable foldable flushable recursive)
   :derive-type #'result-type-float-contagion)
 
@@ -324,7 +326,7 @@
 #-sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
 (defknown (sin cos) (number)
-  (or (float -1.0 1.0) (complex float))
+  (or (float $-1.0 $1.0) (complex float))
   (movable foldable flushable recursive))
 
 (defknown atan
@@ -437,8 +439,8 @@
   (movable foldable flushable))
 (defknown deposit-field (integer byte-specifier integer) integer
   (movable foldable flushable))
-(defknown random ((or (float (0.0)) (integer 1)) &optional random-state)
-  (or (float 0.0) (integer 0))
+(defknown random ((or (float ($0.0f0)) (integer 1)) &optional random-state)
+  (or (float $0.0f0) (integer 0))
   ())
 (defknown make-random-state (&optional (or random-state (member nil t)))
   random-state (flushable))
@@ -762,7 +764,14 @@
 (defknown (%bit-position/0 %bit-position/1) (simple-bit-vector t index index)
   (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable))
+(defknown (%bit-pos-fwd/0 %bit-pos-fwd/1 %bit-pos-rev/0 %bit-pos-rev/1)
+  (simple-bit-vector index index)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (foldable flushable))
 (defknown %bit-position (t simple-bit-vector t index index)
+  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (foldable flushable))
+(defknown (%bit-pos-fwd %bit-pos-rev) (t simple-bit-vector index index)
   (or (mod #.(1- sb-xc:array-dimension-limit)) null)
   (foldable flushable))
 
@@ -1029,7 +1038,7 @@
 
 (defknown make-hash-table
   (&key (:test function-designator) (:size unsigned-byte)
-        (:rehash-size (or (integer 1) (float (1.0))))
+        (:rehash-size (or (integer 1) (float ($1.0))))
         (:rehash-threshold (real 0 1))
         (:hash-function (or null function-designator))
         (:weakness (member nil :key :value :key-and-value :key-or-value))
@@ -1047,15 +1056,19 @@
 (defknown maphash ((function-designator (t t)) hash-table) null (flushable call))
 (defknown clrhash ((modifying hash-table)) hash-table ())
 (defknown hash-table-count (hash-table) index (flushable))
-(defknown hash-table-rehash-size (hash-table) (or index (single-float (1.0)))
+(defknown hash-table-rehash-size (hash-table) (or index (single-float ($1.0)))
   (foldable flushable))
-(defknown hash-table-rehash-threshold (hash-table) (single-float (0.0) 1.0)
+(defknown hash-table-rehash-threshold (hash-table) (single-float ($0.0) $1.0)
   (foldable flushable))
 (defknown hash-table-size (hash-table) index (flushable))
 (defknown hash-table-test (hash-table) symbol (foldable flushable))
-(defknown sxhash (t) hash (#-sb-xc-host foldable flushable))
-(defknown psxhash (t &optional t) hash (#-sb-xc-host foldable flushable))
+(defknown sxhash (t) hash (foldable flushable))
+(defknown psxhash (t &optional t) hash (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
+;; To avoid emitting code to test for nil-function-returned
+(defknown (sb-impl::signal-corrupt-hash-table
+           sb-impl::signal-corrupt-hash-table-bucket)
+ (t) nil ())
 
 ;;;; from the "Arrays" chapter
 
@@ -1629,7 +1642,7 @@
 
 ;;;; from the "Miscellaneous" Chapter:
 
-(defknown compile ((or symbol cons) &optional (or list function null))
+(defknown compile ((or symbol cons) &optional (or list function))
   (values (or function symbol cons) boolean boolean))
 
 (defknown compile-file
@@ -2077,3 +2090,8 @@
 (defknown finalize
     (t (function-designator () * :no-function-conversion t) &key (:dont-save t))
     *)
+
+#+sb-thread
+(defknown sb-thread::call-with-recursive-lock (function t t t) *)
+#+sb-thread
+(defknown sb-thread::call-with-mutex (function t t t t) *)

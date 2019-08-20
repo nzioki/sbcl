@@ -43,47 +43,7 @@
        ((funcallable-instance) (funcallable-instance-p object))
        ((extended-sequence) (extended-sequence-p object))
        ((nil) nil)))
-    (numeric-type
-     (and (numberp object)
-          (let (;; I think this works because of an invariant of the
-                ;; two components of a COMPLEX are always coerced to
-                ;; be the same, e.g. (COMPLEX 1.0 3/2) => #C(1.0 1.5).
-                ;; Dunno why that holds, though -- ANSI? Python
-                ;; tradition? marsh faerie spirits? -- WHN 2001-10-27
-                (num (if (complexp object)
-                         (realpart object)
-                         object)))
-            (ecase (numeric-type-class type)
-              (integer (and (integerp num)
-                            (or (not (complexp object))
-                                (integerp (imagpart object)))))
-              (rational (rationalp num))
-              (float
-               (ecase (numeric-type-format type)
-                 (short-float (typep num 'short-float))
-                 (single-float (typep num 'single-float))
-                 (double-float (typep num 'double-float))
-                 (long-float (typep num 'long-float))
-                 ((nil) (floatp num))))
-              ((nil) t)))
-          (flet ((bound-test (val)
-                   (let ((low (numeric-type-low type))
-                         (high (numeric-type-high type)))
-                     (and (cond ((null low) t)
-                                ((listp low) (> val (car low)))
-                                (t (>= val low)))
-                          (cond ((null high) t)
-                                ((listp high) (< val (car high)))
-                                (t (<= val high)))))))
-            (ecase (numeric-type-complexp type)
-              ((nil) t)
-              (:complex
-               (and (complexp object)
-                    (bound-test (realpart object))
-                    (bound-test (imagpart object))))
-              (:real
-               (and (not (complexp object))
-                    (bound-test object)))))))
+    (numeric-type (number-typep object type))
     (array-type
      (and (arrayp object)
           (or (eq (array-type-complexp type) :maybe)
@@ -159,12 +119,7 @@
             (not (not (member name (simd-pack-256-type-element-type type)))))))
     (character-set-type
      (and (characterp object)
-          (let ((code (char-code object))
-                (pairs (character-set-type-pairs type)))
-            (dolist (pair pairs nil)
-              (destructuring-bind (low . high) pair
-                (when (<= low code high)
-                  (return t)))))))
+          (character-in-charset-p object type)))
     (unknown-type
      ;; Parse it again to make sure it's really undefined.
      (let ((reparse (specifier-type (unknown-type-specifier type))))

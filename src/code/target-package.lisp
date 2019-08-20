@@ -52,15 +52,10 @@
     #.(sb-thread:make-mutex :name "Package Graph Lock"))
 
 (defmacro with-package-graph ((&key) &body forms)
-  `(flet ((thunk () ,@forms))
-     (declare (dynamic-extent #'thunk))
-     (call-with-package-graph #'thunk)))
-(defun call-with-package-graph (function)
-  (declare (function function))
   ;; FIXME: Since name conflicts can be signalled while holding the
   ;; mutex, user code can be run leading to lock ordering problems.
-  (sb-thread:with-recursive-lock (*package-graph-lock*)
-    (funcall function)))
+  `(sb-thread:with-recursive-lock (*package-graph-lock*)
+     ,@forms))
 
 ;;; a map from package names to packages
 (define-load-time-global *package-names* nil)
@@ -73,55 +68,148 @@
 (define-load-time-global *package-nickname-ids* nil)
 (declaim (type (cons info-hashtable fixnum) *package-nickname-ids*))
 
-;;; PKGNICK objects are weak vectors, but weak-vector is not part of
-;;; the type system, so the constructor is handrolled.
-(defstruct (pkgnick (:type vector) (:constructor nil)
-                    (:copier nil) (:predicate nil))
-  ;; Type declarations are harmful in the sense that they slow down slot reads
-  ;; and they don't buy us anything in any of the code that consumes these values.
-  (actual  nil)                ; :type (or package null)
-  (name    nil :read-only t)   ; :type string
-  (id      nil :read-only t))  ; :type fixnum
+;;; Local nicknames are stored in an immutable cons of two immutable simple-vectors.
+;;; There is a 1:1 correspondence between vector elements but the indices don't line up
+;;; since the orderings are different.
+;;; The car vector is #("nickname" index "nickname" index ...) ordered alphabetically
+;;; where the index is a physical index to the cdr vector.
+;;; The cdr is a weak vector and holds #(token #<pkg> token #<pkg> ...) ordered by
+;;; token. A token is a fixnum whose low 9 bits are a logical index (half the
+;;; physical index) into the car vector and whose upper bits are a nickname-id.
+;;; The number of PLNs within a single package is thus constrained to 512,
+;;; but there is no limit on the maximum nickname id.
+;;; To search by:
+;;;  - integer identifier, binary search the vector of packages.
+;;;  - nickname, binary search the strings, and use the found index into the
+;;;    vector of packages.
+;;;  - package, linearly search the package vector's odd indices, use the low
+;;;    bits of the found token to reference the string vector.
 
-;;; Scan for KEY in the local-nicknames slot of PACKAGE.
-;;; If found, return two values: the package and the PKGNICK object.
-;;; Before returning a package, we check whether it was deleted (via DELETE-PACKAGE).
-;;; Deleted packages in non-matching entries are ignored; they do not imply culling,
-;;; but when we see a broken weak reference, we'll cull the entire list and retry.
-(defun pkg-search-localnicks (key package)
-  (declare (string key))
-  (labels ((deletedp (actual) (or (not actual) (not (package-%name actual))))
-           (cull (old)
-             ;; Cull out DELETE-PACKAGE deletions and broken weak references
-             (let* ((v (remove-if (lambda (entry) (deletedp (pkgnick-actual entry)))
-                                  (the simple-vector old)))
-                    ;; Downgrade a 0-length new vector to NIL.
-                    (new (when (plusp (length v)) v)))
-               ;; Update the entire list.  If this CAS loses ... oh well, it remains as-is
-               ;; and maybe gets fixed next time. Retry in the culled list though.
-               (cas (package-%local-nicknames package) old new)
-               new)))
-    (declare (inline deletedp))
-    (named-let retry ((vector (package-%local-nicknames package)))
-      (if vector
-          (dovector (entry vector (values nil nil))
-            (cond ((string= key (pkgnick-name entry))
-                   (return (let ((pkg (pkgnick-actual entry)))
-                             (if (deletedp pkg) (values nil nil) (values pkg entry)))))
-                  ((not (pkgnick-actual entry))
-                   (return (retry (cull vector))))))
-          (values nil nil)))))
+(defconstant pkgnick-index-bits 9)
 
-;;; Return a nickname for PACKAGE with respect to BASE.
+;;; Produce an alist ordered by string
+(defun package-local-nickname-alist (pkgnicks use-ids &aux result)
+  (when pkgnicks
+    (let ((strings (the simple-vector (car pkgnicks)))
+          (packages (the simple-vector (cdr pkgnicks))))
+      ;; Scan backwards so that pushing preserves order
+      (loop for i downfrom (1- (length strings)) to 1 by 2
+            do (let* ((token (aref packages (1- (aref strings i))))
+                      (package (aref packages (aref strings i)))
+                      (id (ash token (- pkgnick-index-bits))))
+                 (aver (= (ldb (byte pkgnick-index-bits 0) token) (ash i -1)))
+                 ;; cull deleted entries
+                 (when (and (packagep package) (package-%name package))
+                   (let ((pair (cons (aref strings (1- i)) package)))
+                     (push (if use-ids (cons id pair) pair) result)))))
+      result)))
+
+;;; PKGNICK-UPDATE is the insert and delete operation on the nickname->package map.
+;;; If OTHER-PACKAGE is a package, an entry for STRING is inserted; if NIL, the entry
+;;; for STRING, if any, is removed. In either case, culling of deleted packages
+;;; is performed. When STRING itself is NIL, then only culling is performed.
+;;; This function entails quite a bit of work, but it is worth the trouble to maintain
+;;; two binary searchable vectors since in comparison to the number of lookups,
+;;; alterations to the mapping are exceedingly rare.
+(defun pkgnick-update (this-package string other-package)
+  (declare (type (or null package) other-package))
+  (let ((entry
+         (when other-package ; Ensure that STRING has a nickname-id
+           (let* ((id-map *package-nickname-ids*)
+                  (id (info-puthash (car id-map)
+                                    (logically-readonlyize (copy-seq string))
+                                    (lambda (old) (or old (atomic-incf (cdr id-map)))))))
+             (list* id string other-package))))
+        (old (package-%local-nicknames this-package)))
+    (loop
+     (let* ((alist (merge 'list
+                          (let ((alist (package-local-nickname-alist old t)))
+                            (if string
+                                (remove string alist :test #'string= :key #'cadr)
+                                alist))
+                          (when entry (list entry))
+                          #'string< :key #'cadr))
+            (new
+             (when alist
+               ;; Create new sorted vectors:
+               ;;  STRINGS  = #("nickname" index "nickname" index ...)
+               ;;  PACKAGES = #(token #<pkg> token #<pkg> ...)
+               (let* ((strings (coerce (mapcan (lambda (x) (list (cadr x) nil)) alist)
+                                       'vector))
+                      (packages (make-weak-vector (length strings))))
+                 (loop for item in (sort (copy-list alist) #'< :key #'car)
+                       for i from 0 by 2
+                       do (let* ((id (car item))
+                                 (string-num (position id alist :key #'car))
+                                 (token (logior (ash id pkgnick-index-bits) string-num)))
+                            (setf (aref strings (1+ (ash string-num 1))) (1+ i)
+                                  (aref packages i) token
+                                  (aref packages (1+ i)) (cddr item))))
+                 (cons strings packages)))))
+       (when (eq old (setf old (cas (package-%local-nicknames this-package) old new)))
+         (return nil))))))
+
+;;; A macro to help search the nickname vectors.
+;;; Return the logical index of KEY in VECTOR (in which each two
+;;; elements comprise a key/value pair)
+(macrolet ((bsearch (key vector)
+             `(let ((v (the simple-vector ,vector)))
+                ;; The search operates on a logical index, which is half the physical
+                ;; index. The returned value is a physical index.
+                (named-let recurse ((start 0) (end (ash (length v) -1)))
+                  (declare (type (unsigned-byte 9) start end)
+                           (optimize (sb-c::insert-array-bounds-checks 0)))
+                  (when (< start end)
+                    (let* ((i (ash (+ start end) -1))
+                           (elt (keyfn (aref v (ash i 1)))))
+                      (case (compare ,key elt)
+                       (-1 (recurse start i))
+                       (+1 (recurse (1+ i) end))
+                       (t (1+ (ash i 1))))))))))
+
+  (defun pkgnick-search-by-name (string base-package)
+    (labels ((keyfn (x) x)
+             (safe-char (s index)
+               (if (< index (length s)) (char s index) (code-char 0)))
+             (compare (a b)
+               (declare (string a) (simple-string b))
+               (let ((pos (string/= a b)))
+                 (cond ((not pos) 0)
+                       ((char< (safe-char a pos) (safe-char b pos)) -1)
+                       (t +1)))))
+      (declare (inline safe-char))
+      (binding* ((nicks (package-%local-nicknames base-package) :exit-if-null)
+                 (string->id (car nicks))
+                 (found (bsearch string string->id) :exit-if-null)
+                 (package (svref (cdr nicks) (svref string->id found))))
+        (cond ((and package (package-%name package)) package)
+              (t (pkgnick-update base-package nil nil))))))
+
+  (defun pkgnick-search-by-id (id base-package)
+    (flet ((keyfn (x) (ash x (- pkgnick-index-bits)))
+           (compare (a b) (signum (- a b))))
+      (binding* ((id->obj (cdr (package-%local-nicknames base-package)) :exit-if-null)
+                 (found (bsearch id id->obj) :exit-if-null)
+                 (package (svref id->obj found)))
+        (cond ((and package (package-%name package)) package)
+              (t (pkgnick-update base-package nil nil)))))))
+
+;;; Return a nickname for PACKAGE with respect to CURRENT.
 ;;; This could in theory return a package that currently has no name. However,
 ;;; at the time of the call to this function from OUTPUT-SYMBOL - the only
 ;;; consumer - the symbol in question *did* have a non-nil package.
 ;;; So whatever we say as far as nickname, if any, is fine.
-(defun package-local-nickname (package base)
-  (awhen (package-%local-nicknames base)
-    (dovector (entry it)
-      (when (eq (pkgnick-actual entry) package)
-        (return (pkgnick-name entry))))))
+;;; If more than one nickname exists, then one that is alphabetically last wins.
+;;; A better tiebreaker  might be either length in characters
+;;; or whichever nickname was added most recently.
+(defun package-local-nickname (package current)
+  (binding* ((nicks (package-%local-nicknames current) :exit-if-null)
+             (vector (the simple-vector (cdr nicks))))
+    (loop for i downfrom (1- (length vector)) to 1 by 2
+          when (eq package (aref vector i))
+          return (aref (car nicks)
+                       (let ((token (aref vector (1- i))))
+                         (ash (ldb (byte pkgnick-index-bits 0) token) 1))))))
 
 ;;; This would have to be bumped ~ 2*most-positive-fixnum times to overflow.
 (define-load-time-global *package-names-cookie* sb-xc:most-negative-fixnum)
@@ -131,23 +219,6 @@
   `(let ((,table-var *package-names*))
      (sb-thread::with-recursive-system-lock ((info-env-mutex ,table-var))
        ,@body)))
-
-(defun make-pkgnick (actual nickname)
-  (let* ((id-map *package-nickname-ids*)
-         (id (info-puthash (car id-map)
-                           (logically-readonlyize (copy-seq nickname))
-                           (lambda (old) (or old (atomic-incf (cdr id-map))))))
-         (strong-string
-          ;; To ensure that the weak vector representing a PKGNICK does not drop the string
-          ;; in GC, we have to ensure that the string is EQ to a key in the name -> id map.
-          (with-package-names (table) ; just borrowing the lock
-           (block nil
-            (info-maphash (lambda (key value) ; exhaustive scan
-                            (declare (ignore value))
-                            (when (string= key nickname) (return key)))
-                          (car id-map))))))
-    (aver strong-string)
-    (make-weak-vector 3 :initial-contents `(,actual ,strong-string ,id))))
 
 (defmethod make-load-form ((p package) &optional environment)
   (declare (ignore environment))
@@ -492,12 +563,9 @@ See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (collect ((result))
-    (awhen (package-%local-nicknames (find-undeleted-package-or-lose package-designator))
-      (dovector (x it (result))
-        (let ((pkg (pkgnick-actual x)))
-          (when (and pkg (package-%name pkg))
-            (result (cons (pkgnick-name x) pkg))))))))
+  (package-local-nickname-alist
+   (package-%local-nicknames (find-undeleted-package-or-lose package-designator))
+   nil))
 
 (defun signal-package-error (package format-control &rest format-args)
   (error 'simple-package-error
@@ -537,7 +605,7 @@ Experimental: interface subject to change."
     (do-packages (namer)
       ;; NAMER will be added once only to the result if there is more
       ;; than one nickname for designee.
-      (when (find designee (package-%local-nicknames namer) :key #'pkgnick-actual)
+      (when (find designee (cdr (package-%local-nicknames namer)))
         (push namer result)))
     result))
 
@@ -567,21 +635,21 @@ See also: PACKAGE-LOCAL-NICKNAMES, PACKAGE-LOCALLY-NICKNAMED-BY-LIST,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (prog1 (%add-package-local-nickname local-nickname actual-package
-                                      package-designator)
-    (atomic-incf *package-names-cookie*)))
+  (let ((package (find-undeleted-package-or-lose package-designator)))
+    (%add-package-local-nickname local-nickname actual-package package)
+    (atomic-incf *package-names-cookie*)
+    package))
 
 ;;; This is called repeatedly by defpackage's UPDATE-PACKAGE.
 ;;; We only need to bump the name cookie once. Synchronization of package lookups
 ;;; is pretty weak in the sense that concurrent FIND-PACKAGE and alteration
 ;;; of the name -> package association does not really promise much.
-(defun %add-package-local-nickname (local-nickname actual-package package-designator)
-  (let* ((nick (string local-nickname))
-         (actual (find-package-using-package actual-package nil))
-         (package (find-undeleted-package-or-lose package-designator)))
+(defun %add-package-local-nickname (local-nickname actual-package package)
+  (let ((nick (string local-nickname))
+        (actual (find-package-using-package actual-package nil)))
     (unless actual
       (signal-package-error
-       package-designator
+       (package-name package)
        "The name ~S does not designate any package."
        actual-package))
     (unless (package-name actual)
@@ -612,7 +680,7 @@ Experimental: interface subject to change."
        "Attempt to use ~A as a package local nickname (for ~A) in ~
         package nicknamed globally ~A."
        nick (package-name actual) nick))
-    (multiple-value-bind (old-actual cell) (pkg-search-localnicks nick package)
+    (let ((old-actual (pkgnick-search-by-name nick package)))
       (when (and old-actual (neq actual old-actual))
          (restart-case
              (signal-package-error
@@ -623,26 +691,13 @@ Experimental: interface subject to change."
           (keep-old ()
            :report (lambda (s)
                      (format s "Keep ~A as local nickname for ~A."
-                             nick (package-name old-actual))))
+                             nick (package-name old-actual))
+                     (return-from %add-package-local-nickname package)))
           (change-nick ()
             :report (lambda (s)
                       (format s "Use ~A as local nickname for ~A instead."
-                              nick (package-name actual)))
-            ;; This is reasonably safe. The danger is that lazy culling might remove CELL,
-            ;; however OLD-ACTUAL was a valid package, so it should still be there.
-            (setf (pkgnick-actual cell) actual)))
-        (return-from %add-package-local-nickname package))
-      (unless cell
-        ;; Add new entry atomically (due to just-in-time culling of deleted
-        ;; entries which swaps the whole list). But note the bug: two threads
-        ;; can each succeed in pushing the same nickname.
-        ;; This function isn't really intended for use by multiple threads.
-        (let ((old (package-%local-nicknames package)))
-          (loop
-            (let ((new (concatenate 'vector (list (make-pkgnick actual nick)) old)))
-              (when (eq old (setf old (cas (package-%local-nicknames package) old new)))
-                (return)))))))
-    package))
+                              nick (package-name actual)))))))
+    (pkgnick-update package nick actual)))
 
 (defun remove-package-local-nickname (old-nickname
                                       &optional (package-designator (sane-package)))
@@ -654,18 +709,13 @@ See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 PACKAGE-LOCALLY-NICKNAMED-BY-LIST, and the DEFPACKAGE option :LOCAL-NICKNAMES.
 
 Experimental: interface subject to change."
-  (binding* ((nick (string old-nickname))
-             (package (find-undeleted-package-or-lose package-designator))
-             ((named cell) (pkg-search-localnicks nick package)))
-    (when cell
+  (let* ((nick (string old-nickname))
+         (package (find-undeleted-package-or-lose package-designator))
+         (existing (pkgnick-search-by-name nick package)))
+    (when existing
       (with-single-package-locked-error
-          (:package package "removing local nickname ~A for ~A" nick named))
-      (let ((old (package-%local-nicknames package)))
-        (loop
-          (let* ((vector (remove cell old))
-                 (new (if (plusp (length vector)) vector)))
-            (when (eq old (setf old (cas (package-%local-nicknames package) old new)))
-              (return)))))
+          (:package package "removing local nickname ~A for ~A" nick existing))
+      (pkgnick-update package nick nil)
       (atomic-incf *package-names-cookie*)
       t)))
 
@@ -708,9 +758,10 @@ Example:
 
 See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
-  (find-package-using-package package-designator
-                              (when (boundp '*package*)
-                                *package*)))
+  ;: We had a BOUNDP check on *PACKAGE* here, but it's effectless due to the
+  ;; always-bound proclamation.
+  (truly-the (or null package) ; force elision of return value type check
+    (find-package-using-package package-designator *package*)))
 
 ;;; Perform (GETHASH NAME TABLE) and then unwrap the value if it is a list.
 ;;; List vs nonlist disambiguates a nickname from the primary name.
@@ -734,7 +785,7 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
      (let ((string (string package-designator)))
        (or (and base
                 (package-%local-nicknames base)
-                (pkg-search-localnicks string base))
+                (pkgnick-search-by-name string base))
            (%get-package string *package-names*))))
     ;; Is there a fundamental reason we don't declare the FTYPE
     ;; of FIND-PACKAGE-USING-PACKAGE letting the compiler do the checking?
@@ -1142,6 +1193,75 @@ implementation it is ~S." *!default-package-use-list*)
     (do-packages (package) (push package result))
     result))
 
+;;; Check internal and external symbols, then scan down the list
+;;; of hashtables for inherited symbols.
+(defun %find-symbol (string length package)
+  (declare (simple-string string)
+           (type index length))
+  (let ((hash (compute-symbol-hash string length)))
+    (declare (type hash hash))
+    (with-symbol ((symbol) (package-internal-symbols package) string length hash)
+      (return-from %find-symbol (values symbol :internal)))
+    (with-symbol ((symbol) (package-external-symbols package) string length hash)
+      (return-from %find-symbol (values symbol :external)))
+    (let* ((tables (package-tables package))
+           (n (length tables)))
+      (unless (eql n 0)
+        ;; Try the most-recently-used table, then others.
+        ;; TABLES is treated as circular for this purpose.
+        (let* ((mru (package-mru-table-index package))
+               (start (if (< mru n) mru 0))
+               (i start))
+          (loop
+           (with-symbol ((symbol) (locally (declare (optimize (safety 0)))
+                                    (svref tables i))
+                         string length hash)
+             (setf (package-mru-table-index package) i)
+             (return-from %find-symbol (values symbol :inherited)))
+           (if (< (decf i) 0) (setq i (1- n)))
+           (if (= i start) (return)))))))
+  (values nil nil))
+
+;;; If the symbol named by the first LENGTH characters of NAME doesn't exist,
+;;; then create it, special-casing the keyword package.
+;;; If a new symbol is created, its print name will be an array of ELT-TYPE.
+;;; The fasloader always supplies NAME as a (SIMPLE-ARRAY <ELT-TYPE> 1),
+;;; but the reader uses a buffer of CHARACTER, which, based on a flag,
+;;; can be demoted to an array of BASE-CHAR.
+(defun %intern (name length package elt-type ignore-lock)
+  ;; No type declarations, %find-symbol will perform the checks
+  (multiple-value-bind (symbol where) (%find-symbol name length package)
+    (if where
+        (values symbol where)
+        ;; Double-checked lock pattern: the common case has the symbol already interned,
+        ;; but in case another thread is interning in parallel we need to check after
+        ;; grabbing the lock.
+        (with-package-graph ()
+          (setf (values symbol where) (%find-symbol name length package))
+          (if where
+              (values symbol where)
+              (let* ((symbol-name
+                       (logically-readonlyize
+                        (replace (make-string length :element-type elt-type) name)))
+                     ;; optimistically create the symbol
+                     (symbol ; Symbol kind: 1=keyword, 2=other interned
+                       (%make-symbol (if (eq package *keyword-package*) 1 2) symbol-name))
+                     (table (cond ((eq package *keyword-package*)
+                                   (%set-symbol-value symbol symbol)
+                                   (package-external-symbols package))
+                                  (t
+                                   (package-internal-symbols package)))))
+                ;; Set the symbol's package before storing it into the package
+                ;; so that (symbol-package (intern x #<pkg>)) = #<pkg>.
+                ;; This matters in the case of concurrent INTERN.
+                (%set-symbol-package symbol package)
+                (if ignore-lock
+                    (add-symbol table symbol)
+                    (with-single-package-locked-error
+                        (:package package "interning ~A" symbol-name)
+                      (add-symbol table symbol)))
+                (values symbol nil)))))))
+
 (macrolet ((find/intern (function package-lookup &rest more-args)
              ;; Both %FIND-SYMBOL and %INTERN require a SIMPLE-STRING,
              ;; but accept a LENGTH. Given a non-simple string,
@@ -1166,9 +1286,7 @@ implementation it is ~S." *!default-package-use-list*)
                             (values name end)
                             (values (subseq name start end)
                                     (- end start)))))
-                (truly-the
-                 (values symbol (member :internal :external :inherited nil))
-                 (,function name length ,package-lookup ,@more-args)))))
+                (,function name length ,package-lookup ,@more-args))))
 
   (defun intern (name &optional (package (sane-package)))
   "Return a symbol in PACKAGE having the specified NAME, creating it
@@ -1196,82 +1314,13 @@ implementation it is ~S." *!default-package-use-list*)
     ;; INTERN2 will only receive a package object if it's one of the standard
     ;; ones. Hence no check for PACKAGE-%NAME validity (i.e. non-deleted)
     (find/intern %intern
-                 (if (packagep cell) cell (cached-find-package cell))
+                 (if (packagep cell) cell (cached-find-undeleted-package cell))
                  (if (base-string-p name) 'base-char 'character)
                  nil))
 
   (defun find-symbol2 (name cell)
     (find/intern %find-symbol ; likewise
-                 (if (packagep cell) cell (cached-find-package cell)))))
-
-;;; If the symbol named by the first LENGTH characters of NAME doesn't exist,
-;;; then create it, special-casing the keyword package.
-;;; If a new symbol is created, its print name will be an array of ELT-TYPE.
-;;; The fasloader always supplies NAME as a (SIMPLE-ARRAY <ELT-TYPE> 1),
-;;; but the reader uses a buffer of CHARACTER, which, based on a flag,
-;;; can be demoted to an array of BASE-CHAR.
-(defun %intern (name length package elt-type ignore-lock)
-  (declare (simple-string name) (index length))
-  (multiple-value-bind (symbol where) (%find-symbol name length package)
-    (if where
-        (values symbol where)
-        ;; Double-checked lock pattern: the common case has the symbol already interned,
-        ;; but in case another thread is interning in parallel we need to check after
-        ;; grabbing the lock.
-        (with-package-graph ()
-         (setf (values symbol where) (%find-symbol name length package))
-         (if where
-             (values symbol where)
-             (let* ((symbol-name
-                     (logically-readonlyize
-                      (replace (make-string length :element-type elt-type) name)))
-                    ;; optimistically create the symbol
-                    (symbol ; Symbol kind: 1=keyword, 2=other interned
-                     (%make-symbol (if (eq package *keyword-package*) 1 2) symbol-name))
-                    (table (cond ((eq package *keyword-package*)
-                                  (%set-symbol-value symbol symbol)
-                                  (package-external-symbols package))
-                                 (t
-                                  (package-internal-symbols package)))))
-               ;; Set the symbol's package before storing it into the package
-               ;; so that (symbol-package (intern x #<pkg>)) = #<pkg>.
-               ;; This matters in the case of concurrent INTERN.
-               (%set-symbol-package symbol package)
-               (if ignore-lock
-                   (add-symbol table symbol)
-                   (with-single-package-locked-error
-                       (:package package "interning ~A" symbol-name)
-                     (add-symbol table symbol)))
-               (values symbol nil)))))))
-
-;;; Check internal and external symbols, then scan down the list
-;;; of hashtables for inherited symbols.
-(defun %find-symbol (string length package)
-  (declare (simple-string string)
-           (type index length))
-  (let ((hash (compute-symbol-hash string length)))
-    (declare (type hash hash))
-    (with-symbol ((symbol) (package-internal-symbols package) string length hash)
-      (return-from %find-symbol (values symbol :internal)))
-    (with-symbol ((symbol) (package-external-symbols package) string length hash)
-      (return-from %find-symbol (values symbol :external)))
-    (let* ((tables (package-tables package))
-           (n (length tables)))
-      (unless (eql n 0)
-        ;; Try the most-recently-used table, then others.
-        ;; TABLES is treated as circular for this purpose.
-        (let* ((mru (package-mru-table-index package))
-               (start (if (< mru n) mru 0))
-               (i start))
-          (loop
-             (with-symbol ((symbol) (locally (declare (optimize (safety 0)))
-                                             (svref tables i))
-                           string length hash)
-               (setf (package-mru-table-index package) i)
-               (return-from %find-symbol (values symbol :inherited)))
-             (if (< (decf i) 0) (setq i (1- n)))
-             (if (= i start) (return)))))))
-  (values nil nil))
+                 (if (packagep cell) cell (cached-find-undeleted-package cell)))))
 
 ;;; Similar to FIND-SYMBOL, but only looks for an external symbol.
 ;;; Return the symbol if found, otherwise 0.
@@ -1941,31 +1990,75 @@ PACKAGE."
 (defmethod (setf documentation) (new-value (x package) (doc-type (eql 't)))
   (setf (package-doc-string x) new-value))
 
+;;; Note: Almost always you want to use FIND-UNDELETED-PACKAGE-OR-LOSE
+;;; instead of this function. (The distinction only actually matters when
+;;; PACKAGE-DESIGNATOR is actually a deleted package, and in that case
+;;; you generally do want to signal an error instead of proceeding.)
+(defun %find-package-or-lose (package-designator)
+  (declare (optimize allow-non-returning-tail-call))
+  (let ((package-designator package-designator))
+    (prog () retry
+       (let ((result (find-package package-designator)))
+         (if result
+             (return result)
+             (find-package-restarts (package-designator)
+               (error 'package-does-not-exist
+                      :package package-designator
+                      :format-control "The name ~S does not designate any package."
+                      :format-arguments (list package-designator))))))))
+
+;;; ANSI specifies (in the section for FIND-PACKAGE) that the
+;;; consequences of most operations on deleted packages are
+;;; unspecified. We try to signal errors in such cases.
+(defun find-undeleted-package-or-lose (package-designator)
+  (declare (optimize allow-non-returning-tail-call))
+  (let ((package-designator package-designator))
+    (prog () retry
+       (let ((maybe-result (%find-package-or-lose package-designator)))
+         (if (package-%name maybe-result) ; if not deleted
+             (return maybe-result)
+             (find-package-restarts (package-designator)
+               (error 'package-does-not-exist
+                      :package maybe-result
+                      :format-control "The package ~S has been deleted."
+                      :format-arguments (list maybe-result))))))))
+
 ;;; Given a cell containing memoization data for FIND-PACKAGE, perform that action
 ;;; with as little work as possible.
-(defun cached-find-package (cell)
-  (declare (optimize speed))
-  (let ((memo (car cell)))
-    (declare (type (simple-vector 3) memo)) ; #(cookie nick-id #<weak-ptr #<pkg>>)
-    (when (eq (aref memo 0) *package-names-cookie*) ; valid cache entry
-      ;; This does not cull out entries containing broken weak references.
-      ;; PKG-SEARCH-LOCALNICKS will take care of them eventually.
-      (binding* ((nicks (package-%local-nicknames *package*) :exit-if-null)
-                 (nick-id (aref memo 1) :exit-if-null)
-                 (entry (find nick-id (the simple-vector nicks)
-                              :test #'eq :key #'pkgnick-id) :exit-if-null)
-                 (pkg (pkgnick-actual entry) :exit-if-null))
-        (when (package-%name pkg)
-          (return-from cached-find-package pkg)))
-      (let ((pkg (weak-pointer-value (aref memo 2))))
-        (when (and (packagep pkg) (package-%name pkg))
-          (return-from cached-find-package pkg))))
-    (let* ((string (cdr cell))
-           (nick-id (info-gethash string (car *package-nickname-ids*)))
-           (pkg (find-undeleted-package-or-lose string)))
-      (setf (car cell)
-            (vector *package-names-cookie* nick-id (make-weak-pointer pkg)))
-      pkg)))
+(macrolet ((def-finder (name sub-finder validp)
+             `(defun ,name (cell)
+                (declare (optimize speed))
+                (let ((memo (cdr cell)))
+                  (declare (type (simple-vector 3) memo)) ; weak vector: #(cookie nick-id #<pkg>)
+                  (when (eq (aref memo 0) *package-names-cookie*) ; valid cache entry
+                    (binding* ((nick-id (aref memo 1) :exit-if-null)
+                               (current-package *package*)
+                               (pkg (and (package-%local-nicknames current-package)
+                                         (pkgnick-search-by-id nick-id current-package))
+                                    :exit-if-null))
+                      (return-from ,name pkg))
+                    (let ((pkg (aref memo 2)))
+                      (when ,validp
+                        (return-from ,name pkg))))
+                  (let* ((string (car cell))
+                         (pkg (,sub-finder string))
+                         (new (make-weak-vector 3 :initial-element 0)))
+                    (setf (elt new 0) *package-names-cookie*
+                          (elt new 1) (info-gethash string (car *package-nickname-ids*))
+                          (elt new 2) pkg)
+                    (sb-thread:barrier (:write))
+                    (setf (cdr cell) new)
+                    pkg)))))
+
+  (def-finder cached-find-undeleted-package find-undeleted-package-or-lose
+              (and (packagep pkg) (package-%name pkg)))
+  (def-finder cached-find-package find-package
+              ;; We can return a NIL as the cached answer. But NIL is also the value that
+              ;; the garbage collector stuffs in when the element is otherwise unreferenced.
+              ;; This is actually OK -  There is no way for the "correct" answer to become
+              ;; other than NIL without invalidating the cache line by incrementing the
+              ;; cookie. i.e. a cached NIL is correct until the next cache invalidation.
+              (or (null pkg) (and (packagep pkg) (package-%name pkg)))))
 
 ;;; We don't benefit from these transforms because any time we have a constant
 ;;; package in our code, we refer to it via #.(FIND-PACKAGE).
@@ -1985,9 +2078,11 @@ PACKAGE."
                         ((or (string= string "COMMON-LISP-USER")
                              (string= string "CL-USER"))
                          "CL-USER"))))
+    ;; the 2nd value return value of T means that this form's value is the
+    ;; package, otherwise this form is an argument to the finding function.
     (if std-pkg
-        `(load-time-value (find-package ,std-pkg) t)
-        `(load-time-value (cons (vector nil nil nil) ,string)))))
+        (values `(load-time-value (find-undeleted-package-or-lose ,std-pkg) t) t)
+        (values `(load-time-value (cons ,string (vector nil nil nil))) nil))))
 
 (deftransform intern ((name package-name) (t (constant-arg string-designator)))
   `(sb-impl::intern2 name ,(find-package-xform package-name)))

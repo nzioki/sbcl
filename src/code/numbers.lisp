@@ -20,30 +20,34 @@
 ;;; alists representing the dispatching off each arg (in order). The
 ;;; leaf is the body to be executed in that case.
 (defun parse-number-dispatch (vars result types var-types body)
-  (cond ((null vars)
-         (unless (null types) (error "More types than vars."))
-         (when (cdr result)
-           (error "Duplicate case: ~S." body))
-         (setf (cdr result)
-               (sublis var-types body :test #'equal)))
-        ((null types)
-         (error "More vars than types."))
-        (t
-         (flet ((frob (var type)
-                  (parse-number-dispatch
-                   (rest vars)
-                   (or (assoc type (cdr result) :test #'equal)
-                       (car (setf (cdr result)
-                                  (acons type nil (cdr result)))))
-                   (rest types)
-                   (acons `(dispatch-type ,var) type var-types)
-                   body)))
-           (let ((type (first types))
-                 (var (first vars)))
-             (if (and (consp type) (eq (first type) 'foreach))
-                 (dolist (type (rest type))
-                   (frob var type))
-                 (frob var type)))))))
+  ;; Shouldn't be necessary, but avoids a warning in certain lisps that
+  ;; seem to like to warn about self-calls in :COMPILE-TOPLEVEL situation.
+  (named-let parse-number-dispatch ((vars vars) (result result) (types types)
+                                    (var-types var-types) (body body))
+    (cond ((null vars)
+           (unless (null types) (error "More types than vars."))
+           (when (cdr result)
+             (error "Duplicate case: ~S." body))
+           (setf (cdr result)
+                 (sublis var-types body :test #'equal)))
+          ((null types)
+           (error "More vars than types."))
+          (t
+           (flet ((frob (var type)
+                    (parse-number-dispatch
+                     (rest vars)
+                     (or (assoc type (cdr result) :test #'equal)
+                         (car (setf (cdr result)
+                                    (acons type nil (cdr result)))))
+                     (rest types)
+                     (acons `(dispatch-type ,var) type var-types)
+                     body)))
+             (let ((type (first types))
+                   (var (first vars)))
+               (if (and (consp type) (eq (first type) 'foreach))
+                   (dolist (type (rest type))
+                     (frob var type))
+                   (frob var type))))))))
 
 ;;; our guess for the preferred order in which to do type tests
 ;;; (cheaper and/or more probable first.)
@@ -83,41 +87,44 @@
 ;;; even though the second clause matches this signature. To catch
 ;;; this earlier than runtime we throw an error already here.
 (defun generate-number-dispatch (vars error-tags cases)
-  (if vars
-      (let ((var (first vars))
-            (cases (sort cases #'type-test-order :key #'car)))
-        (flet ((error-if-sub-or-supertype (type1 type2)
-                 (when (or (sb-xc:subtypep type1 type2)
-                           (sb-xc:subtypep type2 type1))
-                   (error "Types not disjoint: ~S ~S." type1 type2)))
-               (error-if-supertype (type1 type2)
-                 (when (sb-xc:subtypep type2 type1)
-                   (error "Type ~S ordered before subtype ~S."
-                          type1 type2)))
-               (test-type-pairs (fun)
-                 ;; Apply FUN to all (ordered) pairs of types from the
-                 ;; cases.
-                 (mapl (lambda (cases)
-                         (when (cdr cases)
-                           (let ((type1 (caar cases)))
-                             (dolist (case (cdr cases))
-                               (funcall fun type1 (car case))))))
-                       cases)))
-          ;; For the last variable throw an error if a type is followed
-          ;; by a subtype, for all other variables additionally if a
-          ;; type is followed by a supertype.
-          (test-type-pairs (if (cdr vars)
-                               #'error-if-sub-or-supertype
-                               #'error-if-supertype)))
-        `((typecase ,var
-            ,@(mapcar (lambda (case)
-                        `(,(first case)
-                          ,@(generate-number-dispatch (rest vars)
-                                                      (rest error-tags)
-                                                      (cdr case))))
-                      cases)
-            (t (go ,(first error-tags))))))
-      cases))
+  ;; Shouldn't be necessary, but avoids a warning in certain lisps that
+  ;; seem to like to warn about self-calls in :COMPILE-TOPLEVEL situation.
+  (named-let generate-number-dispatch ((vars vars) (error-tags error-tags) (cases cases))
+    (if vars
+        (let ((var (first vars))
+              (cases (sort cases #'type-test-order :key #'car)))
+          (flet ((error-if-sub-or-supertype (type1 type2)
+                   (when (or (sb-xc:subtypep type1 type2)
+                             (sb-xc:subtypep type2 type1))
+                     (error "Types not disjoint: ~S ~S." type1 type2)))
+                 (error-if-supertype (type1 type2)
+                   (when (sb-xc:subtypep type2 type1)
+                     (error "Type ~S ordered before subtype ~S."
+                            type1 type2)))
+                 (test-type-pairs (fun)
+                   ;; Apply FUN to all (ordered) pairs of types from the
+                   ;; cases.
+                   (mapl (lambda (cases)
+                           (when (cdr cases)
+                             (let ((type1 (caar cases)))
+                               (dolist (case (cdr cases))
+                                 (funcall fun type1 (car case))))))
+                         cases)))
+            ;; For the last variable throw an error if a type is followed
+            ;; by a subtype, for all other variables additionally if a
+            ;; type is followed by a supertype.
+            (test-type-pairs (if (cdr vars)
+                                 #'error-if-sub-or-supertype
+                                 #'error-if-supertype)))
+          `((typecase ,var
+              ,@(mapcar (lambda (case)
+                          `(,(first case)
+                            ,@(generate-number-dispatch (rest vars)
+                                                        (rest error-tags)
+                                                        (cdr case))))
+                        cases)
+              (t (go ,(first error-tags))))))
+        cases)))
 
 ) ; EVAL-WHEN
 
@@ -130,6 +137,20 @@
 ;;; instantiated for every Each-Type. In the body of each case, any
 ;;; list of the form (DISPATCH-TYPE Var-Name) is substituted with the
 ;;; type of that var in that instance of the case.
+;;;
+;;; [Though it says "_any_ list", it's still an example of how not to perform
+;;; incomplete lexical analysis within a macro imho. Let's say that the body
+;;; code passes a lambda that happens name its args DISPATCH-TYPE and X.
+;;; What happens?
+;;; (macroexpand-1 '(number-dispatch ((x number))
+;;;                  ((float) (f x (lambda (dispatch-type x) (wat))))))
+;;; -> [stuff elided]
+;;;      (TYPECASE X (FLOAT (F X (LAMBDA FLOAT (WAT))))
+;;;
+;;; So the NUMBER-DISPATCH macro indeed substituted for *any* appearance
+;;; just like it says. I wonder if we could define DISPATCH-TYPE as macrolet
+;;; that expands to the type for the current branch, so that it _must_
+;;; be in a for-evaluation position; but maybe I'm missing something?]
 ;;;
 ;;; As an alternate to a case spec, there may be a form whose CAR is a
 ;;; symbol. In this case, we apply the CAR of the form to the CDR and
@@ -689,7 +710,7 @@
   `(defun ,name (number &optional (divisor 1))
     ,doc
     (multiple-value-bind (res rem) (,op number divisor)
-      (values (float res (if (floatp rem) rem 1.0)) rem))))
+      (values (float res (if (floatp rem) rem $1.0)) rem))))
 
 ;;; Declare these guys inline to let them get optimized a little.
 ;;; ROUND and FROUND are not declared inline since they seem too
@@ -759,7 +780,7 @@
   (declare (explicit-check))
   (multiple-value-bind (res rem)
       (round number divisor)
-    (values (float res (if (floatp rem) rem 1.0)) rem)))
+    (values (float res (if (floatp rem) rem $1.0)) rem)))
 
 ;;;; comparisons
 
@@ -1061,7 +1082,7 @@ and the number of 0 bits if INTEGER is negative."
 
 (defun ash (integer count)
   "Shifts integer left by count places preserving sign. - count shifts right."
-  (declare (integer integer count) (explicit-check))
+  (declare (explicit-check))
   (etypecase integer
     (fixnum
      (cond ((zerop integer)
@@ -1075,7 +1096,7 @@ and the number of 0 bits if INTEGER is negative."
                               sb-vm:n-word-bits))
                      (bignum-ashift-left-fixnum integer count))
                     (t
-                     (truly-the (signed-byte #.sb-vm:n-word-bits)
+                     (truly-the sb-vm:signed-word
                                 (ash (truly-the fixnum integer) count))))))
            ((minusp count)
             (if (minusp integer) -1 0))

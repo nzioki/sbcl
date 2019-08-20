@@ -37,10 +37,7 @@
      `(optimize
        (compilation-speed 1)
        (debug ,(if (find :sb-show sb-xc:*features*) 2 1))
-       ;; CLISP's pretty-printer is fragile and tends to cause stack
-       ;; corruption or fail internal assertions, as of 2003-04-20; we
-       ;; therefore turn off as many notes as possible.
-       (sb-ext:inhibit-warnings #-clisp 2 #+clisp 3)
+       (sb-ext:inhibit-warnings 2)
        ;; SAFETY = SPEED (and < 3) should provide reasonable safety,
        ;; but might skip some unreasonably expensive stuff
        (safety 2) (space 1) (speed 2)
@@ -88,41 +85,51 @@
 #+#.(cl:if (cl:find-package "HOST-SB-POSIX") '(and) '(or))
 (defun parallel-make-host-2 (max-jobs)
   (let ((subprocess-count 0)
-        (subprocess-list nil))
+        (subprocess-list nil)
+        stop)
     (flet ((wait ()
              (multiple-value-bind (pid status) (host-sb-posix:wait)
                (format t "~&; Subprocess ~D exit status ~D~%"  pid status)
+               (unless (zerop status)
+                 (setf stop t))
                (setq subprocess-list (delete pid subprocess-list)))
              (decf subprocess-count)))
-      (do-stems-and-flags (stem flags 2)
-        (unless (position :not-target flags)
-          (when (>= subprocess-count max-jobs)
-            (wait))
-          (let ((pid (host-sb-posix:fork)))
-            (when (zerop pid)
-              (target-compile-stem stem flags)
-              ;; FIXME: convey exit code based on COMPILE result.
-              (sb-cold::exit-process 0))
-            (push pid subprocess-list))
-          (incf subprocess-count)
-          ;; Cause the compile-time effects from this file
-          ;; to appear in subsequently forked children.
-          (let ((*compile-for-effect-only* t))
-            (target-compile-stem stem flags))))
-      (loop (if (plusp subprocess-count) (wait) (return)))
+      (host-sb-ext:disable-debugger)
+      (unwind-protect
+           (do-stems-and-flags (stem flags 2)
+             (unless (position :not-target flags)
+               (when (>= subprocess-count max-jobs)
+                 (wait))
+               (when stop
+                 (return))
+               (let ((pid (host-sb-posix:fork)))
+                 (when (zerop pid)
+                   (target-compile-stem stem flags)
+                   ;; FIXME: convey exit code based on COMPILE result.
+                   (sb-cold::exit-process 0))
+                 (push pid subprocess-list))
+               (incf subprocess-count)
+               ;; Cause the compile-time effects from this file
+               ;; to appear in subsequently forked children.
+               (let ((*compile-for-effect-only* t))
+                 (target-compile-stem stem flags))))
+        (loop (if (plusp subprocess-count) (wait) (return)))
+        (when stop
+          (sb-cold::exit-process 1)))
       (values))))
 
 ;;; Actually compile
 (let ((sb-xc:*compile-print* nil))
   (if (make-host-2-parallelism)
-      (parallel-make-host-2 (make-host-2-parallelism))
+      (funcall 'parallel-make-host-2 (make-host-2-parallelism))
       (let ((total
              (count-if (lambda (x) (not (find :not-target (cdr x))))
                        (get-stems-and-flags 2)))
             (n 0)
             (sb-xc:*compile-verbose* nil))
-        (do-stems-and-flags (stem flags 2)
-          (unless (position :not-target flags)
-            (format t "~&[~D/~D] ~A" (incf n) total (stem-remap-target stem))
-            (target-compile-stem stem flags)
-            (terpri))))))
+        (with-math-journal
+         (do-stems-and-flags (stem flags 2)
+           (unless (position :not-target flags)
+             (format t "~&[~D/~D] ~A" (incf n) total (stem-remap-target stem))
+             (target-compile-stem stem flags)
+             (terpri)))))))

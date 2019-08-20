@@ -182,20 +182,42 @@
   (and (fixnump x)
        (<= 0 x limit)))
 
+;;; a vector that maps widetags to layouts, used for quickly finding
+;;; the layouts of built-in classes
+(define-load-time-global **primitive-object-layouts** nil)
+(declaim (type simple-vector **primitive-object-layouts**))
+(defun !pred-cold-init ()
+  ;; This vector is allocated in immobile space when possible. There isn't
+  ;; a way to do that from lisp, so it's special-cased in genesis.
+  #-immobile-space (setq **primitive-object-layouts** (make-array 256))
+  (map-into **primitive-object-layouts**
+            (lambda (name) (classoid-layout (find-classoid name)))
+            #.(let ((table (make-array 256 :initial-element 'sb-kernel::random-class)))
+                (dolist (x sb-kernel::+!built-in-classes+)
+                  (destructuring-bind (name &key codes &allow-other-keys) x
+                    (dolist (code codes)
+                      (setf (svref table code) name))))
+                (loop for i from sb-vm:list-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
+                      below 256
+                      do (setf (aref table i) 'cons))
+                (loop for i from sb-vm:even-fixnum-lowtag by (ash 1 sb-vm:n-fixnum-tag-bits)
+                      below 256
+                      do (setf (aref table i) 'fixnum))
+                table)))
+
 ;;; Return the layout for an object. This is the basic operation for
 ;;; finding out the "type" of an object, and is used for generic
 ;;; function dispatch. The standard doesn't seem to say as much as it
 ;;; should about what this returns for built-in objects. For example,
 ;;; it seems that we must return NULL rather than LIST when X is NIL
 ;;; so that GF's can specialize on NULL.
+;;; x86-64 has a vop that implements this without even needing to place
+;;; the vector of layouts in the constant pool of the containing code.
+#-(and compact-instance-header x86-64)
+(progn
 (declaim (inline layout-of))
-#-sb-xc-host
 (defun layout-of (x)
   (declare (optimize (speed 3) (safety 0)))
-  #+(and compact-instance-header x86-64)
-  (values (%primitive layout-of x
-                      (load-time-value sb-kernel::**built-in-class-codes** t)))
-  #-(and compact-instance-header x86-64)
   (cond ((%instancep x) (%instance-layout x))
         ((funcallable-instance-p x) (%funcallable-instance-layout x))
         ;; Compiler can dump literal layouts, which handily sidesteps
@@ -204,8 +226,8 @@
         (t
          ;; Note that WIDETAG-OF is slightly suboptimal here and could be
          ;; improved - we've already ruled out some of the lowtags.
-         (svref (load-time-value sb-kernel::**built-in-class-codes** t)
-                (widetag-of x)))))
+         (svref (load-time-value **primitive-object-layouts** t)
+                (widetag-of x))))))
 
 (declaim (inline classoid-of))
 #-sb-xc-host
@@ -229,10 +251,10 @@
      (cond
        ((<= 0 object 1) 'bit)
        ((< object 0) 'fixnum)
-       (t '(integer 0 #.sb-xc:most-positive-fixnum))))
+       (t `(integer 0 ,sb-xc:most-positive-fixnum))))
     (integer
      (if (>= object 0)
-         '(integer #.(1+ sb-xc:most-positive-fixnum))
+         `(integer ,(1+ sb-xc:most-positive-fixnum))
          'bignum))
     (character
      (typecase object
@@ -278,20 +300,26 @@
 ;;; IR1 might potentially transform EQL into %EQL/INTEGER.
 #+integer-eql-vop
 (defun %eql/integer (obj1 obj2)
-  ;; This is just for constant folding, no need to transform into the %EQL/INTEGER VOP
-  (eql obj1 obj2))
+  ;; This is just for constant folding, there's no real need to transform
+  ;; into the %EQL/INTEGER VOP. But it's confusing if it becomes identical to
+  ;; EQL, and then due to ICF we find that #'EQL => #<FUNCTION %EQL/INTEGER>.
+  ;; Type declarations don't suffice because we don't know which arg is an integer
+  ;; (if not both). We could ensure selection of the vop by using %PRIMITIVE.
+  ;; Anyway it suffices to disable type checking and pretend its the always
+  ;; the first arg that's an integer, but that won't work on the host because
+  ;; it might enforce the type since we can't portably unenforce after declaring.
+  #-sb-xc-host (declare (optimize (sb-c::type-check 0)))
+  (eql #+sb-xc-host obj1 #-sb-xc-host (the integer obj1) obj2))
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
   "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
+  #+x86-64 (eql obj1 obj2) ; vop fully implements all cases of EQL
+  #-x86-64 ; else this is the only full implementation of EQL
   (or (eq obj1 obj2)
       (if (or (typep obj2 'fixnum)
               (not (typep obj2 'number)))
           nil
-          ;; I would think that we could do slightly better here by testing that
-          ;; both objs are OTHER-POINTER-P with equal %OTHER-POINTER-WIDETAGs.
-          ;; Then dispatch on obj2 and elide the TYPEP on obj1 using TRULY-THE.
-          ;; Also would need to deal with immediate single-float for 64-bit.
           (macrolet ((foo (&rest stuff)
                        `(typecase obj2
                           ,@(mapcar (lambda (foo)
@@ -327,7 +355,9 @@
                      (eql (imagpart x) (imagpart y))))))))))
 
 (defun eql (x y)
-  (%eql x y))
+  ;; On x86-64, EQL is just an interpreter stub for a vop.
+  ;; For others it's a call to the implementation of generic EQL.
+  (#+x86-64 eql #-x86-64 %eql x y))
 
 (defun bit-vector-= (x y)
   (declare (type bit-vector x y))
@@ -402,36 +432,34 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                       x)
              t))))
 
+(declaim (inline instance-equalp))
 (defun instance-equalp (x y)
   (let ((layout-x (%instance-layout x)))
     (and
      (eq layout-x (%instance-layout y))
-     (logtest +structure-layout-flag+ (layout-%flags layout-x))
+     (logtest +structure-layout-flag+ (layout-%bits layout-x))
      (macrolet ((slot-ref-equalp ()
                   `(let ((x-el (%instance-ref x i))
                          (y-el (%instance-ref y i)))
                      (or (eq x-el y-el) (equalp x-el y-el)))))
+       (let ((n (%instance-length x)))
          (if (eql (layout-bitmap layout-x) sb-kernel::+layout-all-tagged+)
-             (loop for i of-type index from sb-vm:instance-data-start
-                   below (layout-length layout-x)
+             (loop for i downfrom (1- n) to sb-vm:instance-data-start
                    always (slot-ref-equalp))
              (let ((comparators (layout-equalp-tests layout-x)))
-               (unless (= (length comparators)
-                          (- (layout-length layout-x) sb-vm:instance-data-start))
+               (unless (= (length comparators) (- n sb-vm:instance-data-start))
                  (bug "EQUALP got incomplete instance layout"))
                ;; See remark at the source code for %TARGET-DEFSTRUCT
                ;; explaining how to use the vector of comparators.
-               (loop for i of-type index from sb-vm:instance-data-start
-                     below (layout-length layout-x)
+               (loop for i downfrom (1- n) to sb-vm:instance-data-start
                      for test = (data-vector-ref
                                  comparators (- i sb-vm:instance-data-start))
                      always (cond ((eql test 0) (slot-ref-equalp))
-                                  ((functionp test)
-                                   (funcall test i x y))
-                                  (t)))))))))
+                                  ((functionp test) (funcall test i x y))
+                                  (t))))))))))
 
 ;;; Doesn't work on simple vectors
-(defun array-equal-p (x y)
+(defun array-equalp (x y)
   (declare (array x y))
   (let ((rank (array-rank x)))
     (and
@@ -497,22 +525,32 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
         ((%instancep x)
          (and (%instancep y)
               (instance-equalp x y)))
-        ((and (bit-vector-p x)
-              (bit-vector-p y))
+        ((and (simple-vector-p x) (simple-vector-p y))
+         (let ((len (length x)))
+           (and (= len (length y))
+                (loop for i below len ; somewhat faster than the generic loop
+                      always (let ((a (svref x i)) (b (svref y i)))
+                               (or (eq a b) (equalp a b)))))))
+        ((and (bit-vector-p x) (bit-vector-p y))
          (bit-vector-= x y))
         ((vectorp x)
          (and (vectorp y)
               (vector-equalp x y)))
         ((arrayp x)
          (and (arrayp y)
-              (array-equal-p x y)))
+              (array-equalp x y)))
         (t nil)))
 
-(let ((test-cases `((0.0 ,(load-time-value (make-unportable-float :single-float-negative-zero)) t)
-                    (0.0 1.0 nil)
-                    (#c(1 0) #c(1.0 0.0) t)
-                    (#c(0 1) #c(0.0 1.0) t)
-                    (#c(1.1 0.0) #c(11/10 0) nil) ; due to roundoff error
+(let ((test-cases `(($0.0 $-0.0 t)
+                    ($0.0 $1.0 nil)
+                    ;; There is no cross-compiler #C reader macro.
+                    ;; SB-XC:COMPLEX does not want uncanonical input, i.e. imagpart
+                    ;; of rational 0 which downgrades the result to just an integer.
+                    (1 ,(complex $1.0 $0.0) t)
+                    (,(complex 0 1) ,(complex $0.0 $1.0) t)
+                    ;; 11/10 is unequal to real 1.1 due to roundoff error.
+                    ;; COMPLEX here is a red herring
+                    (,(complex $1.1 $0.0) 11/10 nil)
                     ("Hello" "hello" t)
                     ("Hello" #(#\h #\E #\l #\l #\o) t)
                     ("Hello" "goodbye" nil))))

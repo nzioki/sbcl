@@ -262,6 +262,8 @@ created and old ones may exit at any time."
 
 (defun init-initial-thread ()
   (/show0 "Entering INIT-INITIAL-THREAD")
+  ;;; FIXME: is it purposeful or accidental that we recreate some of
+  ;;; the global mutexes but not *ALL-THREADS-LOCKS* ?
   (setf sb-impl::*exit-lock* (make-mutex :name "Exit Lock")
         *make-thread-lock* (make-mutex :name "Make-Thread Lock"))
   (let ((thread (%make-thread :name "main thread"
@@ -631,7 +633,7 @@ returns NIL each time."
                   (let ((,time-left (- ,deadline (get-internal-real-time))))
                     (if (plusp ,time-left)
                         (* (coerce ,time-left 'single-float)
-                           (load-time-value (/ 1.0f0 sb-xc:internal-time-units-per-second) t))
+                           (sb-xc:/ $1.0f0 sb-xc:internal-time-units-per-second))
                         0)))))
          ,@body))))
 
@@ -1301,6 +1303,7 @@ on this semaphore, then N of them is woken up."
   (with-session-lock (session)
     (let ((was-foreground (eq thread (foreground-thread session))))
       (setf (session-threads session)
+            ;; FIXME: I assume these could use DELQ1.
             ;; DELQ never conses, but DELETE does. (FIXME)
             (delq thread (session-threads session))
             (session-interactive-threads session)
@@ -1418,8 +1421,14 @@ interactive."
   #+sb-thread
   (prog1
       (with-session-lock (*session*)
-        (not (member *current-thread*
-                     (session-interactive-threads *session*))))
+        (let ((foreground (foreground-thread)))
+          (unless (or (null foreground)
+                      (eq foreground *current-thread*))
+            (format *error-output* "~%The current thread is not at the foreground,~@
+SB-THREAD:RELEASE-FOREGROUND has to be called in ~s~%for this thread to enter the debugger.~%"
+                    foreground))
+          (not (member *current-thread*
+                       (session-interactive-threads *session*)))))
     (get-foreground)))
 
 (defun get-foreground ()
@@ -1476,6 +1485,7 @@ session."
 session."
   (first (interactive-threads session)))
 
+#-win32
 (defun make-listener-thread (tty-name)
   (aver (probe-file tty-name))
   (let* ((in (sb-unix:unix-open (namestring tty-name) sb-unix:o_rdwr #o666))
@@ -1484,18 +1494,18 @@ session."
     (labels ((thread-repl ()
                (sb-unix::unix-setsid)
                (let* ((sb-impl::*stdin*
-                       (make-fd-stream in :input t :buffering :line
-                                       :dual-channel-p t))
+                        (make-fd-stream in :input t :buffering :line
+                                           :dual-channel-p t))
                       (sb-impl::*stdout*
-                       (make-fd-stream out :output t :buffering :line
-                                              :dual-channel-p t))
+                        (make-fd-stream out :output t :buffering :line
+                                            :dual-channel-p t))
                       (sb-impl::*stderr*
-                       (make-fd-stream err :output t :buffering :line
-                                              :dual-channel-p t))
+                        (make-fd-stream err :output t :buffering :line
+                                            :dual-channel-p t))
                       (sb-impl::*tty*
-                       (make-fd-stream err :input t :output t
-                                              :buffering :line
-                                              :dual-channel-p t))
+                        (make-fd-stream err :input t :output t
+                                            :buffering :line
+                                            :dual-channel-p t))
                       (sb-impl::*descriptor-handlers* nil))
                  (with-new-session ()
                    (unwind-protect
@@ -1506,14 +1516,9 @@ session."
 
 ;;;; The beef
 
-;;; One must parse this name carefully: it is the initial "thread function trampoline",
-;;; and not the "initial thread" "function trampoline".
-;;; i.e. there is an initial thread, which DOES NOT start via this function.
-;;; All threads other than the initial thread DO start via this function.
-;;; The initial thread has its own way of doing things, which ends up calling
-;;; INIT-INITIAL-THREAD.  It might be nice to come up with some better naming.
+;;; All threads other than the initial thread start via this function.
 #+sb-thread
-(defun initial-thread-function-trampoline (thread setup-sem real-function arguments)
+(defun new-lisp-thread-trampoline (thread setup-sem real-function arguments)
   ;; Can't initiate GC before *current-thread* is set, otherwise the
   ;; locks grabbed by SUB-GC wouldn't function.
   ;; Other threads can GC with impunity.
@@ -1619,14 +1624,14 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
            (fp-modes (dpb 0 sb-vm:float-sticky-bits ;; clear accrued bits
                           (sb-vm:floating-point-modes))))
       (declare (dynamic-extent setup-sem))
-      (dx-flet ((initial-thread-function ()
+      (dx-flet ((start-routine ()
                   ;; Inherit parent thread's FP modes
                   #+(or win32 darwin)
                   (setf (sb-vm:floating-point-modes) fp-modes)
                   ;; As it is, this lambda must not cons until we are
                   ;; ready to run GC. Be careful.
-                  (initial-thread-function-trampoline thread setup-sem
-                                                      real-function arguments)))
+                  (new-lisp-thread-trampoline thread setup-sem
+                                              real-function arguments)))
         ;; Holding mutexes or waiting on sempahores inside WITHOUT-GCING will lock up
         (aver (not *gc-inhibit*))
         ;; Keep INITIAL-FUNCTION in the dynamic extent until the child
@@ -1635,8 +1640,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
         ;; INITIAL-FUNCTION to another thread.
         ;; (Does WITHOUT-INTERRUPTS really matter now that it's DXed?)
         (with-system-mutex (*make-thread-lock*)
-          (if (zerop
-               (%create-thread (get-lisp-obj-address #'initial-thread-function)))
+          (if (zerop (%create-thread (get-lisp-obj-address #'start-routine)))
               (setf thread nil)
               (wait-on-semaphore setup-sem)))))
     (or thread (error "Could not create a new thread."))))
@@ -1888,7 +1892,7 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
     (with-all-threads-lock
       (if (thread-alive-p thread)
           (let ((val (sap-ref-lispobj (int-sap (thread-primitive-thread thread))
-                                      (get-lisp-obj-address (symbol-tls-index symbol)))))
+                                      (symbol-tls-index symbol))))
             (case (get-lisp-obj-address val)
               (#.sb-vm:no-tls-value-marker-widetag (values nil :no-tls-value))
               (#.sb-vm:unbound-marker-widetag (values nil :unbound-in-thread))
@@ -1900,7 +1904,7 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
     ;; area...
     (with-all-threads-lock
       (if (thread-alive-p thread)
-          (let ((offset (get-lisp-obj-address (symbol-tls-index symbol))))
+          (let ((offset (symbol-tls-index symbol)))
             (cond ((zerop offset)
                    (values nil :no-tls-value))
                   (t

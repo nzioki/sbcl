@@ -58,7 +58,8 @@
                                         place
                                         (with-unique-names (temp)
                                           (bindings `(,temp ,place))
-                                          (infos `(list ',place ,temp))
+                                          (infos `',place)
+                                          (infos temp)
                                           temp)))
                                   (rest test-form)))
                 ;; For all other cases, just evaluate TEST-FORM
@@ -76,9 +77,9 @@
               (go ,done))
 
             (assert-error ',test-form
-                          ,@(and (or (infos) places datum
-                                     arguments)
-                                 `((list ,@(infos))))
+                          ,@(and (infos)
+                                 `(,(/ (length (infos)) 2)))
+                          ,@(infos)
                           ,@(and (or places datum
                                      arguments)
                                  `(',places))
@@ -474,6 +475,14 @@ invoked. In that case it will store into PLACE and start over."
              (unwind-protect
                   (progn ,@forms)
                (close ,var))))
+        ;; I don't see why we need the unwind-protect.
+        ;; CLHS says: "The output string stream to which the variable /var/
+        ;; is bound has dynamic extent; its extent ends when the form is exited."
+        ;; So technically you can't reference the stream after the string
+        ;; is returned. And since the implication is that we can legally DXify
+        ;; the stream, what difference does it make whether it's open or closed?
+        ;; Certainly in code that is compiled in SAFETY < 3 we should
+        ;; just not bother with the unwind-protect or the close.
         `(let ((,var (make-string-output-stream
                       ;; CHARACTER is the default element-type of
                       ;; string-ouput-stream, save a few bytes when passing it
@@ -498,7 +507,7 @@ invoked. In that case it will store into PLACE and start over."
   ;; optional dispatch mechanism for the M-V-B gets increasingly
   ;; hairy.
   (let ((val (and (sb-xc:constantp n env) (constant-form-value n env))))
-    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64) ;; better DEFAULT-UNKNOWN-VALUES
+    (if (and (integerp val) (<= 0 val (or #+(or x86-64 arm64 riscv) ;; better DEFAULT-UNKNOWN-VALUES
                                           1000
                                           10))) ; Arbitrary limit.
         (let ((dummy-list (make-gensym-list val))

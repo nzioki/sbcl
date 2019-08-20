@@ -197,8 +197,7 @@
   (checked-compile `(lambda () (make-array 0 :element-type 'string)))
   (checked-compile `(lambda () (make-array '(0 2) :element-type 'string))))
 
-(flet ((opaque-identity (x) x))
-  (declare (notinline opaque-identity))
+(with-test (:name :big-array)
   ;; we used to have leakage from cross-compilation hosts of the INDEX
   ;; type, which prevented us from actually using all the large array
   ;; dimensions that we promised.  Let's make sure that we can create
@@ -536,9 +535,6 @@
                                  (princ-to-string c)))
               (:no-error (obj) obj nil)))))
 
-(declaim (notinline opaque-identity))
-(defun opaque-identity (x) x) ; once and only, uh 6 times?
-
 (with-test (:name (make-array :strange-type-specifiers))
   (assert (stringp (make-array 10 :element-type (opaque-identity '(base-char)))))
   (assert (stringp (make-array 10 :element-type (opaque-identity '(standard-char)))))
@@ -568,3 +564,15 @@
          (declare (fixnum y))
          (svref x (+ y 2)))
     ((#(1 2 3) 0) 3)))
+
+(with-test (:name :make-array-header*-type-derivation)
+  (let ((fun (checked-compile
+              '(lambda (a)
+                (declare ((simple-array (unsigned-byte 8) (*)) a))
+                (make-array '(10 20) :element-type (array-element-type a))))))
+    (assert (typep (funcall fun #A((1) (UNSIGNED-BYTE 8) 0))
+                   '(simple-array (unsigned-byte 8) (10 20))))
+    (assert
+     (equal (sb-kernel:%simple-fun-type fun)
+            '(function ((simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (10 20)) &optional))))))

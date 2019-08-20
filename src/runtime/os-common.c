@@ -69,9 +69,7 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
         addr = os_validate(NOT_MOVABLE, block_start, block_size);
 
         if (addr == NULL || addr != block_start)
-            lose("os_zero: block moved! 0x%08x ==> 0x%08x\n",
-                 block_start,
-                 addr);
+            lose("os_zero: block moved! %p ==> %p\n", block_start, addr);
     }
 }
 #endif
@@ -192,9 +190,6 @@ void os_link_runtime()
         link_target += LINKAGE_TABLE_ENTRY_SIZE;
     }
 #endif /* LISP_FEATURE_SB_DYNAMIC_CORE */
-#ifdef LISP_FEATURE_X86_64
-    SetSymbolValue(CPUID_FN1_ECX, (lispobj)make_fixnum(cpuid_fn1_ecx), 0);
-#endif
 }
 
 boolean

@@ -66,7 +66,7 @@ static struct thread *postmortem_thread;
 
 #endif
 
-int dynamic_values_bytes=TLS_SIZE*sizeof(lispobj);  /* same for all threads */
+int dynamic_values_bytes = 4096 * sizeof(lispobj);  // same for all threads
 struct thread *all_threads;
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -521,7 +521,7 @@ attach_os_thread(init_thread_data *scribble)
     block_deferrable_signals(&scribble->oldset);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
-    /* initial-thread-function-trampoline doesn't like when the GC signal is blocked */
+    /* new-lisp-thread-trampoline doesn't like when the GC signal is blocked */
     /* FIXME: could be done using a single call to pthread_sigmask
        together with locking the deferrable signals above. */
     unblock_gc_signals(0, 0);
@@ -685,7 +685,7 @@ callback_wrapper_trampoline(
  */
 
 static struct thread *
-create_thread_struct(lispobj initial_function) {
+create_thread_struct(lispobj start_routine) {
 #if defined(LISP_FEATURE_SB_THREAD) || defined(LISP_FEATURE_WIN32)
     unsigned int i;
 #endif
@@ -716,19 +716,17 @@ create_thread_struct(lispobj initial_function) {
 
 #ifdef LISP_FEATURE_SB_THREAD
     lispobj* tls = (lispobj*)th;
-    for(i = 0; i < TLS_SIZE; i++)
+    for(i = 0; i < (unsigned int)(dynamic_values_bytes/N_WORD_BYTES); i++)
         tls[i] = NO_TLS_VALUE_MARKER_WIDETAG;
+    th->tls_size = dynamic_values_bytes;
 #endif
+    uword_t* __attribute__((__unused__)) constants = (uword_t*)th;
 #ifdef LISP_FEATURE_GENCGC
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#ifdef THREAD_VARYOBJ_CARD_MARKS_SLOT
     extern unsigned int* varyobj_page_touched_bits;
-    th->varyobj_space_addr  = VARYOBJ_SPACE_START;
-    th->varyobj_card_count  = varyobj_space_size / IMMOBILE_CARD_BYTES;
-    th->varyobj_card_marks  = (lispobj)varyobj_page_touched_bits;
-#else
-    th->varyobj_space_addr  = 0;
-    th->varyobj_card_count  = 0;
-    th->varyobj_card_marks  = 0;
+    constants[THREAD_VARYOBJ_SPACE_ADDR_SLOT] = VARYOBJ_SPACE_START;
+    constants[THREAD_VARYOBJ_CARD_COUNT_SLOT] = varyobj_space_size / IMMOBILE_CARD_BYTES;
+    constants[THREAD_VARYOBJ_CARD_MARKS_SLOT] = (lispobj)varyobj_page_touched_bits;
 #endif
     th->dynspace_addr       = DYNAMIC_SPACE_START;
     th->dynspace_card_count = page_table_pages;
@@ -747,7 +745,7 @@ create_thread_struct(lispobj initial_function) {
     th->this=th;
     th->os_thread=0;
 #if defined(LAYOUT_OF_FUNCTION) && defined(LISP_FEATURE_SB_THREAD)
-    th->function_layout = LAYOUT_OF_FUNCTION << 32;
+    constants[THREAD_FUNCTION_LAYOUT_SLOT] = LAYOUT_OF_FUNCTION << 32;
 #endif
     // Once allocated, the allocation profiling buffer sticks around.
     // If present and enabled, assign into the new thread.
@@ -865,7 +863,7 @@ create_thread_struct(lispobj initial_function) {
      * mess up th->no_tls_value_marker. Fail now if that happened. */
     gc_assert(th->no_tls_value_marker == NO_TLS_VALUE_MARKER_WIDETAG);
 #endif
-    th->no_tls_value_marker=initial_function;
+    th->no_tls_value_marker = start_routine;
 
 #if defined(LISP_FEATURE_WIN32)
     for (i = 0; i<sizeof(th->private_events.events)/
@@ -947,7 +945,7 @@ boolean create_os_thread(struct thread *th,os_thread_t *kid_tid)
     return success;
 }
 
-os_thread_t create_thread(lispobj initial_function) {
+os_thread_t create_thread(lispobj start_routine) {
     struct thread *th, *thread = arch_os_get_current_thread();
     os_thread_t kid_tid = 0;
 
@@ -957,10 +955,10 @@ os_thread_t create_thread(lispobj initial_function) {
 
     /* Assuming that a fresh thread struct has no lisp objects in it,
      * linking it to all_threads can be left to the thread itself
-     * without fear of gc lossage. initial_function violates this
+     * without fear of gc lossage. 'start_routine' violates this
      * assumption and must stay pinned until the child starts up. */
-    th = create_thread_struct(initial_function);
-    if (th && !create_os_thread(th,&kid_tid)) {
+    th = create_thread_struct(start_routine);
+    if (th && !create_os_thread(th, &kid_tid)) {
         free_thread_struct(th);
         kid_tid = 0;
     }

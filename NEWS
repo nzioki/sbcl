@@ -1,12 +1,104 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
-changes relative to sbcl-1.4.16:
+changes relative to sbcl-1.5.6:
+  * enhancement: string output streams created with :ELEMENT-TYPE 'BASE-CHAR
+    use internal buffers of BASE-STRING instead of UCS-4 strings restricted
+    to the ASCII range, yielding a theoretical 4:1 space reduction.
+  * optimization: improved make-array type derivation for multi-dimensional
+    arrays. (lp#1838442)
+
+changes in sbcl-1.5.5 relative to sbcl-1.5.4:
+  * platform support:
+    - SunOS: bug reports and patches from Richard Lowe in sb-posix tests
+      (lp#1837495), sb-concurrency tests (lp#1837817), unencapsulated tracing
+      (lp#1837307), float registers in interrupt contexts (lp#1837168)
+  * bug fix: do not generate version.lisp-expr from git describe if the git
+    repository is not sbcl's own.  (lp#1836663, thanks to Richard Lowe)
+  * bug fix: compiler crash related to VALUES-LIST on a &REST argument in some
+    contexts.  (lp#1836096, reported by Samuel Jimenez)
+  * bug fix: compiler hang related to constraint propagation.  (lp#1835599,
+    reported by Mark Cox)
+  * bug fix: the inspector showed the wrong array element type.  (lp#1835934,
+    reported by Richard M Kreuter)
+  * optimization: numerous improvements to hash table access and rehashing
+  * optimization: ASSERT compiles into substantially more compact code.
+    (lp#1835221)
+
+changes in sbcl-1.5.4 relative to sbcl-1.5.3:
+  * minor incompatible change: hash tables on 64-bit machines consume roughly
+    20% less memory but can only grow to hold 2^31 entries (theoretically)
+    due to use of 31-bit indices internally.
+  * platform support:
+    - RISC-V: improve rotate-byte support (thanks to Philipp Matthias
+      Schaefer)
+  * bug fix: the system reasons more correctly regarding the array rank of
+    complicated array types.  (reported by Bart Botta)
+  * bug fix: DOUBLE-FLOAT-P never gets weaked to NUMBERP.  (reported by Bart
+    Botta)  
+  * enhancement: the regression test suite can now benefit from paralellism,
+    completing much faster when enough compute power is available.
+  * optimization: readtables with non-base-char dispatch characters are less
+    inefficient.
+  * optimization: INTERN performs fewer redundant type checks.
+  * optimization: tests for PATHNAMEP and STRUCTURE-OBJECT (including in
+    computing hash functions) are faster.
+
+changes in sbcl-1.5.3 relative to sbcl-1.5.2:
+  * platform support:
+    - RISC-V: numerous bug fixes and improvements
+    - all platforms: better run-program performance when used from multiple
+      threads.
+  * enhancement: (declaim (optimize (debug 2))) ensures compilation of
+    top-level forms, providing better debugging for simple forms that are
+    otherwise "byte-code interpreted" when compiled into FASLs.
+  * bug fix: use of finalizers could in rare circumstances cause a crash in
+    the garbage collector.
+  * bug fix: show extended function designators, e.g. (setf foo), in the
+    disassembler
+  * optimization: reduced overhead of calling NTH/NTHCDR.
+  * optimization: improved FLOAT-SIGN on DOUBLE-FLOATs on 64-bit platforms
+
+changes in sbcl-1.5.2 relative to sbcl-1.5.1:
+  * enhancement: RISC-V support with the generational garbage collector.
+  * enhancement: command-line option "--tls-limit" can be used to alter the
+    maximum number of thread-local symbols from its default of 4096.
+  * enhancement: better muffling of redefinition and lambda-list warnings
+  * platform support:
+    - OS X: use Grand Central Dispatch semaphores, rather than Mach semaphores
+    - Windows: remove non-functional definition of make-listener-thread
+  * new feature: decimal reader syntax for rationals, using the R exponent
+    marker and/or *READ-DEFAULT-FLOAT-FORMAT* of RATIONAL.
+  * optimization: various Unicode tables have been packed more efficiently
+
+changes in sbcl-1.5.1 relative to sbcl-1.5.0:
+  * enhancement: restarts for missing package errors.
+  * optimization: FIND-PACKAGE should be faster even when run in the context
+    of a package with local package-nicknames.
+  * optimization: fix TRUNCATE deftransform's results to have well-defined
+    signs
+  * bug fix: thread-safety problems in RUN-PROGRAM with :PTY.
+  * bug fix: SLEEP transform could never fire.
+  * build enhancement: defend against quirky host floating point
+    implementation
+  * test enhancement: allow more parallelism in running the
+    regression test suite
+
+changes in sbcl-1.5.0 relative to sbcl-1.4.16:
   * enhancement: SB-COVER emulates IN-PACKAGE when recording source maps;
     this makes it possible to generate coverage for forms that uses local
     package nicknames, or otherwise must be read in the correct package.
-  * enhancement: (FIND-SYMBOL x "P") for constant "P" executes faster, subject
-    to "P" not being a package-local nickname of any package. Similarly INTERN.
+  * build enhancement: new host quirks mechanism, support for building under
+    ABCL and ECL (as well as CCL, CMUCL, CLISP and SBCL itself)
+  * optimization: (FIND-SYMBOL x "P") for constant "P" executes faster,
+    subject to "P" not being a package-local nickname of any
+    package. Similarly INTERN.  (lp#1814924)
+  * optimization: bounds checks are elided when possible where the same array
+    is dereferenced multiple times.
   * bug fix: initargs are now deduplicated when computing effective slots.
+  * bug fix: TREE-EQUAL with :TEST 'EQL now correctly computes its answer.
+    (reported by Bahodir Mansurov)
+  * bug fix: compiled (COERCE x 'FLOAT) no longer coerces double-floats into
+    single-floats.  (reported by J. Gareth Williams)
 
 changes in sbcl-1.4.16 relative to sbcl-1.4.15:
   * minor incompatible change: ENSURE-DIRECTORIES-EXIST no longer establishes

@@ -979,7 +979,7 @@
                (map 'vector
                     (lambda (cell)
                       (let ((expander (cddr cell)))
-                        (if (interpreted-function-p expander)
+                        (if (typep expander 'interpreted-function)
                             expander
                             (make-function
                              (%make-proto-fn `(macrolet ,(car cell)) '(form env)
@@ -1044,7 +1044,7 @@
 ;;; In practice it's likely that an interpreted closure would be "too complex"
 ;;; for other reasons, usually due to surrounding BLOCK. It would be somewhat
 ;;; nifty to walk the code and find that the block is never used.
-(defun prepare-for-compile (function &aux nullify-lexenv)
+(defun sb-c::prepare-for-compile (function &aux nullify-lexenv)
   (if (named-let too-complex-p ((env (interpreted-function-env function)))
         (when (null env)
           (return-from too-complex-p nil))
@@ -1190,9 +1190,7 @@
                    (setf (sb-c::lambda-var-flags var) 1)))))
             ((inline notinline)
              ;; This is just enough to get sb-cltl2 tests to pass.
-             (let ((inlinep (case (car spec)
-                              (inline :inline)
-                              (notinline :notinline))))
+             (let ((inlinep (car spec)))
                (dolist (fname (cdr spec))
                  (let ((fun (cdr (assoc fname funs :test 'equal))))
                    (typecase fun
@@ -1273,7 +1271,7 @@
     (unless (setq env (env-parent env))
       (return (car guts)))))
 
-;;; Return :INLINE or :NOTINLINE if FNAME has a lexical declaration,
+;;; Return INLINE or NOTINLINE if FNAME has a lexical declaration,
 ;;; otherwise NIL for no information.
 ;;; FIXME: obviously this does nothing
 (defun fun-lexically-notinline-p (fname env)

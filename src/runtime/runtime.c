@@ -100,7 +100,7 @@ void
 sigint_init(void)
 {
     SHOW("entering sigint_init()");
-    install_handler(SIGINT, sigint_handler, 1);
+    install_handler(SIGINT, sigint_handler, 0, 1);
     SHOW("leaving sigint_init()");
 }
 
@@ -182,6 +182,7 @@ Common runtime options:\n\
   --dynamic-space-size <MiB> Size of reserved dynamic space in megabytes.\n\
   --control-stack-size <MiB> Size of reserved control stack in megabytes.\n\
   --noinform                 Do not print banner on start-up.\n\
+  --tls-limit                Maximum number of thread-local symbols.\n\
 \n\
 Common toplevel options:\n\
   --sysinit <filename>       System-wide init-file to use instead of default.\n\
@@ -461,7 +462,8 @@ sbcl_main(int argc, char *argv[], char *envp[])
 
     lispobj initial_function;
     int merge_core_pages = -1;
-    struct memsize_options memsize_options = {0, 0, 0};
+    struct memsize_options memsize_options;
+    memsize_options.present_in_core = 0;
 
     boolean have_hardwired_spaces = os_preinit(argv, envp);
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
@@ -500,6 +502,7 @@ sbcl_main(int argc, char *argv[], char *envp[])
     if (memsize_options.present_in_core) {
         dynamic_space_size = memsize_options.dynamic_space_size;
         thread_control_stack_size = memsize_options.thread_control_stack_size;
+        dynamic_values_bytes = memsize_options.thread_tls_bytes;
         sbcl_argv = argv;
     } else {
         int argi = 1;
@@ -567,6 +570,13 @@ sbcl_main(int argc, char *argv[], char *envp[])
                     lose("missing argument for --control-stack-size");
                 errno = 0;
                 thread_control_stack_size = parse_size_arg(argv[argi++], "--control-stack-size");
+            } else if (0 == strcmp(arg, "--tls-limit")) {
+                // this is not named "tls-size" because "size" is not the
+                // best measurement for how many symbols to allow
+                ++argi;
+                if (argi >= argc)
+                    lose("missing argument for --tls-limit");
+                dynamic_values_bytes = N_WORD_BYTES * atoi(argv[argi++]);
             } else if (0 == strcmp(arg, "--debug-environment")) {
                 debug_environment_p = 1;
                 ++argi;
@@ -629,15 +639,17 @@ sbcl_main(int argc, char *argv[], char *envp[])
 #endif
     thread_control_stack_size &= ~(sword_t)(CONTROL_STACK_ALIGNMENT_BYTES-1);
 
-    /* KLUDGE: os_vm_page_size is set by os_init(), and on some
-     * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
-     * it must follow os_init(). -- WHN 2000-01-26 */
     os_init(argv, envp);
     if (debug_environment_p) {
         print_environment(argc, argv);
     }
     dyndebug_init();
+#ifdef LISP_FEATURE_ALPHA // When we remove Alpha, this #if can go away
+    /* KLUDGE: os_vm_page_size is set by os_init(), and on some
+     * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
+     * it must follow os_init(). -- WHN 2000-01-26 */
     arch_init();
+#endif
     allocate_spaces(have_hardwired_spaces);
     gc_init();
 
@@ -727,6 +739,7 @@ sbcl_main(int argc, char *argv[], char *envp[])
     write_protect_immobile_space();
 #endif
 #ifdef LISP_FEATURE_HPUX
+    // FIXME: obvious bitrot here. 23 isn't the offset to anything.
     /* -1 = CLOSURE_FUN_OFFSET, 23 = SIMPLE_FUN_CODE_OFFSET, we are
      * not in __ASSEMBLER__ so we cant reach them. */
     return_from_lisp_stub = (void *) ((char *)*((unsigned long *)

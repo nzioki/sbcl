@@ -25,6 +25,7 @@
 #include "lispregs.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/simple-fun.h"
 #include "genesis/static-symbols.h"
@@ -100,7 +101,7 @@ call_into_lisp:
 
 	/* Indirect the closure */
 	ldl	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
-	addl	reg_CODE, SIMPLE_FUN_CODE_OFFSET, reg_LIP
+	addl	reg_CODE, SIMPLE_FUN_INSTS_OFFSET, reg_LIP
 
 	/* And into lisp we go. */
 	jsr	reg_ZERO,(reg_LIP)
@@ -275,7 +276,7 @@ end_of_tramps:
 	.set	noreorder
 	.globl	fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.long	RETURN_PC_WIDETAG + 0x600
+	.long	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	br	zero, fun_end_breakpoint_trap
 	nop
 	mov	reg_CSP, reg_OCFP

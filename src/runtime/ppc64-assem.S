@@ -5,6 +5,7 @@
 #include "genesis/simple-fun.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/static-symbols.h"
 #ifdef LISP_FEATURE_SB_THREAD
@@ -40,7 +41,7 @@ x:
 (NFPR_SAVE_BYTES(first_f)+ NGPR_SAVE_BYTES(first_g)+ FRAME_ARG_BYTES(out_arg_words))
 #define SAVE_FPR(n) stfd n,-8*(32-(n))(11)
 #define SAVE_GPR(n) std n,-8*(32-(n))(11)
-#define FULL_FRAME_SIZE 16000
+#define FULL_FRAME_SIZE 512
 #define RESTORE_FPR(n) lfd n,-8*(32-(n))(11)
 #define RESTORE_GPR(n) ld n,-8*(32-(n))(11)
 
@@ -113,7 +114,7 @@ Low Address
 	SAVE_GPR(30) ; \
 	SAVE_GPR(31) ; \
 	mfcr 0	; \
-	std 0,8(1) /* Save into CR save area */
+	std 0,8(1) /* Save into CR save area */ ; \
 	std 2,40(1) /* Save into TOC save area */
 
 #define C_FULL_EPILOG \
@@ -281,7 +282,7 @@ indirect_ptr(specials)
 	/* Function is an indirect closure */
 	addi reg_NL0,reg_LEXENV,SIMPLE_FUN_SELF_OFFSET
 	ld reg_CODE,0(reg_NL0)
-	addi reg_LIP,reg_CODE,SIMPLE_FUN_CODE_OFFSET
+	addi reg_LIP,reg_CODE,SIMPLE_FUN_INSTS_OFFSET
 	mtctr reg_LIP
 	sldi reg_NARGS, reg_NL2, N_FIXNUM_TAG_BITS
 	bctr
@@ -511,13 +512,8 @@ lra:
 
 	/* Due to pointer verification in MAKE-LISP-OBJ, this must
 	include its header data (the offset from the start of the
-	code-object to the LRA).  The code-object header is 4
-	words, there are 1 word of constants, and the instruction
-	space is doubleword-aligned, making an offset of six.
-	This is header data for a widetag, so shift left eight bits
-	and add. */
-        /* FIXME: the above is full of magic numbers. */
-	.long RETURN_PC_WIDETAG + 0x600
+	code-object to the LRA). */
+	.long  (((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 
 	/* We are receiving unknown multiple values, thus must deal
 	with the single-value and multiple-value cases separately. */
@@ -529,11 +525,11 @@ lra:
 	reg_LRA (where the LRA is stored by the return sequence) to
 	obtain a tagged pointer to the enclosing code component.  Both
 	values are tagged OTHER_POINTER_LOWTAG, so we just have to
-	account for the six words (see calculation for
-	RETURN_PC_WIDETAG, above) between the two addresses.
+	account for N words (see calculation for RETURN_PC_WIDETAG, above)
+	between the two addresses.
 	Restoring reg_CODE doesn't appear to be strictly necessary
 	here, but let's observe the niceties.*/
-	addi reg_CODE, reg_LRA, -24
+	addi reg_CODE, reg_LRA, ((CODE_SIZE+1)&~1)*-N_WORD_BYTES
 
 	/* Multiple values are stored relative to reg_OCFP, which we
 	set to be the current top-of-stack. */

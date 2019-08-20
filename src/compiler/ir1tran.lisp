@@ -107,14 +107,14 @@
               ;; FIXME: this seems to omit FUNCTIONAL
               (when (defined-fun-p fun)
                 (return-from fun-lexically-notinline-p
-                  (eq (defined-fun-inlinep fun) :notinline))))))))
+                  (eq (defined-fun-inlinep fun) 'notinline))))))))
     ;; If ANSWER is NIL, go for the global value
-    (eq (or answer (info :function :inlinep name))
-        :notinline)))
+    (eq (or answer (info :function :inlinep name)) 'notinline)))
 
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
-           (member name *fun-names-in-this-file* :test #'equal))
+           (boundp '*compilation*)
+           (member name (fun-names-in-this-file *compilation*) :test #'equal))
       :defined-here
       where))
 
@@ -232,10 +232,10 @@
                           :%source-name name
                           :inline-expansion expansion
                           :inlinep inlinep
-                          :where-from (if (eq inlinep :notinline)
+                          :where-from (if (eq inlinep 'notinline)
                                           where
                                           (maybe-defined-here name where))
-                          :type (if (and (eq inlinep :notinline)
+                          :type (if (and (eq inlinep 'notinline)
                                          (neq where :declared))
                                     (specifier-type 'function)
                                     (global-ftype name))))
@@ -315,22 +315,10 @@
 ;;; any subparts) are dumpable at all.
 (defun maybe-emit-make-load-forms (constant &optional (name nil namep))
   (let ((xset (alloc-xset)))
-    (labels ((trivialp (value)
-               (sb-xc:typep value
-                      '(or
-                        #-sb-xc-host
-                        (or unboxed-array #+sb-simd-pack simd-pack
-                                          #+sb-simd-pack-256 simd-pack-256)
-                        #+sb-xc-host
-                        (and array (not (array t)))
-                        symbol
-                        number
-                        character
-                        string))) ; subsumed by UNBOXED-ARRAY
-             (grovel (value)
+    (labels ((grovel (value)
                ;; Unless VALUE is an object which which obviously
                ;; can't contain other objects
-               (unless (trivialp value)
+               (unless (dumpable-leaflike-p value)
                  (if (xset-member-p value xset)
                      (return-from grovel nil)
                      (add-to-xset value xset))
@@ -354,11 +342,7 @@
                    ((array t)
                     (dotimes (i (array-total-size value))
                       (grovel (row-major-aref value i))))
-                   ;; We use ordinary host packages to model the target packages.
-                   ;; Those objects are not in "our" type system, but we can check
-                   ;; for them and make them legal to dump out.
-                   (#+sb-xc-host (or structure!object package)
-                    #-sb-xc-host instance
+                   (instance
                     ;; In the target SBCL, we can dump any instance, but
                     ;; in the cross-compilation host, %INSTANCE-FOO
                     ;; functions don't work on general instances, only on
@@ -382,12 +366,7 @@
                        can't be dumped into fasl files."
                      (type-of value)))))))
       ;; Dump all non-trivial named constants using the name.
-      (if (and namep (not (typep constant '(or symbol character
-                                            ;; FIXME: Cold init breaks if we
-                                            ;; try to reference FP constants
-                                            ;; thru their names.
-                                            #+sb-xc-host number
-                                            #-sb-xc-host fixnum))))
+      (if (and namep (not (sb-xc:typep constant '(or symbol character fixnum))))
           (emit-make-load-form constant name)
           (grovel constant))))
   (values))
@@ -641,15 +620,14 @@
 
 ;;; Generate a REF node for LEAF, frobbing the LEAF structure as
 ;;; needed. If LEAF represents a defined function which has already
-;;; been converted, and is not :NOTINLINE, then reference the
+;;; been converted, and is not NOTINLINE, then reference the
 ;;; functional instead.
 (defun reference-leaf (start next result leaf &optional (name '.anonymous.))
   (declare (type ctran start next) (type (or lvar null) result) (type leaf leaf))
   (assure-leaf-live-p leaf)
   (let* ((type (lexenv-find leaf type-restrictions))
          (leaf (or (and (defined-fun-p leaf)
-                        (not (eq (defined-fun-inlinep leaf)
-                                 :notinline))
+                        (not (eq (defined-fun-inlinep leaf) 'notinline))
                         (let ((functional (defined-fun-functional leaf)))
                           (when (and functional (not (functional-kind functional)))
                             (maybe-reanalyze-functional functional))))
@@ -948,7 +926,7 @@
 ;;; ctran. Otherwise insert code coverage instrumentation after
 ;;; START, and return the new ctran.
 (defun instrument-coverage (start mode form
-                            &aux (metadata *compiler-coverage-metadata*))
+                            &aux (metadata (coverage-metadata *compilation*)))
   ;; We don't actually use FORM for anything, it's just convenient to
   ;; have around when debugging the instrumentation.
   (declare (ignore form))
@@ -1091,9 +1069,9 @@
   (let ((*print-right-margin* 100))
     (format *trace-output* "~&xform (~a) ~S~% -> ~S~%"
             kind name new-form)))
-;;; Convert a call to a global function. If not :NOTINLINE, then we do
+;;; Convert a call to a global function. If not NOTINLINE, then we do
 ;;; source transforms and try out any inline expansion. If there is no
-;;; expansion, but is :INLINE, then give an efficiency note (unless a
+;;; expansion, but is INLINE, then give an efficiency note (unless a
 ;;; known function which will quite possibly be open-coded.) Next, we
 ;;; go to ok-combination conversion.
 (defun ir1-convert-srctran (start next result var form)
@@ -1102,7 +1080,7 @@
   (let ((name (leaf-source-name var))
         (inlinep (when (defined-fun-p var)
                    (defined-fun-inlinep var))))
-    (if (eq inlinep :notinline)
+    (if (eq inlinep 'notinline)
         (ir1-convert-combination start next result form var)
         (let ((transform (info :function :source-transform name)))
           (if transform
@@ -1375,7 +1353,7 @@
 ;;; (and TYPE if notinline), plus type-restrictions from the lexenv.
 (defun make-new-inlinep (var inlinep local-type)
   (declare (type global-var var) (type inlinep inlinep))
-  (let* ((type (if (and (eq inlinep :notinline)
+  (let* ((type (if (and (eq inlinep 'notinline)
                         (not (eq (leaf-where-from var) :declared)))
                    (specifier-type 'function)
                    (leaf-type var)))
@@ -1398,7 +1376,7 @@
 ;;; Parse an inline/notinline declaration. If it's a local function we're
 ;;; defining, set its INLINEP. If a global function, add a new FENV entry.
 (defun process-inline-decl (spec res fvars)
-  (let ((sense (cdr (assoc (first spec) +inlinep-translations+ :test #'eq)))
+  (let ((sense (first spec))
         (new-fenv ()))
     (dolist (name (rest spec))
       (let ((fvar (find name fvars
@@ -1500,13 +1478,11 @@
 (defun process-extent-decl (names vars fvars kind)
   (let ((extent
           (ecase kind
-            (truly-dynamic-extent
-             :always-dynamic)
             (dynamic-extent
              (when *stack-allocate-dynamic-extent*
-               :maybe-dynamic))
-            (indefinite-extent
-             :indefinite))))
+               kind))
+            ((indefinite-extent truly-dynamic-extent)
+             kind))))
     (if extent
         (dolist (name names)
           (cond
@@ -1534,7 +1510,7 @@
                   (eq (car name) 'function)
                   (null (cddr name))
                   (valid-function-name-p (cadr name))
-                  (neq :indefinite extent))
+                  (neq extent 'indefinite-extent))
              (let* ((fname (cadr name))
                     (bound-fun (find fname fvars
                                      :key (lambda (x)
@@ -1714,6 +1690,17 @@
     (warn-repeated-optimize-qualities (lexenv-policy lexenv) optimize-qualities)
     (values lexenv result-type (cdr post-binding-lexenv)
             lambda-list explicit-check)))
+
+(defun process-muffle-decls (decls lexenv)
+  (flet ((process-it (spec)
+           (cond ((atom spec))
+                 ((member (car spec) '(muffle-conditions unmuffle-conditions))
+                  (setq lexenv
+                        (process-1-decl spec lexenv nil nil nil nil))))))
+    (dolist (decl decls)
+      (dolist (spec (rest decl))
+        (process-it spec))))
+  lexenv)
 
 (defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
   (multiple-value-bind (*lexenv* result-type post-binding-lexenv)

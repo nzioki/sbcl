@@ -204,6 +204,12 @@
        (2 (weaken-values-type type))
        (3 type)))))
 
+(defun type-contains-fun-type-p (type)
+  (sb-kernel::map-type (lambda (type)
+                         (when (fun-type-p type)
+                           (return-from type-contains-fun-type-p t)))
+                       type))
+
 ;;; LVAR is an lvar we are doing a type check on and TYPES is a list
 ;;; of types that we are checking its values against. If we have
 ;;; proven that LVAR generates a fixed number of values, then for each
@@ -221,6 +227,9 @@
                        c)
           for diff = (type-difference p cc)
           collect (if (and diff
+                           ;; FUN-TYPE is weakend to FUNCTION, can't
+                           ;; use that for invereted type testes
+                           (not (type-contains-fun-type-p diff))
                            (< (type-test-cost diff)
                               (type-test-cost cc)))
                       (list t diff a)
@@ -353,7 +362,7 @@
         (map nil
              (lambda (entry)
                (let* ((canon-type (car entry))
-                      (bucket (mod (sxhash canon-type) (length hashtable))))
+                      (bucket (mod (cl:sxhash canon-type) (length hashtable))))
                  (push entry (svref hashtable bucket))))
              entries)
       hashtable))
@@ -400,7 +409,7 @@
   (let ((table **type-spec-interr-symbols**))
     (if (typep spec '(cons (eql or)))
         (%interr-symbol-for-union-type-spec spec)
-        (cdr (assoc spec (svref table (rem (sxhash spec) (length table)))
+        (cdr (assoc spec (svref table (rem (cl:sxhash spec) (length table)))
                     :test #'equal)))))
 #+nil ; some meta-analysis to decide what types should be in "generic/interr"
 (progn

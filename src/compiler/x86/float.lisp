@@ -184,14 +184,14 @@
 ;;; "immediate-constant-sc" in vm.lisp.
 (eval-when (:compile-toplevel :execute)
   (setf *read-default-float-format*
-        #+long-float 'long-float #-long-float 'double-float))
+        #+long-float 'cl:long-float #-long-float 'cl:double-float))
 (define-move-fun (load-fp-constant 2) (vop x y)
   ((fp-constant) (single-reg double-reg #+long-float long-reg))
   (let ((value (tn-value x)))
     (with-empty-tn@fp-top(y)
-      (cond ((or (eql value 0f0) (eql value 0d0) #+long-float (eql value 0l0))
+      (cond ((or (eql value $0f0) (eql value $0d0) #+long-float (eql value $0l0))
              (inst fldz))
-            ((= value 1e0)
+            ((sb-xc:= value $1e0)
              (inst fld1))
             #+long-float
             ((= value (coerce pi *read-default-float-format*))
@@ -221,7 +221,7 @@
         (double-reg
          (inst fldd value))))))
 (eval-when (:compile-toplevel :execute)
-  (setf *read-default-float-format* 'single-float))
+  (setf *read-default-float-format* 'cl:single-float))
 
 ;;;; complex float move functions
 
@@ -412,7 +412,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (fixed-alloc y single-float-widetag single-float-size node)
+     (alloc-other y single-float-widetag single-float-size node)
      (with-tn@fp-top(x)
        (inst fst (ea-for-sf-desc y)))))
 (define-move-vop move-from-single :move
@@ -424,7 +424,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (fixed-alloc y double-float-widetag double-float-size node)
+     (alloc-other y double-float-widetag double-float-size node)
      (with-tn@fp-top(x)
        (inst fstd (ea-for-df-desc y)))))
 (define-move-vop move-from-double :move
@@ -437,7 +437,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (fixed-alloc y long-float-widetag long-float-size node)
+     (alloc-other y long-float-widetag long-float-size node)
      (with-tn@fp-top(x)
        (store-long-float (ea-for-lf-desc y)))))
 #+long-float
@@ -449,10 +449,10 @@
   (:results (y :scs (descriptor-reg)))
   (:generator 2
      (ecase (sb-c::constant-value (sb-c::tn-leaf x))
-       (0f0 (load-symbol-value y *fp-constant-0f0*))
-       (1f0 (load-symbol-value y *fp-constant-1f0*))
-       (0d0 (load-symbol-value y *fp-constant-0d0*))
-       (1d0 (load-symbol-value y *fp-constant-1d0*))
+       ($0f0 (load-symbol-value y *fp-constant-0f0*))
+       ($1f0 (load-symbol-value y *fp-constant-1f0*))
+       ($0d0 (load-symbol-value y *fp-constant-0d0*))
+       ($1d0 (load-symbol-value y *fp-constant-1d0*))
        #+long-float
        (0l0 (load-symbol-value y *fp-constant-0l0*))
        #+long-float
@@ -510,7 +510,7 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-    (fixed-alloc y complex-single-float-widetag complex-single-float-size node)
+    (alloc-other y complex-single-float-widetag complex-single-float-size node)
     (let ((real-tn (complex-single-reg-real-tn x)))
       (with-tn@fp-top(real-tn)
         (inst fst (ea-for-csf-real-desc y))))
@@ -526,7 +526,7 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (fixed-alloc y complex-double-float-widetag complex-double-float-size node)
+     (alloc-other y complex-double-float-widetag complex-double-float-size node)
      (let ((real-tn (complex-double-reg-real-tn x)))
        (with-tn@fp-top(real-tn)
          (inst fstd (ea-for-cdf-real-desc y))))
@@ -543,7 +543,7 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (fixed-alloc y complex-long-float-widetag complex-long-float-size node)
+     (alloc-other y complex-long-float-widetag complex-long-float-size node)
      (let ((real-tn (complex-long-reg-real-tn x)))
        (with-tn@fp-top(real-tn)
          (store-long-float (ea-for-clf-real-desc y))))
@@ -611,7 +611,7 @@
                       (,stack-sc
                        (if (= (tn-offset fp) esp-offset)
                            ;; C-call
-                           (let* ((offset (* (tn-offset y) n-word-bytes))
+                           (let* ((offset (tn-byte-offset y))
                                   (ea (make-ea :dword :base fp :disp offset)))
                              (with-tn@fp-top(x)
                                 ,@(ecase format
@@ -1524,12 +1524,12 @@
 (define-vop (=0/single-float float-test)
   (:translate =)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float 0f0 0f0)))
+  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
   (:variant #x40))
 (define-vop (=0/double-float float-test)
   (:translate =)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float 0d0 0d0)))
+  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
   (:variant #x40))
 #+long-float
 (define-vop (=0/long-float float-test)
@@ -1541,12 +1541,12 @@
 (define-vop (<0/single-float float-test)
   (:translate <)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float 0f0 0f0)))
+  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
   (:variant #x01))
 (define-vop (<0/double-float float-test)
   (:translate <)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float 0d0 0d0)))
+  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
   (:variant #x01))
 #+long-float
 (define-vop (<0/long-float float-test)
@@ -1558,12 +1558,12 @@
 (define-vop (>0/single-float float-test)
   (:translate >)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float 0f0 0f0)))
+  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
   (:variant #x00))
 (define-vop (>0/double-float float-test)
   (:translate >)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float 0d0 0d0)))
+  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
   (:variant #x00))
 #+long-float
 (define-vop (>0/long-float float-test)
