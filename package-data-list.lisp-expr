@@ -2,7 +2,7 @@
 
 ;;;; the specifications of target packages, except for a few things
 ;;;; which are handled elsewhere by other mechanisms:
-;;;;   * any SHADOWing and nickname hackery;
+;;;;   * some SHADOWing and nickname hackery;
 ;;;;   * the standard, non-SBCL-specific packages COMMON-LISP,
 ;;;;     COMMON-LISP-USER, and KEYWORD.
 ;;;;
@@ -298,6 +298,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "!DEFINE-STORAGE-CLASS" "DEFINE-VOP"
                "DEFKNOWN" "DEFOPTIMIZER"
                "DEFTRANSFORM" "DERIVE-TYPE"
+               "DIS"
                "DO-FORMS-FROM-INFO"
                "EMIT-BLOCK-HEADER"
                "PHYSENV-DEBUG-LIVE-TN" "PHYSENV-LIVE-TN"
@@ -1105,6 +1106,7 @@ possibly temporarily, because it might be used internally."
                "META-INFO-NUMBER"
                "PACKED-INFO-FIELD"
                "PACKED-INFO-INSERT"
+               "PCL-METHODFN-NAME-P"
                "SET-INFO-VALUE"
                "SHOW-INFO"
                "UPDATE-SYMBOL-INFO"
@@ -1316,6 +1318,8 @@ possibly temporarily, because it might be used internally."
                "UNSIGNED-BYTE-WITH-A-BITE-OUT"
                "SFUNCTION" "UNSIGNED-BYTE*"
                "CONSTANT-DISPLACEMENT"
+               "EXTENDED-FUNCTION-DESIGNATOR"
+               "EXTENDED-FUNCTION-DESIGNATOR-P"
                ;; ..and type predicates
                "DOUBLE-FLOAT-P"
                "LOGICAL-PATHNAME-P"
@@ -3375,6 +3379,7 @@ structure representations"
                #+sb-safepoint "GC-SAFEPOINT-TRAP-OFFSET"
                "TLS-SIZE" "N-WIDETAG-BITS" "WIDETAG-MASK"
                "UNBOUND-MARKER-WIDETAG"
+               "UNDEFINED-FUNCTION-TRAP"
                "NO-TLS-VALUE-MARKER-WIDETAG"
                "UNSIGNED-REG-SC-NUMBER" "UNSIGNED-STACK-SC-NUMBER"
                "UNWIND-BLOCK-CODE-SLOT" "UNWIND-BLOCK-CFP-SLOT"
@@ -3393,6 +3398,13 @@ structure representations"
                "WORD-REG-SC-NUMBER" "WORD-SHIFT"
                #+win32 "CONTEXT-RESTORE-TRAP"
                "ZERO-SC-NUMBER"))
+
+   #s(sb-cold:package-data
+      :name "SB-RBTREE"
+      :doc "internal: red/black tree"
+      :use ("CL" "SB-INT" "SB-EXT")
+      :shadow ("DELETE")
+      :export ("INSERT" "DELETE" "FIND=" "FIND<="))
 
    #s(sb-cold:package-data
       :name "SB-WALKER"
@@ -3516,6 +3528,8 @@ SBCL itself"
   (setf sb-mop:generic-function-name)
   sb-mop:slot-definition-allocation
   sb-mop:slot-definition-name
+  sb-pcl::method-p
+  sb-mop:method-function
   sb-pcl::%force-cache-flushes
   sb-pcl::check-wrapper-validity
   sb-pcl::class-has-a-forward-referenced-superclass-p

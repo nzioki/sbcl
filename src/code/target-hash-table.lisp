@@ -15,14 +15,6 @@
 ;;;; utilities
 
 ;;;; TODOs:
-;;;;  - optimistically assume that rehash=1 does not affect the key in question,
-;;;;    even if it was hashed by address. (Surely a win for non-address-based hash)
-;;;;    Only rehash if the lookup failed
-;;;;  - do not inhibit GC during rehash of table.
-;;;;    This works for non-weak tables during GETHASH so far,
-;;;;    but not yet PUTHASH nor REMHASH.
-;;;;    When rehashing weak vectors, can we can toggle the weakness bit off
-;;;;    to prevent any monkey business for the duration?
 ;;;;  - change recursive locks to nonrecursive.
 ;;;;    This will, I fear, be impossible because we've exposed and documented
 ;;;;    an API that pretty much tells users that it's ok to create a synchronized
@@ -144,15 +136,18 @@
   (declare (values hash (member t nil)))
   (if (%other-pointer-subtype-p
        key
+       ;; SYMBOL is listed here so that we can hash symbols address-insensitively.
+       ;; Given that we're already picking off a bunch of OTHER-POINTER objects
+       ;; and already calling SXHASH, the overhead is minimal. In fact, with suitably
+       ;; and rearranged widetags, this would be included in the numeric range.
        '#.(list sb-vm:bignum-widetag sb-vm:ratio-widetag sb-vm:double-float-widetag
                 sb-vm:single-float-widetag
                 sb-vm:complex-widetag sb-vm:complex-single-float-widetag sb-vm:complex-double-float-widetag
                 sb-vm:symbol-widetag))
-      ;; SYMBOL is listed here so that we can hash symbols address-insensitively.
-      ;; Given that we're already picking off a bunch of OTHER-POINTER objects
-      ;; and already calling SXHASH, the overhead is minimal. In fact, with suitably
-      ;; and rearranged widetags, this would be included in the numeric range.
-      (values (sxhash key) nil)
+      (values (if (= (%other-pointer-widetag key) sb-vm:symbol-widetag)
+                  (sxhash (truly-the symbol key))
+                  (number-sxhash key))
+              nil)
       ;; I don't want to add a case for INSTANCE-WITH-HASH-P here,
       ;; but in the EQUAL and EQUAL hash functions, we do that.
       (eq-hash key)))

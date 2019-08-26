@@ -49,6 +49,7 @@
 #include "gc-private.h"
 #include "forwarding-ptr.h"
 #include "var-io.h"
+#include "search.h"
 
 #ifdef LISP_FEATURE_SPARC
 #define LONG_FLOAT_SIZE 4
@@ -744,41 +745,27 @@ static lispobj trans_bignum(lispobj object)
                              UNBOXED_PAGE_FLAG);
 }
 
+#ifndef LISP_FEATURE_X86_64
+lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
+    lispobj raw_addr = (lispobj)fdefn->raw_addr;
+    if (!raw_addr || points_to_asm_code_p(raw_addr))
+        // technically this should return the address of the code object
+        // containing asm routines, but it's fine to return 0.
+        return 0;
+    return raw_addr - FUN_RAW_ADDR_OFFSET;
+}
+#endif
+
 static sword_t
 scav_fdefn(lispobj *where, lispobj __attribute__((unused)) object)
 {
-#if defined LISP_FEATURE_SPARC || defined LISP_FEATURE_ARM || defined LISP_FEATURE_RISCV
-    // Note: on these architectures we don't have to do anything special for fdefns,
-    // because the raw-addr has a function lowtag. But the payload length is not
-    // computed from the header, so it's not quite an ordinary boxed object.
-    scavenge(where + 1, FDEFN_SIZE - 1);
-#else
     struct fdefn *fdefn = (struct fdefn *)where;
-
-    /* FSHOW((stderr, "scav_fdefn, function = %p, raw_addr = %p\n",
-       fdefn->fun, fdefn->raw_addr)); */
-
     scavenge(where + 1, 2); // 'name' and 'fun'
-#ifndef LISP_FEATURE_IMMOBILE_CODE
-    lispobj raw_fun = (lispobj)fdefn->raw_addr;
-    if (raw_fun > READ_ONLY_SPACE_END) {
-        lispobj simple_fun = raw_fun - FUN_RAW_ADDR_OFFSET;
-        scavenge(&simple_fun, 1);
-        /* Don't write unnecessarily. */
-        if (simple_fun != raw_fun - FUN_RAW_ADDR_OFFSET)
-            fdefn->raw_addr = (char *)simple_fun + FUN_RAW_ADDR_OFFSET;
-    }
-#elif defined(LISP_FEATURE_X86_64)
     lispobj obj = fdefn_callee_lispobj(fdefn);
-    if (obj) {
-        lispobj new = obj;
-        scavenge(&new, 1); // enliven
-        gc_dcheck(new == obj); // must not move
-    }
-#else
-#  error "Need to implement scav_fdefn"
-#endif
-#endif
+    lispobj new = obj;
+    scavenge(&new, 1);
+    if (new != obj) fdefn->raw_addr += (new - obj);
+    // Payload length is not computed from the header
     return FDEFN_SIZE;
 }
 static lispobj trans_fdefn(lispobj object) {
@@ -2107,7 +2094,7 @@ scavenge_interrupt_context(os_context_t * context)
 #ifdef ARCH_HAS_NPC_REGISTER
     INTERIOR_POINTER_VARS(npc);
 #endif
-#ifdef LISP_FEATURE_PPC
+#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
     INTERIOR_POINTER_VARS(ctr);
 #endif
 
@@ -2121,7 +2108,7 @@ scavenge_interrupt_context(os_context_t * context)
 #ifdef ARCH_HAS_NPC_REGISTER
     PAIR_INTERIOR_POINTER(npc);
 #endif
-#ifdef LISP_FEATURE_PPC
+#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
     PAIR_INTERIOR_POINTER(ctr);
 #endif
 
@@ -2164,7 +2151,7 @@ scavenge_interrupt_context(os_context_t * context)
 #ifdef ARCH_HAS_NPC_REGISTER
     FIXUP_INTERIOR_POINTER(npc);
 #endif
-#ifdef LISP_FEATURE_PPC
+#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
     FIXUP_INTERIOR_POINTER(ctr);
 #endif
 }
