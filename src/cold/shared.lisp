@@ -43,20 +43,50 @@
         (cons (and (find-package "SB-INTERPRETER") value1)
               value2)))))
 
-(defvar *make-host-parallelism*
-  (or #+sbcl
-      (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
-        (when envvar
-          (require :sb-posix)
-          (parse-make-host-parallelism envvar)))))
-
+(defvar *make-host-parallelism* nil)
 (defun make-host-1-parallelism () (car *make-host-parallelism*))
 (defun make-host-2-parallelism () (cdr *make-host-parallelism*))
 
 #+sbcl
-(let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
-           (if (eq access :external) sym 'sb-unix:unix-exit))))
-  (defun exit-process (arg) (funcall f arg)))
+(progn
+  (setq *make-host-parallelism*
+        (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
+          (when envvar
+            (require :sb-posix)
+            (parse-make-host-parallelism envvar))))
+  (defmacro with-subprocesses (&rest body) `(progn ,@body))
+  (let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
+             (if (eq access :external) sym 'sb-unix:unix-exit))))
+    (defun exit-process (arg) (funcall f arg))
+    (defun exit-subprocess (arg) (funcall f arg)))
+  ;; Lazily reference sb-posix because it may not be loaded
+  (defun posix-fork () (funcall (intern "FORK" "HOST-SB-POSIX")))
+  (defun getpid () (funcall (intern "UNIX-GETPID" "HOST-SB-UNIX")))
+  (defun posix-wait () (funcall (intern "WAIT" "HOST-SB-POSIX"))))
+
+#+clisp
+(progn
+  (setq *make-host-parallelism*
+        (let ((envvar (ext:getenv "SBCL_MAKE_PARALLEL")))
+          (when envvar
+            (parse-make-host-parallelism envvar))))
+  ;; FFI symbols won't exist if libffcall could not be found at build time.
+  (defmacro with-subprocesses (&rest rest)
+    (cons (or (find-symbol "WITH-SUBPROCESSES" "POSIX") 'progn) rest))
+  ;; clisp doesn't expose fork() and consequently doesn't behave
+  ;; correctly when (EXT:EXIT) is called in a forked child process.
+  (defun exit-process (arg) (ext:exit arg))
+  #+#.(cl:if (cl:find-package "FFI") '(and) '(or))
+  (progn (ffi:def-call-out exit-subprocess (:name "exit") (:arguments (arg ffi:int))
+                  (:library :default) (:language :stdc))
+         (ffi:def-call-out posix-fork (:name "fork") (:return-type ffi:int)
+                  (:library :default) (:language :stdc)))
+  (defun getpid () (posix:process-id))
+  (defun posix-wait ()
+    (multiple-value-bind (pid status code) (posix:wait)
+      (if (eql status :exited)
+          (values pid code)
+          (values pid (- code))))))
 
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
@@ -213,20 +243,6 @@
         (cons arch (sort (remove-duplicates (remove arch target-feature-list))
                          #'string<))))
 
-(defvar *build-features* (let ((filename "build-features.lisp-expr"))
-                           (when (probe-file filename)
-                             (read-from-file filename))))
-(dolist (target-feature '(:sb-after-xc-core :cons-profiling))
-  (when (member target-feature sb-xc:*features*)
-    (setf sb-xc:*features* (delete target-feature sb-xc:*features*))
-    ;; If you use --fancy and --with-sb-after-xc-core you might
-    ;; add the feature twice if you don't use pushnew
-    (pushnew target-feature *build-features*)))
-
-;; We update the host's features, because a build-feature is essentially
-;; an option to check in the host enviroment
-(setf *features* (append *build-features* *features*))
-
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
          (customizer-file-name "customize-backend-subfeatures.lisp")
@@ -251,7 +267,7 @@
 (let ((feature-compatibility-tests
        '(("(and sb-thread (not gencgc))"
           ":SB-THREAD requires :GENCGC")
-         ("(and sb-thread (not (or ppc x86 x86-64 arm64)))"
+         ("(and sb-thread (not (or ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
@@ -269,8 +285,7 @@
           "No execute object file format feature defined")
          ("(and sb-dynamic-core (not linkage-table))"
           ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
-         ("(and relocatable-heap win32)"
-          "Relocatable heap requires (not win32)")
+         ("(and cons-profiling (not sb-thread))" ":CONS-PROFILING requires :SB-THREAD")
          ("(and sb-linkable-runtime (not sb-dynamic-core))"
           ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
@@ -283,8 +298,6 @@
           "At most one interpreter can be selected")
          ("(and immobile-space (not x86-64))"
           ":IMMOBILE-SPACE is supported only on x86-64")
-         ("(and immobile-space (not relocatable-heap))"
-          ":IMMOBILE-SPACE requires :RELOCATABLE-HEAP")
          ("(and compact-instance-header (not immobile-space))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
          ("(and immobile-code (not immobile-space))"
@@ -414,8 +427,7 @@
 
 ;;; Determine the object path for a stem/flags/mode combination.
 (defun stem-object-path (stem flags mode)
-  (multiple-value-bind
-        (obj-prefix obj-suffix)
+  (multiple-value-bind (obj-prefix obj-suffix)
       (ecase mode
         (:host-compile
          ;; On some xc hosts, it's impossible to LOAD a fasl file unless it
@@ -425,10 +437,11 @@
          (values *host-obj-prefix*
                  (concatenate 'string "."
                               (pathname-type (compile-file-pathname stem)))))
-        (:target-compile (values *target-obj-prefix*
-                                 (if (find :assem flags)
-                                     *target-assem-obj-suffix*
-                                     *target-obj-suffix*))))
+        (:target-compile
+         (values *target-obj-prefix*
+                 (cond ((find :extra-artifact flags) "")
+                       ((find :assem flags) *target-assem-obj-suffix*)
+                       (t *target-obj-suffix*)))))
     (concatenate 'string obj-prefix (stem-remap-target stem) obj-suffix)))
 (compile 'stem-object-path)
 
@@ -563,7 +576,8 @@
              (restart-case
                  (if trace-file
                      (funcall compile-file src :output-file tmp-obj
-                                               :trace-file t :allow-other-keys t)
+                              ;; if tracing, also show high-level progress
+                              :trace-file t :print t :allow-other-keys t)
                      (funcall compile-file src :output-file tmp-obj))
                (recompile ()
                  :report report-recompile-restart
@@ -691,8 +705,13 @@
              '(or))
   (labels ((contains-irrational (x)
              (typecase x
-               (cons (or (contains-irrational (car x))
-                         (contains-irrational (cdr x))))
+               (cons
+                ;; Tail-recursion not guaranteed
+                (do ((cons x (cdr cons)))
+                    ((atom cons)
+                     (contains-irrational cons))
+                  (when (contains-irrational (car cons))
+                    (return t))))
                (simple-vector (some #'contains-irrational x))
                ;; We use package literals -- see e.g. SANE-PACKAGE - which
                ;; must be treated as opaque, but COMMAs should not be opaque.
@@ -752,3 +771,32 @@
                     table stream))
          (format t "~&; wrote ~a - ~d entries"
                  filename (hash-table-count table))))))
+
+;;;; Please avoid writing "consecutive" (un-nested) reader conditionals
+;;;; in this file, whether for the same or different feature test.
+;;;; The following example prints 3 different results in 3 different lisp
+;;;; implementations all of which have feature :linux (and not :nofeat).
+#|
+(let ((i 0))
+  (dolist (s '("#-nofeat #+linux a b c d e"
+               "#-nofeat #-linux a b c d e"
+               "#+nofeat #-linux a b c d e"
+               "#+nofeat #+linux a b c d e"
+               "#+linux #-nofeat a b c d e"
+               "#-linux #-nofeat a b c d e"
+               "#-linux #+nofeat a b c d e"
+               "#+linux #+nofeat a b c d e"
+               "#+linux #-linux a b c d e"
+               "#-linux #-linux a b c d e"
+               "#-linux #+linux a b c d e"
+               "#+linux #+linux a b c d e"
+               "#+nofeat #-nofeat a b c d e"
+               "#-nofeat #-nofeat a b c d e"
+               "#-nofeat #+nofeat a b c d e"
+               "#+nofeat #+nofeat a b c d e"))
+  (format t "test ~2d: ~a ~s~%"
+          (incf i)
+          (let ((stream (make-string-input-stream s)))
+            (list (read stream) (read stream) (read stream)))
+          s)))
+|#

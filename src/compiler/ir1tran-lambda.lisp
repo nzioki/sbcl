@@ -103,8 +103,9 @@
     (collect ((vars)
               (aux-vars)
               (aux-vals))
-      (flet ((add-var (name)
+      (flet ((add-var (name &optional source-form)
                (let ((var (varify-lambda-arg name)))
+                 (setf (lambda-var-source-form var) source-form)
                  (vars var)
                  var))
              (add-info (var kind &key (default nil defaultp) suppliedp-var key)
@@ -136,7 +137,7 @@
         (dolist (spec keys)
           (multiple-value-bind (keyword name default suppliedp-var defaultp)
               (parse-key-arg-spec spec)
-            (apply #'add-info (add-var name) :keyword
+            (apply #'add-info (add-var name spec) :keyword
                    :suppliedp-var (first suppliedp-var)
                    :key keyword
                    (when defaultp (list :default default)))))
@@ -522,7 +523,6 @@
               (n-value-temp (sb-xc:gensym "N-VALUE-TEMP-"))
               (n-allowp (sb-xc:gensym "N-ALLOWP-"))
               (n-lose (sb-xc:gensym "N-LOSE-"))
-              (n-losep (sb-xc:gensym "N-LOSEP-"))
               (allowp (or (optional-dispatch-allowp res)
                           (policy *lexenv* (zerop safety))))
               (found-allow-p nil))
@@ -552,33 +552,36 @@
                                                        nil
                                                        0)))
                                       (arg-vals n-value n-supplied)
-                                      `((eq ,n-key ',keyword)
+                                      `((,keyword)
                                         (setq ,n-supplied ,(if supplied-used-p
                                                                t
                                                                1))
                                         (setq ,n-value ,n-value-temp))))
                                    (t
                                     (arg-vals n-value)
-                                    `((eq ,n-key ',keyword)
+                                    `((,keyword)
                                       (setq ,n-value ,n-value-temp))))))
                 (when (and (not allowp) (eq keyword :allow-other-keys))
                   (setq found-allow-p t)
                   (setq clause
                         (append clause `((setq ,n-allowp ,n-value-temp)))))
-
-                (temps `(,n-value ,default))
+                (temps `(,n-value ,(if (and default
+                                            (neq (lambda-var-type key) *universal-type*))
+                                       `(the* (,(lambda-var-type key)
+                                               :use-annotations t
+                                               :source-form ,(lambda-var-source-form key))
+                                              ,default)
+                                       default)))
                 (tests clause)))
 
             (unless allowp
               (temps n-allowp
-                     (list n-lose 0)
-                     (list n-losep 0))
+                     (list n-lose '(make-unbound-marker)))
               (unless found-allow-p
-                (tests `((eq ,n-key :allow-other-keys)
+                (tests `(:allow-other-keys
                          (setq ,n-allowp ,n-value-temp))))
               (tests `(t
-                       (setq ,n-lose ,n-key
-                             ,n-losep 1))))
+                       (setq ,n-lose ,n-key))))
 
             (body
              `(when (oddp ,n-count)
@@ -594,7 +597,7 @@
                   (decf ,n-index)
                   (setq ,n-key (%more-arg ,n-context ,n-index))
                   (decf ,n-index)
-                  (cond ,@(tests))))
+                  (case ,n-key ,@(tests))))
              #+stack-grows-downward-not-upward
              `(locally (declare (optimize (safety 0)))
                 (loop
@@ -603,11 +606,12 @@
                       (%more-kw-arg ,n-context ,n-index)
                     (declare (ignorable ,n-value-temp ,n-key))
                     (incf ,n-index 2)
-                    (cond ,@(tests))))))
+                    (case ,n-key ,@(tests))))))
 
             (unless allowp
               (let ((location (make-restart-location)))
-                (body `(if (and (/= ,n-losep 0) (not ,n-allowp))
+                (body `(if (and (not (unbound-marker-p ,n-lose))
+                                (not ,n-allowp))
                            (%unknown-key-arg-error ,n-lose ,location)
                            (restart-point ,location))))))))
 
@@ -685,7 +689,9 @@
              (supplied-p (arg-info-supplied-p info))
              ;; was: (format nil "~A-DEFAULTING-TEMP" (leaf-source-name key))
              (n-val (make-symbol ".DEFAULTING-TEMP."))
-             (val-temp (make-lambda-var :%source-name n-val)))
+             (val-temp (make-lambda-var :%source-name n-val))
+             (default `(with-source-form ,(lambda-var-source-form key)
+                         ,default)))
         (main-vars val-temp)
         (bind-vars key)
         (cond ((or hairy-default supplied-p)
@@ -715,7 +721,7 @@
                    (bind-vars supplied-p)
                    (bind-vals n-supplied))))
               (t
-               (main-vals (arg-info-default info))
+               (main-vals default)
                (bind-vals n-val)))))
 
     (let* ((main-entry (ir1-convert-lambda-body
@@ -1161,8 +1167,9 @@
 ;;; previous references.
 (defun get-defined-fun (name &optional (lambda-list nil lp))
   (proclaim-as-fun-name name)
-  (when (boundp '*free-funs*)
-    (let ((found (find-free-fun name "shouldn't happen! (defined-fun)")))
+  (when (boundp '*ir1-namespace*)
+    (let ((found (find-free-fun name "shouldn't happen! (defined-fun)"))
+          (free-funs (free-funs *ir1-namespace*)))
       (note-name-defined name :function)
       (cond ((not (defined-fun-p found))
              (aver (not (info :function :inlinep name)))
@@ -1178,11 +1185,11 @@
                                              (ftype-from-lambda-list lambda-list))
                                         (specifier-type 'function))))))
                (substitute-leaf res found)
-               (setf (gethash name *free-funs*) res)))
-            ;; If *FREE-FUNS* has a previously converted definition
+               (setf (gethash name free-funs) res)))
+            ;; If FREE-FUNS has a previously converted definition
             ;; for this name, then blow it away and try again.
             ((defined-fun-functionals found)
-             (remhash name *free-funs*)
+             (remhash name free-funs)
              (get-defined-fun name lambda-list))
             (t found)))))
 

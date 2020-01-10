@@ -413,16 +413,13 @@
 ;;;       interface to its walker which looks like the interface to this
 ;;;       walker.
 
-(defmacro get-walker-template-internal (x)
-  `(get ,x 'walker-template))
-
 (defmacro define-walker-template (name
                                   &optional (template '(nil repeat (eval))))
-  `(setf (get-walker-template-internal ',name) ',template))
+  `(setf (info :function :walker-template ',name) ',template))
 
 (defun get-walker-template (x context)
   (cond ((symbolp x)
-         (get-walker-template-internal x))
+         (info :function :walker-template x))
         ((and (listp x) (eq (car x) 'lambda))
          '(lambda repeat (eval)))
         (t
@@ -470,6 +467,7 @@
 ;;; SBCL-only special forms
 (define-walker-template truly-the (nil quote eval))
 (define-walker-template sb-kernel:the* (nil quote eval))
+(define-walker-template sb-c::with-source-form (nil nil eval))
 ;;; FIXME: maybe we don't need this one any more, given that
 ;;; NAMED-LAMBDA now expands into (FUNCTION (NAMED-LAMBDA ...))?
 (define-walker-template named-lambda walk-named-lambda)

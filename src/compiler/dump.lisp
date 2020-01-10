@@ -75,6 +75,7 @@
   (valid-structures (make-hash-table :test 'eq) :type hash-table)
   ;; DEBUG-SOURCE written at the very beginning
   (source-info nil :type (or null sb-c::debug-source)))
+(declaim (freeze-type fasl-output))
 
 ;;; This structure holds information about a circularity.
 (defstruct (circularity (:copier nil))
@@ -774,6 +775,14 @@
     (unless data-only
       (dump-fop 'fop-spec-vector file length)
       (dump-byte widetag file))
+
+    #+sb-xc-host
+    (when (or (= widetag sb-vm:simple-array-fixnum-widetag)
+              (= widetag sb-vm:simple-array-unsigned-fixnum-widetag))
+      ;; Fixnum vector contents are tagged numbers. Make a copy.
+      (setq vector (map 'vector (lambda (x) (ash x sb-vm:n-fixnum-tag-bits))
+                        vector)))
+
     ;; cross-io doesn't know about fasl streams, so use actual stream.
     (sb-impl::buffer-output (fasl-output-stream file)
                             vector
@@ -859,7 +868,8 @@
   (assert (<= (length +fixup-kinds+) 8))) ; fixup-kind fits in 3 bits
 
 (defconstant-eqx +fixup-flavors+
-  #(:assembly-routine :assembly-routine* :symbol-tls-index
+  #(:assembly-routine :assembly-routine* :asm-routine-nil-offset
+    :symbol-tls-index
     :foreign :foreign-dataref :code-object
     :layout :immobile-symbol :named-call :static-call
     :symbol-value)
@@ -903,7 +913,8 @@
             (ecase flavor
               (:code-object (the null name))
               (:layout (if (symbolp name) name (layout-classoid-name name)))
-              ((:assembly-routine :assembly-routine* :symbol-tls-index
+              ((:assembly-routine :assembly-routine* :asm-routine-nil-offset
+               :symbol-tls-index
                ;; Only #+immobile-space can use the following two flavors.
                ;; An :IMMOBILE-SYMBOL fixup references the symbol itself,
                ;; whereas a :SYMBOL-VALUE fixup references the value of the symbol.
@@ -948,9 +959,9 @@
             (cons
              (ecase (car entry)
                (:constant ; anything that has not been wrapped in a #<CONSTANT>
-                (dump-object (cdr entry) fasl-output))
+                (dump-object (cadr entry) fasl-output))
                (:entry
-                (let* ((info (sb-c::leaf-info (cdr entry)))
+                (let* ((info (sb-c::leaf-info (cadr entry)))
                        (handle (gethash info
                                         (fasl-output-entry-table
                                          fasl-output))))
@@ -962,12 +973,12 @@
                     (patches (cons info i))
                     (dump-fop 'fop-misc-trap fasl-output)))))
                (:load-time-value
-                (dump-push (cdr entry) fasl-output))
+                (dump-push (cadr entry) fasl-output))
                (:fdefinition
-                (dump-object (cdr entry) fasl-output)
+                (dump-object (cadr entry) fasl-output)
                 (dump-fop 'fop-fdefn fasl-output))
                (:known-fun
-                (dump-object (cdr entry) fasl-output)
+                (dump-object (cadr entry) fasl-output)
                 (dump-fop 'fop-known-fun fasl-output))))
             (null
              (dump-fop 'fop-misc-trap fasl-output)))))
@@ -1045,7 +1056,7 @@
          (code-handle
           ;; fill in the placeholder elements of constants
           ;; with the NAME, ARGLIST, TYPE, INFO slots of each simple-fun.
-          (let ((constants (sb-c::ir2-component-constants 2comp))
+          (let ((constants (sb-c:ir2-component-constants 2comp))
                 (wordindex (+ sb-vm:code-constants-offset
                               (* sb-vm:code-slots-per-simple-fun nfuns))))
             (dolist (entry entries)
@@ -1053,13 +1064,13 @@
               ;; See also MAKE-CORE-COMPONENT which does the same thing.
               (decf wordindex 4)
               (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
-                    `(:constant . ,(sb-c::entry-info-name entry))
+                    `(:constant ,(sb-c::entry-info-name entry))
                     (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
-                    `(:constant . ,(sb-c::entry-info-arguments entry))
+                    `(:constant ,(sb-c::entry-info-arguments entry))
                     (aref constants (+ wordindex sb-vm:simple-fun-source-slot))
-                    `(:constant . ,(sb-c::entry-info-form/doc entry))
+                    `(:constant ,(sb-c::entry-info-form/doc entry))
                     (aref constants (+ wordindex sb-vm:simple-fun-info-slot))
-                    `(:constant . ,(sb-c::entry-info-type/xref entry))))
+                    `(:constant ,(sb-c::entry-info-type/xref entry))))
             (dump-code-object component code-segment code-length fixups file)))
          (fun-index nfuns))
 

@@ -47,9 +47,21 @@ include genesis/Makefile.features
 # symlink to Config-foo.
 # Commonly used variables in Config are: ARCH_SRC, ASSEM_SRC, GC_SRC,
 # OS_SRC, OS_LIBS, OS_CLEAN_FILES
+DISABLE_PIE=yes
 include Config
 
 # Disable PIE when possible
+# If dynamic core is enabled, we should not care whether we get a PIE or not,
+# and would prefer the default for the installed C toolchain,
+# however, when building the 32-bit x86 code without the disabling of PIE,
+# I got a linker error that was totally unhelpful in that it did not indicate
+# an offending source file:
+#  /usr/bin/ld: BFD (GNU Binutils for Debian) 2.31.1 assertion fail ../../bfd/elflink.c:14480
+# Process of elimination concluded that it's from ldso-stubs.
+# I'm disinclined to find the problem with the asm code in that file.
+# More pertinently, if sb-dynamic-core is enabled, the stubs shouldn't be needed.
+# But we link them them because of, I guess, "historical reasons".
+ifeq ($(DISABLE_PIE),yes)
 ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
 CFLAGS += -fno-pie
 LINKFLAGS += -no-pie
@@ -61,6 +73,7 @@ CFLAGS += -fno-pie
 LINKFLAGS += -nopie
 LDFLAGS += -nopie
 __LDFLAGS__ += -nopie
+endif
 endif
 
 COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
@@ -102,13 +115,13 @@ libsbcl.a: $(OBJS)
 
 PIC_OBJS = $(subst .o,.pic.o,$(filter-out ldso-stubs.o,$(OBJS)))
 libsbcl.so: $(PIC_OBJS)
-	cc -shared -o $@ $^ -ldl -lpthread -lm
+	cc -shared -o $@ $^ $(LIBS)
 # for this to work, you must have with-gcc-tls in your build features already.
 # can't define it here because then it conflicts if you have it in both places.
 %.pic.o: %.c
 	$(CC) -fPIC -c $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
 %.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
-	$(CC) -DPOSITION_INDEPENDENT_ASM -c $(CFLAGS) $< -o $@
+	$(CC) -c $(CFLAGS) $< -o $@
 testmain: testmain.c libsbcl.so -ldl
 
 SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/editcore.lisp
@@ -120,7 +133,7 @@ pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
 		../../output/sbcl.core pie-shrinkwrap-sbcl.s
 comma := , # "Commas ... cannot appear in the text of an argument as written"
 shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
-	$(CC) $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
+	$(CC) -no-pie $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
  $(CFLAGS) -o $@ $(filter-out ldso-stubs.o, $^) $(LIBS)
 pie-shrinkwrap-sbcl: pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o $(PIC_OBJS)
 	$(CC) -pie -o $@ $^ $(LIBS)

@@ -73,7 +73,8 @@
     (if (and olayout
              (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
-        (make-layout (make-undefined-classoid name)
+        (make-layout (randomish-layout-clos-hash name)
+                     (make-undefined-classoid name)
                      :flags +condition-layout-flag+
                      :inherits new-inherits
                      :depthoid -1
@@ -399,61 +400,64 @@
               (all-readers nil append)
               (all-writers nil append))
       (dolist (spec slot-specs)
-        (when (keywordp spec)
-          (warn "Keyword slot name indicates probable syntax error:~%  ~S"
-                spec))
-        (let* ((spec (if (consp spec) spec (list spec)))
-               (slot-name (first spec))
-               (allocation :instance)
-               (initform-p nil)
-               documentation
-               initform)
-          (collect ((initargs)
-                    (readers)
-                    (writers))
-            (do ((options (rest spec) (cddr options)))
-                ((null options))
-              (unless (and (consp options) (consp (cdr options)))
-                (error "malformed condition slot spec:~%  ~S." spec))
-              (let ((arg (second options)))
-                (case (first options)
-                  (:reader (readers arg))
-                  (:writer (writers arg))
-                  (:accessor
-                   (readers arg)
-                   (writers `(setf ,arg)))
-                  (:initform
-                   (when initform-p
-                     (error "more than one :INITFORM in ~S" spec))
-                   (setq initform-p t)
-                   (setq initform arg))
-                  (:initarg (initargs arg))
-                  (:allocation
-                   (setq allocation arg))
-                  (:documentation
-                   (when documentation
-                     (error "more than one :DOCUMENTATION in ~S" spec))
-                   (unless (stringp arg)
-                     (error "slot :DOCUMENTATION argument is not a string: ~S"
-                            arg))
-                   (setq documentation arg))
-                  (:type)
-                  (t
-                   (error "unknown slot option:~%  ~S" (first options))))))
+        (with-current-source-form (spec)
+          (when (keywordp spec)
+            (warn "Keyword slot name indicates probable syntax error:~%  ~S"
+                  spec))
+          (let* ((spec (if (consp spec) spec (list spec)))
+                 (slot-name (first spec))
+                 (allocation :instance)
+                 (initform-p nil)
+                 documentation
+                 initform)
+            (collect ((initargs)
+                      (readers)
+                      (writers))
+              (do ((options (rest spec) (cddr options)))
+                  ((null options))
+                (unless (and (consp options) (consp (cdr options)))
+                  (error "malformed condition slot spec:~%  ~S." spec))
+                (let ((arg (second options)))
+                  (case (first options)
+                    (:reader (readers arg))
+                    (:writer (writers arg))
+                    (:accessor
+                     (readers arg)
+                     (writers `(setf ,arg)))
+                    (:initform
+                     (when initform-p
+                       (error "more than one :INITFORM in ~S" spec))
+                     (setq initform-p t)
+                     (setq initform arg))
+                    (:initarg (initargs arg))
+                    (:allocation
+                     (setq allocation arg))
+                    (:documentation
+                     (when documentation
+                       (error "more than one :DOCUMENTATION in ~S" spec))
+                     (unless (stringp arg)
+                       (error "slot :DOCUMENTATION argument is not a string: ~S"
+                              arg))
+                     (setq documentation arg))
+                    (:type
+                     (check-slot-type-specifier
+                      arg slot-name (cons 'define-condition name)))
+                    (t
+                     (error "unknown slot option:~%  ~S" (first options))))))
 
-            (all-readers (readers))
-            (all-writers (writers))
-            (slots `(make-condition-slot
-                     :name ',slot-name
-                     :initargs ',(initargs)
-                     :readers ',(readers)
-                     :writers ',(writers)
-                     :initform-p ',initform-p
-                     :documentation ',documentation
-                     :initform ,(when initform-p `',initform)
-                     :initfunction ,(when initform-p
-                                      `#'(lambda () ,initform))
-                     :allocation ',allocation)))))
+              (all-readers (readers))
+              (all-writers (writers))
+              (slots `(make-condition-slot
+                       :name ',slot-name
+                       :initargs ',(initargs)
+                       :readers ',(readers)
+                       :writers ',(writers)
+                       :initform-p ',initform-p
+                       :documentation ',documentation
+                       :initform ,(when initform-p `',initform)
+                       :initfunction ,(when initform-p
+                                        `#'(lambda () ,initform))
+                       :allocation ',allocation))))))
 
       (dolist (option options)
         (unless (consp option)
@@ -638,16 +642,20 @@
   ((not-yet-loaded :initform nil :reader not-yet-loaded :initarg :not-yet-loaded))
   (:report
    (lambda (condition stream)
-     (let ((*package* (find-package :keyword)))
+     (let ((name (cell-error-name condition)))
        (format stream
-               "~@<The function ~S is undefined.~@?~@:>"
-               (cell-error-name condition)
+               (if (and (symbolp name) (macro-function name))
+                   (sb-format:tokens "~@<~/sb-ext:print-symbol-with-prefix/ is a macro, ~
+                                      not a function.~@:>")
+                   (sb-format:tokens "~@<The function ~/sb-ext:print-symbol-with-prefix/ ~
+                                      is undefined.~@?~@:>"))
+               name
                (case (not-yet-loaded condition)
                  (:local
-                  "~:@_It is a local function ~
-                       not available at compile-time.")
-                 ((t) "~:@_It is defined earlier in the ~
-                           file but is not available at compile-time.")
+                  (sb-format:tokens "~:@_It is a local function ~
+                                     not available at compile-time."))
+                 ((t) (sb-format:tokens "~:@_It is defined earlier in the ~
+                                         file but is not available at compile-time."))
                  (t
                   "")))))))
 
@@ -762,6 +770,11 @@
 
 (define-condition simple-storage-condition (storage-condition simple-condition)
   ())
+
+(define-condition sanitizer-error (simple-error)
+  ((value :reader sanitizer-error-value :initarg :value)
+   (address :reader sanitizer-error-address :initarg :address)
+   (size :reader sanitizer-error-size :initarg :size)))
 
 ;;; a condition for use in stubs for operations which aren't supported
 ;;; on some platforms
@@ -919,6 +932,7 @@
 (define-condition type-style-warning (reference-condition simple-style-warning)
   ()
   (:default-initargs :references '((:sbcl :node "Handling of Types"))))
+(define-condition slot-initform-type-style-warning (type-style-warning) ())
 
 (define-condition local-argument-mismatch (reference-condition simple-warning)
   ()
@@ -1840,6 +1854,13 @@ the restart does not exist."))
 
 (define-condition simple-control-error (simple-condition control-error) ())
 (define-condition simple-file-error    (simple-condition file-error)    ())
+
+(defun %file-error (pathname &optional datum &rest arguments)
+  (typecase datum
+    (format-control (error 'simple-file-error :pathname pathname
+                                              :format-control datum
+                                              :format-arguments arguments))
+    (t (apply #'error datum :pathname pathname arguments))))
 
 (define-condition file-exists (simple-file-error) ())
 (define-condition file-does-not-exist (simple-file-error) ())

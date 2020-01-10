@@ -29,6 +29,7 @@
            #:checked-compile-capturing-source-paths
            #:checked-compile-condition-source-paths
            #:assemble
+           #:get-simple-fun-instruction-model
 
            #:scratch-file-name
            #:with-scratch-file
@@ -284,6 +285,7 @@
   (push (list type *test-file* (or test-name *test-count*))
         *failures*)
   (unless (stringp condition)
+    ;; (sb-debug:print-backtrace :from :interrupted-frame)
     (when (or (and *break-on-failure*
                    (not (eq type :expected-failure)))
               *break-on-expected-failure*)
@@ -870,7 +872,7 @@
 ;;; Take a list of lists and assemble them as though they are
 ;;; instructions inside the body of a vop. There is no need
 ;;; to use the INST macro in front of each list.
-;;; As a special case, an atom is the symbol LABEL, it will be
+;;; As a special case, if an atom is the symbol LABEL, it will be
 ;;; changed to a generated label. At most one such atom may appear.
 (defun assemble (instructions)
   (let ((segment (sb-assem:make-segment))
@@ -883,10 +885,27 @@
                    (setq label (sb-assem:gen-label))
                    (rplaca cell label)))
                inst)
-         (apply #'sb-assem::%inst
-                (sb-assem::op-encoder-name (car inst))
-                (cdr inst)))
+         (apply #'sb-assem::%inst (car inst) (cdr inst)))
        (when label
          (sb-assem::%emit-label segment nil label)))
     (sb-assem:segment-buffer
      (sb-assem:finalize-segment segment))))
+
+(defun get-simple-fun-instruction-model (fun)
+  (declare (type sb-kernel:simple-fun fun))
+  (sb-disassem:get-inst-space) ; for effect
+  (let* ((code (sb-kernel:fun-code-header fun))
+         (segment (sb-disassem:make-code-segment code
+                                                 (sb-sys:sap- (sb-vm:simple-fun-entry-sap fun)
+                                                              (sb-kernel:code-instructions code))
+                                                 (sb-kernel:%simple-fun-text-len fun)))
+         (dstate (sb-disassem:make-dstate nil)))
+    (setf (sb-disassem::dstate-absolutize-jumps dstate) nil
+          (sb-disassem:dstate-segment dstate) segment
+          (sb-disassem:dstate-segment-sap dstate) (funcall (sb-disassem:seg-sap-maker segment)))
+    (sb-int:collect ((result))
+      (loop (let ((pc (sb-disassem:dstate-cur-offs dstate)))
+              (result (cons pc (sb-disassem:disassemble-instruction dstate))))
+            (when (>= (sb-disassem:dstate-cur-offs dstate) (sb-disassem:seg-length segment))
+              (return)))
+      (result))))

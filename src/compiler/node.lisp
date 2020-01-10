@@ -94,8 +94,9 @@
   (annotations nil)
   (dependent-annotations nil))
 
-;;; These are used for annottating a LVAR with information that can't
-;;; be expressed using types.
+;;; These are used for annotating a LVAR with information that can't
+;;; be expressed using types or if the CAST semantics are undesirable
+;;; (type derivation, runtime errors).
 ;;; Right now it's basically used for tracking constants and checking
 ;;; them for things like proper sequence, or valid type specifier.
 (defstruct lvar-annotation
@@ -139,11 +140,15 @@
   (result-specs nil :type list)
   type)
 
-(defstruct (lvar-function-annotation
-             (:include lvar-annotation)
-             (:copier nil))
+(defstruct (lvar-type-annotation
+            (:include lvar-annotation)
+            (:copier nil))
   type
   context)
+
+(defstruct (lvar-function-annotation
+            (:include lvar-type-annotation)
+            (:copier nil)))
 
 (defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
@@ -171,8 +176,6 @@
                             (number (when (boundp '*compilation*)
                                       (incf (sset-counter *compilation*)))))
                   (:copier nil))
-  ;; unique ID for debugging
-  #+sb-show (id (new-object-id) :read-only t)
   ;; True if this node needs to be optimized. This is set to true
   ;; whenever something changes about the value of an lvar whose DEST
   ;; is this node.
@@ -433,9 +436,9 @@
                         (head
                          tail &aux
                          (last-block tail)
-                         (outer-loop (make-loop :kind :outer :head head)))))
-  ;; unique ID for debugging
-  #+sb-show (id (new-object-id) :read-only t)
+                         (outer-loop (make-loop :kind :outer
+                                                :head head
+                                                :tail (list tail))))))
   ;; space where this component will be allocated in
   ;; :auto won't make any codegen optimizations pertinent to immobile space,
   ;; but will place the code there given sufficient available space.
@@ -550,8 +553,7 @@
 (declaim (inline reoptimize-component))
 (defun reoptimize-component (component kind)
   (declare (type component component)
-           (type (member nil :maybe t) kind))
-  (aver kind)
+           (type (member :maybe t) kind))
   (unless (eq (component-reoptimize component) t)
     (setf (component-reoptimize component) kind)))
 
@@ -729,8 +731,6 @@
                                       (incf (sset-counter *compilation*)))))
                   (:copier nil)
                   (:constructor nil))
-  ;; unique ID for debugging
-  #+sb-show (id (new-object-id) :read-only t)
   ;; (For public access to this slot, use LEAF-SOURCE-NAME.)
   ;;
   ;; the name of LEAF as it appears in the source, e.g. 'FOO or '(SETF
@@ -1335,9 +1335,12 @@
   (eql-var-constraints     nil :type (or null (array t 1)))
   (inheritable-constraints nil :type (or null (array t 1)))
   (private-constraints     nil :type (or null (array t 1)))
+  (equality-constraints    nil :type (or null (array t 1)))
+
   ;; The FOP handle of the lexical variable represented by LAMBDA-VAR
   ;; in the fopcompiler.
-  (fop-value nil))
+  (fop-value nil)
+  source-form)
 (defprinter (lambda-var :identity t)
   %source-name
   #+sb-show id
@@ -1605,6 +1608,9 @@
   #+sb-show id
   (entry :test entry)
   (value :test value))
+
+(def!struct (no-op (:include node)
+                   (:copier nil)))
 
 ;;; a helper for the POLICY macro, defined late here so that the
 ;;; various type tests can be inlined

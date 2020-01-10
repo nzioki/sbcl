@@ -101,8 +101,10 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
  * or (x == bit) depending on the use-case */
 #define NOT_MOVABLE      0
 #define MOVABLE          1
-#define MOVABLE_LOW      2
+#define ALLOCATE_LOW     2
 #define IS_THREAD_STRUCT 4
+#define MOVABLE_LOW      (MOVABLE|ALLOCATE_LOW)
+#define IS_GUARD_PAGE    8
 extern os_vm_address_t os_validate(int movable,
                                    os_vm_address_t addr,
                                    os_vm_size_t len);
@@ -116,10 +118,10 @@ extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
-extern void os_map(int fd,
-                   int offset,
-                   os_vm_address_t addr,
-                   os_vm_size_t len);
+extern void load_core_bytes(int fd,
+                            int offset,
+                            os_vm_address_t addr,
+                            os_vm_size_t len);
 
 /* This presumably flushes the instruction cache, if that can be done
  * explicitly. (It doesn't seem to be an issue for the i386 port,

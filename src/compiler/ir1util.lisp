@@ -231,32 +231,38 @@
            (type node node))
   (unless (bind-p node)
     (aver (eq (node-lvar node) lvar)))
-  (let ((dest (lvar-dest lvar)))
+  (let ((dest (lvar-dest lvar))
+        ctran)
     (tagbody
      :next
-       (let ((ctran (node-next node)))
-         (cond (ctran
-                (setf node (ctran-next ctran))
-                (if (eq node dest)
-                    (return-from almost-immediately-used-p t)
-                    (typecase node
-                      (ref
-                       (go :next))
-                      (cast
-                       (when (and (memq (cast-type-check node) '(:external nil))
-                                  (eq dest (node-dest node)))
-                         (go :next)))
-                      (combination
-                       ;; KLUDGE: Unfortunately we don't have an attribute for
-                       ;; "never unwinds", so we just special case
-                       ;; %ALLOCATE-CLOSURES: it is easy to run into with eg.
-                       ;; FORMAT and a non-constant first argument.
-                       (when (eq '%allocate-closures (combination-fun-source-name node nil))
-                         (go :next))))))
-               (t
-                (when (eq (block-start (first (block-succ (node-block node))))
-                          (node-prev dest))
-                  (return-from almost-immediately-used-p t))))))))
+       (setf ctran (node-next node))
+     :next-ctran
+       (cond (ctran
+              (setf node (ctran-next ctran))
+              (if (eq node dest)
+                  (return-from almost-immediately-used-p t)
+                  (typecase node
+                    (ref
+                     (go :next))
+                    (cast
+                     (when (and (memq (cast-type-check node) '(:external nil))
+                                (eq dest (node-dest node)))
+                       (go :next)))
+                    (combination
+                     ;; KLUDGE: Unfortunately we don't have an attribute for
+                     ;; "never unwinds", so we just special case
+                     ;; %ALLOCATE-CLOSURES: it is easy to run into with eg.
+                     ;; FORMAT and a non-constant first argument.
+                     (when (eq '%allocate-closures (combination-fun-source-name node nil))
+                       (go :next))))))
+             (t
+              ;; Loops shouldn't cause a problem, either it will
+              ;; encounter a not "uninteresting" node, or the destination
+              ;; will be unreachable anyway.
+              (let ((start (block-start (first (block-succ (node-block node))))))
+                (when start
+                  (setf ctran start)
+                  (go :next-ctran))))))))
 
 ;;; Check that all the uses are almost immediately used and look through CASTs,
 ;;; as they can be freely deleted removing the immediateness
@@ -1757,15 +1763,15 @@
 ;;; This is called by locall-analyze-fun-1 after it convers a call to
 ;;; FUN into a local call.
 ;;; Presumably, the function can be no longer reused by new calls to
-;;; FUN, so the whole thing has to be removed from *FREE-FUNS*
-(defun note-local-functional (fun)
+;;; FUN, so the whole thing has to be removed from (FREE-FUN *IR1-NAMESPACE*).
+(defun note-local-functional (fun &aux (free-funs (free-funs *ir1-namespace*)))
   (declare (type functional fun))
   (when (and (leaf-has-source-name-p fun)
              (eq (leaf-source-name fun) (functional-debug-name fun)))
     (let* ((name (leaf-source-name fun))
-           (defined-fun (gethash name *free-funs*)))
+           (defined-fun (gethash name free-funs)))
       (when (defined-fun-p defined-fun)
-        (remhash name *free-funs*)))))
+        (remhash name free-funs)))))
 
 ;;; Return functional for DEFINED-FUN which has been converted in policy
 ;;; corresponding to the current one, or NIL if no such functional exists.
@@ -1977,7 +1983,8 @@
          (setf (basic-var-sets var)
                (delete node (basic-var-sets var)))))
       (cast
-       (flush-dest (cast-value node)))))
+       (flush-dest (cast-value node)))
+      (no-op)))
 
   (remove-from-dfo block)
   (values))
@@ -2365,8 +2372,8 @@ is :ANY, the function name is not checked."
   (values))
 
 ;;; Return a LEAF which represents the specified constant object. If
-;;; the object is not in *CONSTANTS*, then we create a new constant
-;;; LEAF and enter it. If we are producing a fasl file, make sure that
+;;; the object is not in (CONSTANTS *IR1-NAMESPACE*), then we create a new
+;;; constant LEAF and enter it. If we are producing a fasl file, make sure that
 ;;; MAKE-LOAD-FORM gets used on any parts of the constant that it
 ;;; needs to be.
 ;;;
@@ -2450,11 +2457,11 @@ is :ANY, the function name is not checked."
       #-sb-xc-host
       (when (and (not faslp) (simple-string-p object))
         (logically-readonlyize object nil))
-      (let ((hashp (and (boundp '*constants*)
+      (let ((hashp (and (boundp '*ir1-namespace*)
                         (if faslp
                             (file-coalesce-p object)
                             (core-coalesce-p object)))))
-        (awhen (and hashp (gethash object *constants*))
+        (awhen (and hashp (gethash object (constants *ir1-namespace*)))
           (return-from find-constant it))
         (when (and faslp (not (sb-fasl:dumpable-layout-p object)))
           (if namep
@@ -2462,7 +2469,7 @@ is :ANY, the function name is not checked."
               (maybe-emit-make-load-forms object)))
         (let ((new (make-constant object)))
           (when hashp
-            (setf (gethash object *constants*) new))
+            (setf (gethash object (constants *ir1-namespace*)) new))
           new)))))
 
 ;;; Return true if X and Y are lvars whose only use is a
@@ -2991,7 +2998,7 @@ is :ANY, the function name is not checked."
 
 ;;; If the dest is a LET variable use the variable refs.
 (defun map-all-lvar-dests (lvar fun)
-  (let ((dest (principal-lvar-dest lvar)))
+  (multiple-value-bind (dest lvar) (principal-lvar-dest-and-lvar lvar)
     (if (and (combination-p dest)
              (eq (combination-kind dest) :local))
         (let ((var (lvar-lambda-var lvar)))
@@ -3205,6 +3212,34 @@ is :ANY, the function name is not checked."
              (lvar-value lvar))
     t))
 
+(defun process-lvar-type-annotation (lvar annotation)
+  (let* ((uses (lvar-uses lvar))
+         (condition (case (lvar-type-annotation-context annotation)
+                      (:initform
+                       (if (policy (if (consp uses)
+                                       (car uses)
+                                       uses)
+                               (zerop type-check))
+                           'slot-initform-type-style-warning
+                           (return-from process-lvar-type-annotation)))
+                      (t
+                       'sb-int:type-warning)))
+         (type (lvar-type-annotation-type annotation)))
+    (cond ((not (types-equal-or-intersect (lvar-type lvar) type))
+           (%compile-time-type-error-warn annotation (type-specifier type)
+                                          (type-specifier (lvar-type lvar))
+                                          (lvar-all-sources lvar)
+                                          :condition condition))
+          ((consp uses)
+           (loop for use in uses
+                 for dtype = (node-derived-type use)
+                 unless (values-types-equal-or-intersect dtype type)
+                 do (%compile-time-type-error-warn annotation
+                                                   (type-specifier type)
+                                                   (type-specifier dtype)
+                                                   (list (node-source-form use))
+                                                   :condition condition))))))
+
 (defun process-annotations (lvar)
   (unless (and (combination-p (lvar-dest lvar))
                (lvar-fun-is
@@ -3228,7 +3263,9 @@ is :ANY, the function name is not checked."
                     (lvar-function-designator-annotation
                      (check-function-designator-lvar lvar annot))
                     (lvar-function-annotation
-                     (check-function-lvar lvar annot)))
+                     (check-function-lvar lvar annot))
+                    (lvar-type-annotation
+                     (process-lvar-type-annotation lvar annot)))
               (setf (lvar-annotation-fired annot) t))))))
 
 (defun add-annotation (lvar annotation)

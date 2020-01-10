@@ -31,9 +31,8 @@
   ;; constraint on the high end is that it must not exceed
   ;; WORD-SHIFT (defined below) due to the use of unboxed
   ;; word-aligned byte pointers as boxed values in various
-  ;; places.  FIXME: This should possibly be exposed for
-  ;; configuration via customize-target-features.
-  #+64-bit 1
+  ;; places.
+  #+64-bit (or #+ppc64 3 #-ppc64 1)
   ;; On 32-bit targets, this may be as low as 2 (for 30-bit
   ;; fixnums) and as high as 2 (for 30-bit fixnums).  The
   ;; constraint on the low end is simple overcrowding of the
@@ -159,6 +158,7 @@
                     (sb-fasl::descriptor-gspace code)))) ; use CODE, not SAP
               (sap-ref-8 (sap offset) `(sb-fasl::bvref-8 ,sap ,offset))
               (sap-ref-32 (sap offset) `(sb-fasl::bvref-32 ,sap ,offset))
+              (sap-ref-64 (sap offset) `(sb-fasl::bvref-64 ,sap ,offset))
               (sap-ref-word (sap offset) `(sb-fasl::bvref-word ,sap ,offset)))
      ,@body))
 

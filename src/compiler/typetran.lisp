@@ -187,6 +187,22 @@
               (t
                (delay-ir1-transform node :constraint)
                'test-value)))))
+
+(deftransform %type-constraint ((x type) * * :node node)
+  (delay-ir1-transform node :constraint)
+  nil)
+
+(defoptimizer (%type-constraint constraint-propagate) ((x type) node gen)
+  (declare (ignore node))
+  (let ((var (ok-lvar-lambda-var x gen)))
+    (when var
+      (let ((type (lvar-value type)))
+        (list (list 'typep var
+                    (if (ctype-p type)
+                        type
+                        (handler-case (careful-specifier-type type)
+                          (t () nil)))
+                    nil))))))
 
 ;;;; standard type predicates, i.e. those defined in package COMMON-LISP,
 ;;;; plus at least one oddball (%INSTANCEP)
@@ -246,8 +262,23 @@
 (deftransform consp ((x) ((not null)) * :important nil)
   '(listp x))
 
+;;; If X is known non-nil, then testing SYMBOLP can skip the "= NIL" part.
 (deftransform symbolp ((x) ((not null)) * :important nil)
   '(non-null-symbol-p x))
+(deftransform non-null-symbol-p ((object) (symbol) * :important nil)
+  `(not (eq object nil)))
+;;; CLHS: http://www.lispworks.com/documentation/HyperSpec/Body/t_symbol.htm#symbol
+;;;   "The consequences are undefined if an attempt is made to alter the home package
+;;;    of a symbol external in the COMMON-LISP package or the KEYWORD package."
+;;; Therefore, we can constant-fold if the symbol-package is one of those two.
+;;; Interestingly, we don't need any transform for (NOT SYMBOL)
+;;; because IR1-TRANSFORM-TYPE-PREDICATE knows that the intersection of the type
+;;; implied by KEYWORDP with any type that does not intersect SYMBOL is NIL.
+(deftransform keywordp ((x) ((constant-arg symbol)))
+  (let ((pkg (sb-xc:symbol-package (lvar-value x))))
+    (cond ((eq pkg *cl-package*) 'nil)
+          ((eq pkg *keyword-package*) 't)
+          (t (give-up-ir1-transform)))))
 
 ;;;; TYPEP source transform
 

@@ -146,6 +146,7 @@
                               (:copier nil))
   (common-id dchunk-zero :type dchunk)  ; applies to *parent's* mask
   (subspace (missing-arg) :type (or inst-space instruction)))
+(declaim (freeze-type inst-space-choice))
 
 ;;;; searching for an instruction in instruction space
 
@@ -301,6 +302,7 @@
   (offset 0 :type offset)
   (fun (missing-arg) :type function)
   (before-address nil :type (member t nil)))
+(declaim (freeze-type offs-hook))
 
 (defmethod print-object ((seg segment) stream)
   (print-unreadable-object (seg stream :type t)
@@ -366,8 +368,7 @@
            (ignore chunk)
            (type (or null stream) stream)
            (type disassem-state dstate))
-  (when (and (aligned-p (+ (seg-virtual-location (dstate-segment dstate))
-                           (dstate-cur-offs dstate))
+  (when (and (aligned-p (dstate-cur-addr dstate)
                         (* 2 sb-vm:n-word-bytes))
              ;; Check type.
              (= (sap-ref-8 (dstate-segment-sap dstate)
@@ -420,9 +421,7 @@
            (ignore chunk)
            (type (or null stream) stream)
            (type disassem-state dstate))
-  (let ((location
-         (+ (seg-virtual-location (dstate-segment dstate))
-            (dstate-cur-offs dstate)))
+  (let ((location (dstate-cur-addr dstate))
         (alignment (dstate-alignment dstate)))
     (unless (aligned-p location alignment)
       (when stream
@@ -506,20 +505,108 @@
       (print-bytes (+ prefix-len alignment) stream dstate))
     (incf (dstate-next-offs dstate) alignment)))
 
-(defstruct (filtered-arg (:copier nil) (:predicate nil) (:constructor nil))
-  next)
-;;; Return an arbitrary object (one that is a subtype of FILTERED-ARG)
-;;; that is automatically returned to the dstate's filtered-arg-pool
+;;; Return an object that is automatically returned to the dstate's filtered-arg-pool
 ;;; after disassembly of the current instruction.
-;;; Any given disassembler backend must use the same constructor for
-;;; its filtered args that participate in the pool.
+;;; Any given disassembler backend must use the same constructor for its filtered args
+;;; that participate in the pool, and must manually initialize those objects, because
+;;; the value could be a recycled one from the pool.
 (defun new-filtered-arg (dstate constructor)
-  (let ((arg (dstate-filtered-arg-pool-free dstate)))
-    (if arg
-        (setf (dstate-filtered-arg-pool-free dstate) (filtered-arg-next arg))
-        (setf arg (funcall constructor)))
-    (sb-c::push-in filtered-arg-next arg (dstate-filtered-arg-pool-in-use dstate))
-    arg))
+  (let ((list (dstate-filtered-arg-pool-free dstate)))
+    (unless list
+      (setf list (list (funcall constructor))))
+    (prog1 (car list)
+      (setf (dstate-filtered-arg-pool-free dstate) (cdr list))
+      (setf (cdr list) (dstate-filtered-arg-pool-in-use dstate)
+            (dstate-filtered-arg-pool-in-use dstate) list))))
+
+(defmacro get-dchunk (state)
+  (if (= sb-assem:+inst-alignment-bytes+ 1)
+      ;; Don't read beyond the segment. This can occur with DISASSEMBLE-MEMORY
+      ;; on a function whose code ends in pad bytes that are not an integral
+      ;; number of instructions, and maybe you're so unlucky as to be
+      ;; on the exact last page of your heap.
+      ;; For 8-byte words and 7-byte dchunks, we use SAP-REF-WORD, which reads
+      ;; 8 bytes, so make sure the number of bytes to go is 8,
+      ;; never mind that dchunk-bits is less.
+      `(logand (cond ((>= bytes-remaining sb-vm:n-word-bytes)
+                      (sap-ref-word (dstate-segment-sap ,state) (dstate-cur-offs ,state)))
+                     (t
+                      (setf (dstate-scratch-buf ,state) 0)
+                      (%byte-blt (dstate-segment-sap ,state) (dstate-cur-offs ,state)
+                                 (struct-slot-sap ,state disassem-state scratch-buf) 0
+                                 bytes-remaining)
+                      (dstate-scratch-buf ,state)))
+               dchunk-one)
+      ;; This was some sort of meagre attempt to be endian-agnostic.
+      ;; Perhaps it should just use SAP-REF-n directly?
+      `(the dchunk (sap-ref-int (dstate-segment-sap ,state)
+                                (dstate-cur-offs ,state)
+                                (ecase dchunk-bits (32 4) (64 8))
+                                (dstate-byte-order ,state)))))
+
+;;; Apply field prefilters, parsing any additional suffix bytes as needed for
+;;; variable-length instructions.
+;;; Store results into DSTATE and update the next-offs accordingly.
+(defun apply-prefilters (dstate inst chunk)
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  (dolist (item (inst-prefilters inst))
+    ;; item = #(INDEX FUNCTION SIGN-EXTEND-P BYTE-SPEC ...).
+    (flet ((extract-byte (spec-index)
+             (let* ((byte-spec (svref item spec-index))
+                    (integer (dchunk-extract chunk byte-spec)))
+               (if (svref item 2) ; SIGN-EXTEND-P
+                   (sign-extend integer (byte-size byte-spec))
+                   integer))))
+          (let ((item-length (length item))
+                (fun (the function (svref item 1))))
+            (setf (svref (dstate-filtered-values dstate) (svref item 0))
+                  (case item-length
+                   (2 (funcall fun dstate)) ; no subfields
+                   (3 (bug "Bogus prefilter"))
+                   (4 (funcall fun dstate (extract-byte 3))) ; one subfield
+                   (5 (funcall fun dstate ; two subfields
+                               (extract-byte 3) (extract-byte 4)))
+                   (t (apply fun dstate ; > 2 subfields
+                             (loop for i from 3 below item-length
+                                   collect (extract-byte i))))))))))
+
+;;; Decode the instruction at the current ofset in the segment of DSTATE.
+;;; Call this only when all of the following hold:
+;;;  - *DISASSEM-INST-SPACE* has been constructed
+;;;  - the code object referenced in the DSTATE is pinned
+;;;  - the instructions are not so near the end of the code that buffer overrun
+;;;    could occur. Since any code object containing at least one simple-fun has
+;;;    8 bytes of trailer data, this is safe under normal circumstances.
+(defun disassemble-instruction (dstate)
+  (declare (type disassem-state dstate))
+  (setf (dstate-inst-properties dstate) 0)
+  (setf (dstate-filtered-arg-pool-in-use dstate) nil)
+  (loop
+   ;; There is no point to using GET-DCHUNK. How many bytes remain is unknown.
+   (let* ((chunk (logand (sap-ref-word (dstate-segment-sap dstate)
+                                       (dstate-cur-offs dstate))
+                         dchunk-one))
+          (inst (find-inst chunk *disassem-inst-space*)))
+     (aver inst)
+     (let ((offs (+ (dstate-cur-offs dstate) (inst-length inst))))
+       (setf (dstate-next-offs dstate) offs)
+       (apply-prefilters dstate inst chunk)
+       ;; Grab the revised NEXT-OFFS
+       (setf (dstate-cur-offs dstate) (dstate-next-offs dstate))
+       ;; Return the first instruction which has a printer.
+       ;; On the x86 architecture, this would skip over segment override
+       ;; prefixes, and the LOCK, REX, REP prefixes, etc.
+       (awhen (inst-printer inst)
+         (funcall it chunk inst nil dstate)
+         ;; This won't deal with a prefix (i.e. printerless) instruction that
+         ;; also has a "control" function.
+         ;; That's probably not a meaningful combination.
+         (awhen (inst-control inst)
+           (funcall it chunk inst nil dstate)
+           ;; FIXME: we're not returning the opaque bytes in any way
+           (setf (dstate-cur-offs dstate) (dstate-next-offs dstate)))
+         (return (prog1 (cons (inst-name inst) (nreverse (dstate-operands dstate)))
+                   (setf (dstate-operands dstate) nil))))))))
 
 ;;; Iterate through the instructions in SEGMENT, calling FUNCTION for
 ;;; each instruction, with arguments of CHUNK, STREAM, and DSTATE.
@@ -555,9 +642,10 @@
 
     (rewind-current-segment dstate segment)
 
-    (#-gencgc progn
-     #+gencgc with-pinned-objects #+gencgc ((seg-object (dstate-segment dstate))
-                                              (dstate-scratch-buf dstate))
+    ;; Do not pin anything yet if using cheneygc, as that would inhibit GC
+    ;; with a larger scope than intended.
+    (with-pinned-objects (#+gencgc (seg-object (dstate-segment dstate))
+                          #+gencgc dstate) ; for SAP access to SCRATCH-BUF
      #+gencgc (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
 
      ;; Now commence disssembly of instructions
@@ -582,31 +670,9 @@
         (with-pinned-segment
          (let* ((bytes-remaining (- (seg-length (dstate-segment dstate))
                                     (dstate-cur-offs dstate)))
-                (chunk
-                 (if (= sb-assem:+inst-alignment-bytes+ 1)
-                     ;; Don't read beyond the segment. This can occur with DISASSEMBLE-MEMORY
-                     ;; on a function whose code ends in pad bytes that are not an integral
-                     ;; number of instructions, and maybe you're so unlucky as to be
-                     ;; on the exact last page of your heap.
-                     ;; For 8-byte words and 7-byte dchunks, we use SAP-REF-WORD, which reads
-                     ;; 8 bytes, so make sure the number of bytes to go is 8,
-                     ;; never mind that dchunk-bits is less.
-                     (if (< bytes-remaining sb-vm:n-word-bytes)
-                         (let ((temp (dstate-scratch-buf dstate)))
-                           (setf (%vector-raw-bits temp 0) 0)
-                           (%byte-blt (dstate-segment-sap dstate) (dstate-cur-offs dstate)
-                                      temp 0 bytes-remaining)
-                           (sap-ref-word (vector-sap temp) 0))
-                         (logand (sap-ref-word (dstate-segment-sap dstate)
-                                               (dstate-cur-offs dstate))
-                                 dchunk-one))
-                     (the dchunk
-                          (sap-ref-int (dstate-segment-sap dstate)
-                                       (dstate-cur-offs dstate)
-                                       (ecase dchunk-bits (32 4) (64 8))
-                                       (dstate-byte-order dstate)))))
-
+                (chunk (get-dchunk dstate))
                 (fun-prefix-p (call-fun-hooks chunk stream dstate)))
+           (declare (index bytes-remaining))
            (if (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
                (setf prefix-p fun-prefix-p)
                (let ((inst (find-inst chunk ispace)))
@@ -624,38 +690,15 @@
                           (terpri stream))
                         (return))
                        (t
+                        (setf (dstate-inst dstate) inst)
                         (setf (dstate-next-offs dstate)
-                              (+ (dstate-cur-offs dstate)
-                                 (inst-length inst)))
+                              (+ (dstate-cur-offs dstate) (inst-length inst)))
+                        (when stream
+                          (print-inst (inst-length inst) stream dstate
+                                      :trailing-space nil))
                         (let ((orig-next (dstate-next-offs dstate)))
-                          (when stream
-                            (print-inst (inst-length inst) stream dstate
-                                        :trailing-space nil))
-
-                          (dolist (item (inst-prefilters inst))
-                            (declare (optimize (sb-c::insert-array-bounds-checks 0)))
-                            ;; item = #(INDEX FUNCTION SIGN-EXTEND-P BYTE-SPEC ...).
-                            (flet ((extract-byte (spec-index)
-                                     (let* ((byte-spec (svref item spec-index))
-                                            (integer (dchunk-extract chunk byte-spec)))
-                                       (if (svref item 2) ; SIGN-EXTEND-P
-                                           (sign-extend integer (byte-size byte-spec))
-                                           integer))))
-                              (let ((item-length (length item))
-                                    (fun (the function (svref item 1))))
-                                (setf (svref (dstate-filtered-values dstate) (svref item 0))
-                                      (case item-length
-                                        (2 (funcall fun dstate)) ; no subfields
-                                        (3 (bug "Bogus prefilter"))
-                                        (4 (funcall fun dstate (extract-byte 3))) ; one subfield
-                                        (5 (funcall fun dstate ; two subfields
-                                                    (extract-byte 3) (extract-byte 4)))
-                                        (t (apply fun dstate ; > 2 subfields
-                                                  (loop for i from 3 below item-length
-                                                        collect (extract-byte i)))))))))
-
+                          (apply-prefilters dstate inst chunk)
                           (setf prefix-p (null (inst-printer inst)))
-
                           (when stream
                             ;; Print any instruction bytes recognized by
                             ;; the prefilter which calls read-suffix and
@@ -695,12 +738,9 @@
           (print-notes-and-newline stream dstate))
         (setf (dstate-output-state dstate) nil))
       (unless prefix-p
-        (let ((arg (dstate-filtered-arg-pool-in-use dstate)))
-          (loop (unless arg (return))
-                (let ((saved-next (filtered-arg-next arg)))
-                  (sb-c::push-in filtered-arg-next arg
-                                 (dstate-filtered-arg-pool-free dstate))
-                  (setq arg saved-next))))
+        (setf (dstate-filtered-arg-pool-free dstate)
+              (nconc (dstate-filtered-arg-pool-free dstate)
+                     (dstate-filtered-arg-pool-in-use dstate)))
         (setf (dstate-filtered-arg-pool-in-use dstate) nil)
         (setf (dstate-inst-properties dstate) 0)))))))
 
@@ -736,6 +776,15 @@
   ;; add labels at the beginning with a label-number of nil; we'll notice
   ;; later and fill them in (and sort them)
   (declare (type disassem-state dstate))
+  ;; Holy cow, is this flaky. The problem is that labels are computed as absolute
+  ;; addresses, yet GC is (in theory) able to relocate the code while disassembling.
+  ;; The labels wouldn't make sense if that happens.
+  ;; I'm disinclined to revise all of the backends to compute labels relative to
+  ;; code-instructions. Probably we shouldn't try to support code movement while
+  ;; disassembling, it's just not worth the headache.
+  ;; However, a potential fix might be to pin the code while scanning it for
+  ;; labels, then relativize all labels to the segment base.
+  ;; When disassembling arbitrary memory, relativization would be skipped.
   (let ((labels (dstate-labels dstate)))
     (map-segment-instructions
      (lambda (chunk inst)
@@ -775,9 +824,21 @@
                  (push (cons adjusted-value nil) labels)))))
      segment
      dstate)
-    (setf (dstate-labels dstate) labels)
     ;; erase any notes that got there by accident
-    (setf (dstate-notes dstate) nil)))
+    (setf (dstate-notes dstate) nil)
+    ;; add labels from code header jump tables. As noted above,
+    ;; this is buggy if code moves, but no worse than anything else.
+    ;; CODE-JUMP-TABLE-WORDS = 0 if the architecture doesn't have jump tables.
+    (binding* ((code (seg-code segment) :exit-if-null))
+      (with-pinned-objects (code)
+        (loop with insts = (code-instructions code)
+              for i from 1 below (code-jump-table-words code)
+              do (pushnew (cons (sap-ref-word insts (ash i sb-vm:word-shift)) nil)
+                          labels :key #'car
+                          ;; FIXME: compiler uses EQ instead of EQL unless forced
+                          :test #'=))))
+    ;; Return the new list
+    (setf (dstate-labels dstate) labels)))
 
 ;;; If any labels in DSTATE have been added since the last call to
 ;;; this function, give them label-numbers, enter them in the
@@ -886,9 +947,7 @@
 (defun print-current-address (stream dstate)
   (declare (type stream stream)
            (type disassem-state dstate))
-  (let* ((location
-          (+ (seg-virtual-location (dstate-segment dstate))
-             (dstate-cur-offs dstate)))
+  (let* ((location (dstate-cur-addr dstate))
          (location-column-width *disassem-location-column-width*)
          (plen ; the number of rightmost hex chars of this address to print
           (or (dstate-addr-print-len dstate)
@@ -1563,6 +1622,11 @@
   (setf (dstate-labels dstate)
         (remove-if (lambda (lab)
                      (not
+                      ;; Ok, this is bogus when you want to show the code
+                      ;; as if the origin were 0 (perhaps to compare
+                      ;; two disssemblies that should be the same).
+                      ;; Maybe that's a another good reason to store
+                      ;; labels as relativized.
                       (some (lambda (seg)
                               (let ((start (seg-virtual-location seg)))
                                 (<= start
@@ -1750,8 +1814,24 @@
               (get-code-segments code-component))))
     (when use-labels
       (label-segments segments dstate))
-    (disassemble-segments segments stream dstate)))
+    (disassemble-segments segments stream dstate)
+    (let ((n (code-jump-table-words code-component)))
+      (when (> n 1)
+        (format stream "; Jump table (~d entries)~%" (1- n))
+        (let ((sap (code-instructions code-component)))
+          (dotimes (i (1- n))
+            (let ((a (sap-ref-word sap (ash (1+ i) sb-vm:word-shift))))
+              (format stream "; ~vt~v,'02x = ~a~%"
+                      (+ label-column-width
+                         (dstate-addr-print-len dstate)
+                         3) ; i don't know what 3 means
+                      (* 2 sb-vm:n-word-bytes)
+                      a
+                      (gethash a (dstate-label-hash dstate))))))))))
 
+;;; This convenience function has two syntaxes depending on what OBJECT is:
+;;;   (DIS OBJ &optional STREAM)
+;;;   (DIS ADDR|SAP LENGTH &optional STREAM)
 (defun sb-c:dis (object &optional length (stream *standard-output* streamp))
   (typecase object
    ((or address system-area-pointer)
@@ -1759,11 +1839,14 @@
     (disassemble-memory object length :stream stream))
    (t
     (aver (not streamp))
-    (when (and (symbolp object) (special-operator-p object))
-      ;; What could it do- disassemble the interpreter?
-      (error "Can't disassemble a special operator"))
-    (dolist (fun (get-compiled-funs object))
-      (disassemble-code-component fun :stream (or length stream))))))
+    (when length
+      (setq stream length))
+    (dolist (thing (cond ((code-component-p object) (list object))
+                         ((and (symbolp object) (special-operator-p object))
+                          ;; What could it do- disassemble the interpreter?
+                          (error "Can't disassemble a special operator"))
+                         (t (get-compiled-funs object))))
+      (disassemble-code-component thing :stream stream)))))
 
 ;;;; code to disassemble assembler segments
 
@@ -1820,45 +1903,6 @@
 (defun grok-nil-indexed-symbol-slot-ref (byte-offset)
   (declare (type offset byte-offset))
   (grok-symbol-slot-ref (+ sb-vm:nil-value byte-offset)))
-
-;;; Return the Lisp object located BYTE-OFFSET from NIL.
-(defun get-nil-indexed-object (byte-offset)
-  (declare (type offset byte-offset))
-  (make-lisp-obj (+ sb-vm:nil-value byte-offset)))
-
-;;; Return two values; the Lisp object located at BYTE-OFFSET in the
-;;; constant area of the code-object in the current segment and T, or
-;;; NIL and NIL if there is no code-object in the current segment.
-(defun get-code-constant (byte-offset dstate)
-  (declare (type offset byte-offset)
-           (type disassem-state dstate))
-  (let ((code (seg-code (dstate-segment dstate))))
-    (if code
-        (values (code-header-ref code
-                                 (ash (+ byte-offset sb-vm:other-pointer-lowtag)
-                                      (- sb-vm:word-shift)))
-                t)
-        (values nil nil))))
-
-;;; Return the lisp object at ADDR in the code component being disassembled.
-;;; Since we've already decided what the ADDR is, there is nothing that
-;;; has to be done to pin objects or disable GC here - if the object can
-;;; move, then ADDR is already potentially wrong.
-(defun get-code-constant-absolute (addr dstate &optional width
-                                   &aux (code (seg-code (dstate-segment dstate))))
-  (declare (type address addr))
-  (declare (type disassem-state dstate))
-  (declare (ignore width))
-  (if (null code)
-     (values nil nil)
-     (let* ((n-header-bytes (* (code-header-words code) sb-vm:n-word-bytes))
-            (header-addr (- (get-lisp-obj-address code)
-                            sb-vm:other-pointer-lowtag))
-            (code-start (+ header-addr n-header-bytes)))
-         (cond ((< header-addr addr code-start)
-                (values (sap-ref-lispobj (int-sap addr) 0) t))
-               (t
-                (values nil nil))))))
 
 (define-load-time-global *assembler-routines-by-addr* nil)
 
@@ -1917,17 +1961,20 @@
 
 (defun sap-ref-int (sap offset length byte-order)
   (declare (type system-area-pointer sap)
+           (fixnum offset)
            (type (member 1 2 4 8) length)
            (type (member :little-endian :big-endian) byte-order))
   (if (or (eq length 1)
           (and (eq byte-order #+big-endian :big-endian #+little-endian :little-endian)
                #-(or arm arm64 ppc ppc64 x86 x86-64) ; unaligned loads are ok for these
                (not (logtest (1- length) (sap-int (sap+ sap offset))))))
-      (case length
-        (8 (sap-ref-64 sap offset))
-        (4 (sap-ref-32 sap offset))
-        (2 (sap-ref-16 sap offset))
-        (1 (sap-ref-8 sap offset)))
+      (locally
+       (declare (optimize (safety 0))) ; disregard shadow memory for msan
+       (case length
+         (8 (sap-ref-64 sap offset))
+         (4 (sap-ref-32 sap offset))
+         (2 (sap-ref-16 sap offset))
+         (1 (sap-ref-8 sap offset))))
       (binding* (((offset increment)
                   (cond ((eq byte-order :big-endian) (values offset +1))
                         (t (values (+ offset (1- length)) -1))))
@@ -1937,6 +1984,7 @@
           (setq val (logior (ash val 8) (sap-ref-8 sap offset)))
           (incf offset increment)))))
 
+;;; Extract a trailing field starting at NEXT-OFFS, and update NEXT-OFFS.
 (defun read-suffix (length dstate)
   (declare (type (member 8 16 32 64) length)
            (type disassem-state dstate)
@@ -1965,33 +2013,63 @@
       (prin1-short thing stream)
       (prin1-short `',thing stream)))
 
-;;; Store a note about the lisp constant located BYTE-OFFSET bytes
-;;; from the current code-component, to be printed as an end-of-line
-;;; comment after the current instruction is disassembled.
-(defun note-code-constant (byte-offset dstate)
-  (declare (type offset byte-offset)
-           (type disassem-state dstate))
-  (multiple-value-bind (const valid)
-      (get-code-constant byte-offset dstate)
-    (when valid
-      (note (lambda (stream)
-              (prin1-quoted-short const stream))
-            dstate))
-    const))
+(defun tab (column stream)
+  (when stream
+    (funcall (formatter "~V,1t") stream column))
+  nil)
+(defun tab0 (column stream)
+  (funcall (formatter "~V,0t") stream column)
+  nil)
 
-;;; Store a note about the lisp constant located at ADDR in the
-;;; current code-component, to be printed as an end-of-line comment
-;;; after the current instruction is disassembled.
-(defun note-code-constant-absolute (addr dstate &optional width)
-  (declare (type address addr)
-           (type disassem-state dstate))
-  (multiple-value-bind (const valid)
-      (get-code-constant-absolute addr dstate width)
-    (when valid
-      (note (lambda (stream)
-              (prin1-quoted-short const stream))
-            dstate))
-    (values const valid)))
+(defun princ16 (value stream)
+  (write value :stream stream :radix t :base 16 :escape nil))
+
+;;; Store a note about the lisp constant at LOCATION in the code object
+;;; being disassembled, to be printed as an end-of-line comment.
+;;; The interpretation of LOCATION depends on HOW as follows:
+;;; - if :INDEX, then LOCATION is directly the argument to CODE-HEADER-REF.
+;;; - if :RELATIVE, then it is is a byte displacement beyond CODE.
+;;; - if :ABSOLUTE, then it is an address (I'm not sure if this an address
+;;    beyond DSTATE-SEGMENT-SAP or SEGMENT-VIRTUAL-LOCATION when those differ)
+;;; In any case, if the offset indicates a location outside of the
+;;; boxed constants, nothing is printed.
+
+(defun note-code-constant (location dstate &optional (how :relative))
+  (declare (type disassem-state dstate))
+  (binding* ((code (seg-code (dstate-segment dstate)))
+             ((addr index)
+              (ecase how
+               (:relative
+                ;; When CODE-TN has a lowtag (as it usually does), we add it in here.
+                ;; x86-64 does not have a code-tn, but it behaves like ppc64
+                ;; in that the displacement is relative to the base of the code.
+                (let ((addr (+ location
+                               #-(or x86-64 ppc64) sb-vm:other-pointer-lowtag)))
+                  (values addr (ash addr (- sb-vm:word-shift)))))
+               (:absolute
+                ;; Concerning object movement:
+                ;; Since we've already decided what the ADDR is, there is nothing that
+                ;; has to be done to pin objects or disable GC here - if the object
+                ;; is movable, then ADDR is already potentially wrong unless the caller
+                ;; took care of immobilizing the DSTATE's code blob.
+                ;; It's OK to compute a bogus address (when CODE is NIL). It's just math.
+                (values location
+                        (ash (- location (- (get-lisp-obj-address code)
+                                            sb-vm:other-pointer-lowtag))
+                             (- sb-vm:word-shift))))
+               (:index
+                (values nil location)))))
+    ;; Cautiously avoid reading any word index that is not within the
+    ;; boxed portion of the header.
+    ;; The metadata at index 1 is not considered a valid index.
+    (cond ((and code (< 1 index (code-header-words code)))
+           (when addr ; ADDR must be word-aligned to be sensible
+             (aver (not (logtest addr (ash sb-vm:lowtag-mask -1)))))
+           (let ((const (code-header-ref code index)))
+             (note (lambda (stream) (prin1-quoted-short const stream)) dstate)
+             (values const t)))
+          (t
+           (values nil nil)))))
 
 ;;; If the memory address located NIL-BYTE-OFFSET bytes from the
 ;;; constant NIL is a valid slot in a symbol, store a note describing
@@ -2017,14 +2095,21 @@
 ;;; symbol and slot, to be printed as an end-of-line comment after the
 ;;; current instruction is disassembled. Returns non-NIL iff a note
 ;;; was recorded.
+;;; If the address is the start of an assembly routine, print it as
+;;; a symbol without a quote.
 (defun maybe-note-nil-indexed-object (nil-byte-offset dstate)
   (declare (type offset nil-byte-offset)
            (type disassem-state dstate))
-  (let ((obj (get-nil-indexed-object nil-byte-offset)))
-    (note (lambda (stream)
-            (prin1-quoted-short obj stream))
-          dstate)
-    t))
+  (binding* ((addr (+ sb-vm:nil-value nil-byte-offset))
+             ((obj validp) (make-lisp-obj addr nil)))
+    (when validp
+      ;; ambiguous case - the backend could potentially use NIL
+      ;; to compute certain arbitrary fixnums.
+      (awhen (and (fixnump obj) (find-assembler-routine addr))
+        (note (lambda (stream) (prin1-short it stream)) dstate)
+        (return-from maybe-note-nil-indexed-object t))
+      (note (lambda (stream) (prin1-quoted-short obj stream)) dstate)
+      t)))
 
 ;;; If ADDRESS is the address of a primitive assembler routine or
 ;;; foreign symbol, store a note describing which one, to be printed
@@ -2145,25 +2230,26 @@
 ;;;   1) a SYSTEM-AREA-POINTER
 ;;;   2) a BYTE-OFFSET from the SAP to begin at
 ;;; It should read information from the SAP starting at BYTE-OFFSET, and
-;;; return four values:
+;;; return five values:
 ;;;   1) the error number
 ;;;   2) the total length, in bytes, of the information
 ;;;   3) a list of SC-OFFSETs of the locations of the error parameters
 ;;;   4) a list of the length (as read from the SAP), in bytes, of each
 ;;;      of the return values.
+;;;   5) a boolean indicating whether to disassemble 1 byte prior to
+;;;      decoding the SC+OFFSETs.  (This byte is literally the byte in
+;;;      memory, which is distinct from the 'error number')
 (defun handle-break-args (error-parse-fun trap-number stream dstate)
   (declare (type function error-parse-fun)
            (type (or null stream) stream)
            (type disassem-state dstate))
-  (when (or (= trap-number sb-vm:cerror-trap)
-            (>= trap-number sb-vm:error-trap))
-   (multiple-value-bind (errnum adjust sc+offsets lengths error-byte)
+  (multiple-value-bind (errnum adjust sc+offsets lengths error-byte)
        (funcall error-parse-fun
                 (dstate-segment-sap dstate)
                 (dstate-next-offs dstate)
                 trap-number
                 (null stream))
-     (when stream
+    (when stream
        (setf (dstate-cur-offs dstate)
              (dstate-next-offs dstate))
        (flet ((emit-err-arg ()
@@ -2181,13 +2267,10 @@
          (emit-note (symbol-name (get-internal-error-name errnum)))
          (dolist (sc+offset sc+offsets)
            (emit-err-arg)
-           (if (= (sb-c:sc+offset-scn sc+offset)
-                  sb-vm:constant-sc-number)
-               (note-code-constant (* (1- (sb-c:sc+offset-offset sc+offset))
-                                      sb-vm:n-word-bytes)
-                                   dstate)
+           (if (= (sb-c:sc+offset-scn sc+offset) sb-vm:constant-sc-number)
+               (note-code-constant (sb-c:sc+offset-offset sc+offset) dstate :index)
                (emit-note (get-random-tn-name sc+offset))))))
-     (incf (dstate-next-offs dstate) adjust))))
+    (incf (dstate-next-offs dstate) adjust)))
 
 ;;; arm64 stores an error-number in the instruction bytes,
 ;;; so can't easily share this code.

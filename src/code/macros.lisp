@@ -205,6 +205,7 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; CASE, TYPECASE, and friends
 
 ;;; Make this a full warning during SBCL build.
+#+sb-xc ; Don't redefine if recompiling in a warm REPL
 (define-condition duplicate-case-key-warning (#-sb-xc-host style-warning #+sb-xc-host warning)
   ((key :initarg :key
         :reader case-warning-key)
@@ -222,6 +223,628 @@ invoked. In that case it will store into PLACE and start over."
         (case-warning-case-kind condition)
         (duplicate-case-key-warning-occurrences condition)))))
 
+#|
+;;; ---------------------------------------------------------------------------
+;;; And now some theory about how to turn CASE expressions which dispatch on
+;;; symbols into expressions which dispatch on numbers instead. The idea is
+;;; to use SYMBOL-HASH. It is easily enforceable that symbols referenced from
+;;; compiled code have a hash, though generally SYMBOL-HASH is lazily computed.
+;;; The masked hash maps to an integer from 0 to (ASH 1 nbits) which will be
+;;; dispatched via a jump table on compiler backends which support jump tables.
+
+;;; There are complications that make any naive attempt to dispatch on hash
+;;; inadmissible. First off, any symbol could hash to the hash of a symbol
+;;; in the dispatched set, so there always has to be a check for a match on
+;;; the symbol. That's the easy part. The difficulty is figuring out what to
+;;; do with hash collisions; but worse, symbols within a given clause of the
+;;; CASE (having the same consequent) may hash differently.
+;;; Consider one example.
+
+(CASE sym
+ ((u v) (cc1)) ; "CC" designates the "canonical clause" in that ordinal position
+ ((w x) (cc2))
+ ((y z) (cc3)))
+
+;;; In reality, we would probably find a subset of bits of SYMBOL-HASH producing
+;;; unique bins, but suppose for argument's sake that there are collisions:
+
+hash bin 0: (u . cc1) (w . cc2)
+hash bin 1: (v . cc1) (y . cc3)
+hash bin 2: (x . cc2) (z . cc3)
+hash bin 3: - empty -
+
+;;; Something has to be done to resolve the selection of the consequent.
+;;; Described below are 4 possible techniques.
+
+;;; Option (I)
+;;; Syntactically repeat clause consequents giving a literal rendering
+;;; of the hash-table.  This is a poor choice unless the consequent
+;;; is a self-evaluating object. But it has the nice property of invoking
+;;; at most one IF after the jump-table-based dispatch.
+
+(case hash
+  (0 (if (eq sym 'u) (cc1) (cc2)))  ; each canonical consequent appears twice
+  (1 (if (eq sym 'v) (cc1) (cc3)))
+  (2 (if (eq sym 'x) (cc2) (cc3))))
+
+;;; Option (II)
+;;; Merge bins to create equivalence classes by canonical clause.
+
+(case hash
+  ((0 1) (case sym (y (cc3)) (w (cc2)) (otherwise (cc1))))
+  (2 (if (eq sym 'x) (cc2) (cc3)))
+
+;;; So this expansion has avoided inserting the s-expression CC1 more than once,
+;;; but it inserts CC2 and CC3 each twice.  If those are not self-evaluating
+;;; literals, then we should further merge (0 1) with (2). Doing the second
+;;; merge lumps everything into 1 bin which is as bad as, if not worse than,
+;;; a chain if IF expressions testing the original symbol.
+;;; i.e. bin merging could make the hashing operation pointless.
+
+;;; Option (III)
+;;; Use a "two-stage" decode.
+;;; This makes the consequent of the inner case side-effect free,
+;;; but is probably not great for performance, though is an elegant
+;;; rendition of the equivalence class technique.
+
+(let ((original-clause-index
+       (case hash
+        (0 (if (eq sym 'u) 1 2))
+        (1 (if (eq sym 'v) 1 3))
+        (2 (if (eq sym 'x) 2 3)))))
+  (case original-clause-index (1 (cc1)) (2 (cc2)) (3 (cc3))))
+
+;;; Option (IV)
+;;; Expand involving a tagbody, which though slightly ugly, presumably produces
+;;; decent assembly code.
+
+(block b
+ (tagbody
+
+   (case hash
+     (0 (if (eq sym 'u) (go clause1) (go clause2)))
+     (1 (if (eq sym 'v) (go clause1) (go clause3)))
+     (2 (if (eq sym 'x) (go clause2) (go clause3))))
+   clause1 (return-from b (progn (cc1)))
+   clause2 (return-from b (progn (cc2)))
+   ...))
+
+;;; Additionally, if some bin has only 1 possibility, the GO is elided
+;;; and we can just do (return-from b (consequent)).
+
+;;; In practice, the expander does something not entirely unlike any of the above.
+;;; It will insert a consequent more than one time if it is a self-evaluating object,
+;;; and it will merge bins provided that the merging is simple and does not
+;;; introduce any new IF expressions.
+
+;;; A minimal example that won't work - after forcing the expander to try to
+;;; operate on just 4 symbols which normally it would not try to process:
+;;; (CASE (H) ((U V) (F)) ((:U :Z) Y))
+clause 0 -> bins (2 3)
+clause 1 -> bins (1 2)
+bin 0 -> NIL
+bin 1 -> ((:Z . 1))
+bin 2 -> ((:U . 1) (U . 0))
+bin 3 -> ((V . 0))
+symbol-case giving up: case=((V U) (F))
+
+;;; ---------------------------------------------------------------------------
+|#
+
+;;; For the specified symbols, choose bits from the hash producing as near a
+;;; perfect hash function as can be achived without extraction of one
+;;; byte or logxor of two bytes.
+;;; This will fail to find a unique hash if there are symbols whose names are
+;;; spelled the same, since their SXHASHes are the same.
+;;;
+;;; HASH-FUN is taken as an argument mainly for testing purposes so that any
+;;; behavior can be simulated without having to bother with finding symbols
+;;; whose SXHASH hashes collide.
+;;;
+;;; FIXME: If not a perfect hash, then the best choice should be informed by a
+;;; cost function that takes into account which symbols share a clause of the
+;;; CASE form. Prefer collisions on symbols whose consequent in the CASE
+;;; is the same, otherwise the expansion becomes convoluted.
+
+(defun pick-best-sxhash-bits (keys &optional (hash-fun 'sxhash)
+                                             (maxbytes 2)
+                                             (maxbits sb-vm:n-positive-fixnum-bits))
+  (declare (type (member 1 2) maxbytes))
+  (unless keys
+    (bug "Give me some objects")) ; it beats getting division by zero error
+  (let* ((nkeys (length keys))
+         (ideal-table-size (power-of-two-ceiling nkeys))
+         (required-nbits (integer-length (1- ideal-table-size)))
+         ;; If each bin has 2 items in it (which isn't ideal), then the table could
+         ;; be half the "required" minimum size. This occurs with symbol sets such
+         ;; as {AND, NOT, OR, :AND, :NOT, :OR} on account of the fact that hashing
+         ;; by string produces 2 of each hash.
+         (smallest-nbits (max 2 (1- required-nbits)))
+         (largest-nbits (1+ required-nbits)) ; allow double the required minimum
+         (hashes (mapcar hash-fun keys)))
+    (macrolet ((stats (mixer answer)
+                 ;; Compute the average number of items per bin,
+                 ;; looking only at bins that contain something.
+                 ;; It does not improve things to increase the total bins
+                 ;; without distributing items into at least 1 more bin.
+                 `(progn
+                    (fill bin-counts 0)
+                    (dolist (hash hashes)
+                      (incf (aref bin-counts ,mixer)))
+                    (let ((max-bin-count 0) (n-used 0))
+                      (dovector (count bin-counts)
+                        (when (plusp count) (incf n-used))
+                        (setf max-bin-count (max count max-bin-count)))
+                      (when (= max-bin-count 1) ; can't beat a perfect hash
+                        (return-from try (values 1 ,answer)))
+                      (let ((average (/ nkeys n-used)))
+                        (when (or (< max-bin-count best-max-bin-count)
+                                  (and (= max-bin-count best-max-bin-count)
+                                       (< average best-average)))
+                          (setq best-answer ,answer
+                                best-max-bin-count max-bin-count
+                                best-average average)))))))
+      (flet ((try-one-byte ()
+               (let ((best-answer nil)
+                     ;; "best" means smallest
+                     (best-max-bin-count sb-xc:most-positive-fixnum) ; sentinel value
+                     (best-average sb-xc:most-positive-fixnum))
+                 (loop named try
+                       for nbits from smallest-nbits to largest-nbits
+                       do (let ((bin-counts (make-array (ash 1 nbits) :initial-element 0)))
+                            (dotimes (pos (- (1+ maxbits) nbits))
+                              (stats (ldb (byte nbits pos) hash) (byte nbits pos))))
+                       finally (return-from try (values best-max-bin-count best-answer)))))
+             (try-two-bytes ()
+               (let ((best-answer nil)
+                     (best-max-bin-count sb-xc:most-positive-fixnum)
+                     (best-average sb-xc:most-positive-fixnum))
+                 (loop named try
+                       for nbits from smallest-nbits to largest-nbits
+                       do (let ((bin-counts (make-array (ash 1 nbits) :initial-element 0)))
+                            (dotimes (pos1 (- (1+ maxbits) nbits))
+                              (dotimes (pos2 pos1)
+                                (stats (logxor (ldb (byte nbits pos1) hash)
+                                               (ldb (byte nbits pos2) hash))
+                                       (vector (byte nbits pos1) (byte nbits pos2))))))
+                        finally (return-from try (values best-max-bin-count best-answer))))))
+        (multiple-value-bind (score1 answer1) (try-one-byte)
+          ;; Return if perfect score, or if caller doesn't want to try using two bytes
+          (if (or (= score1 1) (= maxbytes 1))
+              (values score1 answer1)
+              (multiple-value-bind (score2 answer2) (try-two-bytes)
+                (if (<= score1 score2)
+                    (values score1 answer1) ; not improved
+                    (values score2 answer2))))))))) ; 2 bytes = better
+
+(defun build-sealed-struct-typecase-map (type-unions)
+  (let* ((layout-lists
+          (mapcar (lambda (x) (mapcar #'find-layout x)) type-unions))
+         (byte (nth-value 1
+                (pick-best-sxhash-bits (apply #'append layout-lists)
+                                       #'layout-clos-hash 1)))
+         (bin-count (ash 1 (byte-size byte)))
+         (array (make-array (1+ bin-count) :initial-element nil))
+         (mask (1- bin-count))
+         (seen))
+    (setf (aref array 0) (logior (ash mask 6) (byte-position byte)))
+    (loop for layout-list in layout-lists
+          for i from 1
+          do (dolist (layout layout-list)
+               (unless (member layout seen) ; in case of dups / overlaps
+                 (push layout seen)
+                 (let ((bin (1+ (logand (ash (layout-clos-hash layout)
+                                             (- (the (mod #.sb-vm:n-word-bits)
+                                                     (byte-position byte))))
+                                        (the (and fixnum unsigned-byte) mask)))))
+                   (setf (aref array bin)
+                         (nconc (aref array bin) (list (cons layout i))))))))
+    array))
+
+;;; FIXME: now that structure classoid hashes are computable at compile-time,
+;;; we can do ever better in this expander: if the hash is perfect,
+;;; then do not iterate over candidates, just flatten the array into
+;;;   #(<LAYOUT> case-index #<LAYOUT> case-index ...)
+;;; then test for a hit on the indexed layout, get the case-index, and jump.
+(sb-xc:defmacro %sealed-struct-typecase-index (cases object)
+  `(if (%instancep ,object)
+       (locally (declare (optimize (safety 0)))
+         ;; When the second argument to LOAD-TIME-VALUE is T in COMPILE (but not COMPILE-FILE)
+         ;; then element 0 of the vector is used as a compile-time constant and we'll wire in
+         ;; the shift and mask which produces an even better instruction sequence.
+         ;; This is pretty awesome and I did not know that we would do that.
+         (let* ((array ,(build-sealed-struct-typecase-map cases))
+                (layout (%instance-layout ,object))
+                (hash-spec (the fixnum (svref array 0)))
+                (shift (ldb (byte ,(integer-length (1- sb-vm:n-word-bits)) 0)
+                            hash-spec)))
+           (the (mod ,(1+ (length cases)))
+                ;; DOLIST performs a leading test, but we're OK with a cell
+                ;; that is NIL. It'll miss and then exit at the end of the loop.
+                ;; This potentially avoids one comparison vs NIL if we hit immediately.
+                (let ((list (svref array
+                                   (1+ (logand (ash (layout-clos-hash layout) (- shift))
+                                               (ash hash-spec -6))))))
+                  (loop (let ((cell (car list)))
+                          (cond ((eq layout (car cell)) (return (cdr cell)))
+                                ((null (setq list (cdr list))) (return 0)))))))))
+       0))
+
+;;; Given an arbitrary TYPECASE, see if it is a discriminator over
+;;; an assortment of structure-object subtypes. If it is, potentially turn it
+;;; into a dispatch based on layout-clos-hash.
+;;; The decision to use a hash-based lookup should depend on the number of types
+;;; matched, but if there are a lot of types matched all rooted at a common
+;;; ancestor, it is not beneficial.
+;;;
+;;; The expansion currently works only with sealed classoids.
+;;; Making it work with unsealed classoids isn't too tough.
+;;; The dispatch will look something like a PCL cache but simpler.
+;;; First of all, there's no reason we can't use stable hashes
+;;; for structure layouts, because an incompatibly redefined structure
+;;; (which is unportable to begin with), doesn't require a new hash.
+;;; In fact as far as I can tell, redefining a standard class doesn't require a new hash
+;;; because the obsolete layout always gets clobbered to 0, and cache lookups always check
+;;; for a match on both the hash and the layout.
+(defun expand-struct-typecase (keyform temp normal-clauses type-specs default errorp
+                               &aux (n-root-types 0) (exhaustive-list))
+  (flet ((discover-subtypes (specifier)
+           (let* ((parse (specifier-type specifier))
+                  (worklist
+                   (cond ((structure-classoid-p parse) (list parse))
+                         ((and (union-type-p parse)
+                               (every #'structure-classoid-p (union-type-types parse)))
+                          (copy-list (union-type-types parse)))
+                         (t
+                          (return-from discover-subtypes nil)))))
+             ;; Assume that each "root" type would require its own test based
+             ;; on %instance-layout of self and ancestor and that all root types
+             ;; are disjoint. This may not be true if a later one includes
+             ;; an earlier one.
+             (incf n-root-types (length worklist))
+             (collect ((visited))
+               (loop (unless worklist (return))
+                     (let ((classoid (pop worklist)))
+                       (visited classoid)
+                       (awhen (classoid-subclasses classoid)
+                         (dohash ((classoid layout) it)
+                           (declare (ignore layout))
+                           (unless (or (member classoid (visited))
+                                       (member classoid worklist))
+                             (setf worklist (nconc worklist (list classoid))))))))
+               (setf exhaustive-list (union (visited) exhaustive-list))
+               (visited)))))
+    (let ((classoid-lists (mapcar #'discover-subtypes type-specs)))
+      (when (or (some #'null classoid-lists)
+                (< n-root-types 6)
+                ;; Given something like:
+                ;; (typecase x
+                ;;   ((or parent1 parent2 parent3) ...)
+                ;;   ((or parent4 parent5 parent6) ...)
+                ;; where eaach parent has dozens of children (directly or indirectly),
+                ;; it may be worse to use a hash-based lookup.
+                (> (length exhaustive-list) (* 3 n-root-types)))
+        (return-from expand-struct-typecase))
+      (if (every (lambda (classoids)
+                   (every (lambda (classoid)
+                            (eq (classoid-state classoid) :sealed))
+                          classoids))
+                 classoid-lists)
+          `(let ((,temp ,keyform))
+             (case (%sealed-struct-typecase-index
+                    ,(mapcar (lambda (list) (mapcar #'classoid-name list))
+                             classoid-lists)
+                    ,temp)
+               ,@(loop for i from 1 for clause in normal-clauses
+                       collect `(,i
+                                 ;; CLAUSE is ((TYPEP #:G 'a-type) NIL . forms)
+                                 (sb-c::%type-constraint ,temp ,(third (car clause)))
+                                 ,@(cddr clause)))
+               (0 ,@(if errorp
+                        `((etypecase-failure ,temp ',type-specs))
+                        (cddr default)))))
+          ;; not done
+          nil))))
+
+;;; Turn a case over symbols into a case over their hashes.
+;;; Regarding the apparently redundant UNREACHABLE branches:
+;;; The first one causes the total number of ways to be (ASH 1 NBITS) exactly.
+;;; The second allows proper type derivation, because otherwise it is not obvious
+;;; (to the compiler) that all prior COND clauses were exhaustive.
+;;; This actually matters to to encoding of alien ENUM types. In the conventional
+;;; expansion of ECASE, all branches cover the enum, and the failure branch
+;;; ensures non-return of anything but an integer.
+;;; In the fancy expansion, we would get a compile-time error:
+;;;   debugger invoked on a SIMPLE-ERROR in thread
+;;;   #<THREAD "main thread" RUNNING {10005304C3}>:
+;;;     #<SB-C:TN t1 :NORMAL> is not valid as the first argument to VOP:
+;;;     SB-VM::MOVE-WORD-ARG
+;;; without the UNREACHABLE branch, because the expansion otherwise
+;;; looked as if the COND might return NIL.
+(defun expand-symbol-case (keyform clauses keys errorp hash-fun &optional (maxbytes 2))
+  (declare (ignorable keyform clauses keys errorp))
+  ;; for few keys, the clever algorithm  probably gives no better performance
+  ;; - and potentially worse - than the CPU's branch predictor.
+  (unless (>= (length keys) 6)
+    (return-from expand-symbol-case nil))
+  (multiple-value-bind (maxprobes byte) (pick-best-sxhash-bits keys hash-fun maxbytes)
+    (when (and (vectorp byte) (< (length keys) 9))
+      ;; It took two bytes to hash well enough. That's more fixed overhead,
+      ;; so require more symbols. Otherwise just go back to linear scan.
+      (return-from expand-symbol-case nil))
+    ;; (format t "maxprobes ~d byte ~s~%" maxprobes byte)
+    (when (> maxprobes 2) ; Give up (for now) if more than 2 keys hash the same.
+      #+sb-devel (format t "~&symbol-case giving up: probes=~d byte=~d~%"
+                         maxprobes byte)
+      (return-from expand-symbol-case nil))
+    (let* ((default (when (eql (caar clauses) 't) (pop clauses)))
+           (unique-symbols)
+           (clauses
+            ;; This is crummy, but we first have to undo our pre-expansion
+            ;; and remove dups. Otherwise the (BUG "Messup") below could occur.
+            (mapcar
+             (lambda (clause)
+               (destructuring-bind (antecedent . consequent) clause
+                 (aver (typep consequent '(cons (eql nil))))
+                 (pop consequent) ; strip the NIL that CASE-BODY inserts
+                 (when (typep antecedent '(cons (eql eql)))
+                   (setq antecedent `(or ,antecedent)))
+                 (flet ((extract-key (form) ; (EQL #:gN (QUOTE foo)) -> FOO
+                          (let ((third (third form)))
+                            (aver (typep third '(cons (eql quote))))
+                            (the symbol (second third)))))
+                   (let (clause-symbols)
+                     ;; De-duplicate across all clauses and within each clause
+                     ;; due to possible extreme stupidity in source code.
+                     (dolist (term (cdr antecedent))
+                       (aver (typep term '(cons (eql eql))))
+                       (let ((symbol (extract-key term)))
+                         (unless (member symbol unique-symbols)
+                           (push symbol unique-symbols)
+                           (push symbol clause-symbols))))
+                     (if clause-symbols ; all symbols could have dropped out
+                         (cons clause-symbols consequent)
+                         ;; give up. There are reasons the compiler should see
+                         ;; all subforms. Maybe not good reasons.
+                         (return-from expand-symbol-case nil))))))
+             (reverse clauses)))
+           (clause->bins (make-array (length clauses) :initial-element nil))
+           (table-nbits (byte-size (if (vectorp byte) (elt byte 0) byte)))
+           (bins (make-array (ash 1 table-nbits) :initial-element 0))
+           (symbol (sb-xc:gensym "S"))
+           (hash (sb-xc:gensym "H"))
+           (vector (sb-xc:gensym "V"))
+           (is-hashable
+            ;; For x86-64, any non-immediate object is considered hashable,
+            ;; so we only do a lowtag test on the object, though the correct hash
+            ;; is obtained only if the object is a symbol.
+            #+x86-64 `(pointerp ,symbol)
+            ;; For others backends, the set of keys in a particular CASE form
+            ;; makes a difference. NIL as a possible key mandates choosing SYMBOLP
+            ;; but NON-NULL-SYMBOL-P is the quicker test.
+            #-x86-64 `(,(if (member nil keys) 'symbolp 'non-null-symbol-p) ,symbol))
+           (sxhash
+             ;; Always access the pre-memoized value in the hash slot.
+             ;; SYMBOL-HASH* reads the word following the header word
+             ;; in any pointer object regardless of lowtag.
+             #+x86-64
+             (if (eq hash-fun 'sxhash) `(symbol-hash* ,symbol nil) `(,hash-fun ,symbol))
+             ;; For others, use SYMBOL-HASH.
+             #-x86-64 `(,(if (eq hash-fun 'sxhash) 'symbol-hash hash-fun) ,symbol))
+           (calc-hash
+             (if (vectorp byte) ; mix 2 bytes
+                 ;; FIXME: this could be performed as ((h >> c1) ^ (h >> c2)) & mask
+                 ;; instead of having two AND operations as it does now.
+                 (let ((b1 (elt byte 0)) (b2 (elt byte 1)))
+                   `(let ((,hash ,sxhash))
+                      (logxor (ldb (byte ,(byte-size b1) ,(byte-position b1)) ,hash)
+                              (ldb (byte ,(byte-size b2) ,(byte-position b2)) ,hash))))
+                 `(ldb (byte ,(byte-size byte) ,(byte-position byte)) ,sxhash))))
+
+      (flet ((trivial-result-p (clause)
+               ;; Return 2 values: T/NIL if the clause's consequent
+               ;; is trivial, and its value when trivial.
+               (let ((consequent (cdr clause)))
+                 (if (singleton-p consequent)
+                     (let ((form (car consequent)))
+                       (cond ((typep form '(cons (eql quote) (cons t null)))
+                              (values t (cadr form)))
+                             ((self-evaluating-p form) (values t form))
+                             (t (values nil nil))))
+                     ;; NIL -> T, otherwise -> NIL
+                     (values (not consequent) nil))))
+             (hash-bits (symbol)
+               (let ((sxhash (funcall hash-fun symbol)))
+                 (if (vectorp byte)
+                     (logxor (ldb (elt byte 0) sxhash)
+                             (ldb (elt byte 1) sxhash))
+                     (ldb byte sxhash)))))
+
+        ;; Try doing an array lookup if the hashing has no collisions and
+        ;; every consequent is trivial.
+        (when (= maxprobes 1)
+          (block try-table-lookup
+            (let ((values (make-array (length bins)))
+                  (single-value) ; only if exactly one clause
+                  (types nil))
+              (dolist (clause clauses)
+                (multiple-value-bind (trivialp value) (trivial-result-p clause)
+                  (unless trivialp
+                    (return-from try-table-lookup))
+                  (setq single-value value)
+                  (push (ctype-of value) types)
+                  (dolist (symbol (car clause))
+                    (let ((index (hash-bits symbol)))
+                      (aver (eql (aref bins index) 0)) ; no collisions
+                      (setf (aref bins index) symbol
+                            (aref values index) value)))))
+              (return-from expand-symbol-case
+                ;; FIXME: figure out how to eliminate the dead store.
+                ;; If hash gets used, then we store into it later, killing the initial store.
+                `(let ((,symbol ,keyform) (,hash 0))
+                   (if (and ,is-hashable (eq ,symbol (svref ,bins (setq ,hash ,calc-hash))))
+                       ,(if (singleton-p clauses)
+                            `',single-value
+                            `(truly-the ,(type-specifier (apply #'type-union types))
+                                        (aref ,(sb-c::coerce-to-smallest-eltype values)
+                                              ,hash)))
+                       ,(if errorp
+                            ;; coalescing of simple-vectors in a saved core
+                            ;; could eliminate repeated data from the same
+                            ;; ECASE that gets inlined many times over.
+                            `(ecase-failure
+                              ,symbol ,(coerce keys 'simple-vector))
+                            `(progn ,@(cddr default)))))))))
+
+        ;; Reset the bins, try it the long way
+        (fill bins nil)
+        ;; Place each symbol into its hash bin. Also, for each clause compute the
+        ;; set of hash bins that it has placed a symbol into.
+        (loop for clause in clauses for clause-index from 0
+              do (dolist (symbol (car clause))
+                   (let ((masked-hash (hash-bits symbol)))
+                     (pushnew masked-hash (aref clause->bins clause-index))
+                     (push (cons symbol clause-index) (aref bins masked-hash)))))
+        ;; Canonically order each element of clause->bins
+        (dotimes (i (length clause->bins))
+          (setf (aref clause->bins i) (sort (aref clause->bins i) #'<)))
+
+        ;; Perform a very limited bin merging step as follows: if a clause
+        ;; placed its symbols in more than one bin, allow it provided that either:
+        ;; - the clause's consequent is trivial, OR
+        ;; - none of its bins contains a symbol from a different clause.
+        ;; In the former case, we don't need to merge bins.
+        ;; In the latter case, the bins define an equivalence class
+        ;; that does not intersect any other equivalence class.
+        ;;
+        ;; To make this work, if a bin requires an IF to disambiguate which consequent
+        ;; to take, then it is removed from the clase->bins entry for each clause
+        ;; for which it contains a consequent so that the code below which computes
+        ;; the COND does not see the bin as a member of any equivalence class.
+        ;; Pass 1: decide whether to give up or go on.
+        (loop for clause in clauses for clause-index from 0
+              do (let ((equivalence-class (aref clause->bins clause-index)))
+                   ;; if a nontrivial consequent is distributed into
+                   ;; more than one hash bin ...
+                   (when (and (cdr equivalence-class)
+                              (not (trivial-result-p clause)))
+                     (dolist (bin-index (aref clause->bins clause-index))
+                       (dolist (item (aref bins bin-index))
+                         (unless (eql (cdr item) clause-index)
+                           #+sb-devel (format t "~&symbol-case gives up: case=~s~%" clause)
+                           (return-from expand-symbol-case)))))))
+        ;; Pass 2: remove bins with more than one consequent from their
+        ;; clause equivalence class.
+        ;; Maybe these passes could be combined, but I'd rather conservatively
+        ;; preserve accumulated data thus far before wrecking it.
+        (dotimes (bin-index (length bins))
+          (let ((unique-clause-indices
+                 (remove-duplicates (mapcar #'cdr (aref bins bin-index)))))
+            (when (cdr unique-clause-indices)
+              (dolist (clause-index unique-clause-indices)
+                (setf (aref clause->bins clause-index)
+                      (delete bin-index (aref clause->bins clause-index))))))))
+
+      ;; Compute the COND clauses over the range of hash values.
+      (let ((symbol-vector (make-array (* maxprobes (length bins)) :initial-element 0))
+            (cond-clauses))
+        ;; For each nonempty bin:
+        ;; - If it contains >1 consequent, then arbitrarily pick one symbol to test
+        ;;   to see which consequent pertains.
+        ;; - Otherwise, it contains exactly one consequent. See if the bin's equivalence
+        ;;   class has >1 item. If it does, insert for only a representative element.
+        ;;   By the above construction, no other bin in the class can have >1 consequent.
+        (flet ((action (clause-index)
+                 (let ((clause (nth clause-index clauses)))
+                   (or (cdr clause) '(nil)))))
+          (dotimes (bin-index (length bins))
+            (let* ((bin-contents (aref bins bin-index))
+                   (unique-clause-indices
+                    (remove-duplicates (mapcar #'cdr bin-contents)))
+                   (cond-clause
+                    (cond ((cdr unique-clause-indices)
+                           ;; Exactly 2 actions in the bin due to hardcoded limitation
+                           ;; on the implementation of collision resolution.
+                           `((eql ,hash ,bin-index)
+                             (cond ((eq ,symbol ',(caar bin-contents))
+                                    ,@(action (cdar bin-contents)))
+                                   (t
+                                    ,@(action (cdadr bin-contents))))))
+                          (unique-clause-indices
+                           (let* ((clause-index (car unique-clause-indices))
+                                  (equivalence-class (aref clause->bins clause-index)))
+                             (when (eql bin-index (car equivalence-class))
+                               ;; This is the representative bin of a class
+                               `(,(if (cdr equivalence-class)
+                                      `(or ,@(mapcar (lambda (x) `(eql ,hash ,x))
+                                                     equivalence-class))
+                                      `(eql ,hash ,bin-index))
+                                 ,@(action clause-index))))))))
+              (when cond-clause (push cond-clause cond-clauses)))))
+
+        ;; Fill in the symbol vector. Symbols in a bin are adjacent in the vector.
+        ;; 2 items per bin looks like so: | elt0 | elt1 | elt2 | elt3 | ...
+        ;;                                | <- bin 0 -> | <- bin 1 -> | ...
+        (dotimes (hash (length bins))
+          (let ((items (aref bins hash))
+                (index (* hash maxprobes)))
+            (dotimes (i maxprobes)
+              (unless items (return))
+              (setf (aref symbol-vector index) (car (pop items)))
+              (incf index))
+            (when items (bug "Messup in CASE vectors for ~S" keys))))
+
+        ;; If there is only one clause (plus possibly a default), then hash
+        ;; collisions do not need to be disambiguated. Hence it can be implemented
+        ;; as one or two array lookups.
+        (when (singleton-p clauses)
+          (return-from expand-symbol-case
+            `(let ((,symbol ,keyform) (,hash 0))
+               (if (and ,is-hashable
+                        ,(ecase maxprobes
+                           (1 `(eq (svref ,symbol-vector (setq ,hash ,calc-hash)) ,symbol))
+                           ;; FIXME: see why SVREF on constant vector of symbols would get
+                           ;; >1 header constant unless lexically bound.
+                           (2 `(let ((,vector ,symbol-vector))
+                                 (or (eq (svref ,vector (setq ,hash (ash ,calc-hash 1))) ,symbol)
+                                     (eq (svref ,vector (1+ ,hash)) ,symbol))))))
+                   (progn ,@(cdar clauses))
+                   ,(if errorp
+                        `(ecase-failure ,symbol ,(coerce keys 'simple-vector))
+                        `(progn ,@(cddr default)))))))
+
+        ;; Produce a COND only if the backend supports the multiway branch vop.
+        #+(or x86 x86-64)
+        (let ((block (sb-xc:gensym "B"))
+              (unused-bins))
+          ;; Take note of the unused bins
+          (dotimes (i (length bins))
+            (unless (aref bins i) (push i unused-bins)))
+          `(let ((,symbol ,keyform))
+             (block ,block
+               (when ,is-hashable
+                 (let ((,hash ,calc-hash))
+                   ;; At most two probes are required, and usually just 1
+                   (when ,(ecase maxprobes
+                            (1 `(eq (svref ,symbol-vector ,hash) ,symbol))
+                            (2 `(let ((,vector ,symbol-vector)
+                                      (,hash (ash ,hash 1)))
+                                  (or (eq (svref ,vector ,hash) ,symbol)
+                                      (eq (svref ,vector (1+ ,hash)) ,symbol)))))
+                     (return-from ,block
+                       (cond ,@(nreverse cond-clauses)
+                             ,@(when unused-bins
+                                 ;; to make it clear that the number of "ways"
+                                 ;; is the exact right number, which avoids a range
+                                 ;; test in multiway-branch.
+                                 `(((or ,@(mapcar (lambda (x) `(eql ,hash ,x))
+                                                  (nreverse unused-bins)))
+                                    (unreachable))))
+                             (t (unreachable)))))))
+               ,@(if errorp
+                     `((ecase-failure ,symbol ,(coerce keys 'simple-vector)))
+                     (cddr default)))))))))
+
 ;;; CASE-BODY returns code for all the standard "case" macros. NAME is
 ;;; the macro name, and KEYFORM is the thing to case on. MULTI-P
 ;;; indicates whether a branch may fire off a list of keys; otherwise,
@@ -234,7 +857,11 @@ invoked. In that case it will store into PLACE and start over."
 ;;; of the ordinary clauses. When PROCEEDP, it is an error to
 ;;; omit ERRORP, and the ERROR form generated is executed within a
 ;;; RESTART-CASE allowing KEYFORM to be set and retested.
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+
+;;; Note the absence of EVAL-WHEN here. The cross-compiler calls this function
+;;; and gets the compiled code that the host produced in make-host-1.
+;;; If recompiled, you do not want an interpreted definition that might come
+;;; from EVALing a toplevel form - the stack blows due to infinite recursion.
 (defun case-body (name keyform cases multi-p test errorp proceedp needcasesp)
   (unless (or cases (not needcasesp))
     (warn "no clauses in ~S" name))
@@ -288,6 +915,8 @@ invoked. In that case it will store into PLACE and start over."
                                         ; not in [EC]CASE or [EC]TYPECASE
                         (memq keyoid '(t otherwise))
                         (null (cdr cases)))
+                   ;; The NIL has a reason for being here: Without it, COND
+                   ;; will return the value of the test form if FORMS is NIL.
                    (push `(t nil ,@forms) clauses))
                   ((and multi-p (listp keyoid))
                    (setf keys (nconc (reverse keyoid) keys))
@@ -336,7 +965,8 @@ invoked. In that case it will store into PLACE and start over."
 ;;; RESTART-CASE macro has been defined.
 (defun case-body-aux (name keyform keyform-value clauses keys
                       errorp proceedp expected-type)
-  (if proceedp
+  (when proceedp ; CCASE or CTYPECASE
+    (return-from case-body-aux
       (let ((block (gensym))
             (again (gensym)))
         `(let ((,keyform-value ,keyform))
@@ -352,17 +982,67 @@ invoked. In that case it will store into PLACE and start over."
                                      (case-body-error
                                       ',name ',keyform ,keyform-value
                                       ',expected-type ',keys)))
-                         (go ,again))))))))
-      `(let ((,keyform-value ,keyform))
-         (declare (ignorable ,keyform-value)) ; e.g. (CASE KEY (T))
-         (cond
-           ,@(nreverse clauses)
-           ,@(when errorp
-               `((t (,(ecase name
-                        (etypecase 'etypecase-failure)
-                        (ecase 'ecase-failure))
-                     ,keyform-value ',keys))))))))
-) ; EVAL-WHEN
+                         (go ,again))))))))))
+
+  (let ((implement-as name)
+        (original-keys keys))
+    (when (member name '(typecase etypecase))
+      ;; Bypass all TYPEP handling if every clause of [E]TYPECASE is a MEMBER type.
+      ;; More importantly, try to use the fancy expansion for symbols as keys.
+      (let* ((default (if (eq (caar clauses) 't) (car clauses)))
+             (normal-clauses (reverse (if default (cdr clauses) clauses)))
+             (new-clauses))
+        (collect ((new-keys))
+          (dolist (clause normal-clauses)
+            ;; clause is ((TYPEP #:x (QUOTE <sometype>)) NIL forms*)
+            (destructuring-bind ((typep thing type-expr) . consequent) clause
+              (declare (ignore thing))
+              (unless (and (typep type-expr '(cons (eql quote) (cons t null)))
+                           (eq typep 'typep))
+                (bug "TYPECASE expander glitch"))
+              (let* ((spec (second type-expr))
+                     (clause-keys
+                      (case (if (listp spec) (car spec))
+                        (eql (when (singleton-p (cdr spec)) (list (cadr spec))))
+                        (member (when (proper-list-p (cdr spec)) (cdr spec)))
+                        (t :fail))))
+                (cond ((eq clause-keys :fail)
+                       (setq new-clauses :fail))
+                      ((neq new-clauses :fail)
+                       (dolist (key clause-keys)
+                         (unless (member key (new-keys))
+                           (new-keys key)))
+                       (push (cons `(or ,@(mapcar (lambda (x) `(eql ,keyform-value ',x))
+                                                  clause-keys))
+                                   consequent)
+                             new-clauses))))))
+          (acond ((neq new-clauses :fail)
+                  ;; all TYPECASE clauses were convertible to CASE clauses
+                  (setq clauses (if default (cons default new-clauses) new-clauses)
+                        keys (new-keys)
+                        implement-as 'case))
+                 #+(vop-named sb-c:multiway-branch-if-eq)
+                 ((expand-struct-typecase keyform keyform-value normal-clauses keys
+                                          default errorp)
+                  (return-from case-body-aux it))))))
+
+    ;; Efficiently expanding CASE over symbols depends on CASE over integers being
+    ;; translated as a jump table. If it's not - as on most backends - then we use
+    ;; the customary expansion as a series of IF tests.
+    ;; Production code rarely uses CCASE, and the expansion differs such that
+    ;; it doesn't seem worth the effort to handle it as a jump table.
+    (when (and (member implement-as '(case ecase)) (every #'symbolp keys))
+      (awhen (expand-symbol-case keyform clauses keys errorp 'sxhash)
+        (return-from case-body-aux it)))
+
+    `(let ((,keyform-value ,keyform))
+       (declare (ignorable ,keyform-value)) ; e.g. (CASE KEY (T))
+       (cond ,@(nreverse clauses)
+             ,@(when errorp
+                 `((t (,(ecase name
+                          (etypecase 'etypecase-failure)
+                          (ecase 'ecase-failure))
+                       ,keyform-value ',original-keys))))))))
 
 (sb-xc:defmacro case (keyform &body cases)
   "CASE Keyform {({(Key*) | Key} Form*)}*

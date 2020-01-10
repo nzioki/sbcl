@@ -289,7 +289,7 @@ bootstrapping.
                                     not allowed inside DEFGENERIC."
                                   spec))
                  (if (or (eq 'optimize (first spec))
-                         (info :declaration :recognized (first spec)))
+                         (info :declaration :known (first spec)))
                      (push spec (initarg :declarations))
                      (warn "Ignoring unrecognized declaration in DEFGENERIC: ~S"
                            spec))))
@@ -567,9 +567,6 @@ bootstrapping.
                              (class-name (class-of proto-method))
                              'standard-method)
                          initargs-form)))
-
-(defun interned-symbol-p (x)
-  (and (symbolp x) (symbol-package x)))
 
 (defun make-defmethod-form
     (name qualifiers specializers unspecialized-lambda-list
@@ -2357,8 +2354,7 @@ bootstrapping.
 (defun make-early-gf (name &optional lambda-list lambda-list-p
                       function argument-precedence-order source-location
                       documentation)
-  (let ((fin (allocate-standard-funcallable-instance-immobile
-              *sgf-wrapper* name)))
+  (let ((fin (allocate-standard-funcallable-instance *sgf-wrapper* name)))
     (replace (fsc-instance-slots fin) *sgf-slots-init*)
     (when function
       (set-funcallable-instance-function fin function))

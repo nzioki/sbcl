@@ -60,7 +60,7 @@
 os_vm_size_t dynamic_space_size = DEFAULT_DYNAMIC_SPACE_SIZE;
 os_vm_size_t thread_control_stack_size = DEFAULT_CONTROL_STACK_SIZE;
 
-sword_t (*scavtab[256])(lispobj *where, lispobj object);
+sword_t (*const scavtab[256])(lispobj *where, lispobj object);
 
 // "Transport" functions are responsible for deciding where to copy an object
 // and how many bytes to copy (usually the sizing function is inlined into the
@@ -303,37 +303,36 @@ trans_code(struct code *code)
 
     set_forwarding_pointer((lispobj *)code, l_new_code);
 
-    /* set forwarding pointers for all the function headers in the */
-    /* code object.  also fix all self pointers */
-    /* Do this by scanning the new code, since the old header is unusable */
-
-    uword_t displacement = l_new_code - l_code;
     struct code *new_code = (struct code *) native_pointer(l_new_code);
+    uword_t displacement = l_new_code - l_code;
 
-    for_each_simple_fun(i, nfheaderp, new_code, 1, {
-        /* Calculate the old raw function pointer */
-        struct simple_fun* fheaderp =
-          (struct simple_fun*)LOW_WORD((char*)nfheaderp - displacement);
-        /* Calculate the new lispobj */
-        lispobj nfheaderl = make_lispobj(nfheaderp, FUN_POINTER_LOWTAG);
-
-        set_forwarding_pointer((lispobj *)fheaderp, nfheaderl);
-
-        /* fix self pointer. */
-        nfheaderp->self =
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-            FUN_RAW_ADDR_OFFSET +
+#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || \
+    defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
+    // Fixup absolute jump tables. These aren't recorded in code->fixups
+    // because we don't need to denote an arbitrary set of places in the code.
+    // The count alone suffices. A GC immediately after creating the code
+    // could cause us to observe some 0 words here. Those should be ignored.
+    lispobj* jump_table = code_jumptable_start(new_code);
+    int count = jumptable_count(jump_table);
+    int i;
+    for (i = 1; i < count; ++i)
+        if (jump_table[i]) jump_table[i] += displacement;
 #endif
-            nfheaderl;
+    for_each_simple_fun(i, new_fun, new_code, 1, {
+        // Calculate the old raw function pointer
+        struct simple_fun* old_fun = (struct simple_fun*)((char*)new_fun - displacement);
+        if (fun_self_from_baseptr(old_fun) == old_fun->self) {
+            new_fun->self = fun_self_from_baseptr(new_fun);
+            set_forwarding_pointer((lispobj*)old_fun,
+                                   make_lispobj(new_fun, FUN_POINTER_LOWTAG));
+        }
     })
+    gencgc_apply_code_fixups(code, new_code);
 #ifdef LISP_FEATURE_GENCGC
     /* Cheneygc doesn't need this os_flush_icache, it flushes the whole
        spaces once when all copying is done. */
     os_flush_icache(code_text_start(new_code), code_text_size(new_code));
 #endif
-
-    gencgc_apply_code_fixups(code, new_code);
-
     return new_code;
 }
 
@@ -382,13 +381,12 @@ static sword_t
 scav_closure(lispobj *where, lispobj header)
 {
     struct closure *closure = (struct closure *)where;
-    lispobj fun = closure->fun;
-    if (fun) {
-        fun -= FUN_RAW_ADDR_OFFSET;
+    if (closure->fun) {
+        lispobj fun = fun_taggedptr_from_self(closure->fun);
         lispobj newfun = fun;
         scavenge(&newfun, 1);
         if (newfun != fun) // Don't write unnecessarily
-            closure->fun = ((struct simple_fun*)(newfun - FUN_POINTER_LOWTAG))->self;
+            closure->fun = fun_self_from_taggedptr(newfun);
     }
     int payload_words = SHORT_BOXED_NWORDS(header);
     // Payload includes 'fun' which was just looked at, so subtract it.
@@ -1308,7 +1306,7 @@ scav_vector (lispobj *where, lispobj header)
     }
     struct hash_table *hash_table  = (struct hash_table *)native_pointer(ltable);
     if (widetag_of(&hash_table->header) != INSTANCE_WIDETAG) {
-        lose("hash table not instance (%"OBJ_FMTX" at %p)\n",
+        lose("hash table not instance (%"OBJ_FMTX" at %p)",
              hash_table->header,
              hash_table);
     }
@@ -1543,21 +1541,8 @@ boolean valid_widetag_p(unsigned char widetag) {
  * initialization
  */
 
+sword_t scav_weak_pointer(lispobj *where, lispobj object);
 #include "genesis/gc-tables.h"
-
-
-lispobj *search_all_gc_spaces(void *pointer)
-{
-    lispobj *start;
-    if (((start = search_dynamic_space(pointer)) != NULL) ||
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-        ((start = search_immobile_space(pointer)) != NULL) ||
-#endif
-        ((start = search_static_space(pointer)) != NULL) ||
-        ((start = search_read_only_space(pointer)) != NULL))
-        return start;
-    return NULL;
-}
 
 /* Find the code object for the given pc, or return NULL on
    failure. */
@@ -1628,14 +1613,6 @@ int simple_fun_index(struct code* code, struct simple_fun *fun)
     return -1;
 }
 
-lispobj simple_fun_name(struct simple_fun* fun)
-{
-    struct code* code = (struct code*)fun_code_header((lispobj*)fun);
-    int index = simple_fun_index(code, fun);
-    if (index < 0) return 0;
-    return code->constants[CODE_SLOTS_PER_SIMPLE_FUN*index];
-}
-
 /* Helper for valid_lisp_pointer_p (below) and
  * conservative_root_p (gencgc).
  *
@@ -1670,7 +1647,10 @@ properly_tagged_p_internal(lispobj pointer, lispobj *start_addr)
     if (lowtag && make_lispobj(start_addr, lowtag) == pointer)
         return 1; // instant win
 
-    if (widetag == CODE_HEADER_WIDETAG) {
+    // debug_info must be assigned prior to examining a code object for simple-funs.
+    // This is how we distinguish objects that are partyway through construction.
+    // It would be wrong to read garbage bytes from the simple-fun table.
+    if (widetag == CODE_HEADER_WIDETAG && ((struct code*)start_addr)->debug_info) {
         if (functionp(pointer)) {
             lispobj* potential_fun = FUNCTION(pointer);
             if (widetag_of(potential_fun) == SIMPLE_FUN_WIDETAG &&
@@ -2006,7 +1986,8 @@ static int boxed_registers[] = BOXED_REGISTERS;
     pair_interior_pointer(context,                              \
                           ACCESS_INTERIOR_POINTER_##name,       \
                           &name##_offset,                       \
-                          &name##_register_pair)
+                          &name##_register_pair,                \
+                          #name)
 
 /* One complexity here is that if a paired register is not found for
  * an interior pointer, then that pointer does not get updated.
@@ -2017,6 +1998,7 @@ static int boxed_registers[] = BOXED_REGISTERS;
  * static space without problems. */
 #define FIXUP_INTERIOR_POINTER(name)                                    \
     do {                                                                \
+        /* fprintf(stderr, "Fixing interior ptr "#name"\n"); */         \
         if (name##_register_pair >= 0) {                                \
             ACCESS_INTERIOR_POINTER_##name =                            \
                 (*os_context_register_addr(context,                     \
@@ -2026,10 +2008,17 @@ static int boxed_registers[] = BOXED_REGISTERS;
         }                                                               \
     } while (0)
 
+#ifdef LISP_FEATURE_PPC64
+// reg_CODE holds a native pointer on PPC64
+#define plausible_base_register(val,reg) (is_lisp_pointer(val)||reg==reg_CODE)
+#else
+#define plausible_base_register(val,reg) (is_lisp_pointer(val))
+#endif
 
 static void
 pair_interior_pointer(os_context_t *context, uword_t pointer,
-                      uword_t *saved_offset, int *register_pair)
+                      uword_t *saved_offset, int *register_pair,
+                      char *regname)
 {
     unsigned int i;
 
@@ -2043,12 +2032,10 @@ pair_interior_pointer(os_context_t *context, uword_t pointer,
     *saved_offset = (((uword_t)1) << (N_WORD_BITS - 1)) - 1;
     *register_pair = -1;
     for (i = 0; i < (sizeof(boxed_registers) / sizeof(int)); i++) {
-        uword_t reg;
         uword_t offset;
-        int index;
 
-        index = boxed_registers[i];
-        reg = *os_context_register_addr(context, index);
+        int regindex = boxed_registers[i];
+        uword_t regval = *os_context_register_addr(context, regindex);
 
         /* An interior pointer is never relative to a non-pointer
          * register (an oversight in the original implementation).
@@ -2062,15 +2049,34 @@ pair_interior_pointer(os_context_t *context, uword_t pointer,
          * move, thus destroying the interior pointer.  --AB,
          * 2010-Jul-14 */
 
-        if (is_lisp_pointer(reg) &&
-            ((reg & ~LOWTAG_MASK) <= pointer)) {
-            offset = pointer - (reg & ~LOWTAG_MASK);
+        // Note this can produce weird pairings that seem not to adversely
+        // affect anything. For instance if reg_LIP points lower than anything
+        // in a boxed register except for let's say register A0 which is
+        // currently NIL, then we'll say that LIP was based on A0 + huge offset.
+        // NIL doesn't move, so we won't alter LIP. But what if A0 had something
+        // random in it and lower than LIP? It will pair with LIP and then
+        // adjust LIP to point to garbage.  This is "harmless" because
+        // we never actually treat LIP as an exact root.
+
+        if (plausible_base_register(regval, regindex) &&
+            ((regval & ~LOWTAG_MASK) <= pointer)) {
+            offset = pointer - (regval & ~LOWTAG_MASK);
             if (offset < *saved_offset) {
                 *saved_offset = offset;
-                *register_pair = index;
+                *register_pair = regindex;
             }
         }
     }
+#if 0
+    if (*register_pair >= 0)
+        fprintf(stderr, "p_i_p: %-3s=%#lx based on %s=%lx + %lx\n",
+                regname, pointer,
+                lisp_register_names[*register_pair],
+                *os_context_register_addr(context, *register_pair),
+                *saved_offset);
+    else
+        fprintf(stderr, "p_i_p: %-3s=%#lx not based\n", regname, pointer);
+#endif
 }
 
 static void

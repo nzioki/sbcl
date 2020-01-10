@@ -21,6 +21,7 @@
   (register-args 0)
   (xmm-args 0)
   (stack-frame-size 0))
+(declaim (freeze-type arg-state))
 
 (defconstant max-int-args #.(length *c-call-register-arg-offsets*))
 (defconstant max-xmm-args #+win32 4 #-win32 8)
@@ -68,6 +69,7 @@
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
+(declaim (freeze-type result-state))
 
 (defun result-reg-offset (slot)
   (ecase slot
@@ -238,7 +240,7 @@
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-   (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
+   (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref)))))
 
 #+sb-safepoint
 (defconstant thread-saved-csp-offset -1)
@@ -338,7 +340,7 @@
   #+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
   #+sb-safepoint
   ;; Zero the saved CSP
-  (inst xor (make-ea-for-object-slot thread-base-tn thread-saved-csp-offset 0)
+  (inst xor (object-slot-ea thread-base-tn thread-saved-csp-offset 0)
         rsp-tn))
 
 (define-vop (alloc-number-stack-space)

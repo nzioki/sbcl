@@ -34,7 +34,8 @@
                 #:seg-virtual-location #:seg-length #:seg-sap-maker
                 #:map-segment-instructions #:inst-name
                 #:dstate-next-addr #:dstate-cur-offs)
-  (:import-from "SB-X86-64-ASM" #:near-jump-displacement #:mov #:|call|)
+  (:import-from "SB-X86-64-ASM" #:near-jump-displacement #:mov #:call
+                #:get-gpr #:reg-name)
   (:import-from "SB-IMPL" #:package-hashtable #:package-%name
                 #:package-hashtable-cells
                 #:hash-table-pairs #:hash-table-%count))
@@ -122,6 +123,8 @@
   (linkage-symbols nil)
   (linkage-symbol-usedp nil)
   (linkage-entry-size nil)
+  ;; For assembler labels that we want to invent at random
+  (label-counter 0)
   (enable-pie nil)
   (dstate (make-dstate nil) :read-only t)
   (seg (%make-segment :sap-maker (lambda () (error "Bad sap maker"))
@@ -319,12 +322,12 @@
 (defun cdf-offset (compiled-debug-fun spaces)
   ;; (Note that on precisely GC'd platforms, this operation is dangerous,
   ;; but no more so than everything else in this file)
-  (let ((locs (sb-c::compiled-debug-fun-encoded-locs compiled-debug-fun)))
+  (let ((locs (sb-c::compiled-debug-fun-encoded-locs
+               (truly-the sb-c::compiled-debug-fun compiled-debug-fun))))
     (sb-c::compiled-debug-fun-offset
-     (if (fixnump locs)
-         compiled-debug-fun
-         (sb-c::make-compiled-debug-fun
-          :name nil :encoded-locs (translate locs spaces))))))
+     (sb-c::make-compiled-debug-fun
+      :name nil
+      :encoded-locs (if (fixnump locs) locs (translate locs spaces))))))
 
 ;;; Return a list of ((NAME START . END) ...)
 ;;; for each C symbol that should be emitted for this code object.
@@ -554,7 +557,7 @@
 ;;; - jmp/call instructions that transfer control to the fixedoj space
 ;;;    delimited by bounds in STATE.
 ;;; At execution time the function will have virtual address LOAD-ADDR.
-(defun list-non-opaque-instructions (sap length core load-addr emit-cfi)
+(defun list-textual-instructions (sap length core load-addr emit-cfi)
   (let ((dstate (core-dstate core))
         (seg (core-seg core))
         (call-inst (core-call-inst core))
@@ -573,14 +576,28 @@
      (lambda (dchunk inst)
        (cond
          ((< next-fixup-addr (dstate-next-addr dstate))
-          (let ((operand (sap-ref-32 sap (- next-fixup-addr load-addr))))
+          (let ((operand (sap-ref-32 sap (- next-fixup-addr load-addr)))
+                (offs (dstate-cur-offs dstate)))
             (when (in-bounds-p operand (core-code-bounds core))
               (cond
                 ((and (eq (inst-name inst) 'mov) ; match "mov eax, imm32"
-                      (eql (sap-ref-8 sap (dstate-cur-offs dstate)) #xB8))
-                 (push (list* (dstate-cur-offs dstate) 5 "mov" operand) list))
+                      (eql (sap-ref-8 sap offs) #xB8))
+                 (let ((text (format nil "mov $(CS+0x~x),%eax"
+                                      (- operand (bounds-low (core-code-bounds core))))))
+                   (push (list* (dstate-cur-offs dstate) 5 "mov" text) list)))
+                ((and (eq (inst-name inst) 'mov) ; match "mov qword ptr [R+disp8], imm32"
+                      (eql (sap-ref-8 sap (1- offs))    #x48)
+                      (eql (sap-ref-8 sap offs)         #xC7)
+                      ;; modRegRm = #b01 #b000 #b___
+                      (eql (logand (sap-ref-8 sap (1+ offs)) #o370) #o100))
+                 (let* ((reg (ldb (byte 3 0) (sap-ref-8 sap (1+ offs))))
+                        (text (format nil "movq $(CS+0x~x),~d(%~a)"
+                                      (- operand (bounds-low (core-code-bounds core)))
+                                      (signed-sap-ref-8 sap (+ offs 2))
+                                      (reg-name (get-gpr :qword reg)))))
+                   (push (list* (1- (dstate-cur-offs dstate)) 8 "mov" text) list)))
                 ((and (eq (inst-name inst) '|call|) ; match "call qword ptr [addr]"
-                      (eql (ldb (byte 24 0) (sap-ref-32 sap (dstate-cur-offs dstate)))
+                      (eql (ldb (byte 24 0) (sap-ref-32 sap offs))
                            #x2514FF)) ; ModRM+SIB encodes disp32, no base, no index
                  ;; This form of call instruction is employed for asm routines when
                  ;; compile-to-memory-space is :AUTO.  If the code were to be loaded
@@ -589,8 +606,7 @@
                  (push (list* (dstate-cur-offs dstate) 7 "call*" operand) list))
                 (t
                  (bug "Can't reverse-engineer fixup: ~s ~x"
-                      (inst-name inst)
-                      (sap-ref-32 sap (dstate-cur-offs dstate)))))))
+                      (inst-name inst) (sap-ref-32 sap offs))))))
           (pop (core-fixup-addrs core))
           (setq next-fixup-addr (or (car (core-fixup-addrs core)) most-positive-word)))
          ((or (eq inst jmp-inst) (eq inst call-inst))
@@ -649,7 +665,7 @@
   ;; thereby affecting the ELF data (cfi or relocs) produced.
   (let ((instructions
          (merge 'list labels
-                (list-non-opaque-instructions (int-sap paddr) count core vaddr emit-cfi)
+                (list-textual-instructions (int-sap paddr) count core vaddr emit-cfi)
                 #'< :key #'car))
         (ptr paddr))
     (symbol-macrolet ((cur-offset (- ptr paddr)))
@@ -715,8 +731,9 @@
                                   nil)
                                  (t)))
                           ((string= opcode "mov")
-                           (format stream " mov $(CS+0x~x),%eax~%"
-                                   (- operand (bounds-low (core-code-bounds core)))))
+                           ;; the so-called "operand" is the entire instruction
+                           (write-string operand stream)
+                           (terpri stream))
                           ((string= opcode "call*")
                            ;; Indirect call - since the code is in immobile space,
                            ;; we could render this as a 2-byte NOP followed by a direct
@@ -747,8 +764,11 @@
         (aver (zerop (rem start-pc n-word-bytes)))
         (push `(:data . ,(ash start-pc (- word-shift))) blobs))
       (loop
-        (let* ((next (when (%instancep (sb-c::compiled-debug-fun-next cdf))
-                       (translate (sb-c::compiled-debug-fun-next cdf) spaces)))
+        (let* ((next (when (%instancep (sb-c::compiled-debug-fun-next
+                                        (truly-the sb-c::compiled-debug-fun cdf)))
+                       (translate (sb-c::compiled-debug-fun-next
+                                   (truly-the sb-c::compiled-debug-fun cdf))
+                                  spaces)))
                (end-pc (if next
                            (cdf-offset next spaces)
                            (%code-text-size code))))
@@ -784,26 +804,50 @@
 (defun c-symbol-quote (name)
   (concatenate 'string '(#\") name '(#\")))
 
-(defun emit-symbols (blobs core pp-state output)
-  (dolist (blob blobs)
+(defun emit-symbols (blobs core pp-state output &aux base-symbol)
+  (dolist (blob blobs base-symbol)
     (destructuring-bind (name start . end) blob
       (let ((c-name (c-name (or name "anonymous") core pp-state)))
+        (unless base-symbol
+          (setq base-symbol c-name))
         (format output " lsym \"~a\", 0x~x, 0x~x~%"
                 c-name start (- end start))))))
 
-(defun emit-funs (code vaddr core dumpwords output emit-cfi)
+(defun emit-funs (code vaddr core dumpwords output base-symbol emit-cfi)
   (let* ((spaces (core-spaces core))
          (ranges (get-text-ranges code spaces))
          (text-sap (code-instructions code))
          (text (sap-int text-sap))
+         ;; Like CODE-INSTRUCTIONS, but where the text virtually was
          (text-vaddr (+ vaddr (* (code-header-words code) n-word-bytes)))
          (max-end 0))
-    (when (eq (caar ranges) :data) ; Unboxed data and/or padding
-      (funcall dumpwords text (cdr (pop ranges)) output))
+    ;; There is *always* at least 1 word of unboxed data now
+    (aver (eq (caar ranges) :data))
+    (let ((jump-table-size (code-jump-table-words code))
+          (total-nwords (cdr (pop ranges))))
+      (cond ((> jump-table-size 1)
+             (format output "# jump table~%")
+             (format output ".quad ~d" jump-table-size)
+             (dotimes (i (1- jump-table-size))
+               (format output ",\"~a\"+0x~x"
+                       base-symbol
+                       (- (sap-ref-word text-sap (ash (1+ i) sb-vm:word-shift))
+                          vaddr)))
+             (terpri output)
+             (let ((remaining (- total-nwords jump-table-size)))
+               (when (plusp remaining)
+                 (funcall dumpwords
+                          (sap+ text-sap (ash jump-table-size sb-vm:word-shift))
+                          remaining output))))
+            (t
+             (funcall dumpwords text-sap total-nwords output))))
     (loop
       (destructuring-bind (start . end) (pop ranges)
         (setq max-end end)
-        (funcall dumpwords (+ text start) simple-fun-insts-offset output
+        ;; FIXME: it seems like this should just be reduced to emitting 2 words
+        ;; now that simple-fun headers don't hold any boxed words.
+        ;; (generality here is without merit)
+        (funcall dumpwords (sap+ text-sap start) simple-fun-insts-offset output
                  #(nil #.(format nil ".+~D" (* (1- simple-fun-insts-offset)
                                              n-word-bytes))))
         (incf start (* simple-fun-insts-offset n-word-bytes))
@@ -863,7 +907,7 @@
           (total-code-size 0)
           (pp-state (cons (make-hash-table :test 'equal)
                           ;; copy no entries for macros/special-operators (flet, etc)
-                          (sb-pretty::make-pprint-dispatch-table)))
+                          (sb-pretty::make-pprint-dispatch-table nil nil nil)))
           (prev-namestring "")
           (n-linker-relocs 0)
           (seen-fdefns nil)
@@ -875,25 +919,24 @@
                        (lambda (stream string) (write-string string stream))
                        0
                        (cdr pp-state))
-  (labels ((dumpwords (addr count stream &optional (exceptions #()) logical-addr)
-             (let ((sap (int-sap addr)))
-               (aver (sap>= sap (car spaces)))
-               ;; Make intra-code-space pointers computed at link time
-               (dotimes (i (if logical-addr count 0))
-                 (unless (and (< i (length exceptions)) (svref exceptions i))
-                   (let ((word (sap-ref-word sap (* i n-word-bytes))))
-                     (when (and (= (logand word 3) 3) ; is a pointer
-                                (in-bounds-p word code-bounds)) ; to code space
-                       #+nil
-                       (format t "~&~(~x: ~x~)~%" (+ logical-addr  (* i n-word-bytes))
-                               word)
-                       (incf n-linker-relocs)
-                       (setf exceptions (adjust-array exceptions (max (length exceptions) (1+ i))
-                                                      :initial-element nil)
-                             (svref exceptions i)
-                             (format nil "CS+0x~x"
-                                     (- word (bounds-low code-bounds))))))))
-               (emit-asm-directives :qword sap count stream exceptions)))
+  (labels ((dumpwords (sap count stream &optional (exceptions #()) logical-addr)
+             (aver (sap>= sap (car spaces)))
+             ;; Make intra-code-space pointers computed at link time
+             (dotimes (i (if logical-addr count 0))
+               (unless (and (< i (length exceptions)) (svref exceptions i))
+                 (let ((word (sap-ref-word sap (* i n-word-bytes))))
+                   (when (and (= (logand word 3) 3) ; is a pointer
+                              (in-bounds-p word code-bounds)) ; to code space
+                     #+nil
+                     (format t "~&~(~x: ~x~)~%" (+ logical-addr  (* i n-word-bytes))
+                             word)
+                     (incf n-linker-relocs)
+                     (setf exceptions (adjust-array exceptions (max (length exceptions) (1+ i))
+                                                    :initial-element nil)
+                           (svref exceptions i)
+                           (format nil "CS+0x~x"
+                                   (- word (bounds-low code-bounds))))))))
+             (emit-asm-directives :qword sap count stream exceptions))
            (make-code-obj (addr)
              (let ((translation (translate-ptr addr spaces)))
                (aver (= (%widetag-of (sap-ref-word (int-sap translation) 0))
@@ -906,12 +949,20 @@
 
     ;; Scan the assembly routines.
     (let* ((code-component (make-code-obj code-addr))
-           (header-len (code-header-words code-component)))
+           (obj-sap (int-sap (- (get-lisp-obj-address code-component)
+                                other-pointer-lowtag)))
+           (header-len (code-header-words code-component))
+           (jump-table-count (sap-ref-word (code-instructions code-component) 0)))
       ;; Write the code component header
-      (emit-asm-directives :qword
-                           (int-sap (- (get-lisp-obj-address code-component)
-                                       other-pointer-lowtag))
-                           header-len output #())
+      (emit-asm-directives :qword obj-sap header-len output #())
+      ;; Write the jump table
+      (format output " .quad ~D" jump-table-count)
+      (dotimes (i (1- jump-table-count))
+        (format output ",CS+0x~x"
+                (- (sap-ref-word (code-instructions code-component)
+                                 (ash (1+ i) sb-vm:word-shift))
+                   code-addr)))
+      (terpri output)
       (let ((name->addr
              ;; the CDR of each alist item is a target cons (needing translation)
              (sort
@@ -925,18 +976,12 @@
                        (car (translate (%code-debug-info code-component) spaces))
                        spaces))
               #'< :key #'cadr)))
-        (let* ((n-entrypoints (length name->addr))
-               (min-entry-offs (cadar name->addr))
-               (n-words (/ min-entry-offs n-word-bytes)))
-          ;; Write a table of N-WORDS in length containing the entrypoints
-          ;; Not all words in the jump table will necessarily be used.
-          (dotimes (i n-words)
-            (format output "~A ~:[0~;CS+0x~:*~x~]"
-                    (if (= i 0) " .quad" ",")
-                    (when (< i n-entrypoints)
-                      (+ (ash header-len word-shift)
-                         (cadr (nth i name->addr)))))))
-        (terpri output)
+        ;; Possibly a padding word
+        (let ((here (ash jump-table-count sb-vm:word-shift))
+              (first-entry-point (cadar name->addr)))
+          (when (> first-entry-point here)
+            (assert (= first-entry-point (+ here 8)))
+            (format output " .quad 0~%")))
         ;; Loop over the embedded routines
         (let ((list name->addr)
               (obj-size (code-object-size code-component)))
@@ -998,9 +1043,10 @@
                 (format output "#x~x:~%" code-addr)
                 ;; Emit symbols before the code header data, because the symbols
                 ;; refer to "." (the current PC) which is the base of the object.
-                (emit-symbols (code-symbols code core) core pp-state output)
-                (dumpwords code-physaddr (code-header-words code) output #() code-addr)
-                (emit-funs code code-addr core #'dumpwords output emit-cfi)))
+                (let ((base (emit-symbols (code-symbols code core) core pp-state output)))
+                  (dumpwords (int-sap code-physaddr)
+                             (code-header-words code) output #() code-addr)
+                  (emit-funs code code-addr core #'dumpwords output base emit-cfi))))
              ((functionp (%code-debug-info code))
               (unless seen-trampolines
                 (setq seen-trampolines t)
@@ -1021,21 +1067,19 @@
          (let* ((ptr (translate-ptr code-addr spaces))
                 (fdefn (%make-lisp-obj (logior ptr other-pointer-lowtag)))
                 (name (fun-name-from-core (fdefn-name fdefn) core))
-                (fun (get-lisp-obj-address (fdefn-fun fdefn)))
-                (code-space-p (in-bounds-p fun code-bounds))
-                (raw-fun (sap-ref-word (int-sap ptr)
-                                       (ash fdefn-raw-addr-slot word-shift)))
                 (c-name (c-name name core pp-state "F")))
            (format output "~a: # ~x~% .size ~0@*~a, 32~%"
                      (c-symbol-quote c-name)
                      (logior code-addr other-pointer-lowtag))
-           (format output " .quad 0x~x, 0x~x, ~:[~;CS+~]0x~x, ~:[~;CS+~]0x~x~%"
-                   (sap-ref-word (int-sap ptr) 0)
-                   (sap-ref-word (int-sap ptr) 8)
-                   code-space-p
-                   (if code-space-p (- fun (bounds-low code-bounds)) fun)
-                   code-space-p
-                   (if code-space-p (- raw-fun (bounds-low code-bounds)) raw-fun))
+           (flet ((relativize (slot &aux (x (sap-ref-word (int-sap ptr) (ash slot word-shift))))
+                    (if (in-bounds-p x code-bounds)
+                        (format nil "CS+0x~x" (- x (bounds-low code-bounds)))
+                        (format nil "0x~x" x))))
+             (format output " .quad 0x~x, 0x~x, ~a, ~a~%"
+                     (sap-ref-word (int-sap ptr) 0)
+                     (sap-ref-word (int-sap ptr) 8)
+                     (relativize fdefn-fun-slot)
+                     (relativize fdefn-raw-addr-slot)))
            (incf code-addr (* 4 n-word-bytes))))
         (#.funcallable-instance-widetag
          (unless seen-gfs
@@ -1720,7 +1764,7 @@
             ;; in case the resulting executable needs to compile anything.
             ;; (Call frame info will be missing, but at least it's something.)
             (dolist (item '(("*COMPILE-FILE-TO-MEMORY-SPACE*" . "DYNAMIC")
-                            ("*COMPILE-TO-MEMORY-SPACE*" . "AUTO")))
+                            ("*COMPILE-TO-MEMORY-SPACE*" . "DYNAMIC")))
               (destructuring-bind (symbol . value) item
                 (%set-symbol-global-value
                  (find-target-symbol "SB-C" symbol map)

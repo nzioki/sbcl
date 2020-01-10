@@ -210,6 +210,7 @@
  ("src/code/pred" :not-host)
  ("src/compiler/generic/pinned-objects" :not-host)
 
+ ("src/code/string-hash" :c-headers)
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
  ("src/code/list"   :not-host)
@@ -232,6 +233,7 @@
  #+hpux  ("src/code/hpux-os"  :not-host)
  #+bsd   ("src/code/bsd-os"   :not-host)
  #+linux ("src/code/linux-os" :not-host)
+ #+haiku ("src/code/haiku-os" :not-host)
  #+win32 ("src/code/win32-os" :not-host)
 
  ("src/code/share-vm" :not-host)
@@ -493,6 +495,7 @@
  ("src/compiler/array-tran")
  ("src/compiler/seqtran")
  ("src/compiler/saptran")
+ ("src/compiler/modarith")
  ("src/compiler/sxhash")
  ("src/code/quantifiers")
  ("src/compiler/bitops-derive-type")
@@ -639,8 +642,9 @@
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
  ("src/code/final" :not-host)
  ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
+ ("src/code/reader" :not-host) ; needs "code/readtable"
  ("src/code/print" :not-host)
- ("src/code/reader"            :not-host) ; needs "code/readtable"
+
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
  #-win32
  ("src/code/unix-pathname"     :not-host)
@@ -716,7 +720,12 @@
 
  ("src/code/late-globaldb" :not-host)
  ("src/code/redblack" :not-host)
- )
+ ;; This file, which must be last, contains sanity-checks of the cross-compile.
+ ;; The inputs and outputs of certain functions (currently just SXHASH) are stored
+ ;; in global symbols. Relying on the fact that data are easily dumped as constants
+ ;; (assuming we don't have a genesis bug), the forms in this file can audit
+ ;; whether things came out right.
+ ("src/code/last-file" :not-host))
 
 ;;; make-target-2 build steps
 (("src/code/early-ntrace" ; lets PCL hook into tracing
@@ -818,12 +827,12 @@
   "src/code/describe-policy"
   "src/code/inspect"
   "src/code/profile"
-  #+x86-64 "src/code/aprof" ; precise allocation profiler
+  #+(and x86-64 sb-thread) "src/code/aprof" ; precise allocation profiler
   "src/code/step"
   "src/code/warm-lib"
   "src/code/alien-callback"
-  #+win32 "src/code/warm-mswin"
   "src/code/run-program"
+  #+win32 "src/code/warm-mswin"
   #+gencgc "src/code/traceroot"
 
   "src/code/repack-xref"

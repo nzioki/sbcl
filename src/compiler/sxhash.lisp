@@ -141,11 +141,11 @@
   ;; other than what the fixnum 0 hashes to (as tested in hash.impure.lisp)
   (let ((c (logandc1 1193941380939624010 sb-xc:most-positive-fixnum)))
     `(let ((x (double-float-bits x)))
-       ;; shift by -2 to get sign bit into hash.
-       ;; shifting by -1 isn't enough, for lack of significant bits in a fixnum.
-       ;; This would need to shift more if N-FIXNUM-TAG-BITS > 1,
-       ;; but seriously, who changes that parameter?
-       (logand (logxor (ash x 4) (ash x -2) ,c) sb-xc:most-positive-fixnum))))
+       ;; ensure we mix the sign bit into the hash
+       (logand (logxor (ash x 4)
+                       (ash x (- (1+ sb-vm:n-fixnum-tag-bits)))
+                       ,c)
+               sb-xc:most-positive-fixnum))))
 
 (deftransform sxhash ((x) (double-float)) '#.+sxhash-double-float-expr+)
 
@@ -208,6 +208,14 @@
                 (ensure-symbol-hash x)
                 result)))))
 
+(deftransform symbol-hash* ((object predicate) (symbol null) * :important nil)
+  `(symbol-hash* object 'symbolp)) ; annotate that object satisfies SYMBOLP
+(deftransform symbol-hash* ((object predicate)
+                            ((and (not null) symbol)
+                             (constant-arg (member nil symbolp)))
+                            * :important nil)
+  `(symbol-hash* object 'non-null-symbol-p)) ; etc
+
 ;;; These transforms are somehow needed when compiling ARRAY-PSXHASH and
 ;;; then never again.  Can't we define the guts of it to not need them?
 (deftransform psxhash ((x &optional depthoid) (character &optional t))
@@ -223,10 +231,18 @@
 (progn
   (defvar *sxhash-crosscheck* nil)
   (defun sxhash (x)
-    (let ((answer (etypecase x ; croak on anything but these
-                    (null         (ash sb-vm:nil-value (- sb-vm:n-fixnum-tag-bits)))
-                    (sb-xc:fixnum #.+sxhash-fixnum-expr+)
-                    (single-float #.+sxhash-single-float-expr+)
-                    (double-float #.+sxhash-double-float-expr+))))
+    (let ((answer
+           (etypecase x ; croak on anything but these
+            (null (ash sb-vm:nil-value (- sb-vm:n-fixnum-tag-bits)))
+            (symbol
+             (cond ((string= x "NIL") ; :NIL must hash the same as NIL
+                    (ash sb-vm:nil-value (- sb-vm:n-fixnum-tag-bits)))
+                   (t
+                    (let ((string-hash (sb-impl::%sxhash-simple-string
+                                        (coerce (string x) 'simple-string))))
+                      (logand (lognot string-hash) sb-xc:most-positive-fixnum)))))
+            (sb-xc:fixnum #.+sxhash-fixnum-expr+)
+            (single-float #.+sxhash-single-float-expr+)
+            (double-float #.+sxhash-double-float-expr+))))
       (push (cons x answer) *sxhash-crosscheck*)
       answer)))

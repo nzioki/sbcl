@@ -168,46 +168,9 @@ lose:
     return core_start;
 }
 
-#ifndef LISP_FEATURE_HPUX
-#define load_core_bytes(fd, where, addr, len) os_map(fd, where, addr, len)
-#else
-#define load_core_bytes(fd, where, addr, len) copy_core_bytes(fd, where, addr, len)
-/* If more platforms don't support overlapping mmap rename this
- * def to something like ifdef nommapoverlap */
-/* currently hpux only */
-static void copy_core_bytes(int fd, os_vm_offset_t offset,
-                            os_vm_address_t addr, int len)
-{
-  unsigned char buf[4096];
-  int c,x;
-  int old_fd = lseek(fd, 0, SEEK_CUR);
-
-  if(len & (4096-1)){
-    fprintf(stderr, "cant copy a slice of core because slice-length is not of page size(4096)\n");
-    exit(-1);
-  }
-  if(old_fd < 0){
-    fprintf(stderr, "cant perform lseek() on corefile\n");
-  }
-  lseek(fd, offset, SEEK_SET);
-  if(fd < 0){
-    fprintf(stderr, "cant perform lseek(%u,%lu,SEEK_SET) on corefile\n", fd, offset);
-  }
-  for(x = 0; x < len; x += 4096){
-    c = read(fd, buf, 4096);
-    if(c != 4096){
-      fprintf(stderr, "cant read memory area from corefile at position %lu, got %d\n", offset + x, c);
-      exit(-1);
-    }
-    memcpy(addr+x, buf, 4096);
-  }
-  os_flush_icache(addr, len);
-}
-#endif
-
 #ifndef LISP_FEATURE_SB_CORE_COMPRESSION
 # define inflate_core_bytes(fd,offset,addr,len) \
-    lose("This runtime was not built with zlib-compressed core support... aborting\n")
+    lose("This runtime was not built with zlib-compressed core support... aborting")
 #else
 # define ZLIB_BUFFER_SIZE (1u<<16)
 static void inflate_core_bytes(int fd, os_vm_offset_t offset,
@@ -224,7 +187,7 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
 # endif
 
     if (-1 == lseek(fd, offset, SEEK_SET)) {
-        lose("Unable to lseek() on corefile\n");
+        lose("Unable to lseek() on corefile");
     }
 
     stream.zalloc = NULL;
@@ -235,14 +198,14 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
 
     ret = inflateInit(&stream);
     if (ret != Z_OK)
-        lose("zlib error %i\n", ret);
+        lose("zlib error %i", ret);
 
     stream.next_out  = (void*)addr;
     stream.avail_out = len;
     do {
         ssize_t count = read(fd, buf, ZLIB_BUFFER_SIZE);
         if (count < 0)
-            lose("unable to read core file (errno = %i)\n", errno);
+            lose("unable to read core file (errno = %i)", errno);
         stream.next_in = buf;
         stream.avail_in = count;
         if (count == 0) break;
@@ -252,13 +215,13 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
             break;
         case Z_OK:
             if (stream.avail_out == 0)
-                lose("Runaway gzipped core directory... aborting\n");
+                lose("Runaway gzipped core directory... aborting");
             if (stream.avail_in > 0)
                 lose("zlib inflate returned without fully"
-                     "using up input buffer... aborting\n");
+                     "using up input buffer... aborting");
             break;
         default:
-            lose("zlib inflate error: %i\n", ret);
+            lose("zlib inflate error: %i", ret);
             break;
         }
     } while (ret != Z_STREAM_END);
@@ -289,18 +252,6 @@ struct heap_adjust {
     int n_relocs_rel; // relative
 };
 
-static inline struct code* get_asm_routine_code_component() {
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    return (struct code*)VARYOBJ_SPACE_START;
-#else
-    return (struct code*)READ_ONLY_SPACE_START;
-#endif
-}
-
-#ifndef LISP_FEATURE_RELOCATABLE_HEAP
-#define adjust_word(ignore,thing) thing
-#define relocate_heap(ignore)
-#else
 #include "genesis/gc-tables.h"
 #include "genesis/cons.h"
 #include "genesis/hash-table.h"
@@ -507,6 +458,13 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             // Fixup the constant pool. The word at where+1 is a fixnum.
             code = (struct code*)where;
             adjust_pointers(where+2, code_header_words(code)-2, adj);
+#if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
+            // Fixup absolute jump table
+            lispobj* jump_table = code_jumptable_start(code);
+            int count = jumptable_count(jump_table);
+            int i;
+            for (i = 1; i < count; ++i) adjust_word_at(jump_table+i, adj);
+#endif
             // Fixup all embedded simple-funs
             for_each_simple_fun(i, f, code, 1, {
                 fix_fun_header_layout((lispobj*)f, adj);
@@ -645,14 +603,7 @@ static void relocate_heap(struct heap_adjust* adj)
 #else
     relocate_space(DYNAMIC_SPACE_START, (lispobj*)get_alloc_pointer(), adj);
 #endif
-
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-    // Assembler routines move with varyobj space.
-    // (They're in readonly space if no immobile space)
-    struct code* code = get_asm_routine_code_component();
-    lispobj* jump_table = (lispobj*)code_text_start(code);
-    for ( ; *jump_table ; ++jump_table )
-        adjust_word_at(jump_table, adj);
     // Pointers within varyobj space to varyobj space do not need adjustment
     // so remove any delta before performing the relocation pass on this space.
     if (lisp_code_in_elf())
@@ -674,13 +625,19 @@ set_adjustment(struct heap_adjust* adj,
     adj->range[j].delta = actual_addr - desired_addr;
     adj->n_ranges = j+1;
 }
-#endif
 
 #if defined(LISP_FEATURE_ELF) && defined(LISP_FEATURE_IMMOBILE_SPACE)
     extern int apply_pie_relocs(long,long,int);
 #else
 #   define apply_pie_relocs(dummy1,dummy2,dummy3) (0)
 #endif
+
+/* TODO: If static + readonly were mapped as desired without disabling ASLR
+ * but one of the large spaces couldn't be mapped as desired, start over from
+ * the top, disabling ASLR. This should help to avoid relocating the heap
+ * if at all possible. It might make sense to parse the core header sooner in
+ * startup to avoid wasting time on all actions performed prior to re-exec.
+ */
 
 static void
 process_directory(int count, struct ndir_entry *entry,
@@ -775,11 +732,9 @@ process_directory(int count, struct ndir_entry *entry,
         int compressed = id & DEFLATED_CORE_SPACE_ID_FLAG;
         id -= compressed;
         if (id < 1 || id > MAX_CORE_SPACE_ID)
-            lose("unknown space ID %ld addr %p\n", id, (void*)addr);
+            lose("unknown space ID %ld addr %p", id, (void*)addr);
 
-#ifndef LISP_FEATURE_RELOCATABLE_HEAP
-        int enforce_address = 1;
-#elif defined(LISP_FEATURE_IMMOBILE_SPACE)
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
         // Enforce address of readonly, static, immobile varyobj
         int enforce_address = id != DYNAMIC_CORE_SPACE_ID
           && id != IMMOBILE_FIXEDOBJ_CORE_SPACE_ID
@@ -806,14 +761,13 @@ process_directory(int count, struct ndir_entry *entry,
         spaces[id].base = addr;
         uword_t len = os_vm_page_size * entry->page_count;
         if (id == DYNAMIC_CORE_SPACE_ID && len > dynamic_space_size) {
-            lose("dynamic space too small for core: %luKiB required, %luKiB available.\n",
+            lose("dynamic space too small for core: %luKiB required, %luKiB available.",
                  (unsigned long)len >> 10,
                  (unsigned long)dynamic_space_size >> 10);
         }
         if (len != 0) {
             spaces[id].len = len;
             uword_t __attribute__((unused)) aligned_start;
-#ifdef LISP_FEATURE_RELOCATABLE_HEAP
             // Try to map at address requested by the core file.
             size_t request = spaces[id].desired_size;
             int sub_2gb_flag = (request & 1);
@@ -826,7 +780,11 @@ process_directory(int count, struct ndir_entry *entry,
             else
 #endif
             if (request) {
-                addr = (uword_t)os_validate(sub_2gb_flag ? MOVABLE_LOW : MOVABLE,
+                // Avoid "Relocation of fixedobj space not supported" error by
+                // not passing relocatable flag for immobile space if text in ELF.
+                addr = (uword_t)os_validate(sub_2gb_flag ?
+                                            (lisp_code_in_elf() ? NOT_MOVABLE : MOVABLE_LOW) :
+                                            MOVABLE,
                                             (os_vm_address_t)addr, request);
                 if (!addr) {
                     lose("Can't allocate %#"OBJ_FMTX" bytes for space %ld",
@@ -877,7 +835,6 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
                 break;
             }
-#endif /* LISP_FEATURE_RELOCATABLE_HEAP */
 
             sword_t offset = os_vm_page_size * (1 + entry->data_page);
             if (compressed)
@@ -914,7 +871,27 @@ process_directory(int count, struct ndir_entry *entry,
         }
     }
 
-#ifdef LISP_FEATURE_RELOCATABLE_HEAP
+    // Compute the bounds of the lisp assembly routines
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    asm_routines_start = VARYOBJ_SPACE_START;
+#else
+    if (widetag_of((lispobj*)READ_ONLY_SPACE_START) == CODE_HEADER_WIDETAG) {
+        asm_routines_start = READ_ONLY_SPACE_START;
+    } else {
+        lispobj *where = (lispobj*)STATIC_SPACE_START;
+        while (where < static_space_free_pointer) {
+            if (widetag_of((lispobj*)where) == CODE_HEADER_WIDETAG) {
+                asm_routines_start = (uword_t)where;
+                break;
+            }
+            where += OBJECT_SIZE(*where, where);
+        }
+        if (!asm_routines_start) lose("Can't find asm routines");
+    }
+#endif
+    asm_routines_end = asm_routines_start +
+      N_WORD_BYTES * sizetab[CODE_HEADER_WIDETAG]((lispobj*)asm_routines_start);
+
 #  ifdef LISP_FEATURE_GENCGC
     set_adjustment(adj, DYNAMIC_SPACE_START, // actual
                    spaces[DYNAMIC_CORE_SPACE_ID].base, // expected
@@ -942,7 +919,6 @@ process_directory(int count, struct ndir_entry *entry,
 Please report this as a bug");
         relocate_heap(adj);
     }
-#endif
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     /* Now determine page characteristics (such as object spacing)
@@ -974,12 +950,6 @@ Please report this as a bug");
     immobile_space_max_offset   = range2.end - range1.start;
     immobile_range_1_max_offset = range1.end - range1.start;
     immobile_range_2_min_offset = range2.start - range1.start;
-#else
-    asm_routines_start = READ_ONLY_SPACE_START;
-    if (widetag_of((lispobj*)asm_routines_start) != CODE_HEADER_WIDETAG)
-        lose("Can't find asm routines");
-    int nwords = sizetab[CODE_HEADER_WIDETAG]((lispobj*)asm_routines_start);
-    asm_routines_end = asm_routines_start + nwords*N_WORD_BYTES;
 #endif
 #ifdef LISP_FEATURE_X86_64
     tune_asm_routines_for_microarch(); // before WPing immobile space
@@ -1024,7 +994,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 
     count = read(fd, header, os_vm_page_size);
     if (count < (ssize_t) os_vm_page_size) {
-        lose("premature end of core file\n");
+        lose("premature end of core file");
     }
 
     ptr = header;
@@ -1068,6 +1038,14 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                 // fprintf(stderr, "NOTE: TLS size increased to %x\n", dynamic_values_bytes);
             }
 #endif
+#ifdef LISP_FEATURE_GENCGC
+            if (widetag_of(native_pointer(initial_function)) == SIMPLE_FUN_WIDETAG
+                && !lisp_startup_options.noinform) {
+                fprintf(stderr, "Initial page table:\n");
+                extern void print_generation_stats(void);
+                print_generation_stats();
+            }
+#endif
             sanity_check_loaded_core(initial_function);
             return initial_function;
         case RUNTIME_OPTIONS_MAGIC: break; // already processed
@@ -1082,7 +1060,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 #include "genesis/cons.h"
 char* get_asm_routine_by_name(const char* name)
 {
-    struct code* code = get_asm_routine_code_component();
+    struct code* code = (struct code*)asm_routines_start;
     lispobj ht = CONS(code->debug_info)->car;
     if (ht) {
         struct vector* table =
@@ -1176,11 +1154,11 @@ static void graph_visit(lispobj __attribute__((unused)) referer,
             break;
         case CLOSURE_WIDETAG:
             // We must scan the closure's trampoline word.
+            graph_visit(ptr, fun_taggedptr_from_self(obj[1]), seen);
             // Closures can utilize one payload word beyond what the header
             // indicates. This is quite sucky and I don't know why I did that.
             // However, it is correctly accounted for by SHORT_BOXED_NWORDS
             // which gives you the right number of words to scan.
-            graph_visit(ptr, obj[1] - FUN_RAW_ADDR_OFFSET, seen);
             nwords = SHORT_BOXED_NWORDS(*obj);
             for(i=2; i<=nwords; ++i) RECURSE(obj[i]);
             break;
@@ -1218,13 +1196,15 @@ static void tally(lispobj ptr, struct visitor* v)
         ++v->headers[header_index].count;
         v->headers[header_index].words += words;
         if (widetag == SIMPLE_VECTOR_WIDETAG) {
-            int st = 0;
-            switch ((*obj >> N_WIDETAG_BITS) & 7) {
-            case subtype_VectorWeak: st = 1; break;
-            case subtype_VectorValidHashing: st = 2; break;
-            }
-            ++v->sv_subtypes[st].count;
-            v->sv_subtypes[st].words += words;
+            int subtype = (*obj >> N_WIDETAG_BITS) & 7;
+            if (subtype == subtype_VectorWeak)
+                subtype = 1;
+            else if (subtype & subtype_VectorHashing)
+                subtype = 2;
+            else // The above test should account for everything
+                gc_assert(subtype == 0);
+            ++v->sv_subtypes[subtype].count;
+            v->sv_subtypes[subtype].words += words;
         }
     }
 }

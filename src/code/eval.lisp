@@ -96,7 +96,7 @@
            ;; written on a "let's get it to work" basis.
            ;; These seem to be the variables that need
            ;; bindings for PROCESS-DECLS to work
-           ;; (*FREE-FUNS* and *FREE-VARS* so that
+           ;; (*IR1-NAMESPACE* so that
            ;; references to free functions and variables
            ;; in the declarations can be noted;
            ;; *UNDEFINED-WARNINGS* so that warnings about
@@ -104,8 +104,7 @@
            ;; then thrown away, as it happens]). -- CSR,
            ;; 2002-10-24
            (let* ((sb-c:*lexenv* lexenv)
-                  (sb-c::*free-funs* (make-hash-table :test 'equal))
-                  (sb-c::*free-vars* (make-hash-table :test 'eq))
+                  (sb-c::*ir1-namespace* (sb-c::make-ir1-namespace))
                   (sb-c::*undefined-warnings* nil))
              ;; FIXME: VALUES declaration
              (sb-c::process-decls decls
@@ -184,8 +183,7 @@
                   (error "wrong number of args to FUNCTION:~% ~S" exp))
                 (let ((name (second exp)))
                   (if (and (legal-fun-name-p name)
-                           (not (consp (let ((sb-c:*lexenv* lexenv))
-                                         (sb-c:lexenv-find name funs)))))
+                           (not (consp (sb-c:lexenv-find name funs :lexenv lexenv))))
                       (%coerce-name-to-fun name)
                       ;; FIXME: This is a bit wasteful: it would be nice to call
                       ;; COMPILE-IN-LEXENV with the lambda-form directly, but

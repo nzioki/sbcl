@@ -329,7 +329,8 @@
                      (lambda-var-p (ref-leaf node)))
             (let ((type (single-value-type int)))
               (when (and (member-type-p type)
-                         (eql 1 (member-type-size type)))
+                         (eql (member-type-size type) 1)
+                         (not (preserve-single-use-debug-var-p node (ref-leaf node))))
                 (change-ref-leaf node (find-constant
                                        (first (member-type-members type)))))))
           (reoptimize-lvar lvar)))))
@@ -1193,7 +1194,7 @@
                  ;; multiple times.
                  (setf (combination-type-validated-for-leaf call) fun)
                  (when (and (valid-fun-use call defined-type
-                                           :argument-test #'always-subtypep
+                                           :argument-test nil
                                            :result-test nil
                                            :lossage-fun (if same-file-p
                                                             #'compiler-warn
@@ -1206,7 +1207,7 @@
           (t
            (multiple-value-bind (valid unwinnage unknown-keys)
                (valid-fun-use call type
-                              :argument-test #'always-subtypep
+                              :argument-test nil
                               :result-test nil
                               :lossage-fun #'compiler-warn
                               :unwinnage-fun #'compiler-notify)
@@ -1927,8 +1928,6 @@
                                        t)
                  (%delete-lvar-use ref)
                  (add-lvar-use cast lvar)))))
-      (setf (node-derived-type ref) *wild-type*)
-      (change-ref-leaf ref (find-constant nil))
       (delete-ref ref)
       (unlink-node ref)
       (when (return-p dest)
@@ -2519,6 +2518,12 @@
             ;; optimization.
             ((and (bound-cast-p cast)
                   (bound-cast-check cast)))
+            ((and (eq atype *empty-type*)
+                  (do-uses (node value t)
+                    (unless (basic-combination-p node)
+                      (return))))
+             ;; Combinations have nil-fun-returned-error
+             (setf (cast-%type-check cast) nil))
             (t
              (let ((context (node-source-form cast))
                    (detail (lvar-all-sources (cast-value cast))))

@@ -377,6 +377,13 @@
                    (dd-slots (find-defstruct-description type-name))
                    :key #'dsd-name)))
 
+;;; Compute a SAP to the specified slot in INSTANCE.
+(defmacro struct-slot-sap (instance type-name slot-name)
+  `(sap+ (int-sap (get-lisp-obj-address ,instance))
+         (- (ash (+ (get-dsd-index ,type-name ,slot-name) sb-vm:instance-slots-offset)
+                 sb-vm:word-shift)
+            sb-vm:instance-pointer-lowtag)))
+
 (defmacro define-type-class (name &key inherits
                                      (enumerable (unless inherits (must-supply-this))
                                                  enumerable-supplied-p)
@@ -569,7 +576,7 @@
 ;;; interpolate between regions of the type hierarchy, such as
 ;;; INSTANCE (which corresponds to all those classes with slots which
 ;;; are not funcallable), FUNCALLABLE-INSTANCE (those classes with
-;;; slots which are funcallable) and EXTENDED-SEQUUENCE (non-LIST
+;;; slots which are funcallable) and EXTENDED-SEQUENCE (non-LIST
 ;;; non-VECTOR classes which are also sequences).  These special cases
 ;;; are the ones that aren't really discussed by Baker in his
 ;;; "Decision Procedure for SUBTYPEP" paper.
@@ -762,6 +769,7 @@
   (name (missing-arg) :type symbol :read-only t)
   ;; the type of the argument value
   (type (missing-arg) :type ctype :read-only t))
+(declaim (freeze-type key-info))
 
 ;;; ARGS-TYPE objects are used both to represent VALUES types and
 ;;; to represent FUNCTION types.

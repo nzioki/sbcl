@@ -403,12 +403,12 @@
                    (inst mov (second default) eax-tn))
                  (inst jmp defaulting-done)))))))
       (t
-       ;; 91 bytes for this branch.
        (let ((regs-defaulted (gen-label))
              (restore-edi (gen-label))
              (no-stack-args (gen-label))
              (default-stack-vals (gen-label))
-             (count-okay (gen-label)))
+             (count-okay (gen-label))
+             (copy-loop (gen-label)))
          (note-this-location vop :unknown-return)
          ;; Branch off to the MV case.
          (inst jmp :c regs-defaulted)
@@ -427,8 +427,7 @@
          ;; Load EAX with NIL so we can quickly store it, and set up
          ;; stuff for the loop.
          (inst mov eax-tn nil-value)
-         (inst std)
-         (inst mov ecx-tn (- nvals register-arg-count))
+         (inst mov ecx-tn (fixnumize (- nvals register-arg-count)))
          ;; Jump into the default loop.
          (inst jmp default-stack-vals)
          ;; The regs are defaulted. We need to copy any stack arguments,
@@ -458,10 +457,15 @@
                         :disp (frame-byte-offset
                                (+ sp->fp-offset register-arg-count))))
          ;; Do the copy.
-         (inst shr ecx-tn word-shift)   ; make word count
-         (inst std)
-         (inst rep)
-         (inst movs :dword)
+         (inst push edx-tn)
+         (emit-label copy-loop)
+         (inst mov edx-tn (make-ea :dword :base esi-tn))
+         (inst sub esi-tn n-word-bytes)
+         (inst mov (make-ea :dword :base edi-tn) edx-tn)
+         (inst sub edi-tn n-word-bytes)
+         (inst sub ecx-tn (fixnumize 1))
+         (inst jmp :nz copy-loop)
+         (inst pop edx-tn)
          ;; Restore ESI.
          (loadw esi-tn ebx-tn (frame-word-offset (+ sp->fp-offset 2)))
          ;; Now we have to default the remaining args. Find out how many.
@@ -470,18 +474,18 @@
          ;; If none, then just blow out of here.
          (inst jmp :le restore-edi)
          (inst mov ecx-tn eax-tn)
-         (inst shr ecx-tn word-shift)   ; word count
          ;; Load EAX with NIL for fast storing.
          (inst mov eax-tn nil-value)
          ;; Do the store.
          (emit-label default-stack-vals)
-         (inst rep)
-         (inst stos eax-tn)
+         (inst mov (make-ea :dword :base edi-tn) eax-tn)
+         (inst sub edi-tn n-word-bytes)
+         (inst sub ecx-tn (fixnumize 1))
+         (inst jmp :nz default-stack-vals)
          ;; Restore EDI, and reset the stack.
          (emit-label restore-edi)
          (loadw edi-tn ebx-tn (frame-word-offset (+ sp->fp-offset 1)))
-         (inst mov esp-tn ebx-tn)
-         (inst cld)))))
+         (inst mov esp-tn ebx-tn)))))
   (values))
 
 ;;;; unknown values receiving
@@ -906,10 +910,10 @@
                          '(make-ea :dword :disp
                            (+ nil-value (static-fun-offset fun))))
                         ((t)
-                         '(make-ea-for-object-slot eax fdefn-raw-addr-slot
+                         '(object-slot-ea eax fdefn-raw-addr-slot
                            other-pointer-lowtag))
                         ((nil)
-                         '(make-ea-for-object-slot eax closure-fun-slot
+                         '(object-slot-ea eax closure-fun-slot
                            fun-pointer-lowtag))))
                ,@(ecase return
                    (:fixed
@@ -1126,7 +1130,8 @@
   (:generator 20
     ;; Avoid the copy if there are no more args.
     (cond ((zerop fixed)
-           (inst jecxz JUST-ALLOC-FRAME))
+           (inst test ecx-tn ecx-tn)
+           (inst jmp :z JUST-ALLOC-FRAME))
           (t
            (inst cmp ecx-tn (fixnumize fixed))
            (inst jmp :be JUST-ALLOC-FRAME)))
@@ -1350,12 +1355,11 @@
                 (move ecx count)
                 ;; Check to see whether there are no args, and just return NIL if so.
                 (inst mov result nil-value)
-                (inst jecxz done)
+                (inst test ecx ecx)
+                (inst jmp :z done)
                 (inst lea dst (make-ea :dword :base ecx :index ecx))
                 (pseudo-atomic (:elide-if stack-allocate-p)
                                (allocation dst dst node stack-allocate-p list-pointer-lowtag)
-                               ;; Set decrement mode (successive args at lower addresses)
-                               (inst std)
                                ;; Set up the result.
                                (move result dst)
                                ;; Jump into the middle of the loop, 'cause that's where we want
@@ -1368,14 +1372,14 @@
                                (storew dst dst -1 list-pointer-lowtag)
                                (emit-label enter)
                                ;; Grab one value and stash it in the car of this cons.
-                               (inst lods eax)
+                               (inst mov eax (make-ea :dword :base src))
+                               (inst sub src n-word-bytes)
                                (storew eax dst 0 list-pointer-lowtag)
                                ;; Go back for more.
                                (inst sub ecx n-word-bytes)
                                (inst jmp :nz loop)
                                ;; NIL out the last cons.
-                               (storew nil-value dst 1 list-pointer-lowtag)
-                               (inst cld))
+                               (storew nil-value dst 1 list-pointer-lowtag))
                 (emit-label done))))
 
 ;;; Return the location and size of the &MORE arg glob created by

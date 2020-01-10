@@ -70,12 +70,6 @@ os_vm_size_t os_vm_page_size;
 #include "gc.h"
 #include "gencgc-internal.h"
 #include <wincrypt.h>
-
-#if 0
-int linux_sparc_siginfo_bug = 0;
-int linux_supports_futex=0;
-#endif
-
 #include <stdarg.h>
 #include <string.h>
 
@@ -679,6 +673,9 @@ int os_preinit(char *argv[], char *envp[])
         lose("TLS slot assertion failed: slot 63 is unavailable "
              "(last TlsAlloc() returned %u)",key);
     }
+#else
+    (void) argv; /* unused */
+    (void) envp; /* unused */
 #endif
     return 0;
 }
@@ -734,14 +731,12 @@ int fprintf(FILE*stream,const char*fmt,...)
 
 int os_number_of_processors = 1;
 
-BOOL WINAPI CancelIoEx(HANDLE handle, LPOVERLAPPED overlapped);
-typeof(CancelIoEx) *ptr_CancelIoEx;
-BOOL WINAPI CancelSynchronousIo(HANDLE threadHandle);
-typeof(CancelSynchronousIo) *ptr_CancelSynchronousIo;
+BOOL (*ptr_CancelIoEx)(HANDLE /*handle*/, LPOVERLAPPED /*overlapped*/);
+BOOL (*ptr_CancelSynchronousIo)(HANDLE /*threadHandle*/);
 
 #define RESOLVE(hmodule,fn)                     \
     do {                                        \
-        ptr_##fn = (typeof(ptr_##fn))           \
+        ptr_##fn = (typeof(ptr_##fn)) (void *)  \
             GetProcAddress(hmodule,#fn);        \
     } while (0)
 
@@ -820,20 +815,21 @@ static inline boolean local_thread_stack_address_p(os_vm_address_t address)
  */
 
 os_vm_address_t
-os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
+os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
 {
     MEMORY_BASIC_INFORMATION mem_info;
 
     if (!addr) {
         /* the simple case first */
+        int protection = attributes & IS_GUARD_PAGE ? PAGE_NOACCESS : PAGE_EXECUTE_READWRITE;
         return
-            AVERLAX(VirtualAlloc(addr, len, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+            AVERLAX(VirtualAlloc(addr, len, MEM_RESERVE|MEM_COMMIT, protection));
     }
 
     if (!AVERLAX(VirtualQuery(addr, &mem_info, sizeof mem_info)))
         return 0;
 
-    if ((mem_info.State == MEM_RESERVE) && (mem_info.RegionSize >=len)) {
+    if ((mem_info.State == MEM_RESERVE) && (mem_info.RegionSize >= len)) {
         /* It would be correct to return here. However, support for Wine
          * is beneficial, and Wine has a strange behavior in this
          * department. It reports all memory below KERNEL32.DLL as
@@ -845,23 +841,36 @@ os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
          * actually free.
          */
         VirtualAlloc(addr, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        /* If it is wine, the second call has succeded, and now the region
+        /* If it is wine, the second call has succeeded, and now the region
          * is really reserved. */
         return addr;
     }
 
+    DWORD mode;
     if (mem_info.State == MEM_RESERVE) {
         fprintf(stderr, "validation of reserved space too short.\n");
         fflush(stderr);
         /* Oddly, we do not treat this assertion as fatal; hence also the
          * provision for MEM_RESERVE in the following code, I suppose: */
+        mode = MEM_COMMIT;
+    } else {
+        mode = MEM_RESERVE;
     }
 
-    os_vm_address_t actual;
+    os_vm_address_t actual = VirtualAlloc(addr, len, mode, PAGE_EXECUTE_READWRITE);
 
-    if (!AVERLAX(actual = VirtualAlloc(addr, len, (mem_info.State == MEM_RESERVE)?
-                                       MEM_COMMIT: MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
-        return 0;
+    if (!actual) {
+        if (!(attributes & MOVABLE)) {
+            fprintf(stderr,
+                    "VirtualAlloc: wanted %lu bytes at %p, actually mapped at %p\n",
+                    (unsigned long) len, addr, actual);
+            fflush(stderr);
+            return 0;
+        }
+
+        return AVERLAX(VirtualAlloc(NULL, len, mode, PAGE_EXECUTE_READWRITE));
+    }
+
     return actual;
 }
 
@@ -925,7 +934,7 @@ os_invalidate_free_by_any_address(os_vm_address_t addr,
 
 /* os_validate doesn't commit, i.e. doesn't actually "validate" in the
  * sense that we could start using the space afterwards.  Usually it's
- * os_map or Lisp code that will run into that, in which case we recommit
+ * load_core_bytes or Lisp code that will run into that, in which case we recommit
  * elsewhere in this file.  For cases where C wants to write into newly
  * os_validate()d memory, it needs to commit it explicitly first:
  */
@@ -937,7 +946,7 @@ os_validate_recommit(os_vm_address_t addr, os_vm_size_t len)
 }
 
 /*
- * os_map() is called to map a chunk of the core file into memory.
+ * load_core_bytes() is called to load a chunk of the core file into memory.
  *
  * Unfortunately, Windows semantics completely screws this up, so
  * we just add backing store from the swapfile to where the chunk
@@ -947,7 +956,7 @@ os_validate_recommit(os_vm_address_t addr, os_vm_size_t len)
  * thing to maintain).
  */
 
-void os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 {
     os_vm_size_t count;
 
@@ -1388,7 +1397,7 @@ handle_exception(EXCEPTION_RECORD *exception_record,
     context.sigmask = self ? self->os_thread->blocked_signal_set : 0;
 #endif
 
-    os_context_register_t oldbp = NULL;
+    os_context_register_t oldbp = 0;
     if (self) {
         oldbp = self ? self->carried_base_pointer : 0;
         self->carried_base_pointer
@@ -1530,7 +1539,7 @@ char *dirname(char *path)
     int i;
 
     if (pathlen >= sizeof(buf)) {
-        lose("Pathname too long in dirname.\n");
+        lose("Pathname too long in dirname.");
         return NULL;
     }
 

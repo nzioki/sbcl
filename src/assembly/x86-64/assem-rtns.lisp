@@ -33,7 +33,8 @@
      (:temp loop-index unsigned-reg r9-offset))
 
   ;; Pick off the cases where everything fits in register args.
-  (inst jrcxz ZERO-VALUES)
+  (inst test rcx rcx)
+  (inst jmp :z ZERO-VALUES)
   (inst cmp rcx (fixnumize 1))
   (inst jmp :e ONE-VALUE)
   (inst cmp rcx (fixnumize 2))
@@ -247,7 +248,8 @@
   (inst jmp :b undefined)
 
   (loadw length vector 1 other-pointer-lowtag)
-  (inst mov fun (ea (- 8 other-pointer-lowtag) vector length 4))
+  (inst mov fun (ea (- 8 other-pointer-lowtag) vector length
+                    (ash 1 (- word-shift n-fixnum-tag-bits))))
 
   (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fun))
   UNDEFINED
@@ -288,7 +290,7 @@
     (inst test catch catch)             ; check for NULL pointer
     (inst jmp :z error))
 
-  (inst cmp target (make-ea-for-object-slot catch catch-block-tag-slot 0))
+  (inst cmp target (object-slot-ea catch catch-block-tag-slot 0))
   (inst jmp :e EXIT)
 
   (loadw catch catch catch-block-previous-catch-slot)
@@ -327,7 +329,7 @@
   ;; Does *CURRENT-UNWIND-PROTECT-BLOCK* match the value stored in
   ;; argument's CURRENT-UWP-SLOT?
   (inst cmp uwp
-        (make-ea-for-object-slot block unwind-block-uwp-slot 0))
+        (object-slot-ea block unwind-block-uwp-slot 0))
   ;; If a match, return to conitext in arg block.
   (inst jmp :e DO-EXIT)
 

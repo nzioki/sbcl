@@ -26,7 +26,6 @@ else
     SBCL_PREFIX="/usr/local"
 fi
 SBCL_XC_HOST="sbcl --no-userinit --no-sysinit"
-export SBCL_XC_HOST
 
 # Parse command-line options.
 bad_option() {
@@ -37,8 +36,7 @@ bad_option() {
 
 WITH_FEATURES=""
 WITHOUT_FEATURES=""
-FANCY_FEATURES=":sb-core-compression :sb-xref-for-internals"
-BUILD_FEATURES=""
+FANCY_FEATURES=":sb-core-compression :sb-xref-for-internals :sb-after-xc-core"
 
 fancy=false
 some_options=false
@@ -53,7 +51,7 @@ do
         optarg=`expr "X$option" : '[^=]*=\(.*\)'` || optarg_ok=false
         option=`expr "X$option" : 'X\([^=]*=\).*'`
         ;;
-      --with*|--build*)
+      --with*)
         optarg=`expr "X$option" : 'X--[^-]*-\(.*\)'` \
             || bad_option "Malformed feature toggle: $option"
         option=`expr "X$option" : 'X\(--[^-]*\).*'`
@@ -92,12 +90,8 @@ do
 	;;
       --fancy)
         WITH_FEATURES="$WITH_FEATURES $FANCY_FEATURES"
-        BUILD_FEATURES="$BUILD_FEATURES :sb-after-xc-core"
         # Lower down we add :sb-thread for platforms where it can be built.
         fancy=true
-        ;;
-      --build)
-        BUILD_FEATURES="$BUILD_FEATURES :$optarg"
         ;;
       -*)
         bad_option "Unknown command-line option to $0: \"$option\""
@@ -107,7 +101,7 @@ do
         then
             bad_option "Unknown command-line option to $0: \"$option\""
         else
-            legacy_xc_spec=$option
+            SBCL_XC_HOST=$option
         fi
         ;;
   esac
@@ -123,12 +117,6 @@ then
     echo "ERROR: Both customize-target-features.lisp, and feature-options"
     echo "to make.sh present -- cannot use both at the same time."
     exit 1
-fi
-
-# Previously XC host was provided as a positional argument.
-if test -n "$legacy_xc_spec"
-then
-    SBCL_XC_HOST="$legacy_xc_spec"
 fi
 
 if test "$print_help" = "yes"
@@ -225,11 +213,20 @@ EOF
   exit 1
 fi
 
+mkdir -p output
+echo "SBCL_TEST_HOST=\"$SBCL_XC_HOST\"" > output/build-config
+. output/build-config # may come out differently due to escaping
+
+if ! echo '(lisp-implementation-type)' | $SBCL_TEST_HOST; then
+    echo "No working host Common Lisp implementation."
+    echo 'See ./INSTALL, the "SOURCE DISTRIBUTION" section'
+    exit 1
+fi
+
 # Running make.sh with different options without clean.sh in the middle
 # can break things.
 sh clean.sh
 
-mkdir -p output
 # Save prefix for make and install.sh.
 echo "SBCL_PREFIX='$SBCL_PREFIX'" > output/prefix.def
 echo "$SBCL_DYNAMIC_SPACE_SIZE" > output/dynamic-space-size.txt
@@ -254,7 +251,6 @@ find_gnumake
 
 echo "GNUMAKE=\"$GNUMAKE\"; export GNUMAKE" >> output/build-config
 echo "SBCL_XC_HOST=\"$SBCL_XC_HOST\"; export SBCL_XC_HOST" >> output/build-config
-echo "legacy_xc_spec=\"$legacy_xc_spec\"; export legacy_xc_spec" >> output/build-config
 if [ -n "$SBCL_HOST_LOCATION" ]; then
     echo "SBCL_HOST_LOCATION=\"$SBCL_HOST_LOCATION\"; export SBCL_HOST_LOCATION" >> output/build-config
 fi
@@ -302,6 +298,9 @@ case `uname` in
         ;;
     HP-UX)
         sbcl_os="hpux"
+        ;;
+    Haiku)
+        sbcl_os="haiku"
         ;;
     *)
         echo unsupported OS type: `uname`
@@ -426,6 +425,14 @@ else
 fi
 
 case "$sbcl_os" in
+    netbsd)
+        # default to using paxctl to disable mprotect restrictions
+        if [ "x$(sysctl -n security.pax.mprotect.enabled 2>/dev/null)" = x1 -a \
+             "x$SBCL_PAXCTL" = x ]; then
+            echo "SBCL_PAXCTL=\"/usr/sbin/paxctl +m\"; export SBCL_PAXCTL" \
+                 >> output/build-config
+        fi
+        ;;
     openbsd)
         # openbsd 6.0 and newer restrict mmap of RWX pages
         if [ $(uname -r | tr -d .) -gt 60 ]; then
@@ -439,13 +446,6 @@ case "$sbcl_os" in
         fi
     ;;
 esac
-
-bf=`pwd`/build-features.lisp-expr
-echo //initializing $bf
-echo ';;;; This is a machine-generated file.' > $bf
-echo ';;;; Please do not edit it by hand.' >> $bf
-echo ';;;; See make-config.sh.' >> $bf
-echo "($BUILD_FEATURES)" >> $bf
 
 ltf=`pwd`/local-target-features.lisp-expr
 echo //initializing $ltf
@@ -503,6 +503,12 @@ case "$sbcl_os" in
         link_or_copy Config.$sbcl_arch-hpux Config
         link_or_copy $sbcl_arch-hpux-os.h target-arch-os.h
         link_or_copy hpux-os.h target-os.h
+        ;;
+    haiku)
+        printf ' :unix :elf :haiku :sb-dynamic-core' >> $ltf
+        link_or_copy Config.$sbcl_arch-haiku Config
+        link_or_copy $sbcl_arch-haiku-os.h target-arch-os.h
+        link_or_copy haiku-os.h target-os.h
         ;;
     *bsd)
         printf ' :unix' >> $ltf
@@ -564,7 +570,7 @@ case "$sbcl_os" in
             printf ' :mach-exception-handler' >> $ltf
             darwin_version=`uname -r`
             darwin_version_major=${DARWIN_VERSION_MAJOR:-${darwin_version%%.*}}
-    
+
             if (( 8 < $darwin_version_major )); then
 	        printf ' :inode64' >> $ltf
             fi
@@ -609,13 +615,6 @@ case "$sbcl_os" in
     *)
         echo unsupported OS type: `uname`
         exit 1
-        ;;
-esac
-case "$sbcl_os" in
-    win32)
-        ;;
-    *)
-        printf ' :relocatable-heap' >> $ltf
         ;;
 esac
 cd "$original_dir"
@@ -663,7 +662,7 @@ if [ "$sbcl_arch" = "x86" ]; then
         sh tools-for-build/openbsd-sigcontext.sh > src/runtime/openbsd-sigcontext.h
     fi
 elif [ "$sbcl_arch" = "x86-64" ]; then
-    printf ' :64-bit :64-bit-registers :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack :linkage-table' >> $ltf
+    printf ' :64-bit :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack :linkage-table' >> $ltf
     printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop' >> $ltf
     printf ' :fp-and-pc-standard-save' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
@@ -706,7 +705,7 @@ elif [ "$sbcl_arch" = "ppc" ]; then
 	fi
     fi
 elif [ "$sbcl_arch" = "ppc64" ]; then
-    printf ' :64-bit :64-bit-registers' >> $ltf
+    printf ' :64-bit' >> $ltf
     printf ' :gencgc :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :linkage-table :sb-dynamic-core' >> $ltf
@@ -716,7 +715,7 @@ elif [ "$sbcl_arch" = "ppc64" ]; then
     # 2.3.1, so define our constant for that)
     echo '#define GLIBC231_STYLE_UCONTEXT 1' > src/runtime/ppc-linux-mcontext.h
 elif [ "$sbcl_arch" = "riscv" ]; then
-    printf ' :64-bit :64-bit-registers' >> $ltf
+    printf ' :64-bit' >> $ltf
     printf ' :gencgc' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
@@ -744,7 +743,6 @@ elif [ "$sbcl_arch" = "sparc" ]; then
     printf ' :stack-allocatable-closures :stack-allocatable-lists' >> $ltf
 elif [ "$sbcl_arch" = "alpha" ]; then
     printf ' :cheneygc' >> $ltf
-    printf ' :64-bit-registers' >> $ltf
     printf ' :stack-allocatable-closures :stack-allocatable-lists' >> $ltf
     printf ' :stack-allocatable-fixed-objects' >> $ltf
 elif [ "$sbcl_arch" = "hppa" ]; then
@@ -762,7 +760,7 @@ elif [ "$sbcl_arch" = "arm" ]; then
     printf ' :unwind-to-frame-and-call-vop' >> $ltf
     printf ' :fp-and-pc-standard-save' >> $ltf
 elif [ "$sbcl_arch" = "arm64" ]; then
-    printf ' :64-bit :64-bit-registers :gencgc :linkage-table :fp-and-pc-standard-save' >> $ltf
+    printf ' :64-bit :gencgc :linkage-table :fp-and-pc-standard-save' >> $ltf
     printf ' :alien-callbacks' >> $ltf
     printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
     printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
@@ -807,4 +805,3 @@ if [ -n "$SBCL_HOST_LOCATION" ]; then
     rsync --delete-after -a output/ "$SBCL_HOST_LOCATION/output/"
     rsync -a local-target-features.lisp-expr version.lisp-expr "$SBCL_HOST_LOCATION/"
 fi
-

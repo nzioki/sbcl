@@ -349,12 +349,6 @@
     (tai '*print-base* :heap '(:space :immobile))
   t)
 
-(deftest allocation-information.2c
-  ;; This is a a test of SBCL genesis that leverages sb-introspect.
-    (tai (sb-kernel::find-fdefn (elt sb-vm:+static-fdefns+ 0))
-         :heap '(:space #+immobile-code :immobile #-immobile-code :static))
-  t)
-
 (deftest allocation-information.3
     (tai 42 :immediate nil)
   t)
@@ -374,7 +368,7 @@
 (deftest* (allocation-information.4
            ;; Ignored as per the comment above, even though it seems
            ;; unlikely that this is the right condition.
-           :fails-on (or :win32 (and :sparc :gencgc)))
+           :fails-on (or :win32 :ppc64 (and :sparc :gencgc)))
     #+gencgc
     (tai (make-list 1) :heap
          `(:space :dynamic :boxed t :large nil)

@@ -228,6 +228,12 @@ sufficiently motivated to do lengthy fixes."
           ;; prior causes compilation to occur into immobile space.
           ;; Failing to see all immobile code would miss some relocs.
           #+immobile-code (sb-vm::choose-code-component-order root-structures)
+          ;; Must clear this cache if asm routines are movable.
+          (setq sb-disassem::*assembler-routines-by-addr* nil
+                ;; and save some space by deleting the instruction decoding table
+                ;; which can be rebuilt on demand. Must be done after DEINIT
+                ;; and CHOOSE-CODE-COMPONENT-ORDER both of which disassemble.
+                sb-disassem::*disassem-inst-space* nil)
           ;; Save the restart function. Logically a passed argument, but can't be,
           ;; as it would require pinning around the whole save operation.
           (with-pinned-objects (#'restart-lisp)
@@ -280,7 +286,11 @@ sufficiently motivated to do lengthy fixes."
          (if shared-info
              (setf (info :function :info name) shared-info)
              (setf (gethash info ht) info))))))
-  (sb-c::coalesce-debug-info) ; Share even more things
+
+  ;; Don't try to assign header slots of code objects. Any of them could be in
+  ;; readonly space. It's not worth the trouble to try to figure out which aren't.
+  #-cheneygc (sb-c::coalesce-debug-info) ; Share even more things
+
   #+sb-fasteval (sb-interpreter::flush-everything)
   (tune-hashtable-sizes-of-all-packages))
 
@@ -288,17 +298,38 @@ sufficiently motivated to do lengthy fixes."
   (call-hooks "save" *save-hooks*)
   #+sb-wtimer
   (itimer-emulation-deinit)
-  ;; Terminate finalizer thread now, especially given that the thread runs
-  ;; user-supplied code that might not even work in later steps of deinit.
-  ;; See also the comment at definition of THREAD-EPHEMERAL-P.
-  #+sb-thread (finalizer-thread-stop)
-  (let ((threads (sb-thread:list-all-threads)))
-    (unless (= 1 (length threads))
-      (let* ((interactive (sb-thread::interactive-threads))
-             (other (set-difference threads interactive)))
-        (error 'save-with-multiple-threads-error
-               :interactive-threads interactive
-               :other-threads other))))
+  #+sb-thread
+  (progn
+    ;; Terminate finalizer thread now, especially given that the thread runs
+    ;; user-supplied code that might not even work in later steps of deinit.
+    ;; See also the comment at definition of THREAD-EPHEMERAL-P.
+    (finalizer-thread-stop)
+    (let ((threads (sb-thread:list-all-threads)))
+      (when (cdr threads)
+        ;; Despite calling FINALIZER-THREAD-STOP, an unlucky thread schedule
+        ;; courtesy of the OS might notionally start the finalizer thread but not
+        ;; run it until now. Suppose it barely got to its lisp trampoline,
+        ;; at which point we see it in *ALL-THREADS* not having observed it
+        ;; in *FINALIZER-THREAD*. FINALIZER-THREAD-STOP didn't know to stop it.
+        ;; Without adding significantly more synchronization, the best recourse
+        ;; is to consider it as nonexistent whenever it was "stopped".
+        ;; A newly started finalizer thread can do nothing but exit immediately
+        ;; whenever *FINALIZER-THREAD* is NIL so we don't actually care
+        ;; what that thread is doing at this point.
+        (let ((finalizer (find-if (lambda (x)
+                                    (and (sb-thread::thread-%ephemeral-p x)
+                                         (string= (sb-thread:thread-name x) "finalizer")))
+                                  threads)))
+          (when finalizer
+            (sb-thread:join-thread finalizer)))
+        ;; Regardless of what happened above, grab the all-threads list again.
+        (setq threads (sb-thread:list-all-threads)))
+      (when (cdr threads)
+        (let* ((interactive (sb-thread::interactive-threads))
+               (other (set-difference threads interactive)))
+          (error 'save-with-multiple-threads-error
+                 :interactive-threads interactive
+                 :other-threads other)))))
   (tune-image-for-dump)
   (float-deinit)
   (profile-deinit)
@@ -312,8 +343,6 @@ sufficiently motivated to do lengthy fixes."
   ;; because coalescing compares by TYPE= which creates more cache entries.
   (coalesce-ctypes)
   (drop-all-hash-caches)
-  ;; Must clear this cache if asm routines are movable.
-  (setq sb-disassem::*assembler-routines-by-addr* nil)
   (os-deinit)
   ;; Perform static linkage. Functions become un-statically-linked
   ;; on demand, for TRACE, redefinition, etc.
@@ -443,8 +472,7 @@ sb-c::
 (defun coalesce-debug-info ()
   (flet ((debug-source= (a b)
            (and (equal (debug-source-plist a) (debug-source-plist b))
-                (eql (debug-source-created a) (debug-source-created b))
-                (eql (debug-source-compiled a) (debug-source-compiled b)))))
+                (eql (debug-source-created a) (debug-source-created b)))))
     ;; Coalesce the following:
     ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
     ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE

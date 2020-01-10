@@ -32,7 +32,7 @@
   ;; unfortunately not enforced by PAD-DATA-BLOCK and
   ;; FIXED-ALLOC), so that ESP is always divisible by 8 (for
   ;; 32-bit lispobjs).  In that case, this AND instruction is
-  ;; unneccessary and could be removed.  If not, explain why.  -- CSR,
+  ;; unnecessary and could be removed.  If not, explain why.  -- CSR,
   ;; 2004-03-30
   (inst and esp-tn (lognot lowtag-mask))
   (inst lea alloc-tn (make-ea :byte :base esp-tn :disp lowtag))
@@ -78,6 +78,8 @@
                               scratch-tn)
                     :disp
                     #+sb-thread (* n-word-bytes thread-alloc-region-slot)
+                    ;; not a foreign-dataref because we don't support
+                    ;; dynamic core + no threads.
                     #-sb-thread (make-fixup "gc_alloc_region" :foreign)))
          (end-addr
             ;; thread->alloc_region.end_addr
@@ -340,7 +342,7 @@
        (storew (logior (ash (1- size) n-widetag-bits) closure-widetag)
                result 0 fun-pointer-lowtag)))
    ;; Done with pseudo-atomic
-   (inst lea temp (make-ea-for-object-slot function simple-fun-insts-offset
+   (inst lea temp (object-slot-ea function simple-fun-insts-offset
                                            fun-pointer-lowtag))
    (storew temp result closure-fun-slot fun-pointer-lowtag)))
 
@@ -366,7 +368,7 @@
   (:args)
   (:results (result :scs (any-reg)))
   (:generator 1
-    (inst lea result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
+    (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
   (:args)
@@ -406,7 +408,7 @@
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
   (:arg-types positive-fixnum)
-  (:info name words type lowtag)
+  (:info name words type lowtag stack-allocate-p)
   (:ignore name)
   (:results (result :scs (descriptor-reg) :from (:eval 1)))
   (:temporary (:sc any-reg :from :eval :to (:eval 1)) bytes)
@@ -420,7 +422,6 @@
     (inst lea header                    ; (w-1 << 8) | type
           (make-ea :dword :base header :disp (+ (ash -2 n-widetag-bits) type)))
     (inst and bytes (lognot lowtag-mask))
-    (pseudo-atomic ()
-     (allocation result bytes node)
-     (inst lea result (make-ea :byte :base result :disp lowtag))
+    (pseudo-atomic (:elide-if stack-allocate-p)
+     (allocation result bytes node stack-allocate-p lowtag)
      (storew header result 0 lowtag))))

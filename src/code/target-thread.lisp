@@ -268,12 +268,14 @@ created and old ones may exit at any time."
         *make-thread-lock* (make-mutex :name "Make-Thread Lock"))
   (let ((thread (%make-thread :name "main thread"
                               :%alive-p t)))
+    ;; Run the macro-generated function which writes some values into the TLS,
+    ;; most especially *CURRENT-THREAD*.
+    (init-thread-local-storage thread)
     (setf (thread-os-thread thread) (current-thread-os-thread)
           (thread-stack-end thread) (get-lisp-obj-address sb-vm:*control-stack-end*)
           (thread-primitive-thread thread) (sap-int (current-thread-sap))
-          *initial-thread* thread
-          *current-thread* thread)
-    (grab-mutex (thread-result-lock *initial-thread*))
+          *initial-thread* thread)
+    (grab-mutex (thread-result-lock thread))
     ;; Either *all-threads* is empty or it contains exactly one thread
     ;; in case we are in reinit since saving core with multiple
     ;; threads doesn't work.
@@ -1519,11 +1521,11 @@ session."
 ;;; All threads other than the initial thread start via this function.
 #+sb-thread
 (defun new-lisp-thread-trampoline (thread setup-sem real-function arguments)
+  (init-thread-local-storage thread)
   ;; Can't initiate GC before *current-thread* is set, otherwise the
   ;; locks grabbed by SUB-GC wouldn't function.
   ;; Other threads can GC with impunity.
-  (setf *current-thread* thread ; is thread-local already
-        (thread-os-thread thread) (current-thread-os-thread)
+  (setf (thread-os-thread thread) (current-thread-os-thread)
         (thread-stack-end thread) (get-lisp-obj-address sb-vm:*control-stack-end*)
         (thread-primitive-thread thread) (sap-int (current-thread-sap)))
   ;; *ALLOC-SIGNAL* is made thread-local by create_thread_struct()
@@ -1607,13 +1609,38 @@ terminates the thread.
 See also: RETURN-FROM-THREAD, ABORT-THREAD."
   #-sb-thread (declare (ignore function name arguments ephemeral))
   #-sb-thread (error "Not supported in unithread builds.")
-  #+sb-thread (assert (or (atom arguments)
-                           (null (cdr (last arguments))))
-                       (arguments)
-                       "Argument passed to ~S, ~S, is an improper list."
-                       'make-thread arguments)
   #+sb-thread
-  (let ((thread (%make-thread :name name :%ephemeral-p ephemeral)))
+  (progn (assert (or (atom arguments)
+                     (null (cdr (last arguments))))
+                 (arguments)
+                 "Argument passed to ~S, ~S, is an improper list."
+                 'make-thread arguments)
+         (run-thread (%make-thread :name name :%ephemeral-p ephemeral)
+                     function arguments)))
+
+;;; The purpose of splitting out RUN-THREAD from MAKE-THREAD is that when
+;;; starting the finalizer thread, we might be able to do:
+;;; (let ((thread (%make-thread :name "finalizer" :%ephemeral-p t)))
+;;;   (when (cas *finalizer-thread* nil thread)
+;;;     (run-thread thread ...)
+;;; which is possibly an improvement in two ways:
+
+;;; (1) it ensures that there is no hidden state in the transition diagram
+;;;     when we are invisibly starting the finalizer thread but have not made it
+;;;     known to FINALIZER-THREAD-STOP that we are doing so. There would be a
+;;;     thread object published or not - and no "maybe starting" state.
+;;; (2) imagine two threads, each of which actually GC'd - so the 'gc_happened'
+;;;     flag in gc-common.c is T for both - and each wants to start the finalizer.
+;;;     They both get all the way into NEW-LISP-THREAD-TRAMPOLINE, only for one
+;;;     to lose the CAS on *FINALIZER-THREAD*. It's a lot of overhead to start
+;;;     a thread that does nothing and then exits.
+;;;
+;;; But it's not all fun and games, because we'd have to figure out how to
+;;; get FINALIZER-THREAD-STOP _not_ to attempt to join a thread that has not
+;;; yet sprung into being as an OS-level thread.
+
+#+sb-thread
+(defun run-thread (thread function arguments)
     (declare (inline make-semaphore
                      make-waitqueue
                      make-mutex))
@@ -1643,7 +1670,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
           (if (zerop (%create-thread (get-lisp-obj-address #'start-routine)))
               (setf thread nil)
               (wait-on-semaphore setup-sem)))))
-    (or thread (error "Could not create a new thread."))))
+    (or thread (error "Could not create a new thread.")))
 
 (defun join-thread (thread &key (default nil defaultp) timeout)
   "Suspend current thread until THREAD exits. Return the result values
@@ -1883,7 +1910,7 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
 
   (sb-ext:define-load-time-global sb-vm::*free-tls-index* 0)
   ;; Keep in sync with 'compiler/generic/parms.lisp'
-  #+ppc ; only PPC uses a separate symbol for the TLS index lock
+  #+(or ppc ppc64) ; only PPC uses a separate symbol for the TLS index lock
   (!define-load-time-global sb-vm::*tls-index-lock* 0)
 
   (defun %symbol-value-in-thread (symbol thread)
@@ -1930,7 +1957,8 @@ assume that unknown code can safely be terminated using TERMINATE-THREAD."
          ;; (There's no reason this couldn't work on any thread now.)
          (sap (int-sap (thread-primitive-thread *current-thread*)))
          (list))
-        ((< index (ash tls-index-start sb-vm:word-shift)) list)
+        ((< index (ash sb-vm::primitive-thread-object-length sb-vm:word-shift))
+         list)
       (let ((obj (sap-ref-lispobj sap index)))
         (when (and obj ; don't bother returning NIL
                    (sb-vm:is-lisp-pointer (get-lisp-obj-address obj))
@@ -1995,6 +2023,69 @@ mechanism for inter-thread communication."
 
 
 
+;;; Initialize thread-local special vars other than the GC control specials.
+;;; globaldb should indicate that the variable is both :always-thread-local
+;;; (which says that the TLS index is nonzero), and :always-bound (which says that
+;;; the value in TLS is not UNBOUND-MARKER).
+;;; Here's the problem: Some of the backends implement those semantics as dictated
+;;; by globaldb - assigning into TLS even if the current TLS value is NO_TLS_VALUE;
+;;; while others do not make use of that information, and will therefore assign into
+;;; the global value if the TLS value is NO_TLS_VALUE.
+;;; This can not be "corrected" by genesis - there is no TLS when genesis executes.
+;;; The only way to do this reliably is to compute the address of the thread-local
+;;; storage slot, and use (SETF SAP-REF-LISPOBJ)
+;;; (Nor is #+(vop-translates ensure-symbol-tls-index) a reliable indicator that the
+;;; SET vop will assign into a thread-local symbol that currently has no TLS value.)
+
+;;; Note also that this is called by REINIT, which _should_ reinitialize
+;;; the *CURRENT-THREAD* but should _NOT_ reinitialize anything else.
+;;; That's actually kind of weird, but it's necessary to ensure that *RESTART-CLUSTERS*
+;;; does not get clobbered if there were any restarts available.
+;;; There's a SAVE-LISP-AND-DIE test which asserts that you can resume
+;;; from a failed save.
+;;; It might behoove us to pass in a flag as to whether this is coming from REINIT,
+;;; but INIT-INITIAL-THREAD doesn't know either. We'd have to plumb a new flag
+;;; down all the way from SAVE.
+(defun init-thread-local-storage (thread)
+  ;; In addition to wanting the expressly unsafe variant of SYMBOL-VALUE, any error
+  ;; signaled such as invalid-arg-count would just go totally wrong at this point.
+  (declare (optimize (safety 0)))
+  #-sb-thread
+  ;; *CURRENT-THREAD* is known always bound, so BOUNDP would be T
+  ;; We need to see whether it's really boundp.
+  (if (unbound-marker-p *current-thread*)
+      (macrolet ((expand ()
+                   `(setf ,@(apply #'append (cdr *thread-local-specials*)))))
+        (expand))
+      (setf *current-thread* thread))
+  ;; See %SET-SYMBOL-VALUE-IN-THREAD for comparison's sake
+  #+sb-thread
+  (let ((sap (current-thread-sap)))
+    (macrolet ((expand ()
+                 `(if (= (sap-ref-word sap ,(info :variable :wired-tls '*current-thread*))
+                         sb-vm:no-tls-value-marker-widetag)
+                      (setf ,@(loop for (var form) in (cdr *thread-local-specials*)
+                                    for index = (info :variable :wired-tls var)
+                                    append `((sap-ref-lispobj sap ,index) ,form)))
+                      (setf *current-thread* thread))))
+      (expand)))
+  nil)
+
+(eval-when (:compile-toplevel)
+  ;; Inform genesis of the index <-> symbol mapping made by DEFINE-THREAD-LOCAL
+  (with-open-file (output (sb-cold::stem-object-path "tls-init.lisp-expr"
+                                                     '(:extra-artifact) :target-compile)
+                          :direction :output :if-exists :supersede)
+    (let ((list (mapcar (lambda (x &aux (symbol (car x)))
+                          (cons (info :variable :wired-tls symbol) symbol))
+                        (cdr *thread-local-specials*)))
+          (*package* *keyword-package*))
+      (write list :stream output :readably t)
+      (terpri output)))
+  ;; Prevent further use of DEFINE-THREAD-LOCAL after compiling this file
+  ;; because the definition of INIT-THREAD-LOCAL-STORAGE is now frozen.
+  (setf *thread-local-specials* (cons :final (cdr *thread-local-specials*))))
+
 ;;;; Stepping
 
 (defun thread-stepping ()
@@ -2005,3 +2096,54 @@ mechanism for inter-thread communication."
   (setf (sap-ref-lispobj (current-thread-sap)
                          (* sb-vm::thread-stepping-slot sb-vm:n-word-bytes))
         value))
+
+;;;; Diagnostic tool
+
+#+(and sb-thread sb-devel)
+(defun dump-thread ()
+  (let* ((primobj (find 'sb-vm::thread sb-vm::*primitive-objects*
+                        :key #'sb-vm::primitive-object-name))
+         (slots (sb-vm::primitive-object-slots primobj))
+         (sap (current-thread-sap))
+         (thread-obj-len (sb-vm::primitive-object-length primobj))
+         (names (make-array thread-obj-len :initial-element "")))
+    (dolist (slot slots)
+      (setf (aref names (sb-vm::slot-offset slot)) (sb-vm::slot-name slot)))
+    (flet ((safely-read (sap offset)
+             (let ((word (sap-ref-word sap offset)))
+               (cond ((= word sb-vm:no-tls-value-marker-widetag) :no-tls-value)
+                     ((= word sb-vm:unbound-marker-widetag) :unbound)
+                     (t (sap-ref-lispobj sap offset)))))
+           (show (tlsindex val &optional thread-slot-p)
+             (if thread-slot-p
+                 (format t " ~3d ~30a : #x~x~%"
+                         (ash tlsindex (- sb-vm:word-shift))
+                         (aref names (ash tlsindex (- sb-vm:word-shift)))
+                         val)
+                 (let ((*print-right-margin* 128)
+                       (*print-lines* 4))
+                   (format t " ~3d ~30a : ~s~%"
+                           (ash tlsindex (- sb-vm:word-shift))
+                           ;; FIND-SYMBOL-FROM-TLS-INDEX uses MAP-ALLOCATED-OBJECTS
+                           ;; which is not defined during cross-compilation.
+                           (funcall 'sb-ext::find-symbol-from-tls-index tlsindex)
+                           val)))))
+      (format t "~&TLS: (base=~x)~%" (sap-int sap))
+      (loop for tlsindex from sb-vm:n-word-bytes below
+            (ash sb-vm::*free-tls-index* sb-vm:n-fixnum-tag-bits)
+            by sb-vm:n-word-bytes
+            do (if (< tlsindex (ash thread-obj-len sb-vm:word-shift))
+                   (show tlsindex (sap-ref-word sap tlsindex) t)
+                   (let ((val (safely-read sap tlsindex)))
+                     (unless (eq val :no-tls-value)
+                       (show tlsindex val)))))
+      (let ((from (descriptor-sap sb-vm:*binding-stack-start*))
+            (to (binding-stack-pointer-sap)))
+        (format t "~%Binding stack: (depth ~d)~%"
+                (/ (sap- to from) (* sb-vm:binding-size sb-vm:n-word-bytes)))
+        (loop
+          (when (sap>= from to) (return))
+          (let ((val (safely-read from 0))
+                (tlsindex (sap-ref-word from sb-vm:n-word-bytes)))
+            (show tlsindex val))
+          (setq from (sap+ from (* sb-vm:binding-size sb-vm:n-word-bytes))))))))

@@ -2880,7 +2880,7 @@
 (with-test (:name (compile :hairy-array-element-type-derivation))
   (checked-compile
    '(lambda (x)
-     (declare (type (and simple-string (satisfies array-has-fill-pointer-p)) x))
+     (declare (type (and simple-string (satisfies eval)) x))
      (array-element-type x))))
 
 (with-test (:name (compile &rest :derive-type 1))
@@ -6082,7 +6082,7 @@
                           '(2 4 3))
                  3)))
 
-(with-test (:name :usigned-word-float-conversion)
+(with-test (:name :unsigned-word-float-conversion)
   (assert (= (rational (funcall (checked-compile `(lambda (x)
                                                     (float (the sb-ext:word x) 1d0)))
                                 sb-ext:most-positive-word))
