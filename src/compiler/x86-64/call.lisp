@@ -167,7 +167,7 @@
          (system-area-pointer sap-stack
                               ancestor-frame-ref/system-area-pointer
                               ancestor-frame-set/system-area-pointer))))
-(defvar *new* nil)
+
 (define-vop (xep-allocate-frame)
   (:info start-lab)
   (:generator 1
@@ -181,8 +181,7 @@
     (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Save the return-pc.
-    (unless *new*
-     (popw rbp-tn (frame-word-offset return-pc-save-offset)))))
+    (popw rbp-tn (frame-word-offset return-pc-save-offset))))
 
 (defun emit-lea (target source disp)
   (if (eql disp 0)
@@ -1218,7 +1217,7 @@
 
     DONE))
 
-(define-vop (more-kw-arg)
+(define-vop ()
   (:translate sb-c::%more-kw-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
@@ -1233,7 +1232,7 @@
                            (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 (define-vop (more-arg/c)
-  (:translate sb-c::%more-arg)
+  (:translate sb-c:%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:info index)
@@ -1244,7 +1243,7 @@
     (inst mov value (ea (- (* index n-word-bytes)) object))))
 
 (define-vop (more-arg)
-  (:translate sb-c::%more-arg)
+  (:translate sb-c:%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
          (index :scs (any-reg) :to (:result 1) :target value))
@@ -1273,7 +1272,7 @@
     done))
 
 ;;; Turn more arg (context, count) into a list.
-(define-vop (listify-rest-args)
+(define-vop ()
   (:translate %listify-rest-args)
   (:policy :safe)
   (:args (context :scs (descriptor-reg) :target src)
@@ -1300,10 +1299,7 @@
       (unless stack-allocate-p
         (instrument-alloc dst node))
       (pseudo-atomic (:elide-if stack-allocate-p)
-       ;; FIXME: if COUNT >= 8192, allocates to single-object page(s).
-       ;; All we have to do is unset the '.singleton' bit,
-       ;; a permissible state change as long as pseudo-atomic.
-       (allocation dst dst node stack-allocate-p list-pointer-lowtag)
+       (allocation 'list dst list-pointer-lowtag node stack-allocate-p dst)
        ;; Set up the result.
        (move result dst)
        ;; Jump into the middle of the loop, 'cause that's where we want
@@ -1336,7 +1332,7 @@
 ;;; preventing this info from being returned as values. What we do is
 ;;; compute supplied - fixed, and return a pointer that many words
 ;;; below the current stack top.
-(define-vop (more-arg-context)
+(define-vop ()
   (:policy :fast-safe)
   (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg) :target count))

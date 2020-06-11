@@ -34,7 +34,7 @@
 #include "arch.h"
 #include "search.h"
 #include "thread.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 
 #include "genesis/simple-fun.h"
 #include "genesis/fdefn.h"
@@ -215,7 +215,7 @@ static lispobj lookup_symbol(char *name)
 #if defined(LISP_FEATURE_GENCGC)
       { DYNAMIC_SPACE_START, (uword_t)get_alloc_pointer() }
 #else
-      { (uword_t)current_dynamic_space, (uword_t)dynamic_space_free_pointer }
+      { (uword_t)current_dynamic_space, (uword_t)get_alloc_pointer() }
 #endif
     };
 

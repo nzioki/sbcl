@@ -126,6 +126,7 @@
 
 #+linux
 (!gencgc-space-setup #x50000000
+                     :read-only-space-size 0
                      :fixedobj-space-size #.(* 30 1024 1024)
                      :varyobj-space-size #.(* 130 1024 1024)
                      :dynamic-space-start #x1000000000)
@@ -135,9 +136,11 @@
 
 #-linux
 (!gencgc-space-setup #x20000000
+                     #-win32 :read-only-space-size #-win32 0
                      :dynamic-space-start #x1000000000
                      #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
 
+(defconstant linkage-table-growth-direction :up)
 (defconstant linkage-table-entry-size 16)
 
 
@@ -184,8 +187,6 @@
     *cpuid-fn1-ecx*)
   #'equalp)
 
-;;; FIXME: with #+immobile-space, this should be the empty list,
-;;; because *all* fdefns are permanently placed.
 (defconstant-eqx +static-fdefns+
   #(length
     two-arg-+
@@ -202,6 +203,8 @@
     two-arg-xor
     two-arg-gcd
     two-arg-lcm
+    ensure-symbol-hash
+    update-object-layout-or-invalid
     %coerce-callable-to-fun)
   #'equalp)
 

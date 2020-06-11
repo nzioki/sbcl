@@ -32,6 +32,15 @@
 # include <dlfcn.h>
 #endif
 
+/*
+ * historically, this used sysconf to select the runtime page size
+ * per recent changes on other arches and discussion on sbcl-devel,
+ * however, this is not necessary -- the VM page size need not match
+ * the OS page size (and the default backend page size has been
+ * ramped up accordingly for efficiency reasons).
+*/
+os_vm_size_t os_vm_page_size = BACKEND_PAGE_BYTES;
+
 /* Expose to Lisp the value of the preprocessor define. Don't touch! */
 int install_sig_memory_fault_handler = INSTALL_SIG_MEMORY_FAULT_HANDLER;
 
@@ -130,7 +139,7 @@ os_sem_destroy(os_sem_t *sem)
 
 #endif
 
-/* When :SB-DYNAMIC-CORE is enabled, the special category of /static/ foreign
+/* When :LINKAGE-TABLE is enabled, the special category of /static/ foreign
  * symbols disappears. Foreign fixups are resolved to linkage table locations
  * during genesis, and for each of them a record is added to
  * REQUIRED_FOREIGN_SYMBOLS vector, of the form "name" for a function reference,
@@ -141,7 +150,7 @@ os_sem_destroy(os_sem_t *sem)
  * table entry for each element of REQUIRED_FOREIGN_SYMBOLS.
  */
 
-#if defined(LISP_FEATURE_SB_DYNAMIC_CORE) && !defined(LISP_FEATURE_WIN32)
+#if defined(LISP_FEATURE_LINKAGE_TABLE) && !defined(LISP_FEATURE_WIN32)
 void *
 os_dlsym_default(char *name)
 {
@@ -153,9 +162,13 @@ os_dlsym_default(char *name)
 int lisp_linkage_table_n_prelinked;
 void os_link_runtime()
 {
-#ifdef LISP_FEATURE_SB_DYNAMIC_CORE
-    char *link_target = (char*)(intptr_t)LINKAGE_TABLE_SPACE_START;
-    void *validated_end = link_target;
+    // There is a potentially better technique we could use which would simplify
+    // this function, rendering REQUIRED_FOREIGN_SYMBOLS unnecessary, namely:
+    // all we need are two prefilled entries: one for dlsym() itself, and one
+    // for the allocation region overflow handler ("alloc" or "alloc_tramp").
+    // Lisp can fill in the linkage table as the very first action on startup.
+#ifdef LISP_FEATURE_LINKAGE_TABLE
+    int entry_index = 0;
     lispobj symbol_name;
     char *namechars;
     boolean datap;
@@ -175,21 +188,24 @@ void os_link_runtime()
         namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
         result = os_dlsym_default(namechars);
 
-        if (link_target == validated_end) {
-            validated_end = (char*)validated_end + os_vm_page_size;
+        if (entry_index == 0) {
 #ifdef LISP_FEATURE_WIN32
-            os_validate_recommit(link_target,os_vm_page_size);
+            os_validate_recommit(LINKAGE_TABLE_SPACE_START, os_vm_page_size);
 #endif
         }
         if (result) {
-            arch_write_linkage_table_entry(link_target, result, datap);
+            arch_write_linkage_table_entry(entry_index, result, datap);
         } else { // startup might or might not work. ymmv
-            printf("Missing required foreign symbol '%s'\n", namechars);
+            fprintf(stderr, "Missing required foreign symbol '%s'\n", namechars);
         }
 
-        link_target += LINKAGE_TABLE_ENTRY_SIZE;
+        ++entry_index;
     }
-#endif /* LISP_FEATURE_SB_DYNAMIC_CORE */
+#endif /* LISP_FEATURE_LINKAGE_TABLE */
+}
+
+void os_unlink_runtime()
+{
 }
 
 boolean
@@ -214,8 +230,9 @@ gc_managed_heap_space_p(lispobj addr)
 
 #ifndef LISP_FEATURE_WIN32
 
-/* Remap a part of an already existing memory mapping from a file */
-void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+/* Remap a part of an already existing memory mapping from a file,
+ * and/or create a new mapping as need be */
+void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len)
 {
     int fail = 0;
 #ifdef LISP_FEATURE_HPUX
@@ -227,7 +244,15 @@ void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
     os_flush_icache(addr, len);
 #else
     os_vm_address_t actual;
-    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
+    actual = mmap(addr, len,
+                  // If mapping to a random address, then the assumption is
+                  // that we're not going to execute the core; nor should we write to it.
+                  // However, the addr=0 case is for 'editcore' which unfortunately _does_
+                  // write the memory. I'd prefer that it not,
+                  // but that's not the concern here.
+                  addr ? OS_VM_PROT_ALL : OS_VM_PROT_READ | OS_VM_PROT_WRITE,
+                  // Do not pass MAP_FIXED with addr of 0, because most OSes disallow that.
+                  MAP_PRIVATE | (addr ? MAP_FIXED : 0),
                   fd, (off_t) offset);
     if (actual == MAP_FAILED) {
         perror("mmap");
@@ -237,7 +262,8 @@ void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
     }
 #endif
     if (fail)
-        lose("load_core_bytes(%d,%x,%lx,%x) failed", fd, offset, (long)addr, (int)len);
+        lose("load_core_bytes(%d,%zx,%p,%zx) failed", fd, offset, addr, len);
+    return (void*)actual;
 }
 
 boolean

@@ -506,4 +506,31 @@
       ()
       `(lambda (x y)
          (adjoin (list x) y :key 'car))
-    ((3d0 '((3d0))) '((3d0)) :test #'equal)))
+      ((3d0 '((3d0))) '((3d0)) :test #'equal)))
+
+(with-test (:name :fill-transform-bounds-checks)
+  (checked-compile-and-assert
+      (:optimize :default)
+      `(lambda (item start end)
+         (fill (make-array 3 :element-type '(unsigned-byte 8)) item :start start :end end))
+    ((2 0 nil) #(2 2 2) :test #'equalp)
+    ((2 10 10)  (condition 'sb-kernel:bounding-indices-bad-error))
+    ((2 2 1)  (condition 'sb-kernel:bounding-indices-bad-error))
+    ((2 10 nil)  (condition 'sb-kernel:bounding-indices-bad-error))))
+
+(with-test (:name :fill-transform-derive-type)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            '(lambda (x)
+              (fill (the (simple-array (unsigned-byte 32) (*)) x) 0))))
+          '(FUNCTION (T) (VALUES (SIMPLE-ARRAY (UNSIGNED-BYTE 32) (*)) &OPTIONAL)))))
+
+
+(with-test (:name :fill-transform-print-case)
+  (let ((*print-case* :downcase))
+    (checked-compile-and-assert
+        ()
+        `(lambda (x)
+           (make-array 3 :element-type 'fixnum :initial-element x))
+      ((1) #(1 1 1) :test #'equalp))))

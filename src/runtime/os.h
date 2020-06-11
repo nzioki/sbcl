@@ -72,6 +72,8 @@ boolean os_preinit(char *argv[], char *envp[]);
 #else
 #define os_preinit(dummy1,dummy2) (0)
 #endif
+void os_link_runtime();
+void os_unlink_runtime();
 
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */
@@ -118,10 +120,10 @@ extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
-extern void load_core_bytes(int fd,
-                            int offset,
-                            os_vm_address_t addr,
-                            os_vm_size_t len);
+extern void* load_core_bytes(int fd,
+                             os_vm_offset_t offset,
+                             os_vm_address_t addr,
+                             os_vm_size_t len);
 
 /* This presumably flushes the instruction cache, if that can be done
  * explicitly. (It doesn't seem to be an issue for the i386 port,
@@ -210,11 +212,9 @@ extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
 int os_get_errno(void);
 
 /* Return an absolute path to the runtime executable, or NULL if this
- * information is unavailable.  Unless external_path is non-zero the
- * returned path may only be valid for the current process, ie:
- * something like /proc/curproc/file.  If a non-null pathname is
+ * information is unavailable. If a non-null pathname is
  * returned, it must be 'free'd. */
-extern char *os_get_runtime_executable_path(int external_path);
+extern char *os_get_runtime_executable_path();
 
 /* Write platforms specific ones when necessary. This is to get us off
  * the ground. */

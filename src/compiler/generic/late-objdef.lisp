@@ -76,7 +76,7 @@
     (sap "unboxed")
     (unbound-marker "immediate")
     (weak-pointer "weak_pointer" "weak_pointer" "boxed")
-    (instance "instance" "lose" "short_boxed")
+    (instance "instance" "lose" "instance")
     (fdefn "fdefn")
 
     (no-tls-value-marker "immediate")
@@ -149,33 +149,45 @@
                       (ldb (byte 32 0) bits) (ldb (byte 32 32) bits))
     (format stream "~%}~%"))
 
-  (format stream "extern unsigned char lowtag_for_widetag[64];
+  (format stream "extern unsigned char widetag_lowtag[256];
 static inline lispobj compute_lispobj(lispobj* base_addr) {
-  lispobj header = *base_addr;
-  return make_lispobj(base_addr,
-                      is_cons_half(header) ? LIST_POINTER_LOWTAG :
-                        lowtag_for_widetag[header_widetag(header)>>2]);~%}~%")
+  return make_lispobj(base_addr, LOWTAG_FOR_WIDETAG(*base_addr & WIDETAG_MASK));~%}~%")
 
   (format stream "~%#ifdef WANT_SCAV_TRANS_SIZE_TABLES~%")
-  (let ((a (make-array 64 :initial-element 0)))
+  (let ((lowtag-tbl (make-array 256 :initial-element 0)))
+    ;; Build a table translating from the from low byte of first word of any
+    ;; heap object to that object's lowtag when pointed to by a tagged pointer.
+    ;; If the first word is {immediate | pointer} then the object is a cons,
+    ;; otherwise the object is a headered object.
+    (dotimes (byte 256)
+      (when (or (eql 0 (logand byte fixnum-tag-mask))
+                (member (logand byte lowtag-mask)
+                        `(,instance-pointer-lowtag
+                          ,list-pointer-lowtag
+                          ,fun-pointer-lowtag
+                          ,other-pointer-lowtag))
+                (member byte `(#+64-bit ,single-float-widetag
+                               ,character-widetag
+                               ,unbound-marker-widetag)))
+        ;; gotta be a CONS
+        (setf (svref lowtag-tbl byte) list-pointer-lowtag)))
     (dolist (entry *scav/trans/size*)
       (destructuring-bind (widetag scav &rest ignore) entry
         (declare (ignore ignore))
         (unless (string= scav "immediate")
-          (setf (aref a (ash widetag -2))
-                (case widetag
-                  (#.instance-widetag instance-pointer-lowtag)
-                  (#.+function-widetags+ fun-pointer-lowtag)
-                  (t other-pointer-lowtag))))))
-    (let ((contents (format nil "~{0x~x,~} " (coerce a 'list))))
-      (format stream
-              "unsigned char lowtag_for_widetag[64] = {~{~%  ~A~}~%};~%"
-              ;; write 4 characters per widetag ("0xN,"), 16 per line
-              (loop for i from 0 by 64 repeat 4
-                    ;; trailing comma on the last item is OK in C
-                    collect (subseq contents i (+ i 64))))))
+          (setf (svref lowtag-tbl widetag)
+                (+ #x80 (case widetag
+                          (#.instance-widetag instance-pointer-lowtag)
+                          (#.+function-widetags+ fun-pointer-lowtag)
+                          (t other-pointer-lowtag)))))))
+    (format stream "unsigned char widetag_lowtag[256] = {")
+    (dotimes (line 16)
+      (format stream "~%~:{ ~:[0x~2,'0x~;~4d~],~}"
+              (mapcar (lambda (x) (list (member x `(0 ,sb-vm:list-pointer-lowtag)) x))
+                      (coerce (subseq lowtag-tbl (* line 16) (* (1+ line) 16)) 'list))))
+    (format stream "~%};~%"))
   (let ((scavtab  (make-array 256 :initial-element nil))
-        (ptrtab   (make-array 4   :initial-element nil))
+        (ptrtab   (make-list #+ppc64 16 #-ppc64 4))
         (transtab (make-array 64  :initial-element nil))
         (sizetab  (make-array 256 :initial-element nil)))
     (dotimes (i 256)
@@ -188,10 +200,19 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
                                    (#.fun-pointer-lowtag      "fun")
                                    (#.other-pointer-lowtag    "other"))))
                (when pointer-kind
-                 (setf (svref ptrtab (ldb (byte 2 (- sb-vm:n-lowtag-bits 2)) i))
-                       pointer-kind)
+                 #-ppc64
+                 (let ((n (ldb (byte 2 (- sb-vm:n-lowtag-bits 2)) i)))
+                   (unless (nth n ptrtab)
+                     (setf (nth n ptrtab) (format nil "scav_~A_pointer" pointer-kind))))
                  (setf (svref scavtab i) (format nil "~A_pointer" pointer-kind)
                        (svref sizetab i) "pointer"))))))
+    #+ppc64
+    (progn
+      (fill ptrtab "scav_lose")
+      (setf (nth instance-pointer-lowtag ptrtab) "scav_instance_pointer"
+            (nth list-pointer-lowtag ptrtab)     "scav_list_pointer"
+            (nth fun-pointer-lowtag ptrtab)      "scav_fun_pointer"
+            (nth other-pointer-lowtag ptrtab)    "scav_other_pointer"))
     (dolist (entry *scav/trans/size*)
       (destructuring-bind (widetag scav &optional (trans scav) (size trans)) entry
         ;; immediates use trans_lose which is what trans_immediate did anyway.
@@ -213,9 +234,8 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
              (format stream "~%};~%")))
       (write-table "sword_t (*const scavtab[256])(lispobj *where, lispobj object)"
                    "scav_" scavtab)
-      (format stream "static void (*scav_ptr[4])(lispobj *where, lispobj object)~
- = {~{~%  (void(*)(lispobj*,lispobj))scav_~A_pointer~^,~}~%};~%"
-              (coerce ptrtab 'list))
+      (format stream "static void (*scav_ptr[~d])(lispobj *where, lispobj object)~
+ = {~{~%  (void(*)(lispobj*,lispobj))~A~^,~}~%};~%" (length ptrtab) ptrtab)
       (write-table "static lispobj (*transother[64])(lispobj object)"
                    "trans_" transtab)
       (format stream "#define size_pointer size_immediate~%")
@@ -225,3 +245,14 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
       (format stream "#undef size_pointer~%")
       (format stream "#undef size_unboxed~%")))
   (format stream "#endif~%"))
+
+;;; AVLNODE is primitive-object-like because it is needed by C code that looks up
+;;; entries in the tree of lisp threads.  But objdef doesn't have SB-XC:DEFSTRUCT
+;;; working, and I'm reluctant to create yet another 'something-thread' file to
+;;; put this in, not to mention that SB-THREAD is the wrong package anyway.
+(in-package "SB-THREAD")
+(sb-xc:defstruct (avlnode (:constructor avlnode (key data left right)))
+  (left  nil :read-only t)
+  (right nil :read-only t)
+  (key   0   :read-only t :type sb-vm:word)
+  data)

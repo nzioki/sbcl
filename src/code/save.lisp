@@ -187,7 +187,8 @@ sufficiently motivated to do lengthy fixes."
   (declare (ignore purify) (ignorable root-structures))
   ;; If the toplevel function is not defined, this will signal an
   ;; error before saving, not at startup time.
-  (let ((toplevel (%coerce-callable-to-fun toplevel)))
+  (let ((toplevel (%coerce-callable-to-fun toplevel))
+        *streams-closed-by-slad*)
     #+sb-core-compression
     (check-type compression (or boolean (integer -1 9)))
     #-sb-core-compression
@@ -269,6 +270,7 @@ sufficiently motivated to do lengthy fixes."
 
     ;; Something went very wrong -- reinitialize to have a prayer
     ;; of being able to report the error.
+    (restore-fd-streams)
     (reinit)
     (error 'save-error)))
 
@@ -334,7 +336,6 @@ sufficiently motivated to do lengthy fixes."
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
-  (finalizers-deinit)
   (fill *pathnames* nil)
   ;; Clean up the simulated weak list of covered code components.
   (rplacd sb-c:*code-coverage-info*
@@ -347,6 +348,8 @@ sufficiently motivated to do lengthy fixes."
   ;; Perform static linkage. Functions become un-statically-linked
   ;; on demand, for TRACE, redefinition, etc.
   #+immobile-code (sb-vm::statically-link-core)
+  (invalidate-fd-streams)
+  (finalizers-deinit)
   ;; Do this last, to have some hope of printing if we need to.
   (stream-deinit)
   (setf * nil ** nil *** nil
@@ -388,8 +391,9 @@ sufficiently motivated to do lengthy fixes."
                     ;; ctype, because that's already a canonical object.
                     (not (minusp (type-hash-value part)))))
              (coalesce (type &aux
-                             ;; Deal with ctypes instances whose unparser fails.
-                             (spec (ignore-errors (type-specifier type))))
+                               ;; Deal with ctypes instances whose unparser fails.
+                               (spec (and (not (contains-unknown-type-p type))
+                                          (ignore-errors (type-specifier type)))))
                ;; There are ctypes that unparse to the same s-expression
                ;; but are *NOT* TYPE=. Some examples:
                ;;   classoid LIST  vs UNION-TYPE LIST  = (OR CONS NULL)
@@ -470,6 +474,7 @@ sufficiently motivated to do lengthy fixes."
 
 sb-c::
 (defun coalesce-debug-info ()
+  #+cheneygc (clrhash sb-di::*compiled-debug-funs*)
   (flet ((debug-source= (a b)
            (and (equal (debug-source-plist a) (debug-source-plist b))
                 (eql (debug-source-created a) (debug-source-created b)))))
@@ -487,6 +492,10 @@ sb-c::
          (declare (ignore size))
          (case widetag
           (#.sb-vm:code-header-widetag
+           (let ((di (sb-vm::%%code-debug-info obj)))
+             ;; Discard memoized debugger's debug info
+             (when (and (consp di) (neq obj sb-fasl:*assembler-routines*))
+               (setf (%code-debug-info obj) (car di))))
            (dotimes (i (sb-kernel:code-n-entries obj))
              (let* ((fun (sb-kernel:%code-entry-point obj i))
                     (arglist (%simple-fun-arglist fun))
@@ -505,7 +514,7 @@ sb-c::
             (compiled-debug-info
              (let ((source (compiled-debug-info-source obj)))
                (typecase source
-                 (core-debug-source)    ; skip
+                 (core-debug-source)    ; skip - uh, why?
                  (debug-source
                   (let* ((namestring (debug-source-namestring source))
                          (canonical-repr

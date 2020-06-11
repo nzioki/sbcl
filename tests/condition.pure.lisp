@@ -288,18 +288,28 @@
 ;; should print the stream position information.
 (with-test (:name (reader-error :stream-error-position-info :open-stream
                                 :bug-1264902))
-  (assert
-   (search
+  (locally
+   ;; High debug avoids stack-allocating the stream.
+   ;; It would be fine to stack-allocate it, because the handler-case does not
+   ;; use the stream outside of its extent, however, because ALLOCATE-CONDITION
+   ;; doesn't know when you will use the stream, it always replaces a DX stream
+   ;; with a dummy. The dummy stream would not have position information.
+   (declare (optimize debug))
+   (assert
+    (search
     "Line: 1, Column: 22, File-Position: 22"
     (with-input-from-string (stream "no-such-package::symbol")
       (handler-case
           (read stream)
-        (reader-error (condition) (princ-to-string condition)))))))
+        (reader-error (condition) (princ-to-string condition))))))))
 
 ;; Printing a READER-ERROR when the underlying stream has been closed
 ;; should still work, but the stream information will not be printed.
 (with-test (:name (reader-error :stream-error-position-info :closed-stream
                                 :bug-1264902))
+  ;; This test operates on a closed stream that has dynamic extent (theoretically).
+  ;; SAFETY 3 prevents a memory fault by not actually stack-allocating it.
+  (declare (optimize (safety 3)))
   (assert
    (search
     "Package NO-SUCH-PACKAGE does not exist"
@@ -361,7 +371,7 @@
 (with-test (:name (handler-bind :no-sloppy-semantics))
   (multiple-value-bind (fun failure-p)
       (checked-compile '(lambda (x)
-                         (sb-impl::%handler-bind
+                         (sb-kernel::%handler-bind
                           ((condition (function (lambda (c) (print c)) garb)))
                           (print x)))
                        :allow-failure t)
@@ -427,3 +437,12 @@ is not of type
     (declare (ignore newcond))
     (assert (string= (write-to-string error :escape nil)
                      "odd-length initializer list: (:A 1 :B)."))))
+
+(with-test (:name :type-error-on-dx-object)
+  (handler-case
+    (sb-int:dx-let ((a (make-array 3)))
+      (setf (aref a 0) a)
+      (print (1+ (aref a 0))))
+    (error (e)
+      (assert (equal (sb-kernel:type-error-datum-stored-type e)
+                     '(simple-vector 3))))))

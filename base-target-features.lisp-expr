@@ -401,9 +401,6 @@
  ;;   just parameterized by #+X86, but it'd probably be better to
  ;;   use new flags like :CONTROL-STACK-CONTAINS-C-STACK.
  ;;
- ;;   :stack-allocatable-closures
- ;;     The compiler can allocate dynamic-extent closures on stack.
- ;;
  ;;   :alien-callbacks
  ;;     Alien callbacks have been implemented for this platform.
  ;;
@@ -427,7 +424,4 @@
  ;;                 with the SunOS kernel.
  ;;   :hpux       = We're intended to run under HP-UX 11.11 or later
  ;;   :win32      = We're intended to under some version of Microsoft Windows.
- ;; (No others are supported by SBCL as of 1.0.8, but :hpux or :irix
- ;; support could be ported from CMU CL if anyone is sufficiently
- ;; motivated to do so.)
  )

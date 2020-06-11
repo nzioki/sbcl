@@ -1,6 +1,7 @@
 #include "globals.h"
 #include "lispregs.h"
 #include "sbcl.h"
+#include "validate.h"
 
 #include "genesis/closure.h"
 #include "genesis/funcallable-instance.h"
@@ -49,7 +50,37 @@
 /* the CSP page sits right before the thread */
 # define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 #endif
-	.align
+
+
+#ifdef OS_THREAD_STACK
+	.align 2
+	.global funcall1_switching_stack
+	.type	funcall1_switching_stack, %function
+funcall1_switching_stack:
+        /* The arguments are switched, funcall1_switching_stack(arg, function)
+           to avoid shuffling registers
+        */
+	/* save FP and LR to old stack */
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	/* switch to new stack */
+	ldr	x9, [x0, #THREAD_ALIEN_STACK_START_OFFSET]
+	add	x9, x9, #ALIEN_STACK_SIZE >> 12, lsl #12
+#if ALIEN_STACK_SIZE % 0x1000 != 0
+	add	x9, x9, #ALIEN_STACK_SIZE & 0xfff
+#endif
+	sub	sp, x9, #16
+	/* call function */
+	blr	x1
+	/* restore old SP, FP, LR and return */
+	add	sp, x29, #16
+	ldp	x29, x30, [x29]
+	ret
+	.size	funcall1_switching_stack, .-funcall1_switching_stack
+#endif
+
+
+	.align 2
 	.global	call_into_lisp
 	.type	call_into_lisp, %function
 call_into_lisp:
@@ -126,14 +157,6 @@ call_into_lisp:
 #endif
         ENTER_PA
 
-
-#ifndef LISP_FEATURE_GENCGC
-        // Copy the current allocation pointer into the symbol.
-        ldr     reg_NL3, =dynamic_space_free_pointer
-        ldr     reg_NL3, [reg_NL3]
-        STORE_STATIC_SYMBOL_VALUE(reg_NL3, ALLOCATION_POINTER)
-#endif
-
 	// Clear FFCA, so the runtime knows that we're "in lisp".
 #ifdef LISP_FEATURE_SB_THREAD
         str     xzr,[reg_THREAD, THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET]
@@ -182,7 +205,7 @@ no_args:
 
 	.align 4
 	.equ	.lra, .+OTHER_POINTER_LOWTAG
-	.dword	RETURN_PC_WIDETAG
+	.xword	RETURN_PC_WIDETAG
 
 	// Correct stack pointer for return processing.
         csel reg_CSP, reg_OCFP, reg_CSP, eq
@@ -207,13 +230,6 @@ no_args:
 	str     reg_OCFP, [reg_OCFP]
 #endif
 
-#ifndef LISP_FEATURE_GENCGC
-        // Copy the current allocation pointer out from the symbol.
-        ldr     reg_OCFP, =dynamic_space_free_pointer
-        LOAD_STATIC_SYMBOL_VALUE(reg_NFP, ALLOCATION_POINTER)
-        str     reg_NFP, [reg_OCFP]
-#endif
-
         LEAVE_PA
 
 	// Restore saved registers.
@@ -235,7 +251,7 @@ no_args:
 	.size	call_into_lisp, .-call_into_lisp
 
 
-	.align
+	.align 2
 	.global	call_into_c
 	.type	call_into_c, %function
 call_into_c:
@@ -285,14 +301,6 @@ call_into_c:
 	ldr     reg_OCFP, =foreign_function_call_active
 	str     reg_OCFP, [reg_OCFP]
 #endif
-
-#ifndef LISP_FEATURE_GENCGC
-        // Copy the current allocation pointer out from the symbol.
-        ldr     reg_NL9, =dynamic_space_free_pointer
-        LOAD_STATIC_SYMBOL_VALUE(reg_NFP, ALLOCATION_POINTER)
-        str     reg_NFP, [reg_NL9]
-#endif
-
 	LEAVE_PA
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* OK to run GC without stopping this thread from this point on. */
@@ -353,13 +361,6 @@ call_into_c:
 	// Clear FFCA, so the runtime knows that we're "in lisp".
 	str     xzr, [reg_OCFP]
 
-#ifndef LISP_FEATURE_GENCGC
-        // Copy the current allocation pointer into the symbol.
-        ldr     reg_NL9, =dynamic_space_free_pointer
-        ldr     reg_NL9, [reg_NL9]
-        STORE_STATIC_SYMBOL_VALUE(reg_OCFP, ALLOCATION_POINTER)
-#endif
-
         ldr	reg_NFP, =current_control_stack_pointer
 	ldr	reg_CSP, [reg_NFP]
 	ldr	reg_NFP, =current_control_frame_pointer
@@ -381,7 +382,7 @@ call_into_c:
         // FIXME-ARM: The following is random garbage, to make
         // code/debug-int compile. To get the debugger working, this
         // needs to be implemented.
-        .align
+        .align 2
         .global fun_end_breakpoint_guts
         .type   fun_end_breakpoint_guts, %object
 fun_end_breakpoint_guts:
@@ -391,14 +392,14 @@ fun_end_breakpoint_trap:
         b      fun_end_breakpoint_trap
         .global fun_end_breakpoint_end
 fun_end_breakpoint_end:
-#ifdef LISP_FEATURE_GENCGC
-        .align
+
+        .align 2
 	.global	do_pending_interrupt
 	.type	do_pending_interrupt, %function
 do_pending_interrupt:
         brk trap_PendingInterrupt
 	ret
-#endif
+
 #ifdef __ELF__
 // Mark the object as not requiring an executable stack.
 .section .note.GNU-stack,"",%progbits

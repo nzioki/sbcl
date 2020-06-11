@@ -237,7 +237,7 @@
   (inst jmp :nz not-callable)
   (inst cmp :byte (ea (- other-pointer-lowtag) fun) symbol-widetag)
   (inst jmp :ne not-callable)
-  (load-symbol-info-vector vector fun r11-tn)
+  (load-symbol-info-vector vector fun)
   ;; info-vector-fdefn
   (inst cmp vector nil-value)
   (inst jmp :e undefined)
@@ -303,11 +303,17 @@
   ;; the :return-style to :none because that also affects the call sequence.
   (inst jmp (make-fixup 'unwind :assembly-routine)))
 
-;;;; non-local exit noise
+;;; Simply return and enter the loop in UNWIND instead of calling
+;;; UNWIND directly
+(define-vop ()
+  (:translate %continue-unwind)
+  (:policy :fast-safe)
+  (:generator 0
+    (inst ret)))
 
 (define-assembly-routine (unwind
                           (:return-style :none)
-                          (:translate %continue-unwind)
+                          (:translate %unwind)
                           (:policy :fast-safe))
                          ((:arg block (any-reg descriptor-reg) rax-offset)
                           (:arg start (any-reg descriptor-reg) rbx-offset)
@@ -318,8 +324,7 @@
                           (:temp symbol unsigned-reg r9-offset)
                           (:temp value unsigned-reg r10-offset)
                           (:temp zero complex-double-reg float0-offset))
-  (declare (ignore start count))
-
+  AGAIN
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst test block block)             ; check for NULL pointer
     (inst jmp :z error))
@@ -330,38 +335,49 @@
   ;; argument's CURRENT-UWP-SLOT?
   (inst cmp uwp
         (object-slot-ea block unwind-block-uwp-slot 0))
-  ;; If a match, return to conitext in arg block.
+  ;; If a match, return to context in arg block.
   (inst jmp :e DO-EXIT)
 
   ;; Not a match - return to *CURRENT-UNWIND-PROTECT-BLOCK* context.
-  ;; Important! Must save (and return) the arg 'block' for later use!!
-  (move rdx-tn block)
-  (move block uwp)
-  ;; Set next unwind protect context.
-  (loadw uwp uwp unwind-block-uwp-slot)
-
-  DO-EXIT
+  (inst push block)
+  (inst push start)
+  (inst push count)
 
   ;; Need to perform unbinding before unlinking the UWP so that if
   ;; interrupted here it can still run the clean up form. While the
   ;; cleanup form itself cannot be protected from interrupts (can't
   ;; run it twice) one of the variables being unbound can be
   ;; *interrupts-enabled*
-  (loadw where block unwind-block-bsp-slot)
+  (loadw where uwp unwind-block-bsp-slot)
   (unbind-to-here where symbol value temp-reg-tn zero)
 
-  (store-tl-symbol-value uwp *current-unwind-protect-block*)
+  ;; Set next unwind protect context.
+  (loadw block uwp unwind-block-uwp-slot)
+  (store-tl-symbol-value block *current-unwind-protect-block*)
+
+  (loadw rbp-tn uwp unwind-block-cfp-slot)
+
+  (loadw block uwp unwind-block-current-catch-slot)
+  (store-tl-symbol-value block *current-catch-block*)
+
+  ;; Go to uwp-entry, it can fetch the pushed above values if it needs
+  ;; to.
+  (inst call (ea (* unwind-block-entry-pc-slot n-word-bytes) uwp))
+  (inst pop count)
+  (inst pop start)
+  (inst pop block)
+  (inst jmp AGAIN)
+
+  DO-EXIT
+  (loadw where block unwind-block-bsp-slot)
+  (unbind-to-here where symbol value temp-reg-tn zero)
 
   (loadw rbp-tn block unwind-block-cfp-slot)
 
   (loadw uwp block unwind-block-current-catch-slot)
   (store-tl-symbol-value uwp *current-catch-block*)
 
-
-  ;; Uwp-entry expects some things in known locations so that they can
-  ;; be saved on the stack: the block in rdx-tn, start in rbx-tn, and
-  ;; count in rcx-tn.
-
+  ;; nlx-entry expects start in RBX and count in RCX
   (inst jmp (ea (* unwind-block-entry-pc-slot n-word-bytes) block)))
 
 #+sb-assembling
@@ -372,12 +388,8 @@
     ;; to stack, because we do do not give the register allocator access to it.
     ;; And call_into_lisp saves it as per convention, not that it matters,
     ;; because there's no way to get back into C code anyhow.
-    #+sb-dynamic-core
-    (progn
-      (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
-      (inst mov thread-base-tn (ea thread-base-tn)))
-    #-sb-dynamic-core
-    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign)))))
+    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
+    (inst mov thread-base-tn (ea thread-base-tn))))
 
 ;;; Perform a store to code, updating the GC page (card) protection bits.
 ;;; This is not a "good" implementation of soft card marking.

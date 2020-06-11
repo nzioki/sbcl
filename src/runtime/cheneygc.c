@@ -34,6 +34,7 @@
 #include "arch.h"
 #include "code.h"
 #include "private-cons.inc"
+#include "getallocptr.h"
 
 /* So you need to debug? */
 #if 0
@@ -69,7 +70,7 @@ tv_diff(struct timeval *x, struct timeval *y)
 #endif
 
 void *
-gc_general_alloc(sword_t bytes, int page_type_flag, int quick_p) {
+gc_general_alloc(sword_t bytes, int page_type_flag) {
     lispobj *new=new_space_free_pointer;
     new_space_free_pointer+=(bytes/N_WORD_BYTES);
     return new;
@@ -127,7 +128,7 @@ collect_garbage(generation_index_t ignore)
     /* Set up from space and new space pointers. */
 
     from_space = current_dynamic_space;
-    from_space_free_pointer = dynamic_space_free_pointer;
+    from_space_free_pointer = get_alloc_pointer();
 
 #ifdef PRINTNOISE
     fprintf(stderr,"from_space = %lx\n",
@@ -208,7 +209,7 @@ collect_garbage(generation_index_t ignore)
             (os_vm_size_t) dynamic_space_size);
 
     current_dynamic_space = new_space;
-    dynamic_space_free_pointer = new_space_free_pointer;
+    set_alloc_pointer((lispobj)new_space_free_pointer);
 
 #ifdef PRINTNOISE
     size_discarded = (from_space_free_pointer - from_space) * sizeof(lispobj);
@@ -349,7 +350,7 @@ lispobj *
 search_dynamic_space(void *pointer)
 {
     lispobj *start = (lispobj *) current_dynamic_space;
-    lispobj *end = (lispobj *) dynamic_space_free_pointer;
+    lispobj *end = get_alloc_pointer();
     if ((pointer < (void *)start) || (pointer >= (void *)end))
         return NULL;
     return gc_search_space(start, pointer);
@@ -376,10 +377,10 @@ void set_auto_gc_trigger(os_vm_size_t dynamic_usage)
 
     addr = os_round_up_to_page((os_vm_address_t)current_dynamic_space
                                + dynamic_usage);
-    if (addr < (os_vm_address_t)dynamic_space_free_pointer)
+    if (addr < (os_vm_address_t)get_alloc_pointer())
         lose("set_auto_gc_trigger: tried to set gc trigger too low! (%ld < 0x%08lx)",
              (unsigned long)dynamic_usage,
-             (unsigned long)((os_vm_address_t)dynamic_space_free_pointer
+             (unsigned long)((os_vm_address_t)get_alloc_pointer()
                              - (os_vm_address_t)current_dynamic_space));
 
     if (dynamic_usage > dynamic_space_size)
@@ -387,12 +388,21 @@ void set_auto_gc_trigger(os_vm_size_t dynamic_usage)
              (unsigned long)dynamic_usage);
     length = os_trunc_size_to_page(dynamic_space_size - dynamic_usage);
 
+    // range has to fall entirely within either semispace
+    uword_t semispace_0_end = DYNAMIC_0_SPACE_START + dynamic_space_size;
+    uword_t semispace_1_end = DYNAMIC_1_SPACE_START + dynamic_space_size;
+    uword_t end = (uword_t)addr + length - 1;
+    if (((uword_t)addr >= DYNAMIC_0_SPACE_START && end < semispace_0_end) ||
+        ((uword_t)addr >= DYNAMIC_1_SPACE_START && end < semispace_1_end)) {
 #if defined(SUNOS) || defined(SOLARIS) || defined(LISP_FEATURE_HPUX)
-    os_invalidate(addr, length);
+        os_invalidate(addr, length);
 #else
-    os_protect(addr, length, 0);
+        os_protect(addr, length, 0);
 #endif
-
+    } else {
+        lose("auto_gc_trigger can't protect %p..%p (not owned)\n",
+             (void*)addr, (char*)end-1);
+    }
     current_auto_gc_trigger = (lispobj *)addr;
 }
 

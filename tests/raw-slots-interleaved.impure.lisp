@@ -119,19 +119,20 @@
 (with-test (:name :tagged-slot-iterator-macro)
   ;; on 32-bit, the logical length is 14, which means 15 words (with header),
   ;; but slot index 14 (word index 15) exists after padding to 16 memory words.
+  ;; It is allowed to hold a fixnum (or any non-pointer) but naught else.
   #-64-bit (progn (assert (= (sb-kernel:%instance-length *afoo*) 14))
-                  (setf (sb-kernel:%instance-ref *afoo* 14) 'magic))
+                  (setf (sb-kernel:%instance-ref *afoo* 14) #xdead))
   ;; on 64-bit, the logical length is 10, which means 11 words (with header),
   ;; but slot index 10 (word index 11) exists after padding to 12 memory words.
   #+64-bit (progn (assert (= (sb-kernel:%instance-length *afoo*) 10))
-                  (setf (sb-kernel:%instance-ref *afoo* 10) 'magic))
+                  (setf (sb-kernel:%instance-ref *afoo* 10) #xdead))
 
   (let (l)
     (sb-kernel:do-instance-tagged-slot (i *afoo*)
       (push `(,i ,(sb-kernel:%instance-ref *afoo* i)) l))
     (assert (equalp (nreverse l)
-                    #-64-bit `((3 aaay) (9 bee) (13 cee) (14 magic))
-                    #+64-bit `((2 aaay) (6 bee) (9 cee) (10 magic))))))
+                    #-64-bit `((3 aaay) (9 bee) (13 cee) (14 #xdead))
+                    #+64-bit `((2 aaay) (6 bee) (9 cee) (10 #xdead))))))
 
 (defvar *anotherfoo* (make-foo1))
 
@@ -171,7 +172,7 @@
               (slots (sb-kernel:dd-slots (sb-kernel:find-defstruct-description 'foo)))
               (valtype (sb-kernel:dsd-raw-type
                         (find 'sword slots :key #'sb-kernel:dsd-name))))
-         #-(or alpha hppa sparc) (assert (eq valtype 'sb-vm:signed-word))
+         (assert (eq valtype 'sb-vm:signed-word))
          (assert (= -9 (if (eq valtype 'sb-vm:signed-word)
                            (sb-sys:signed-sap-ref-word sap 0)
                            (sb-sys:sap-ref-lispobj sap 0))))))))

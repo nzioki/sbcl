@@ -38,6 +38,7 @@ WITH_FEATURES=""
 WITHOUT_FEATURES=""
 FANCY_FEATURES=":sb-core-compression :sb-xref-for-internals :sb-after-xc-core"
 
+perform_host_lisp_check=no
 fancy=false
 some_options=false
 for option
@@ -92,6 +93,9 @@ do
         WITH_FEATURES="$WITH_FEATURES $FANCY_FEATURES"
         # Lower down we add :sb-thread for platforms where it can be built.
         fancy=true
+        ;;
+      --check-host-lisp)
+        perform_host_lisp_check=yes
         ;;
       -*)
         bad_option "Unknown command-line option to $0: \"$option\""
@@ -217,10 +221,15 @@ mkdir -p output
 echo "SBCL_TEST_HOST=\"$SBCL_XC_HOST\"" > output/build-config
 . output/build-config # may come out differently due to escaping
 
-if ! echo '(lisp-implementation-type)' | $SBCL_TEST_HOST; then
-    echo "No working host Common Lisp implementation."
-    echo 'See ./INSTALL, the "SOURCE DISTRIBUTION" section'
-    exit 1
+if [ $perform_host_lisp_check = yes ]
+then
+    if echo '(lisp-implementation-type)' | $SBCL_TEST_HOST; then
+        :
+    else
+        echo "No working host Common Lisp implementation."
+        echo 'See ./INSTALL, the "SOURCE DISTRIBUTION" section'
+        exit 1
+    fi
 fi
 
 # Running make.sh with different options without clean.sh in the middle
@@ -285,7 +294,7 @@ case `uname` in
         esac
         ;;
     DragonFly)
-	sbcl_os="dragonfly"
+	sbcl_os="dragonflybsd"
 	;;
     Darwin)
         sbcl_os="darwin"
@@ -362,11 +371,14 @@ case `uname -m` in
     ppc64le) guessed_sbcl_arch=ppc64 ;; # is ok because there was never 32-bit LE
     Power*Macintosh) guessed_sbcl_arch=ppc ;;
     ibmnws) guessed_sbcl_arch=ppc ;;
-    parisc) guessed_sbcl_arch=hppa ;;
+    parisc*) guessed_sbcl_arch=hppa ;;
     9000/800) guessed_sbcl_arch=hppa ;;
     mips*) guessed_sbcl_arch=mips ;;
+    arm64) guessed_sbcl_arch=arm64 ;;
     *arm*) guessed_sbcl_arch=arm ;;
     aarch64) guessed_sbcl_arch=arm64 ;;
+    riscv32) guessed_sbcl_arch=riscv xlen=32;;
+    riscv64) guessed_sbcl_arch=riscv xlen=64;;
     *)
         # If we're not building on a supported target architecture, we
         # we have no guess, but it's not an error yet, since maybe
@@ -390,6 +402,16 @@ if test -n "$SBCL_ARCH"
 then
     # Normalize it.
     SBCL_ARCH=`echo $SBCL_ARCH | tr '[A-Z]' '[a-z]' | tr _ -`
+    case $SBCL_ARCH in
+        riscv*)
+            case $SBCL_ARCH in
+                riscv32) SBCL_ARCH=riscv xlen=32;;
+                riscv64) SBCL_ARCH=riscv xlen=64;;
+                *)
+                    echo "Please choose between riscv32 and riscv64."
+                    exit 1
+            esac
+    esac
 fi
 sbcl_arch=${SBCL_ARCH:-$guessed_sbcl_arch}
 echo sbcl_arch=\"$sbcl_arch\"
@@ -401,8 +423,8 @@ if $fancy
 then
     # If --fancy, enable threads on platforms where they can be built.
     case $sbcl_arch in
-        x86|x86-64|ppc|arm64)
-	    if [ "$sbcl_os" = "dragonfly" ]
+        x86|x86-64|ppc|arm64|riscv)
+	    if [ "$sbcl_os" = "dragonflybsd" ]
 	    then
 		echo "No threads on this platform."
 	    else
@@ -435,7 +457,7 @@ case "$sbcl_os" in
         ;;
     openbsd)
         # openbsd 6.0 and newer restrict mmap of RWX pages
-        if [ $(uname -r | tr -d .) -gt 60 ]; then
+        if [ `uname -r | tr -d .` -gt 60 ]; then
             rm -f tools-for-build/mmap-rwx
             LDFLAGS="$LDFLAGS -Wl,-zwxneeded" $GNUMAKE -C tools-for-build mmap-rwx -I ../src/runtime
             if ! ./tools-for-build/mmap-rwx; then
@@ -452,9 +474,7 @@ echo //initializing $ltf
 echo ';;;; This is a machine-generated file.' > $ltf
 echo ';;;; Please do not edit it by hand.' >> $ltf
 echo ';;;; See make-config.sh.' >> $ltf
-echo "(lambda (features) (set-difference (union features (list$WITH_FEATURES " >> $ltf
-
-printf ":%s" "$sbcl_arch" >> $ltf
+echo "(lambda (features) (set-difference (union features (list :${sbcl_arch}$WITH_FEATURES " >> $ltf
 
 echo //setting up OS-dependent information
 
@@ -469,9 +489,7 @@ link_or_copy $sbcl_arch-arch.h target-arch.h
 link_or_copy $sbcl_arch-lispregs.h target-lispregs.h
 case "$sbcl_os" in
     linux)
-        printf ' :unix' >> $ltf
-        printf ' :elf' >> $ltf
-        printf ' :linux' >> $ltf
+        printf ' :unix :linux :elf' >> $ltf
         case "$sbcl_arch" in
           x86 | x86-64 | arm64)
 	        printf ' :gcc-tls' >> $ltf
@@ -486,38 +504,34 @@ case "$sbcl_os" in
             x86 | x86-64)
 		printf ' :sb-futex :largefile' >> $ltf
 		;;
-            ppc | arm64)
+            ppc | ppc64 | arm64 | riscv)
 		printf ' :sb-futex' >> $ltf
 		;;
         esac
-
 
         link_or_copy Config.$sbcl_arch-linux Config
         link_or_copy $sbcl_arch-linux-os.h target-arch-os.h
         link_or_copy linux-os.h target-os.h
         ;;
     hpux)
-        printf ' :unix' >> $ltf
-        printf ' :elf' >> $ltf
-        printf ' :hpux' >> $ltf
+        printf ' :unix :hpux :elf' >> $ltf
         link_or_copy Config.$sbcl_arch-hpux Config
         link_or_copy $sbcl_arch-hpux-os.h target-arch-os.h
         link_or_copy hpux-os.h target-os.h
         ;;
     haiku)
-        printf ' :unix :elf :haiku :sb-dynamic-core' >> $ltf
+        printf ' :unix :haiku :elf :int4-breakpoints' >> $ltf
         link_or_copy Config.$sbcl_arch-haiku Config
         link_or_copy $sbcl_arch-haiku-os.h target-arch-os.h
         link_or_copy haiku-os.h target-os.h
         ;;
     *bsd)
-        printf ' :unix' >> $ltf
-        printf ' :bsd' >> $ltf
+        printf ' :unix :bsd :elf' >> $ltf
+        # FIXME: can we enable :gcc-tls across all variants?
         link_or_copy $sbcl_arch-bsd-os.h target-arch-os.h
         link_or_copy bsd-os.h target-os.h
         case "$sbcl_os" in
             *freebsd)
-                printf ' :elf' >> $ltf
                 printf ' :freebsd' >> $ltf
                 printf ' :gcc-tls' >> $ltf
                 if [ $sbcl_os = "gnu-kfreebsd" ]; then
@@ -530,14 +544,16 @@ case "$sbcl_os" in
                 link_or_copy Config.$sbcl_arch-$sbcl_os Config
                 ;;
             openbsd)
-                printf ' :elf' >> $ltf
                 printf ' :openbsd' >> $ltf
                 link_or_copy Config.$sbcl_arch-openbsd Config
                 ;;
             netbsd)
                 printf ' :netbsd' >> $ltf
-                printf ' :elf' >> $ltf
                 link_or_copy Config.$sbcl_arch-netbsd Config
+                ;;
+            dragonflybsd)
+                printf ' :dragonfly' >> $ltf
+                link_or_copy Config.$sbcl_arch-dragonfly Config
                 ;;
             *)
                 echo unsupported BSD variant: `uname`
@@ -545,24 +561,8 @@ case "$sbcl_os" in
                 ;;
         esac
         ;;
-    dragonfly)
-        printf ' :unix' >> $ltf
-        printf ' :bsd' >> $ltf
-        printf ' :elf' >> $ltf
-        printf ' :dragonfly' >> $ltf
-        printf ' :sb-qshow' >> $ltf
-        if [ $sbcl_arch = "x86" ]; then
-            printf ' :restore-fs-segment-register-from-tls' >> $ltf
-        fi
-        link_or_copy $sbcl_arch-bsd-os.h target-arch-os.h
-        link_or_copy bsd-os.h target-os.h
-        link_or_copy Config.$sbcl_arch-dragonfly Config
-        ;;
     darwin)
-        printf ' :unix' >> $ltf
-        printf ' :mach-o' >> $ltf
-        printf ' :bsd' >> $ltf
-        printf ' :darwin' >> $ltf
+        printf ' :unix :bsd :darwin :mach-o' >> $ltf
         if [ $sbcl_arch = "x86" ]; then
             printf ' :mach-exception-handler :restore-fs-segment-register-from-tls' >> $ltf
         fi
@@ -580,9 +580,7 @@ case "$sbcl_os" in
         link_or_copy Config.$sbcl_arch-darwin Config
         ;;
     sunos)
-        printf ' :unix' >> $ltf
-        printf ' :elf' >> $ltf
-        printf ' :sunos' >> $ltf
+        printf ' :unix :sunos :elf' >> $ltf
         if [ $sbcl_arch = "x86-64" ]; then
             printf ' :largefile' >> $ltf
         fi
@@ -604,7 +602,7 @@ case "$sbcl_os" in
         #
         # (Of course it doesn't provide dlopen, but there is
         # roughly-equivalent magic nevertheless:)
-        printf ' :sb-dynamic-core :os-provides-dlopen' >> $ltf
+        printf ' :os-provides-dlopen' >> $ltf
         printf ' :sb-thread :sb-safepoint :sb-thruption :sb-wtimer' >> $ltf
         printf ' :sb-safepoint-strictly' >> $ltf
         #
@@ -641,17 +639,8 @@ cd "$original_dir"
 # base-target-features.lisp-expr, we add it into local-target-features
 # if we're building for x86. -- CSR, 2002-02-21 Then we do something
 # similar with :STACK-GROWS-FOOWARD, too. -- WHN 2002-03-03
-if [ "$sbcl_arch" = "x86" ]; then
-    printf ' :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack' >> $ltf
-    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :alien-callbacks :cycle-counter' >> $ltf
-    printf ' :fp-and-pc-standard-save' >> $ltf
-    case "$sbcl_os" in
-    linux | freebsd | gnu-kfreebsd | netbsd | openbsd | sunos | darwin | win32 | dragonfly)
-        printf ' :linkage-table' >> $ltf
-    esac
+case "$sbcl_arch" in
+  x86)
     if [ "$sbcl_os" = "win32" ]; then
         # of course it doesn't provide dlopen, but there is
         # roughly-equivalent magic nevertheless.
@@ -661,30 +650,15 @@ if [ "$sbcl_arch" = "x86" ]; then
         rm -f src/runtime/openbsd-sigcontext.h
         sh tools-for-build/openbsd-sigcontext.sh > src/runtime/openbsd-sigcontext.h
     fi
-elif [ "$sbcl_arch" = "x86-64" ]; then
-    printf ' :64-bit :gencgc :stack-grows-downward-not-upward :c-stack-is-control-stack :linkage-table' >> $ltf
-    printf ' :compare-and-swap-vops :unwind-to-frame-and-call-vop' >> $ltf
-    printf ' :fp-and-pc-standard-save' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :alien-callbacks :cycle-counter' >> $ltf
-    printf ' :integer-eql-vop' >> $ltf
-    printf ' :sb-simd-pack :sb-simd-pack-256 :avx2' >> $ltf
-    printf ' :undefined-fun-restarts :call-symbol' >> $ltf
+    ;;
+  x86-64)
+    printf ' :sb-simd-pack :sb-simd-pack-256 :avx2' >> $ltf # not mandatory
     case "$sbcl_os" in
     linux | darwin | *bsd)
         printf ' :immobile-space :immobile-code :compact-instance-header' >> $ltf
     esac
-elif [ "$sbcl_arch" = "mips" ]; then
-    printf ' :cheneygc :linkage-table' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :alien-callbacks' >> $ltf
-elif [ "$sbcl_arch" = "ppc" ]; then
-    printf ' :gencgc :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :linkage-table' >> $ltf
-    printf ' :compare-and-swap-vops :alien-callbacks' >> $ltf
+    ;;
+  ppc)
     if [ "$sbcl_os" = "linux" ]; then
         # Use a C program to detect which kind of glibc we're building on,
         # to bandage across the break in source compatibility between
@@ -704,72 +678,49 @@ elif [ "$sbcl_arch" = "ppc" ]; then
             exit 1
 	fi
     fi
-elif [ "$sbcl_arch" = "ppc64" ]; then
-    printf ' :64-bit' >> $ltf
-    printf ' :gencgc :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :linkage-table :sb-dynamic-core' >> $ltf
-    printf ' :compare-and-swap-vops :alien-callbacks' >> $ltf
+    ;;
+  ppc64)
     # there is no glibc bug that requires the 'where-is-mcontext' hack.
     # (Sufficiently new glibc uses the correct definition, which is the same as
     # 2.3.1, so define our constant for that)
     echo '#define GLIBC231_STYLE_UCONTEXT 1' > src/runtime/ppc-linux-mcontext.h
-elif [ "$sbcl_arch" = "riscv" ]; then
-    printf ' :64-bit' >> $ltf
-    printf ' :gencgc' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-vectors' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :linkage-table' >> $ltf
-elif [ "$sbcl_arch" = "sparc" ]; then
+   ;;
+  riscv)
+    if [ "$xlen" = "64" ]; then
+        printf ' :64-bit' >> $ltf
+    elif [ "$xlen" = "32" ]; then
+        :
+    else
+        echo 'Architecture word width unspecified. (Either 32-bit or 64-bit.)'
+        exit 1
+    fi
+    ;;
+  sparc)
     # Test the compiler in order to see if we are building on Sun
     # toolchain as opposed to GNU binutils, and write the appropriate
     # FUNCDEF macro for assembler. No harm in running this on sparc-linux
     # as well.
     sh tools-for-build/sparc-funcdef.sh > src/runtime/sparc-funcdef.h
-    if [ "$sbcl_os" = "sunos" ] || [ "$sbcl_os" = "linux" ]; then
+    if [ "$sbcl_os" = "netbsd" ] || [ "$sbcl_os" = "sunos" ] || [ "$sbcl_os" = "linux" ]; then
         printf ' :gencgc' >> $ltf
     else
         echo '***'
-        echo '*** You are running SPARC on non-SunOS, non-Linux.  Since'
+        echo '*** You are running SPARC on other than SunOS, NetBSD, or Linux.  Since'
         echo '*** GENCGC is untested on this combination, make-config.sh'
         echo '*** is falling back to CHENEYGC.  Please consider adjusting'
         echo '*** parms.lisp to build with GENCGC instead.'
         echo '***'
         printf ' :cheneygc' >> $ltf
     fi
-    if [ "$sbcl_os" = "sunos" ] || [ "$sbcl_os" = "linux" ]; then
-        printf ' :linkage-table' >> $ltf
-    fi
-    printf ' :stack-allocatable-closures :stack-allocatable-lists' >> $ltf
-elif [ "$sbcl_arch" = "alpha" ]; then
-    printf ' :cheneygc' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-lists' >> $ltf
-    printf ' :stack-allocatable-fixed-objects' >> $ltf
-elif [ "$sbcl_arch" = "hppa" ]; then
-    printf ' :cheneygc' >> $ltf
-    printf ' :stack-allocatable-vectors :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :stack-allocatable-closures :stack-allocatable-lists' >> $ltf
-elif [ "$sbcl_arch" = "arm" ]; then
-    printf ' :gencgc :linkage-table :alien-callbacks' >> $ltf
-    # As opposed to soft-float or FPA, we support VFP only (and
-    # possibly VFPv2 and higher only), but we'll leave the obvious
-    # hooks in for someone to add the support later.
-    printf ' :arm-vfp :arm-vfpv2' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
-    printf ' :unwind-to-frame-and-call-vop' >> $ltf
-    printf ' :fp-and-pc-standard-save' >> $ltf
-elif [ "$sbcl_arch" = "arm64" ]; then
-    printf ' :64-bit :gencgc :linkage-table :fp-and-pc-standard-save' >> $ltf
-    printf ' :alien-callbacks' >> $ltf
-    printf ' :stack-allocatable-lists :stack-allocatable-fixed-objects' >> $ltf
-    printf ' :stack-allocatable-vectors :stack-allocatable-closures' >> $ltf
-    printf ' :unwind-to-frame-and-call-vop' >> $ltf
-    printf ' :compare-and-swap-vops :undefined-fun-restarts' >> $ltf
-else
-    # Nothing need be done in this case, but sh syntax wants a placeholder.
-    echo > /dev/null
-fi
+    ;;
+esac
+
+# There are only two architectures that don't have linkage tables,
+# and they also don't run for half a dozen other reasons.
+case "$sbcl_arch" in
+    alpha | hppa)  ;;
+    *) printf ' :linkage-table' >> $ltf
+esac
 
 # Use a little C program to try to guess the endianness.  Ware
 # cross-compilers!
@@ -782,6 +733,7 @@ export sbcl_os sbcl_arch
 sh tools-for-build/grovel-features.sh >> $ltf
 
 echo //finishing $ltf
+printf " %s" "`cat crossbuild-runner/backends/${sbcl_arch}/features`" >> $ltf
 echo ")) (list$WITHOUT_FEATURES)))" >> $ltf
 
 # FIXME: The version system should probably be redone along these lines:

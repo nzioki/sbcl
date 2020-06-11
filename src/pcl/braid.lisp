@@ -32,11 +32,10 @@
 (in-package "SB-PCL")
 
 (defun allocate-standard-instance (wrapper)
-  (let ((instance (%make-standard-instance
-                   (make-array (layout-length wrapper)
-                               :initial-element +slot-unbound+)
-                   #-compact-instance-header 0)))
+  (let* ((instance (%make-instance (1+ sb-vm:instance-data-start)))
+         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+)))
     (setf (%instance-layout instance) wrapper)
+    (setf (std-instance-slots instance) slots)
     instance))
 
 (define-condition unset-funcallable-instance-function
@@ -46,44 +45,37 @@
    :references '((:amop :generic-function allocate-instance)
                  (:amop :function set-funcallable-instance-function))))
 
+(defmacro error-no-implementation-function (fin)
+  `(error 'unset-funcallable-instance-function
+          :format-control "~@<The function of funcallable instance ~
+                           ~S has not been set.~@:>"
+          :format-arguments (list ,fin)))
+
 (defun allocate-standard-funcallable-instance (wrapper name)
   (declare (layout wrapper))
   (let* ((hash (if name
                    (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
-                   (sb-impl::new-instance-hash-code)))
+                   (sb-impl::quasi-random-address-based-hash
+                    (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte)))
+                    most-positive-fixnum)))
          (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
          (fin (cond #+(and immobile-code)
-                    ((or (find (find-layout 'generic-function) (layout-inherits wrapper))
-                         ;; KLUDGE: early GFs are created with nothing in the layout-inherits.
-                         ;; Could we add some assertions that the standard CLOS type lattice
-                         ;; is correctly interconnected before allocating instances???
-                         (eq wrapper *sgf-wrapper*))
-                     (truly-the funcallable-instance
-                                (sb-vm::make-immobile-funinstance wrapper slots)))
+                    ((/= (layout-bitmap wrapper) +layout-all-tagged+)
+                     (let ((f (truly-the funcallable-instance
+                                         (sb-vm::make-immobile-funinstance wrapper slots))))
+                       ;; set the upper 4 bytes of wordindex 5
+                       (sb-sys:with-pinned-objects (f)
+                         (setf (sb-impl::fsc-instance-trailer-hash f) (ldb (byte 32 0) hash)))
+                       f))
                     (t
                      (let ((f (truly-the funcallable-instance
-                                         (%make-standard-funcallable-instance
-                                          slots
-                                          #-compact-instance-header hash))))
-                       (setf (%funcallable-instance-layout f) wrapper)
+                                         (%make-standard-funcallable-instance slots hash))))
+                       (setf (%fun-layout f) wrapper)
                        f)))))
-    ;; Compact-instance-header uses the high 32 bits of the slot vector's
-    ;; header word. Mix down the full hash, then shift left 24 bits
-    ;; which when shifted by N-WIDETAG-BITS puts it in the upper 32.
-    ;; The contraint on size is that we must not touch the byte for immobile
-    ;; GC's generation. But, you might say, vector's don't go in immobile
-    ;; space. That's true for the time being, but might not be true always.
-    #+compact-instance-header
-    (set-header-data slots (ash (ldb (byte 32 0) (logxor (ash hash -32) hash))
-                                24))
-    (set-funcallable-instance-function
-     fin
-     #'(lambda (&rest args)
-         (declare (ignore args))
-         (error 'unset-funcallable-instance-function
-                :format-control "~@<The function of funcallable instance ~
-                                 ~S has not been set.~@:>"
-                :format-arguments (list fin))))
+    (setf (%funcallable-instance-fun fin)
+          (lambda (&rest args)
+            (declare (ignore args))
+            (error-no-implementation-function fin)))
     fin))
 
 (defun classify-slotds (slotds)
@@ -129,7 +121,7 @@
                           (find-class ',class) ,class)))
                classes)))
 
-(defun !wrapper-p (x) (and (sb-kernel::layout-p x) (layout-for-std-class-p x)))
+(defun !wrapper-p (x) (and (sb-kernel::layout-p x) (layout-for-pcl-obj-p x)))
 
 (defun !bootstrap-meta-braid ()
   (let* ((*create-classes-from-internal-structure-definitions-p* nil)
@@ -666,10 +658,10 @@
   ;; Protected by *world-lock* in callers.
   (let ((classoid (layout-classoid layout)))
     (unless (eq (classoid-layout classoid) layout)
-      (setf (layout-inherits layout)
-            (order-layout-inherits
-             (map 'simple-vector #'class-wrapper
-                  (reverse (rest (class-precedence-list class))))))
+      (set-layout-inherits layout
+                           (order-layout-inherits
+                            (map 'simple-vector #'class-wrapper
+                                 (reverse (rest (class-precedence-list class))))))
       (register-layout layout :invalidate t)
 
       ;; FIXME: I don't think this should be necessary, but without it

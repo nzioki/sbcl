@@ -73,3 +73,28 @@
             x)))
     ((#c(1 2)) #c(1 2))
     ((#c(2 1)) nil)))
+
+(with-test (:name :compare-both-operands)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (type real a b))
+         (if (>= a a)
+             (if (= b a)
+                 1
+                 2)
+             t))
+    ((0 1) 2)
+    ((1 1) 1)))
+
+(with-test (:name :eql-constant)
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (i)
+                     (declare ((integer 0) i))
+                     (cond
+                       ((= i 0) 3)
+                       ((= i 1) 3)
+                       (t i))))))
+          '(values (integer 2) &optional))))

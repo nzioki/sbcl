@@ -33,8 +33,10 @@
   ;; whatever it is that show would have shown. Comment this out if you need.
     (when s (set s nil))))
 
-(assert (zerop (deref (extern-alien "lowtag_for_widetag" (array char 64))
-                      (ash sb-vm:character-widetag -2))))
+(let ((byte (deref (extern-alien "widetag_lowtag" (array char 256))
+                   sb-vm:character-widetag)))
+  (assert (not (logbitp 7 byte))) ; not a headered object
+  (assert (= (logand byte sb-vm:lowtag-mask) sb-vm:list-pointer-lowtag)))
 (gc :full t)
 
 ;;; Verify that all defstructs except for one were compiled in a null lexical
@@ -65,15 +67,19 @@
       ;; Ensure that we're reading the correct variant of the file
       ;; in case there is more than one set of floating-point formats.
       (assert (eq (read stream) :default))
-      (let ((*package* (find-package "SB-KERNEL")))
-        (dolist (expr (read stream))
-          (destructuring-bind (fun args result) expr
-            (let ((actual (apply fun (sb-int:ensure-list args))))
-              (unless (eql actual result)
-                (#+sb-devel cerror #+sb-devel ""
-                 #-sb-devel format #-sb-devel t
-                 "FLOAT CACHE LINE ~S vs COMPUTED ~S~%"
-                 expr actual)))))))))
+      (sb-kernel::with-float-traps-masked (:overflow :divide-by-zero)
+        (let ((*package* (find-package "SB-KERNEL")))
+          (dolist (expr (read stream))
+            (destructuring-bind (fun args . result) expr
+              (let ((result (if (eq (first result) 'sb-kernel::&values)
+                                (rest result)
+                                result))
+                    (actual (multiple-value-list (apply fun (sb-int:ensure-list args)))))
+                (unless (equalp actual result)
+                  (#+sb-devel cerror #+sb-devel ""
+                   #-sb-devel format #-sb-devel t
+                   "FLOAT CACHE LINE ~S vs COMPUTED ~S~%"
+                   expr actual))))))))))
 
 (when (if (boundp '*compile-files-p*) *compile-files-p* t)
   (with-open-file (output "output/cold-vop-usage.txt" :if-does-not-exist nil)
@@ -176,12 +182,13 @@
 
   (let ((*compile-print* nil))
     (dolist (group sources)
-      (handler-bind ((simple-warning
+      (handler-bind ((#+x86-64 warning #-x86-64 simple-warning
                       (lambda (c)
                         ;; escalate "undefined variable" warnings to errors.
                         ;; There's no reason to allow them in our code.
-                        (when (search "undefined variable"
-                                      (write-to-string c :escape nil))
+                        (when (and #-x86-64 ; Don't allow any warnings on x86-64.
+                                   (search "undefined variable"
+                                           (write-to-string c :escape nil)))
                           (cerror "Finish warm compile ignoring the problem" c)))))
         (with-compilation-unit () (do-srcs group)))))))
 

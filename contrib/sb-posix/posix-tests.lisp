@@ -22,6 +22,7 @@
              sb-posix::s-iroth sb-posix::s-iwoth sb-posix::s-ixoth))))
 
 (defmacro define-eacces-test (name form &rest values)
+  #+win32 (declare (ignore name form values))
   #-win32
   `(deftest ,name
     (block ,name
@@ -432,18 +433,13 @@
   #+win32
   #.sb-posix:eacces)
 
-#-(or (and (or x86-64 arm64 ppc64 alpha) (or linux sunos)) win32)
-(deftest fcntl.1
-  (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
-    (= (sb-posix:fcntl fd sb-posix::f-getfl) sb-posix::o-nonblock))
-  t)
-;; On AMD64/Linux O_LARGEFILE is always set, even though the whole
+;; O_LARGEFILE is always set on 64-bit *nix platforms even though the whole
 ;; flag makes no sense.
-#+(and (or x86-64 arm64 ppc64 alpha) (or linux sunos))
+#-win32
 (deftest fcntl.1
-  (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
-    (/= 0 (logand (sb-posix:fcntl fd sb-posix::f-getfl)
-                  sb-posix::o-nonblock)))
+    (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
+      (logtest (sb-posix:fcntl fd sb-posix::f-getfl)
+               sb-posix::o-nonblock))
   t)
 
 #-(or hpux win32 netbsd) ; fix: cant handle c-vargs
@@ -737,7 +733,7 @@
   (deftest readlink.error.2
       (let* ((non-link-pathname (make-pathname :name "readlink.error.2"
                                                :defaults *test-directory*))
-             (fd (sb-posix:open non-link-pathname sb-posix::o-creat)))
+             (fd (sb-posix:open non-link-pathname sb-posix:o-creat #o777)))
         (unwind-protect
              (handler-case (sb-posix:readlink non-link-pathname)
                (sb-posix:syscall-error (c)
@@ -795,7 +791,7 @@
                                     '(:relative "readlink.error.7")
                                     :name "readlink.error.7")
                                    *test-directory*))
-             (fd (sb-posix:open non-link-pathname sb-posix::o-creat)))
+             (fd (sb-posix:open non-link-pathname sb-posix:o-creat #o777)))
         (unwind-protect
              (handler-case (sb-posix:readlink impossible-pathname)
                (sb-posix:syscall-error (c)

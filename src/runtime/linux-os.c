@@ -55,6 +55,8 @@
 # include <sys/timerfd.h>
 #endif
 
+int sb_GetTID() { return syscall(SYS_gettid); }
+
 #ifdef LISP_FEATURE_X86
 /* Prototype for personality(2). Done inline here since the header file
  * for this isn't available on old versions of glibc. */
@@ -63,8 +65,6 @@ int personality (unsigned long);
 #else
 #include <sys/personality.h>
 #endif
-
-size_t os_vm_page_size;
 
 #if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
 #include <sys/syscall.h>
@@ -81,8 +81,6 @@ size_t os_vm_page_size;
  * futexes when available.*/
 #define FUTEX_WAIT_PRIVATE (0+128)
 #define FUTEX_WAKE_PRIVATE (1+128)
-#define FUTEX_FD (2)
-#define FUTEX_REQUEUE (3)
 
 /* Not static so that Lisp may query it. */
 boolean futex_private_supported_p;
@@ -128,16 +126,11 @@ futex_init()
 #include "genesis/vector.h"
 char* futex_name(int *lock_word)
 {
-    // If there is a Lisp string at lock_word-1 or -2, return that.
-    // Otherwise return NULL.
-    lispobj name = *(lock_word - 1);
-    struct vector* v = (struct vector*)native_pointer(name);
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
-        return (char*)(v->data);
-    name = *(lock_word - 2);
-    v = (struct vector*)native_pointer(name);
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
-        return (char*)(v->data);
+    // If there is a Lisp string at lock_word+1, return that, otherwise NULL.
+    lispobj name = ((lispobj*)lock_word)[1];
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG &&
+        header_widetag(VECTOR(name)->header) == SIMPLE_BASE_STRING_WIDETAG)
+        return (char*)VECTOR(name)->data;
     return 0;
 }
 
@@ -174,62 +167,12 @@ futex_wake(int *lock_word, int n)
 #endif
 
 
-
-#ifdef LISP_FEATURE_SB_THREAD
-int
-isnptl (void)
-{
-  size_t n = confstr (_CS_GNU_LIBPTHREAD_VERSION, NULL, 0);
-  if (n > 0) {
-      char *buf = alloca (n);
-      confstr (_CS_GNU_LIBPTHREAD_VERSION, buf, n);
-      if (strstr (buf, "NPTL")) {
-          return 1;
-      }
-  }
-  return 0;
-}
-#endif
-
-static void getuname(int *major_version, int* minor_version, int *patch_version)
-{
-    /* Conduct various version checks: do we have enough mmap(), is
-     * this a sparc running 2.2, can we do threads? */
-    struct utsname name;
-    char *p;
-    uname(&name);
-
-    p=name.release;
-    *major_version = atoi(p);
-    *minor_version = *patch_version = 0;
-    p=strchr(p,'.');
-    if (p != NULL) {
-            *minor_version = atoi(++p);
-            p=strchr(p,'.');
-            if (p != NULL)
-                    *patch_version = atoi(++p);
-    }
-}
-
 void os_init(char __attribute__((unused)) *argv[],
              char __attribute__((unused)) *envp[])
 {
-#ifdef LISP_FEATURE_SB_THREAD
-#if defined(LISP_FEATURE_SB_FUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
     futex_init();
 #endif
-    if(! isnptl()) {
-       lose("This version of SBCL only works correctly with the NPTL threading\n"
-            "library. Please use a newer glibc, use an older SBCL, or stop using\n"
-            "LD_ASSUME_KERNEL");
-    }
-#endif
-
-    /* Don't use getpagesize(), since it's not constant across Linux
-     * kernel versions on some architectures (for example PPC). FIXME:
-     * possibly the same should be done on other architectures too.
-     */
-    os_vm_page_size = BACKEND_PAGE_BYTES;
 
 #ifdef LISP_FEATURE_X86
     /* Use SSE detector.  Recent versions of Linux enable SSE support
@@ -248,19 +191,6 @@ void os_init(char __attribute__((unused)) *argv[],
 
 int os_preinit(char *argv[], char *envp[])
 {
-    int major_version, minor_version, patch_version;
-    getuname(&major_version, &minor_version, &patch_version);
-    if (major_version<2) {
-        lose("linux kernel version too old: major version=%d (can't run in version < 2.0.0)",
-             major_version);
-    }
-    // Rev b44ca02cb963 conditionally enabled a workaround for a kernel 2.6 bug.
-    // Rev d4d6c4b16a36 moved the workaround check from compile-time to runtime.
-    // 14 years later we're still performing that check, which annoyingly adds
-    // signal-related junk to startup which must be ignored when debugging.
-    // Let's assume that major version 3 and later are fine.
-    extern void set_sigaction_nodefer_works();
-    if (major_version>=3) set_sigaction_nodefer_works();
 
 #if ALLOW_PERSONALITY_CHANGE
     if (getenv("SBCL_IS_RESTARTING")) {
@@ -279,53 +209,43 @@ int os_preinit(char *argv[], char *envp[])
         return 1; // indicate that we already allocated hardwired spaces
 
 #if ALLOW_PERSONALITY_CHANGE
-    /* KLUDGE: Disable memory randomization on new Linux kernels
-     * by setting a personality flag and re-executing. (We need
-     * to re-execute, since the memory maps that can conflict with
-     * the SBCL spaces have already been done at this point).
+    /* KLUDGE: Disable memory randomization by setting a personality
+     * flag and re-executing. (We need to re-execute, since the memory
+     * maps that can conflict with the SBCL spaces have already been
+     * done at this point).
      */
-    if ((major_version == 2
-         /* Some old kernels will apparently lose unsupported personality flags
-          * on exec() */
-         && ((minor_version == 6 && patch_version >= 11)
-             || (minor_version > 6)
-             /* This is what RHEL 3 reports */
-             || (minor_version == 4 && patch_version > 20)))
-        || major_version >= 3)
-    {
-        int pers = personality(0xffffffffUL);
-        if (!(pers & ADDR_NO_RANDOMIZE)) {
-            int retval = personality(pers | ADDR_NO_RANDOMIZE);
-            /* Allegedly some Linux kernels (the reported case was
-             * "hardened Linux 2.6.7") won't set the new personality,
-             * but nor will they return -1 for an error. So as a
-             * workaround query the new personality...
-             */
-            int newpers = personality(0xffffffffUL);
-            /* ... and don't re-execute if either the setting resulted
-             * in an error or if the value didn't change. Otherwise
-             * this might result in an infinite loop.
-             */
+    int pers = personality(0xffffffffUL);
+    if (!(pers & ADDR_NO_RANDOMIZE)) {
+        int retval = personality(pers | ADDR_NO_RANDOMIZE);
+        /* Allegedly some Linux kernels (the reported case was
+         * "hardened Linux 2.6.7") won't set the new personality,
+         * but nor will they return -1 for an error. So as a
+         * workaround query the new personality...
+         */
+        int newpers = personality(0xffffffffUL);
+        /* ... and don't re-execute if either the setting resulted
+         * in an error or if the value didn't change. Otherwise
+         * this might result in an infinite loop.
+         */
 
-            if (!getenv("SBCL_IS_RESTARTING") &&
-                retval != -1 && newpers != pers) {
-                /* Use /proc/self/exe instead of trying to figure out
-                 * the executable path from PATH and argv[0], since
-                 * that's unreliable. We follow the symlink instead of
-                 * executing the file directly in order to prevent top
-                 * from displaying the name of the process as "exe". */
-                char runtime[PATH_MAX+1];
-                int i = readlink("/proc/self/exe", runtime, PATH_MAX);
-                if (i != -1) {
-                    environ = envp;
-                    setenv("SBCL_IS_RESTARTING", "T", 1);
-                    runtime[i] = '\0';
-                    execv(runtime, argv);
-                }
+        if (!getenv("SBCL_IS_RESTARTING") &&
+            retval != -1 && newpers != pers) {
+            /* Use /proc/self/exe instead of trying to figure out
+             * the executable path from PATH and argv[0], since
+             * that's unreliable. We follow the symlink instead of
+             * executing the file directly in order to prevent top
+             * from displaying the name of the process as "exe". */
+            char runtime[PATH_MAX+1];
+            int i = readlink("/proc/self/exe", runtime, PATH_MAX);
+            if (i != -1) {
+                environ = envp;
+                setenv("SBCL_IS_RESTARTING", "T", 1);
+                runtime[i] = '\0';
+                execv(runtime, argv);
             }
-            /* Either changing the personality or execve() failed.
-             * Just get on with life and hope for the best. */
         }
+        /* Either changing the personality or execve() failed.
+         * Just get on with life and hope for the best. */
     }
 #endif
     return 0;
@@ -421,8 +341,7 @@ os_install_interrupt_handlers(void)
 #endif
 }
 
-char *
-os_get_runtime_executable_path(int __attribute__((unused)) external)
+char *os_get_runtime_executable_path()
 {
     char path[PATH_MAX + 1];
     int size;

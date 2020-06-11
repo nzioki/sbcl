@@ -211,7 +211,7 @@
                   :skipped-on (not :sb-unicode))
   (let ((rt (copy-readtable)))
     (set-macro-character (code-char #x100fa) #'error nil rt)
-    (assert (plusp (hash-table-count (sb-impl::character-macro-hash-table rt))))
+    (assert (plusp (hash-table-count (sb-impl::extended-char-table rt))))
     (copy-readtable nil rt)
     (assert (null (get-macro-character #\UFC rt)))))
 
@@ -359,15 +359,21 @@
 ;;  - calling SUBSEQ for package names
 ;;  - multiple-value-call in WITH-CHAR-MACRO-RESULT
 ;;  - the initial cons cell in READ-LIST
-(with-test (:name :read-does-not-cons-per-se
-                  :skipped-on (:or :interpreter (:not :x86-64)))
+(with-test (:name :read-does-not-cons-per-se :skipped-on :interpreter)
   (flet ((test-reading (string)
            (let ((s (make-string-input-stream string)))
              (read s) ; once outside the loop, to make A-SYMBOL
              (ctu:assert-no-consing
               (progn (file-position s 0)
                      (read s))
-              40000))))
+              40000))
+           ;; WITH-INPUT-FROM-STRING doesn't heap-allocate a stream
+           (ctu:assert-no-consing
+            (with-input-from-string (s string)
+              (opaque-identity s)))
+           ;; READ-FROM-STRING doesn't heap-allocate a stream
+           (ctu:assert-no-consing
+            (read-from-string string))))
     ;; These each used to produce at least 20 MB of garbage,
     ;; a result of using 128-character (= 512 bytes for Unicode) buffers.
     ;; Now we use exactly one buffer, or maybe two for package + symbol-name.
@@ -382,7 +388,7 @@
     ;; impossible to cons 1 byte per run.
     ;; If this still fails, it might be due to somebody changing the
     ;; backend-page-bytes to exceed 32KB. Not sure what to do about that.
-    (test-reading "4.0s0")
+    #+64-bit (test-reading "4.0s0")
     (test-reading "COMMON-LISP-USER::A-SYMBOL")
     (test-reading "()")
     (test-reading "#\\-") ; should not copy the token buffer

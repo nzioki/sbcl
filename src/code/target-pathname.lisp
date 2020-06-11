@@ -37,6 +37,7 @@
                        (unparse-directory-separator ";")
                        (simplify-namestring #'identity)
                        (customary-case :upper)))
+  (name-hash 0 :type fixnum)
   (name "" :type simple-string :read-only t)
   (translations nil :type list)
   (canon-transls nil :type list))
@@ -252,6 +253,22 @@
   (let ((hash (sxhash (car directory))))
     (dolist (piece (cdr directory) hash)
       (mixf hash (sxhash piece)))))
+;;; Pathname hashing used to be nested inside SXHASH so that it could utilize
+;;; the depth cutoff to avoid performing unbounded work. We don't need that any more,
+;;; as the parts of the pathname that invoke SXHASH (host, device, version) are atoms
+;;; and hence they entail bounded computation.
+(defun pathname-sxhash (x)
+  (declare (pathname x))
+  ;; Pathnames are EQUAL if all the components are EQUAL, so
+  ;; we hash all of the components of a pathname together.
+  (let ((hash (sxhash (pathname-host x))))
+    (mixf hash (sxhash (pathname-device x)))
+    (mixf hash (logxor (%pathname-dir-hash x)
+                       (%pathname-stem-hash x)))
+    ;; Hash :NEWEST the same as NIL because EQUAL for
+    ;; pathnames assumes that :newest and nil are equal.
+    (let ((version (%pathname-version x)))
+      (mixf hash (sxhash (if (eq version :newest) nil version))))))
 
 (defmethod print-object ((pathname pathname) stream)
   (let ((namestring (handler-case (namestring pathname)
@@ -297,10 +314,12 @@
           (aver (eq host *physical-host*))
           (%make-pathname host device directory name type version)))))
 
-;;; Hash table searching maps a logical pathname's host to its
-;;; physical pathname translation.
-(define-load-time-global *logical-hosts*
-    (make-hash-table :test 'equal :synchronized t))
+;;; Vector of logical host objects, each of which contains its translations.
+;;; The vector is never mutated- always a new vector is created when adding
+;;; translations for a new host. So nothing needs locking.
+;;; And the fact that hosts are never deleted keeps things really simple.
+(define-load-time-global *logical-hosts* #())
+(declaim (simple-vector *logical-hosts*))
 
 ;;;; patterns
 
@@ -472,6 +491,7 @@
            (or (eq (%pathname-host pathname1) *physical-host*)
                (compare-component (%pathname-version pathname1)
                                   (%pathname-version pathname2))))))
+(sb-kernel::assign-equalp-impl 'pathname #'pathname=)
 
 ;;; This is conceptually like (DEFUN-CACHED (%MAKE-PATHNAME ...))
 ;;; except that we try hard never to evict entries until SAVE-LISP-AND-DIE.
@@ -1031,18 +1051,6 @@ a host-structure or string."
                     pn-host device directory file type version)
                    end)))))))
 
-;;; If NAMESTR begins with a colon-terminated, defined, logical host,
-;;; then return that host, otherwise return NIL.
-(defun extract-logical-host-prefix (namestr start end)
-  (declare (type simple-string namestr)
-           (type index start end)
-           (values (or logical-host null)))
-  (let ((colon-pos (position #\: namestr :start start :end end)))
-    (if colon-pos
-        (values (gethash (nstring-upcase (subseq namestr start colon-pos))
-                         *logical-hosts*))
-        nil)))
-
 (defun parse-namestring (thing
                          &optional
                          host
@@ -1556,8 +1564,13 @@ unspecified elements into a completed to-pathname based on the to-wildname."
 (defun find-logical-host (thing &optional (errorp t))
   (etypecase thing
     (string
-     (let ((found (gethash (logical-word-or-lose thing)
-                           *logical-hosts*)))
+     (let* ((name (logical-word-or-lose thing))
+            (hash (sxhash name))
+            ;; Can do better here: binary search, since we maintain sorted order.
+            (found (dovector (x *logical-hosts*)
+                     (when (and (eq (logical-host-name-hash x) hash)
+                                (string= (logical-host-name x) name))
+                       (return x)))))
        (if (or found (not errorp))
            found
            ;; This is the error signalled from e.g.
@@ -1575,13 +1588,16 @@ unspecified elements into a completed to-pathname based on the to-wildname."
 
 ;;; Given a logical host name or host, return a logical host, creating
 ;;; a new one if necessary.
-(defun intern-logical-host (thing)
-  (with-locked-system-table (*logical-hosts*)
-    (or (find-logical-host thing nil)
-        (let* ((name (logical-word-or-lose thing))
-               (new (make-logical-host :name name)))
-          (setf (gethash name *logical-hosts*) new)
-          new))))
+(defun intern-logical-host (thing &aux name host)
+  (loop
+    (awhen (find-logical-host thing nil) (return it))
+    (unless name
+      (setq name (logical-word-or-lose thing)
+            host (make-logical-host :name name :name-hash (sxhash name))))
+    (let* ((old *logical-hosts*)
+           (new (merge 'vector old (list host) #'string< :key #'logical-host-name)))
+      (when (eq (cas *logical-hosts* old new) old)
+        (return host)))))
 
 ;;;; logical pathname parsing
 

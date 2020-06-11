@@ -257,10 +257,16 @@
                  (push-fop-table (%intern name length package elt-type t)
                                  fasl-input))))
          (ensure-hashed (symbol)
+           ;; ENSURE-SYMBOL-HASH when vop-translated is flushable since it is
+           ;; conceptually just a slot reader, however its actual effect is to fill in
+           ;; the hash if absent, so it's not quite flushable when called expressly
+           ;; to fill in the slot. In this case we need a full call to ENSURE-SYMBOL-HASH
+           ;; to ensure the side-effect happens.
+           ;; Careful if changing this again. There'a regression test thank goodness.
+           (declare (notinline ensure-symbol-hash))
            (ensure-symbol-hash symbol)
            symbol))
 
-  #-sb-xc-host (declare (inline ensure-hashed))
   (define-fop 77 :not-host (fop-lisp-symbol-save ((:operands length+flag)))
     (aux-fop-intern length+flag *cl-package* (fasl-input)))
   (define-fop 78 :not-host (fop-keyword-symbol-save ((:operands length+flag)))
@@ -512,9 +518,9 @@
 ;;; putting the implementation and version in required fields in the
 ;;; fasl file header.)
 
-;; Cold-load calls COLD-LOAD-CODE instead
 (define-fop 16 :not-host (fop-load-code ((:operands header n-code-bytes n-fixups)))
-  (let* ((n-boxed-words (ash header -1))
+  (let* ((n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
+         (n-boxed-words (ash header -1))
          (n-constants (- n-boxed-words sb-vm:code-constants-offset)))
     ;; stack has (at least) N-CONSTANTS words plus debug-info
     (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
@@ -522,11 +528,9 @@
              (n-boxed-words (+ sb-vm:code-constants-offset n-constants))
              (code (sb-c:allocate-code-object
                     (if (oddp header) :immobile :dynamic)
+                    n-named-calls
                     (align-up n-boxed-words sb-c::code-boxed-words-align)
                     n-code-bytes)))
-        (loop for i of-type index from sb-vm:code-constants-offset
-              for j of-type index from ptr below debug-info-index
-              do (setf (code-header-ref code i) (svref stack j)))
         (with-pinned-objects (code)
           ;; * DO * NOT * SEPARATE * THESE * STEPS *
           ;; For a full explanation, refer to the comment above MAKE-CORE-COMPONENT
@@ -536,6 +540,18 @@
           ;; Assign debug-info last. A code object that has no debug-info will never
           ;; have its fun table accessed in conservative_root_p() or pin_object().
           (setf (%code-debug-info code) (svref stack debug-info-index))
+          ;; Boxed constants can be assigned only after figuring out where the range
+          ;; of implicitly tagged words is, which requires knowing how many functions
+          ;; are in the code component, which requires reading the code trailer.
+          (let* ((fdefns-start (sb-impl::code-fdefns-start-index code))
+                 (fdefns-end (1- (+ fdefns-start n-named-calls)))) ; inclusive bound
+            (loop for i of-type index from sb-vm:code-constants-offset
+                  for j of-type index from ptr below debug-info-index
+                  do (let ((constant (svref stack j)))
+                       (if (<= fdefns-start i fdefns-end)
+                           (sb-c::set-code-fdefn code i constant)
+                           (setf (code-header-ref code i) constant)))))
+          ;; Now apply fixups. The fixups to perform are popped from the fasl stack.
           (sb-c::apply-fasl-fixups stack code n-fixups))
         #-sb-xc-host
         (when (typep (code-header-ref code (1- n-boxed-words))
@@ -554,6 +570,26 @@
 
 (define-fop 18 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
+
+;; This FOP is only encountered in cross-compiled files for cold-load.
+(define-fop 74 :not-host (fop-fset (name fn) nil)
+  ;; Ordinary, not-for-cold-load code shouldn't need to mess with this
+  ;; at all, since it's only used as part of the conspiracy between
+  ;; the cross-compiler and GENESIS to statically link FDEFINITIONs
+  ;; for cold init.
+  (warn "~@<FOP-FSET seen in ordinary load (not cold load) -- quite
+strange! ~ If you didn't do something strange to cause this, please
+report it as a ~ bug.~:@>")
+  ;; Unlike CMU CL, we don't treat this as a no-op in ordinary code.
+  ;; If the user (or, more likely, developer) is trying to reload
+  ;; compiled-for-cold-load code into a warm SBCL, we'll do a warm
+  ;; assignment. (This is partly for abstract tidiness, since the warm
+  ;; assignment is the closest analogy to what happens at cold load,
+  ;; and partly because otherwise our compiled-for-cold-load code will
+  ;; fail, since in SBCL things like compiled-for-cold-load %DEFUN
+  ;; depend more strongly than in CMU CL on FOP-FSET actually doing
+  ;; something.)
+  (setf (fdefinition name) fn))
 
 ;;; Modify a slot of the code boxed constants.
 (define-fop 19 (fop-alter-code ((:operands index) code value) nil)

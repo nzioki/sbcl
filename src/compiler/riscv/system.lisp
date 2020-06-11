@@ -63,7 +63,7 @@
   (:generator 1
     (inst lw values object
           (- (+ (ash (+ instance-slots-offset
-                        (get-dsd-index layout sb-kernel::%bits))
+                        (get-dsd-index layout sb-kernel::flags))
                      word-shift)
                 4)
              instance-pointer-lowtag))))
@@ -85,16 +85,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srli res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -136,8 +126,7 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst andi res ptr (lognot lowtag-mask))
-    (inst srli res res (- n-lowtag-bits n-fixnum-tag-bits))))
+    (inst andi res ptr (lognot fixnum-tag-mask))))
 
 
 ;;;; Allocation
@@ -268,13 +257,67 @@
     (inst ebreak pending-interrupt-trap)
     (emit-alignment 2)))
 
+#+sb-thread
+(define-vop (current-thread-offset-sap)
+  (:results (sap :scs (sap-reg)))
+  (:result-types system-area-pointer)
+  (:translate current-thread-offset-sap)
+  (:args (n :scs (signed-reg) :target sap))
+  (:temporary (:scs (interior-reg)) lip)
+  (:arg-types signed-num)
+  (:policy :fast-safe)
+  (:generator 3
+    (inst slli n n word-shift)
+    (inst add lip thread-base-tn n)
+    (loadw sap lip)))
+
+#+sb-thread
+(define-vop (current-thread-offset-sap/c)
+  (:results (sap :scs (sap-reg)))
+  (:result-types system-area-pointer)
+  (:translate current-thread-offset-sap)
+  (:info n)
+  (:arg-types (:constant short-immediate))
+  (:policy :fast-safe)
+  (:generator 1
+    (loadw sap thread-base-tn n)))
+
 (define-vop (halt)
   (:generator 1
     (inst ebreak halt-trap)
     (emit-alignment 2)))
 
 ;;;; Dummy definition for a spin-loop hint VOP
-(define-vop (spin-loop-hint)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+;;; Barriers
+(define-vop (%compiler-barrier)
+  (:policy :fast-safe)
+  (:translate %compiler-barrier)
+  (:generator 3))
+
+(define-vop (%memory-barrier)
+  (:policy :fast-safe)
+  (:translate %memory-barrier)
+  (:generator 3
+    (inst fence :rw :rw)))
+
+(define-vop (%read-barrier)
+  (:policy :fast-safe)
+  (:translate %read-barrier)
+  (:generator 3
+    (inst fence :r :r)))
+
+(define-vop (%write-barrier)
+  (:policy :fast-safe)
+  (:translate %write-barrier)
+  (:generator 3
+    (inst fence :w :w)))
+
+(define-vop (%data-dependency-barrier)
+  (:policy :fast-safe)
+  (:translate %data-dependency-barrier)
+  (:generator 3))

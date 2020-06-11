@@ -92,11 +92,13 @@
 (define-arg-type reg
   :printer
   (lambda (value stream dstate)
-    (declare (type stream stream) (fixnum value))
     (let ((regname (aref reg-symbols value)))
-      (princ regname stream)
-      (maybe-note-associated-storage-ref value 'registers regname dstate)
-      (maybe-add-notes value dstate))))
+      (cond (stream
+             (princ regname stream)
+             (maybe-note-associated-storage-ref value 'registers regname dstate)
+             (maybe-add-notes value dstate))
+            (t
+             (operand regname dstate))))))
 
 (defparameter float-reg-symbols
   #.(coerce
@@ -105,14 +107,13 @@
 
 (define-arg-type fp-reg
   :printer #'(lambda (value stream dstate)
-               (declare (type stream stream) (fixnum value))
                (let ((regname (aref float-reg-symbols value)))
-                 (princ regname stream)
-                 (maybe-note-associated-storage-ref
-                  value
-                  'float-registers
-                  regname
-                  dstate))))
+                 (cond (stream
+                        (princ regname stream)
+                        (maybe-note-associated-storage-ref
+                         value 'float-registers regname dstate))
+                       (t
+                        (operand regname dstate))))))
 
 (define-arg-type ds-field
   :prefilter (lambda (dstate value)
@@ -128,10 +129,10 @@
 
 (define-arg-type bo-field
   :printer #'(lambda (value stream dstate)
-               (declare (ignore dstate)
-                        (type stream stream)
-                        (type fixnum value))
-               (princ (svref bo-kind-names value) stream)))
+               (let ((thing (svref bo-kind-names value)))
+                 (if stream
+                     (princ thing stream)
+                     (operand thing dstate)))))
 
 (define-compiler-macro valid-bo-encoding (&whole form enc)
   (declare (notinline valid-bo-encoding))
@@ -179,22 +180,25 @@
 
 (define-arg-type bi-field
   :printer #'(lambda (value stream dstate)
-               (declare (ignore dstate)
-                        (type stream stream)
-                        (type (unsigned-byte 5) value))
+               (declare (type (unsigned-byte 5) value))
                (let* ((bitname (svref cr-bit-names (logand 3 value)))
                       (crfield (ash value -2)))
                  (declare (type (unsigned-byte 3) crfield))
-                 (if (= crfield 0)
-                   (princ bitname stream)
-                   (princ (list (svref cr-field-names crfield) bitname) stream)))))
+                 (let ((operand
+                         (if (= crfield 0)
+                             bitname
+                             (list (svref cr-field-names crfield) bitname))))
+                   (if stream
+                       (princ operand stream)
+                       (operand operand dstate))))))
 
 (define-arg-type crf
   :printer #'(lambda (value stream dstate)
-               (declare (ignore dstate)
-                        (type stream stream)
-                        (type (unsigned-byte 3) value))
-               (princ (svref cr-field-names value) stream)))
+               (declare (type (unsigned-byte 3) value))
+               (let ((operand (svref cr-field-names value)))
+                 (if stream
+                     (princ operand stream)
+                     (operand operand dstate)))))
 
 (define-arg-type relative-label
   :sign-extend t
@@ -217,12 +221,12 @@
 (define-arg-type to-field
   :sign-extend nil
   :printer #'(lambda (value stream dstate)
-               (declare (ignore dstate)
-                        (type stream stream)
-                        (type fixnum value))
-               (princ (or (car (rassoc value trap-values-alist))
-                          value)
-                      stream)))
+               (declare (type fixnum value))
+               (let ((operand (or (car (rassoc value trap-values-alist))
+                                  value)))
+                 (if stream
+                     (princ operand stream)
+                     (operand operand dstate)))))
 
 (defun emit-conditional-branch (segment bo bi target &optional aa-p lk-p)
   (declare (type boolean aa-p lk-p))
@@ -287,19 +291,21 @@
 
 (define-arg-type spr
   :printer #'(lambda (value stream dstate)
-               (declare (ignore dstate)
-                        (type (unsigned-byte 10) value))
-               (let* ((name (car (rassoc value +spr-numbers-alist+))))
-                   (if name
-                     (princ name stream)
-                     (princ value stream)))))
+               (declare (type (unsigned-byte 10) value))
+               (let* ((name (car (rassoc value +spr-numbers-alist+)))
+                      (operand (or name value)))
+                 (if stream
+                     (princ operand stream)
+                     (operand operand dstate)))))
 
 #-sb-xc-host ; no definition of MAYBE-NOTE-ASSEMBLER-ROUTINE
 (defparameter jump-printer
     #'(lambda (value stream dstate)
         (let ((addr (ash value 2)))
           (maybe-note-assembler-routine addr t dstate)
-          (write addr :base 16 :radix t :stream stream))))
+          (if stream
+              (write addr :base 16 :radix t :stream stream)
+              (operand addr dstate)))))
 
 
 
@@ -1536,6 +1542,12 @@
     (:delay 0)
     :pinned
     (:emitter (emit-x-form-inst segment 31 (valid-tcond-encoding tcond) (reg-tn-encoding ra) (reg-tn-encoding rb) 4 0)))
+  (define-instruction td (segment tcond ra rb)
+    (:printer x-19 ((op 31) (xo 68)))
+    (:attributes branch)
+    (:delay 0)
+    :pinned
+    (:emitter (emit-x-form-inst segment 31 (valid-tcond-encoding tcond) (reg-tn-encoding ra) (reg-tn-encoding rb) 68 0)))
 
   (define-4-xo-instructions subfc 31 8 :always-writes-xer t)
   (define-4-xo-instructions addc 31 10 :always-writes-xer t)
@@ -1604,6 +1616,8 @@
   (define-2-x-5-instructions eqv 31 284)
   (define-2-x-5-instructions xor 31 316)
 
+  ;; This instruction existed on processor model 601; it is the same as 'mfspr'
+  ;; with a spr encoding that is now an illegal one.
   (define-instruction mfmq (segment rt)
     (:printer xfx ((op 31) (xo 339) (spr 0)) '(:name :tab rt))
     (:delay 1)
@@ -2186,16 +2200,20 @@
 #+64-bit
 (defun %lr (reg value)
   (etypecase value
-    ((signed-byte 16)
-     (inst li reg value))
-    ((unsigned-byte 16)
-     (inst lhz reg code-tn (register-inline-constant value :halfword)))
-    ((signed-byte 32)
-     (inst lwa reg code-tn (register-inline-constant value :word)))
-    ((unsigned-byte 32)
-     (inst lwz reg code-tn (register-inline-constant value :word)))
-    ((or (signed-byte 64) (unsigned-byte 64))
-     (inst ld reg code-tn (register-inline-constant value :dword)))
+    (integer
+     (etypecase value
+       ((signed-byte 16)
+        (inst li reg value))
+       ((unsigned-byte 16)
+        (inst lhz reg code-tn (register-inline-constant value :halfword)))
+       ((signed-byte 32)
+        (if (not (logtest value #xFFFF))
+            (inst lis reg (ash value -16))
+            (inst lwa reg code-tn (register-inline-constant value :word))))
+       ((unsigned-byte 32)
+        (inst lwz reg code-tn (register-inline-constant value :word)))
+       ((or (signed-byte 64) (unsigned-byte 64))
+        (inst ld reg code-tn (register-inline-constant value :dword)))))
     (fixup
      (inst lis reg value)
      (inst addi reg reg value))))
@@ -2326,11 +2344,11 @@
 
 ;;; Unboxed constant support
 
-(defun sb-vm::canonicalize-inline-constant (constant)
+(defun sb-vm:canonicalize-inline-constant (constant)
   (destructuring-bind (value size) constant
     (cons size value)))
 
-(defun sb-vm::inline-constant-value (constant)
+(defun sb-vm:inline-constant-value (constant)
   (declare (ignore constant))
   (let ((label (gen-label)))
     (values label label)))

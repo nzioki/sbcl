@@ -463,7 +463,7 @@ static boolean tagged_slot_p(struct layout *layout, int slot_index)
 static void print_struct(lispobj obj)
 {
     struct instance *instance = (struct instance *)native_pointer(obj);
-    unsigned int i;
+    short int i;
     char buffer[16];
     lispobj layout = instance_layout(native_pointer(obj));
     print_obj("type: ", layout);
@@ -511,7 +511,7 @@ void show_lstring(struct vector * string, int quotes, FILE *s)
   if (quotes) putc('"', s);
 }
 
-static void brief_otherptr(lispobj obj)
+static void brief_fun_or_otherptr(lispobj obj)
 {
     extern void safely_show_lstring(struct vector*, int, FILE*);
     lispobj *ptr, header;
@@ -569,7 +569,7 @@ static void print_slots(char **slots, int count, lispobj *ptr)
     }
 }
 
-static lispobj symbol_function(lispobj* symbol)
+lispobj symbol_function(lispobj* symbol)
 {
     lispobj info = ((struct symbol*)symbol)->info;
     if (listp(info))
@@ -589,7 +589,7 @@ static lispobj symbol_function(lispobj* symbol)
     return NIL;
 }
 
-static void print_otherptr(lispobj obj)
+static void print_fun_or_otherptr(lispobj obj)
 {
 #ifndef LISP_FEATURE_ALPHA
     lispobj *ptr;
@@ -727,7 +727,7 @@ static void print_otherptr(lispobj obj)
     // FIXME: This case looks unreachable. print_struct() does it
     case INSTANCE_WIDETAG:
         NEWLINE_OR_RETURN;
-        count &= SHORT_HEADER_MAX_WORDS;
+        count = instance_length(header);
         printf("length = %ld", (long) count);
         index = 0;
         while (count-- > 0) {
@@ -824,25 +824,7 @@ static void print_otherptr(lispobj obj)
 
 static void print_obj(char *prefix, lispobj obj)
 {
-#ifdef LISP_FEATURE_64_BIT
-    static void (*verbose_fns[])(lispobj obj)
-        = {print_fixnum, print_otherimm, print_fixnum, print_struct,
-           print_fixnum, print_otherimm, print_fixnum, print_list,
-           print_fixnum, print_otherimm, print_fixnum, print_otherptr,
-           print_fixnum, print_otherimm, print_fixnum, print_otherptr};
-    static void (*brief_fns[])(lispobj obj)
-        = {brief_fixnum, brief_otherimm, brief_fixnum, brief_struct,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_list,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr};
-#else
-    static void (*verbose_fns[])(lispobj obj)
-        = {print_fixnum, print_struct, print_otherimm, print_list,
-           print_fixnum, print_otherptr, print_otherimm, print_otherptr};
-    static void (*brief_fns[])(lispobj obj)
-        = {brief_fixnum, brief_struct, brief_otherimm, brief_list,
-           brief_fixnum, brief_otherptr, brief_otherimm, brief_otherptr};
-#endif
+#include "genesis/print.inc"
     int type = lowtag_of(obj);
     struct var *var = lookup_by_obj(obj);
     char buffer[256];
@@ -872,7 +854,7 @@ static void print_obj(char *prefix, lispobj obj)
         printf("%s0x%08lx: ", prefix, (unsigned long) obj);
         if (cur_depth < brief_depth) {
             fputs(lowtag_names[type], stdout);
-            fns = verbose_fns;
+            fns = print_fns;
         }
         else
             fns = brief_fns;

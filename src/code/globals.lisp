@@ -65,14 +65,14 @@
       (let ((found (assq symbol (cdr list))))
         (if found
             (setf (cadr found) initform)
-            (let* ((thread-struct (find 'sb-vm::thread sb-vm::*primitive-objects*
+            (let* ((thread-struct (find 'sb-vm::thread sb-vm:*primitive-objects*
                                         :key #'sb-vm:primitive-object-name))
                    (n-fixed (+ (sb-vm:primitive-object-length thread-struct)
                                (count-if-not
                                 (lambda (x)
                                   (find (car (ensure-list x))
                                         (sb-vm:primitive-object-slots thread-struct)
-                                        :key #'sb-vm::slot-special))
+                                        :key #'sb-vm:slot-special))
                                 sb-vm::!per-thread-c-interface-symbols)))
                    (tls-slot (+ n-fixed (length (cdr list)))))
               (nconc list (list (list symbol initform)))
@@ -95,7 +95,7 @@
                   *posix-argv*))
 ;;; This constant is assigned by Genesis and never read by Lisp code.
 ;;; (To prove that it isn't used, it's not a toplevel form)
-#+sb-dynamic-core
+#+linkage-table
 (let ()
   (defconstant sb-vm::+required-foreign-symbols+
     (symbol-value 'sb-vm::+required-foreign-symbols+)))

@@ -338,24 +338,15 @@
             (compiled-frame-escaped obj))))
 
 
+(define-load-time-global *debug-funs-mutex* (sb-thread:make-mutex :name "CDF lock"))
 ;;; This maps SB-C::COMPILED-DEBUG-FUNs to
 ;;; COMPILED-DEBUG-FUNs, so we can get at cached stuff and not
 ;;; duplicate COMPILED-DEBUG-FUN structures.
+#+cheneygc ; can't write to debuf-info in a purified code object
 (define-load-time-global *compiled-debug-funs*
+    ;; The table's lock is redundant - I'm working on removal of the default
+    ;; assumption of synchronization on all weak tables, but it's unrelated.
     (make-hash-table :test 'eq :weakness :key))
-
-;;; Make a COMPILED-DEBUG-FUN for a SB-C::COMPILER-DEBUG-FUN and its
-;;; component. This maps the latter to the former in
-;;; *COMPILED-DEBUG-FUNS*. If there already is a COMPILED-DEBUG-FUN,
-;;; then this returns it from *COMPILED-DEBUG-FUNS*.
-;;;
-;;; FIXME: It seems this table can potentially grow without bounds,
-;;; and retains roots to functions that might otherwise be collected.
-(defun make-compiled-debug-fun (compiler-debug-fun component)
-  (let ((table *compiled-debug-funs*))
-    (with-locked-system-table (table)
-      (ensure-gethash compiler-debug-fun table
-                      (%make-compiled-debug-fun compiler-debug-fun component)))))
 
 ;;;; breakpoints
 
@@ -369,7 +360,7 @@
   ;; This is the byte offset into the component.
   (offset nil :type index :read-only t)
   ;; The original instruction replaced by the breakpoint.
-  (instruction nil :type (or null sb-vm::word))
+  (instruction nil :type (or null sb-vm:word))
   ;; A list of user breakpoints at this location.
   (breakpoints nil :type list))
 (defmethod print-object ((obj breakpoint-data) str)
@@ -448,6 +439,36 @@
   ;; the :FUN-START breakpoint (if any) used to facilitate
   ;; function end breakpoints
   (end-starter nil :type (or null breakpoint)))
+
+;;; Map a SB-C::COMPILED-DEBUG-FUN to a SB-DI::COMPILED-DEBUG-FUN.
+;;; The mapping is memoized into %CODE-DEBUG-INFO of COMPONENT
+;;; except on #+cheneygc where that is assumed not to be possible
+;;; (even if it is possible), because usually it's not, because
+;;; code might reside in readonly space, and it can only have pointers
+;;; to static space, not dynamic space.
+;;;
+;;; BTW, the nomenclature here is utter and total confusion.
+;;; The type of the object in the argument named COMPILER-DEBUG-FUN
+;;; is SB-C::COMPILED-DEBUG-FUN.
+;;; There is no such type as a "COMPILER-DEBUG-FUN", it's just the name
+;;; of the slot in the SB-DI:: version of the structure.
+(defun make-compiled-debug-fun (compiler-debug-fun component)
+  (declare (code-component component))
+  ;; Technically this could all be lockfree if we had compare-and-swap
+  ;; on the debug-info slot. Not worth the effort.
+  (sb-thread::with-system-mutex (*debug-funs-mutex*)
+    #+gencgc
+    (let* ((info (ensure-list (sb-vm::%%code-debug-info component)))
+           (found (assoc compiler-debug-fun (cdr info) :test #'eq)))
+      (if found
+          (cdr found)
+          (let* ((my-debug-fun (%make-compiled-debug-fun compiler-debug-fun component))
+                 (new-pair (cons compiler-debug-fun my-debug-fun)))
+            (setf (%code-debug-info component) (list* (car info) new-pair (cdr info)))
+            my-debug-fun)))
+    #+cheneygc
+    (ensure-gethash compiler-debug-fun *compiled-debug-funs*
+                    (%make-compiled-debug-fun compiler-debug-fun component))))
 
 ;;;; CODE-LOCATIONs
 
@@ -937,13 +958,13 @@
             #+alpha (* 2 n))))
     (sb-alien:sap-alien context-pointer (* os-context-t))))
 
-;;; On SB-DYNAMIC-CORE symbols which come from the runtime go through
+;;; With :LINKAGE-TABLE symbols which come from the runtime go through
 ;;; an indirection table, but the debugger needs to know the actual
 ;;; address.
 (defun static-foreign-symbol-address (name)
-  #+sb-dynamic-core
+  #+linkage-table
   (find-dynamic-foreign-symbol-address name)
-  #-sb-dynamic-core
+  #-linkage-table
   (foreign-symbol-address name))
 
 (defun catch-runaway-unwind (block)
@@ -1198,9 +1219,11 @@ register."
 ;;; SB-C::COMPILED-DEBUG-FUN.
 (defun debug-fun-from-pc (component pc &optional (escaped t))
   (let ((info (%code-debug-info component)))
-    (cond
-      ((consp info)
-       (let ((routine (dohash ((name pc-range) (car info))
+    (etypecase info
+      (sb-c::compiled-debug-info
+       (make-compiled-debug-fun (compiled-debug-fun-from-pc info pc escaped) component))
+      (hash-table ; interrupted in an assembler routine
+       (let ((routine (dohash ((name pc-range) info)
                         (when (<= (car pc-range) pc (cadr pc-range))
                           (return name)))))
          (make-bogus-debug-fun (cond ((not routine)
@@ -1209,10 +1232,10 @@ register."
                                                       sb-vm::undefined-alien-tramp))
                                       "undefined function")
                                      (routine)))))
-     ((eq info :bpt-lra)
-      (make-bogus-debug-fun "function end breakpoint"))
-     (t
-      (make-compiled-debug-fun (compiled-debug-fun-from-pc info pc escaped) component)))))
+      (closure ; interrupted in an immobile code trampoline
+       (make-bogus-debug-fun "closure-calling trampoline"))
+      ((eql :bpt-lra)
+       (make-bogus-debug-fun "function end breakpoint")))))
 
 ;;; This returns a code-location for the COMPILED-DEBUG-FUN,
 ;;; DEBUG-FUN, and the pc into its code vector. If we stopped at a
@@ -1435,6 +1458,8 @@ register."
                                         (%code-debug-info component))
                       then next
                       for next = (sb-c::compiled-debug-fun-next fmap-entry)
+                      ;; Is NAME really the right thing to match on given how bogus
+                      ;; it might be? I would think PC range is better.
                       when (and (eq (sb-c::compiled-debug-fun-name fmap-entry) name)
                                 (eq (sb-c::compiled-debug-fun-kind fmap-entry) nil))
                       return fmap-entry
@@ -3482,7 +3507,7 @@ register."
 (defun make-bpt-lra (real-lra)
   (declare (type #-(or x86 x86-64) lra #+(or x86 x86-64) system-area-pointer real-lra))
   (macrolet ((symbol-addr (name)
-               ;; "static" is not really correct if #+sb-dynamic-core
+               ;; "static" is not really correct if #+linkage-table
                `(static-foreign-symbol-address ,name))
              (trap-offset ()
                `(- (symbol-addr "fun_end_breakpoint_trap") src-start)))
@@ -3493,7 +3518,7 @@ register."
                                  src-start)))
            (code-object
             (sb-c:allocate-code-object
-             nil
+             nil 0
              ;; For non-x86: a single boxed constant holds the true LRA.
              ;; For x86[-64]: one boxed constant holds the code object to which
              ;; to return, and one holds the displacement into that object.
@@ -3588,7 +3613,7 @@ register."
     ;; sense in signaling the condition.
     (when step-info
       (let ((*step-frame*
-             (signal-context-frame (sb-alien::alien-sap context))))
+             (signal-context-frame (sb-alien:alien-sap context))))
         (sb-impl::step-form step-info
                             ;; We could theoretically store information in
                             ;; the debug-info about to determine the

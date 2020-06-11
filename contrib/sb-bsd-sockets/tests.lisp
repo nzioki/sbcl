@@ -18,13 +18,11 @@
   (equalp (make-inet-address "242.1.211.3")  #(242 1 211 3))
   t)
 
-#-win32
 (deftest make-inet6-address.1
     (equalp (make-inet6-address "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
             #(255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255))
   t)
 
-#-win32
 (deftest unparse-inet6-address
     (string= (sb-bsd-sockets::unparse-inet6-address
               (make-inet6-address "fe80::abcd:1234"))
@@ -52,12 +50,13 @@
       nil))
   t)
 
-(when (handler-case (make-instance 'inet-socket
-                                   :type :stream
-                                   :protocol (get-protocol-by-name "tcp"))
-        (error nil)
-        (:no-error (x) x))
-  (push :ipv4-support *features*))
+(eval-when (:compile-toplevel :execute)
+  (when (handler-case (make-instance 'inet-socket
+                                     :type :stream
+                                     :protocol (get-protocol-by-name "tcp"))
+          (error nil)
+          (:no-error (x) x))
+    (push :ipv4-support *features*)))
 
 #+ipv4-support
 (deftest make-inet-socket.smoke
@@ -109,7 +108,6 @@
       (:no-error nil))
   t)
 
-#-win32
 (deftest make-inet6-socket.smoke
   (handler-case
       (let ((s (make-instance 'inet6-socket :type :stream :protocol (get-protocol-by-name "tcp"))))
@@ -117,7 +115,6 @@
     ((or address-family-not-supported protocol-not-supported-error) () t))
   t)
 
-#-win32
 (deftest make-inet6-socket.keyword
   (handler-case
       (let ((s (make-instance 'inet6-socket :type :stream :protocol :tcp)))
@@ -153,7 +150,6 @@
       (socket-close s2)))
   t)
 
-#-win32
 (deftest inet6-socket-bind
   (handler-case
       (let* ((tcp (get-protocol-by-name "tcp"))
@@ -396,7 +392,8 @@
 
 #+(and ipv4-support sb-thread)
 (deftest interrupt-io
-    (let (result)
+    (let (result
+          (sem (sb-thread:make-semaphore)))
       (labels
           ((client (port)
              (setf result
@@ -411,11 +408,8 @@
                        (handler-case
                            (prog1
                                (catch 'stop
-                                 (progn
-                                   (read-char stream)
-                                   (sleep 0.1)
-                                   (sleep 0.1)
-                                   (sleep 0.1)))
+                                 (sb-thread:signal-semaphore sem)
+                                 (read-char stream))
                              (close stream))
                          (error (c)
                            c))))))
@@ -434,17 +428,18 @@
                         (stream (socket-make-stream r
                                                     :input t
                                                     :output t
-                                                    :buffering :none))
-                        (ok :ok))
+                                                    :buffering :none)))
                    (socket-close s)
-                   (sleep 5)
+                   (sb-thread:wait-on-semaphore sem)
+                   (sleep 0.1)
                    (sb-thread:interrupt-thread client
-                                               (lambda () (throw 'stop ok)))
-                   (sleep 5)
-                   (setf ok :not-ok)
+                                               (lambda () (throw 'stop :ok)))
+                   (unless (sb-ext:wait-for (null (sb-thread::thread-interruptions client)) :timeout 5)
+                     (setf result :timeout))
                    (write-char #\x stream)
                    (close stream)
-                   (socket-close r))))))
+                   (socket-close r)
+                   (sb-thread:join-thread client :timeout 5))))))
         (server))
       result)
   :ok)

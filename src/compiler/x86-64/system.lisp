@@ -48,7 +48,7 @@
 
 (macrolet ((read-depthoid ()
              `(ea (- (+ 4 (ash (+ instance-slots-offset
-                                  (get-dsd-index layout sb-kernel::%bits))
+                                  (get-dsd-index layout sb-kernel::flags))
                                word-shift))
                      instance-pointer-lowtag)
                   layout)))
@@ -137,16 +137,6 @@
   (:result-types positive-fixnum)
   (:generator 1 (load-type result function fun-pointer-lowtag))))
 
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -175,6 +165,8 @@
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)
     (move res x)))
+
+;;; These next 2 vops are for manipulating the flag bits of a vector header.
 (define-vop (set-header-bits)
   (:translate set-header-bits)
   (:policy :fast-safe)
@@ -196,41 +188,6 @@
         (inst and :byte (ea (- 1 other-pointer-lowtag) x) (lognot bits))
         (inst and :dword (ea (- other-pointer-lowtag) x)
               (lognot (ash bits n-widetag-bits))))))
-
-;;; Set the bit indicating that instances of this type require
-;;; special treatment of slot index 0.
-(define-vop (set-custom-gc-scavenge-bit)
-  (:args (x :scs (descriptor-reg)))
-  (:generator 1
-    (inst or :byte (ea (- 2 instance-pointer-lowtag) x) #x80)))
-
-(define-vop (get-header-data-high)
-  (:translate get-header-data-high)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst mov :dword res (ea (- 4 other-pointer-lowtag) x))
-    (inst shl res n-fixnum-tag-bits)))
-
-;;; Swap the high half of the header word of an object
-;;; that has OTHER-POINTER-LOWTAG
-(define-vop (cas-header-data-high)
-  (:args (object :scs (descriptor-reg) :to :eval)
-         (old :scs (unsigned-reg) :target rax)
-         (new :scs (unsigned-reg)))
-  (:policy :fast-safe)
-  (:translate cas-header-data-high)
-  (:temporary (:sc descriptor-reg :offset rax-offset
-               :from (:argument 1) :to :result :target result) rax)
-  (:arg-types * unsigned-num unsigned-num)
-  (:results (result :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 5
-     (move rax old)
-     (inst cmpxchg :dword (ea (- 4 other-pointer-lowtag) object) new :lock)
-     (inst lea result (ea nil rax (ash 1 n-fixnum-tag-bits)))))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -239,8 +196,7 @@
   (:policy :fast-safe)
   (:generator 1
     (move res ptr)
-    (inst and res (constantize (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
-                                             n-fixnum-tag-bits) 0)))))
+    (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; allocation
 
@@ -320,15 +276,15 @@
                result))))
 
 ;;;; symbol frobbing
-(defun load-symbol-info-vector (result symbol temp)
+(defun load-symbol-info-vector (result symbol)
   (loadw result symbol symbol-info-slot other-pointer-lowtag)
   ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
   ;; This CMOV safely reads from memory when it does not move, because if
   ;; there is an info-vector in the slot, it has at least one element.
   ;; This would compile to almost the same code without a VOP,
   ;; but using a jmp around a mov instead.
-  (inst lea :dword temp (ea (- list-pointer-lowtag) result))
-  (inst test :byte temp lowtag-mask)
+  (aver (= (logior list-pointer-lowtag #b1000) other-pointer-lowtag))
+  (inst test :byte result #b1000)
   (inst cmov :e result
         (object-slot-ea result cons-cdr-slot list-pointer-lowtag)))
 
@@ -337,9 +293,7 @@
   (:translate symbol-info-vector)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset rax-offset) rax)
-  (:generator 1
-    (load-symbol-info-vector res x rax)))
+  (:generator 1 (load-symbol-info-vector res x)))
 
 (define-vop (symbol-plist)
   (:policy :fast-safe)
@@ -505,7 +459,7 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
     ;; inhibit instcombine across any barrier
     (inst .skip 0)))
 
-(define-vop (pause)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0
@@ -555,3 +509,19 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:generator 1
     ;; atomic because the immobile gen# is in the same byte
     (inst and :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f :lock)))
+
+(define-vop ()
+  (:translate update-object-layout-or-invalid)
+  (:args (obj :scs (descriptor-reg)))
+  (:info layout)
+  (:arg-types * (:constant t))
+  (:results (res :scs (descriptor-reg)))
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (inst push (if (immediate-constant-sc layout)
+                   (make-fixup layout :layout)
+                   (make-constant-tn (sb-c::find-constant layout))))
+    (inst push obj)
+    (invoke-asm-routine 'call 'invalid-layout-trap vop)
+    (inst pop res)))

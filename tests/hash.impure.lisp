@@ -12,6 +12,58 @@
 (defstruct foo)
 (defstruct bar x y)
 
+(defvar *things*)
+(defun make-things-for-sxhash-test (n)
+  (setf *things* (make-array n :fill-pointer 0))
+  (flet ((store (obj)
+           (vector-push-extend (list (sb-kernel:get-lisp-obj-address obj)
+                                     (sxhash obj)
+                                     obj)
+                               *things*)))
+    #-(or x86 x86-64) ; precise GC
+    (return-from make-things-for-sxhash-test (dotimes (i n t) (store (make-foo))))
+    #+sb-thread
+    (sb-thread:join-thread
+     (sb-thread:make-thread
+      (lambda () (dotimes (i n t) (store (make-foo))))))))
+(compile 'make-things-for-sxhash-test)
+
+;;; Assert that the C code which computes a perturbation of the object
+;;; address for lazy stable address-based hashing is the same as lisp.
+;;; Further, assert that each bit of the resulting positive-fixnum
+;;; can be in a 0 and 1 state (don't want any bits stuck at 0).
+(with-test (:name :address-based-sxhash-gcing)
+  (dotimes (runs 5)
+    (let ((tracker (make-array 4 :element-type 'sb-ext:word
+                               :initial-element 0)))
+      ;; with this many sxhashes we should see a 1 bit in
+      ;; in each bit position.
+      (when (make-things-for-sxhash-test 20)
+        (gc)
+        (sb-int:dovector (thing *things*)
+          (destructuring-bind (old-addr old-hash object) thing
+            (let* ((new-addr (sb-kernel:get-lisp-obj-address object))
+                   (new-hash (sxhash object)))
+              (setf (aref tracker 0) (logior (aref tracker 0) old-hash)
+                    (aref tracker 1) (logior (aref tracker 1)
+                                             (logxor old-hash most-positive-fixnum)))
+              (let* ((count-1s (logcount new-hash))
+                     (count-0s (- sb-vm:n-positive-fixnum-bits count-1s)))
+                (incf (aref tracker 2) count-1s)
+                (incf (aref tracker 3) count-0s))
+              (cond ((= new-addr old-addr)
+                     (warn "Can't test SXHASH after movement: didn't move"))
+                    ((not (eql new-hash old-hash))
+                     (error "SXHASH failure"))))))
+        ;; show the mask where we saw 1 bits (respectively 0),
+        ;; and total number of 1 (respectively 0) bits.)
+        #+nil
+        (format t "~@{[~64,'0b] ~d~%~}"
+                (aref tracker 0) (aref tracker 2)
+                (aref tracker 1) (aref tracker 3))
+        (assert (= (aref tracker 0) most-positive-fixnum))
+        (assert (= (aref tracker 1) most-positive-fixnum))))))
+
 ;;; SXHASH and PSXHASH should distribute hash values well over the
 ;;; space of possible values, so that collisions between the hash
 ;;; values of unequal objects should be very uncommon. (Except of
@@ -444,5 +496,32 @@
     (incf (gethash (complex 1.0d0 0.0d0) table))
     (assert (= 5 (gethash 1 table)))
     (assert (eq '= (hash-table-test table)))))
+
+(defstruct rslotty a
+  (uword 0 :type word)
+  (sword 0 :type sb-vm:signed-word)
+  (sf 0s0 :type single-float)
+  (df 0d0 :type double-float)
+  (csf #c(0s0 0s0) :type (complex single-float))
+  (cdf #c(0d0 0d0) :type (complex double-float)))
+
+(import 'sb-impl::psxhash)
+(with-test (:name :psxhash-raw-slots)
+  (let ((empty (psxhash (make-rslotty))))
+    ;; unequalp values produce unequal hashes
+    (assert (/= empty (psxhash (make-rslotty :uword 32))))
+    (assert (/= empty (psxhash (make-rslotty :sword -1800))))
+    (assert (/= empty (psxhash (make-rslotty :sf 1s0))))
+    (assert (/= empty (psxhash (make-rslotty :df 1d0))))
+    (assert (/= empty (psxhash (make-rslotty :csf #c(1s0 1s0)))))
+    (assert (/= empty (psxhash (make-rslotty :cdf #c(1d0 1d0)))))
+    ;; equalp values produce equal hashes
+    (assert (= empty (psxhash (make-rslotty :sf -0s0 :df -0d0))))
+    (assert (= empty (psxhash (make-rslotty :csf #c(-0s0 -0s0)))))
+    (assert (= empty (psxhash (make-rslotty :csf #c(0s0 -0s0)))))
+    (assert (= empty (psxhash (make-rslotty :csf #c(-0s0 0s0)))))
+    (assert (= empty (psxhash (make-rslotty :cdf #c(-0d0 -0d0)))))
+    (assert (= empty (psxhash (make-rslotty :cdf #c(0d0 -0d0)))))
+    (assert (= empty (psxhash (make-rslotty :cdf #c(-0d0 0d0)))))))
 
 ;;; success

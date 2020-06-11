@@ -254,9 +254,7 @@ arch_handle_allocation_trap(os_context_t *context)
     int rs1;
     int size;
     int immed;
-    int context_index;
-    boolean were_in_lisp;
-    char* memory;
+    extern void boxed_region_rollback(sword_t);
 
     if (foreign_function_call_active)
       lose("Allocation trap inside foreign code.");
@@ -276,29 +274,33 @@ arch_handle_allocation_trap(os_context_t *context)
      * An OR instruction.  RS1 is the register we want to allocate to.
      * RS2 (or an immediate) is the size.
      */
+    int rd = (or_inst >> 25) & 0x1f; // just a 1 bit flag essentially
     rs1 = (or_inst >> 14) & 0x1f;
     immed = (or_inst >> 13) & 1;
 
     if (immed == 1)
         size = or_inst & 0x1fff;
-    else {
-        size = or_inst & 0x1f;
-        size = *os_context_register_addr(context, size);
-    }
+    else
+        size = *os_context_register_addr(context, or_inst & 0x1f);
+    boxed_region_rollback(size);
 
     fake_foreign_function_call(context);
 
     /*
      * Allocate some memory, store the memory address in rs1.
      */
+    lispobj* memory;
     {
         struct interrupt_data *data =
             arch_os_get_current_thread()->interrupt_data;
         data->allocation_trap_context = context;
-        memory = alloc(size);
+        extern lispobj *alloc(sword_t), *alloc_list(sword_t);
+        memory = (rd & 1) ? alloc_list(size) : alloc(size);
         data->allocation_trap_context = 0;
     }
-    *os_context_register_addr(context, rs1) = memory;
+
+    *os_context_register_addr(context, rs1) = (lispobj)memory;
+    arch_skip_instruction(context);
 
     undo_fake_foreign_function_call(context);
 }
@@ -341,7 +343,6 @@ void arch_install_interrupt_handlers()
 }
 
 
-#ifdef LISP_FEATURE_LINKAGE_TABLE
 
 /* This a naive port from CMUCL/sparc, which was mostly stolen from the
  * CMUCL/x86 version, with adjustments for sparc
@@ -371,8 +372,9 @@ void arch_install_interrupt_handlers()
  * Insert the necessary jump instructions at the given address.
  */
 void
-arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
+  char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;
@@ -427,4 +429,3 @@ arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-#endif

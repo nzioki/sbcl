@@ -49,6 +49,21 @@
            (- list-pointer-lowtag)))
       0))
 
+;;; the address of the linkage table entry for table index I.
+#+linkage-table
+(defun linkage-table-entry-address (i)
+  (ecase linkage-table-growth-direction
+    (:up   (+ (* i linkage-table-entry-size) linkage-table-space-start))
+    (:down (- linkage-table-space-end (* (1+ i) linkage-table-entry-size)))))
+
+#+linkage-table
+(defun linkage-table-index-from-address (addr)
+  (ecase linkage-table-growth-direction
+    (:up
+     (floor (- addr linkage-table-space-start) linkage-table-entry-size))
+    (:down
+     (1- (floor (- linkage-table-space-end addr) linkage-table-space-end)))))
+
 (defconstant-eqx +all-static-fdefns+
     #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
 
@@ -148,19 +163,6 @@
               (t
                (make-normal-tn *fixnum-primitive-type*)))))
 
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure. We
-;;; push placeholder entries in the CONSTANTS to leave room for
-;;; additional noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (let* ((2comp (component-info component))
-         (n-entries (length (sb-c::ir2-component-entries 2comp)))
-         (consts (ir2-component-constants 2comp)))
-    (dotimes (i (+ code-constants-offset (* sb-vm:code-slots-per-simple-fun n-entries)))
-      (vector-push-extend nil consts)))
-  (values))
-
 (defun error-call (vop error-code &rest values)
   "Cause an error.  ERROR-CODE is the error to cause."
   (emit-error-break vop error-trap (error-number-or-lose error-code) values))
@@ -176,6 +178,23 @@
   (:generator 0
     (emit-safepoint)))
 
+;;; Does the TN definitely hold *any* of the 4 pointer types
+(defun pointer-tn-ref-p (tn-ref)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (specifier-type '(or fixnum
+                               #+64-bit single-float
+                               character))))))
+
+;;; Does the TN definitely hold any of the 3 non-list pointer types
+(defun headered-object-pointer-tn-ref-p (tn-ref)
+  (and (pointer-tn-ref-p tn-ref)
+       (not (types-equal-or-intersect (tn-ref-type tn-ref)
+                                      (specifier-type 'list)))))
+
+;;; Does the TN definitely hold an OTHER pointer
 (defun other-pointer-tn-ref-p (tn-ref)
   (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
        (tn-ref-type tn-ref)
@@ -188,8 +207,18 @@
                                instance
                                character))))))
 
+(defun not-nil-tn-ref-p (tn-ref)
+  (and (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect (tn-ref-type tn-ref)
+                                      (specifier-type '(eql nil))))))
+
+(defun length-field-shift (widetag)
+  (if (= widetag instance-widetag)
+      instance-length-shift
+      n-widetag-bits))
+
 (defun compute-object-header (size widetag)
   (logior (case widetag
             (#.fdefn-widetag 0)
-            (t (ash (1- size) n-widetag-bits)))
+            (t (ash (1- size) (length-field-shift widetag))))
           widetag))

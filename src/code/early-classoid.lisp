@@ -22,7 +22,7 @@
 (def!struct (defstruct-description
              (:conc-name dd-)
              (:copier nil)
-             #-sb-xc-host (:pure t)
+             (:pure t)
              (:constructor make-defstruct-description (null-lexenv-p name)))
   ;; name of the structure
   (name (missing-arg) :type symbol :read-only t)
@@ -52,7 +52,8 @@
   (slots () :type list)
   ;; a list of (NAME . INDEX) pairs for accessors of included structures
   (inherited-accessor-alist () :type list)
-  ;; number of elements including the layout itself (minimum=1)
+  ;; number of data words, including the layout itself if the layout
+  ;; requires an entire word (when no immobile-space)
   (length 0 :type index)
   ;; General kind of implementation.
   (type 'structure :type (member structure vector list
@@ -86,29 +87,13 @@
 
 ;;;; basic LAYOUT stuff
 
-;;; Note: This bound is set somewhat less than MOST-POSITIVE-FIXNUM
-;;; in order to guarantee that several hash values can be added without
-;;; overflowing into a bignum.
-(defconstant layout-clos-hash-limit (1+ (ash sb-xc:most-positive-fixnum -3))
-  "the exclusive upper bound on LAYOUT-CLOS-HASH values")
-;; This must be DEF!TYPE and not just DEFTYPE because access to slots
-;; of a layout occur "before" the structure definition is made in the
-;; run-the-xc pass, and the source-transform of a slot accessor
-;; wraps (TRULY-THE <type> ...) around %INSTANCE-REF,
-;; so <type> had best be defined at that point.
-(def!type layout-clos-hash () `(integer 0 ,layout-clos-hash-limit))
-(declaim (ftype (sfunction (t) layout-clos-hash) randomish-layout-clos-hash))
-
 ;;; Careful here: if you add more bits, then adjust the bit packing for
 ;;; 64-bit layouts which also store LENGTH + DEPTHOID in the same word.
-;;; When testing these, you usually want to use LAYOUT-%BITS rather than
-;;; LAYOUT-FLAGS, because the compiler will stupidly "unpack" the
-;;; flags by masking out the stuff that aren't the "bits" and then
-;;; mask again.
-(defconstant +structure-layout-flag+  #b0001)
-(defconstant +pcl-object-layout-flag+ #b0010)
-(defconstant +condition-layout-flag+  #b0100)
-(defconstant +pathname-layout-flag+   #b1000) ; ORed with structure-layout-flag
+(defconstant +structure-layout-flag+         #b00000001)
+(defconstant +pathname-layout-flag+          #b00000010)
+(defconstant +condition-layout-flag+         #b00001000)
+(defconstant +pcl-object-layout-flag+        #b00010000)
+(defconstant sb-vm:lockfree-list-node-flag   #b01000000) ; exported for use in gc-private.h
 
 ;;; The LAYOUT structure is pointed to by the first cell of instance
 ;;; (or structure) objects. It represents what we need to know for
@@ -123,10 +108,10 @@
 ;;;
 ;;; FIXME: ...it would be better to automate this, of course...
 
-;;; 64-bit layout %BITS slot:
+;;; 64-bit layout FLAGS slot:
 ;;;
-;;; | 4 bytes  | 28 bits | 4 bits |
-;;; +----------+---------+--------+
+;;; | 4 bytes  | 16 bits | 16 bits |
+;;; +----------+---------+---------+
 ;;;  depthoid    length     flags
 ;;;
 ;;; depthoid is stored as a tagged fixnum in its 4 byte field.
@@ -145,26 +130,26 @@
 
 ;;; 32-bit is not done yet. Three slots are still used, instead of two.
 
-(def!struct (layout
-             #+64-bit
+;;; Maximum value of N in ANCESTOR_N. Couldn't come up with a better name.
+(defconstant sb-c::layout-inherits-max-optimized-depth 5)
+(sb-xc:defstruct (layout
              ;; Accept a specific subset of keywords
-             (:constructor %make-layout (clos-hash classoid %bits
-                                         &key inherits bitmap info invalid
-                                           depth2-ancestor depth3-ancestor depth4-ancestor))
-             #-64-bit
-             (:constructor make-layout (clos-hash classoid
-                                        &key flags invalid inherits depthoid length info bitmap
-                                          depth2-ancestor depth3-ancestor depth4-ancestor))
+             #+64-bit (:constructor %make-layout
+                          (clos-hash classoid flags info bitmap))
+             #-64-bit (:constructor %make-layout
+                          (clos-hash classoid depthoid length flags info bitmap))
              (:copier nil))
 
   ;; A packed field containing the DEPTHOID, LENGTH, and FLAGS
-  #+64-bit (%bits 0 :type (signed-byte #.sb-vm:n-word-bits))
+  #+64-bit (flags 0 :type (signed-byte #.sb-vm:n-word-bits))
 
-  ;; one +something-LAYOUT-FLAG+ bit or none of them
-  #-64-bit (flags 0 :type fixnum :read-only nil)
+  ;; a union of +something-LAYOUT-FLAG+ bits
+  #-64-bit (flags 0 :type word :read-only nil)
 
-  ;; a pseudo-random hash value for use by CLOS.
-  (clos-hash (missing-arg) :type layout-clos-hash) ; this no longer defaults to a random number
+  ;; a quasi-random hash value for use by CLOS. Determine by class-name
+  ;; for classes named by a symbol, otherwise a pseudo-random value.
+  ;; Must be acceptable as an argument to SB-INT:MIX
+  (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
   ;; the class that this is a layout for
   (classoid (missing-arg) :type classoid)
   ;; The value of this slot can be:
@@ -206,8 +191,10 @@
   (info nil :type (or null defstruct-description))
   ;; Map of raw slot indices.
   (bitmap +layout-all-tagged+ :type layout-bitmap)
-  ;; Per-slot comparator for implementing EQUALP.
-  (equalp-tests #() :type simple-vector)
+  ;; EQUALP comparator for two instances with this layout
+  ;; Could be the generalized function, or a type-specific one
+  ;; if the defstruct was compiled in a policy of SPEED 3.
+  (equalp-impl #'equalp-err :type (sfunction (t t) boolean) :read-only t)
   ;; If this layout is for an object of metatype STANDARD-CLASS,
   ;; these are the EFFECTIVE-SLOT-DEFINITION metaobjects.
   (slot-list nil :type list)
@@ -218,65 +205,128 @@
   ;; inherited layouts or 0, only pertinent to structure classoids.
   ;; There is no need to store the layout at depths 0 or 1
   ;; since they're predetermined to be T and STRUCTURE-OBJECT.
-  ;; These 3 slots cause the length of a layout to be exactly 16 words
-  ;; with compact-instance-header, which avoids having to change some
-  ;; logic in 'immobile-space' that assumes this alignment constraint.
-  (depth2-ancestor 0)
-  (depth3-ancestor 0)
-  (depth4-ancestor 0))
+  (ancestor_2 0)
+  (ancestor_3 0)
+  (ancestor_4 0)
+  (ancestor_5 0))
 (declaim (freeze-type layout))
 
-#+64-bit
-(progn
-(defmacro pack-layout-bits (depthoid length flags)
+(defun equalp-err (a b)
+  (bug "EQUALP ~S ~S" a b))
+
+;;; Applicable only if bit-packed (for 64-bit architectures)
+(defmacro pack-layout-flags (depthoid length flags)
   `(logior (ash ,(or depthoid -1) (+ 32 sb-vm:n-fixnum-tag-bits))
-           (ash ,(or length 0) 4)
+           (ash ,(or length 0) 16)
            ,(or flags 0)))
-(defmacro unpack-layout-bits (bits field)
-  (ecase field
-    (:depthoid `(ash ,bits (- -32 sb-vm:n-fixnum-tag-bits)))
-    (:length   `(ldb (byte 28 4) ,bits))
-    (:flags    `(ldb (byte 4 0) ,bits))))
 
-(defmacro make-layout (clos-hash classoid &rest rest &key depthoid length flags &allow-other-keys)
-  (setq rest (copy-list rest))
-  (remf rest :depthoid)
-  (remf rest :length)
-  (remf rest :flags)
-  `(%make-layout ,clos-hash ,classoid (pack-layout-bits ,depthoid ,length ,flags) ,@rest))
+(defmacro set-layout-inherits (layout inherits &optional depthoid)
+  `(let* ((l ,layout) (i ,inherits) (d ,(or depthoid '(length i))))
+     (declare (ignorable i d))
+     ;; I tried putting a /SHOW here for debugging, but it's just too broken
+     ;; because layouts affect the printer dispatch mechanism.
+     #+nil
+     (let ((*print-pretty* nil))
+       (fresh-line)
+       (write-string "SET-INHERITS ")
+       (write (layout-classoid-name l))
+       (write-string " ")
+       (write (map 'list #'layout-classoid-name i))
+       (terpri))
+     (setf (layout-inherits l) i)
+     #-sb-xc-host
+     (setf (layout-ancestor_2 l) (if (> d 2) (svref i 2) 0)
+           (layout-ancestor_3 l) (if (> d 3) (svref i 3) 0)
+           (layout-ancestor_4 l) (if (> d 4) (svref i 4) 0)
+           (layout-ancestor_5 l) (if (> d 5) (svref i 5) 0))
+     l))
 
-(declaim (inline layout-length layout-flags))
+#-sb-xc-host
+(defun make-layout (clos-hash classoid
+                    &key (depthoid -1) (length 0) (flags 0)
+                         (inherits #() inheritsp)
+                         (info nil)
+                         (bitmap (if info (dd-bitmap info) +layout-all-tagged+)))
+  (let ((layout (%make-layout clos-hash classoid
+                              #+64-bit (pack-layout-flags depthoid length flags)
+                              #-64-bit depthoid #-64-bit length #-64-bit flags
+                              info bitmap)))
+    (when inheritsp
+      (set-layout-inherits layout inherits))
+    layout))
+
+;;; The cross-compiler representation of a LAYOUT omits several things:
+;;;   * BITMAP - obtainable via (DD-MAPMAP (LAYOUT-INFO layout)).
+;;;     GC wants it in the layout to avoid double indirection.
+;;;   * EQUALP-TESTS - needed only for the target's implementation of EQUALP.
+;;;   * SLOT-TABLE, and SLOT-LIST - used only by the CLOS implementation.
+;;;   * ANCESTOR_N are optimizations for TYPEP.
+;;; So none of those really make sense on the host.
+;;; Also, we eschew the packed representation of length+depthoid+flags.
+;;; FLAGS are not even strictly necessary, since they are for optimizing
+;;; various type checks.
 #+sb-xc-host
-(defun layout-depthoid (layout)
-  (unpack-layout-bits (layout-%bits layout) :depthoid))
-(defun layout-length (layout)
-  (unpack-layout-bits (layout-%bits layout) :length))
-(defun layout-flags (layout)
-  (unpack-layout-bits (layout-%bits layout) :flags))
-
-(declaim (inline (setf layout-depthoid) (setf layout-length) (setf layout-flags)))
-(defun (setf layout-depthoid) (val layout)
-  (declare (type (integer -1 #x7fff) val))
-  (setf (layout-%bits layout) (logior (ash val (+ 32 sb-vm:n-fixnum-tag-bits))
-                                      (ldb (byte 32 0) (layout-%bits layout)))))
-(defun (setf layout-length) (val layout)
-  (setf (unpack-layout-bits (layout-%bits layout) :length) val))
-(defun (setf layout-flags) (val layout)
-  (setf (unpack-layout-bits (layout-%bits layout) :flags) val))
-) ; end PROGN
-
-#-64-bit
 (progn
-(defmacro layout-%bits (x) `(layout-flags ,x))
-)
+  (defstruct (layout (:include structure!object)
+                     (:constructor make-layout
+                                   (clos-hash classoid &key depthoid length flags inherits info)))
+    ;; CLOS-HASH is needed to convert some TYPECASE forms to jump tables.
+    ;; Theoretically we don't need this in the cross-compiler, because the
+    ;; layout has a classoid which has a name which has a known hash.
+    ;; But there's no harm in storing it.
+    (clos-hash nil :type (and sb-xc:fixnum unsigned-byte))
+    (classoid nil :type classoid)
+    (flags 0 :type word)
+    (invalid :uninitialized :type (or cons (member nil t :uninitialized)))
+    (inherits #() :type simple-vector)
+    (depthoid -1 :type layout-depthoid)
+    (length 0 :type layout-length)
+    (info nil :type (or null defstruct-description)))
+  (defun layout-bitmap (layout)
+    (if (layout-info layout) (dd-bitmap (layout-info layout)) +layout-all-tagged+)))
 
-(declaim (inline layout-for-std-class-p))
-(defun layout-for-std-class-p (x)
-  (logtest (layout-%bits x) +pcl-object-layout-flag+))
+(defmacro sb-c::layout-nth-ancestor-slot (n)
+  `(case ,n
+     (2 'layout-ancestor_2)
+     (3 'layout-ancestor_3)
+     (4 'layout-ancestor_4)
+     (5 'layout-ancestor_5)))
+
+#+(and (not sb-xc-host) 64-bit)
+;;; LAYOUT-DEPTHOID gets a vop and a stub
+(defmacro layout-length (layout) ; SETFable
+  `(ldb (byte 16 16) (layout-flags ,layout)))
+
+(defconstant layout-flags-mask #xffff) ; "strictly flags" bits from the packed field
+
+;;; Abstract out the differences between {32-bit,64-bit} target and XC layouts.
+;;; FLAGS can't change once assigned.
+(defmacro assign-layout-slots (layout &key depthoid length
+                                           (flags `(layout-flags ,layout)) flagsp)
+  (let ((invalidate-p (and (eql depthoid -1) (not length) (not flagsp))))
+    #+(and 64-bit (not xc-host)) ; packed slot
+    `(setf (layout-flags ,layout)
+           ,(if invalidate-p
+                `(logior (ash -1 (+ 32 sb-vm:n-fixnum-tag-bits))
+                         (ldb (byte 32 0) (layout-flags ,layout)))
+                `(pack-layout-flags ,depthoid ,length
+                                    (logand ,flags layout-flags-mask))))
+    #+(or (not 64-bit) sb-xc-host) ; ordinary slot
+    (if invalidate-p
+        `(setf (layout-depthoid ,layout) -1)
+        `(setf (layout-depthoid ,layout) ,depthoid
+               (layout-length ,layout) ,length
+               (layout-flags ,layout) ,flags))))
+
+;;; True of STANDARD-OBJECT, which include generic functions.
+;;; This one includes any class that mixes in STANDARD-OBJECT.
+(declaim (inline layout-for-pcl-obj-p))
+(defun layout-for-pcl-obj-p (x)
+  (logtest (layout-flags x) +pcl-object-layout-flag+))
 
 (declaim (inline sb-fasl:dumpable-layout-p))
 (defun sb-fasl:dumpable-layout-p (x)
-  (and (typep x 'layout) (not (layout-for-std-class-p x))))
+  (and (typep x 'layout) (not (layout-for-pcl-obj-p x))))
 
 ;;; The CLASSOID structure is a supertype of all classoid types.  A
 ;;; CLASSOID is also a CTYPE structure as recognized by the type
@@ -284,11 +334,9 @@
 ;;; away as with the merger of SB-PCL:CLASS and CL:CLASS it's no
 ;;; longer necessary)
 (def!struct (classoid
-             (:include ctype
-                       (class-info (type-class-or-lose 'classoid)))
+             (:include ctype)
              (:constructor nil)
              (:copier nil)
-             #-no-ansi-print-object
              (:print-object
               (lambda (class stream)
                 (let ((name (classoid-name class)))
@@ -331,32 +379,6 @@
 (defun layout-classoid-name (x)
   (classoid-name (layout-classoid x)))
 
-;;; A helper to make classoid (and named-type) hash values stable.
-;;; For other ctypes, generally improve the randomness of the hash.
-;;; (The host uses at most 21 bits of randomness. See CTYPE-RANDOM)
-#+sb-xc
-(defun !improve-ctype-hash (obj type-class-name)
-  (let ((hash (case type-class-name
-                (named
-                 (interned-type-hash (named-type-name obj) 'named))
-                (classoid
-                 (interned-type-hash (classoid-name obj)))
-                (t
-                 (interned-type-hash))))
-        ;; Preserve the interned-p and type=-optimization bits
-        ;; by affecting only bits under the ctype-hash-mask.
-        ;; Upper 5 hash bits might be an index into SAETP array
-        ;; (if this ctype is exactly a type to which upgrade occurs)
-        (nbits (- (integer-length +ctype-hash-mask+)
-                  +ctype-saetp-index-bits+)))
-    (macrolet ((slot-index ()
-                 (let* ((dd (find-defstruct-description 'ctype))
-                        (dsd (find 'hash-value (dd-slots dd) :key #'dsd-name)))
-                   (dsd-index dsd))))
-      (setf (%instance-ref obj (slot-index))
-            (dpb hash (byte nbits 0) (type-hash-value obj)))))
-  obj)
-
 ;;;; object types to represent classes
 
 ;;; An UNDEFINED-CLASSOID is a cookie we make up to stick in forward
@@ -364,7 +386,8 @@
 (def!struct (undefined-classoid
              (:include classoid)
              (:copier nil)
-             (:constructor make-undefined-classoid (name))))
+             (:constructor make-undefined-classoid
+                 (name &aux (%bits (pack-ctype-bits classoid name))))))
 
 ;;; BUILT-IN-CLASS is used to represent the standard classes that
 ;;; aren't defined with DEFSTRUCT and other specially implemented
@@ -386,8 +409,8 @@
 
 (def!struct (condition-classoid (:include classoid)
                                 (:copier nil)
-                                (:constructor %make-condition-classoid
-                                    (hash-value name)))
+                                (:constructor make-condition-classoid
+                                    (&key name &aux (%bits (pack-ctype-bits classoid name)))))
   ;; list of CONDITION-SLOT structures for the direct slots of this
   ;; class
   (slots nil :type list)
@@ -411,8 +434,6 @@
   ;; Values for these slots must be computed in the dynamic
   ;; environment of MAKE-CONDITION.
   (hairy-slots nil :type list))
-(defun make-condition-classoid (&key name)
-  (%make-condition-classoid (interned-type-hash name) name))
 
 ;;;; classoid namespace
 
@@ -421,7 +442,6 @@
 (def!struct (classoid-cell
              (:copier nil)
              (:constructor make-classoid-cell (name &optional classoid))
-             #-no-ansi-print-object
              (:print-object (lambda (s stream)
                               (print-unreadable-object (s stream :type t)
                                 (prin1 (classoid-cell-name s) stream)))))
@@ -465,13 +485,16 @@
 ;;; FUNCALLABLE-STANDARD-CLASS.
 (def!struct (standard-classoid (:include classoid)
                                (:copier nil)
-                               (:constructor make-standard-classoid))
+                               (:constructor make-standard-classoid
+                                   (&key name pcl-class
+                                    &aux (%bits (pack-ctype-bits classoid name)))))
   old-layouts)
 ;;; a metaclass for classes which aren't standardlike but will never
 ;;; change either.
 (def!struct (static-classoid (:include classoid)
                              (:copier nil)
-                             (:constructor make-static-classoid)))
+                             (:constructor make-static-classoid
+                                 (&key name &aux (%bits (pack-ctype-bits classoid name))))))
 
 (declaim (freeze-type built-in-classoid condition-classoid
                       standard-classoid static-classoid))
@@ -515,8 +538,8 @@
     (dolist (layout (sort (loop for v being each hash-value
                                 of (classoid-subclasses (find-classoid 't))
                                 collect v)
-                          #'< :key #'sb-kernel::layout-flags))
-      (let ((flags (sb-kernel::layout-flags layout)))
+                          #'< :key #'sb-kernel:layout-flags))
+      (let ((flags (sb-kernel:layout-flags layout)))
         (unless (= flags prev)
           (format t "Layout flags = ~d~%" flags)
           (setq prev flags)))

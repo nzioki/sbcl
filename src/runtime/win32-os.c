@@ -65,8 +65,6 @@
 #define WITH_GC_AT_SAFEPOINTS_ONLY() if (0) ; else
 #endif
 
-os_vm_size_t os_vm_page_size;
-
 #include "gc.h"
 #include "gencgc-internal.h"
 #include <wincrypt.h>
@@ -311,7 +309,7 @@ void unmap_gc_page()
 
 #endif
 
-#if defined(LISP_FEATURE_SB_DYNAMIC_CORE)
+#if defined(LISP_FEATURE_LINKAGE_TABLE)
 /* This feature has already saved me more development time than it
  * took to implement.  In its current state, ``dynamic RT<->core
  * linking'' is a protocol of initialization of C runtime and Lisp
@@ -360,7 +358,7 @@ void unmap_gc_page()
  * bundle'' that rolls up your patch, redumps and -- presto -- 100MiB
  * program is fixed by sending and loading a 50KiB thingie.
  *
- * However, until LISP_FEATURE_SB_DYNAMIC_CORE, if your bug were fixed
+ * However, until LISP_FEATURE_LINKAGE_TABLE, if your bug were fixed
  * by modifying two lines of _C_ sources, a customer described above
  * had to be ready to receive and reinstall a new 100MiB
  * executable. With the aid of code below, deploying such a fix
@@ -395,7 +393,7 @@ void unmap_gc_page()
  * to leave old-style linking code in place for the sake of
  * _non-linkage-table_ platforms (they probably don't have -ldl or its
  * equivalent, like LL/GPA, at all) -- but i did it usually by moving
- * the entire `old style' code under #-sb-dynamic-core and
+ * the entire `old style' code under #-linkage-table and
  * refactoring the `new style' branch, instead of cutting the tail
  * piecemeal and increasing #+-ifdeffery amount & the world enthropy.
  *
@@ -550,7 +548,7 @@ u32 os_get_build_time_shared_libraries(u32 excl_maximum,
                    Anyway: using a module handle more than once will
                    do no harm, but it slows down the startup (even
                    now, our startup time is not a pleasant topic to
-                   discuss when it comes to :sb-dynamic-core; there is
+                   discuss when it comes to :linkage-table; there is
                    an obvious direction to go for speed, though --
                    instead of resolving symbols one-by-one, locate PE
                    export directories -- they are sorted by symbol
@@ -605,7 +603,7 @@ void* os_dlsym_default(char* name)
     return result;
 }
 
-#endif /* SB_DYNAMIC_CORE */
+#endif /* LINKAGE_TABLE */
 
 #if defined(LISP_FEATURE_SB_THREAD)
 /* We want to get a slot in TIB that (1) is available at constant
@@ -680,54 +678,6 @@ int os_preinit(char *argv[], char *envp[])
     return 0;
 }
 #endif  /* LISP_FEATURE_SB_THREAD */
-
-
-#ifdef LISP_FEATURE_X86_64
-/* Windows has 32-bit 'longs', so printf...%lX (and other %l patterns) doesn't
- * work well with address-sized values, like it's done all over the place in
- * SBCL. And msvcrt uses I64, not LL, for printing long longs.
- *
- * I've already had enough search/replace with longs/words/intptr_t for today,
- * so I prefer to solve this problem with a format string translator. */
-
-/* There is (will be) defines for printf and friends. */
-
-static int translating_vfprintf(FILE*stream, const char *fmt, va_list args)
-{
-    char translated[1024];
-    unsigned i=0, delta = 0;
-
-    while (fmt[i-delta] && i<sizeof(translated)-1) {
-        if((fmt[i-delta]=='%')&&
-           (fmt[i-delta+1]=='l')) {
-            translated[i++]='%';
-            translated[i++]='I';
-            translated[i++]='6';
-            translated[i++]='4';
-            delta += 2;
-        } else {
-            translated[i]=fmt[i-delta];
-            ++i;
-        }
-    }
-    translated[i++]=0;
-    return vfprintf(stream,translated,args);
-}
-
-int printf(const char*fmt,...)
-{
-    va_list args;
-    va_start(args,fmt);
-    return translating_vfprintf(stdout,fmt,args);
-}
-int fprintf(FILE*stream,const char*fmt,...)
-{
-    va_list args;
-    va_start(args,fmt);
-    return translating_vfprintf(stream,fmt,args);
-}
-
-#endif
 
 int os_number_of_processors = 1;
 
@@ -956,7 +906,7 @@ os_validate_recommit(os_vm_address_t addr, os_vm_size_t len)
  * thing to maintain).
  */
 
-void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len)
 {
     os_vm_size_t count;
 
@@ -968,6 +918,7 @@ void load_core_bytes(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 
     count = read(fd, addr, len);
     CRT_AVER( count == len );
+    return (void*)0;
 }
 static DWORD os_protect_modes[8] = {
     PAGE_NOACCESS,
@@ -1381,6 +1332,7 @@ handle_exception(EXCEPTION_RECORD *exception_record,
     DWORD code = exception_record->ExceptionCode;
 
     if(code == 0x20474343 || /* GCC */
+       code == 0x406D1388 || /* MS_VC_EXCEPTION */
        code == 0xE06D7363 || /* Emsc */
        code == 0xE0434352)   /* ECCR */
         /* Do not handle G++, VC++ and .NET exceptions */
@@ -2109,8 +2061,7 @@ void scratch(void)
     CryptGenRandom(0, 0, 0);
 }
 
-char *
-os_get_runtime_executable_path(int __attribute__((__unused__)) external)
+char *os_get_runtime_executable_path()
 {
     char path[MAX_PATH + 1];
     DWORD bufsize = sizeof(path);

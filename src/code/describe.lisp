@@ -9,7 +9,6 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-;;; SB-IMPL, not SB-IMPL, since we're built in warm load.
 (in-package "SB-IMPL")
 
 ;;;; Utils, move elsewhere.
@@ -68,7 +67,7 @@
          (limit (truncate (- *print-right-margin* reserve) columns)))
     (flet ((trunc (&optional end)
              (let ((line-end (- limit 2)))
-               (with-simple-output-to-string (s)
+               (%with-output-to-string (s)
                  (write-string line s :end (if end
                                                (min end line-end)
                                                line-end))
@@ -663,7 +662,7 @@
             (when methods
               (format stream "~@:_Method-combination: ~S"
                       (sb-pcl::method-combination-type-name
-                       (sb-pcl:generic-function-method-combination fun)))
+                       (sb-mop:generic-function-method-combination fun)))
               (cond ((eq :none methods)
                      (format stream "~@:_No methods."))
                     (t

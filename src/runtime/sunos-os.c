@@ -23,7 +23,7 @@
 #endif
 
 #ifdef LISP_FEATURE_GENCGC
-#include "gencgc-internal.h"
+#include "gc-internal.h"
 #endif
 
 #ifdef LISP_FEATURE_SB_WTIMER
@@ -32,19 +32,9 @@
 # include <errno.h>
 #endif
 
-os_vm_size_t os_vm_page_size=0;
-
 void
 os_init(char *argv[], char *envp[])
 {
-    /*
-     * historically, this used sysconf to select the runtime page size
-     * per recent changes on other arches and discussion on sbcl-devel,
-     * however, this is not necessary -- the VM page size need not match
-     * the OS page size (and the default backend page size has been
-     * ramped up accordingly for efficiency reasons).
-     */
-    os_vm_page_size = BACKEND_PAGE_BYTES;
 }
 
 os_vm_address_t os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
@@ -138,14 +128,16 @@ os_install_interrupt_handlers()
 #endif
 }
 
-char *
-os_get_runtime_executable_path(int external)
+char *os_get_runtime_executable_path()
 {
-    char path[] = "/proc/self/object/a.out";
-
-    if (external || access(path, R_OK) == -1)
+    char path[PATH_MAX + 1];
+    int size = readlink("/proc/self/path/a.out", path, sizeof(path) - 1);
+    if (size < 0)
         return NULL;
+    path[size] = '\0';
 
+    if (strcmp(path, "unknown") == 0)
+        return NULL;
     return copied_string(path);
 }
 

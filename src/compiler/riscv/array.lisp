@@ -23,16 +23,12 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 5
     ;; Compute the allocation size.
-    (cond ((zerop (- word-shift n-fixnum-tag-bits))
-           (inst addi ndescr rank (+ (* array-dimensions-offset n-word-bytes)
-                                     lowtag-mask)))
-          (t
-           (inst slli ndescr rank (- word-shift n-fixnum-tag-bits))
-           (inst addi ndescr ndescr (+ (* array-dimensions-offset n-word-bytes)
-                                       lowtag-mask))))
+    (with-fixnum-as-word-index (rank ndescr)
+      (inst addi ndescr rank (+ (* array-dimensions-offset n-word-bytes)
+                                lowtag-mask)))
     (inst andi ndescr ndescr (lognot lowtag-mask))
     (pseudo-atomic (pa-flag)
-      (allocation header ndescr other-pointer-lowtag :flag-tn pa-flag)
+      (allocation nil ndescr other-pointer-lowtag header :flag-tn pa-flag)
       ;; Now that we have the space allocated, compute the header
       ;; value.
       (inst slli ndescr rank (- n-widetag-bits n-fixnum-tag-bits))
@@ -58,7 +54,7 @@
                             lowtag-mask))
            (header-bits (logior (ash header-size n-widetag-bits) type)))
       (pseudo-atomic (pa-flag)
-        (allocation header bytes other-pointer-lowtag :flag-tn pa-flag)
+        (allocation nil bytes other-pointer-lowtag header :flag-tn pa-flag)
         (inst li pa-flag header-bits)
         (storew pa-flag header 0 other-pointer-lowtag)))
     (move result header)))
@@ -166,9 +162,9 @@
   (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg)
 
   (def-partial-data-vector-frobs simple-base-string character 1 nil character-reg)
-  #-64-bit
+  #+(and sb-unicode (not 64-bit))
   (def-full-data-vector-frobs simple-character-string character character-reg)
-  #+64-bit
+  #+(and sb-unicode 64-bit)
   (def-partial-data-vector-frobs simple-character-string character
     4 nil character-reg)
 
@@ -364,3 +360,8 @@
   (unsigned-reg) unsigned-num %vector-raw-bits)
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num %set-vector-raw-bits)
+
+(define-full-casser data-vector-cas/simple-vector simple-vector vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %compare-and-swap-svref)
+(define-atomic-frobber array-atomic-incf/word amoadd * vector-data-offset
+  other-pointer-lowtag (unsigned-reg) unsigned-num %array-atomic-incf/word)

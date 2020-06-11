@@ -57,25 +57,13 @@
 (defstruct (keyed-node
             (:conc-name nil)
             (:include list-node)
-            (:constructor %make-node (node-key node-data)))
+            (:constructor make-node (node-key node-data)))
   (node-key 0 :read-only t)
   (node-data))
 
-(defconstant special-gc-strategy-flag #x800000)
-(declaim (ftype (sfunction (t t) list-node) make-node))
-(defun make-node (key data)
-  (declare (inline %make-node))
-  (let ((node (%make-node key data)))
-    #-x86-64
-    ;; Note that SET-HEADER-DATA only works on OTHER-POINTER-LOWTAG.
-    (with-pinned-objects (node)
-      (let ((sap (int-sap (get-lisp-obj-address node))))
-        (setf (sap-ref-word sap (- sb-vm:instance-pointer-lowtag))
-              (logior special-gc-strategy-flag
-                      (sap-ref-word sap (- sb-vm:instance-pointer-lowtag))))))
-    #+x86-64
-    (sb-sys:%primitive sb-vm::set-custom-gc-scavenge-bit node)
-    node))
+(let ((layout (find-layout 'keyed-node)))
+  (setf (layout-flags layout)
+        (logior (layout-flags layout) sb-vm:lockfree-list-node-flag)))
 
 (declaim (inline ptr-markedp node-markedp))
 (defun ptr-markedp (bits) (fixnump bits))

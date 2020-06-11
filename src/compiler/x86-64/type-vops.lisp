@@ -32,15 +32,22 @@
   (generate-fixnum-test value)
   (inst jmp (if not-p :nz :z) target))
 
-(defun %lea-for-lowtag-test (temp value lowtag)
-  (inst lea :dword temp (ea (- lowtag) value)))
+(defun %lea-for-lowtag-test (temp value lowtag &optional (operand-size :dword))
+  ;; If OPERAND-SIZE is :QWORD, then instead of discarding the upper 32 bits
+  ;; in a lowtag test, preserve the full word which becomes an untagged pointer.
+  ;; The REX byte can't be avoided if VALUE is R8 or higher, so it costs nothing
+  ;; to widen the LEA operand. In this way, we avoid emitting a displacement to
+  ;; load the widetag. The total number of bytes emitted is reduced by 1,
+  ;; or by nothing. ASSUMPTION: tagged pointer causes conservative pinning,
+  ;; hence an untagged pointer remains valid.
+  (inst lea operand-size temp (ea (- lowtag) value)))
 
 ;; Numerics including fixnum, excluding short-float. (INTEGER,RATIONAL)
 (defun %test-fixnum-and-headers (value temp target not-p headers
                                  &key value-tn-ref)
   (let ((drop-through (gen-label)))
     (case n-fixnum-tag-bits
-     (1 (%lea-for-lowtag-test temp value other-pointer-lowtag)
+     (1 (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
         (inst test :byte temp 1)
         (inst jmp :nz (if not-p drop-through target)) ; inverted
         (%test-headers value temp target not-p nil headers
@@ -66,7 +73,7 @@
                                            &key value-tn-ref)
   (let ((drop-through (gen-label)))
     (case n-fixnum-tag-bits
-     (1 (%lea-for-lowtag-test temp value other-pointer-lowtag)
+     (1 (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
         (inst test :byte temp 1)
         (inst jmp :nz (if not-p drop-through target)) ; inverted
         (inst cmp :byte temp (- immediate other-pointer-lowtag))
@@ -115,7 +122,21 @@
                            (drop-through (gen-label))
                            (compute-temp t)
                            value-tn-ref)
-  (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
+  (let* ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag))
+         ;; It is preferable (smaller and faster code) to directly
+         ;; compare the value in memory instead of loading it into
+         ;; a register first. Find out if this is possible and set
+         ;; WIDETAG-TN accordingly. If impossible, generate the
+         ;; register load.
+         (widetag-tn (if (and (null (cdr headers))
+                              (not except)
+                              (or (atom (car headers))
+                                  (= (caar headers) bignum-widetag)
+                                  (= (cdar headers) complex-array-widetag)))
+                         (ea (- lowtag) value)
+                         temp))
+         (untagged))
+
     (multiple-value-bind (equal less-or-equal greater-or-equal when-true
                                 when-false)
         ;; EQUAL, LESS-OR-EQUAL, and GREATER-OR-EQUAL are the conditions
@@ -126,38 +147,55 @@
             (values :ne :a :b drop-through target)
             (values :e :na :nb target drop-through))
 
-      (unless (and value-tn-ref
-                   (eq lowtag other-pointer-lowtag)
-                   (other-pointer-tn-ref-p value-tn-ref))
-        (when compute-temp
-          (%lea-for-lowtag-test temp value lowtag))
-        (inst test :byte temp lowtag-mask)
-        (inst jmp :nz when-false))
+      ;; FIXME: the first case, by elision of the lowtag test, can cause this
+      ;; typecase to memory fault if given an unbound marker:
+      ;;  (typecase x
+      ;;   ((or character number list instance function) 1)
+      ;;   ((simple-vector x) 2)
+      (cond ((and value-tn-ref
+                  (eq lowtag other-pointer-lowtag)
+                  (other-pointer-tn-ref-p value-tn-ref))) ; best case: lowtag is right
+            ;; This case is theoretically right, but causes a strictly greater number
+            ;; of ways to elide a lowtag test, hence more likely to memory fault.
+            #+nil
+            ((and value-tn-ref
+                  ;; If HEADERS contains a range, then list pointers have to be
+                  ;; disallowed - consider a list whose CAR has a fixnum that
+                  ;; spuriously matches the range test.
+                  (if (some #'listp headers)
+                      (headered-object-pointer-tn-ref-p value-tn-ref)
+                      (pointer-tn-ref-p value-tn-ref)))
+             ;; Emit one fewer conditional jump than the general case,
+             (inst mov temp value)
+             (inst and temp (lognot lowtag-mask))
+             (if (ea-p widetag-tn)
+                 (setq widetag-tn (ea temp))
+                 (setq untagged (ea temp))))
+            (t
+             ;; Regardless of whether :COMPUTE-TEMP is T or NIL, it will hold
+             ;; an untagged ptr to VALUE if the lowtag test passes.
+             (setq untagged (ea temp))
+             (when (ea-p widetag-tn)
+               (setq widetag-tn untagged))
+             (when compute-temp
+               (%lea-for-lowtag-test temp value lowtag :qword))
+             (inst test :byte temp lowtag-mask)
+             (inst jmp :nz when-false)))
+
+      (when (eq widetag-tn temp)
+        (inst mov :dword temp (or untagged (ea (- lowtag) value))))
+      (dolist (widetag except)
+        (inst cmp :byte temp widetag)
+        (inst jmp :e when-false))
+
       ;; FIXME: this backend seems to be missing the special logic for
       ;;        testing exactly two widetags differing only in a single bit,
       ;;        which through evolution is almost totally unworkable anyway...
-      (do ((remaining headers (cdr remaining))
-           ;; It is preferable (smaller and faster code) to directly
-           ;; compare the value in memory instead of loading it into
-           ;; a register first. Find out if this is possible and set
-           ;; WIDETAG-TN accordingly. If impossible, generate the
-           ;; register load.
-           ;; Compared to x86 we additionally optimize the cases of a
-           ;; range starting with BIGNUM-WIDETAG (= min widetag)
-           ;; or ending with COMPLEX-ARRAY-WIDETAG (= max widetag)
-           (widetag-tn (if (and (null (cdr headers))
-                                (not except)
-                                (or (atom (car headers))
-                                    (= (caar headers) bignum-widetag)
-                                    (= (cdar headers) complex-array-widetag)))
-                           (ea (- lowtag) value)
-                           (progn (inst mov :dword temp (ea (- lowtag) value))
-                                  temp))))
+      ;; Compared to x86 we additionally optimize the cases of a
+      ;; range starting with BIGNUM-WIDETAG (= min widetag)
+      ;; or ending with COMPLEX-ARRAY-WIDETAG (= max widetag)
+      (do ((remaining headers (cdr remaining)))
           ((null remaining))
-        (dolist (widetag except) ; only after loading widetag-tn
-          (inst cmp :byte temp widetag)
-          (inst jmp :e when-false))
-        (setq except nil)
         (let ((header (car remaining))
               (last (null (cdr remaining))))
           (cond

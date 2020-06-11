@@ -62,7 +62,8 @@
                                   (make-entry)))
                          (cleanup (make-cleanup :kind :dynamic-extent
                                                 :mess-up entry
-                                                :info dx-lvars)))
+                                                :info dx-lvars
+                                                :lexenv (lambda-lexenv fun))))
                     (setf (entry-cleanup entry) cleanup)
                     (insert-node-before call entry)
                     (setf (node-lexenv call)
@@ -363,37 +364,22 @@
   (declare (type component component))
   (aver-live-component component)
   (loop
-    (let* ((new-functional (pop (component-new-functionals component)))
-           (functional (or new-functional
-                           (pop (component-reanalyze-functionals component)))))
-      (unless functional
+    (let* ((new (pop (component-new-functionals component)))
+           (fun (or new (pop (component-reanalyze-functionals component)))))
+      (unless fun
         (return))
-      (let ((kind (functional-kind functional)))
-        (cond ((or (functional-somewhat-letlike-p functional)
-                   (memq kind '(:deleted :zombie)))
-               (values)) ; nothing to do
-              ((and (null (leaf-refs functional)) (eq kind nil)
-                    (not (functional-entry-fun functional)))
-               (delete-functional functional))
+      (let ((kind (functional-kind fun)))
+        (cond ((or (functional-somewhat-letlike-p fun)
+                   (memq kind '(:deleted :zombie))))
+              ((and (null (leaf-refs fun)) (eq kind nil)
+                    (not (functional-entry-fun fun)))
+               (delete-functional fun))
               (t
-               ;; Fix/check FUNCTIONAL's relationship to COMPONENT-LAMDBAS.
-               (cond ((not (lambda-p functional))
-                      ;; Since FUNCTIONAL isn't a LAMBDA, this doesn't
-                      ;; apply: no-op.
-                      (values))
-                     (new-functional ; FUNCTIONAL came from
-                                     ; NEW-FUNCTIONALS, hence is new.
-                      ;; FUNCTIONAL becomes part of COMPONENT-LAMBDAS now.
-                      (aver (not (member functional
-                                         (component-lambdas component))))
-                      (push functional (component-lambdas component)))
-                     (t ; FUNCTIONAL is old.
-                      ;; FUNCTIONAL should be in COMPONENT-LAMBDAS already.
-                      (aver (member functional (component-lambdas
-                                                component)))))
-               (locall-analyze-fun-1 functional)
-               (when (lambda-p functional)
-                 (maybe-let-convert functional component)))))))
+               (when (and new (lambda-p fun))
+                 (push fun (component-lambdas component)))
+               (locall-analyze-fun-1 fun)
+               (when (lambda-p fun)
+                 (maybe-let-convert fun component)))))))
   (values))
 
 (defun locall-analyze-clambdas-until-done (clambdas)
@@ -408,9 +394,11 @@
          (when (or (component-new-functionals component)
                    (component-reanalyze-functionals component))
            (setf did-something t)
-           (locall-analyze-component component))))
+           (locall-analyze-component component)
+           (clean-component component))))
      (unless did-something
        (return))))
+  (initial-eliminate-dead-code clambdas)
   (values))
 
 ;;; If policy is auspicious and CALL is not in an XEP and we don't seem
@@ -419,22 +407,23 @@
 ;;; reference.
 (defun maybe-expand-local-inline (original-functional ref call)
   (if (and (policy call
-                   (and (>= speed space)
-                        (>= speed compilation-speed)))
+               (and (>= speed space)
+                    (>= speed compilation-speed)))
            (not (eq (functional-kind (node-home-lambda call)) :external))
-           (inline-expansion-ok call))
+           (inline-expansion-ok call original-functional))
       (let* ((end (component-last-block (node-component call)))
              (pred (block-prev end)))
         (multiple-value-bind (losing-local-object converted-lambda)
             (catch 'locall-already-let-converted
               (with-ir1-environment-from-node call
-                (let ((*lexenv* (functional-lexenv original-functional)))
+                (let ((*inline-expansions*
+                        (register-inline-expansion original-functional call))
+                      (*lexenv* (functional-lexenv original-functional)))
                   (values nil
                           (ir1-convert-lambda
                            (functional-inline-expansion original-functional)
                            :debug-name (debug-name 'local-inline
-                                                   (leaf-debug-name
-                                                    original-functional)))))))
+                                                   (leaf-%source-name original-functional)))))))
           (cond (losing-local-object
                  (if (functional-p losing-local-object)
                      (let ((*compiler-error-context* call))
@@ -502,7 +491,10 @@
                    (rest (leaf-refs original-fun))
                    ;; Some REFs are already unused bot not yet deleted,
                    ;; avoid unnecessary inlining
-                   (> (count-if #'node-lvar (leaf-refs original-fun)) 1))
+                   (> (count-if #'node-lvar (leaf-refs original-fun)) 1)
+                   ;; Don't inline if the function is not going to be
+                   ;; let-converted.
+                   (let-convertable-p call fun))
           (setq fun (maybe-expand-local-inline fun ref call)))
 
         (aver (member (functional-kind fun)
@@ -515,6 +507,15 @@
                (convert-hairy-call ref call fun))))))
 
   (values))
+
+(defun let-convertable-p (call fun)
+  (cond ((mv-combination-p call)
+         (and (looks-like-an-mv-bind fun)
+              (not (functional-entry-fun fun))))
+        ((lambda-p fun)
+         t)
+        (t ;; Hairy
+         t)))
 
 ;;; Attempt to convert a multiple-value call. The only interesting
 ;;; case is a call to a function that LOOKS-LIKE-AN-MV-BIND, has
@@ -1002,6 +1003,10 @@
 ;;; Handle the value semantics of LET conversion. Delete FUN's return
 ;;; node, and change the control flow to transfer to NEXT-BLOCK
 ;;; instead. Move all the uses of the result lvar to CALL's lvar.
+;;;
+;;; We also intersect the derived type of the CALL with the derived
+;;; type of all the dummy continuation's uses. This serves mainly to
+;;; propagate TRULY-THE through LETs.
 (defun move-return-uses (fun call next-block)
   (declare (type clambda fun) (type basic-combination call)
            (type cblock next-block))

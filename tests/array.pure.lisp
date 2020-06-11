@@ -433,7 +433,7 @@
   (checked-compile-and-assert (:optimize '(:safety 0))
       `(lambda (x)
          ;; Strings are null-terminated for C interoperability
-         (char "abcd" x))
+         (char #.(coerce "abcd" 'simple-base-string) x))
     ((4) #\Nul)))
 
 (with-test (:name (adjust-array :transform))
@@ -576,3 +576,25 @@
      (equal (sb-kernel:%simple-fun-type fun)
             '(function ((simple-array (unsigned-byte 8) (*)))
               (values (simple-array (unsigned-byte 8) (10 20)) &optional))))))
+
+(with-test (:name :displaced-to-with-intitial)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (make-array 1 :displaced-to x :initial-element 1))
+    ((#(0)) (condition 'error)))
+  (assert
+   (nth-value 2
+              (checked-compile
+               `(lambda ()
+                  (lambda (x)
+                    (make-array 1 :displaced-to (the vector x) :initial-contents '(1))))
+               :allow-warnings t))))
+
+(with-test (:name :check-bound-type-error)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (p)
+                         (unless (svref p 0)
+                           (svref p nil)))
+                      :allow-warnings t))))

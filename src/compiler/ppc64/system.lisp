@@ -58,7 +58,7 @@
   (:generator 1
     (inst lr temp (- (+ #+little-endian 4
                         (ash (+ instance-slots-offset
-                                (get-dsd-index layout sb-kernel::%bits))
+                                (get-dsd-index layout sb-kernel::flags))
                              word-shift))
                      instance-pointer-lowtag))
     (inst lwax res object temp)))
@@ -80,16 +80,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srdi res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -122,8 +112,7 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst srdi res ptr 1) ; clear the fixnum sign bit
-    (inst rldicr res res 0 (- 63 n-fixnum-tag-bits))))
+    (inst clrrdi res ptr n-fixnum-tag-bits)))
 
 
 ;;;; Allocation
@@ -256,7 +245,7 @@
   (:generator 3))
 
 ;;;; Dummy definition for a spin-loop hint VOP
-(define-vop (spin-loop-hint)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))

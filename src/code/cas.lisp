@@ -18,8 +18,10 @@
          (casser
           (case (dsd-raw-type slotd)
             ((t) '%instance-cas)
-            #+(or x86 x86-64)
-            ((word) '%raw-instance-cas/word))))
+            #+(or x86 x86-64 riscv)
+            ((word) '%raw-instance-cas/word)
+            #+riscv
+            ((signed-word) '%raw-instance-cas/signed-word))))
     (unless casser
       (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
                 for a typed slot: ~S"
@@ -210,9 +212,10 @@ whose CAR is one of the following:
  CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SVREF, SLOT-VALUE
  SB-MOP:STANDARD-INSTANCE-ACCESS, SB-MOP:FUNCALLABLE-STANDARD-INSTANCE-ACCESS,
 
-or the name of a DEFSTRUCT created accessor for a slot whose declared type is
-either FIXNUM or T. Results are unspecified if the slot has a declared type
-other than FIXNUM or T.
+or the name of a DEFSTRUCT created accessor for a slot whose storage type
+is not raw. (Refer to the the \"Efficiency\" chapter of the manual
+for the list of raw slot types.  Future extensions to this macro may allow
+it to work on some raw slot types.)
 
 In case of SLOT-VALUE, if the slot is unbound, SLOT-UNBOUND is called unless
 OLD is EQ to SB-PCL:+SLOT-UNBOUND+ in which case SB-PCL:+SLOT-UNBOUND+ is

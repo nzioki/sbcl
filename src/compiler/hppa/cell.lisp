@@ -257,7 +257,7 @@
 
 ;;;; Instance hackery:
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
@@ -265,7 +265,7 @@
   (:result-types positive-fixnum)
   (:generator 4
     (loadw res struct 0 instance-pointer-lowtag)
-    (inst srl res n-widetag-bits res)))
+    (inst srl res instance-length-shift res)))
 
 (define-full-reffer instance-index-ref * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-ref)
@@ -312,9 +312,10 @@
              (declare (ignore inc-offset-by)) ; FIXME: remove
              (let ((name (symbolicate "RAW-INSTANCE-"
                                       (if set "SET/" "REF/")
-                                      (if (eq type 'unsigned)
-                                        "WORD"
-                                        (or complex type))))
+                                      (case type
+                                        (unsigned "WORD")
+                                        (signed "SIGNED-WORD")
+                                        (t (or complex type)))))
                    (type-num (cond
                                ((eq type 'single)
                                  (if complex 'complex-single-float
@@ -347,6 +348,15 @@
               instance-pointer-lowtag) lip value))
 
   (raw-instance (unsigned -1 t)
+    (inst stw value (- (* instance-slots-offset n-word-bytes)
+                          instance-pointer-lowtag) lip)
+    (move value result))
+
+  (raw-instance (signed -1 nil)
+    (inst ldw (- (* instance-slots-offset n-word-bytes)
+              instance-pointer-lowtag) lip value))
+
+  (raw-instance (signed -1 t)
     (inst stw value (- (* instance-slots-offset n-word-bytes)
                           instance-pointer-lowtag) lip)
     (move value result))

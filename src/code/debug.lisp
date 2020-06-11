@@ -578,7 +578,7 @@ information."
                         (setf reversed-result
                               (append (reverse
                                        (multiple-value-list
-                                        (sb-c::%more-arg-values context 0 count)))
+                                        (sb-c:%more-arg-values context 0 count)))
                                       reversed-result))
                         (return-from enumerating))
                       (push (make-unprintable-object "unavailable &MORE argument")
@@ -1777,7 +1777,7 @@ forms that explicitly control this kind of evaluation.")
            ;; *CURRENT-CATCH-BLOCK* are negative, so we need to jump through
            ;; some hoops to make these calculated values negative too.
            (ash (truly-the sb-vm:signed-word (sap-int sap))
-                (- sb-vm::n-fixnum-tag-bits))))
+                (- sb-vm:n-fixnum-tag-bits))))
     ;; To properly unwind the stack, we need three pieces of information:
     ;;   * The unwind block that should be active after the unwind
     ;;   * The catch block that should be active after the unwind
@@ -1790,7 +1790,7 @@ forms that explicitly control this kind of evaluation.")
       (sb-vm::%primitive sb-vm::unwind-to-frame-and-call
                          (sb-di::frame-pointer frame)
                          (find-enclosing-uwp frame)
-                         #-x86-64
+                         #-unbind-in-unwind
                          (lambda ()
                            ;; Before calling the user-specified
                            ;; function, we need to restore the binding
@@ -1798,11 +1798,11 @@ forms that explicitly control this kind of evaluation.")
                            ;; is taken care of by the VOP.
                            (sb-vm::%primitive sb-vm::unbind-to-here
                                               unbind-to)
-                           (setf sb-vm::*current-catch-block* catch-block)
+                           (setf sb-vm:*current-catch-block* catch-block)
                            (funcall thunk))
-                         #+x86-64 thunk
-                         #+x86-64 unbind-to
-                         #+x86-64 catch-block)))
+                         #+unbind-in-unwind thunk
+                         #+unbind-in-unwind unbind-to
+                         #+unbind-in-unwind catch-block)))
   #-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))
     (replace-frame-catch-tag frame
@@ -1832,12 +1832,12 @@ forms that explicitly control this kind of evaluation.")
   ;; higher than the pointer for FRAME or a null pointer.
   (let* ((frame-pointer (sb-di::frame-pointer frame))
          (current-block (int-sap (ldb (byte #.sb-vm:n-word-bits 0)
-                                      (ash sb-vm::*current-catch-block*
+                                      (ash sb-vm:*current-catch-block*
                                            sb-vm:n-fixnum-tag-bits))))
          (enclosing-block (loop for block = current-block
                                 then (sap-ref-sap block
                                                   (* sb-vm:catch-block-previous-catch-slot
-                                                     sb-vm::n-word-bytes))
+                                                     sb-vm:n-word-bytes))
                                 when (or (zerop (sap-int block))
                                          #+stack-grows-downward-not-upward
                                          (sap> block frame-pointer)
@@ -1914,7 +1914,7 @@ forms that explicitly control this kind of evaluation.")
   ;; XEPs do not bind anything, nothing to restore
   (find-binding-stack-pointer frame)
   #-unwind-to-frame-and-call-vop
-  (find 'sb-c:debug-catch-tag (sb-di::frame-catches frame) :key #'car))
+  (find 'sb-c:debug-catch-tag (sb-di:frame-catches frame) :key #'car))
 
 (defun frame-has-debug-vars-p (frame)
   (debug-var-info-available

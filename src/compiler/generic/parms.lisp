@@ -54,6 +54,8 @@
 ;;     prior to static page.
 (defmacro !gencgc-space-setup
     (small-spaces-start
+          ;; These keywords variables have to be careful not to overlap with the
+          ;; the DEFCONSTANT of the same name, hence the suffix.
           &key ((:dynamic-space-start dynamic-space-start*))
                ((:dynamic-space-size dynamic-space-size*))
                ;; The immobile-space START parameters should not be used
@@ -63,7 +65,8 @@
                ((:fixedobj-space-size  fixedobj-space-size*) (* 24 1024 1024))
                ((:varyobj-space-start  varyobj-space-start*))
                ((:varyobj-space-size   varyobj-space-size*) (* 104 1024 1024))
-               (small-space-size #x100000))
+               (small-space-size #x100000)
+               ((:read-only-space-size ro-space-size) small-space-size))
   (declare (ignorable dynamic-space-start*)) ; might be unused in make-host-2
   (flet ((defconstantish (relocatable symbol value)
            (if (not relocatable) ; easy case
@@ -75,13 +78,12 @@
                ;; but can't be due to dependency order problem.
                )))
     (let*
-        ((spaces (append `((read-only ,small-space-size)
+        ((spaces (append `((read-only ,ro-space-size)
+                           (linkage-table ,small-space-size)
                            #+sb-safepoint
-                           (safepoint ,(symbol-value '+backend-page-bytes+)
-                                      gc-safepoint-page-addr)
+                           ;; Must be just before NIL.
+                           (safepoint ,(symbol-value '+backend-page-bytes+) gc-safepoint-page-addr)
                            (static ,small-space-size))
-                         #+linkage-table
-                         `((linkage-table ,small-space-size))
                          #+immobile-space
                          `((fixedobj ,fixedobj-space-size*)
                            (varyobj ,varyobj-space-size*))))
@@ -183,11 +185,12 @@
     ;; never the symbol-value slot
     #-sb-thread ,@(mapcar (lambda (x) (car (ensure-list x)))
                            !per-thread-c-interface-symbols)
-    ;; NLX variables are thread slots on x86-64.  A static sym is needed
+    ;; NLX variables are thread slots on x86-64 and RISC-V.  A static sym is needed
     ;; for arm64, ppc, and x86 because we haven't implemented TLS index fixups,
     ;; so must lookup the TLS index given the symbol.
-    #+(and sb-thread (not x86-64)) ,@'(*current-catch-block*
-                                        *current-unwind-protect-block*)
+    #+(and sb-thread (not x86-64) (not riscv))
+    ,@'(*current-catch-block*
+        *current-unwind-protect-block*)
 
     ;; sb-safepoint in addition to accessing this symbol via TLS,
     ;; uses the symbol itself as a value. Kinda weird.
@@ -206,12 +209,9 @@
 
     ;; threading support
     #+sb-thread *free-tls-index*
-    ;; Keep in sync with 'code/target-thread.lisp':
-    ;;  "only PPC uses a separate symbol for the TLS index lock"
-    #+(and sb-thread (or ppc ppc64)) *tls-index-lock*
 
     ;; dynamic runtime linking support
-    #+sb-dynamic-core +required-foreign-symbols+
+    #+linkage-table +required-foreign-symbols+
 
     ;;; The following symbols aren't strictly required to be static
     ;;; - they are not accessed from C - but we make them static in order
@@ -245,6 +245,7 @@
   (defconstant +pseudo-static-generation+ 6))
 
 (defparameter *runtime-asm-routines* nil)
+(defparameter *linkage-space-predefined-entries* nil)
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

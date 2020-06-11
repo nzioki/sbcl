@@ -34,7 +34,9 @@
            ;; Make a code component occupying exactly NBYTES bytes in total.
            (assert (zerop (mod nbytes (* 2 sb-vm:n-word-bytes))))
            (assert (>= nbytes min-code-header-bytes))
-           (sb-c:allocate-code-object nil sb-vm:code-constants-offset (- nbytes min-code-header-bytes)))
+           (sb-c:allocate-code-object nil 0
+                                      sb-vm:code-constants-offset
+                                      (- nbytes min-code-header-bytes)))
          (get-code-region (a)
            (declare (type (simple-array sb-ext:word (4)) a))
            ;; Return array of 4: free-ptr, end-addr, last-page, start-addr
@@ -58,7 +60,7 @@
         (get-code-region a)
         (assert (= free-ptr end-addr))
         ;; Allocate a teency amount to start a new region
-        (sb-c:allocate-code-object nil sb-vm:code-constants-offset 0)
+        (sb-c:allocate-code-object nil 0 sb-vm:code-constants-offset 0)
         (get-code-region a)
         (setq saved-region-start start-addr
               saved-region-end end-addr)
@@ -117,7 +119,7 @@
   (flet ((copy-layout (layout)
            ;; don't just COPY-STRUCTURE - that would place it in dynamic space
            (let ((new-layout
-                  (sb-kernel:make-layout (sb-kernel::randomish-layout-clos-hash nil)
+                  (sb-kernel:make-layout (sb-kernel::hash-layout-name nil)
                                          (sb-kernel:layout-classoid layout))))
              (sb-kernel:%byte-blt
               (sb-sys:int-sap

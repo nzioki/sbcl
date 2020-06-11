@@ -87,7 +87,7 @@
 
 (def!struct (compiled-debug-fun (:include debug-fun)
                                 (:copier nil)
-                                #-sb-xc-host (:pure t))
+                                (:pure t))
   ;; KLUDGE: Courtesy of more than a decade of, ah, organic growth in
   ;; CMU CL, there are two distinct -- but coupled -- mechanisms to
   ;; finding the name of a function. The slot here is one mechanism
@@ -285,23 +285,23 @@
 ;;; If you add more subtypes here, be sure to amend the set of
 ;;; predefined layout FOP codes in src/code/fop
 (def!struct (compiled-debug-fun-optional (:include compiled-debug-fun)
-                                         #-sb-xc-host (:pure t)
+                                         (:pure t)
                                          (:copier nil)
                                          (:predicate nil)))
 (def!struct (compiled-debug-fun-more (:include compiled-debug-fun)
-                                     #-sb-xc-host (:pure t)
+                                     (:pure t)
                                      (:copier nil)
                                      (:predicate nil)))
 (def!struct (compiled-debug-fun-external (:include compiled-debug-fun)
-                                         #-sb-xc-host (:pure t)
+                                         (:pure t)
                                          (:copier nil)
                                          (:predicate nil)))
 (def!struct (compiled-debug-fun-toplevel (:include compiled-debug-fun)
-                                         #-sb-xc-host (:pure t)
+                                         (:pure t)
                                          (:copier nil)
                                          (:predicate nil)))
 (def!struct (compiled-debug-fun-cleanup (:include compiled-debug-fun)
-                                        #-sb-xc-host (:pure t)
+                                        (:pure t)
                                         (:copier nil)
                                         (:predicate nil)))
 
@@ -380,7 +380,7 @@
 
 ;;; There is one per compiled file and one per function compiled at
 ;;; toplevel or loaded from source.
-(def!struct (debug-source #-sb-xc-host (:pure t)
+(def!struct (debug-source (:pure t)
                           (:copier nil))
   ;; When the DEBUG-SOURCE describes a file, the file's namestring.
   ;; Otherwise, NIL.
@@ -390,7 +390,7 @@
   (created nil :type (or unsigned-byte null))
   ;; Additional information from (WITH-COMPILATION-UNIT (:SOURCE-PLIST ...))
   (plist *source-plist* :read-only t))
-(def!struct (core-debug-source #-sb-xc-host (:pure t)
+(def!struct (core-debug-source (:pure t)
                                (:copier nil)
                                (:include debug-source))
   ;; Compilation to memory stores each toplevel form given to %COMPILE.
@@ -412,7 +412,7 @@
 (def!struct (compiled-debug-info
              (:include debug-info)
              (:copier nil)
-             #-sb-xc-host (:pure t))
+             (:pure t))
   ;; COMPILED-DEBUG-FUNs linked through COMPILED-DEBUG-FUN-NEXT
   (fun-map (missing-arg) :type compiled-debug-fun)
   ;; Location contexts
@@ -443,7 +443,6 @@
 ;;; given file.
 (defstruct (file-info
              (:copier nil)
-             #-no-ansi-print-object
              (:print-object (lambda (s stream)
                               (print-unreadable-object (s stream :type t)
                                 (princ (file-info-name s) stream)))))
@@ -468,7 +467,7 @@
                                                            :read-only t)
   ;; A vector of character ranges than span each subform in the TLF,
   ;; reset to empty for each one, updated by form-tracking-stream-observer.
-  (subforms nil :type (or null (vector t)) :read-only t :read-only t)
+  (subforms nil :type (or null (vector t)) :read-only t)
   ;; A list of objects about which the compile may/would/should have signaled
   ;; a style-warning in the :compile-toplevel situation, so we don't do it
   ;; again in the :load-toplevel situation.
@@ -476,15 +475,11 @@
   ;; the "&OPTIONAL and &KEY" warning is quite annoying to see repeated.
   ;; And I doubt it changes anyone's mind about coding style anyway.
   ;; Typically this matters for DEFTYPE and DEFMACRO.
-  (style-warning-tracker nil :type list)
-  ;; A list of forms that are pending compilation. Delaying compilation helps
-  ;; with defstruct constructors that involve type dependency cycles.
-  (queued-tlfs nil))
+  (style-warning-tracker nil :type list))
 
 ;;; The SOURCE-INFO structure provides a handle on all the source
 ;;; information for an entire compilation.
 (defstruct (source-info
-             #-no-ansi-print-object
              (:print-object (lambda (s stream)
                               (print-unreadable-object
                                   (s stream :type t :identity t))))

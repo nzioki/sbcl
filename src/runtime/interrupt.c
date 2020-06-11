@@ -63,7 +63,7 @@
 #include "gc.h"
 #include "alloc.h"
 #include "dynbind.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "genesis/fdefn.h"
 #include "genesis/simple-fun.h"
 #include "genesis/cons.h"
@@ -85,6 +85,12 @@
 /* FIXME: do not rely on NSIG being a multiple of 8.
  * In fact it is *not* a multiple of 8 - it it 65 on x86-64-linux */
 # define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+#endif
+
+#ifdef LISP_FEATURE_NETBSD
+#define OS_SA_NODEFER 0
+#else
+#define OS_SA_NODEFER SA_NODEFER
 #endif
 
 static inline void
@@ -217,7 +223,7 @@ maybe_resignal_to_lisp_thread(int signal, os_context_t *context)
 }
 
 #if INSTALL_SIG_MEMORY_FAULT_HANDLER && defined(THREAD_SANITIZER)
-/* Under TSAN, every signal blocks every other signal regardless of the
+/* Under TSAN, any delivered signal blocks all other signals regardless of the
  * 'sa_mask' given to sigaction(). This is courtesy of an interceptor -
  * https://github.com/llvm-mirror/compiler-rt/blob/bcc227ee4af1ef3e63033b35dcb1d5627a3b2941/lib/tsan/rtl/tsan_interceptors.cc#L1972
  *
@@ -228,11 +234,6 @@ maybe_resignal_to_lisp_thread(int signal, os_context_t *context)
  * blocked SIGSEGV exactly as if the specified disposition were SIG_DFL,
  * which results in process termination and a core dump.
  *
- * It doesn't work to route all our signals through 'unblock_me_trampoline',
- * because that only unblocks the specific signal that was just delivered,
- * to work around the problem of SA_NODEFER not working. (Which says that
- * a signal should not be blocked within in its own handler; it says nothing
- * about all other signals.)
  * Our trick is to unblock SIGSEGV early in every handler,
  * so not to face sudden death if it happens to invoke Lisp.
  */
@@ -249,10 +250,8 @@ maybe_resignal_to_lisp_thread(int signal, os_context_t *context)
  *
  * interrupt_handle_now_handler
  * maybe_now_maybe_later
- * unblock_me_trampoline
  * low_level_handle_now_handler
  * low_level_maybe_now_maybe_later
- * low_level_unblock_me_trampoline
  *
  * This gives us a single point of control (or six) over errno, fp
  * control word, and fixing up signal context on sparc.
@@ -294,7 +293,7 @@ get_current_sigmask(sigset_t *sigset)
 }
 
 // Stringify sigset into the supplied result buffer.
-static void
+void
 sigset_tostring(const sigset_t *sigset, char* result, int result_length)
 {
     int i;
@@ -785,10 +784,6 @@ fake_foreign_function_call(os_context_t *context)
     /* context_index incrementing must not be interrupted */
     check_blockables_blocked_or_lose(0);
 
-    /* Get current Lisp state from context. */
-#if (defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)) && !defined(LISP_FEATURE_GENCGC)
-    dynamic_space_free_pointer = SymbolValue(ALLOCATION_POINTER, thread);
-#endif
 #ifdef reg_ALLOC
 #ifdef LISP_FEATURE_SB_THREAD
     thread->pseudo_atomic_bits =
@@ -900,9 +895,6 @@ undo_fake_foreign_function_call(os_context_t __attribute__((unused)) *context)
     /* And clear them so we don't get bit later by call-in/call-out
      * not updating them. */
     thread->pseudo_atomic_bits = 0;
-#endif
-#if (defined(LISP_FEATURE_ARM) || defined (LISP_FEATURE_RISCV)) && !defined(LISP_FEATURE_GENCGC)
-    SetSymbolValue(ALLOCATION_POINTER, dynamic_space_free_pointer, thread);
 #endif
 }
 
@@ -1487,11 +1479,7 @@ interrupt_handle_now_handler(int signal, siginfo_t *info, void *void_context)
 extern int *context_eflags_addr(os_context_t *context);
 #endif
 
-#ifdef CALL_INTO_LISP
-#define call_into_lisp ((lispobj(*)(lispobj fun, lispobj *args, int nargs))SYMBOL(CALL_INTO_LISP)->value)
-#else
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs);
-#endif
 extern void post_signal_tramp(void);
 extern void call_into_lisp_tramp(void);
 
@@ -1730,15 +1718,6 @@ void reset_thread_control_stack_guard_page(struct thread *th)
     fprintf(stderr, "INFO: Control stack guard page reprotected\n");
 }
 
-/* Called from the REPL, too. */
-void reset_control_stack_guard_page(void)
-{
-    struct thread *th=arch_os_get_current_thread();
-    if (th->control_stack_guard_page_protected == NIL) {
-        reset_thread_control_stack_guard_page(th);
-    }
-}
-
 boolean
 handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
 {
@@ -1791,7 +1770,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
          * exhaustion instead. */
         if (th->control_stack_guard_page_protected != NIL)
             lose("control_stack_guard_page_protected not NIL");
-        reset_control_stack_guard_page();
+        reset_thread_control_stack_guard_page(th);
         return 1;
     }
     else if(addr >= BINDING_STACK_HARD_GUARD_PAGE(th) &&
@@ -1857,80 +1836,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
     else return 0;
 }
 
-/*
- * noise to install handlers
- */
-
 #ifndef LISP_FEATURE_WIN32
-/* In Linux 2.4 synchronous signals (sigtrap & co) can be delivered if
- * they are blocked, in Linux 2.6 the default handler is invoked
- * instead that usually coredumps. One might hastily think that adding
- * SA_NODEFER helps, but until ~2.6.13 if SA_NODEFER is specified then
- * the whole sa_mask is ignored and instead of not adding the signal
- * in question to the mask. That means if it's not blockable the
- * signal must be unblocked at the beginning of signal handlers.
- *
- * It turns out that NetBSD's SA_NODEFER doesn't DTRT in a different
- * way: if SA_NODEFER is set and the signal is in sa_mask, the signal
- * will be unblocked in the sigmask during the signal handler.  -- RMK
- * X-mas day, 2005
- */
-static volatile int sigaction_nodefer_works = -1;
-
-#define SA_NODEFER_TEST_BLOCK_SIGNAL SIGABRT
-#define SA_NODEFER_TEST_KILL_SIGNAL SIGUSR1
-
-static void
-sigaction_nodefer_test_handler(int signal,
-                               siginfo_t __attribute__((unused)) *info,
-                               void __attribute__((unused)) *void_context)
-{
-    sigset_t current;
-    int i;
-    get_current_sigmask(&current);
-    /* There should be exactly two blocked signals: the two we added
-     * to sa_mask when setting up the handler.  NetBSD doesn't block
-     * the signal we're handling when SA_NODEFER is set; Linux before
-     * 2.6.13 or so also doesn't block the other signal when
-     * SA_NODEFER is set. */
-    for(i = 1; i <= MAX_SIGNUM; i++)
-        if (sigismember(&current, i) !=
-            (((i == SA_NODEFER_TEST_BLOCK_SIGNAL) || (i == signal)) ? 1 : 0)) {
-            FSHOW_SIGNAL((stderr, "SA_NODEFER doesn't work, signal %d\n", i));
-            sigaction_nodefer_works = 0;
-        }
-    if (sigaction_nodefer_works == -1)
-        sigaction_nodefer_works = 1;
-}
-
-void set_sigaction_nodefer_works() { sigaction_nodefer_works = 1; }
-
-static void
-see_if_sigaction_nodefer_works(void)
-{
-    if (sigaction_nodefer_works > 0) return; // good
-    struct sigaction sa, old_sa;
-
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sa.sa_sigaction = sigaction_nodefer_test_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaddset(&sa.sa_mask, SA_NODEFER_TEST_BLOCK_SIGNAL);
-    sigaddset(&sa.sa_mask, SA_NODEFER_TEST_KILL_SIGNAL);
-    sigaction(SA_NODEFER_TEST_KILL_SIGNAL, &sa, &old_sa);
-    /* Make sure no signals are blocked. */
-    {
-        sigset_t empty;
-        sigemptyset(&empty);
-        thread_sigmask(SIG_SETMASK, &empty, 0);
-    }
-    kill(getpid(), SA_NODEFER_TEST_KILL_SIGNAL);
-    while (sigaction_nodefer_works == -1);
-    sigaction(SA_NODEFER_TEST_KILL_SIGNAL, &old_sa, NULL);
-}
-
-#undef SA_NODEFER_TEST_BLOCK_SIGNAL
-#undef SA_NODEFER_TEST_KILL_SIGNAL
-
 extern void restore_sbcl_signals () {
     int signal;
     for (signal = 0; signal < NSIG; signal++) {
@@ -2025,32 +1931,6 @@ lost:
 #endif
 
 static void
-unblock_me_trampoline(int signal, siginfo_t *info, void *void_context)
-{
-    SAVE_ERRNO(signal,context,void_context);
-    sigset_t unblock;
-
-    sigemptyset(&unblock);
-    sigaddset(&unblock, signal);
-    thread_sigmask(SIG_UNBLOCK, &unblock, 0);
-    interrupt_handle_now(signal, info, context);
-    RESTORE_ERRNO;
-}
-
-static void
-low_level_unblock_me_trampoline(int signal, siginfo_t *info, void *void_context)
-{
-    SAVE_ERRNO(signal,context,void_context);
-    sigset_t unblock;
-
-    sigemptyset(&unblock);
-    sigaddset(&unblock, signal);
-    thread_sigmask(SIG_UNBLOCK, &unblock, 0);
-    (*interrupt_low_level_handlers[signal])(signal, info, context);
-    RESTORE_ERRNO;
-}
-
-static void
 low_level_handle_now_handler(int signal, siginfo_t *info, void *void_context)
 {
     SAVE_ERRNO(signal,context,void_context);
@@ -2072,9 +1952,6 @@ undoably_install_low_level_interrupt_handler (int signal,
         sa.sa_sigaction = (void (*)(int, siginfo_t*, void*))handler;
     else if (sigismember(&deferrable_sigset,signal))
         sa.sa_sigaction = low_level_maybe_now_maybe_later;
-    else if (!sigaction_nodefer_works &&
-             !sigismember(&blockable_sigset, signal))
-        sa.sa_sigaction = low_level_unblock_me_trampoline;
     else
         sa.sa_sigaction = low_level_handle_now_handler;
 
@@ -2088,8 +1965,7 @@ undoably_install_low_level_interrupt_handler (int signal,
 #endif
 
     sa.sa_mask = blockable_sigset;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART
-        | (sigaction_nodefer_works ? SA_NODEFER : 0);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | OS_SA_NODEFER;
 #if defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     if(signal==SIG_MEMORY_FAULT) {
         sa.sa_flags |= SA_ONSTACK;
@@ -2135,15 +2011,11 @@ install_handler(int signal, void handler(int, siginfo_t*, os_context_t*),
 #endif
         else if (sigismember(&deferrable_sigset, signal))
             sa.sa_sigaction = maybe_now_maybe_later;
-        else if (!sigaction_nodefer_works &&
-                 !sigismember(&blockable_sigset, signal))
-            sa.sa_sigaction = unblock_me_trampoline;
         else
             sa.sa_sigaction = interrupt_handle_now_handler;
 
         sa.sa_mask = blockable_sigset;
-        sa.sa_flags = SA_SIGINFO | SA_RESTART |
-            (sigaction_nodefer_works ? SA_NODEFER : 0);
+        sa.sa_flags = SA_SIGINFO | SA_RESTART | OS_SA_NODEFER;
         sigaction(signal, &sa, NULL);
     }
 
@@ -2203,9 +2075,6 @@ interrupt_init(void)
 #if !defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_THREAD)
     int i;
     SHOW("entering interrupt_init()");
-#ifndef LISP_FEATURE_WIN32
-    see_if_sigaction_nodefer_works();
-#endif
     sigemptyset(&deferrable_sigset);
     sigemptyset(&blockable_sigset);
     sigemptyset(&gc_sigset);
@@ -2244,10 +2113,10 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
     fake_foreign_function_call(context);
 
     /* To allow debugging memory faults in signal handlers and such. */
+#ifdef ARCH_HAS_STACK_POINTER
     char* pc = (char*)*os_context_pc_addr(context);
     struct code* code = (struct code*)component_ptr_from_pc(pc);
     unsigned int offset = code ? pc - (char*)code : 0;
-#ifdef ARCH_HAS_STACK_POINTER
     if (offset)
         corruption_warning_and_maybe_lose(
             "Memory fault at %p (pc=%p [code %p+0x%X ID 0x%x], fp=%p, sp=%p) tid %#lx",
@@ -2412,7 +2281,6 @@ handle_trap(os_context_t *context, int trap)
 #if defined(LISP_FEATURE_SPARC) && defined(LISP_FEATURE_GENCGC)
     case trap_Allocation:
         arch_handle_allocation_trap(context);
-        arch_skip_instruction(context);
         break;
 #endif
 #if defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK) && !defined(LISP_FEATURE_WIN32)

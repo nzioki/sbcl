@@ -87,8 +87,6 @@
               positive-fixnum)
   (:temporary (:sc non-descriptor-reg) bytes)
   (:results (result :scs (descriptor-reg) :from :load))
-  #-stack-allocatable-vectors
-  (:translate allocate-vector)
   (:policy :fast-safe)
   (:generator 100
     (inst addi (+ lowtag-mask
@@ -206,7 +204,16 @@
     (cond ((= type code-header-widetag)
            (inst addi type header header))
           (t
-           (inst addi (+ (ash -2 n-widetag-bits) type) header header)
+           (cond ((> (length-field-shift type) n-widetag-bits)
+                  ;; can't encode (+ (ash -2 n-widetag-bits) instance-widetag)
+                  ;; as an immediate operand, so do what worked before.
+                  (inst addi (+ (ash -2 n-widetag-bits) 0) header header)
+                  ;; now shift left a few bits more
+                  (inst sll header (- (length-field-shift type) n-widetag-bits) header)
+                  ;; and add the widetag in
+                  (inst addi type header header))
+                 (t
+                  (inst addi (+ (ash -2 n-widetag-bits) type) header header)))
            (inst dep 0 31 n-lowtag-bits bytes)))
     (pseudo-atomic ()
       (set-lowtag lowtag alloc-tn result)

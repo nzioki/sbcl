@@ -39,7 +39,7 @@
     (inst shr :dword header n-fixnum-tag-bits)
     (instrument-alloc bytes node)
     (pseudo-atomic ()
-     (allocation result bytes node nil 0)
+     (allocation nil bytes 0 node nil result)
      (storew header result 0 0)
      (inst or :byte result other-pointer-lowtag))))
 
@@ -59,7 +59,7 @@
                            type)))
      (instrument-alloc bytes node)
      (pseudo-atomic ()
-      (allocation result bytes node nil 0)
+      (allocation nil bytes 0 node nil result)
       (storew* header result 0 0 t)
       (inst or :byte result other-pointer-lowtag)))))
 
@@ -99,7 +99,7 @@
             (ea (- (* scale (1- array-dimensions-offset)))
                 (if (= scale 2) res nil) res (if (= scale 2) 1 scale))))))
 
-(define-vop (array-rank=)
+(define-vop ()
   (:translate %array-rank=)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))

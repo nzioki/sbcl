@@ -69,7 +69,7 @@
   (def sb-c::vector-length)
   (def make-array-header (type rank))
   (def code-instructions)
-  (def code-header-ref (code-obj index))
+  #-untagged-fdefns (def code-header-ref (code-obj index))
   (def code-header-set (code-obj index new))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
@@ -81,7 +81,6 @@
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
-  (def %code-debug-info)
   #+(or x86 x86-64) (def sb-vm::%code-fixups)
   #+x86-64 (def pointerp)
 
@@ -94,7 +93,7 @@
   (def %instance-set (instance index new-value))
   ;; funcallable instances
   (def %make-funcallable-instance)
-  (def %funcallable-instance-layout)
+  (def %fun-layout)
   (def %set-funcallable-instance-layout (fin new-value))
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
@@ -134,8 +133,10 @@
   (def stack-ref (s n))
   (def %set-stack-ref (s n value))
   (def fun-code-header)
+  (def symbol-hash)
   (def sb-vm::symbol-extra)
-  #+sb-thread (def sb-kernel:symbol-tls-index)
+  #+sb-thread (def symbol-tls-index)
+  #.(if (fboundp 'symbol-info-vector) (values) '(def symbol-info-vector))
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
   (def get-lisp-obj-address)
@@ -159,3 +160,15 @@
   (declare (explicit-check)) ; actually, not
   (declare (ignore satisfies))
   (symbol-hash* x nil))
+
+;;; TYPECASE could expand to contain a call to this function.
+;;; The interpreter can ignore it, it is just compiler magic.
+(defun sb-c::%type-constraint (var type)
+  (declare (ignore var type))
+  nil)
+(eval-when (:compile-toplevel)
+  ;; Defining %TYPE-CONSTRAINT issues a full warning because TYPE's type
+  ;; is (OR TYPE-SPECIFIER CTYPE), and TYPE-SPECIFIER is
+  ;; (OR LIST SYMBOL CLASSOID CLASS), and CLASS isn't known, and you can't
+  ;; define it because it's a standard symbol.
+  (setq sb-c::*undefined-warnings* nil))

@@ -33,7 +33,7 @@
         (error "Update (DEFUN INTERNAL-ERROR) for ~D error arguments" max))))
   `(setf (svref **internal-error-handlers** ,(error-number-or-lose name))
          (named-lambda ,(string name) (,@args)
-           (declare (optimize (sb-c::verify-arg-count 0)))
+           (declare (optimize (sb-c:verify-arg-count 0)))
            ,@body)))
 
 ;;; Backtrace code may want to know the error that caused
@@ -131,6 +131,10 @@
 
 (deferr undefined-fun-error (fdefn-or-symbol)
   (let* ((name (etypecase fdefn-or-symbol
+                 #+untagged-fdefns
+                 ((unsigned-byte 61)
+                  (fdefn-name (make-lisp-obj (logior (get-lisp-obj-address fdefn-or-symbol)
+                                                     sb-vm:other-pointer-lowtag))))
                  (symbol fdefn-or-symbol)
                  (fdefn (fdefn-name fdefn-or-symbol))))
          (condition

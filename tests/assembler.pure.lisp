@@ -19,8 +19,8 @@
 (defun test-assemble (inst expect)
   (let ((segment (sb-assem:make-segment)))
     (sb-assem:assemble (segment 'nil)
-        (apply #'sb-assem::%inst (car inst) (cdr inst)))
-    (let* ((buf (sb-assem::segment-buffer segment))
+        (apply #'sb-assem:inst* (car inst) (cdr inst)))
+    (let* ((buf (sb-assem:segment-buffer segment))
            (string
              (with-output-to-string (stream)
                (with-pinned-objects (buf)

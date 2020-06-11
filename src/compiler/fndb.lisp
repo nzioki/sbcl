@@ -285,14 +285,9 @@
 (defknown lcm (&rest integer) unsigned-byte
     (movable foldable flushable))
 
-#+sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
-(defknown exp (number) irrational
-  (movable foldable flushable recursive)
-  :derive-type #'result-type-float-contagion)
-
-#-sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (defknown exp (number) irrational
   (movable foldable flushable recursive))
+
 
 (defknown expt (number number) number
   (movable foldable flushable recursive))
@@ -308,25 +303,6 @@
 (defknown cis (real) (complex float)
   (movable foldable flushable))
 
-#+sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
-(progn
-(defknown (sin cos) (number)
-  (or (float $-1.0 $1.0) (complex float))
-  (movable foldable flushable recursive)
-  :derive-type #'result-type-float-contagion)
-
-(defknown atan
-  (number &optional real) irrational
-  (movable foldable unsafely-flushable recursive)
-  :derive-type #'result-type-float-contagion)
-
-(defknown (tan sinh cosh tanh asinh)
-  (number) irrational (movable foldable flushable recursive)
-  :derive-type #'result-type-float-contagion)
-) ; PROGN
-
-#-sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
-(progn
 (defknown (sin cos) (number)
   (or (float $-1.0 $1.0) (complex float))
   (movable foldable flushable recursive))
@@ -337,7 +313,6 @@
 
 (defknown (tan sinh cosh tanh asinh)
   (number) irrational (movable foldable flushable recursive))
-) ; PROGN
 
 (defknown (asin acos acosh atanh)
   (number) irrational
@@ -1064,8 +1039,7 @@
   (foldable flushable))
 (defknown hash-table-size (hash-table) index (flushable))
 (defknown hash-table-test (hash-table) symbol (foldable flushable))
-(defknown sxhash (t) hash (foldable flushable))
-(defknown psxhash (t &optional t) hash (foldable flushable))
+(defknown (sxhash psxhash) (t) hash-code (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
 ;; To avoid emitting code to test for nil-function-returned
 (defknown (sb-impl::signal-corrupt-hash-table
@@ -1265,16 +1239,22 @@
 
 ;;;; from the "Streams" chapter:
 
-;;; FIXME: the first 5 of these should be specified to return a particular
-;;; subtype of STREAM, just like MAKE-STRING-{INPUT,OUTPUT}-STREAM do.
-(defknown make-synonym-stream (symbol) stream (flushable))
-(defknown make-broadcast-stream (&rest stream) stream (unsafely-flushable))
-(defknown make-concatenated-stream (&rest stream) stream (unsafely-flushable))
-(defknown make-two-way-stream (stream stream) stream (unsafely-flushable))
-(defknown make-echo-stream (stream stream) stream (flushable))
+(defknown make-synonym-stream (symbol) synonym-stream (flushable))
+(defknown make-broadcast-stream (&rest stream) broadcast-stream (unsafely-flushable))
+(defknown make-concatenated-stream (&rest stream) concatenated-stream (unsafely-flushable))
+(defknown make-two-way-stream (stream stream) two-way-stream (unsafely-flushable))
+(defknown make-echo-stream (stream stream) echo-stream (flushable))
 (defknown make-string-input-stream (string &optional index sequence-end)
   sb-impl::string-input-stream
   (flushable))
+(defknown sb-impl::%init-string-input-stream (instance string &optional index sequence-end)
+  (values sb-impl::string-input-stream index &optional)
+  (flushable))
+(defknown sb-impl::%init-string-output-stream (instance t t) sb-impl::string-output-stream
+  ;; Not flushable, for two reasons:
+  ;; - possibly need to verify that the second arg is a type specifier
+  ;; - if you don't initialize the stream, then GET-OUTPUT-STRING-STREAM will crash
+  ())
 (defknown make-string-output-stream (&key (:element-type type-specifier))
   sb-impl::string-output-stream
   (flushable))
@@ -1471,7 +1451,7 @@
     ())
 (defknown sb-format::format-error* (string list &rest t &key &allow-other-keys)
     nil)
-(defknown sb-format::format-error (string &rest t) nil)
+(defknown sb-format:format-error (string &rest t) nil)
 (defknown sb-format::format-error-at* ((or null string) (or null index) string list
                                        &rest t &key &allow-other-keys)
     nil)
@@ -1662,10 +1642,12 @@
    (:verbose t)
    (:print t)
    (:external-format external-format-designator)
+   (:progress t)
 
    ;; extensions
    (:trace-file t)
    (:block-compile t)
+   (:entry-points list)
    (:emit-cfasl t))
   (values (or pathname null) boolean boolean))
 
@@ -1770,7 +1752,7 @@
 ;;; We can't fold this in general because of SATISFIES. There is a
 ;;; special optimizer anyway.
 (defknown %typep (t (or type-specifier ctype)) boolean (movable flushable))
-(defknown %instance-typep (t (or type-specifier ctype)) boolean
+(defknown %instance-typep (t (or type-specifier ctype layout)) boolean
   (movable flushable always-translatable))
 ;;; We should never emit a call to %typep-wrapper
 (defknown %typep-wrapper (t t (or type-specifier ctype)) t
@@ -1802,9 +1784,9 @@
 (defknown %unknown-values () *)
 (defknown %catch (t t) t)
 (defknown %unwind-protect (t t) t)
-(defknown (%catch-breakup %unwind-protect-breakup) () t)
-(defknown %lexical-exit-breakup (t) t)
-(defknown %continue-unwind (t t t) nil)
+(defknown (%catch-breakup %unwind-protect-breakup %lexical-exit-breakup) (t) t)
+(defknown %unwind (t t t) nil)
+(defknown %continue-unwind () nil)
 (defknown %throw (t &rest t) nil) ; This is MV-called.
 (defknown %nlx-entry (t) *)
 (defknown %%primitive (t t &rest t) *)
@@ -2065,7 +2047,7 @@
 ;;; by wiring in the needed functions instead of dereferencing their fdefns.
 (defknown (ill-in ill-bin ill-out ill-bout
            sb-impl::string-inch sb-impl::string-in-misc
-           sb-impl::string-ouch sb-impl::string-sout sb-impl::string-out-misc
+           sb-impl::string-sout
            sb-impl::finite-base-string-ouch sb-impl::finite-base-string-out-misc
            sb-impl::fill-pointer-ouch sb-impl::fill-pointer-sout
            sb-impl::fill-pointer-misc
@@ -2082,8 +2064,6 @@
 
 (defknown sb-pcl::pcl-instance-p (t) boolean
   (movable foldable flushable))
-(defknown sb-impl::new-instance-hash-code ()
-  (and unsigned-byte fixnum (not (eql 0))))
 
 ;; FIXME: should T be be (OR INSTANCE FUNCALLABLE-INSTANCE) etc?
 (defknown slot-value (t symbol) t (any))

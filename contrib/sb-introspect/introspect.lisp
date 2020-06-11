@@ -57,6 +57,8 @@
            "WHO-SPECIALIZES-GENERALLY"))
 
 (in-package :sb-introspect)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (setf (system-package-p *package*) t))
 
 ;;;; Internal interface for SBCL debug info
 
@@ -717,7 +719,6 @@ Experimental.
 ;;;; ALLOCATION INTROSPECTION
 
 (defun allocation-information (object)
-  #+sb-doc
   "Returns information about the allocation of OBJECT. Primary return value
 indicates the general type of allocation: :IMMEDIATE, :HEAP, :STACK,
 or :FOREIGN.

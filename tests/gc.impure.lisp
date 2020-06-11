@@ -101,8 +101,7 @@
 ;;; (I don't know what platforms it passes on, but at least these two it does)
 (with-test (:name :repeatably-count-allocated-objects
             :skipped-on (or (not (or :x86 :x86-64))
-                            :interpreter)
-            :fails-on (not :sb-thread))
+                            :interpreter))
   (let ((a (make-array 5)))
     (dotimes (i (length a))
       (setf (aref a i) (count-dynamic-space-objects))
@@ -323,7 +322,6 @@
              (assert (logbitp 4 type)))))))
    :all))
 
-#+64-bit ; code-serialno not defined unless 64-bit
 (with-test (:name :unique-code-serialno)
   (let ((a (make-array 100000 :element-type 'bit :initial-element 0)))
     (sb-vm:map-allocated-objects
@@ -425,3 +423,14 @@
     (sb-thread:join-thread worker-thread)
     (setq working nil)
     (sb-thread:join-thread gc-thread)))
+
+(with-test (:name :no-conses-on-large-object-pages)
+  (let* ((fun (checked-compile '(lambda (&rest params) params)))
+         (list (make-list #+gencgc (/ sb-vm:large-object-size
+                                      (sb-vm::primitive-object-size '(1))
+                                      1/2)
+                          #-gencgc 16384))
+         (rest (apply fun list)))
+    (sb-sys:with-pinned-objects (rest)
+      (sb-ext:gc :full t)
+      (assert (and (equal list rest) t)))))

@@ -56,7 +56,7 @@
   ;; The EVAL-WHEN is necessary (at least for Lispworks), because the
   ;; second DEFENUM uses the value of OTHER-IMMEDIATE-0-LOWTAG, which is
   ;; defined in the first DEFENUM. -- AL 20000216
-  #+64-bit
+  #+(and 64-bit (not ppc64))
   (defenum ()
     even-fixnum-lowtag
     other-immediate-0-lowtag
@@ -74,6 +74,24 @@
     other-immediate-3-lowtag
     pad5-lowtag
     other-pointer-lowtag)
+  #+ppc64
+  (defenum ()
+    even-fixnum-lowtag
+    other-immediate-0-lowtag
+    unused1-lowtag
+    unused2-lowtag
+    list-pointer-lowtag
+    unused3-lowtag
+    fun-pointer-lowtag
+    unused4-lowtag
+    odd-fixnum-lowtag
+    unused5-lowtag
+    unused6-lowtag
+    unused7-lowtag
+    instance-pointer-lowtag
+    unused8-lowtag
+    other-pointer-lowtag
+    unused9-lowtag)
   #-64-bit
   (defenum ()
     even-fixnum-lowtag
@@ -86,7 +104,19 @@
     other-pointer-lowtag))
 
 (defconstant nil-value
-    (+ static-space-start n-word-bytes other-pointer-lowtag))
+    (+ static-space-start
+       ;; boxed_region precedes NIL
+       ;; 8 is the number of words to reserve at the beginning of static space
+       ;; prior to the words of NIL.
+       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
+       #+(and gencgc (not sb-thread)) (ash 8 word-shift)
+       (* 2 n-word-bytes)
+       list-pointer-lowtag))
+
+;;; BOXED-REGION is address in static space at which a 'struct alloc_region'
+;;; is overlaid on a lisp vector with element type WORD.
+#-sb-thread
+(defconstant boxed-region (+ static-space-start (* 2 n-word-bytes)))
 
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
@@ -165,6 +195,7 @@
 ;; and simple vector of T to SIMPLE-VECTOR-T. Just because CL says that
 ;; SIMPLE-VECTOR means the latter doesn't make it right for SBCL internals.
 
+(defconstant widetag-spacing 4)
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defenum (;; The first widetag must be greater than SB-VM:LOWTAG-LIMIT
           ;; otherwise code in generic/early-type-vops will suffer
@@ -175,27 +206,28 @@
 ;;                             Word bits    ;  32 | 64  32 | 64
                                             ;------------------
                                             ; [ all numbers are hex ]
-  bignum-widetag                            ;  0A   11  0A   11
-  ratio-widetag                             ;  0E   15  0E   15
-  single-float-widetag                      ;  12   19  12   19
-  double-float-widetag                      ;  16   1D  16   1D
-  complex-widetag                           ;  1A   21  1A   21
-  complex-single-float-widetag              ;  1E   25  1E   25
-  complex-double-float-widetag              ;  22   29  22   29
+  bignum-widetag                            ;  0A   11  0A   11       \
+  ratio-widetag                             ;  0E   15  0E   15        |
+  single-float-widetag                      ;  12   19  12   19        |
+  double-float-widetag                      ;  16   1D  16   1D        | EQL-hash picks off this
+  complex-widetag                           ;  1A   21  1A   21        | range of widetags
+  complex-single-float-widetag              ;  1E   25  1E   25        |
+  complex-double-float-widetag              ;  22   29  22   29        |
+                                            ;                          |
+  symbol-widetag                            ;  26   2D  26   2D       /
 
-  code-header-widetag                       ;  26   2D  26   2D
+  code-header-widetag                       ;  2A   31  2A   31
 
-  simple-fun-widetag                        ;  2A   31  2A   31
-  closure-widetag                           ;  2E   35  2E   35
-  funcallable-instance-widetag              ;  32   39  32   39
+  simple-fun-widetag                        ;  2E   35  2E   35
+  closure-widetag                           ;  32   39  32   39
+  funcallable-instance-widetag              ;  36   3D  36   3D
 
   ;; x86[-64] does not have objects with this widetag,
   #+(or x86 x86-64) unused00-widetag
   #-(or x86 x86-64)
-  return-pc-widetag                         ;  36   3D  36   3D
+  return-pc-widetag                         ;  3A   41  3A   41
 
-  value-cell-widetag                        ;  3A   41  3A   41
-  symbol-widetag                            ;  3E   45  3E   45
+  value-cell-widetag                        ;  3E   45  3E   45
   character-widetag                         ;  42   49  42   49
   sap-widetag                               ;  46   4D  46   4D
   unbound-marker-widetag                    ;  4A   51  4A   51
@@ -318,11 +350,13 @@
 ;;; Note also that sb-fasteval uses 2 bits of the symbol header.
 (defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
 
+;;; Bit indices of the status bits in an INSTANCE header
+;;; that implement lazily computed stable hash codes.
+(defconstant stable-hash-required-flag 8)
+(defconstant hash-slot-present-flag    9)
+
 #+immobile-space
 (progn
-  ;; See 'doc/internal-notes/compact-instance' for rationale
-  (defconstant layout-align #+64-bit 128 #-64-bit 256) ; in bytes
-
   ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
   ;; low half of a closure header to form the full header word.
   #-sb-thread

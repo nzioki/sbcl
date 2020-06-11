@@ -70,6 +70,7 @@
            simple-fun-p
            closurep
            funcallable-instance-p
+           function-with-layout-p
            non-null-symbol-p)
     (t) boolean (movable foldable flushable))
 
@@ -96,22 +97,23 @@
 
 ;;;; miscellaneous "sub-primitives"
 
-(defknown pointer-hash (t) hash (flushable))
+(defknown pointer-hash (t) fixnum (flushable))
 
 (defknown %sp-string-compare
   (simple-string index (or null index) simple-string index (or null index))
   (values index fixnum)
   (foldable flushable))
 
-(defknown %sxhash-string (string) hash (foldable flushable))
-(defknown %sxhash-simple-string (simple-string) hash (foldable flushable))
+(defknown sb-impl::number-sxhash (number) hash-code (foldable flushable))
+(defknown %sxhash-string (string) hash-code (foldable flushable))
+(defknown %sxhash-simple-string (simple-string) hash-code (foldable flushable))
 
-(defknown (%sxhash-simple-substring) (simple-string index index) hash
+(defknown (%sxhash-simple-substring) (simple-string index index) hash-code
   (foldable flushable))
-(defknown (compute-symbol-hash) (simple-string index) hash
+(defknown (compute-symbol-hash) (simple-string index) hash-code
   (foldable flushable))
 
-(defknown symbol-hash (symbol) hash
+(defknown (symbol-hash ensure-symbol-hash) (symbol) hash-code
   (flushable movable))
 ;;; This unusual accessor will read the word at SYMBOL-HASH-SLOT in any
 ;;; object, not only symbols. The result is meaningful only if the object
@@ -121,9 +123,9 @@
 ;;; to be anything except NIL. That predicate would be IDENTITY,
 ;;; which is not terribly helpful from a code generation stance.
 (defknown symbol-hash* (t (member nil symbolp non-null-symbol-p))
-  hash (flushable movable always-translatable))
+  hash-code (flushable movable always-translatable))
 
-(defknown %set-symbol-hash (symbol hash)
+(defknown %set-symbol-hash (symbol hash-code)
   t ())
 
 (defknown symbol-info-vector (symbol) (or null simple-vector))
@@ -154,11 +156,12 @@
   (unsigned-byte #.sb-vm:n-widetag-bits)
   (flushable movable))
 
-;;; Return the data from the header of object, which for GET-HEADER-DATA
-;;; must be an other-pointer, and for FUN-HEADER-DATA a fun-pointer.
-(defknown (get-header-data fun-header-data) (t)
+;;; Return the data from the header of an OTHER-POINTER object.
+(defknown (get-header-data) (t)
     (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))
   (flushable))
+(defknown (function-header-word) (function) sb-vm:word (flushable))
+(defknown (instance-header-word) (instance) sb-vm:word (flushable))
 
 ;;; This unconventional setter returns its first arg, not the newval.
 (defknown set-header-data
@@ -168,11 +171,6 @@
 (defknown (set-header-bits unset-header-bits)
   (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (values)
   ())
-#+64-bit
-(progn
-(defknown sb-vm::get-header-data-high (t) (unsigned-byte 32) (flushable))
-(defknown sb-vm::cas-header-data-high
-    (t (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32)))
 
 (defknown %array-dimension (array index) index
   (flushable))
@@ -198,14 +196,18 @@
   () :result-arg 0)
 (defknown %instance-layout (instance) layout
   (foldable flushable))
-(defknown %funcallable-instance-layout (funcallable-instance) layout
+;;; %FUN-LAYOUT is to %INSTANCE-LAYOUT as FUN-POINTER-LOWTAG is to INSTANCE-POINTER-LOWTAG
+(defknown %fun-layout (#-compact-instance-header funcallable-instance
+                       #+compact-instance-header function)
+  layout
   (foldable flushable))
 (defknown %set-instance-layout (instance layout) layout
   ())
 (defknown %set-funcallable-instance-layout (funcallable-instance layout) layout
   ())
-(defknown %instance-length (instance) (integer 0 #.sb-vm:short-header-max-words)
-  (foldable flushable))
+;;; Caution: This is not exactly the same as instance_length() in C.
+;;; The C one is the same as SB-VM::INSTANCE-LENGTH.
+(defknown %instance-length (instance) (unsigned-byte 14) (foldable flushable))
 (defknown %instance-cas (instance index t t) t ())
 (defknown %instance-ref (instance index) t
   (flushable always-translatable))
@@ -215,10 +217,15 @@
   (always-translatable)
   :derive-type #'result-type-last-arg)
 (defknown %layout-invalid-error (t layout) nil)
+(defknown update-object-layout-or-invalid (t layout) layout)
 
-#+(or x86 x86-64)
+#+(or x86 x86-64 riscv)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
   sb-vm:word ())
+#+riscv
+(defknown %raw-instance-cas/signed-word (instance index sb-vm:signed-word sb-vm:signed-word)
+  sb-vm:signed-word ())
+
 #.`(progn
      ,@(map 'list
             (lambda (rsd)
@@ -397,7 +404,11 @@
 (defknown stack-ref (system-area-pointer index) t (flushable))
 (defknown %set-stack-ref (system-area-pointer index t) t ())
 (defknown lra-code-header (t) t (movable flushable))
-(defknown fun-code-header (t) t (movable flushable))
+;; FUN-CODE-HEADER returns NIL for assembly routines that have a simple-fun header
+;; with 0 as the data value. We should probably ensure that assembly routines
+;; referenced by tagged pointers have correct code backpointers.
+(defknown fun-code-header (simple-fun) (or code-component null)
+  (movable flushable))
 (defknown %make-lisp-obj (sb-vm:word) t (movable flushable))
 (defknown get-lisp-obj-address (t) sb-vm:word (flushable))
 
@@ -516,14 +527,14 @@
 ;;;; code/function/fdefn object manipulation routines
 
 ;;; Return a SAP pointing to the instructions part of CODE-OBJ.
-(defknown code-instructions (t) system-area-pointer (flushable movable))
+(defknown code-instructions (code-component) system-area-pointer (flushable movable))
 ;;; Extract the INDEXth element from the header of CODE-OBJ. Can be
 ;;; set with SETF.
-(defknown code-header-ref (t index) t (flushable))
-(defknown code-header-set (t index t) t ())
+(defknown code-header-ref (code-component index) t (flushable))
+(defknown code-header-set (code-component index t) t ())
 ;;; Extract a 4-byte element relative to the end of CODE-OBJ.
 ;;; The index should be strictly negative and a multiple of 4.
-(defknown code-trailer-ref (t fixnum) (unsigned-byte 32)
+(defknown code-trailer-ref (code-component fixnum) (unsigned-byte 32)
   (flushable #-(or sparc alpha hppa ppc64) always-translatable))
 
 (defknown fun-subtype (function) (member . #.sb-vm::+function-widetags+)

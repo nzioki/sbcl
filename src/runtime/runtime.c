@@ -64,18 +64,9 @@
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 
-
-#ifdef irix
-#include <string.h>
-#include "interr.h"
-#endif
-
-#ifdef SBCL_PREFIX
-char *sbcl_home = SBCL_PREFIX"/lib/sbcl/";
-#else
 static char libpath[] = "../lib/sbcl";
-char *sbcl_home;
-#endif
+char *sbcl_runtime_home;
+char *sbcl_runtime;
 
 #ifdef LISP_FEATURE_HPUX
 extern void *return_from_lisp_stub;
@@ -224,15 +215,7 @@ SBCL is free software, provided as is, with absolutely no warranty.\n\
 It is mostly in the public domain; some portions are provided under\n\
 BSD-style licenses.  See the CREDITS and COPYING files in the\n\
 distribution for more information.\n\
-"
-#ifdef LISP_FEATURE_WIN32
-"\n\
-WARNING: the Windows port is fragile, particularly for multithreaded\n\
-code.  Unfortunately, the development team currently lacks the time\n\
-and resources this platform demands.\n\
-"
-#endif
-, SBCL_VERSION_STRING);
+", SBCL_VERSION_STRING);
 }
 
 /* Look for a core file to load, first in the directory named by the
@@ -245,21 +228,38 @@ search_for_core ()
     char *lookhere;
     char *stem = "/sbcl.core";
     char *core;
+    struct stat filename_stat;
 
-    if (!(env_sbcl_home && *env_sbcl_home))
-      env_sbcl_home = sbcl_home;
+    if (!(env_sbcl_home && *env_sbcl_home) ||
+        stat(env_sbcl_home, &filename_stat))
+        env_sbcl_home = sbcl_runtime_home;
     lookhere = (char *) calloc(strlen(env_sbcl_home) +
+                               strlen(libpath) +
                                strlen(stem) +
                                1,
                                sizeof(char));
-    sprintf(lookhere, "%s%s", env_sbcl_home, stem);
+    sprintf(lookhere, "%s%s%s", env_sbcl_home, libpath, stem);
     core = copied_existing_filename_or_null(lookhere);
 
-    if (!core) {
-        lose("can't find core file at %s", lookhere);
+    if (core) {
+        free(lookhere);
+    } else {
+        free(lookhere);
+        core = copied_existing_filename_or_null ("sbcl.core");
+        if (!core) {
+            lookhere = (char *) calloc(strlen(env_sbcl_home) +
+                                       strlen(stem) +
+                                       1,
+                                       sizeof(char));
+            sprintf(lookhere, "%s%s", env_sbcl_home, stem);
+            core = copied_existing_filename_or_null (lookhere);
+            if (core) {
+                free(lookhere);
+            } else {
+                return NULL;
+            }
+        }
     }
-
-    free(lookhere);
 
     return core;
 }
@@ -368,54 +368,10 @@ parse_size_arg(char *arg, char *arg_name)
 char **posix_argv;
 char *core_string;
 
-char *saved_runtime_path = NULL;
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
 void pthreads_win32_init();
 #endif
 
-static void print_locale_variable(const char *name)
-{
-  char *value = getenv(name);
-
-  if (value) {
-    fprintf(stderr, "\n  %s=%s", name, value);
-  }
-}
-
-static void setup_locale()
-{
-  if(setlocale(LC_ALL, "") == NULL) {
-#ifndef LISP_FEATURE_WIN32
-
-    fprintf(stderr, "WARNING: Setting locale failed.\n");
-    fprintf(stderr, "  Check the following variables for correct values:");
-
-    if (setlocale(LC_CTYPE, "") == NULL) {
-      print_locale_variable("LC_ALL");
-      print_locale_variable("LC_CTYPE");
-      print_locale_variable("LANG");
-    }
-
-    if (setlocale(LC_MESSAGES, "") == NULL) {
-      print_locale_variable("LC_MESSAGES");
-    }
-    if (setlocale(LC_COLLATE, "") == NULL) {
-      print_locale_variable("LC_COLLATE");
-    }
-    if (setlocale(LC_MONETARY, "") == NULL) {
-      print_locale_variable("LC_MONETARY");
-    }
-    if (setlocale(LC_NUMERIC, "") == NULL) {
-      print_locale_variable("LC_NUMERIC");
-    }
-    if (setlocale(LC_TIME, "") == NULL) {
-      print_locale_variable("LC_TIME");
-    }
-    fprintf(stderr, "\n");
-
-#endif
-  }
-}
 static void print_environment(int argc, char *argv[])
 {
     int n = 0;
@@ -431,6 +387,33 @@ static void print_environment(int argc, char *argv[])
         ++n;
     }
 }
+
+char * sb_realpath (char *);
+char *dir_name(char *path) {
+    if (path == NULL)
+        return NULL;
+
+    char* result;
+    char slashchar =
+#ifdef LISP_FEATURE_WIN32
+        '\\';
+#else
+    '/';
+#endif
+
+    char *slash = strrchr(path, slashchar);
+
+    if (slash) {
+        int prefixlen = slash - path + 1; // keep the slash in the prefix
+        result = successful_malloc(prefixlen + 1);
+        memcpy(result, path, prefixlen);
+        result[prefixlen] = 0;
+        return result;
+    } else {
+        return NULL;
+    }
+}
+
 
 extern void write_protect_immobile_space();
 struct lisp_startup_options lisp_startup_options;
@@ -447,7 +430,6 @@ sbcl_main(int argc, char *argv[], char *envp[])
     char *core = 0;
     char **sbcl_argv = 0;
     os_vm_offset_t embedded_core_offset = 0;
-    char *runtime_path = 0;
 
     /* other command line options */
     boolean end_runtime_options = 0;
@@ -473,29 +455,23 @@ sbcl_main(int argc, char *argv[], char *envp[])
     interrupt_init();
     block_blockable_signals(0);
 
-    /* Save the argv[0] derived runtime path in case
-     * os_get_runtime_executable_path(1) isn't able to get an
-     * externally-usable path later on. */
-    saved_runtime_path = search_for_executable(argv[0]);
-
     /* Check early to see if this executable has an embedded core,
      * which also populates runtime_options if the core has runtime
      * options */
-    runtime_path = os_get_runtime_executable_path(0);
-    if (runtime_path || saved_runtime_path) {
-        os_vm_offset_t offset = search_for_embedded_core(
-            runtime_path ? runtime_path : saved_runtime_path,
-            &memsize_options);
+    if (!(sbcl_runtime = os_get_runtime_executable_path()))
+        sbcl_runtime = search_for_executable(argv[0]);
+
+    if (!(sbcl_runtime_home = dir_name(argv[0])))
+      if (!(sbcl_runtime_home = dir_name(sbcl_runtime)))
+        sbcl_runtime_home = libpath;
+
+    if (sbcl_runtime) {
+        os_vm_offset_t offset = search_for_embedded_core(sbcl_runtime, &memsize_options);
         if (offset != -1) {
             embedded_core_offset = offset;
-            core = (runtime_path ? runtime_path :
-                    copied_string(saved_runtime_path));
-        } else {
-            if (runtime_path)
-                free(runtime_path);
+            core = sbcl_runtime;
         }
     }
-
 
     /* Parse our part of the command line (aka "runtime options"),
      * stripping out those options that we handle. */
@@ -656,39 +632,24 @@ sbcl_main(int argc, char *argv[], char *envp[])
     allocate_lisp_dynamic_space(have_hardwired_spaces);
     gc_init();
 
-    setup_locale();
-
-    #ifndef SBCL_PREFIX
-    /* If built without SBCL_PREFIX defined, then set 'sbcl_home' to
-     * "<here>/../lib/sbcl/" based on how this executable was invoked. */
-    {
-        char *exename = argv[0]; // Use as-it, not truenameified
-        char *slash = strrchr(exename, '/');
-        if (!slash) {
-            sbcl_home = libpath;
-        } else {
-            int prefixlen = slash - exename + 1; // keep the slash in the prefix
-            char *tail = exename + prefixlen - 4;
-            char *suffix = libpath;
-            sbcl_home = successful_malloc(prefixlen + sizeof libpath); // sizeof incl. nul
-            // Translate "{path/}bin/sbcl" => "{path/}lib/sbcl", otherwise
-            // "{path}/sbcl" => "{path}/../lib/sbcl" so that running "./sbcl" works
-            // if sitting in "bin".
-            if (prefixlen >= 4 && !strncmp(tail, "bin/", 4)
-                // chop "bin" only if a complete word: '/' or nothing to its left.
-                && (tail-1 < exename || tail[-1] == '/')) {
-                prefixlen -= 4; // remove "bin/"
-                suffix += 3; // don't append "../"
-            }
-            memcpy(sbcl_home, exename, prefixlen);
-            strcpy(sbcl_home+prefixlen, suffix);
-        }
-    }
-    #endif
-
     /* If no core file was specified, look for one. */
-    if (!core) {
-        core = search_for_core();
+    if (!core && !(core = search_for_core())) {
+      /* Try resolving symlinks */
+      if (sbcl_runtime) {
+        free(sbcl_runtime_home);
+        char* real = sb_realpath(sbcl_runtime);
+        if (!real)
+          goto lose;
+        sbcl_runtime_home = dir_name(real);
+        free(real);
+        if (!sbcl_runtime_home)
+          goto lose;
+        if(!(core = search_for_core()))
+          goto lose;
+      } else {
+      lose:
+        lose("Can't find sbcl.core");
+      }
     }
 
     if (embedded_core_offset)

@@ -70,7 +70,7 @@
             (load-store-offset
              (- (+ #+little-endian 4
                    (ash (+ instance-slots-offset
-                           (get-dsd-index layout sb-kernel::%bits))
+                           (get-dsd-index layout sb-kernel::flags))
                         word-shift))
                 instance-pointer-lowtag))))))
 
@@ -91,16 +91,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst lsr res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -136,8 +126,7 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst and res ptr (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
-                                    n-fixnum-tag-bits) 0))))
+    (inst and res ptr (lognot fixnum-tag-mask))))
 
 ;;;; Allocation
 
@@ -248,7 +237,7 @@
     (inst brk halt-trap)))
 
 ;;;; Dummy definition for a spin-loop hint VOP
-(define-vop (spin-loop-hint)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))

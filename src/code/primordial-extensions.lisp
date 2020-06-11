@@ -274,34 +274,14 @@
 ;;; Otherwise, evaluate DEFAULT, store the resulting value in
 ;;; HASH-TABLE and return two values: 1) the result of evaluating
 ;;; DEFAULT 2) NIL.
-;;; If ATOMICP is true, perform the lookup and potential update
-;;; atomically.
-(defmacro ensure-gethash (key hash-table &optional default atomicp)
-  (check-type atomicp boolean)
+(defmacro ensure-gethash (key hash-table default)
   (with-unique-names (n-key n-hash-table value foundp)
-    (flet ((probe-and-update (&optional update)
-             `(multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
-                (if ,foundp
-                    (values ,value t)
-                    ,(or update
-                         `(values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
-      `(let ((,n-key ,key)
-             (,n-hash-table ,hash-table))
-         ,(if atomicp
-              (probe-and-update `(with-locked-system-table (,n-hash-table)
-                                   ,(probe-and-update)))
-              (probe-and-update))))))
-
-;; This is not an 'extension', but is needed super early, so ....
-(defmacro sb-xc:defconstant (name value &optional (doc nil docp))
-  "Define a global constant, saying that the value is constant and may be
-  compiled into code. If the variable already has a value, and this is not
-  EQL to the new value, the code is not portable (undefined behavior). The
-  third argument is an optional documentation string for the variable."
-  (check-designator name defconstant)
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (sb-c::%defconstant ',name ,value (sb-c:source-location)
-                         ,@(and docp `(',doc)))))
+    `(let ((,n-key ,key)
+           (,n-hash-table ,hash-table))
+       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
+         (if ,foundp
+             (values ,value t)
+             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 (defvar *!removable-symbols* nil)
 (push '("SB-INT" check-designator) *!removable-symbols*)

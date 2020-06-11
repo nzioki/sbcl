@@ -122,7 +122,7 @@
   t)
 
 (deftest find-source-stuff.4
-    (matchp (car (sb-pcl:generic-function-methods #'cl-user::two)) 4)
+    (matchp (car (sb-mop:generic-function-methods #'cl-user::two)) 4)
   t)
 
 (deftest find-source-stuff.5
@@ -384,7 +384,7 @@
 (setq sb-ext:*evaluator-mode* :compile)
 (sb-ext:defglobal *large-obj* nil)
 
-#+(and gencgc (or x86 x86-64 ppc) (not win32))
+#+(and gencgc (or riscv x86 x86-64 ppc) (not win32))
 (progn
   (setq *print-array* nil)
   (setq *large-obj* (make-array (* sb-vm:gencgc-card-bytes 4)
@@ -436,7 +436,7 @@
                ;; but the large object size can be as small as 16K.
                ;; 16K might fit in the free space of an open region,
                ;; and by accident would not go on a large object page.
-               (sb-c:allocate-code-object nil 0
+               (sb-c:allocate-code-object nil 0 0
                 (max (* 4 sb-vm:gencgc-card-bytes) #-64-bit 65536))))
       (declare (notinline format))
       (format (make-string-output-stream) "~%")

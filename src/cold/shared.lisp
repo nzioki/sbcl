@@ -120,7 +120,8 @@
 
 ;;; a function of one functional argument, which calls its functional argument
 ;;; in an environment suitable for compiling the target. (This environment
-;;; includes e.g. a suitable *FEATURES* value.)
+;;; includes e.g. a suitable *READTABLE* that looks in SB-XC:*FEATURES*
+;;; when it reads #- and #+ syntax)
 (declaim (type function *in-target-compilation-mode-fn*))
 (defvar *in-target-compilation-mode-fn*)
 
@@ -189,11 +190,14 @@
       result)))
 (compile 'read-from-file)
 
-;;; Try to minimize/conceal any non-standardness of the host Common Lisp.
-#-sbcl (load "src/cold/ansify.lisp")
+#+sbcl (let ((ext (find-package "SB-EXT")))
+         ;; prevent things from working by accident when they would not work in
+         ;; ANSI lisp, e.g. ~/print-symbol-with-prefix/ (missing SB-EXT:)
+         (when (member ext (package-use-list "CL-USER"))
+           (unuse-package ext "CL-USER")))
 
-;;;; Do not put SBCL-specific things in 'ansify'. Put them here.
-;;;; And there had better not be a reason that SBCL needs ansification.
+#+cmu
+(setq *compile-print* nil) ; too much noise, can't see the actual warnings
 #+sbcl
 (progn
   (setq *compile-print* nil)
@@ -236,12 +240,28 @@
                                       (read-from-file customizer-file-name))
                              #'identity))
              (target-feature-list (funcall customizer default-features))
+             (gc (find-if (lambda (x) (member x '(:cheneygc :gencgc)))
+                          target-feature-list))
              (arch (target-platform-keyword target-feature-list)))
-        ;; Sort the arch name to the front and de-dup the rest in case the
-        ;; command line had a redundant --with-mumble option and/or the
-        ;; customizer decided to return dups.
-        (cons arch (sort (remove-duplicates (remove arch target-feature-list))
-                         #'string<))))
+        (when (and (member :x86 target-feature-list)
+                   (member :int4-breakpoints target-feature-list))
+          ;; 0xCE is a perfectly good 32-bit instruction,
+          ;; unlike on x86-64 where it is illegal. It's therefore
+          ;; confusing to allow this feature in a 32-bit build.
+          ;; But it's annoying to have a build script that otherwise works
+          ;; for a native x86/x86-64 build except for needing one change.
+          ;; Just print something and go on with life.
+          (setq target-feature-list
+                (remove :int4-breakpoints target-feature-list))
+          (warn "Removed :INT4-BREAKPOINTS from target features"))
+        ;; Putting arch and gc choice first is visually convenient, versus
+        ;; having to parse a random place in the line to figure out the value
+        ;; of a binary choice {cheney vs gencgc} and architecture.
+        ;; De-duplicate the rest of the symbols because the command line
+        ;; can add redundant --with-mumble options.
+        (list* arch gc (sort (remove-duplicates
+                              (remove arch (remove gc target-feature-list)))
+                             #'string<))))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -267,11 +287,11 @@
 (let ((feature-compatibility-tests
        '(("(and sb-thread (not gencgc))"
           ":SB-THREAD requires :GENCGC")
-         ("(and sb-thread (not (or ppc ppc64 x86 x86-64 arm64)))"
+         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
-         ("(and cheneygc (not (or alpha arm hppa mips ppc riscv sparc)))"
+         ("(and cheneygc (not (or alpha arm arm64 hppa mips ppc riscv sparc)))"
           ":CHENEYGC not supported on selected architecture")
          ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64 riscv)))"
           ":GENCGC not supported on selected architecture")
@@ -283,11 +303,7 @@
           ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
          ("(not (or elf mach-o win32))"
           "No execute object file format feature defined")
-         ("(and sb-dynamic-core (not linkage-table))"
-          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
          ("(and cons-profiling (not sb-thread))" ":CONS-PROFILING requires :SB-THREAD")
-         ("(and sb-linkable-runtime (not sb-dynamic-core))"
-          ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
           ":SB-LINKABLE-RUNTIME not supported on selected architecture")
          ("(and sb-linkable-runtime (not (or darwin linux win32)))"
@@ -304,17 +320,12 @@
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
          ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
-         ("(and int4-breakpoints x86)"
-          ;; 0xCE is a perfectly good 32-bit instruction,
-          ;; unlike on x86-64 where it is illegal. It's therefore
-          ;; confusing to allow this feature in a 32-bit build.
-          ":INT4-BREAKPOINTS are incompatible with x86")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
-    (let ((cl:*features* sb-xc:*features*))
+    (let ((*readtable* *xc-readtable*))
       (when (read-from-string (concatenate 'string "#+" (first test) "T NIL"))
         (push (second test) failed-test-descriptions))))
   (when failed-test-descriptions
@@ -357,6 +368,11 @@
     ;; of exciting low-level information about representation selection,
     ;; VOPs used by the compiler, and bits of assembly.
     :trace-file
+    ;; meaning: The #'COMPILE-STEM argument :BLOCK-COMPILE should be
+    ;; T. That is, the entire file will be block compiled. Like
+    ;; :TRACE-FILE, this applies to all COMPILE-FILEs which support
+    ;; something like :BLOCK-COMPILE.
+    :block-compile
     ;; meaning: This file is to be processed with the SBCL assembler,
     ;; not COMPILE-FILE. (Note that this doesn't make sense unless
     ;; :NOT-HOST is also set, since the SBCL assembler doesn't exist
@@ -426,6 +442,7 @@
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.
+(export 'stem-object-path)
 (defun stem-object-path (stem flags mode)
   (multiple-value-bind (obj-prefix obj-suffix)
       (ecase mode
@@ -522,7 +539,8 @@
                          (:target-compile (if (find :assem flags)
                                               *target-assemble-file*
                                               *target-compile-file*))))
-         (trace-file (find :trace-file flags))
+         (trace-file (if (find :trace-file flags) t nil))
+         (block-compile (if (find :block-compile flags) t :specified))
          (ignore-failure-p (find :ignore-failure-p flags)))
     (declare (type function compile-file))
 
@@ -574,11 +592,26 @@
        retry-compile-file
          (multiple-value-bind (output-truename warnings-p failure-p)
              (restart-case
-                 (if trace-file
-                     (funcall compile-file src :output-file tmp-obj
-                              ;; if tracing, also show high-level progress
-                              :trace-file t :print t :allow-other-keys t)
-                     (funcall compile-file src :output-file tmp-obj))
+                 (apply compile-file src :output-file tmp-obj
+                          :block-compile (and ;; Block compilation was
+                                              ;; completely broken
+                                              ;; from the beginning of
+                                              ;; SBCL history until
+                                              ;; version 2.0.2.
+                                              #+sbcl
+                                              (or (eq mode :target-compile)
+                                                  (and (find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                                                       (funcall (find-symbol "VERSION>=" "SB-C")
+                                                                (funcall (find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                                                                         (lisp-implementation-version))
+                                                                '(2 0 2))))
+                                              block-compile)
+                          :allow-other-keys t
+                          ;; If tracing, also print, but don't specify :PRINT unless specifying
+                          ;; :TRACE-FILE so that whatever the default is for *COMPILE-PRINT*
+                          ;; prevails, insensitively to whether it's the SB-XC: or CL: symbol.
+                          (when trace-file
+                            '(:trace-file t :print t)))
                (recompile ()
                  :report report-recompile-restart
                  (go retry-compile-file)))
@@ -618,7 +651,7 @@
 (compile 'compile-stem)
 
 (defparameter *host-quirks*
-  (or #+cmu  '(:host-quirks-cmu :no-ansi-print-object)
+  (or #+cmu  '(:host-quirks-cmu)
       #+ecl  '(:host-quirks-ecl)
       #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
 

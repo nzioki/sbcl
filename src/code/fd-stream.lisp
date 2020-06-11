@@ -859,10 +859,6 @@
       (frob ef-string-to-octets-fun))
     result))
 
-(define-load-time-global *external-formats* (make-hash-table)
-  "Hashtable of all available external formats. The table maps from
-  external-format names to EXTERNAL-FORMAT structures.")
-
 (defun get-external-format-or-lose (external-format)
   (or (get-external-format external-format)
       (error "Undefined external-format: ~S" external-format)))
@@ -1676,9 +1672,9 @@
                           (tail 0)
                           (,n-buffer (make-array buffer-length
                                                  :element-type '(unsigned-byte 8)))
-                          stream)
+                          ;; For external-format-encoding-error
+                          (stream ',name))
                      (declare (type index length buffer-length tail)
-                              (type null stream)
                               (ignorable stream))
                      (with-pinned-objects (,n-buffer)
                        (let ((sap (vector-sap ,n-buffer)))
@@ -1697,8 +1693,8 @@
                            ,out-expr)))
                      ,n-buffer))))))
 
-      (let ((entry (%make-external-format
-                    :names ',external-format
+      (register-external-format
+                    ',external-format
                     :default-replacement-character ,replacement-character
                     :read-n-chars-fun #',in-function
                     :read-char-fun #',in-char-function
@@ -1716,9 +1712,7 @@
                                             (apply ',octets-to-string-sym rest))
                     :string-to-octets-fun (lambda (&rest rest)
                                             (declare (dynamic-extent rest))
-                                            (apply ',string-to-octets-sym rest)))))
-        (dolist (ef ',external-format)
-          (setf (gethash ef *external-formats*) entry))))))
+                                            (apply ',string-to-octets-sym rest))))))
 
 ;;;; utility functions (misc routines, etc)
 
@@ -2601,6 +2595,19 @@
   ;; rightly complain that *AVAILABLE-BUFFERS* is proclaimed always bound.
   (%makunbound '*available-buffers*))
 
+(defvar *streams-closed-by-slad*)
+
+(defun restore-fd-streams ()
+  (loop for (stream in bin n-bin out bout sout misc) in *streams-closed-by-slad*
+        do
+        (setf (ansi-stream-in stream) in)
+        (setf (ansi-stream-bin stream) bin)
+        (setf (ansi-stream-n-bin stream) n-bin)
+        (setf (ansi-stream-out stream) out)
+        (setf (ansi-stream-bout stream) bout)
+        (setf (ansi-stream-sout stream) sout)
+        (setf (ansi-stream-misc stream) misc)))
+
 (defun stdstream-external-format (fd)
   #-win32 (declare (ignore fd))
   (let* ((keyword (cond #+(and win32 sb-unicode)
@@ -2619,7 +2626,7 @@
     ;; BOUNDP on a known global transforms to the constant T.
     (aver (not (%boundp '*available-buffers*)))
     (setf *available-buffers* nil))
-  (with-simple-output-to-string (*error-output*)
+  (%with-output-to-string (*error-output*)
     (multiple-value-bind (in out err)
         #-win32 (values 0 1 2)
         #+win32 (sb-win32::get-std-handles)

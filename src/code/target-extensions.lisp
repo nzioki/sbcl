@@ -17,10 +17,9 @@
 
 (in-package "SB-IMPL")
 
-;;; like (DELETE .. :TEST #'EQ):
-;;;   Delete all LIST entries EQ to ITEM (destructively modifying
-;;;   LIST), and return the modified LIST.
 (defun delq (item list)
+  "Delete all LIST entries EQ to ITEM (destructively modifying LIST),
+and return the modified LIST."
   (declare (explicit-check))
   (let ((list list))
     (do ((x list (cdr x))
@@ -32,14 +31,10 @@
                  (rplacd splice (cdr x))))
             (t (setq splice x)))))) ; Move splice along to include element.
 
-;;; like (POSITION .. :TEST #'EQ):
-;;;   Return the position of the first element EQ to ITEM.
 (defun posq (item list)
-  (do ((i list (cdr i))
-       (j 0 (1+ j)))
-      ((null i))
-    (when (eq (car i) item)
-      (return j))))
+  "Return the position of the first element EQ to ITEM."
+  (declare (inline position))
+  (position item list :test #'eq))
 
 (defun interned-symbol-p (x) (and (symbolp x) (symbol-package x)))
 
@@ -186,9 +181,11 @@ unspecified."
   ;; Needless to say, this also excludes some internal bits, but
   ;; getting there is too much detail when "unspecified" says what
   ;; is important -- unpredictable, but harmless.
-  `(sb-thread::with-recursive-lock ((hash-table-lock ,hash-table))
+  `(sb-thread:with-recursive-lock ((hash-table-lock ,hash-table))
      ,@body))
 
+;;; This macro is horrible (because WITH-RECURSIVE-SYSTEM-LOCK is).
+;;; So PLEASE don't use it, if at all possible.
 (defmacro with-locked-system-table ((hash-table) &body body)
   `(sb-thread::with-recursive-system-lock
        ((hash-table-lock ,hash-table))

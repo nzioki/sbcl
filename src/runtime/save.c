@@ -35,7 +35,7 @@
 #include "gc-internal.h"
 #include "thread.h"
 #include "arch.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "genesis/vector.h"
@@ -188,10 +188,23 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
 
     bytes = words * sizeof(lispobj);
 
+#ifdef LISP_FEATURE_CHENEYGC
+    /* KLUDGE: cheneygc can not restart a saved core if the dynamic space is empty,
+     * because coreparse would never get to make the second semispace. That GC is such
+     * a total piece of garbage that I don't care to fix, but yet it shouldn't be in
+     * such bad shape that saved cores don't work. This seems to do the trick. */
+    if (id == DYNAMIC_CORE_SPACE_ID && bytes == 0) bytes = 2*N_WORD_BYTES;
+#endif
+
     if (!lisp_startup_options.noinform)
         printf("writing %lu bytes from the %s space at %p\n",
                (long unsigned)bytes, names[id], addr);
 
+    /* FIXME: it sure would be nice to discover and document the behavior of this function
+     * with regard to aligning up the byte count as pertains to bytes spanned by a rounded
+     * up count that were not zeroized and would not have been written had we not rounded.
+     * That seems quite bogus to operate on bytes that the caller didn't promise were OK
+     * to be saved out (and didn't contain, say, a password and social security number) */
     data = write_bytes(file, (char *)addr, ALIGN_UP(bytes, os_vm_page_size),
                        file_offset, core_compression_level);
 
@@ -489,8 +502,7 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
                 size_t *runtime_size)
 {
     FILE *file;
-    char *runtime_path;
-    extern char *saved_runtime_path; // path computed from argv[0]
+    extern char *sbcl_runtime;
 
     // SB-IMPL::DEINIT already checked for exactly 1 thread,
     // so this really shouldn't happen.
@@ -500,19 +512,11 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
     }
 
     if (prepend_runtime) {
-        runtime_path = os_get_runtime_executable_path(0);
-
-        if (runtime_path == NULL && saved_runtime_path == NULL) {
+        if (!sbcl_runtime) {
             fprintf(stderr, "Unable to get default runtime path.\n");
             return NULL;
         }
-
-        if (runtime_path == NULL)
-            *runtime_bytes = load_runtime(saved_runtime_path, runtime_size);
-        else {
-            *runtime_bytes = load_runtime(runtime_path, runtime_size);
-            free(runtime_path);
-        }
+        *runtime_bytes = load_runtime(sbcl_runtime, runtime_size);
 
         if (*runtime_bytes == NULL)
             return 0;
@@ -550,6 +554,7 @@ save(char *filename, lispobj init_function, boolean prepend_runtime,
      * too late to remove old references from the binding stack.
      * There's probably no safe way to do that from Lisp */
     unwind_binding_stack();
+    os_unlink_runtime();
     return save_to_filehandle(file, filename, init_function, prepend_runtime,
                               save_runtime_options,
                               compressed ? compressed : COMPRESSION_LEVEL_NONE);

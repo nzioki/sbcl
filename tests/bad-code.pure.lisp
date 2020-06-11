@@ -492,3 +492,49 @@
                `(lambda (x)
                   (make-array 10 (list x) x))
                :allow-warnings t))))
+
+(with-test (:name :unused-local-functions)
+  (labels ((find-note (x)
+             (loop for note in (nth-value 4 (checked-compile x))
+                   thereis (and (typep note 'sb-ext:code-deletion-note)
+                                (eql (search "deleting unused function"
+                                             (princ-to-string note))
+                                     0))))
+           (check (f)
+             (assert (find-note `(lambda () (flet (,f)))))
+             (assert (not (find-note `(lambda (x)
+                                        (flet (,f)
+                                          (and x (not x) (f)))))))))
+    (check '(f ()))
+    (check '(f (&key)))
+    (check '(f (&key k) k))
+    (check '(f (&rest args) args))
+    (check '(f (&optional o) o))
+    (check '(f (&optional)))))
+
+(with-test (:name :calling-ignored-local)
+  (assert
+   (nth-value 3
+              (checked-compile
+               `(lambda ()
+                  (flet ((f ()))
+                    (declare (ignore #'f))
+                    (f)))
+               :allow-style-warnings t))))
+
+(with-test (:name :inapprorate-declare)
+  (assert
+   (nth-value 5
+              (checked-compile
+               `(lambda (x y) (print-unreadable-object (x y) (declare (optimize))))
+               :allow-failure t)))
+  (assert
+   (nth-value 5
+              (checked-compile
+               `(lambda () (restart-bind () (declare (optimize)) 42))
+               :allow-failure t)))
+  (assert
+   (nth-value 5
+              (checked-compile
+               `(lambda () (prog1 10 (declare (optimize))))
+               :allow-failure t))))

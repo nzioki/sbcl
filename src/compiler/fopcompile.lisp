@@ -193,7 +193,8 @@
                   ;; as dumpable literals.
                   (and (eq function 'sb-impl::%defun) (fopcompilable-p (fourth form)))
                   (member function '(sb-pcl::!trivial-defmethod
-                                     sb-kernel::%defstruct))
+                                     sb-kernel::%defstruct
+                                     sb-thread:make-mutex))
                   ;; allow DEF{CONSTANT,PARAMETER} only if the value form is ok
                   (and (member function '(%defconstant sb-impl::%defparameter))
                        (fopcompilable-p (third form)))
@@ -357,19 +358,20 @@
                        (fopcompile `(symbol-global-value ',form) path for-value-p))
                       (t
                        ;; Lexical
-                       (let* ((lambda-var (cdr (assoc form (lexenv-vars *lexenv*))))
-                              (handle (when lambda-var
-                                        (lambda-var-fop-value lambda-var))))
+                       (let* ((var (cdr (assoc form (lexenv-vars *lexenv*))))
+                              (handle (and (lambda-var-p var)
+                                           (lambda-var-fop-value var))))
                          (cond (handle
-                                (setf (lambda-var-ever-used lambda-var) t)
+                                (setf (lambda-var-ever-used var) t)
                                 (when for-value-p
                                   (sb-fasl::dump-push handle fasl)))
                                (t
-                                ;; Undefined variable. Signal a warning, and
-                                ;; treat it as a special variable reference, like
-                                ;; the real compiler does -- do not elide even if
-                                ;; the value is unused.
-                                (note-undefined-reference form :variable)
+                                (unless var
+                                  ;; Undefined variable. Signal a warning, and
+                                  ;; treat it as a special variable reference, like
+                                  ;; the real compiler does -- do not elide even if
+                                  ;; the value is unused.
+                                  (note-undefined-reference form :variable))
                                 (fopcompile `(symbol-value ',form)
                                             path
                                             for-value-p))))))))))
@@ -466,7 +468,8 @@
                                      :file-position
                                      (nth-value 1 (find-source-root tlf *source-info*))
                                      :original-source-path (source-path-original-source path)
-                                     :lexenv *lexenv*)))
+                                     :handled-conditions
+                                     (lexenv-handled-conditions *lexenv*))))
                              (note-unreferenced-vars vars *policy*)))))
                       ;; Otherwise it must be an ordinary funcall.
                       (otherwise

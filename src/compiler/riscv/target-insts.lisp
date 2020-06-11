@@ -28,9 +28,9 @@ Otherwise, use the RISC-V register names")
 
 ;; FIXME: Can this be a property of DSTATE instead?
 (defvar *note-u-inst* (make-array 32 :initial-element nil)
-  "An map for the disassembler indicating the target register and
-value used in a u-type instruction.  This is used to make annotations
-about function addresses and register values.")
+  "A map for the disassembler indicating the target register and value
+used in a u-type instruction.  This is used to make annotations about
+function addresses and register values.")
 
 (defconstant-eqx lisp-reg-symbols
   (map 'vector
@@ -140,6 +140,24 @@ about function addresses and register values.")
   (princ (aref #(rne rtz rdn rup rmm unused1 unused2 dynamic)
                value)
          stream))
+
+(defun print-a-ordering (value stream dstate)
+  (declare (ignore dstate)
+           (stream stream)
+           (type (unsigned-byte 2) value))
+  (when (logbitp 0 value)
+    (princ 'aq stream)
+    (princ #\Space stream))
+  (when (logbitp 1 value)
+    (princ 'rl stream)))
+
+(defun print-fence-ordering (value stream dstate)
+  (declare (ignore dstate)
+           (stream stream)
+           (type (unsigned-byte 4) value))
+  (dotimes (index 4)
+    (when (logbitp (- 3 index) value)
+      (princ (aref #(i o r w) index) stream))))
 
 (defun maybe-augment (rd i-imm)
   (+ (ash (or (aref *note-u-inst* rd) 0) 12)

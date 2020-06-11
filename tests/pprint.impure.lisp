@@ -287,8 +287,7 @@
                        (*print-pretty* t))
                    (format nil "~@<~S~:>" (make-instance 'frob))))))
 
-(with-test (:name :pprint-logical-block-code-deletion-node
-                  :skipped-on (not :stack-allocatable-closures))
+(with-test (:name :pprint-logical-block-code-deletion-node)
   (handler-case
       (compile nil
                `(lambda (words &key a b c)
@@ -449,5 +448,19 @@
   (assert (= (sb-pretty::macro-indentation 'try4) 2))
   (assert (= (sb-pretty::macro-indentation 'try5) 2))
   (assert (= (sb-pretty::macro-indentation 'try6) 3)))
+
+(defclass ship () ())
+(let ((ppd (copy-pprint-dispatch)))
+  (set-pprint-dispatch 'integer
+                       (lambda (stream obj)
+                         (let ((*print-pretty* nil))
+                           (format stream "[[~d]]" obj)))
+                       1
+                       ppd)
+  (let ((string (write-to-string (make-instance 'ship)
+                                 :pprint-dispatch ppd
+                                 :pretty t)))
+    ;; Do not want to see "#<SHIP {[[decimal-integer]]}>"
+    (assert (not (search "{[[" string)))))
 
 ;;; success

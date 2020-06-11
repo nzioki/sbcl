@@ -31,46 +31,11 @@
   (def))
 
 ;;; Is X an extended sequence?
-;; This is like the "hierarchical layout depths for other things"
-;; case of the TYPEP transform (cf 'typetran'). Ideally it would
-;; be preferable to share TYPEP's code rather than repeat it here.
 (declaim (maybe-inline extended-sequence-p))
-(defun extended-sequence-p (x)
-  (let* ((slayout #.(info :type :compiler-layout 'sequence))
-         (depthoid #.(layout-depthoid (info :type :compiler-layout 'sequence)))
-         (layout
-          ;; It is not an error to define a class that is both SEQUENCE and
-          ;; FUNCALLABLE-INSTANCE with metaclass FUNCALLABLE-STANDARD-CLASS
-          (cond ((%instancep x) (%instance-layout x))
-                ((funcallable-instance-p x) (%funcallable-instance-layout x))
-                (t (return-from extended-sequence-p nil)))))
-    (when (layout-invalid layout)
-      (setq layout (update-object-layout-or-invalid x slayout)))
-    ;; It's _nearly_ impossible to create an instance which is exactly
-    ;; of type SEQUENCE. To wit: (make-instance 'sequence) =>
-    ;;   "Cannot allocate an instance of #<BUILT-IN-CLASS SEQUENCE>."
-    ;; We should not need to check for that, just the 'inherits' vector.
-    ;; However, bootstrap code does a sleazy thing, making an instance of
-    ;; the abstract base type which is impossible for user code to do.
-    ;; Preferably the prototype instance for SEQUENCE would be one that could
-    ;; exist, so it would be a STANDARD-OBJECT and SEQUENCE. But it's not.
-    ;; Hence we have to check for a layout that no code using the documented
-    ;; sequence API would ever see, just to get the boundary case right.
-    ;; Note also:
-    ;; - Some builtins use a prototype object that is strictly deeper than
-    ;;   layout of the named class because it is indeed the case that no
-    ;;   object's layout can ever be EQ to that of the ancestor.
-    ;;   e.g. a fixnum as representative of class REAL
-    ;; - Some builtins actually fail (TYPEP (CLASS-PROTOTYPE X) X)
-    ;;   but that's not an excuse for getting SEQUENCE wrong:
-    ;;    (CLASS-PROTOTYPE (FIND-CLASS 'FLOAT)) => 42
-    ;;    (CLASS-PROTOTYPE (FIND-CLASS 'VECTOR)) => 42
-    ;;    (CLASS-PROTOTYPE (FIND-CLASS 'LIST)) => 42
-    ;;    (CLASS-PROTOTYPE (FIND-CLASS 'STRING)) => 42
-    (let ((inherits (layout-inherits (truly-the layout layout))))
-      (declare (optimize (safety 0)))
-      (eq (if (> (length inherits) depthoid) (svref inherits depthoid) layout)
-          slayout))))
+(defun extended-sequence-p (sb-c::object) ; name the argugment as required by transform
+  (macrolet ((transform ()
+               (sb-c::transform-instance-typep (find-classoid 'sequence))))
+    (transform)))
 
 ;;; Is X a SEQUENCE?  Harder than just (OR VECTOR LIST)
 (defun sequencep (x)
@@ -219,7 +184,7 @@
 (defun layout-of (x)
   (declare (optimize (speed 3) (safety 0)))
   (cond ((%instancep x) (%instance-layout x))
-        ((funcallable-instance-p x) (%funcallable-instance-layout x))
+        ((funcallable-instance-p x) (%fun-layout x))
         ;; Compiler can dump literal layouts, which handily sidesteps
         ;; the question of when cold-init runs L-T-V forms.
         ((null x) #.(find-layout 'null))
@@ -393,6 +358,11 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                          (equal-aux (cdr x) (cdr y))))
                    ((stringp x)
                     (and (stringp y) (string= x y)))
+                   ;; We could remove this case by ensuring that MAKE-PATHNAME,
+                   ;; PARSE-NAMESTRING, MERGE-PATHNAME, etc look in a weak hash-based
+                   ;; thing first for an EQUAL pathname, ensuring that if two pathnames
+                   ;; are EQUAL then they are EQ. That would elide this test at the
+                   ;; expense of pathname construction which seems like a good tradeoff.
                    ((pathnamep x)
                     (and (pathnamep y) (pathname= x y)))
                    ((bit-vector-p x)
@@ -417,11 +387,11 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
            (equal x y)))))
 
 ;;; EQUALP comparison of HASH-TABLE values
+;;; Can be called only if both X and Y are definitely hash-tables.
 (defun hash-table-equalp (x y)
-  (declare (type hash-table x y))
+  (declare (type hash-table x y) (explicit-check))
   (or (eq x y)
-      (and (hash-table-p y)
-           (eql (hash-table-count x) (hash-table-count y))
+      (and (eql (hash-table-count x) (hash-table-count y))
            (eql (hash-table-test x) (hash-table-test y))
            (block comparison-of-entries
              (maphash (lambda (key x-value)
@@ -432,31 +402,25 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                       x)
              t))))
 
-(declaim (inline instance-equalp))
+(macrolet ((slot-ref-equalp ()
+             `(let ((x-el (%instance-ref x i))
+                    (y-el (%instance-ref y i)))
+                (or (eq x-el y-el) (equalp x-el y-el)))))
 (defun instance-equalp (x y)
-  (let ((layout-x (%instance-layout x)))
-    (and
-     (eq layout-x (%instance-layout y))
-     (logtest +structure-layout-flag+ (layout-%bits layout-x))
-     (macrolet ((slot-ref-equalp ()
-                  `(let ((x-el (%instance-ref x i))
-                         (y-el (%instance-ref y i)))
-                     (or (eq x-el y-el) (equalp x-el y-el)))))
-       (let ((n (%instance-length x)))
-         (if (eql (layout-bitmap layout-x) sb-kernel:+layout-all-tagged+)
-             (loop for i downfrom (1- n) to sb-vm:instance-data-start
-                   always (slot-ref-equalp))
-             (let ((comparators (layout-equalp-tests layout-x)))
-               (unless (= (length comparators) (- n sb-vm:instance-data-start))
-                 (bug "EQUALP got incomplete instance layout"))
-               ;; See remark at the source code for %TARGET-DEFSTRUCT
-               ;; explaining how to use the vector of comparators.
-               (loop for i downfrom (1- n) to sb-vm:instance-data-start
-                     for test = (data-vector-ref
-                                 comparators (- i sb-vm:instance-data-start))
-                     always (cond ((eql test 0) (slot-ref-equalp))
-                                  ((functionp test) (funcall test i x y))
-                                  (t))))))))))
+  (declare (optimize (safety 0)))
+  (loop for i downfrom (1- (%instance-length x)) to sb-vm:instance-data-start
+        always (slot-ref-equalp)))
+(defun instance-equalp* (comparators x y)
+  (declare (optimize (safety 0))
+           (simple-vector comparators)
+           (type instance x y))
+  ;; See remark at the source code for %TARGET-DEFSTRUCT
+  ;; explaining how to use the vector of comparators.
+  (loop for i downfrom (1- (%instance-length x)) to sb-vm:instance-data-start
+        for test = (data-vector-ref comparators (- i sb-vm:instance-data-start))
+        always (cond ((eql test 0) (slot-ref-equalp))
+                     ((functionp test) (funcall test i x y))
+                     (t)))))
 
 ;;; Doesn't work on simple vectors
 (defun array-equalp (x y)
@@ -503,13 +467,12 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                                 (equalp x-el y-el)))))))))
 
 (defun equalp (x y)
-  #+nil ; KLUDGE: If doc string, should be accurate: Talk about structures
-  ; and HASH-TABLEs.
-  "This is like EQUAL, except more liberal in several respects.
+  "Just like EQUAL, but more liberal in several respects.
   Numbers may be of different types, as long as the values are identical
   after coercion. Characters may differ in alphabetic case. Vectors and
   arrays must have identical dimensions and EQUALP elements, but may differ
-  in their type restriction."
+  in their type restriction. The elements of structured components
+  are compared with EQUALP."
   (cond ((eq x y) t)
         ((characterp x) (and (characterp y) (char-equal x y)))
         ((numberp x) (and (numberp y) (= x y)))
@@ -517,14 +480,12 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
          (and (consp y)
               (equalp (car x) (car y))
               (equalp (cdr x) (cdr y))))
-        ((pathnamep x)
-         (and (pathnamep y) (pathname= x y)))
-        ((hash-table-p x)
-         (and (hash-table-p y)
-              (hash-table-equalp x y)))
         ((%instancep x)
          (and (%instancep y)
-              (instance-equalp x y)))
+              (let ((layout (%instance-layout x)))
+                (and (logtest +structure-layout-flag+ (layout-flags layout))
+                     (eq (%instance-layout y) layout)
+                     (funcall (layout-equalp-impl layout) x y)))))
         ((and (simple-vector-p x) (simple-vector-p y))
          (let ((len (length x)))
            (and (= len (length y))

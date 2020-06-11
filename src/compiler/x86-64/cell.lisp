@@ -358,13 +358,34 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
+  (:args-var args)
   (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
     ;; The symbol-hash slot of NIL holds NIL because it is also the
     ;; car slot, so we have to zero the fixnum tag bit(s) to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
+    (unless (not-nil-tn-ref-p args)
+      (inst and res (lognot fixnum-tag-mask)))))
+
+;;; Combine SYMBOL-HASH and the lisp fallback code into one vop.
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate ensure-symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:vop-var vop)
+  (:generator 5
+    (when (location= res symbol) (move temp-reg-tn symbol)) ; save a backup
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (inst and res (lognot fixnum-tag-mask))))
+    (inst test :dword res res)
+    (inst jmp :ne good)
+    (inst push (if (location= res symbol) temp-reg-tn symbol))
+    (invoke-asm-routine 'call 'ensure-symbol-hash vop)
+    (inst pop res)
+    GOOD
+    (inst and res (lognot fixnum-tag-mask)))) ; redundant (but ok) if asm routine used
 
 (eval-when (:compile-toplevel)
   ;; assumption: any object can be read 1 word past its base pointer
@@ -679,18 +700,18 @@
 
 ;;;; structure hackery
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  ;; Explicitly fixnumizing admits a 32-bit left-shift which might encode
-  ;; in 1 less byte. (Other backends return an UNSIGNED-REG here.)
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (inst movzx '(:word :dword) res (ea (1+ (- instance-pointer-lowtag)) struct))
-    (inst and :dword res short-header-max-words) ; clear special GC bit
-    (inst shl :dword res n-fixnum-tag-bits)))
+    (inst mov :dword res (ea (- instance-pointer-lowtag) struct))
+    ;; Returning fixnum/any-reg elides some REX prefixes due to the shifts
+    ;; being small. Maybe the asm optimizer could figure it out now?
+    (inst shr :dword res (- instance-length-shift n-fixnum-tag-bits))
+    (inst and :dword res (fixnumize instance-length-mask))))
 
 #+compact-instance-header
 (progn
@@ -709,24 +730,21 @@
    (:args (object :scs (descriptor-reg))
           (value :scs (any-reg descriptor-reg) :target res))
    (:results (res :scs (any-reg descriptor-reg)))
-   (:variant-vars lowtag)
-   (:variant instance-pointer-lowtag)
    (:vop-var vop)
-   (:generator 2 ; underestimates cost, but irrelevant as there's no choice
-    (cond ((= lowtag fun-pointer-lowtag)
-           (pseudo-atomic ()
-             (inst push object)
-             (invoke-asm-routine 'call 'touch-gc-card vop)
-             (inst mov :dword (ea (- 4 lowtag) object) value)))
-          (t
-           (inst mov :dword (ea (- 4 lowtag) object) value)))
-    (move res value)))
- (define-vop (%funcallable-instance-layout %instance-layout)
-   (:translate %funcallable-instance-layout)
+   (:generator 1
+     (inst mov :dword (ea (- 4 instance-pointer-lowtag) object) value)
+     (move res value)))
+ (define-vop (%fun-layout %instance-layout)
+   (:translate %fun-layout)
    (:variant fun-pointer-lowtag))
  (define-vop (%set-funcallable-instance-layout %set-instance-layout)
    (:translate %set-funcallable-instance-layout)
-   (:variant fun-pointer-lowtag)))
+   (:generator 50
+     (pseudo-atomic ()
+       (inst push object)
+       (invoke-asm-routine 'call 'touch-gc-card vop)
+       (inst mov :dword (ea (- 4 fun-pointer-lowtag) object) value))
+     (move res value))))
 
 (define-full-reffer instance-index-ref * instance-slots-offset
   instance-pointer-lowtag (any-reg descriptor-reg) * %instance-ref)
@@ -746,7 +764,7 @@
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (any-reg descriptor-reg) * code-header-ref)
 
-;; CODE-HEADER-SET of a constant index is never used, so we specifically
+;; CODE-HEADER-SET of a constant index is seldom used, so we specifically
 ;; ask not to get it defined. (It's not impossible to use, it's just not
 ;; helpful to have - either you want to access CODE-FIXUPS or CODE-DEBUG-INFO,
 ;; which do things their own way, or you want a variable index.)
@@ -767,7 +785,7 @@
                      (- instance-pointer-lowtag))
                   object index (ash 1 (- word-shift n-fixnum-tag-bits)))))))
   (macrolet
-      ((def (suffix result-sc result-type inst &optional (inst/c inst))
+      ((def (suffix result-sc result-type inst &optional (inst/c (list 'quote inst)))
          `(progn
             (define-vop (,(symbolicate "RAW-INSTANCE-REF/" suffix))
               (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
@@ -791,7 +809,7 @@
               (:results (value :scs (,result-sc)))
               (:result-types ,result-type)
               (:generator 4
-                (inst ,inst/c value (instance-slot-ea object index))))
+                (inst* ,inst/c value (instance-slot-ea object index))))
             (define-vop (,(symbolicate "RAW-INSTANCE-SET/" suffix))
               (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
               (:policy :fast-safe)
@@ -817,7 +835,7 @@
               (:results (result :scs (,result-sc)))
               (:result-types ,result-type)
               (:generator 4
-                (inst ,inst/c (instance-slot-ea object index) value)
+                (inst* ,inst/c (instance-slot-ea object index) value)
                 (move result value)))
             (define-vop (,(symbolicate "RAW-INSTANCE-INIT/" suffix))
               (:args (object :scs (descriptor-reg))
@@ -825,7 +843,7 @@
               (:arg-types * ,result-type)
               (:info index)
               (:generator 4
-                (inst ,inst/c (instance-slot-ea object index) value))))))
+                (inst* ,inst/c (instance-slot-ea object index) value))))))
     (def word unsigned-reg unsigned-num mov)
     (def signed-word signed-reg signed-num mov)
     (def single single-reg single-float movss)

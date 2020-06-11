@@ -13,7 +13,6 @@
            sb-vm:instance-widetag sb-vm:instance-pointer-lowtag
            nil)
 
-#+stack-allocatable-fixed-objects
 (defoptimizer (%make-structure-instance stack-allocate-result)
     ((defstruct-description &rest args) node dx)
   (declare (ignore args dx))
@@ -30,10 +29,13 @@
          (dd-slots (lvar-value defstruct-description)))
   #+(and :gencgc :c-stack-is-control-stack)
   t)
-#+(or x86 x86-64)
+
 (defoptimizer (%make-instance stack-allocate-result) ((n) node dx)
-  (declare (ignore n dx))
-  t)
+  (declare (ignore n))
+  (eq dx 'truly-dynamic-extent))
+(defoptimizer (%make-funcallable-instance stack-allocate-result) ((n) node dx)
+  (declare (ignore n))
+  (eq dx 'truly-dynamic-extent))
 
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
   (let* ((lvar (node-lvar node))
@@ -314,12 +316,10 @@
                  node block (list value-tn) (node-lvar node))))))))
 
 ;;; Stack allocation optimizers per platform support
-#+stack-allocatable-vectors
-(progn
-  (defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
     args dx
     t)
-  (defoptimizer (allocate-vector stack-allocate-result)
+(defoptimizer (allocate-vector stack-allocate-result)
       ((type length words) node dx)
     (declare (ignorable type) (ignore length))
     (and
@@ -339,35 +339,31 @@
                           (specifier-type
                            `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
                                            sb-vm:vector-data-offset)))))))
-
-  (defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
+(defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
     (declare (ignore type length words))
     (vectorish-ltn-annotate-helper call ltn-policy
                                    'sb-vm::allocate-vector-on-stack
                                    'sb-vm::allocate-vector-on-heap))
 
-  (defun vectorish-ltn-annotate-helper (call ltn-policy dx-template &optional not-dx-template)
+(defun vectorish-ltn-annotate-helper (call ltn-policy dx-template not-dx-template)
     (let* ((args (basic-combination-args call))
            (template-name (if (node-stack-allocate-p call)
                               dx-template
                               not-dx-template))
-           (template (and template-name
-                          (template-or-lose template-name))))
+           (template (template-or-lose template-name)))
       (dolist (arg args)
         (setf (lvar-info arg)
               (make-ir2-lvar (primitive-type (lvar-type arg)))))
-      (unless (and template
-                   (is-ok-template-use template call (ltn-policy-safe-p ltn-policy)))
+      (unless (is-ok-template-use template call (ltn-policy-safe-p ltn-policy))
         (ltn-default-call call)
         (return-from vectorish-ltn-annotate-helper (values)))
       (setf (basic-combination-info call) template)
       (setf (node-tail-p call) nil)
 
       (dolist (arg args)
-        (annotate-1-value-lvar arg)))))
+        (annotate-1-value-lvar arg))))
 
 ;;; ...lists
-#+stack-allocatable-lists
 (progn
   (defoptimizer (list stack-allocate-result) ((&rest args) node dx)
     (declare (ignore dx))
@@ -380,14 +376,12 @@
     t))
 
 ;;; ...conses
-#+stack-allocatable-fixed-objects
-(progn
-  (defoptimizer (cons stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (cons stack-allocate-result) ((&rest args) node dx)
     (declare (ignore args dx))
     t)
-  (defoptimizer (%make-complex stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (%make-complex stack-allocate-result) ((&rest args) node dx)
     (declare (ignore args dx))
-    t))
+    t)
 
 ;;; MAKE-LIST optimizations
 #+x86-64
@@ -407,7 +401,8 @@
   (defoptimizer (%make-list ltn-annotate) ((length element) call ltn-policy)
     (declare (ignore length element))
     (vectorish-ltn-annotate-helper call ltn-policy
-                                   'sb-vm::allocate-list-on-stack)))
+                                   'sb-vm::allocate-list-on-stack
+                                   'sb-vm::allocate-list-on-heap)))
 
 
 (in-package "SB-VM")

@@ -26,12 +26,13 @@
 #include "immobile-space.h"
 #include "hopscotch.h"
 #include "code.h"
+#include "getallocptr.h"
 
 static boolean gcable_pointer_p(lispobj pointer)
 {
 #ifdef LISP_FEATURE_CHENEYGC
    return pointer >= (lispobj)current_dynamic_space
-       && pointer < (lispobj)dynamic_space_free_pointer;
+       && pointer < (lispobj)get_alloc_pointer();
 #endif
 #ifdef LISP_FEATURE_GENCGC
    return find_page_index((void*)pointer) >= 0 || immobile_space_p(pointer);
@@ -156,13 +157,9 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
     sword_t nwords, i;
 
     for ( ; where < limit ; where = next ) {
-        lispobj header = *where;
-        if (is_cons_half(header)) {
-            coalesce_obj(where+0, ht);
-            coalesce_obj(where+1, ht);
-            next = where + 2;
-        } else {
-            int widetag = header_widetag(header);
+        lispobj word = *where;
+        if (is_header(word)) {
+            int widetag = header_widetag(word);
             nwords = sizetab[widetag](where);
             next = where + nwords;
             switch (widetag) {
@@ -185,6 +182,10 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
             }
             for(i=1; i<nwords; ++i)
                 coalesce_obj(where+i, ht);
+        } else {
+            coalesce_obj(where+0, ht);
+            coalesce_obj(where+1, ht);
+            next = where + 2;
         }
     }
     return 0;
@@ -216,7 +217,7 @@ void coalesce_similar_objects()
 #ifdef LISP_FEATURE_GENCGC
     walk_generation(coalesce_range, -1, arg);
 #else
-    coalesce_range(current_dynamic_space, dynamic_space_free_pointer, arg);
+    coalesce_range(current_dynamic_space, get_alloc_pointer(), arg);
 #endif
     hopscotch_destroy(&ht);
 }

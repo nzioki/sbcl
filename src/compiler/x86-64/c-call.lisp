@@ -230,7 +230,6 @@
   (:generator 2
    (inst mov res (make-fixup foreign-symbol :foreign))))
 
-#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -282,7 +281,6 @@
 
 ;;; Calls to C can generally be made without loading a register
 ;;; with the function. We receive the function name as an info argument.
-#+sb-dynamic-core ;; broken when calling ldso-stubs
 (define-vop (call-out-named)
   (:args (args :more t))
   (:results (results :more t))
@@ -536,7 +534,7 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let ((buffer (sb-assem::segment-buffer segment)))
+      (let ((buffer (sb-assem:segment-buffer segment)))
         (make-static-vector (length buffer)
                             :element-type '(unsigned-byte 8)
                             :initial-contents buffer)))))

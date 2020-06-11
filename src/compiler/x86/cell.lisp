@@ -234,13 +234,15 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
+  (:args-var args)
   (:generator 2
     ;; The symbol-hash slot of NIL holds NIL because it is also the
     ;; car slot, so we have to strip off the two low bits to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (inst and res (lognot #b11))))
+    (unless (not-nil-tn-ref-p args)
+      (inst and res (lognot #b11)))))
 
 ;;;; fdefinition (FDEFN) objects
 
@@ -450,7 +452,7 @@
 
 ;;;; structure hackery
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
@@ -458,8 +460,7 @@
   (:result-types positive-fixnum)
   (:generator 4
     (loadw res struct 0 instance-pointer-lowtag)
-    (inst shr res n-widetag-bits)
-    (inst and res short-header-max-words))) ; clear special GC bit
+    (inst shr res instance-length-shift)))
 
 (define-full-reffer instance-index-ref *
   instance-slots-offset instance-pointer-lowtag

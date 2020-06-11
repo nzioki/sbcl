@@ -41,7 +41,7 @@
 ;;; is not seen by the "#." expression a few lines down.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant info-number-bits 6))
-(def!type info-number () `(unsigned-byte ,info-number-bits))
+(deftype info-number () `(unsigned-byte ,info-number-bits))
 
 ;;; A map from info-number to its META-INFO object.
 ;;; The reverse mapping is obtained by reading the META-INFO.
@@ -90,7 +90,7 @@
 ;;; In terms of this function being named "-vector", implying always a vector,
 ;;; it is understood that NIL is a proxy for +NIL-PACKED-INFOS+, a vector.
 ;;;
-;;; Declaim SYMBOL-INFO-VECTOR inline unless a vop translates it.
+;;; Define SYMBOL-INFO-VECTOR as an inline function unless a vop translates it.
 ;;; (Inlining occurs first, which would cause the vop not to be used.)
 ;;; Also note that we have to guard the appearance of VOP-TRANSLATES here
 ;;; so that it does not get tested when building the cross-compiler.
@@ -99,12 +99,12 @@
 ;;; The #+/- reader can't see that a VOP-TRANSLATES term is not for the
 ;;; host compiler unless the whole thing is one expression.
 #-(or sb-xc-host (vop-translates sb-kernel:symbol-info-vector))
+(progn
 (declaim (inline symbol-info-vector))
-#-sb-xc-host
 (defun symbol-info-vector (symbol)
   (let ((info-holder (symbol-info symbol)))
     (truly-the (or null simple-vector)
-               (if (listp info-holder) (cdr info-holder) info-holder))))
+               (if (listp info-holder) (cdr info-holder) info-holder)))))
 
 ;;; SYMBOL-INFO is a primitive object accessor defined in 'objdef.lisp'
 ;;; But in the host Lisp, there is no such thing as a symbol-info slot.
@@ -266,7 +266,7 @@
 ;;;; operations, we represent the attributes as bits in a fixnum.
 
 (in-package "SB-C")
-(def!type attributes () 'fixnum)
+(deftype attributes () 'fixnum)
 
 ;;; Given a list of attribute names and an alist that translates them
 ;;; to masks, return the OR of the masks.

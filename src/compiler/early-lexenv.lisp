@@ -71,8 +71,7 @@
 ;;; (This is also what shows up as an ENVIRONMENT value in macroexpansion.)
 #-sb-fluid (declaim (inline internal-make-lexenv)) ; only called in one place
 (defstruct (lexenv
-             (:include abstract-lexenv)
-             #-no-ansi-print-object
+            (:include abstract-lexenv)
              (:print-function
               (lambda (lexenv stream depth)
                 (if (null-lexenv-p lexenv)
@@ -82,7 +81,7 @@
              (:copier nil)
              (:constructor make-null-lexenv ())
              (:constructor make-almost-null-lexenv (%policy handled-conditions
-                                                    flushable))
+                                                    flushable lambda parent))
              (:constructor make-package-lock-lexenv
                            (disabled-package-locks %policy
                             &aux (handled-conditions nil)))
@@ -140,7 +139,7 @@
   ;; are of the form (:declare name . value),
   ;; (:variable name key . value), or (:function name key . value)
   (user-data nil :type list)
-  parent
+  (parent nil)
   ;; Cache of all visible variables, including the ones coming from
   ;; (call-lexenv lambda)
   ;; Used for LEAF-VISIBLE-TO-DEBUGGER-P

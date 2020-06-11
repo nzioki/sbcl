@@ -631,18 +631,40 @@ exist or if is a file or a symbolic link."
           (delete-dir physical)))))
 
 
-(sb-alien:define-alien-variable ("sbcl_home" *sbcl-home*) c-string)
-
 (defun sbcl-homedir-pathname ()
-  (let ((env (posix-getenv "SBCL_HOME")))
-    ;; Should we absoluteize this if it was obtained automatically?
-    ;; Depends whether people are in the habit of using chdir within Lisp.
-    (parse-native-namestring (if (and env (not (string= env "")))
-                                 env
-                                 (or *sbcl-home* ""))
-                             *physical-host*
-                             *default-pathname-defaults*
-                             :as-directory t)))
+  sb-sys::*sbcl-homedir-pathname*)
+
+(defun %sbcl-homedir-pathname ()
+  ;; Should we absoluteize this if it was obtained automatically?
+  ;; Depends whether people are in the habit of using chdir within Lisp.
+  (labels ((parse (namestring &optional (directory t))
+             (parse-native-namestring namestring
+                                      *physical-host*
+                                      *default-pathname-defaults*
+                                      :as-directory directory))
+           (probe (path)
+             (let ((contrib (merge-pathnames "contrib/" path)))
+               (when (probe-file contrib)
+                 path)))
+           (try-runtime-home (path)
+             (or (probe path)
+                 (probe (merge-pathnames "../lib/sbcl/" path)))))
+    (let* ((env (posix-getenv "SBCL_HOME"))
+           (env (and env (not (string= env ""))
+                     (parse env))))
+      (or (and env
+               (probe env))
+          (try-runtime-home (parse (or (extern-alien "sbcl_runtime_home" c-string)
+                                       "")))
+          (probe (parse "."))
+          ;; Handle a symlink
+          (let ((runtime (extern-alien "sbcl_runtime" c-string)))
+            (and runtime
+                 (let ((truename (probe-file (parse runtime nil))))
+                   (when truename
+                    (try-runtime-home (make-pathname :name nil
+                                                     :type nil
+                                                     :defaults truename))))))))))
 
 (flet ((not-empty (x)
          (and (not (equal x "")) x))

@@ -49,16 +49,12 @@
 
 (define-arg-type accum
   :printer (lambda (value stream dstate)
-             (declare (ignore value)
-                      (type stream stream)
-                      (type disassem-state dstate))
+             (declare (ignore value))
              (print-reg 0 stream dstate)))
 
 (define-arg-type word-accum
   :printer (lambda (value stream dstate)
-             (declare (ignore value)
-                      (type stream stream)
-                      (type disassem-state dstate))
+             (declare (ignore value))
              (print-word-reg 0 stream dstate)))
 
 (define-arg-type reg :printer #'print-reg)
@@ -580,11 +576,11 @@
         (t
          (format stream "~A PTR [" (symbol-name (ea-size ea)))
          (when (ea-base ea)
-           (write-string (sb-c::location-print-name (ea-base ea)) stream)
+           (write-string (sb-c:location-print-name (ea-base ea)) stream)
            (when (ea-index ea)
              (write-string "+" stream)))
          (when (ea-index ea)
-           (write-string (sb-c::location-print-name (ea-index ea)) stream))
+           (write-string (sb-c:location-print-name (ea-index ea)) stream))
          (unless (= (ea-scale ea) 1)
            (format stream "*~A" (ea-scale ea)))
          (typecase (ea-disp ea)

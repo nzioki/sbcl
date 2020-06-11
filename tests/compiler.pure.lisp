@@ -1945,7 +1945,7 @@
      and v-max = (1- (ash 1 n-bits))
      while (<= n-bits sb-vm:n-word-bits)
      do
-       (let* ((n (* 2 (1+ (- sb-vm::n-word-bits n-bits))))
+       (let* ((n (* 2 (1+ (- sb-vm:n-word-bits n-bits))))
               (array1 (make-array n :element-type type))
               (array2 (make-array n :element-type type)))
          (dotimes (i n)
@@ -3716,10 +3716,10 @@
 (with-test (:name :bug-316078)
   (let ((fun (checked-compile
               `(lambda (x)
-                 (declare (type (and simple-bit-vector (satisfies bar)) x)
+                 (declare (type (and simple-bit-vector (satisfies eval)) x)
                           (optimize speed))
                  (elt x 5)))))
-    (assert (not (ctu:find-named-callees fun)))
+    (assert (equal (ctu:find-named-callees fun) (list #'eval)))
     (assert (= 1 (funcall fun #*000001)))
     (assert (= 0 (funcall fun #*000010)))))
 
@@ -5029,9 +5029,7 @@
                               y)))
         (((list (string 'list)) (list "LIST")) t)))))
 
-(with-test (:name (compile restart-case optimize speed compiler-note)
-                  ;; Cannot-DX note crashes test driver unless we have this:
-            :skipped-on (not :stack-allocatable-fixed-objects))
+(with-test (:name (compile restart-case optimize speed compiler-note))
   (checked-compile '(lambda ()
                      (declare (optimize speed))
                      (restart-case () (c ()))))
@@ -5085,8 +5083,7 @@
 ;; quantifiers shouldn't cons themselves.
 (with-test (:name :quantifiers-no-consing
             :serial t
-            :skipped-on (or :interpreter
-                             (not :stack-allocatable-closures)))
+            :skipped-on :interpreter)
   (let ((constantly-t (lambda (x) x t))
         (constantly-nil (lambda (x) x nil))
         (list (make-list 1000 :initial-element nil))
@@ -5230,7 +5227,7 @@
                   (with-output-to-string (s)
                     (disassemble
                      `(lambda (x)
-                        (declare (optimize (sb-c::verify-arg-count 0)))
+                        (declare (optimize (sb-c:verify-arg-count 0)))
                         (typep x ',type-expr))
                      :stream s)))))
     ;; These are fragile, but less bad than the possibility of messing up
@@ -6456,3 +6453,23 @@
                 (type (eql -1) p2))
        (logandc1 p1 p2))
     ((-3 -1) 2)))
+
+;;; A user reported a potential compiler bug when SBCL consumed all its memory
+;;; while trying to compile a "trivial" wrapper macro similar to this one.
+;;; (because MACROLET is not FLET)
+(with-test (:name :macrolet-infinite-loop-detection)
+  (multiple-value-bind (fun warningsp errorp)
+      (compile nil
+               '(lambda (x)
+                  (macrolet ((complicated-fun (&rest keys)
+                               `(complicated-fun :a 1 ,@keys)))
+                    (complicated-fun :x 9))))
+    (assert (and fun warningsp errorp))))
+
+;;; This SAP+ call overflowed the size of an immediate on MIPS.
+;;; 'bit-vector.impure.lisp' exposed this bug where it computes
+;;;   (sb-sys:sap+ first sb-c:+backend-page-bytes+)
+;;; which is not the ideal place to fail, considering that
+;;; pointer arithmetic is not what's being tested.
+(with-test (:name :sap+-immediate)
+  (compile nil '(lambda (x) (sb-sys:sap+ x 65536))))

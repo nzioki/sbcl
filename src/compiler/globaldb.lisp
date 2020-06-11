@@ -34,7 +34,6 @@
 
 (in-package "SB-IMPL")
 
-#-no-ansi-print-object
 (defmethod print-object ((x meta-info) stream)
   (print-unreadable-object (x stream)
     (format stream "~S ~S, ~D" (meta-info-category x) (meta-info-kind x)
@@ -79,17 +78,15 @@
         ;; The SB-FASL: symbols are poor style, but the lesser evil.
         ;; If exported, then they'll stick around in the target image.
         ;; Perhaps SB-COLD should re-export some of these.
-        (declare (special sb-fasl::*dynamic* sb-fasl::*cold-layouts*))
-        (let ((layout (gethash 'meta-info sb-fasl::*cold-layouts*)))
-          (sb-fasl::cold-svset
-           (sb-fasl::cold-symbol-value '*info-types*)
-           id
-           (sb-fasl::write-slots
-            (sb-fasl::allocate-struct sb-fasl::*dynamic* layout)
-            'meta-info ; give the type name in lieu of layout
-            :category category :kind kind :type-spec type-spec
-            :type-checker checker :validate-function validator
-            :default default :number id)))))
+        (sb-fasl::cold-svset
+         (sb-fasl::cold-symbol-value '*info-types*)
+         id
+         (sb-fasl::write-slots
+          (sb-fasl::allocate-struct-of-type 'meta-info)
+          'meta-info ; pass the type name in lieu of layout
+          :category category :kind kind :type-spec type-spec
+          :type-checker checker :validate-function validator
+          :default default :number id))))
 
 ;;;; info types, and type numbers, part II: what's
 ;;;; needed only at compile time, not at run time
@@ -281,8 +278,9 @@
 (define-info-type (:function :deprecated)
   :type-spec (or null deprecation-info))
 
-(declaim (ftype (sfunction (t) ctype)
-                specifier-type ctype-of sb-kernel::ctype-of-array))
+;;; Why are these here? It seems like the wrong place.
+(declaim (ftype (sfunction (t &optional t symbol) ctype) specifier-type)
+         (ftype (sfunction (t) ctype) ctype-of sb-kernel::ctype-of-array))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition

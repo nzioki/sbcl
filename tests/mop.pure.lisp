@@ -90,7 +90,7 @@
 (with-test (:name :bug-936513)
   ;; This used to fail as ENSURE-GENERIC-FUNCTION wanted a list specifying
   ;; the method combination, and didn't accept the actual object
-  (let ((mc (sb-pcl:find-method-combination #'make-instance 'standard nil)))
+  (let ((mc (sb-mop:find-method-combination #'make-instance 'standard nil)))
     (ensure-generic-function 'make-instance :method-combination mc))
   ;; Let's make sure the list works too...
   (ensure-generic-function 'make-instance :method-combination '(standard)))
@@ -171,13 +171,13 @@
              (find slot-name (sb-mop:class-direct-slots kid)
                    :key 'sb-mop:slot-definition-name)
              (find slot-name (sb-mop:class-direct-slots par)
-                   :key 'sb-pcl:slot-definition-name)
+                   :key 'sb-mop:slot-definition-name)
              ;; there is only one effective slot of that name
              (assert (= 1 (count slot-name (sb-mop:class-slots kid)
-                                 :key 'sb-pcl:slot-definition-name))))))
+                                 :key 'sb-mop:slot-definition-name))))))
     ;; metaclass = structure-class
     ;; FUN-TYPE inherits CTYPE
-    (check 'sb-kernel:fun-type 'sb-kernel:ctype 'sb-kernel::class-info)
+    (check 'sb-kernel:fun-type 'sb-kernel:ctype 'sb-kernel::%bits)
     ;; metaclass = condition-class
     ;; REDEFINITION-WITH-DEFMETHOD inherits REDEFINITION-WARNING
     (check 'sb-kernel:redefinition-with-defmethod

@@ -57,7 +57,11 @@
 
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
-(defun %target-defstruct (dd)
+(defun assign-equalp-impl (type-name function)
+  (setf (%instance-ref (find-layout type-name) (get-dsd-index layout equalp-impl))
+        function))
+
+(defun %target-defstruct (dd equalp)
   (declare (type defstruct-description dd))
 
   (when (dd-doc dd)
@@ -66,35 +70,34 @@
 
   (let* ((classoid (find-classoid (dd-name dd)))
          (layout (classoid-layout classoid)))
-    ;; Make a vector of EQUALP slots comparators, indexed by (- word-index data-start).
-    ;; This has to be assigned to something regardless of whether there are
-    ;; raw slots just in case someone mutates a layout which had raw
-    ;; slots into one which does not - although that would probably crash
-    ;; unless no instances exist or all raw slots miraculously contained
-    ;; bits which were the equivalent of valid Lisp descriptors.
-    (setf (layout-equalp-tests layout)
-          (if (eql (layout-bitmap layout) +layout-all-tagged+)
-              #()
-              ;; The initial element of NIL means "do not compare".
-              ;; Ignored words (comparator = NIL) fall into two categories:
-              ;; - pseudo-ignored, which get compared by their
-              ;;   predecessor word, as for complex-double-float,
-              ;; - internal padding words which are truly ignored.
-              ;; Other words are compared as tagged if the comparator is 0,
-              ;; or as untagged if the comparator is a type-specific function.
-              (let ((comparators
+    (setf (%instance-ref layout (get-dsd-index sb-kernel:layout sb-kernel::equalp-impl))
+          (cond ((compiled-function-p equalp) equalp)
+                ((eql (layout-bitmap layout) +layout-all-tagged+)
+                 #'sb-impl::instance-equalp)
+                (t
+                  ;; Make a vector of EQUALP slots comparators, indexed by
+                  ;; (- word-index INSTANCE-DATA-START).
+                  ;; The initial element of NIL means "do not compare".
+                  ;; Ignored words (comparator = NIL) fall into two categories:
+                  ;; - pseudo-ignored, which get compared by their
+                  ;;   predecessor word, as for complex-double-float,
+                  ;; - internal padding words which are truly ignored.
+                  ;; Other words are compared as tagged if the comparator is 0,
+                  ;; or as untagged if the comparator is a type-specific function.
+                  (let ((comparators
                      ;; If data-start is 1, subtract 1 because we don't need
                      ;; a comparator for the LAYOUT slot.
                      (make-array (- (dd-length dd) sb-vm:instance-data-start)
                                  :initial-element nil)))
-                (dolist (slot (dd-slots dd) comparators)
-                  ;; -1 because LAYOUT (slot index 0) has no comparator stored.
-                  (setf (aref comparators
-                              (- (dsd-index slot) sb-vm:instance-data-start))
-                        (let ((rsd (dsd-raw-slot-data slot)))
-                          (if (not rsd)
-                              0 ; means recurse using EQUALP
-                              (raw-slot-data-comparator rsd))))))))
+                    (dolist (slot (dd-slots dd) comparators)
+                      (setf (aref comparators
+                                  (- (dsd-index slot) sb-vm:instance-data-start))
+                            (let ((rsd (dsd-raw-slot-data slot)))
+                              (if (not rsd)
+                                  0 ; means recurse using EQUALP
+                                  (raw-slot-data-comparator rsd)))))
+                    (lambda (a b)
+                      (sb-impl::instance-equalp* comparators a b))))))
 
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
@@ -172,7 +175,7 @@
 
 (defun %default-structure-pretty-print (structure stream name dd)
   (pprint-logical-block (stream nil :prefix "#S(" :suffix ")")
-    (prin1 name stream)
+    (write name :stream stream) ; escaped or not, according to printer controls
     (let ((remaining-slots (dd-slots dd)))
       (when remaining-slots
         (write-char #\space stream)
@@ -193,7 +196,7 @@
 (defun %default-structure-ugly-print (structure stream name dd)
   (descend-into (stream)
     (write-string "#S(" stream)
-    (prin1 name stream)
+    (write name :stream stream)
     (do ((index 0 (1+ index))
          (limit (or (and (not *print-readably*) *print-length*)
                     sb-xc:most-positive-fixnum))
@@ -244,7 +247,7 @@
 
 ;;; Used internally, but it would be nice to provide something
 ;;; like this for users as well.
-(defmacro define-structure-slot-addressor (name &key structure slot)
+(defmacro define-structure-slot-addressor (name &key structure slot (byte-offset 0))
   (let* ((dd (find-defstruct-description structure t))
          (slotd (or (and dd (find slot (dd-slots dd) :key #'dsd-name))
                     (error "Slot ~S not found in ~S." slot structure)))
@@ -256,6 +259,7 @@
          (truly-the
           word
           (+ (get-lisp-obj-address instance)
+             ,byte-offset
              ,(+ (- sb-vm:instance-pointer-lowtag)
                  (* (+ sb-vm:instance-slots-offset index)
                     sb-vm:n-word-bytes))))))))

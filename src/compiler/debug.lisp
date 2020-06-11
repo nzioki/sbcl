@@ -107,7 +107,7 @@
                         (barf "strange CONSTANTS entry: ~S" v))
                       (dolist (n (leaf-refs v))
                         (check-node-reached n)))
-                    (constants ns))
+                    (eq-constants ns))
 
            (maphash (lambda (k v)
                       (declare (ignore k))
@@ -1107,7 +1107,7 @@
        (multiway-branch-if-eq
         (princ (vop-codegen-info vop)))
        (t
-        (princ (with-simple-output-to-string (stream)
+        (princ (%with-output-to-string (stream)
                  ;; Current print depth varies based on whether PRINT-VOP
                  ;; is called by DESCRIBE-IR2-COMPONENT or TRACE-INSTRUCTION,
                  ;; so any fixed value of *PRINT-LEVEL* changes its effect

@@ -9,7 +9,7 @@ set -e
 # or a host machine on which to run its native compiler.
 
 if [ -z "$*" ]; then
-    targets="alpha arm arm64 hppa mips ppc ppc64 sparc x86 x86-64 riscv"
+    targets="alpha arm arm64 hppa mips ppc ppc64 riscv sparc x86 x86-64"
 else
     targets="$@"
 fi
@@ -21,11 +21,19 @@ do
   # Whether any of the :OS-PROVIDES-* features are present is mostly immaterial
   # to this cross-build test. Some of the provisions are only for C code which
   # we don't compile. Or else it doesn't matter much which lisp code is compiled.
-  # However, with :SB-DYNAMIC-CORE we need to assume that dlopen() is provided
-  # as there would otherwise be missing references due to excluding foreign-load
-  # in build-order.
+  # Assume that dlopen() is provided so that we don't try to read sbcl.nm though.
   echo '(lambda (features) (union features (list :crossbuild-test :os-provides-dlopen ' > $ltf
+  echo ":$arch" >> $ltf
+  # x86-64 is tested as if #+win32
+  if [ $arch != "x86-64" ]; then
+    echo ':unix :linux :elf :sb-futex' >> $ltf
+  fi
+  cat crossbuild-runner/backends/$arch/features >> $ltf
   cat crossbuild-runner/backends/$arch/local-target-features >> $ltf
+  case "$arch" in
+    alpha | hppa)  ;;
+    *) echo ':linkage-table' >> $ltf
+  esac
   echo ')))' >> $ltf
 
   cp -fv crossbuild-runner/backends/$arch/stuff-groveled-from-headers.lisp \

@@ -527,7 +527,11 @@ bootstrapping.
               (with-current-source-form (lambda-list)
                 (parse-specialized-lambda-list lambda-list)))
              (*method-name* `(,name ,@qualifiers ,specializers))
-             (method-lambda `(lambda ,unspecialized-lambda-list ,@body))
+             (method-lambda `(lambda ,unspecialized-lambda-list
+                               (declare (sb-c::source-form
+                                         (lambda ,unspecialized-lambda-list
+                                           ,@body)))
+                               ,@body))
              ((method-function-lambda initargs new-lambda-list)
               (make-method-lambda-using-specializers
                proto-gf proto-method qualifiers specializers method-lambda env))
@@ -1394,7 +1398,7 @@ bootstrapping.
             (values (fast-method-call-pv ,method-call))
             (values (fast-method-call-next-method-call ,method-call))
             ,@required-args
-            (sb-c::%more-arg-values ,more-context 0 ,more-count))))))
+            (sb-c:%more-arg-values ,more-context 0 ,more-count))))))
 
 (defstruct (fast-instance-boundp (:copier nil))
   (index 0 :type fixnum))
@@ -1823,11 +1827,13 @@ bootstrapping.
                                  (slot-value #'optimize-slot-value)
                                  (set-slot-value #'optimize-set-slot-value)
                                  (slot-boundp #'optimize-slot-boundp))))
-                      (funcall fun form slots required-parameters env))
+                      `(sb-c::with-source-form ,form
+                        ,(funcall fun form slots required-parameters env)))
                     form))
                (t form))))
 
-      (let ((walked-lambda (walk-form method-lambda env #'walk-function)))
+      (let* ((sb-walker::*walk-form-preserve-source* t)
+             (walked-lambda (walk-form method-lambda env #'walk-function)))
         ;;; FIXME: the walker's rewriting of the source code causes
         ;;; trouble when doing code coverage. The rewrites should be
         ;;; removed, and the same operations done using
@@ -2009,7 +2015,9 @@ bootstrapping.
 
 (define-load-time-global *sgf-wrapper*
   (!boot-make-wrapper (!early-class-size 'standard-generic-function)
-                      'standard-generic-function))
+                      'standard-generic-function
+                      nil
+                      #+immobile-code +machine-code-embedding-fsc-instance-bitmap+))
 
 (define-load-time-global *sgf-slots-init*
   (mapcar (lambda (canonical-slot)
@@ -2357,7 +2365,7 @@ bootstrapping.
   (let ((fin (allocate-standard-funcallable-instance *sgf-wrapper* name)))
     (replace (fsc-instance-slots fin) *sgf-slots-init*)
     (when function
-      (set-funcallable-instance-function fin function))
+      (setf (%funcallable-instance-fun fin) function))
     (setf (gdefinition name) fin)
     (!bootstrap-set-slot 'standard-generic-function fin 'name name)
     (!bootstrap-set-slot 'standard-generic-function fin

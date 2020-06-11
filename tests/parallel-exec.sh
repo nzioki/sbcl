@@ -1,9 +1,12 @@
 #!/bin/sh
 
-logdir=/var/tmp/sbcl-test-logs-$$
+logdir=${SBCL_PAREXEC_TMP:-$HOME}/sbcl-test-logs-$$
 echo ==== Writing logs to $logdir ====
-mkdir -p /var/tmp/junk $logdir
-TEST_DIRECTORY=/var/tmp/junk SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
+junkdir=${SBCL_PAREXEC_TMP:-/tmp}/junk
+mkdir -p $junkdir $logdir
+
+export TEST_DIRECTORY SBCL_HOME
+TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
   --noinform --core ../output/sbcl.core --no-userinit --no-sysinit --noprint --disable-debugger << EOF
 (require :sb-posix)
 (let ((*evaluator-mode* :compile))
@@ -29,6 +32,9 @@ TEST_DIRECTORY=/var/tmp/junk SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl
         (missing-usage)
         (losing))
     (labels ((wait ()
+               ;; Though far from elegant, this is an easy way to figure out
+               ;; which tests are getting stuck, if any are.
+               #+nil (format t "Runner is waiting on: ~S~%" subprocess-list)
                (multiple-value-bind (pid status) (sb-posix:wait)
                  (decf subprocess-count)
                  (let ((process (assoc pid subprocess-list)))
@@ -68,11 +74,12 @@ TEST_DIRECTORY=/var/tmp/junk SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl
             (setq *debug-io* (make-two-way-stream (make-concatenated-stream)
                                                   *error-output*))
             (cond ((string= (pathname-type file) "test")
-                   ;; exec /bin/sh with the test and we'll pick up its exit code
-                   (alien-funcall (extern-alien "execl" (function int c-string c-string
-                                                                  c-string unsigned))
-                                  "/bin/sh" "/bin/sh"
-                                  (concatenate 'string file ".sh") 0)
+                   (let ((shell (or #+sunos (posix-getenv "SHELL") "/bin/sh")))
+                     ;; exec the shell with the test and we'll pick up its exit code
+                     (alien-funcall (extern-alien "execl" (function int c-string c-string
+                                                                    c-string unsigned))
+                                    shell shell
+                                    (concatenate 'string file ".sh") 0))
                    ;; if exec fails, just exit with a wrong (not 104) status
                    (alien-funcall (extern-alien "_exit" (function (values) int)) 0))
                   (t
@@ -83,8 +90,11 @@ TEST_DIRECTORY=/var/tmp/junk SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl
                                   (make-broadcast-stream)))
                    (with-open-file (output (format nil "$logdir/~a.vop-usage" file)
                                            :direction :output)
-                     (sb-int:dohash ((name count) sb-c::*static-vop-usage-counts*)
-                       (format output "~7d ~s~%" count name)))
+                     ;; There's an impure test that screws with the default pprint dispatch
+                     ;; table such that integers don't print normally (and can't be parsed).
+                     (let ((*print-pretty* nil))
+                       (sb-int:dohash ((name count) sb-c::*static-vop-usage-counts*)
+                         (format output "~7d ~s~%" count name))))
                    (exit :code (if (unexpected-failures) 1 104)))))
           (format t "~A: pid ~d~%" file pid)
           (incf subprocess-count)

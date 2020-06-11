@@ -66,32 +66,34 @@
                            (load-fresh-line)
                            (format t "~{~S~^, ~}~%" results))
                          (eval-tlf form index)))
-                   (return))))))
-        (if pathname
-            (let* ((info (sb-c::make-file-source-info
-                          pathname (stream-external-format stream)))
-                   (sb-c::*source-info* info)
-                   (sb-c::*current-path* nil))
-              (locally (declare (optimize (sb-c::type-check 0)))
-                (setf sb-c::*current-path* (make-unbound-marker)))
-              (setf (sb-c::source-info-stream info) stream)
-              (sb-c::do-forms-from-info ((form current-index) info
-                                         'sb-c::input-error-in-load)
-                (sb-c::with-source-paths
-                  (sb-c::find-source-paths form current-index)
-                  (eval-form form current-index))))
-            (let ((sb-c::*source-info* nil)
-                  (sb-c::*current-path* nil))
-              (locally (declare (optimize (sb-c::type-check 0)))
-                (setf sb-c::*current-path* (make-unbound-marker)))
-              (loop for form =
-                    (handler-case (read stream nil *eof-object*)
-                      ((or reader-error end-of-file) (c)
-                        (error 'sb-c::input-error-in-load :stream stream
-                                                          :condition c)))
-                    until (eq form *eof-object*)
-                    do (sb-c::with-source-paths
-                         (eval-form form nil))))))))
+                    (return))))))
+       (let ((sb-c::*current-path* nil)
+             (sb-impl::*eval-source-info* nil)
+             (sb-impl::*eval-tlf-index* nil)
+             (sb-impl::*eval-source-context* nil))
+         (locally (declare (optimize (sb-c::type-check 0)))
+           (setf sb-c::*current-path* (make-unbound-marker)))
+         (if pathname
+             (let* ((info (sb-c::make-file-source-info
+                           pathname (stream-external-format stream)))
+                    (sb-c::*source-info* info))
+               (locally (declare (optimize (sb-c::type-check 0)))
+                 (setf sb-c::*current-path* (make-unbound-marker)))
+               (setf (sb-c::source-info-stream info) stream)
+               (sb-c:do-forms-from-info ((form current-index) info
+                                          'sb-c::input-error-in-load)
+                 (sb-c::with-source-paths
+                   (sb-c::find-source-paths form current-index)
+                   (eval-form form current-index))))
+             (let ((sb-c::*source-info* nil))
+               (loop for form =
+                     (handler-case (read stream nil *eof-object*)
+                       ((or reader-error end-of-file) (c)
+                         (error 'sb-c::input-error-in-load :stream stream
+                                                           :condition c)))
+                     until (eq form *eof-object*)
+                     do (sb-c::with-source-paths
+                          (eval-form form nil)))))))))
   t)
 
 ;;;; LOAD itself
@@ -289,7 +291,7 @@
 (declaim (code-component *assembler-routines*))
 
 (defun calc-asm-routine-bounds ()
-  (loop for v being each hash-value of (car (%code-debug-info *assembler-routines*))
+  (loop for v being each hash-value of (%code-debug-info *assembler-routines*)
         minimize (car v) into min
         maximize (cadr v) into max
         ;; min/max are inclusive byte ranges, but return the answer
@@ -300,7 +302,7 @@
 (defvar *!initial-assembler-routines*)
 
 (defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
-  (awhen (the list (gethash (the symbol name) (car (%code-debug-info code))))
+  (awhen (the list (gethash (the symbol name) (%code-debug-info code)))
     (sap-int (sap+ (code-instructions code)
                    (if indirect
                        ;; Return the address containing the routine address

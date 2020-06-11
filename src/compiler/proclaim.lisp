@@ -119,8 +119,16 @@
 
   (multiple-value-bind (allowed test)
       (ecase kind
-        (special (values '(:special :unknown) #'eq))
-        (global (values '(:global :unknown) #'eq))
+        (special
+         ;; KLUDGE: There is probably a better place to do this.
+         (when (boundp '*ir1-namespace*)
+           (remhash name (free-vars *ir1-namespace*)))
+         (values '(:special :unknown) #'eq))
+        (global
+         ;; KLUDGE: Ditto.
+         (when (boundp '*ir1-namespace*)
+           (remhash name (free-vars *ir1-namespace*)))
+         (values '(:global :unknown) #'eq))
         (always-bound (values '(:constant) #'neq)))
     (let ((old (info :variable :kind name)))
       (unless (member old allowed :test test)
@@ -213,6 +221,16 @@
   (proclaim-as-fun-name name)
   (warn-if-inline-failed/proclaim name kind)
   (setf (info :function :inlinep name) kind))
+
+(defun process-block-compile-declaration (entries kind)
+  (ecase kind
+    (start-block
+     (finish-block-compilation)
+     (let ((compilation *compilation*))
+       (setf (block-compile compilation) t)
+       (setf (entry-points compilation) entries)))
+    (end-block
+     (finish-block-compilation))))
 
 (defun check-deprecation-declaration (state since form)
   (unless (typep state 'deprecation-state)
@@ -323,9 +341,20 @@
              (push raw-form *queued-proclaims*)))
         (freeze-type
          (map-args #'process-freeze-type-declaration))
+        ((start-block end-block)
+         (when (and *compile-time-eval* (boundp '*compilation*))
+           (if (eq *block-compile-argument* :specified)
+               (process-block-compile-declaration args kind)
+               (compiler-notify "ignoring ~S declaration since ~
+                                :BLOCK-COMPILE is not :SPECIFIED"
+                                kind))))
         (optimize
          (multiple-value-bind (new-policy specified-qualities)
              (process-optimize-decl form *policy*)
+           (when (and (boundp '*compilation*)
+                      ;; Should I also examine *COMPILE-TIME-EVAL* here? I don't think so.
+                      (listp (saved-optimize-decls *compilation*)))
+             (push form (saved-optimize-decls *compilation*)))
            (setq *policy* new-policy)
            (warn-repeated-optimize-qualities new-policy specified-qualities)))
         (muffle-conditions

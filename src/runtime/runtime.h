@@ -49,8 +49,6 @@
 #define thread_mutex_unlock(l) 0
 #endif
 
-void os_link_runtime();
-
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
 
 typedef enum {
@@ -297,14 +295,29 @@ static inline int simple_vector_p(lispobj obj) {
            widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
 }
 
-static inline uword_t instance_length(lispobj header)
+/* This is NOT the same value that lisp's %INSTANCE-LENGTH returns.
+ * Lisp always uses the logical length (as originally allocated),
+ * except when heap-walking which requires exact physical sizes */
+static inline int instance_length(lispobj header)
 {
-  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
+    // * Byte 3 of an instance header word holds the immobile gen# and visited bit,
+    //   so those have to be masked off.
+    // * fullcgc uses bit index 31 as a mark bit, so that has to
+    //   be cleared. Lisp does not have to clear bit 31 because fullcgc does not
+    //   operate concurrently.
+    // * If the object is in hashed-and-moved state and the original instance payload
+    //   length was odd (total object length was even), then add 1.
+    //   This can be detected by ANDing some bits, bit 10 being the least-significant
+    //   bit of the original size, and bit 9 being the 'hashed+moved' bit.
+    // * 64-bit machines do not need 'long' right-shifts, so truncate to int.
+
+    int extra = ((unsigned int)header >> 10) & ((unsigned int)header >> 9) & 1;
+    return (((unsigned int)header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF) + extra;
 }
 
-/* Define an assignable instance_layout() macro taking a native pointer */
+/// instance_layout() macro takes a lispobj* and is an lvalue
 #ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-# define instance_layout(instance_ptr) (instance_ptr)[1]
+# define instance_layout(instance_ptr) ((lispobj*)instance_ptr)[1]
 #elif defined(LISP_FEATURE_64_BIT) && defined(LISP_FEATURE_LITTLE_ENDIAN)
   // so that this stays an lvalue, it can't be cast to lispobj
 # define instance_layout(instance_ptr) ((uint32_t*)(instance_ptr))[1]
@@ -317,12 +330,24 @@ static inline uword_t instance_length(lispobj header)
 static inline int
 is_lisp_pointer(lispobj obj)
 {
-#if N_WORD_BITS == 64
+#ifdef LISP_FEATURE_PPC64
+    return (obj & 5) == 4;
+#elif N_WORD_BITS == 64
     return (obj & 3) == 3;
 #else
     return obj & 1;
 #endif
 }
+
+/* The standard pointer tagging scheme admits an optimization that cuts the number
+ * of instructions down when testing for either 'a' or 'b' (or both) being a tagged
+ * pointer, because the bitwise OR of two pointers is considered a pointer.
+ * This trick is inadmissible for the PPC64 lowtag arrangement */
+#ifdef LISP_FEATURE_PPC64
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a) || is_lisp_pointer(b))
+#else
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a|b))
+#endif
 
 #include "fixnump.h"
 
@@ -369,6 +394,8 @@ fixnum_value(lispobj n)
     return (sword_t)n >> N_FIXNUM_TAG_BITS;
 }
 
+lispobj symbol_function(lispobj* symbol);
+
 #include "align.h"
 
 #if defined(LISP_FEATURE_WIN32)
@@ -386,6 +413,16 @@ fixnum_value(lispobj n)
 #endif
 typedef int boolean;
 
+// other_immediate_lowtag_p is the least strict of the tests for whether a word
+// is potentially an object header, merely checking whether the bits fit the general
+// pattern of header widetags without regard for whether some headered object type
+// could in fact have those exact low bits. Specifically, this falsely returns 1
+// for UNBOUND_MARKER_WIDETAG, CHARACTER_WIDETAG, and on 64-bit machines,
+// SINGLE_FLOAT_WIDETAG; as well as unallocated and unused widetags (e.g. LRA on x86)
+// none of which denote the start of a headered object.
+// The ambiguous cases are for words would start a cons - the three mentioned above.
+// Other cases (NO_TLS_VALUE_MARKER_WIDETAG and other things) do not cause a problem
+// in practice because they can't be the first word of a lisp object.
 static inline boolean
 other_immediate_lowtag_p(lispobj header)
 {
@@ -393,21 +430,32 @@ other_immediate_lowtag_p(lispobj header)
     return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
 }
 
+// widetag_lowtag encodes in the sign bit whether the byte corresponds
+// to a headered object, and in the low bits the lowtag of a tagged pointer
+// pointing to this object, be it headered or a cons.
+extern unsigned char widetag_lowtag[256];
+#define LOWTAG_FOR_WIDETAG(x) (widetag_lowtag[x] & LOWTAG_MASK)
+
+// is_header() and is_cons_half() are logical complements when invoked
+// on the first word of any lisp object. However, given a word which is
+// only *potentially* the first word of a lisp object, they can both be false.
+// In ambiguous root detection, is_cons_half() is to be used, as it is the more
+// stringent check. The set of valid bit patterns in the low byte of the car
+// of a cons is smaller than the set of patterns accepted by !is_header().
+static inline int is_header(lispobj potential_header_word) {
+    return widetag_lowtag[potential_header_word & WIDETAG_MASK] & 0x80;
+}
+
 static inline int
 is_cons_half(lispobj obj)
 {
-    /* A word that satisfies other_immediate_lowtag_p is a headered object
-     * and can not be half of a cons, except that widetags which satisfy
-     * other_immediate and are Lisp immediates can be half of a cons */
-    return !other_immediate_lowtag_p(obj)
+    if (fixnump(obj) || is_lisp_pointer(obj)) return 1;
+    int widetag = header_widetag(obj);
+    return widetag == CHARACTER_WIDETAG ||
 #if N_WORD_BITS == 64
-        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (header_widetag(obj) >> 2)) & 1;
-#else
-      /* The above bit-shifting approach is not applicable
-       * since we can't employ a 64-bit unsigned integer constant. */
-      || header_widetag(obj) == CHARACTER_WIDETAG
-      || header_widetag(obj) == UNBOUND_MARKER_WIDETAG;
+           widetag == SINGLE_FLOAT_WIDETAG ||
 #endif
+           widetag == UNBOUND_MARKER_WIDETAG;
 }
 
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
@@ -513,9 +561,8 @@ extern struct lisp_startup_options lisp_startup_options;
 #define BOXED_NWORDS(obj) ((HeaderValue(obj) & 0x7FFFFF) | 1)
 
 /* Medium-sized payload count is expressed in 15 bits. Objects in this category
- * may reside in immobile space: CLOSURE, INSTANCE, FUNCALLABLE-INSTANCE.
- * The single data bit is used as a closure's NAMED flag,
- * or an instance's "special GC strategy" flag.
+ * may reside in immobile space: CLOSURE, FUNCALLABLE-INSTANCE.
+ * The single data bit is used as a closure's NAMED flag.
  *
  * Header:  gen# |  data |     size |    tag
  *         -----   -----    -------   ------

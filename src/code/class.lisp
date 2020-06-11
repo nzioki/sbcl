@@ -41,16 +41,6 @@
 ;;; cdr is the layout itself.
 (defvar *!initial-layouts*)
 
-;;; a generator for random values suitable for the CLOS-HASH slots of
-;;; LAYOUTs. We use our own RANDOM-STATE here because we'd like
-;;; pseudo-random values to come the same way in the target even when
-;;; we make minor changes to the system, in order to reduce the
-;;; mysteriousness of possible CLOS bugs.
-;;; However, we now try very hard to use deterministic hashes
-;;; based on the characters in the name of the class, if a symbol.
-(define-load-time-global *layout-clos-hash-random-state*
-    (make-random-state))
-
 ;;; a table mapping class names to layouts for classes we have
 ;;; referenced but not yet loaded. This is initialized from an alist
 ;;; created by genesis describing the layouts that genesis created at
@@ -65,7 +55,7 @@
                  (/show0 "processing *!INITIAL-LAYOUTS*")
                  (setq *forward-referenced-layouts* (make-hash-table :test 'equal))
                  (dovector (x *!initial-layouts*)
-                   (let ((expected (randomish-layout-clos-hash (car x)))
+                   (let ((expected (hash-layout-name (car x)))
                          (actual (layout-clos-hash (cdr x))))
                      (unless (= actual expected)
                        (bug "XC layout hash calculation failed")))
@@ -85,26 +75,6 @@
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun layout-proper-name (layout)
     (classoid-proper-name (layout-classoid layout))))
-
-;;;; support for the hash values used by CLOS when working with LAYOUTs
-
-(defun randomish-layout-clos-hash (name)
-  ;; A hash of 0 occurs with probability 1 in 2^25 for a 32-bit hash
-  ;; or 2^58 for a 64-bit hash. It must be changed to something else
-  ;; because 0 has means that the layout is invalid.
-  ;; See paper by Kiczales and Rodriguez, "Efficient Method Dispatch in PCL", 1990
-  (1+ (if (typep name '(and symbol (not null)))
-          (let ((package (sb-xc:symbol-package name)))
-            ;; TODO: We should use murmur_hash (in the C runtime)
-            ;; for better hashiness than our sxhash on strings.
-            (rem (logxor (sb-impl::%sxhash-simple-string
-                          (cond #+sb-xc ((eq package *cl-package*) "COMMON-LISP")
-                                ((not package) "uninterned")
-                                (t (package-name package))))
-                         (sb-impl::%sxhash-simple-string
-                          (symbol-name name)))
-                 (1- layout-clos-hash-limit)))
-          (random (1- layout-clos-hash-limit) *layout-clos-hash-random-state*))))
 
 ;;; If we can't find any existing layout, then we create a new one
 ;;; storing it in *FORWARD-REFERENCED-LAYOUTS*. In classic CMU CL, we
@@ -126,7 +96,7 @@
         (or (and classoid (classoid-layout classoid))
             (values (ensure-gethash name table
                                     (make-layout
-                                     (randomish-layout-clos-hash name)
+                                     (hash-layout-name name)
                                      (or classoid
                                          (make-undefined-classoid name))))))))))
 
@@ -143,24 +113,21 @@
                             layout-depthoid layout-bitmap) layout)
                 %init-or-check-layout))
 (defun %init-or-check-layout (layout classoid length flags inherits depthoid bitmap)
+  ;; BITMAP is redundant information about the primitive object representation
+  ;; which is fully captured by the defstruct description, and not stored in the
+  ;; host layout.
   (cond ((eq (layout-invalid layout) :uninitialized)
          ;; There was no layout before, we just created one which
          ;; we'll now initialize with our information.
-         (macrolet ((inherit (n) `(if (> struct-depth ,n) (svref inherits ,n) 0)))
-           ;; struct-depth is generally the depthoid when the depthoid is >0,
-           ;; but not for FILE-STREAM which has depthoid=4 but is not a structure.
-           (let ((struct-depth
-                  (if (logtest +structure-layout-flag+ flags) depthoid 0)))
-             (setf (layout-length layout) length
-                   (layout-flags layout) flags
-                   (layout-inherits layout) inherits
-                   (layout-depthoid layout) depthoid
-                   (layout-depth2-ancestor layout) (inherit 2)
-                   (layout-depth3-ancestor layout) (inherit 3)
-                   (layout-depth4-ancestor layout) (inherit 4)
-                   (layout-bitmap layout) bitmap
-                   (layout-classoid layout) classoid
-                   (layout-invalid layout) nil))))
+         (setf (layout-classoid layout) classoid)
+         (set-layout-inherits layout inherits)
+         (assign-layout-slots layout :depthoid depthoid :length length :flags flags)
+         #-sb-xc-host ; Assign target-only slots
+         (when (logtest +structure-layout-flag+ flags)
+           ;; STRING-STREAM and FILE-STREAM have depthoid=4 but are not structure types
+           (setf (layout-bitmap layout) bitmap))
+         ;; Finally, make it valid.
+         (setf (layout-invalid layout) nil))
         ;; FIXME: Now that LAYOUTs are born :UNINITIALIZED, maybe this
         ;; clause is not needed?
         ((not *type-system-initialized*)
@@ -184,7 +151,7 @@
 (defmethod make-load-form ((layout layout) &optional env)
   (declare (ignore env))
   (when (layout-invalid layout)
-    (sb-c::compiler-error "can't dump reference to obsolete class: ~S"
+    (sb-c:compiler-error "can't dump reference to obsolete class: ~S"
                           (layout-classoid layout)))
   (let* ((classoid (layout-classoid layout))
          (name (classoid-name classoid)))
@@ -196,7 +163,7 @@
                 (bug "xc MAKE-LOAD-FORM on undefined layout"))
                (t 0))))
     (unless name
-      (sb-c::compiler-error "can't dump anonymous LAYOUT: ~S" layout))
+      (sb-c:compiler-error "can't dump anonymous LAYOUT: ~S" layout))
     ;; Since LAYOUT refers to a class which refers back to the LAYOUT,
     ;; we have to do this in two stages, like the TREE-WITH-PARENT
     ;; example in the MAKE-LOAD-FORM entry in the ANSI spec.
@@ -206,13 +173,13 @@
      `(find-layout ',name)
      ;; "initialization" form (which actually doesn't initialize
      ;; preexisting LAYOUTs, just checks that they're consistent).
-     `(%init-or-check-layout ',layout
-                             ',(layout-classoid layout)
-                             ',(layout-length layout)
-                             ',(layout-flags layout)
-                             ',(layout-inherits layout)
-                             ',(layout-depthoid layout)
-                             ',(layout-bitmap layout)))))
+     `(%init-or-check-layout ,layout
+                             ,(layout-classoid layout)
+                             ,(layout-length layout)
+                             ,(layout-flags layout)
+                             ,(layout-inherits layout)
+                             ,(layout-depthoid layout)
+                             ,(layout-bitmap layout)))))
 
 ;;; If LAYOUT's slot values differ from the specified slot values in
 ;;; any interesting way, then give a warning and return T.
@@ -356,23 +323,22 @@ between the ~A definition and the ~A definition"
           (setf (classoid-subclasses classoid) nil)))
 
       (if destruct-layout
+          #+sb-xc-host (error "Why mutate a layout in XC host?")
+          #-sb-xc-host
           ;; Destructively modifying a layout is not threadsafe at all.
           ;; Use at your own risk (interactive use only).
           (let ((inherits (layout-inherits layout))
                 (depthoid (layout-depthoid layout)))
-            (aver (logtest +structure-layout-flag+ (layout-%bits layout)))
+            (aver (logtest +structure-layout-flag+ (layout-flags layout)))
             (aver (= (length inherits) depthoid))
-            (macrolet ((inherit (n) `(if (> depthoid ,n) (svref inherits ,n) 0)))
-              (setf (layout-invalid destruct-layout) nil
-                    (layout-inherits destruct-layout) inherits
-                    (layout-depthoid destruct-layout) (layout-depthoid layout)
-                    (layout-depth2-ancestor destruct-layout) (inherit 2)
-                    (layout-depth3-ancestor destruct-layout) (inherit 3)
-                    (layout-depth4-ancestor destruct-layout) (inherit 4)
-                    (layout-length destruct-layout) (layout-length layout)
-                    (layout-bitmap destruct-layout) (layout-bitmap layout)
-                    (layout-info destruct-layout) (layout-info layout)
-                    (classoid-layout classoid) destruct-layout)))
+            #-64-bit (setf (layout-depthoid destruct-layout) (layout-depthoid layout)
+                           (layout-length destruct-layout) (layout-length layout))
+            (setf (layout-flags destruct-layout) (layout-flags layout)
+                  (layout-info destruct-layout) (layout-info layout)
+                  (layout-bitmap destruct-layout) (layout-bitmap layout))
+            (set-layout-inherits destruct-layout inherits)
+            (setf (layout-invalid destruct-layout) nil
+                  (classoid-layout classoid) destruct-layout))
           (setf (layout-invalid layout) nil
                 (classoid-layout classoid) layout))
 
@@ -525,10 +491,8 @@ between the ~A definition and the ~A definition"
 ;;; don't have a corresponding class.
 (def!struct (structure-classoid (:include classoid)
                                 (:copier nil)
-                                (:constructor %make-structure-classoid
-                                    (hash-value name))))
-(defun make-structure-classoid (&key name)
-  (%make-structure-classoid (interned-type-hash name) name))
+                                (:constructor make-structure-classoid
+                                    (&key name &aux (%bits (pack-ctype-bits classoid name))))))
 
 ;;;; classoid namespace
 
@@ -707,7 +671,7 @@ between the ~A definition and the ~A definition"
       (if (typep classoid 'standard-classoid)
           (let ((class (classoid-pcl-class classoid)))
             (cond
-              ((sb-pcl:class-finalized-p class)
+              ((sb-mop:class-finalized-p class)
                (sb-pcl::%force-cache-flushes class)
                t)
               ((sb-pcl::class-has-a-forward-referenced-superclass-p class)
@@ -719,7 +683,7 @@ between the ~A definition and the ~A definition"
                       error-context))
                nil)
               (t
-               (sb-pcl:finalize-inheritance class)
+               (sb-mop:finalize-inheritance class)
                t)))
           (bug "~@<Don't know how to ensure validity of ~S (not a STANDARD-CLASSOID) ~
                 for ~A.~%~:@>"
@@ -735,13 +699,6 @@ between the ~A definition and the ~A definition"
     (unless (and (%ensure-classoid-valid class1 layout1 errorp)
                  (%ensure-classoid-valid class2 layout2 errorp))
       (return-from %ensure-both-classoids-valid nil))))
-
-#-sb-xc-host ; No such thing as LAYOUT-OF, never mind the rest
-(defun update-object-layout-or-invalid (object layout)
-  ;; FIXME: explain why this isn't (LAYOUT-FOR-STD-CLASS-P LAYOUT).
-  (if (layout-for-std-class-p (layout-of object))
-      (sb-pcl::check-wrapper-validity object)
-      (sb-c::%layout-invalid-error object layout)))
 
 ;;; Simple methods for TYPE= and SUBTYPEP should never be called when
 ;;; the two classes are equal, since there are EQ checks in those
@@ -1171,7 +1128,7 @@ between the ~A definition and the ~A definition"
                      (setf (classoid-cell-classoid
                             (find-classoid-cell name :create t))
                            (!make-built-in-classoid
-                             :hash-value (interned-type-hash name)
+                             :%bits (pack-ctype-bits classoid name)
                              :name name
                              :translation (if trans-p :initializing nil)
                              :direct-superclasses
@@ -1232,8 +1189,12 @@ between the ~A definition and the ~A definition"
 ;;; use those slots as indexes into tables.
 (defun %invalidate-layout (layout)
   (declare (type layout layout))
-  (setf (layout-invalid layout) t
-        (layout-depthoid layout) -1)
+  #+sb-xc-host (warn "Why are we invalidating layout ~S?" layout)
+  (setf (layout-invalid layout) t)
+  (assign-layout-slots layout :depthoid -1)
+  ;; Ensure that the INVALID slot conveying ancillary data describing the
+  ;; invalidity reason is published before causing the invalid layout trap.
+  (sb-thread:barrier (:write))
   (setf (layout-clos-hash layout) 0)
   (let ((inherits (layout-inherits layout))
         (classoid (layout-classoid layout)))

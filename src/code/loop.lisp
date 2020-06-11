@@ -94,6 +94,7 @@
     ((head-var tail-var &optional user-head-var) &body body)
   (let ((l (and user-head-var (list (list user-head-var nil)))))
     `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
+       (declare (truly-dynamic-extent ,head-var))
        ,@body)))
 
 (sb-xc:defmacro loop-collect-rplacd
@@ -176,9 +177,9 @@ constructed.
 (declaim (sb-ext:freeze-type loop-minimax))
 
 (defconstant-eqx +loop-minimax-type-infinities-alist+
-  ;; FIXME: Now that SBCL supports floating point infinities again, we
-  ;; should have floating point infinities here, as cmucl-2.4.8 did.
-  '((fixnum sb-xc:most-positive-fixnum sb-xc:most-negative-fixnum))
+    '((fixnum            sb-xc:most-positive-fixnum            sb-xc:most-negative-fixnum)
+      (single-float      sb-ext:single-float-positive-infinity sb-ext:single-float-negative-infinity)
+      (double-float      sb-ext:double-float-positive-infinity sb-ext:double-float-negative-infinity))
   #'equal)
 
 (defun make-loop-minimax (answer-variable type)
@@ -415,35 +416,35 @@ code to be loaded.
 
 ;;; This is the pointer to the original, for things like NAMED that
 ;;; insist on being in a particular position
-  (original-source-code)
+  (original-source-code nil)
 
 ;;; This is (source-code *loop*) as of the "last" clause. It is used
 ;;; primarily for generating error messages (see loop-error, loop-warn).
-  (source-context)
+  (source-context nil)
 
 ;;; list of names for the LOOP, supplied by the NAMED clause
-  (names)
+  (names nil)
 
 ;;; The macroexpansion environment given to the macro.
   (macro-environment)
 
 ;;; This holds variable names specified with the USING clause.
 ;;; See LOOP-NAMED-VAR.
-  (named-vars)
+  (named-vars nil)
 
 ;;; LETlist-like list being accumulated for current group of bindings.
-  (vars)
+  (vars nil)
 
 ;;; List of declarations being accumulated in parallel with
 ;;; VARS.
-  (declarations)
+  (declarations nil)
 
 ;;; Declarations for destructuring bindings
-  (desetq-declarations)
+  (desetq-declarations nil)
 
 ;;; This is used by LOOP for destructuring binding, if it is doing
 ;;; that itself. See LOOP-MAKE-VAR.
-  (desetq)
+  (desetq nil)
 
 ;;; list of wrapping forms, innermost first, which go immediately
 ;;; inside the current set of parallel bindings being accumulated in
@@ -452,56 +453,56 @@ code to be loaded.
 ;;;   ((WITH-OPEN-FILE (G0001 G0002 ...))),
 ;;; with G0002 being one of the bindings in VARS (This is why the
 ;;; wrappers go inside of the variable bindings).
-  (wrappers)
+  (wrappers nil)
 
 ;;; This accumulates lists of previous values of VARS and the other
 ;;; lists above, for each new nesting of bindings. See
 ;;; LOOP-BIND-BLOCK.
-  (bind-stack)
+  (bind-stack nil)
 
 ;;; list of prologue forms of the loop, accumulated in reverse order
-  (prologue)
+  (prologue nil)
 
-  (before-loop)
-  (after-body)
+  (before-loop nil)
+  (after-body nil)
 
 ;;; This is T if we have emitted any body code, so that iteration
 ;;; driving clauses can be disallowed. This is not strictly the same
 ;;; as checking (BODY *LOOP*), because we permit some clauses such as
 ;;; RETURN to not be considered "real" body (so as to permit the user
 ;;; to "code" an abnormal return value "in loop").
-  (emitted-body)
+  (emitted-body nil)
 
 ;;; list of epilogue forms (supplied by FINALLY generally), accumulated
 ;;; in reverse order
-  (epilogue)
+  (epilogue nil)
 
 ;;; list of epilogue forms which are supplied after the above "user"
 ;;; epilogue. "Normal" termination return values are provide by
 ;;; putting the return form in here. Normally this is done using
 ;;; LOOP-EMIT-FINAL-VALUE, q.v.
-  (after-epilogue)
+  (after-epilogue nil)
 
 ;;; the "culprit" responsible for supplying a final value from the
 ;;; loop. This is so LOOP-DISALLOW-AGGREGATE-BOOLEANS can moan about
 ;;; disallowed anonymous collections.
-  (final-value-culprit)
+  (final-value-culprit nil)
 
 ;;; If not NIL, this is a temporary bound around the loop for holding
 ;;; the temporary value for "it" in things like "when (f) collect it".
 ;;; It may be used as a supertemporary by some other things.
-  (when-it-var)
+  (when-it-var nil)
 
 ;;; Sometimes we decide we need to fold together parts of the loop,
 ;;; but some part of the generated iteration code is different for the
 ;;; first and remaining iterations. This variable will be the
 ;;; temporary which is the flag used in the loop to tell whether we
 ;;; are in the first or remaining iterations.
-  (never-stepped-var)
+  (never-stepped-var nil)
 
 ;;; list of all the value-accumulation descriptor structures in the
 ;;; loop. See LOOP-GET-COLLECTION-INFO.
-  (collection-cruft) ; for multiple COLLECTs (etc.)
+  (collection-cruft nil) ; for multiple COLLECTs (etc.)
 
 ;;; This is the "current" loop context in use when we are expanding a
 ;;; loop. It gets bound on each invocation of LOOP.
@@ -759,11 +760,13 @@ code to be loaded.
                              '(complex float)))
                       (t
                        init)))))
-           ((csubtypep ctype (specifier-type 'vector))
-            (when (array-type-p ctype)
-              (let ((etype (type-*-to-t
-                            (array-type-specialized-element-type ctype))))
-                (make-array 0 :element-type (type-specifier etype)))))
+          ((csubtypep ctype (specifier-type 'vector))
+           (cond ((array-type-p ctype)
+                  (let ((etype (type-*-to-t
+                                (array-type-specialized-element-type ctype))))
+                    (make-array 0 :element-type (type-specifier etype))))
+                 ((csubtypep ctype (specifier-type 'string))
+                  "")))
            #+sb-unicode
            ((csubtypep ctype (specifier-type 'extended-char))
             (code-char base-char-code-limit))
@@ -1379,19 +1382,11 @@ code to be loaded.
 ;;;; list iteration
 
 (defun loop-list-step (listvar)
-  ;; We are not equipped to analyze whether 'FOO is the same as #'FOO
-  ;; here in any sensible fashion, so let's give an obnoxious warning
-  ;; whenever 'FOO is used as the stepping function.
-  ;;
-  ;; While a Discerning Compiler may deal intelligently with
-  ;; (FUNCALL 'FOO ...), not recognizing FOO may defeat some LOOP
-  ;; optimizations.
   (let ((stepper (cond ((loop-tequal (car (source-code *loop*)) :by)
                         (loop-pop-source)
                         (loop-get-form))
                        (t '(function cdr)))))
     (cond ((and (consp stepper) (eq (car stepper) 'quote))
-           (loop-warn "Use of QUOTE around stepping function in LOOP will be left verbatim.")
            `(funcall ,stepper ,listvar))
           ((and (consp stepper) (eq (car stepper) 'function))
            (list (cadr stepper) listvar))

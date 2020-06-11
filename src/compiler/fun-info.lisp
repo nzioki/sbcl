@@ -91,8 +91,8 @@
   ;; constant, then the arguments will be swapped.
   commutative)
 
-(def!struct (fun-info #-sb-xc-host (:pure t)
-                     (:copier nil))
+(defstruct (fun-info (:copier nil)
+                     #-sb-xc-host (:pure t))
   ;; boolean attributes of this function.
   (attributes (missing-arg) :type attributes)
   ;; TRANSFORM structures describing transforms for this function
@@ -148,6 +148,7 @@
   ;; a sequence of constraints (see CONSTRAINT-PROPAGATE), for the
   ;; consequent and alternative branches, respectively.
   (constraint-propagate-if nil :type (or function null))
+  (equality-constraint nil :type (or function null))
   ;; all the templates that could be used to translate this function
   ;; into IR2, sorted by increasing cost.
   (templates nil :type list)

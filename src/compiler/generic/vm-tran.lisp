@@ -117,7 +117,6 @@
     ;; There are some benefits to using the simple case for a known exact type:
     ;; - the layout can be wired in which might or might not save 1 instruction
     ;;   depending on whether layouts are in immobile space.
-    ;; - all backends can do this (subject to stack-allocatable-fixed-objects)
     ;; - for a small number of slots, copying them is inlined
     (cond ((not dd) ; it's going to be some subtype of NAME
            `(%copy-instance (%make-instance (%instance-length instance)) instance))
@@ -145,13 +144,17 @@
 ;;; The layout is stored in slot 0.
 ;;; *** These next two transforms should be the only code, aside from
 ;;;     some parts of the C runtime, with knowledge of the layout index.
+#+compact-instance-header
+(define-source-transform function-with-layout-p (x) `(functionp ,x))
 #-compact-instance-header
 (progn
   (define-source-transform %instance-layout (x)
     `(truly-the layout (%instance-ref ,x 0)))
   (define-source-transform %set-instance-layout (x val)
     `(%instance-set ,x 0 (the layout ,val)))
-  (define-source-transform %funcallable-instance-layout (x)
+  (define-source-transform function-with-layout-p (x)
+    `(funcallable-instance-p ,x))
+  (define-source-transform %fun-layout (x)
     `(truly-the layout (%funcallable-instance-info ,x 0)))
   (define-source-transform %set-funcallable-instance-layout (x val)
     `(setf (%funcallable-instance-info ,x 0) (the layout ,val))))
@@ -501,6 +504,7 @@
                   (word-logical-not (%vector-raw-bits bit-array index))))))))
 
 (deftransform bit-vector-= ((x y) (simple-bit-vector simple-bit-vector))
+  ;; TODO: unroll if length is known and not more than a few words
   `(and (= (length x) (length y))
         (let ((length (length x)))
           (or (= length 0)
@@ -541,6 +545,7 @@
 
 (deftransform count ((item sequence) (bit simple-bit-vector) *
                      :policy (>= speed space))
+  ;; TODO: unroll if length is known and not more than a few words
   `(let ((length (length sequence)))
     (if (zerop length)
         0
@@ -617,23 +622,24 @@
                      (dotimes (i sb-vm:n-word-bytes accum)
                        (setf accum (logior accum (ash code (* 8 i))))))
                    `(let ((code (sb-xc:char-code item)))
-                     (logior ,@(loop for i from 0 below sb-vm:n-word-bytes
-                                     collect `(ash code ,(* 8 i))))))))
+                      (setf code (dpb code (byte 8 8) code))
+                      (setf code (dpb code (byte 16 16) code))
+                      (dpb code (byte 32 32) code)))))
     `(let ((length (length sequence))
            (value ,value))
-      (multiple-value-bind (times rem)
-          (truncate length sb-vm:n-word-bytes)
-        (do ((index 0 (1+ index))
-             (end times))
-            ((>= index end)
-             (let ((place (* times sb-vm:n-word-bytes)))
-               (declare (fixnum place))
-               (dotimes (j rem sequence)
-                 (declare (index j))
-                 (setf (schar sequence (the index (+ place j))) item))))
-          (declare (optimize (speed 3) (safety 0))
-                   (type index index))
-          (setf (%vector-raw-bits sequence index) value))))))
+       (multiple-value-bind (times rem)
+           (truncate length sb-vm:n-word-bytes)
+         (do ((index 0 (1+ index))
+              (end times))
+             ((>= index end)
+              (let ((place (* times sb-vm:n-word-bytes)))
+                (declare (fixnum place))
+                (dotimes (j rem sequence)
+                  (declare (index j))
+                  (setf (schar sequence (the index (+ place j))) item))))
+           (declare (optimize (speed 3) (safety 0))
+                    (type index index))
+           (setf (%vector-raw-bits sequence index) value))))))
 
 ;;;; %BYTE-BLT
 
@@ -810,11 +816,11 @@
 ;;; VOP can't handle them.
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg fixnum)))
-  (ash (lvar-value obj) sb-vm::n-fixnum-tag-bits))
+  (ash (lvar-value obj) sb-vm:n-fixnum-tag-bits))
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg character)))
-  (logior sb-vm::character-widetag
-          (ash (char-code (lvar-value obj)) sb-vm::n-widetag-bits)))
+  (logior sb-vm:character-widetag
+          (ash (char-code (lvar-value obj)) sb-vm:n-widetag-bits)))
 
 ;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
 ;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.

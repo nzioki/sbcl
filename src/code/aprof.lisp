@@ -168,6 +168,10 @@
 ;;; Templates to try in order.  The one for unknown headered objects should be last
 ;;; so that we try to match a store to the header word if possible.
 (defglobal *allocation-templates* nil)
+;;; Running sb-aprof with #+sb-show is not an important concern,
+;;; and I don't care to fix it. It gets an error here:
+;;; "don't know how to dump R13 (default MAKE-LOAD-FORM method called)."
+#-sb-show
 (setq *allocation-templates*
       `((array ;; also array-header
                (xadd $free $size)
@@ -427,6 +431,9 @@
           (let ((nbytes (cdr (assoc '$nbytes bindings)))
                 (header (cdr (assoc '$header bindings)))
                 (lowtag (cdr (assoc '$lowtag bindings))))
+            ;; The low bit might signify something to the allocator. Clear it.
+            (when (integerp nbytes)
+              (setq nbytes (logandc2 nbytes 1)))
             ;; matchp converts NIL in a machine-ea to 0.  The disassembler uses
             ;; NIL to signify that there was no displacement, which makes sense
             ;; when register indirect mode is used without a SIB byte.

@@ -411,7 +411,7 @@
   (csubtypep type (specifier-type 'eq-comparable-type)))
 
 (defun specialized-list-seek-function-name (function-name key-functions &optional variant)
-  (or (find-symbol (with-simple-output-to-string (s)
+  (or (find-symbol (%with-output-to-string (s)
                      ;; Write "%NAME-FUN1-FUN2-FUN3", etc. Not only is
                      ;; this ever so slightly faster then FORMAT, this
                      ;; way we are also proof against *PRINT-CASE*
@@ -666,11 +666,6 @@
   (let* ((element-type (sb-vm:saetp-specifier saetp))
          (element-ctype (sb-vm:saetp-ctype saetp))
          (n-bits (sb-vm:saetp-n-bits saetp))
-         (basher-name (format nil "UB~D-BASH-FILL" n-bits))
-         (basher (or (find-symbol basher-name #.(find-package "SB-KERNEL"))
-                     (abort-ir1-transform
-                      "Unknown fill basher, please report to sbcl-devel: ~A"
-                      basher-name)))
          (kind (cond ((sb-vm:saetp-fixnum-p saetp) :tagged)
                      ((member element-type '(character base-char)) :char)
                      ((eq element-type 'single-float) :single-float)
@@ -681,81 +676,89 @@
                       :complex-single-float)
                      (t
                       (aver (integer-type-p element-ctype))
-                      :bits)))
-         ;; BASH-VALUE is a word that we can repeatedly smash
-         ;; on the array: for less-than-word sized elements it
-         ;; contains multiple copies of the fill item.
-         (bash-value
-           (if (constant-lvar-p item)
-               (let ((tmp (lvar-value item)))
-                 (unless (ctypep tmp element-ctype)
-                   (abort-ir1-transform "~S is not ~S" tmp element-type))
-                 (let* ((bits
-                          (ldb (byte n-bits 0)
-                               (ecase kind
-                                 (:tagged
-                                  (ash tmp sb-vm:n-fixnum-tag-bits))
-                                 (:char
-                                  (char-code tmp))
-                                 (:bits
-                                  tmp)
-                                 (:single-float
-                                  (single-float-bits tmp))
-                                 #+64-bit
-                                 (:double-float
-                                  (double-float-bits tmp))
-                                 #+64-bit
-                                 (:complex-single-float
-                                  #+big-endian
-                                  (logior (ash (single-float-bits (realpart tmp)) 32)
-                                          (ldb (byte 32 0)
-                                               (single-float-bits (imagpart tmp))))
-                                  #+little-endian
-                                  (logior (ash (single-float-bits (imagpart tmp)) 32)
-                                          (ldb (byte 32 0)
-                                               (single-float-bits (realpart tmp))))))))
-                        (res bits))
-                   (loop for i of-type sb-vm:word from n-bits by n-bits
-                         until (= i sb-vm:n-word-bits)
-                         do (setf res (ldb (byte sb-vm:n-word-bits 0)
-                                           (logior res (ash bits i)))))
-                   res))
-               (progn
-                 (when node
-                   (delay-ir1-transform node :constraint))
-                 (if (and (eq kind :bits)
-                          (= n-bits 1))
-                     `(ldb (byte ,sb-vm:n-word-bits 0) (- item))
-                     `(let ((res (ldb (byte ,n-bits 0)
-                                      ,(ecase kind
-                                         (:tagged
-                                          `(ash item ,sb-vm:n-fixnum-tag-bits))
-                                         (:char
-                                          `(char-code item))
-                                         (:bits
-                                          `item)
-                                         (:single-float
-                                          `(single-float-bits item))
-                                         #+64-bit
-                                         (:double-float
-                                          `(double-float-bits item))
-                                         #+64-bit
-                                         (:complex-single-float
-                                          #+big-endian
-                                          `(logior (ash (single-float-bits (realpart item)) 32)
-                                                   (ldb (byte 32 0)
-                                                        (single-float-bits (imagpart item))))
-                                          #+little-endian
-                                          `(logior (ash (single-float-bits (imagpart item)) 32)
-                                                   (ldb (byte 32 0)
-                                                        (single-float-bits (realpart item)))))))))
-                        (declare (type sb-vm:word res))
-                        ,@(loop for i of-type sb-vm:word = n-bits then (* 2 i)
-                                until (= i sb-vm:n-word-bits)
-                                collect
-                                `(setf res (dpb res (byte ,i ,i) res)))
-                        res))))))
-    (values basher bash-value)))
+                      :bits))))
+    (if (constant-lvar-p item)
+        (let* ((basher-name (format nil "UB~D-BASH-FILL" n-bits))
+               (basher (or (find-symbol basher-name #.(find-package "SB-KERNEL"))
+                           (abort-ir1-transform
+                            "Unknown fill basher, please report to sbcl-devel: ~A"
+                            basher-name)))
+               (tmp (lvar-value item)))
+          (unless (ctypep tmp element-ctype)
+            (abort-ir1-transform "~S is not ~S" tmp element-type))
+          (values
+           basher
+           ;; Construct a word that we can repeatedly smash
+           ;; on the array: for less-than-word sized elements it
+           ;; contains multiple copies of the fill item.
+           (let* ((bits
+                    (ldb (byte n-bits 0)
+                         (ecase kind
+                           (:tagged
+                            (ash tmp sb-vm:n-fixnum-tag-bits))
+                           (:char
+                            (char-code tmp))
+                           (:bits
+                            tmp)
+                           (:single-float
+                            (single-float-bits tmp))
+                           #+64-bit
+                           (:double-float
+                            (double-float-bits tmp))
+                           #+64-bit
+                           (:complex-single-float
+                            #+big-endian
+                            (logior (ash (single-float-bits (realpart tmp)) 32)
+                                    (ldb (byte 32 0)
+                                         (single-float-bits (imagpart tmp))))
+                            #+little-endian
+                            (logior (ash (single-float-bits (imagpart tmp)) 32)
+                                    (ldb (byte 32 0)
+                                         (single-float-bits (realpart tmp))))))))
+                  (res bits))
+             (loop for i of-type sb-vm:word from n-bits by n-bits
+                   until (= i sb-vm:n-word-bits)
+                   do (setf res (ldb (byte sb-vm:n-word-bits 0)
+                                     (logior res (ash bits i)))))
+             res)))
+        (progn
+          (when node
+            (delay-ir1-transform node :constraint))
+          (let* ((with
+                   (ecase kind
+                     (:tagged
+                      'fixnum)
+                     (:char
+                      (if (= n-bits sb-vm:n-word-bits)
+                          'word
+                          (format nil "UB~A" n-bits)))
+                     (:bits
+                      (cond ((not (csubtypep element-ctype (specifier-type 'unsigned-byte)))
+                             (format nil "SB~A" n-bits))
+                            ((= n-bits sb-vm:n-word-bits)
+                             'word)
+                            (t
+                             (format nil "UB~A" n-bits))))
+                     (:single-float
+                      'single-float)
+                     #+64-bit
+                     (:double-float
+                      'double-float)
+                     #+64-bit
+                     (:complex-single-float
+                      'complex-single-float)))
+                 (basher-name (if (eq with 'word)
+                                  (format nil "UB~D-BASH-FILL" n-bits)
+                                  (format nil "UB~D-BASH-FILL-WITH-~A"
+                                          n-bits (string with)))))
+            (values
+             (or (find-symbol basher-name #.(find-package "SB-KERNEL"))
+                 (abort-ir1-transform
+                  "Unknown fill basher, please report to sbcl-devel: ~A"
+                  basher-name))
+             (if (eq kind :char)
+                 '(char-code item)
+                 'item)))))))
 
 (deftransform fill ((seq item &key (start 0) (end nil))
                     (vector t &key (:start t) (:end t))
@@ -769,22 +772,39 @@
     (cond ((eq *wild-type* element-ctype)
            (delay-ir1-transform node :constraint)
            `(vector-fill* seq item start end))
+          #+x86-64
+          ((and (type= element-ctype *universal-type*)
+                (csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
+                (or (not start)
+                    (and (constant-lvar-p start)
+                         (eql (lvar-value start) 0)))
+                (not end))
+           '(vector-fill/t seq item 0 (length seq)))
           ((and saetp (sb-vm:valid-bit-bash-saetp-p saetp))
            (multiple-value-bind (basher bash-value) (find-basher saetp item node)
              (values
               ;; KLUDGE: WITH-ARRAY data in its full glory is going to mess up
               ;; dynamic-extent for MAKE-ARRAY :INITIAL-ELEMENT initialization.
               (if (csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
-                  `(let* ((len (length seq))
-                          (end (or end len))
-                          (bound (1+ end)))
-                     ;; Minor abuse CHECK-BOUND for bounds checking.
-                     ;; (- END START) may still end up negative, but
-                     ;; the basher handle that.
-                     (,basher ,bash-value seq
-                              (check-bound seq bound start)
-                              (- (if end (check-bound seq bound end) len)
-                                 start)))
+                  `(block nil
+                     (tagbody
+                        (let* ((len (length seq))
+                               (end (cond (end
+                                           (when (> end len)
+                                             (go bad-index))
+                                           end)
+                                          (len))))
+                          (return (,basher ,bash-value seq
+                                           ,(if (or (not start)
+                                                    (and (constant-lvar-p start)
+                                                         (eql (lvar-value start) 0)))
+                                                0
+                                                `(if (> start end)
+                                                     (go bad-index)
+                                                     start))
+                                           (- end start))))
+                      bad-index
+                        (sequence-bounding-indices-bad-error seq start end)))
                   `(with-array-data ((data seq)
                                      (start start)
                                      (end end)
@@ -1021,7 +1041,7 @@
     ((define-replace-transforms ()
        (loop for saetp across sb-vm:*specialized-array-element-type-properties*
              for sequence-type = `(simple-array ,(sb-vm:saetp-specifier saetp) (*))
-             unless (= (sb-vm:saetp-typecode saetp) sb-vm::simple-array-nil-widetag)
+             unless (= (sb-vm:saetp-typecode saetp) sb-vm:simple-array-nil-widetag)
              collect (!make-replace-transform saetp sequence-type sequence-type)
              into forms
              finally (return `(progn ,@forms))))
@@ -1059,11 +1079,7 @@
         ;; determining the direction of copying.
         (unless (= src-word dst-word)
           (give-up-ir1-transform))
-        ;; FIXME: The cross-compiler doesn't optimize TRUNCATE properly,
-        ;; so we have to do its work here.
-        `(let ((end (+ ,src-word ,(if (= n-elems-per-word 1)
-                                      'length
-                                      `(truncate (the index length) ,n-elems-per-word)))))
+        `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word))))
            (declare (type index end))
            ;; Handle any bits at the end.
            (when (logtest length (1- ,n-elems-per-word))
@@ -2245,9 +2261,12 @@
               (dolist (x (if reversedp (reverse map) map))
                 (let ((sym (car x)))
                   (unless (member sym seen)
-                    ;; NIL and T need wrapping in () since they should not signify
+                    ;; NIL, T, OTHERWISE need wrapping in () since they should not signify
                     ;; an empty list of keys or the "otherwise" case respectively.
-                    (push (list (if (member sym '(nil t)) (list sym) sym) (cdr x))
+                    (push (list (if (memq sym '(nil t otherwise))
+                                    (list sym)
+                                    sym)
+                                (cdr x))
                           clauses)
                     (push sym seen))))
               ;; CASE could decide not to use hash-based lookup, as there is a

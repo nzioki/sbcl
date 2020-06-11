@@ -18,6 +18,7 @@
 (defstruct (block-end (:include queued-op) (:copier nil))
   (suffix nil :type (or null simple-string)))
 
+(declaim (start-block))
 (defstruct (section-start (:include queued-op)
                           (:constructor nil)
                           (:copier nil))
@@ -27,7 +28,8 @@
 (defstruct (newline (:include section-start) (:copier nil))
   (kind (missing-arg)
         :type (member :linear :fill :miser :literal :mandatory)))
-(declaim (freeze-type newline))
+(declaim (freeze-type newline)
+         (end-block))
 
 #-sb-fluid (declaim (inline index-posn posn-index posn-column))
 (defun index-posn (index stream)
@@ -743,7 +745,7 @@ line break."
   ;; T iff one of the original entries.
   (initial-p (null *initial-pprint-dispatch-table*) :type boolean :read-only t)
   ;; and the associated function
-  (fun nil :type callable :read-only t))
+  (fun nil :type function-designator :read-only t))
 
 (declaim (freeze-type pprint-dispatch-entry))
 
@@ -805,15 +807,34 @@ line break."
          (new (make-pprint-dispatch-table (copy-list (pp-dispatch-entries orig))
                                           (pp-dispatch-number-matchable-p orig)
                                           (pp-dispatch-only-initial-entries orig))))
-    (replace/eql-hash-table (pp-dispatch-cons-entries new)
-                            (pp-dispatch-cons-entries orig))
+    (hash-table-replace (pp-dispatch-cons-entries new) (pp-dispatch-cons-entries orig))
     new))
 
 (defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((table (or table *initial-pprint-dispatch-table*))
+         (possibly-matchable
+          (if (pp-dispatch-only-initial-entries table)
+              ;; Filters out SYMBOL, INSTANCE, FUNCTION, NUMBER, most arrays,
+              ;; and many other types very quickly. As horrible as the code emitted
+              ;; for this check is, it's still 3x to 4x faster than >= 6 funcalls.
+              ;; The inefficiency of the array test can be fixed by transforming
+              ;; it to something clever like
+              ;;  (and (> widetag #x80) (logbitp (ash widetag -2) #xNNNN)) ; some bit pattern
+              ;; at the source level, or in the backend.
+              ;; See !PPRINT-COLD-INIT for the possibly matchable types.
+              (typep object '(or cons
+                                 (and array (not (or string bit-vector)))
+                                 sb-impl::comma))
+              ;; We could do something similar to the POSSIBLY-MATCHABLE test
+              ;; based on tracking separately whether the user added any non-cons
+              ;; entries and cons entries. So if no non-cons entries were added,
+              ;; then the table can't match OBJECT if it is an atom and in the
+              ;; set of atoms matched by the preceding TYPEP test.
+              (or (not (numberp object))
+                  (pp-dispatch-number-matchable-p table))))
          (entry
-          (when (or (not (numberp object)) (pp-dispatch-number-matchable-p table))
+          (when possibly-matchable
             (let ((cons-entry
                    (and (consp object)
                         (sb-impl::gethash/eql (car object) (pp-dispatch-cons-entries table) nil))))
@@ -864,7 +885,7 @@ line break."
 ;; (cons (eql foo) cons) and (cons (eql foo) bit-vector) as two FOO entries.
 (defun set-pprint-dispatch (type function &optional
                             (priority 0) (table *print-pprint-dispatch*))
-  (declare (type (or null callable) function)
+  (declare (type function-designator function)
            (type real priority)
            (type pprint-dispatch-table table))
   (declare (explicit-check))
@@ -1474,6 +1495,9 @@ line break."
   (setf *initial-pprint-dispatch-table* nil)
   (let ((*print-pprint-dispatch* (make-pprint-dispatch-table nil nil nil)))
     (/show0 "doing SET-PPRINT-DISPATCH for regular types")
+    ;; * PLEASE NOTE : If you change these definitions, then you may need to adjust
+    ;; the computation of POSSIBLY-MATCHABLE in PPRINT-DISPATCH.
+    ;;
     ;; Assign a lower priority than for the cons entries below, making
     ;; fewer type tests when dispatching.
     (set-pprint-dispatch '(and array (not (or string bit-vector))) 'pprint-array -1)

@@ -346,11 +346,11 @@
                           node))
 
 (defoptimizer (make-array-header* derive-type) ((&rest inits))
-  (let* ((data-position #.(sb-vm::slot-offset
+  (let* ((data-position #.(sb-vm:slot-offset
                            (find 'sb-vm::data (sb-vm:primitive-object-slots
                                                (find 'array sb-vm:*primitive-objects*
                                                      :key 'sb-vm:primitive-object-name))
-                                 :key 'sb-vm::slot-name)))
+                                 :key 'sb-vm:slot-name)))
          (data (nth data-position inits))
          (type (lvar-type data)))
     (when (array-type-p type)
@@ -716,6 +716,14 @@
                                         ;; we want to avoid reading it.
                                         (the index ,(or c-length 'length))
                                         ,n-words-form))))
+    (when (and c-length
+               fill-pointer
+               (csubtypep (lvar-type fill-pointer) (specifier-type 'index))
+               (not (types-equal-or-intersect (lvar-type fill-pointer)
+                                              (specifier-type `(integer 0 ,c-length)))))
+      (abort-ir1-transform "Invalid fill-pointer ~s for a vector of length ~s."
+                           (type-specifier (lvar-type fill-pointer))
+                           c-length))
     (flet ((eliminate-keywords ()
              (eliminate-keyword-args
               call 1
@@ -725,15 +733,6 @@
                 (:adjustable adjustable)
                 (:fill-pointer fill-pointer))))
            (with-alloc-form (&optional data-wrapper)
-             (when (and c-length
-                        fill-pointer
-                        (csubtypep (lvar-type fill-pointer) (specifier-type 'index))
-                        (not (types-equal-or-intersect (lvar-type fill-pointer)
-                                                       (specifier-type `(integer 0 ,c-length)))))
-               (compiler-warn "Invalid fill-pointer ~s for a vector of length ~s."
-                              (type-specifier (lvar-type fill-pointer))
-                              c-length)
-               (give-up-ir1-transform))
              (cond (complex
                     (let* ((constant-fill-pointer-p (constant-lvar-p fill-pointer))
                            (fill-pointer-value (and constant-fill-pointer-p
@@ -906,12 +905,22 @@
                           :node node)
   (delay-ir1-transform node :constraint)
   (when (and initial-contents initial-element)
-    (compiler-warn "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS")
-    (give-up-ir1-transform))
+    (abort-ir1-transform "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS"))
   (when (and displaced-index-offset
              (not displaced-to))
-    (compiler-warn "Can't specify :DISPLACED-INDEX-OFFSET without :DISPLACED-TO")
-    (give-up-ir1-transform))
+    (abort-ir1-transform "Can't specify :DISPLACED-INDEX-OFFSET without :DISPLACED-TO"))
+  (when (and displaced-to
+             (or initial-element initial-contents))
+    (if (types-equal-or-intersect (lvar-type displaced-to)
+                                  (specifier-type 'null))
+        (give-up-ir1-transform ":DISPLACED-TO potentially used with ~S"
+                               (if initial-element
+                                   :initial-element
+                                   :initial-contents))
+        (abort-ir1-transform "Can't specify :DISPLACED-TO and ~S"
+                             (if initial-element
+                                 :initial-element
+                                 :initial-contents))))
   (let ((fp-type (and fill-pointer
                       (lvar-type fill-pointer)) ))
     (when (and fp-type
@@ -1043,7 +1052,7 @@
                 (not (proper-list-p dims)))
         (give-up-ir1-transform))
       (unless (check-array-dimensions dims call)
-          (give-up-ir1-transform))
+        (give-up-ir1-transform))
       (cond ((singleton-p dims)
              (transform-make-array-vector (car dims) element-type
                                           initial-element initial-contents call
@@ -1417,15 +1426,18 @@
              (ref-p array-ref)
              (ref-p index-ref)
              (or
-              (let ((index-leaf (ref-leaf index-ref)))
+              (let* ((index-leaf (ref-leaf index-ref))
+                     (index-value (and (constant-p index-leaf)
+                                       (constant-value index-leaf)))
+                     (index-value (and (integerp index-value)
+                                       index-value)))
                 (loop for constraint in (ref-constraints array-ref)
                       for y = (constraint-y constraint)
                       thereis (and
                                (eq (constraint-kind constraint) 'array-in-bounds-p)
-                               (if (constant-p index-leaf)
+                               (if index-value
                                    (and (constant-p y)
-                                        (<= (constant-value index-leaf)
-                                            (constant-value y)))
+                                        (<= index-value (constant-value y)))
                                    (eq index-leaf y)))))
               (loop for constraint in (ref-constraints index-ref)
                     thereis (and (eq (constraint-kind constraint) 'array-in-bounds-p)

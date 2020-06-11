@@ -147,7 +147,7 @@
 
 (with-test (:name (sb-vm:map-allocated-objects :no-consing)
             :serial t
-            :fails-on :cheneygc
+            :fails-on (or :cheneygc (not :sb-thread))
             :skipped-on :interpreter)
   (let ((n 0))
     (sb-int:dx-flet ((f (obj type size)
@@ -222,10 +222,10 @@
         (incf count)))
     (assert (= count 2))))
 
-(with-test (:name :linkage-table-bogosity :skipped-on (not :sb-dynamic-core))
+;; Whoever deals with the Alpha and/or HPPA ports can make this test pass for them
+(with-test (:name :linkage-table-bogosity)
   (let ((strings (map 'list (lambda (x) (if (consp x) (car x) x))
-                      #+sb-dynamic-core sb-vm::+required-foreign-symbols+
-                      #-sb-dynamic-core '())))
+                      sb-vm::+required-foreign-symbols+)))
     (assert (= (length (remove-duplicates strings :test 'string=))
                (length strings)))))
 
@@ -2475,17 +2475,27 @@
                (rem x 10)))))
         (assert (not (ctu:find-code-constants f :type 'bignum)))))
 
-(with-test (:name :deduplicated-fdefns)
-  (dolist (c (sb-vm::list-allocated-objects :all :type sb-vm:code-header-widetag))
-    (let (dup-fdefns names)
-      (dotimes (i (sb-kernel:code-header-words c))
-        (let ((obj (sb-kernel:code-header-ref c i)))
-          (when (sb-kernel:fdefn-p obj)
-            (let ((name (sb-kernel:fdefn-name obj)))
-              (when (member name names)
-                (push obj dup-fdefns))
-              (push name names)))))
-      (assert (not dup-fdefns)))))
+(with-test (:name :deduplicated-fdefns :fails-on (not :64-bit))
+  (flet ((scan-range (c start end)
+           (let (dup-fdefns names)
+             (loop for i from start below end
+                   do (let ((obj (sb-kernel:code-header-ref c i)))
+                        (when (sb-kernel:fdefn-p obj)
+                          (let ((name (sb-kernel:fdefn-name obj)))
+                            (when (member name names)
+                              (push obj dup-fdefns))
+                            (push name names)))))
+             (assert (not dup-fdefns)))))
+    (dolist (c (sb-vm::list-allocated-objects :all :type sb-vm:code-header-widetag))
+      (let* ((start (+ sb-vm:code-constants-offset
+                       (* (sb-kernel:code-n-entries c)
+                          sb-vm:code-slots-per-simple-fun)))
+             (end (+ start (sb-kernel:code-n-named-calls c))))
+        ;; Within each subset of FDEFNs there should be no duplicates
+        ;; by name. But there could be an fdefn that is in the union of
+        ;; the ranges twice, if used for named call and a global ref.
+        (scan-range c start end)
+        (scan-range c end (sb-kernel:code-header-words c))))))
 
 (with-test (:name :map-all-lvar-dests)
   (checked-compile-and-assert
@@ -2588,6 +2598,9 @@
     (((expt 2 (1- sb-vm:n-word-bits)) #xFFFFFF) -1)
     (((1- (expt 2 (1- sb-vm:n-word-bits))) #xFFFFFF) -16777216)))
 
+#+#.(cl:if (cl:gethash 'sb-c:multiway-branch-if-eq sb-c::*backend-template-names*)
+           '(:and)
+           '(:or))
 (with-test (:name :typecase-to-case-preserves-type)
   (let ((f (checked-compile
             '(lambda (x)
@@ -2656,3 +2669,248 @@
     ((44 nil nil) 45)
     ((3 2 1) 0.0)
     ((30 2 nil) 30)))
+
+(with-test (:name :if-eq-optimization-consistency)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile-and-assert
+     ()
+     `(lambda ()
+        (eval (and (if (eval 0) (eval 0) (eval 0)) t)))
+     (() t))))
+
+(with-test (:name :make-array-half-finished-transform)
+  (checked-compile-and-assert
+      (:allow-warnings t)
+      `(lambda ()
+         (make-array 6 :fill-pointer 33))
+    (() (condition '(not program-error)))))
+
+(with-test (:name :nested-if+let)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let (x)
+           (when x
+             (setq x 1))
+           (let ((y (if x
+                        t
+                        nil)))
+             (if y
+                 y
+                 (let ((x x))
+                   x)))))
+      (() nil)))
+
+(with-test (:name :let-var-immediately-used-p-deleted-lambda)
+  (checked-compile-and-assert
+   ()
+   `(lambda (c)
+      (if (and nil
+               (or
+                (zerop (count (unwind-protect 1) '(1)))
+                c))
+          1
+          0))
+   ((2) 0)))
+
+(with-test (:name :dce-local-functions)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (block out
+           (labels ((mmm (z vars)
+                      (when vars
+                        (mmm z vars))))
+             (mmm 1 (progn
+                      (dotimes (a 1) (return-from out 10))
+                      (dotimes (b 3) (catch 'b))))
+             (dotimes (c 3) (catch 'c)))))
+    (() 10)))
+
+(with-test (:name :dce-more-often)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (+ 1
+            (if t
+                0
+                (progn
+                  (tagbody
+                   p
+                     (tagbody
+                        (let ((a (lambda () (go o))))
+                          (declare (special a)))
+                      o)
+                     (when (< a 1)
+                       (go p)))
+                  2))))
+    ((1) 1)))
+
+(with-test (:name :ir1-optimize-constant-fold-before-giving-up)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (+ 2 (- (let ((sum 0))
+                   (declare (type fixnum sum))
+                   (block nil
+                     (tagbody
+                      next
+                        (cond ((>= sum '0)
+                               (go end))
+                              (a
+                               (ceiling 1 (unwind-protect 2))
+                               (incf sum)))
+                        (go next)
+                      end))
+                   sum))))
+    ((1) 2)))
+
+(with-test (:name :position-case-otherwise)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (position x '(a otherwise b t nil)))
+    (('a) 0)
+    (('otherwise) 1)
+    ((nil) 4)
+    ((t) 3)))
+
+(with-test (:name :unreachable-component-propagate-let-args)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((p 0))
+           (flet ((f (&key)
+                    (flet ((g (&optional
+                                 (z
+                                  (return-from f (+ (dotimes (i 0 0)) p))))
+                             p))))))
+           p))
+    (() 0)))
+
+(with-test (:name :dce-through-optional-dispatch)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (flet ((z (&optional a)
+                  (declare (ignore a))
+                  123))
+           (let ((z #'z))
+             (when x
+               (unless x
+                 (setf z 10)))
+                   (funcall z))))
+    ((nil) 123)
+    ((t) 123)))
+
+(with-test (:name :values-list+cons)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            `(lambda ()
+               (values-list (cons 1 nil)))))
+          '(function () (values (integer 1 1) &optional)))))
+
+(with-test (:name :xeps-and-inlining)
+  (checked-compile-and-assert
+   ()
+   `(lambda (args)
+      (flet ((fun () args))
+        (declare (inline fun))
+        (multiple-value-call #'fun (values-list args))
+        #'fun))))
+
+(with-test (:name :split-let-ctran-kind)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b)
+      (let ((a-n (null a))
+            (b-n (null b)))
+        (cond (b-n 1)
+              (a-n a)
+              (t a))))
+   ((nil nil) 1)
+   ((nil t) nil)))
+
+(with-test (:name :dead-component-unused-closure)
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (labels ((%f1 ())
+               (%f2 (&key)
+                 (flet ((%f3 ()
+                          (unwind-protect 1)
+                          (return-from %f2 (%f1)))))))
+        (%f1)))
+   (() nil)))
+
+(with-test (:name :references-to-inline-funs-copied)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (and (inline-fun-arg-mismatch t)
+              #'inline-fun-arg-mismatch))
+    (() #'inline-fun-arg-mismatch)))
+
+(with-test (:name :eliminate-dead-code-before-initial-dfo)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (block nil
+          (flet ((f (&key (k1 (catch 'c)))
+                   (max 0
+                        (let ((v9 10))
+                          (return))))))))
+    (() nil)))
+
+(with-test (:name :%coerce-callable-to-fun-movement)
+  (checked-compile-and-assert
+   ()
+   `(lambda (y x)
+      (let ((x (sb-kernel:%coerce-callable-to-fun x)))
+        (when y
+          (funcall x))))
+    ((nil (make-symbol "UNDEF")) (condition 'undefined-function))))
+
+(with-test (:name :jump-table-use-labels)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x m)
+      (case x
+        ((a b c)
+         (if m
+             (error ""))
+         x)
+        ((d e f)
+         (eval 10)
+         x)))
+    (('a nil) 'a)
+    (('d 30) 'd)))
+
+(with-test (:name :dfo-deleted-lambda-home)
+  (assert
+   (nth-value 5 (checked-compile
+                 `(lambda (c)
+                    (flet ((f (&optional (o c))
+                             (lambda (&key)
+                               (+ (restart-bind nil (go missing-tag))
+                                  (progv nil nil o)))))))
+                 :allow-failure t))))
+
+
+(declaim (maybe-inline inline-recursive))
+(defun inline-recursive (x)
+  (declare (muffle-conditions compiler-note
+                              style-warning))
+  (if (zerop x)
+      x
+      (inline-recursive (1- x))))
+(declaim (inline inline-recursive))
+
+(with-test (:name :reanalyze-functionals-when-inlining)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (inline-recursive x)
+      (inline-recursive x))
+   ((5) 0)))

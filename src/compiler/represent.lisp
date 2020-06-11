@@ -214,8 +214,11 @@
 ;;; ignore TYPE-CHECK-ERROR because we don't want the possibility of
 ;;; error to bias the result. Notes are suppressed for T-C-E as well,
 ;;; since we don't need to worry about the efficiency of that case.
-(define-load-time-global *ignore-cost-vops* '(set type-check-error))
-(define-load-time-global *suppress-note-vops* '(type-check-error))
+(defconstant-eqx ignore-cost-vops '(set type-check-error) #'equal)
+(defconstant-eqx suppress-note-vops '(type-check-error) #'equal)
+
+#-sb-devel
+(declaim (start-block select-tn-representation))
 
 ;;; We special-case the move VOP, since using this costs for the
 ;;; normal MOVE would spuriously encourage descriptor representations.
@@ -239,7 +242,7 @@
       (let* ((vop (tn-ref-vop ref))
              (info (vop-info vop)))
         (unless (and (neq (tn-kind tn) :constant)
-                     (find (vop-info-name info) *ignore-cost-vops*))
+                     (find (vop-info-name info) ignore-cost-vops))
           (case (vop-info-name info)
             (move
              (let ((rep (tn-sc
@@ -305,6 +308,8 @@
                (setq unique t)))))
     (values min-scn unique)))
 
+(declaim (end-block))
+
 ;;; Prepare for the possibility of a TN being allocated on the number
 ;;; stack by setting NUMBER-STACK-P in all functions that TN is
 ;;; referenced in and in all the functions in their tail sets. REFS is
@@ -359,7 +364,7 @@
     (cond ((eq (tn-kind op-tn) :constant))
           ((policy op-node (and (<= speed inhibit-warnings)
                                 (<= space inhibit-warnings))))
-          ((member (template-name (vop-info op-vop)) *suppress-note-vops*))
+          ((member (template-name (vop-info op-vop)) suppress-note-vops))
           ((null dest-tn)
            (let* ((op-info (vop-info op-vop))
                   (op-note (or (template-note op-info)
@@ -745,6 +750,59 @@
     (note-number-stack-tn (tn-writes tn)))
   (values))
 
+;;; Arrange boxed constants so that all :NAMED-CALL constants are first,
+;;; then constant leaves, and finally LOAD-TIME-VALUE constants.
+;;; There exist a few reasons for placing all the FDEFNs first:
+;;;  * FDEFNs which are referenced for lisp call - as opposed to referenced
+;;;    in #'FUN syntax - could be stored as untagged pointers which would
+;;;    benefit the PPC64 architecture by removing a few instructions from each
+;;;    use of such fdefn by not having to subtract its lowtag prior to loading
+;;;    from both the fun and raw-fun slots. GC would need to be aware of the
+;;;    untagged pointer convention.
+;;;  * In the current approach for so-called "static" linking of immobile code,
+;;;    we change code instruction bytes so that they call into a simple-fun
+;;;    directly rather than through an fdefn, but the approach is subject to a
+;;;    data race when redefining an fdefn. It's conceivable that the race can be
+;;;    eliminated by substituting placeholders in the code headers of functions
+;;;    that had static linking performed - so that they see a reference to the
+;;;    callee rather than an fdefn - but in order for that to work, we must
+;;;    distinguish between fdefns that are needed for FDEFN-FUN
+;;;    (via IR2-CONVERT-GLOBAL-VAR) versus those which are present to satisfy
+;;;    a GC invariant and are not otherwise actually used.
+;;;  * Even without the preceding change, remove-static-links can avoid
+;;;    scanning code constants that are not FDEFNs.
+(defun sort-boxed-constants (2comp)
+  (let* ((sorted (ir2-component-constants 2comp))
+         (unsorted (subseq sorted 1))
+         (renumbering)) ; alist of (old . new) indices into constant vector
+    (setf (fill-pointer sorted) 0)
+    ;; add in fixed overhead
+    (let ((n-entries (length (ir2-component-entries 2comp))))
+      (dotimes (i (+ (* sb-vm:code-slots-per-simple-fun n-entries)
+                     sb-vm:code-constants-offset))
+        (vector-push-extend nil sorted)))
+    (flet ((scan (pass &aux (old-offset 0))
+             (dovector (constant unsorted)
+               (incf old-offset)
+               (when (eql pass (cond ((constant-p constant) 2)
+                                     ((eq (car constant) :named-call) 1)
+                                     (t 3)))
+                 (let ((new-offset (vector-push-extend constant sorted)))
+                   (push (cons old-offset new-offset) renumbering))))))
+      (scan 1)  ; first all the called fdefinitions
+      (scan 2)  ; then IR1 constants
+      (scan 3)) ; then various flavors of load-time magic
+    ;; Update the TN-OFFSET slot.
+    ;; There can be more than one TN with the same index into the constants
+    ;; because of how MAKE-LOAD-TIME-CONSTANT-TN works.
+    (do ((tn (ir2-component-constant-tns 2comp) (tn-next tn)))
+        ((null tn))
+      (let ((old-offset (tn-offset tn)))
+        (when old-offset
+          (setf (tn-offset tn)
+                (cdr (the (not null) (assoc old-offset renumbering)))))))
+    sorted))
+
 ;;; This is the entry to representation selection. First we select the
 ;;; representation for all normal TNs, setting the TN-SC. After
 ;;; selecting the TN representations, we set the SC for all :ALIAS TNs
@@ -757,12 +815,13 @@
 (defun select-representations (component)
   (let ((costs (make-array sb-vm:sc-number-limit))
         (2comp (component-info component)))
+    (sort-boxed-constants 2comp)
     (labels ((set-sc (tn sc)
-               (cond ((not (eq (tn-kind tn) :constant))
+               (cond ((neq (tn-kind tn) :constant)
                       (setf (tn-sc tn)
                             (svref *backend-sc-numbers* sc)))
                      ;; Translate primitive type scs into constant scs
-                     ((= sc sb-vm::descriptor-reg-sc-number)
+                     ((= sc sb-vm:descriptor-reg-sc-number)
                       (setf (tn-sc tn)
                             (svref *backend-sc-numbers* sb-vm:constant-sc-number)
                             (tn-offset tn)

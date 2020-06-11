@@ -88,14 +88,6 @@
   ;; does *not* hold.
   (not-p nil :type boolean))
 
-(defstruct (equality-constraint
-            (:include constraint)
-            (:constructor make-equality-constraint
-                (number operator x y not-p
-                 &aux (kind 'equality))))
-
-  (operator nil :type symbol))
-
 
 ;;; Historically, CMUCL and SBCL have used a sparse set implementation
 ;;; for which most operations are O(n) (see sset.lisp), but at the
@@ -307,7 +299,7 @@
   (etypecase y
     (ctype
        (awhen (lambda-var-ctype-constraints x)
-         (dolist (con (gethash (sb-kernel::type-class-info y) it) nil)
+         (dolist (con (gethash (sb-kernel::type-class y) it) nil)
            (when (and (eq (constraint-kind con) kind)
                       (eq (constraint-not-p con) not-p)
                       (type= (constraint-y con) y))
@@ -352,7 +344,7 @@
       (ctype
        (let ((index (ensure-hash (lambda-var-ctype-constraints x)))
              (vec   (ensure-vec  (lambda-var-inheritable-constraints x))))
-         (push con (gethash (sb-kernel::type-class-info y) index))
+         (push con (gethash (sb-kernel::type-class y) index))
          (vector-push-extend con vec)))
       (lvar
        (let ((index (ensure-hash (lambda-var-eq-constraints x))))
@@ -489,6 +481,9 @@
            (body-fun con))
          (do-conset-constraints-intersection
              (con (,conset (lambda-var-inheritable-constraints ,variable)) ,result)
+           (body-fun con))
+         (do-conset-constraints-intersection
+             (con (,conset (lambda-var-equality-constraints ,variable)) ,result)
            (body-fun con))))))
 
 (declaim (inline conset-lvar-lambda-var-eql-p conset-add-lvar-lambda-var-eql))
@@ -685,57 +680,6 @@
               (values 'array-in-bounds-p array-var index-constant)
               (values 'array-in-bounds-p index-var array-var)))))))
 
-(defun find-equality-constraint (operator x y not-p)
-  (let ((constraints (lambda-var-equality-constraints x)))
-    (when constraints
-      (loop for con across constraints
-            when (and (eq (equality-constraint-operator con) operator)
-                      (eq (constraint-not-p con) not-p)
-                      (eq (constraint-y con) y))
-            return con))))
-
-(defun find-or-create-equality-constraint (operator x y not-p)
-  (or (find-equality-constraint operator x y not-p)
-      (let ((new (make-equality-constraint (length *constraint-universe*)
-                                           operator
-                                           x y not-p)))
-        (vector-push-extend new *constraint-universe* (1+ (length *constraint-universe*)))
-        (flet ((add (var)
-                 (conset-adjoin new (lambda-var-constraints var))
-                 (macrolet ((ensure-vec (place)
-                              `(or ,place
-                                   (setf ,place
-                                         (make-array 8 :adjustable t :fill-pointer 0)))))
-                   (vector-push-extend new (ensure-vec (lambda-var-equality-constraints var)))
-                   (vector-push-extend new (ensure-vec (lambda-var-inheritable-constraints var))))))
-          (add x)
-          (when (lambda-var-p y)
-            (add y)))
-        new)))
-
-(defun add-equality-constraints (operator args constraints
-                                 consequent-constraints
-                                 alternative-constraints)
-  (case operator
-    ((eq eql)
-     (when (= (length args) 2)
-       (let* ((x (ok-lvar-lambda-var (first args) constraints))
-              (second (second args))
-              (y (if (constant-lvar-p second)
-                     (find-constant (lvar-value second))
-                     (ok-lvar-lambda-var second constraints))))
-         (when (and x y)
-           ;; TODO: inherit constraints
-           (let ((con (find-or-create-equality-constraint operator x y nil))
-                 (not-con (find-or-create-equality-constraint operator x y t)))
-             (conset-adjoin con consequent-constraints)
-             (conset-adjoin not-con alternative-constraints))))))))
-
-(defun add-eq-constraint (var lvar gen)
-  (let ((var2 (ok-lvar-lambda-var lvar gen)))
-    (when var2
-      (conset-adjoin (find-or-create-equality-constraint 'eq var var2 nil) gen))))
-
 ;;; Add test constraints to the consequent and alternative blocks of
 ;;; the test represented by USE.
 (defun add-test-constraints (use if constraints)
@@ -900,13 +844,8 @@
 ;;; into the result instead, if appropriate.
 (defun constrain-float-type (x y greater or-equal)
   (declare (type numeric-type x y))
-  (declare (ignorable x y greater or-equal)) ; for CROSS-FLOAT-INFINITY-KLUDGE
-
   (aver (eql (numeric-type-class x) 'float))
   (aver (eql (numeric-type-class y) 'float))
-  #+sb-xc-host                    ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
-  x
-  #-sb-xc-host                    ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
   (labels ((exclude (x)
              (cond ((not x) nil)
                    (or-equal x)
@@ -919,13 +858,13 @@
            (tighter-p (x ref)
              (cond ((null x) nil)
                    ((null ref) t)
-                   ((= (type-bound-number x) (type-bound-number ref))
+                   ((sb-xc:= (type-bound-number x) (type-bound-number ref))
                     ;; X is tighter if X is an open bound and REF is not
                     (and (consp x) (not (consp ref))))
                    (greater
-                    (< (type-bound-number ref) (type-bound-number x)))
+                    (sb-xc:< (type-bound-number ref) (type-bound-number x)))
                    (t
-                    (> (type-bound-number ref) (type-bound-number x))))))
+                    (sb-xc:> (type-bound-number ref) (type-bound-number x))))))
     (let* ((x-bound (bound x))
            (y-bound (exclude (bound y)))
            (new-bound (cond ((not x-bound)
@@ -959,20 +898,39 @@
 ;;; Return true if LEAF is "visible" from NODE.
 (defun leaf-visible-from-node-p (leaf node)
   (cond
-   ((lambda-var-p leaf)
-    ;; A LAMBDA-VAR is visible iif it is homed in a CLAMBDA that is an
-    ;; ancestor for NODE.
-    (let ((leaf-lambda (lambda-var-home leaf)))
-      (loop for lambda = (node-home-lambda node)
-            then (lambda-parent lambda)
-            while lambda
-            when (eq lambda leaf-lambda)
-            return t)))
+    ((lambda-var-p leaf)
+     (and (find leaf (lexenv-vars (node-lexenv node))
+                :key #'cdr :test #'eq)
+          t))
    ;; FIXME: Check on FUNCTIONALs (CLAMBDAs and OPTIONAL-DISPATCHes),
    ;; not just LAMBDA-VARs.
    (t
     ;; Assume everything else is globally visible.
     t)))
+
+(defun contiguous-numeric-set-type (xset)
+  (cond ((xset-empty-p xset)
+         nil)
+        ;; Is XSET a contiguous integer range?
+        ((block nil
+           (let ((count 0)
+                 (min nil)
+                 (max nil))
+             (declare (type fixnum count))
+             (map-xset (lambda (value)
+                         (unless (integerp value)
+                           (return))
+                         (incf count)
+                         (when (or (null min) (< value min))
+                           (setf min value))
+                         (when (or (null max) (> value max))
+                           (setf max value)))
+                       xset)
+             (when (= (- max min) (1- count))
+               (make-numeric-type :class 'integer :low min :high max)))))
+        ;; It's useful to know when something is not zero
+        ((xset-member-p 0 xset)
+         (make-numeric-type :class 'integer :low 0 :high 0))))
 
 ;;; Given the set of CONSTRAINTS for a variable and the current set of
 ;;; restrictions from flow analysis IN, set the type for REF
@@ -992,6 +950,7 @@
   (let ((res (single-value-type (node-derived-type ref)))
         (constrain-symbols (policy ref (> speed compilation-speed)))
         (not-set (alloc-xset))
+        (not-numeric (alloc-xset))
         (not-fpz nil)
         (not-res *empty-type*)
         (leaf (ref-leaf ref)))
@@ -1011,7 +970,11 @@
             (equality
              (unless (eq (ref-constraints ref)
                          (pushnew con (ref-constraints ref)))
-               (reoptimize-lvar (node-lvar ref))))
+               (let ((lvar (node-lvar ref))
+                     (principal-lvar (nth-value 1 (principal-lvar-dest-and-lvar (node-lvar ref)))))
+                 (reoptimize-lvar lvar)
+                 (unless (eq lvar principal-lvar)
+                   (reoptimize-lvar principal-lvar)))))
             (typep
              (if not-p
                  (if (member-type-p other)
@@ -1025,9 +988,15 @@
             (eql
              (let ((other-type (leaf-type other)))
                (if not-p
-                   (when (and (constant-p other)
-                              (member-type-p other-type))
-                     (note-not (constant-value other)))
+                   (when (constant-p other)
+                     (cond ((member-type-p other-type)
+                            (note-not (constant-value other)))
+                           ;; Numeric types will produce interesting
+                           ;; negations, other than just "not equal"
+                           ;; which can be handled by the equality
+                           ;; constraints.
+                           ((numeric-type-p other-type)
+                            (add-to-xset (constant-value other) not-numeric))))
                    (let ((leaf-type (leaf-type leaf)))
                      (cond
                        ((or (constant-p other)
@@ -1073,9 +1042,14 @@
            (setf (node-derived-type ref) *wild-type*)
            (change-ref-leaf ref (find-constant t)))
           (t
-           (let ((type (type-difference res
-                                        (type-union not-res
-                                                    (make-member-type not-set not-fpz)))))
+           (let* ((union
+                    (type-union not-res
+                                (make-member-type not-set not-fpz)))
+                  (numeric (contiguous-numeric-set-type not-numeric))
+                  (type (type-difference res
+                                         (if  numeric
+                                              (type-union union numeric)
+                                             union))))
              ;; CHANGE-CLASS can change the type, lower down to standard-object,
              ;; type propagation for classes is not as important anyway.
              (cond #-sb-xc-host
@@ -1269,7 +1243,8 @@
   (dolist (fun (component-lambdas component))
     (flet ((frob (x)
              (dolist (var (lambda-vars x))
-               (unless (lambda-var-constraints var)
+               (unless (or (lambda-var-constraints var)
+                           (lambda-var-no-constraints var))
                  (when (or (null (lambda-var-sets var))
                            (not (closure-var-p var)))
                    (setf (lambda-var-constraints var) (make-conset)))))))

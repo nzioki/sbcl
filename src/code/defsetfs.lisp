@@ -41,12 +41,6 @@
 (defsetf %instance-ref %instance-set)
 
 (defsetf %raw-instance-ref/word %raw-instance-set/word)
-;; The *FEATURE* formerly known as :RAW-SIGNED-WORD
-;; This condition would be better as
-;;   (vop-translates sb-kernel:%raw-instance-ref/signed-word)
-;; however the defknown is only executed if the raw slot type exists.
-;; (See compiler/generic/vm-fndb where it maps over *raw-slot-data*)
-#+(vop-named sb-vm::raw-instance-ref/signed-word)
 (defsetf %raw-instance-ref/signed-word %raw-instance-set/signed-word)
 (defsetf %raw-instance-ref/single %raw-instance-set/single)
 (defsetf %raw-instance-ref/double %raw-instance-set/double)
@@ -55,7 +49,9 @@
 
 (defsetf %instance-layout %set-instance-layout)
 (defsetf %funcallable-instance-info %set-funcallable-instance-info)
-(defsetf %funcallable-instance-layout %set-funcallable-instance-layout)
+;;; The writer is named after the reader, but only operates on FUNCALLABLE-INSTANCE
+;;; even if the reader operates on any FUNCTION.
+(defsetf %fun-layout %set-funcallable-instance-layout)
 
 ;;; from early-setf.lisp
 
@@ -359,8 +355,8 @@ with bits from the corresponding position in the new value.")
 (export '(0-arg-nil 1-arg-nil 2-arg-nil 3-arg-nil n-arg-nil
           1-arg-t n-arg-t)
         "SB-IMPL") ; export to prevent death by tree-shaker
-(defun n-arg-nil () (declare (optimize (sb-c::verify-arg-count 0))) nil)
-(defun n-arg-t   () (declare (optimize (sb-c::verify-arg-count 0))) t)
+(defun n-arg-nil () (declare (optimize (sb-c:verify-arg-count 0))) nil)
+(defun n-arg-t   () (declare (optimize (sb-c:verify-arg-count 0))) t)
 (defun 0-arg-nil () nil)
 (defun 1-arg-nil (a) (declare (ignore a)) nil)
 (defun 1-arg-t   (a) (declare (ignore a)) t)

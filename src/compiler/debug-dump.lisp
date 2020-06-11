@@ -38,7 +38,7 @@
   ;; The VOP that emitted this location (for node, save-set, ir2-block, etc.)
   (vop nil :type vop))
 
-(def!struct (restart-location
+(defstruct (restart-location
             (:constructor make-restart-location (&optional label tn))
             (:copier nil))
   (label nil :type (or null label))
@@ -387,16 +387,6 @@
   (make-sc+offset (sc-number (tn-sc tn))
                   (tn-offset tn)))
 
-(defun lambda-ancestor-p (maybe-ancestor maybe-descendant)
-  (declare (type clambda maybe-ancestor)
-           (type (or clambda null) maybe-descendant))
-  (loop
-     (when (eq maybe-ancestor maybe-descendant)
-       (return t))
-     (setf maybe-descendant (lambda-parent maybe-descendant))
-     (when (null maybe-descendant)
-       (return nil))))
-
 ;;; Dump info to represent VAR's location being TN. ID is an integer
 ;;; that makes VAR's name unique in the function. BUFFER is the vector
 ;;; we stick the result in. If MINIMAL, we suppress name dumping, and
@@ -430,7 +420,8 @@
                         (null (basic-var-sets var))))
                (not (gethash tn (ir2-component-spilled-tns
                                  (component-info *component-being-compiled*))))
-               (lambda-ancestor-p (lambda-var-home var) fun))
+               (lexenv-contains-lambda fun
+                                       (lambda-lexenv (lambda-var-home var))))
       (setq flags (logior flags compiled-debug-var-environment-live)))
     (when save-tn
       (setq flags (logior flags compiled-debug-var-save-loc-p)))
@@ -720,6 +711,18 @@
         do (setf (compiled-debug-fun-next fun) next))
   (car sorted))
 
+(defun empty-fun-p (fun)
+  (let* ((2block (block-info (lambda-block fun)))
+         (start (ir2-block-start-vop 2block))
+         (next (ir2-block-next 2block)))
+    (and
+     start
+     (eq start (ir2-block-last-vop 2block))
+     (eq (vop-name start) 'note-environment-start)
+     next
+     (neq (ir2-block-physenv 2block)
+          (ir2-block-physenv next)))))
+
 ;;; Return a DEBUG-INFO structure describing COMPONENT. This has to be
 ;;; called after assembly so that source map information is available.
 (defun debug-info-for-component (component)
@@ -735,13 +738,15 @@
                                 :adjustable t))
         component-tlf-num)
     (dolist (lambda (component-lambdas component))
-      (clrhash var-locs)
-      (let ((tlf-num (source-path-tlf-number
-                      (node-source-path (lambda-bind lambda)))))
-        (if component-tlf-num
-            (aver (= component-tlf-num tlf-num))
-            (setf component-tlf-num tlf-num))
-        (push (compute-1-debug-fun lambda var-locs) dfuns)))
+      (unless (empty-fun-p lambda)
+       (clrhash var-locs)
+       (let ((tlf-num (source-path-tlf-number
+                       (node-source-path (lambda-bind lambda)))))
+         (if component-tlf-num
+             (aver (or (block-compile *compilation*)
+                       (= component-tlf-num tlf-num)))
+             (setf component-tlf-num tlf-num))
+         (push (compute-1-debug-fun lambda var-locs) dfuns))))
     (let* ((sorted (sort dfuns #'< :key #'compiled-debug-fun-offset))
            (fun-map (compute-debug-fun-map sorted)))
       (make-compiled-debug-info

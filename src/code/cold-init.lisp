@@ -65,7 +65,7 @@
 
   (/show0 "entering !COLD-INIT")
   (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
-  (!cold-init-hash-table-methods) ; needed by MAKE-READTABLE
+  (!readtable-cold-init)
   (setq *readtable* (make-readtable)
         *print-length* 6 *print-level* 3)
   (setq *error-output* (!make-cold-stderr-stream)
@@ -74,6 +74,7 @@
   (/show "testing '/SHOW" *print-length* *print-level*) ; show anything
   (unless (!c-runtime-noinform-p)
     (write-string "COLD-INIT... "))
+  (!cold-init-hash-table-methods)
   ;; Establish **initial-handler-clusters**
   (show-and-call sb-kernel::!target-error-cold-init)
   ;; And now *CURRENT-THREAD* and *HANDLER-CLUSTERS*
@@ -125,7 +126,6 @@
   (show-and-call !early-type-cold-init)
   (show-and-call !late-type-cold-init)
   (show-and-call !alien-type-cold-init)
-  (show-and-call !target-type-cold-init)
   ;; FIXME: It would be tidy to make sure that that these cold init
   ;; functions are called in the same relative order as the toplevel
   ;; forms of the corresponding source files.
@@ -161,8 +161,6 @@
   (unless (!c-runtime-noinform-p)
     (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
     (terpri))
-  ;; only the basic external formats are present at this point.
-  (setq sb-impl::*default-external-format* :latin-1)
 
   (loop with *package* = *package* ; rebind to self, as if by LOAD
         for index-in-cold-toplevels from 0
@@ -213,12 +211,12 @@
   ;; run the PROCLAIMs.
   (show-and-call !late-proclaim-cold-init)
 
+  (show-and-call !loader-cold-init)
   (show-and-call os-cold-init-or-reinit)
   (show-and-call !pathname-cold-init)
 
   (show-and-call stream-cold-init-or-reset)
   (/show "Enabled buffered streams")
-  (show-and-call !loader-cold-init)
   (show-and-call !foreign-cold-init)
   #-(and win32 (not sb-thread))
   (show-and-call signal-cold-init-or-reinit)
@@ -226,14 +224,7 @@
   (show-and-call float-cold-init-or-reinit)
 
   (show-and-call !class-finalize)
-
-  ;; Install closures as guards on some early PRINT-OBJECT methods so that
-  ;; THREAD and RESTART print nicely prior to the real methods being installed.
-  (dovector (method (cdr (assoc 'print-object sb-pcl::*!trivial-methods*)))
-    (unless (car method)
-      (let ((classoid (find-classoid (third method))))
-        (rplaca method
-                (lambda (x) (classoid-typep (layout-of x) classoid x))))))
+  (show-and-call sb-pcl::!fixup-print-object-method-guards)
 
   ;; The reader and printer are initialized very late, so that they
   ;; can do hairy things like invoking the compiler as part of their
@@ -252,7 +243,7 @@
   (setq *print-level* nil *print-length* nil) ; restore defaults
 
   ;; Enable normal (post-cold-init) behavior of INFINITE-ERROR-PROTECT.
-  (setf sb-kernel::*maximum-error-depth* 10)
+  (setf sb-kernel:*maximum-error-depth* 10)
   (/show0 "enabling internal errors")
   (setf (extern-alien "internal_errors_enabled" int) 1)
   (setf (symbol-function '%failed-aver) real-failed-aver-fun)
@@ -342,10 +333,6 @@ process to continue normally."
   (sb-thread::get-foreground))
 
 (defun reinit ()
-  #+win32
-  (setf sb-win32::*ansi-codepage* nil)
-  (setf *default-external-format* nil)
-  (setf sb-alien::*default-c-string-external-format* nil)
   ;; WITHOUT-GCING implies WITHOUT-INTERRUPTS.
   (without-gcing
     ;; Until *CURRENT-THREAD* has been set, nothing the slightest bit complicated

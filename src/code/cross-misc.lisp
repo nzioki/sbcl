@@ -339,6 +339,10 @@
 
 (defmacro sb-format:tokens (string) string)
 
+(defmacro sb-thread::with-recursive-system-lock ((lock) &body body)
+  (declare (ignore lock))
+  `(progn ,@body))
+
 ;;; Used by our lockfree memoization functions (define-hash-cache)
 (defmacro sb-thread:barrier ((kind) &body body)
   (declare (ignore kind))
@@ -348,3 +352,8 @@
 (defmacro %primitive (name arg)
   (ecase name
     (print `(format t "~A~%" ,arg))))
+
+(defmacro %with-output-to-string ((var) &body body)
+  ;; Let's suppose that the host lisp knows what it's doing to efficiently
+  ;; compile the standard macro. Don't try to outdo it.
+  `(with-output-to-string (,var) ,@body))

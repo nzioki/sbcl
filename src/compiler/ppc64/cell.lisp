@@ -14,13 +14,29 @@
 
 ;;;; Data object ref/set stuff.
 
+;;; PPC64 can't use the NIL-as-CONS + NIL-as-symbol trick *and* avoid using
+;;; temp-reg-tn to access symbol slots.
+;;; Since the NIL-as-CONS is necessary, and efficient accessor to lists and
+;;; instances is desirable, we lose a little on symbol access by being forced
+;;; to pre-check for NIL. There is trick that can get back some performance
+;;; on SYMBOL-VALUE which I plan to implement after this much works right.
 (define-vop (slot)
   (:args (object :scs (descriptor-reg)))
   (:info name offset lowtag)
-  (:ignore name)
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
-    (loadw result object offset lowtag)))
+    (cond ((member name '(symbol-name symbol-info sb-xc:symbol-package))
+           (let ((null-label (gen-label))
+                 (done-label (gen-label)))
+             (inst cmpld object null-tn)
+             (inst beq null-label)
+             (loadw result object offset lowtag)
+             (inst b done-label)
+             (emit-label null-label)
+             (loadw result object (1- offset) list-pointer-lowtag)
+             (emit-label done-label)))
+          (t
+           (loadw result object offset lowtag)))))
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
@@ -114,16 +130,32 @@
 (define-vop (symbol-global-value checked-cell-ref)
   (:translate sym-global-val)
   (:generator 9
+    ;; TODO: can this be made branchless somehow?
+    (inst cmpld object null-tn)
+    (inst beq NULL)
     (move obj-temp object)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
     (let ((err-lab (generate-error-code vop 'unbound-symbol-error obj-temp)))
       (inst cmpwi value unbound-marker-widetag)
-      (inst beq err-lab))))
+      (inst beq err-lab))
+    (inst b DONE)
+    NULL
+    (move value object)
+    DONE))
 
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate sym-global-val))
+  (:translate sym-global-val)
+  (:ignore offset lowtag)
+  (:generator 7
+    (inst cmpld object null-tn)
+    (inst beq NULL)
+    (loadw value object symbol-value-slot other-pointer-lowtag)
+    (inst b DONE)
+    NULL
+    (move value object)
+    DONE))
 
 #+sb-thread
 (progn
@@ -152,6 +184,8 @@
     (:vop-var vop)
     (:save-p :compute-only)
     (:generator 9
+      (inst cmpld object null-tn)
+      (inst beq NULL)
       (load-tls-index value object)
       (inst ldx value thread-base-tn value)
       (inst cmpdi value no-tls-value-marker-widetag)
@@ -159,7 +193,11 @@
       (loadw value object symbol-value-slot other-pointer-lowtag)
       CHECK-UNBOUND
       (inst cmpdi value unbound-marker-widetag)
-      (inst beq (generate-error-code vop 'unbound-symbol-error object))))
+      (inst beq (generate-error-code vop 'unbound-symbol-error object))
+      (inst b DONE)
+      NULL
+      (move value object)
+      DONE))
 
   (define-vop (fast-symbol-value symbol-value)
     ;; KLUDGE: not really fast, in fact, because we're going to have to
@@ -170,11 +208,16 @@
     (:policy :fast)
     (:translate symeval)
     (:generator 8
+      (inst cmpld object null-tn)
+      (inst beq NULL)
       (load-tls-index value object)
       (inst ldx value thread-base-tn value)
       (inst cmpdi value no-tls-value-marker-widetag)
       (inst bne DONE)
       (loadw value object symbol-value-slot other-pointer-lowtag)
+      (inst b DONE)
+      NULL
+      (move value object)
       DONE)))
 
 ;;; On unithreaded builds these are just copies of the global versions.
@@ -199,6 +242,8 @@
 (define-vop (boundp boundp-frob)
   (:translate boundp)
   (:generator 9
+    (inst cmpld object null-tn)
+    (inst beq (if not-p out target))
     (load-tls-index value object)
     (inst ldx value thread-base-tn value)
     (inst cmpdi value no-tls-value-marker-widetag)
@@ -206,7 +251,8 @@
     (loadw value object symbol-value-slot other-pointer-lowtag)
     CHECK-UNBOUND
     (inst cmpdi value unbound-marker-widetag)
-    (inst b? (if not-p :eq :ne) target)))
+    (inst b? (if not-p :eq :ne) target)
+    OUT))
 
 #-sb-thread
 (define-vop (boundp boundp-frob)
@@ -222,18 +268,46 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
-  (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; car slot, so we have to strip off the fixnum-tag-mask to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
+  (:args-var args)
+  (:generator 4
+    (when (not-nil-tn-ref-p args)
+      (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+      (return-from symbol-hash))
+    (inst cmpld symbol null-tn)
+    (inst beq NULL)
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (inst clrrdi res res n-fixnum-tag-bits)))
+    (inst b DONE)
+    NULL
+    (inst addi res null-tn (- (logand sb-vm:nil-value sb-vm:fixnum-tag-mask)))
+    DONE))
+(define-vop (symbol-plist)
+  (:policy :fast-safe)
+  (:translate symbol-plist)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (descriptor-reg)))
+  (:temporary (:scs (unsigned-reg)) temp)
+  (:generator 6
+    (inst cmpld symbol null-tn)
+    (inst beq NULL)
+    (loadw res symbol symbol-info-slot other-pointer-lowtag)
+    (inst andi. temp res lowtag-mask)
+    (inst cmpwi temp list-pointer-lowtag)
+    (inst beq take-car)
+    (move res null-tn) ; if INFO is a non-list, then the PLIST is NIL
+    (inst b DONE)
+    NULL
+    (loadw res symbol (1- symbol-info-slot) list-pointer-lowtag)
+    ;; fallthru. NULL's info slot always holds a cons
+    TAKE-CAR
+    (loadw res res cons-car-slot list-pointer-lowtag)
+    DONE))
 
 ;;;; Fdefinition (fdefn) objects.
 
-(define-vop (fdefn-fun cell-ref)
+(define-vop (fdefn-fun cell-ref) ; does not translate anything
   (:variant fdefn-fun-slot other-pointer-lowtag))
+(define-vop (untagged-fdefn-fun cell-ref) ; does not translate anything
+  (:variant fdefn-fun-slot 0))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -246,6 +320,31 @@
   (:generator 10
     (move obj-temp object)
     (loadw value obj-temp fdefn-fun-slot other-pointer-lowtag)
+    (inst cmpd value null-tn)
+    (let ((err-lab (generate-error-code vop 'undefined-fun-error obj-temp)))
+      (inst beq err-lab))))
+;;; We need the ordinary safe-fdefn-fun *and* the untagged one. The tagged vop
+;;; translates calls which store and pass fdefns as objects:
+;;;  - a readtable can map a character to an fdefn (or a function)
+;;;  - handler clusters can bind a condition to an fdefn (or function)
+;;;  - maybe more
+;;; Those uses want the lazy lookup aspect while being faster than symbol-function.
+;;; References within code never manipulate the fdefn as an object.
+;;; Luckily there is no ambiguity in the undefined-fun trap when it receives
+;;; an integer in a descriptor register: it's a "stealth mode" fdefn.
+(define-vop (safe-untagged-fdefn-fun) ; does not translate anything
+  (:policy :fast-safe)
+  ;; I've given up on the idea that untagged fdefns shall only be loaded into fdefn-tn.
+  ;; Because of error handling, the GC has to allow them to be seen anywhere,
+  ;; conservatively not touching the bits.
+  (:args (object :scs (descriptor-reg) :target obj-temp))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) obj-temp)
+  (:generator 10
+    (move obj-temp object)
+    (loadw value obj-temp fdefn-fun-slot 0)
     (inst cmpd value null-tn)
     (let ((err-lab (generate-error-code vop 'undefined-fun-error obj-temp)))
       (inst beq err-lab))))
@@ -296,60 +395,16 @@
 (define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
-  (:temporary (:scs (descriptor-reg)) temp tls-index)
-  (:temporary (:sc any-reg) zero)
+  (:temporary (:scs (descriptor-reg)) temp)
   (:generator 5
+    (let ((tls-index temp-reg-tn))
      (load-tls-index tls-index symbol)
-     (inst cmpdi tls-index 0)
-     (inst bne TLS-VALID)
-
-     ;; No TLS slot allocated, so allocate one.
-     ;; FIXME: this is a ridiculous number of instructions to emit inline.
-     (pseudo-atomic (pa-flag)
-       (without-scheduling ()
-         (assemble ()
-           (inst li temp (+ (static-symbol-offset '*tls-index-lock*)
-                            (ash symbol-value-slot word-shift)
-                            (- other-pointer-lowtag)))
-           OBTAIN-LOCK
-           (inst ldarx tls-index null-tn temp)
-           (inst cmpdi tls-index 0)
-           (inst bne OBTAIN-LOCK)
-           (inst stdcx. thread-base-tn null-tn temp)
-           (inst bne OBTAIN-LOCK)
-           (inst isync)
-
-           ;; Check to see if the TLS index was set while we were waiting.
-           (load-tls-index tls-index symbol)
-           (inst cmpdi tls-index 0)
-           (inst bne RELEASE-LOCK)
-
-           (load-symbol-value tls-index *free-tls-index*)
-           ;; FIXME: Check for TLS index overflow.
-           (inst addi tls-index tls-index n-word-bytes)
-           (store-symbol-value tls-index *free-tls-index*)
-           (inst addi tls-index tls-index (- n-word-bytes))
-           (store-tls-index tls-index symbol)
-
-           ;; The sync instruction doesn't need to happen if we branch
-           ;; directly to RELEASE-LOCK as we didn't do any stores in that
-           ;; case.
-           (inst sync)
-           RELEASE-LOCK
-           (inst li zero 0)
-           (inst stdx zero null-tn temp)
-
-           ;; temp is a boxed register, but we've been storing crap in it.
-           ;; fix it before we leave pseudo-atomic.
-           (inst li temp 0))))
-
-     TLS-VALID
+     (inst twi :eq tls-index 0)
      (inst ldx temp thread-base-tn tls-index)
      (inst addi bsp-tn bsp-tn (* binding-size n-word-bytes))
      (storew temp bsp-tn (- binding-value-slot binding-size))
      (storew tls-index bsp-tn (- binding-symbol-slot binding-size))
-     (inst stdx val thread-base-tn tls-index)))
+     (inst stdx val thread-base-tn tls-index))))
 
 #-sb-thread
 (define-vop (dynbind)
@@ -467,16 +522,15 @@
 
 ;;;; Instance hackery:
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (loadw temp struct 0 instance-pointer-lowtag)
-    (inst srdi res temp n-widetag-bits)))
+    (loadw res struct 0 instance-pointer-lowtag)
+    (inst srwi res res instance-length-shift)))
 
 (define-vop (instance-index-ref word-index-ref)
   (:policy :fast-safe)
@@ -499,10 +553,41 @@
 
 ;;;; Code object frobbing.
 
-(define-vop (code-header-ref word-index-ref)
-  (:translate code-header-ref)
+(define-vop (code-header-ref-any)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:results (value :scs (descriptor-reg)))
   (:policy :fast-safe)
-  (:variant 0 other-pointer-lowtag))
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:generator 2
+    ;; ASSUMPTION: N-FIXNUM-TAG-BITS = 3
+    (inst addi temp index (- other-pointer-lowtag))
+    (inst ldx value object temp)))
+
+(define-vop (code-header-ref-fdefn)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:results (value :scs (descriptor-reg)))
+  (:policy :fast-safe)
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:generator 3
+    ;; ASSUMPTION: N-FIXNUM-TAG-BITS = 3
+    (inst addi temp index (- other-pointer-lowtag))
+    ;; Loaded value is automatically pinned.
+    (inst ldx value object temp)
+    (inst ori value value other-pointer-lowtag)))
+
+#-sb-xc-host
+(defun code-header-ref (code index)
+  (declare (index index))
+  (let ((fdefns-start (sb-impl::code-fdefns-start-index code))
+        (count (code-n-named-calls code)))
+    (declare ((unsigned-byte 16) fdefns-start count))
+    (if (and (>= index fdefns-start) (< index (+ fdefns-start count)))
+        (%primitive code-header-ref-fdefn code index)
+        (%primitive code-header-ref-any code index))))
 
 (define-vop (code-header-set word-index-set)
   (:translate code-header-set)

@@ -38,28 +38,31 @@
   (inst lea alloc-tn (make-ea :byte :base esp-tn :disp lowtag))
   (values))
 
-(defun allocation-notinline (alloc-tn size)
+(defun allocation-notinline (type alloc-tn size)
   (let* ((alloc-tn-offset (tn-offset alloc-tn))
          ;; C call to allocate via dispatch routines. Each
          ;; destination has a special entry point. The size may be a
          ;; register or a constant.
-         (tn-text (ecase alloc-tn-offset
-                    (#.eax-offset "eax")
-                    (#.ecx-offset "ecx")
-                    (#.edx-offset "edx")
-                    (#.ebx-offset "ebx")
-                    (#.esi-offset "esi")
-                    (#.edi-offset "edi")))
-         (size-text (case size (8 "8_") (16 "16_") (t ""))))
+         (tn-name (ecase alloc-tn-offset
+                    (#.eax-offset 'eax)
+                    (#.ecx-offset 'ecx)
+                    (#.edx-offset 'edx)
+                    (#.ebx-offset 'ebx)
+                    (#.esi-offset 'esi)
+                    (#.edi-offset 'edi)))
+         (size-text
+           (case size
+             (8  "8-")
+             (16 "16-")
+             (t  (if (eq type 'list) "LIST-" "")))))
     (unless (or (eql size 8) (eql size 16))
       (unless (and (tn-p size) (location= alloc-tn size))
         (inst mov alloc-tn size)))
-    (inst call (make-fixup (concatenate 'string
-                                         "alloc_" size-text
-                                         "to_" tn-text)
-                           :foreign))))
+    (let ((routine (package-symbolicate (sb-xc:symbol-package tn-name)
+                                        "ALLOC-" size-text "TO-" tn-name)))
+      (inst call (make-fixup routine :assembly-routine)))))
 
-(defun allocation-inline (alloc-tn size)
+(defun allocation-inline (type alloc-tn size)
   (let* ((ok (gen-label))
          (done (gen-label))
          #+(and sb-thread win32)
@@ -78,9 +81,7 @@
                               scratch-tn)
                     :disp
                     #+sb-thread (* n-word-bytes thread-alloc-region-slot)
-                    ;; not a foreign-dataref because we don't support
-                    ;; dynamic core + no threads.
-                    #-sb-thread (make-fixup "gc_alloc_region" :foreign)))
+                    #-sb-thread boxed-region))
          (end-addr
             ;; thread->alloc_region.end_addr
            (make-ea :dword
@@ -88,7 +89,7 @@
                               scratch-tn)
                     :disp
                     #+sb-thread (* n-word-bytes (1+ thread-alloc-region-slot))
-                    #-sb-thread (make-fixup "gc_alloc_region" :foreign 4))))
+                    #-sb-thread (+ boxed-region n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -102,14 +103,22 @@
     (inst add alloc-tn free-pointer tls-prefix)
     (inst cmp alloc-tn end-addr tls-prefix)
     (inst jmp :be ok)
-    (let ((dst (ecase (tn-offset alloc-tn)
-                 (#.eax-offset "alloc_overflow_eax")
-                 (#.ecx-offset "alloc_overflow_ecx")
-                 (#.edx-offset "alloc_overflow_edx")
-                 (#.ebx-offset "alloc_overflow_ebx")
-                 (#.esi-offset "alloc_overflow_esi")
-                 (#.edi-offset "alloc_overflow_edi"))))
-      (inst call (make-fixup dst :foreign)))
+    (let ((dst (if (eq type 'list)
+                   (ecase (tn-offset alloc-tn)
+                     (#.eax-offset 'alloc-list-overflow-eax)
+                     (#.ecx-offset 'alloc-list-overflow-ecx)
+                     (#.edx-offset 'alloc-list-overflow-edx)
+                     (#.ebx-offset 'alloc-list-overflow-ebx)
+                     (#.esi-offset 'alloc-list-overflow-esi)
+                     (#.edi-offset 'alloc-list-overflow-edi))
+                   (ecase (tn-offset alloc-tn)
+                     (#.eax-offset 'alloc-overflow-eax)
+                     (#.ecx-offset 'alloc-overflow-ecx)
+                     (#.edx-offset 'alloc-overflow-edx)
+                     (#.ebx-offset 'alloc-overflow-ebx)
+                     (#.esi-offset 'alloc-overflow-esi)
+                     (#.edi-offset 'alloc-overflow-edi)))))
+      (inst call (make-fixup dst :assembly-routine)))
     (inst jmp done)
     (emit-label ok)
     ;; Swap ALLOC-TN and FREE-POINTER
@@ -146,19 +155,23 @@
 
 ;;; (FIXME: so why aren't we asserting this?)
 
-(defun allocation (alloc-tn size node &optional dynamic-extent lowtag)
+;;; A mnemonic device for the argument pattern here:
+;;; 1. what to allocate: type, size, lowtag describe the object
+;;; 2. how to allocate it: policy and how to invoke the trampoline
+;;; 3. where to put the result
+(defun allocation (type size lowtag node dynamic-extent alloc-tn)
   (declare (ignorable node))
   (cond
     (dynamic-extent
      (stack-allocation alloc-tn size lowtag))
-    ;; Inline allocation can't work if (and (not sb-thread) sb-dynamic-core)
-    ;; because boxed_region points to the linkage table, not the alloc region.
-    #+(or sb-thread (not sb-dynamic-core))
     ((or (null node) (policy node (>= speed space)))
-     (allocation-inline alloc-tn size))
+     (allocation-inline type alloc-tn size))
     (t
-     (allocation-notinline alloc-tn size)))
+     (allocation-notinline type alloc-tn size)))
   (when (and lowtag (not dynamic-extent))
+    ;; This is dumb, it should be an ADD or an OR, but a better solution
+    ;; would be to pass lowtag into the allocation-inline function so that
+    ;; for a fixed size we don't emit code such as "SUB r, 8 ; ADD r, 3".
     (inst lea alloc-tn (make-ea :byte :base alloc-tn :disp lowtag)))
   (values))
 
@@ -167,8 +180,8 @@
 ;;; RESULT-TN.
 (defun alloc-other (result-tn widetag size node &optional stack-allocate-p)
   (pseudo-atomic (:elide-if stack-allocate-p)
-      (allocation result-tn (pad-data-block size) node stack-allocate-p
-                  other-pointer-lowtag)
+      (allocation nil (pad-data-block size) other-pointer-lowtag
+                  node stack-allocate-p result-tn)
       (storew (compute-object-header size widetag)
               result-tn 0 other-pointer-lowtag)))
 
@@ -201,8 +214,8 @@
              (let ((cons-cells (if star (1- num) num))
                    (stack-allocate-p (node-stack-allocate-p node)))
                (pseudo-atomic (:elide-if stack-allocate-p)
-                (allocation res (* (pad-data-block cons-size) cons-cells) node
-                            stack-allocate-p list-pointer-lowtag)
+                (allocation 'list (* (pad-data-block cons-size) cons-cells)
+                            list-pointer-lowtag node stack-allocate-p res)
                 (move ptr res)
                 (dotimes (i (1- cons-cells))
                   (store-car (tn-ref-tn things) ptr)
@@ -254,8 +267,7 @@
                    (inst and result (lognot lowtag-mask))
                    result))))
       (pseudo-atomic ()
-       (allocation result size node)
-       (inst lea result (make-ea :byte :base result :disp other-pointer-lowtag))
+       (allocation nil size other-pointer-lowtag node nil result)
        (sc-case type
          (immediate
           (aver (typep (tn-value type) '(unsigned-byte 9)))
@@ -336,9 +348,8 @@
   (:generator 10
    (pseudo-atomic (:elide-if stack-allocate-p)
      (let ((size (+ length closure-info-offset)))
-       (allocation result (pad-data-block size) node
-                   stack-allocate-p
-                   fun-pointer-lowtag)
+       (allocation nil (pad-data-block size) fun-pointer-lowtag
+                   node stack-allocate-p result)
        (storew (logior (ash (1- size) n-widetag-bits) closure-widetag)
                result 0 fun-pointer-lowtag)))
    ;; Done with pseudo-atomic
@@ -398,9 +409,9 @@
           (aver (null type))
           (inst call (make-fixup dst :assembly-routine)))
         (pseudo-atomic (:elide-if stack-allocate-p)
-         (allocation result (pad-data-block words) node stack-allocate-p lowtag)
+         (allocation nil (pad-data-block words) lowtag node stack-allocate-p result)
          (when type
-           (storew (logior (ash (1- words) n-widetag-bits) type)
+           (storew (logior (ash (1- words) (length-field-shift type)) type)
                    result
                    0
                    lowtag))))))
@@ -418,10 +429,11 @@
     (inst lea bytes
           (make-ea :dword :base extra :disp (* (1+ words) n-word-bytes)))
     (inst mov header bytes)
-    (inst shl header (- n-widetag-bits 2)) ; w+1 to length field
+    (inst shl header (- (length-field-shift type) 2)) ; w+1 to length field
     (inst lea header                    ; (w-1 << 8) | type
-          (make-ea :dword :base header :disp (+ (ash -2 n-widetag-bits) type)))
+          (make-ea :dword :base header
+                          :disp (+ (ash -2 (length-field-shift type)) type)))
     (inst and bytes (lognot lowtag-mask))
     (pseudo-atomic (:elide-if stack-allocate-p)
-     (allocation result bytes node stack-allocate-p lowtag)
+     (allocation nil bytes lowtag node stack-allocate-p result)
      (storew header result 0 lowtag))))

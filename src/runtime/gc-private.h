@@ -19,27 +19,19 @@
 #include "immobile-space.h"
 #include "code.h"
 
-// Gencgc distinguishes between "quick" and "ordinary" requests.
-// Even on cheneygc we need this flag, but it's actually just ignored.
-#define ALLOC_QUICK 1
-
-#define CUSTOM_GC_SCAVENGE_FLAG 0x800000
-
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h"
-void *
-gc_alloc_with_region(struct alloc_region *my_region, sword_t nbytes,
-                     int page_type_flag, int quick_p);
 static inline void *
-gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
+gc_general_alloc(sword_t nbytes, int page_type_flag)
 {
+    void *gc_alloc_with_region(struct alloc_region*,sword_t,int);
     if (1 <= page_type_flag && page_type_flag <= 3)
         return gc_alloc_with_region(&gc_alloc_region[page_type_flag-1],
-                                    nbytes, page_type_flag, quick_p);
+                                    nbytes, page_type_flag);
     lose("bad page type flag: %d", page_type_flag);
 }
 #else
-extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
+extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
 #endif
 
 #define CHECK_COPY_PRECONDITIONS(object, nwords) \
@@ -56,18 +48,29 @@ extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
 static inline lispobj
 gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
 {
-    lispobj *new;
-
     CHECK_COPY_PRECONDITIONS(object, nwords);
 
     /* Allocate space. */
-    new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag, ALLOC_QUICK);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
 
     /* Copy the object. */
     memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
 
     note_transported_object(object, new);
 
+    return make_lispobj(new, lowtag_of(object));
+}
+
+// Like above but copy potentially fewer words than are allocated.
+// ('old_nwords' can be, but does not have to be, smaller than 'nwords')
+static inline lispobj
+gc_copy_object_resizing(lispobj object, long nwords, int page_type_flag,
+                        int old_nwords)
+{
+    CHECK_COPY_PRECONDITIONS(object, nwords);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
+    memcpy(new, native_pointer(object), old_nwords*N_WORD_BYTES);
+    note_transported_object(object, new);
     return make_lispobj(new, lowtag_of(object));
 }
 
@@ -139,7 +142,6 @@ static inline boolean filler_obj_p(lispobj __attribute__((unused)) *obj) { retur
 extern void enliven_immobile_obj(lispobj*,int);
 
 #define IMMOBILE_OBJ_VISITED_FLAG    0x10
-#define IMMOBILE_OBJ_GENERATION_MASK 0x0f // mask off the VISITED flag
 
 // Immobile object header word:
 //                 generation byte --|    |-- widetag
@@ -158,40 +160,37 @@ extern void enliven_immobile_obj(lispobj*,int);
 // Shifting a 1 bit left by the contents of the generation byte
 // must not overflow a register.
 
-// Note: this does not work on a SIMPLE-FUN
-// because a simple-fun header does not contain a generation.
-#define __immobile_obj_generation(x) (__immobile_obj_gen_bits(x) & IMMOBILE_OBJ_GENERATION_MASK)
+// Mask off the VISITED flag to get the generation number
+#define immobile_obj_generation(x) (immobile_obj_gen_bits(x) & 0xf)
 
 #ifdef LISP_FEATURE_LITTLE_ENDIAN
+// Return the generation bits which means the generation number
+// in the 4 low bits (there's 1 excess bit) and the VISITED flag.
 static inline int immobile_obj_gen_bits(lispobj* obj) // native pointer
 {
+    // When debugging, assert that we're called only on a headered object
+    // whose header contains a generation byte.
+    gc_dcheck(!embedded_obj_p(widetag_of(obj)));
     char gen;
     switch (widetag_of(obj)) {
     default:
         gen = ((generation_index_t*)obj)[3]; break;
-    case SIMPLE_FUN_WIDETAG:
-        gen = ((generation_index_t*)fun_code_header(obj))[3]; break;
     case FDEFN_WIDETAG:
         gen = ((generation_index_t*)obj)[1]; break;
     }
     return gen & 0x1F;
 }
-// Slightly faster variant when we know that the object can't be a simple-fun,
-// such as when walking the immobile space.
-static inline int __immobile_obj_gen_bits(lispobj* obj) // native pointer
-{
-    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    return ((generation_index_t*)obj)[byte] & 0x1F;
-}
 // Turn a grey node black.
 static inline void set_visited(lispobj* obj)
 {
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
+    gc_dcheck(immobile_obj_gen_bits(obj) == new_space);
     int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    gc_dcheck(__immobile_obj_gen_bits(obj) == new_space);
     ((generation_index_t*)obj)[byte] |= IMMOBILE_OBJ_VISITED_FLAG;
 }
 static inline void assign_generation(lispobj* obj, generation_index_t gen)
 {
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
     int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
     generation_index_t* ptr = (generation_index_t*)obj + byte;
     // Clear the VISITED flag, assign a new generation, preserving the three
@@ -220,7 +219,7 @@ static inline boolean weak_pointer_breakable_p(struct weak_pointer *wp)
     return is_lisp_pointer(pointee) && (from_space_p(pointee)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
          || (immobile_space_p(pointee) &&
-             immobile_obj_gen_bits(native_pointer(pointee)) == from_space)
+             immobile_obj_gen_bits(base_pointer(pointee)) == from_space)
 #endif
             );
 }
@@ -333,5 +332,28 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 
 #define KV_PAIRS_HIGH_WATER_MARK(kvv) fixnum_value(kvv[0])
 #define KV_PAIRS_REHASH(kvv) kvv[1]
+
+#include "genesis/layout.h"
+// Generalize over INSTANCEish things. (Not general like SB-KERNEL:LAYOUT-OF)
+static inline lispobj layout_of(lispobj* instance) { // native ptr
+    // Smart C compilers eliminate the ternary operator if exprs are the same
+    return widetag_of(instance) == FUNCALLABLE_INSTANCE_WIDETAG
+      ? funinstance_layout(instance) : instance_layout(instance);
+}
+
+extern lispobj layout_of_layout;
+/// Return true if 'thing' is a layout.
+static inline boolean layoutp(lispobj thing)
+{
+    lispobj base_ptr = thing - INSTANCE_POINTER_LOWTAG;
+    lispobj layout;
+    if ((base_ptr & LOWTAG_MASK) || !(layout = layout_of((lispobj*)base_ptr)))
+        return 0;
+    return layout == layout_of_layout;
+}
+
+static inline int lockfree_list_node_layout_p(struct layout* layout) {
+    return layout->flags & flag_LockfreeListNode;
+}
 
 #endif /* _GC_PRIVATE_H_ */

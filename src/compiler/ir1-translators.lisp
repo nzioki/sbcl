@@ -571,6 +571,10 @@ Return VALUE without evaluating it."
     (t
      (compiler-error "~S is not a legal function name." thing))))
 
+(def-ir1-translator %fun-name-leaf ((thing) start next result)
+  (fun-name-leaf thing)
+  (ir1-convert start next result nil))
+
 (def-ir1-translator %%allocate-closures ((&rest leaves) start next result)
   (aver (eq result 'nil))
   (let ((lambdas leaves))
@@ -1113,7 +1117,7 @@ care."
                                   :derived derived
                                   :array array
                                   :bound bound)))
-      (push cast (lvar-dependent-casts array))
+      (push cast (lvar-dependent-nodes array))
       (link-node-to-previous-ctran cast index-ctran)
       (setf (lvar-dest index-lvar) cast)
       (use-continuation cast next result))))
@@ -1322,15 +1326,14 @@ due to normal completion or a non-local exit such as THROW)."
   ;; an XEP.
   (ir1-convert
    start next result
-   (with-unique-names (cleanup-fun drop-thru-tag exit-tag next start count)
+   (with-unique-names (cleanup-fun drop-thru-tag exit-tag . #-no-continue-unwind (next start count)
+                                                            #+no-continue-unwind ())
      `(flet ((,cleanup-fun ()
                ,@cleanup
                (values)))
-        ;; FIXME: If we ever get DYNAMIC-EXTENT working, then
-        ;; ,CLEANUP-FUN should probably be declared DYNAMIC-EXTENT,
-        ;; and something can be done to make %ESCAPE-FUN have
-        ;; dynamic extent too.
+        ;; FIXME: Maybe %ESCAPE-FUN could dynamic extent too.
         (declare (dynamic-extent #',cleanup-fun))
+        #-no-continue-unwind
         (block ,drop-thru-tag
           (multiple-value-bind (,next ,start ,count)
               (block ,exit-tag
@@ -1341,14 +1344,28 @@ due to normal completion or a non-local exit such as THROW)."
                  (return-from ,drop-thru-tag ,protected)))
             (declare (optimize (insert-debug-catch 0)))
             (,cleanup-fun)
-            (%continue-unwind ,next ,start ,count)))))))
+            (%unwind ,next ,start ,count)))
+        #+no-continue-unwind
+        (block ,drop-thru-tag
+          (block ,exit-tag
+            (%within-cleanup
+             :unwind-protect
+             (%unwind-protect (%escape-fun ,exit-tag)
+                              (%cleanup-fun ,cleanup-fun))
+             (return-from ,drop-thru-tag ,protected)))
+          (locally
+              (declare (optimize (insert-debug-catch 0)))
+            (,cleanup-fun)
+            (%continue-unwind)))))))
 
 (def-ir1-translator inspect-unwinding
     ((protected inspect-fun) start next result)
   (ir1-convert
    start next result
-   (with-unique-names (drop-thru-tag exit-tag next start count)
+   (with-unique-names (drop-thru-tag exit-tag next . #-no-continue-unwind (start count)
+                                                     #+no-continue-unwind ())
      `(block ,drop-thru-tag
+        #-no-continue-unwind
         (multiple-value-bind (,next ,start ,count)
             (block ,exit-tag
               (%within-cleanup
@@ -1358,15 +1375,40 @@ due to normal completion or a non-local exit such as THROW)."
                (return-from ,drop-thru-tag ,protected)))
           (declare (optimize (insert-debug-catch 0)))
           (funcall ,inspect-fun ,next)
-          (%continue-unwind ,next ,start ,count))))))
+          (%unwind ,next ,start ,count))
+        #+no-continue-unwind
+        (let ((,next
+                (block ,exit-tag
+                  (%within-cleanup
+                   :unwind-protect
+                   (%unwind-protect (%escape-fun ,exit-tag)
+                                    nil)
+                   (return-from ,drop-thru-tag ,protected)))))
+          (declare (optimize (insert-debug-catch 0)))
+          (funcall ,inspect-fun ,next)
+          (%continue-unwind))))))
 
 ;;; Evaluate CLEANUP iff PROTECTED does a non-local exit.
 (def-ir1-translator nlx-protect
     ((protected &body cleanup) start next result)
   (ir1-convert
    start next result
-   (with-unique-names (drop-thru-tag exit-tag next start count)
+   (with-unique-names (drop-thru-tag exit-tag . #-no-continue-unwind (next start count)
+                                                #+no-continue-unwind ())
      `(block ,drop-thru-tag
+        #+no-continue-unwind
+        (progn
+          (block ,exit-tag
+            (%within-cleanup
+             :unwind-protect
+             (%unwind-protect (%escape-fun ,exit-tag)
+                              nil)
+             (return-from ,drop-thru-tag ,protected)))
+          (locally
+              (declare (optimize (insert-debug-catch 0)))
+            ,@cleanup
+            (%continue-unwind)))
+        #-no-continue-unwind
         (multiple-value-bind (,next ,start ,count)
             (block ,exit-tag
               (%within-cleanup
@@ -1376,7 +1418,7 @@ due to normal completion or a non-local exit such as THROW)."
                (return-from ,drop-thru-tag ,protected)))
           (declare (optimize (insert-debug-catch 0)))
           ,@cleanup
-          (%continue-unwind ,next ,start ,count))))))
+          (%unwind ,next ,start ,count))))))
 
 ;;;; multiple-value stuff
 

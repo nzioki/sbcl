@@ -28,6 +28,8 @@
 
 (in-package "SB-PCL")
 
+(declaim (type (member nil early braid complete) **boot-state**))
+(define-load-time-global **boot-state** nil)
 
 ;;; method function stuff.
 ;;;
@@ -49,7 +51,13 @@
 ;;; method function itself, and also that if a user overrides method
 ;;; function creation there is no danger of having the system get
 ;;; confused.
+
+;;; FIXME: these all go in dynamic space and then allocate a trampoline when
+;;; assigned into an FDEFN. Figure out how to put them in immobile space,
+;;; or can we allocate them _anywhere_ with embedded code now? I think so!
+;;; And why do we assign these info FDEFNs? What calls them via their names?
 #-sb-xc-host ; host doesn't need
+(progn
 (!defstruct-with-alternate-metaclass %method-function
   :slot-names (fast-function)
   :constructor %make-method-function
@@ -57,6 +65,25 @@
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
   :dd-type funcallable-structure)
+;;; Note: for x8-64 with #+immobile-code there are 2 additional raw slots which
+;;; hold machine instructions to load the funcallable-instance-fun and jump to
+;;; it, so that funcallable-instances can act like simple-funs, in as much as
+;;; there's an address you can jump to without loading a register.
+(sb-kernel:!defstruct-with-alternate-metaclass standard-funcallable-instance
+  :slot-names (clos-slots hash-code)
+  :constructor %make-standard-funcallable-instance
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
+)
+
+;;; Needed to compile the #n# reader because apparently some people think it amusing
+;;; to create readable funcallable instances involving circularity and/or sharing.
+;;; No constraint on the result type so that the slot implementation strategy
+;;; is wholly defined within the warm build.
+(defmacro %fsc-instance-slots (fin)
+  `(%funcallable-instance-info ,fin ,sb-vm:instance-data-start))
 
 ;;; Set up fake standard-classes.
 ;;; This is enough to fool the compiler into optimizing TYPEP into
@@ -92,18 +119,45 @@
     (long-method-combination long-method-combination-p)
     (short-method-combination short-method-combination-p)))
 
+(defmacro set-layout-valid (layout)
+  `(let ((layout ,layout))
+     (setf (layout-invalid layout) niL)
+     layout))
+
 #+sb-xc-host
+(progn
+;;; Create #<SB-KERNEL::CONDITION-CLASSOID CONDITION>
+;;; so that we can successfully parse the type specifier
+;;; CONDITION-DESIGNATOR-HEAD which expands to
+;;; (or format-control symbol condition sb-pcl::condition-class).
+;;; Compiling any ERROR or WARN call eagerly looks up and re-parses
+;;; the global ftype, and we don't want to see unknown types.
+(let* ((name 'condition)
+       (classoid (sb-kernel::make-condition-classoid :name name))
+       (cell (sb-kernel::make-classoid-cell name classoid))
+       (layout (set-layout-valid
+                (make-layout (hash-layout-name name)
+                             classoid
+                             :inherits (vector (find-layout 't))
+                             :depthoid 1
+                             :length (+ sb-vm:instance-data-start 1)
+                             :flags +condition-layout-flag+))))
+  (setf (classoid-layout classoid) layout
+        (info :type :classoid-cell name) cell
+        (info :type :kind name) :instance))
+
+;;; Create classoids that correspond with some CLOS classes
 (flet ((create-fake-classoid (name fun-p)
          (let* ((classoid (make-standard-classoid :name name))
                 (cell (sb-kernel::make-classoid-cell name classoid))
                 (layout
-                 (make-layout
-                  (randomish-layout-clos-hash name) classoid
-                  :inherits (map 'vector #'find-layout
-                                 (cons t (if fun-p '(function))))
-                  :length 0 ; don't care
-                  :depthoid -1
-                  :invalid nil)))
+                 (set-layout-valid
+                  (make-layout (hash-layout-name name)
+                               classoid
+                               :inherits (map 'vector #'find-layout
+                                              (cons t (if fun-p '(function))))
+                               :length 0 ; don't care
+                               :depthoid -1))))
            (setf (classoid-layout classoid) layout
                  (info :type :classoid-cell name) cell
                  (info :type :kind name) :instance))))
@@ -118,6 +172,7 @@
       (create-fake-classoid name
                             (memq name '(standard-generic-function
                                          generic-function))))))
+) ; end PROGN
 
 ;;; BIG FAT WARNING: These predicates can't in general be called prior to the
 ;;; definition of the class which they test. However in carefully controlled

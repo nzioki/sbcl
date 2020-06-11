@@ -39,8 +39,6 @@
 #include "validate.h"
 #include "ppc-linux-mcontext.h"
 
-size_t os_vm_page_size;
-
 int arch_os_thread_init(struct thread *thread) {
 #if defined(LISP_FEATURE_SB_THREAD)
     pthread_setspecific(specials,thread);
@@ -178,8 +176,6 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
     ppc_flush_icache(address,length);
 }
 
-
-#ifdef LISP_FEATURE_PPC64
 // "cc -S" on this file shows that the C compiler is responsible for making
 // a substitution for these functions with an additional argument in front.
 // I don't want to know how to do that from Lisp.
@@ -189,4 +185,3 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 int _stat(const char *pathname, struct stat *sb) {return stat(pathname, sb); }
 int _lstat(const char *pathname, struct stat *sb) { return lstat(pathname, sb); }
 int _fstat(int fd, struct stat *sb) { return fstat(fd, sb); }
-#endif

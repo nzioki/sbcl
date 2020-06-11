@@ -203,49 +203,17 @@
          ,@(if ignores `((declare (ignorable ,@ignores))))
          ,@body))))
 
-;;;; some old-fashioned functions. (They're not just for old-fashioned
-;;;; code, they're also used as optimized forms of the corresponding
-;;;; general functions when the compiler can prove that they're
-;;;; equivalent.)
+;;; Functions for compatibility sake:
 
-;;; like (MEMBER ITEM LIST :TEST #'EQ)
 (defun memq (item list)
   "Return tail of LIST beginning with first element EQ to ITEM."
-  (declare (explicit-check))
-  ;; KLUDGE: These could be and probably should be defined as
-  ;;   (MEMBER ITEM LIST :TEST #'EQ)),
-  ;; but when I try to cross-compile that, I get an error from
-  ;; LTN-ANALYZE-KNOWN-CALL, "Recursive known function definition". The
-  ;; comments for that error say it "is probably a botched interpreter stub".
-  ;; Rather than try to figure that out, I just rewrote this function from
-  ;; scratch. -- WHN 19990512
-  (do ((i list (cdr i)))
-      ((null i))
-    (when (eq (car i) item)
-      (return i))))
+  (declare (inline member))
+  (member item list :test #'eq))
 
-;;; like (ASSOC ITEM ALIST :TEST #'EQ):
-;;;   Return the first pair of ALIST where ITEM is EQ to the key of
-;;;   the pair.
 (defun assq (item alist)
-  (declare (explicit-check))
-  ;; KLUDGE: CMU CL defined this with
-  ;;   (DECLARE (INLINE ASSOC))
-  ;;   (ASSOC ITEM ALIST :TEST #'EQ))
-  ;; which is pretty, but which would have required adding awkward
-  ;; build order constraints on SBCL (or figuring out some way to make
-  ;; inline definitions installable at build-the-cross-compiler time,
-  ;; which was too ambitious for now). Rather than mess with that, we
-  ;; just define ASSQ explicitly in terms of more primitive
-  ;; operations:
-  (dolist (pair alist)
-    ;; though it may look more natural to write this as
-    ;;   (AND PAIR (EQ (CAR PAIR) ITEM))
-    ;; the temptation to do so should be resisted, as pointed out by PFD
-    ;; sbcl-devel 2003-08-16, as NIL elements are rare in association
-    ;; lists.  -- CSR, 2003-08-16
-    (when (and (eq (car pair) item) (not (null pair)))
-      (return pair))))
+  "Return the first pair of alist where item is EQ to the key of pair."
+  (declare (inline assoc))
+  (assoc item alist :test #'eq))
 
 ;;; Delete just one item
 (defun delq1 (item list)
@@ -565,7 +533,7 @@ NOTE: This interface is experimental and subject to change."
          (line-type (let ((n (+ nargs nvalues)))
                       (if (<= n 3) 'cons `(simple-vector ,n))))
          (bind-hashval
-          `((,hashval (the (signed-byte #.sb-vm:n-fixnum-bits)
+          `((,hashval (the sb-xc:fixnum
                            (funcall ,hash-function ,@arg-vars)))
             (,cache ,var-name)))
          (probe-it
@@ -574,7 +542,7 @@ NOTE: This interface is experimental and subject to change."
                (let ((,hashval ,hashval) ; gets clobbered in probe loop
                      (,cache (truly-the ,cache-type ,cache)))
                  ;; FIXME: redundant?
-                 (declare (type (signed-byte #.sb-vm:n-fixnum-bits) ,hashval))
+                 (declare (type sb-xc:fixnum ,hashval))
                  (loop repeat 2
                     do (let ((,entry
                               (svref ,cache
@@ -636,7 +604,7 @@ NOTE: This interface is experimental and subject to change."
                  (values ,@result-temps))))))
     `(progn
        (pushnew ',var-name *cache-vector-symbols*)
-       (define-load-time-global ,var-name nil)
+       (!define-load-time-global ,var-name nil)
        ,@(when *profile-hash-cache*
            `((declaim (type (simple-array fixnum (3)) ,statistics-name))
              (defvar ,statistics-name)))
@@ -1366,33 +1334,6 @@ NOTE: This interface is experimental and subject to change."
                       (* 100 (/ (count-if-not #'fixnump cache)
                                 (length cache))))
                   short-name))))))
-
-;;; Just like WITH-OUTPUT-TO-STRING but doesn't close the stream,
-;;; producing more compact code.
-(defmacro with-simple-output-to-string
-    ((var &optional string (element-type :default)) &body body)
-  ;; Don't need any fancy type-specifier parsing. Uses of this macro
-  ;; are confined to our own code. So the element-type is literally
-  ;; either :DEFAULT or BASE-CHAR.
-  (aver (member element-type '(base-char :default)))
-  (multiple-value-bind (forms decls) (parse-body body nil)
-    (if string
-        `(let ((,var (make-fill-pointer-output-stream ,string)))
-           ,@decls
-           ,@forms)
-        ;; Why not dxify this stream?
-        `(let ((,var #+sb-xc-host (make-string-output-stream)
-                     #-sb-xc-host
-                     ,(case element-type
-                        ;; Non-unicode doesn't have %MAKE-DEFAULT-STRING-OSTREAM
-                        #+sb-unicode
-                        (:default '(%make-default-string-ostream))
-                        ;; and this macro is never employed to make streams
-                        ;; that can only return CHARACTER string.
-                        (t '(%make-base-string-ostream)))))
-           ,@decls
-           ,@forms
-           (get-output-stream-string ,var)))))
 
 (in-package "SB-KERNEL")
 

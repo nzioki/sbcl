@@ -178,3 +178,114 @@
   (let ((name (make-symbol "THUNK")))
     `(dx-flet ((,name () ,@body))
        (%with-standard-io-syntax #',name))))
+
+;;; Note that this macro may display problems (as do most) with out-of-order
+;;; evaluation of keyword args if passed in a different order from listed,
+;;; in situations where evaluation order matters.
+(defmacro with-input-from-string ((var string &key index
+                                                   (start 0 start-suppliedp)
+                                                   end)
+                                  &body forms-decls
+                                  &environment env)
+  (let* ((dummy '#:stream) ; in case VAR is declared special
+         (offset '#:offset)
+         ;; CLHS says in WITH-INPUT-FROM-STRING:
+         ;;  "The input string stream is automatically closed on exit from with-input-from-string,
+         ;;   no matter whether the exit is normal or abnormal. The input string stream to which
+         ;;   the variable var is bound has dynamic extent; its extent ends when the form is exited."
+         ;; In light of the second point, we need not close the stream if the object is
+         ;; stack-allocated, because any attempt to access it after the forms exit will surely
+         ;; crash, and there are otherwise no observable effects from closing the stream.
+         ;; The choice to avoid DX-LET in some policies is strictly unecessary, because it is
+         ;; *always* undefined behavior to use the DX object after its extent ends,
+         ;; however it might help expose user code bugs by keeping the stream accessible
+         ;; but closed.
+         (bind (if (sb-c:policy env (or (= safety 3) (= debug 3))) 'let 'dx-let))
+         (ctor `(%init-string-input-stream
+                 ,dummy ,string
+                 ;; not (OR START 0), because ":START NIL" should err
+                 ,@(cond (start-suppliedp (list start)) (end '(0)))
+                 ,@(when end (list end)))))
+    (flet ((uwp (forms)
+             (if (eq bind 'let)
+                 ;; "The consequences are undefined if an attempt is made to assign
+                 ;;  the variable var." - so we can read it here with impunity.
+                 `(unwind-protect (progn ,@forms) (close ,var))
+                 `(progn ,@forms)))) ; don't bother closing
+      `(,bind ((,dummy (%make-instance ,(dd-length (find-defstruct-description
+                                                    'string-input-stream)))))
+              ,(multiple-value-bind (forms decls) (parse-body forms-decls nil)
+                 (if index
+                     `(multiple-value-bind (,var ,offset) ,ctor
+                        ,@decls
+                        (multiple-value-prog1 ,(uwp forms)
+                          (setf ,index (- (string-input-stream-index ,var) ,offset))))
+                     `(let ((,var ,ctor))
+                        (declare (ignorable ,var))
+                        ,@decls
+                        ,(uwp forms)))))))) ; easy way
+
+(defstruct (string-output-stream
+            (:include ansi-stream)
+            (:constructor nil)
+            (:copier nil)
+            (:predicate nil))
+  ;; Function to perform a piece of the SOUT operation
+  ;; Args: (stream buffer string pointer start stop)
+  (sout-aux nil :type (sfunction (t t t t t t) t) :read-only t)
+  ;; The string we throw stuff in.
+  ;; In terms of representation of this buffer, we could do something like
+  ;; always use UTF-8, or use a custom encoding that has a bit indicating
+  ;; whether the next bits are base-char or character, and then just the
+  ;; bits of that character using either 7 bits (filling out 1 byte)
+  ;; or 21 bits (consuming 3 or 4 bytes total) on a per-character basis.
+  (buffer nil :type (or simple-base-string simple-character-string))
+  ;; Whether any non-base character has been written.
+  ;; This is :IGNORE for base-char output streams.
+  (unicode-p :ignore)
+  ;; Chains of buffers to use
+  (prev nil :type list)
+  (next nil :type list)
+  ;; Index of the next location to use in the current string.
+  (pointer 0 :type index)
+  ;; Global location in the stream
+  (index 0 :type index)
+  ;; Index cache: when we move backwards we save the greater of this
+  ;; and index here, so the greater of index and this is always the
+  ;; end of the stream.
+  (index-cache 0 :type index)
+  ;; Pseudo-actual element type. We no longer store the as-requested type.
+  ;; (If the value is :DEFAULT, we return CHARACTER on inquiry.)
+  (element-type nil :read-only t
+                    :type (member #+sb-unicode :default
+                                  #+sb-unicode character
+                                  base-char nil)))
+(declaim (freeze-type string-output-stream))
+
+(defmacro %allocate-string-ostream ()
+  `(%make-instance ,(dd-length (find-defstruct-description 'string-output-stream))))
+
+(defmacro with-output-to-string
+    ((var &optional string &key (element-type ''character)) &body body)
+  (if string
+      (let ((dummy '#:stream))
+        ;; "If string is supplied, element-type is ignored".
+        ;; Why do implementors take this to mean "evaluated and ignored?"
+        ;; I would have figured it meant expansion-time ignored.
+        `(dx-let ((,dummy (%make-instance ,(dd-length (find-defstruct-description
+                                                       'fill-pointer-output-stream)))))
+           (let ((,var (truly-the fill-pointer-output-stream
+                                  (%init-fill-pointer-output-stream
+                                   ,dummy ,string ,element-type))))
+             ;; http://www.lispworks.com/documentation/HyperSpec/Body/d_ignore.htm#ignore
+             ;; "The stream variables established by ... with-output-to-string
+             ;; are, by definition, always used"
+             (declare (ignorable ,var))
+             ,@body)))
+      (expand-with-output-to-string var element-type body nil)))
+
+;;; Similar to WITH-OUTPUT-TO-STRING, but produces the most compact result
+;;; string possible (BASE or CHARACTER) depending on what was written.
+;;; This is not something that the standard macro permits.
+(defmacro %with-output-to-string ((var) &body body)
+  (expand-with-output-to-string var ''character body t))

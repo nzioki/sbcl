@@ -494,7 +494,8 @@
     done))
 
 ;;; Turn more arg (context, count) into a list.
-(define-vop (listify-rest-args)
+(define-vop ()
+  (:translate %listify-rest-args)
   (:args (context-arg :target context :scs (descriptor-reg))
          (count-arg :target count :scs (any-reg)))
   (:arg-types * tagged-num)
@@ -505,7 +506,6 @@
   (:temporary (:sc non-descriptor-reg) pa-flag)
   (:temporary (:scs (interior-reg)) lip)
   (:results (result :scs (descriptor-reg)))
-  (:translate %listify-rest-args)
   (:policy :safe)
   (:node-var node)
   (:generator 20
@@ -516,7 +516,7 @@
     (inst cbz count DONE)
 
     ;; We need to do this atomically.
-    (pseudo-atomic (pa-flag)
+    (pseudo-atomic (pa-flag :sync nil)
       ;; Allocate a cons (2 words) for each item.
       (let* ((dx-p (node-stack-allocate-p node))
              (size (cond (dx-p
@@ -524,7 +524,7 @@
                          (t
                           (inst lsl temp count (1+ (- word-shift n-fixnum-tag-bits)))
                           temp))))
-        (allocation dst size list-pointer-lowtag
+        (allocation 'list size list-pointer-lowtag dst
                     :flag-tn pa-flag
                     :stack-allocate-p dx-p
                     :lip lip))
@@ -561,7 +561,7 @@
 ;;; preventing this info from being returned as values.  What we do is
 ;;; compute supplied - fixed, and return a pointer that many words
 ;;; below the current stack top.
-(define-vop (more-arg-context)
+(define-vop ()
   (:policy :fast-safe)
   (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
@@ -757,9 +757,8 @@
     (move csp-tn cfp-tn)
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst add cur-nfp cur-nfp (add-sub-immediate
-                                   (bytes-needed-for-non-descriptor-stack-frame)))
-        (inst mov-sp nsp-tn cur-nfp)))
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
     (move cfp-tn old-fp-temp)
     (lisp-return return-pc-temp lip :known)))
 
@@ -931,9 +930,8 @@
                             '((:load-return-pc
                                (error "RETURN-PC not in its passing location"))
                               (:frob-nfp
-                               (inst add cur-nfp cur-nfp (add-sub-immediate
-                                                          (bytes-needed-for-non-descriptor-stack-frame)))
-                               (inst mov-sp nsp-tn cur-nfp)))
+                               (inst add nsp-tn cur-nfp (add-sub-immediate
+                                                         (bytes-needed-for-non-descriptor-stack-frame)))))
                             `((:comp-lra
                                (inst compute-lra lip lip lra-label)
                                (inst str lip (@ new-fp (* lra-save-offset
@@ -1054,9 +1052,8 @@
     ;; Clear the number stack if anything is there.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst add cur-nfp cur-nfp (add-sub-immediate
-                                   (bytes-needed-for-non-descriptor-stack-frame)))
-        (inst mov-sp nsp-tn cur-nfp)))
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
     (load-inline-constant tmp-tn '(:fixup tail-call-variable :assembly-routine) lip)
     (inst br tmp-tn)))
 
@@ -1074,9 +1071,8 @@
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst add cur-nfp cur-nfp (add-sub-immediate
-                                   (bytes-needed-for-non-descriptor-stack-frame)))
-        (inst mov-sp nsp-tn cur-nfp)))
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
     ;; Clear the control stack, and restore the frame pointer.
     (move csp-tn cfp-tn)
     (move cfp-tn old-fp)
@@ -1115,9 +1111,8 @@
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst add cur-nfp cur-nfp (add-sub-immediate
-                                   (bytes-needed-for-non-descriptor-stack-frame)))
-        (inst mov-sp nsp-tn cur-nfp)))
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
     (cond ((= nvals 1)
            ;; Clear the control stack, and restore the frame pointer.
            (move csp-tn cfp-tn)
@@ -1163,9 +1158,8 @@
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
-        (inst add cur-nfp cur-nfp (add-sub-immediate
-                                   (bytes-needed-for-non-descriptor-stack-frame)))
-        (inst mov-sp nsp-tn cur-nfp)))
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
 
     ;; Check for the single case.
     (inst cmp nvals-arg (fixnumize 1))

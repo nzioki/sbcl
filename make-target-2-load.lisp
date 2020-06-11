@@ -25,8 +25,7 @@
           :GCC-TLS
           :RESTORE-FS-SEGMENT-REGISTER-FROM-TLS ; only for 'src/runtime/thread.h'
           :OS-PROVIDES-BLKSIZE-T ; only for 'src/runtime/wrap.h'
-          :OS-PROVIDES-PUTWC ; only for 'src/runtime/backtrace.c'
-          ))
+          :OS-PROVIDES-PUTWC)) ; only for 'src/runtime/backtrace.c'
        (public-features
         (cons
          sb-impl::!sbcl-architecture
@@ -34,27 +33,23 @@
            :64-BIT ; choice of word size. 32-bit if absent
            :BIG-ENDIAN :LITTLE-ENDIAN ; endianness: pick one and only one
            :BSD :UNIX :LINUX :WIN32 :DARWIN :SUNOS :ANDROID ; OS: pick one or more
+           :FREEBSD :GNU-KFREEBSD :OPENBSD :NETBSD :DRAGONFLY :HAIKU :HPUX
            :MACH-O :ELF ; obj file format: pick zero or one
            ;; I would argue that this should not be exposed,
            ;; but I would also anticipate blowblack from removing it.
            :CHENEYGC :GENCGC ; GC: pick one and only one
-           ;; This really should not exist. For any one architecture, if it supports
-           ;; :linkage-table (which almost all do), then it should support dynamic-core,
-           ;; and we should build with both, which is to say that dynamic-core is not
-           ;; an additional yes/no choice.
-           :SB-DYNAMIC-CORE
            ;; Can't use s-l-a-d :compression safely without it
            :SB-CORE-COMPRESSION
-           ;; Features that are also in *features-potentially-affecting-fasl-format*
+           ;; Features that are also in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
            ;; and would probably mess up something if made non-public,
            ;; though I don't think they should all be public.
+           :MSAN
            :SB-SAFEPOINT :SB-SAFEPOINT-STRICTLY
            :SB-THREAD :SB-UNICODE
            ;; Things which (I think) at least one person has requested be kept around
            :SB-LDB
-           ;; Features which are public and "potentially affect" fasl format,
-           ;; though in practice they don't because every build has them.
-           ;; And/or at least one person has requested be kept around.
+           ;; We keep the :SB-PACKAGE-LOCKS feature despite it no longer
+           ;; affecting the build. (It's not a choice any more)
            :SB-PACKAGE-LOCKS
            ;; unsure, I think this is for end-user consumption,
            ;; though every release of SBCL since eons ago has had local nicknames.
@@ -65,7 +60,31 @@
        (removable-features
         (append non-target-features public-features)))
   (defconstant sb-impl:+internal-features+
-    (remove-if (lambda (x) (member x removable-features)) *features*))
+    ;;; Well, who would have guessed that our internal features list would nicely
+    ;;; repair damage induced by ASDF, namely: ASDF removes features when loaded.
+    ;;; Take a look at (DEFUN DETECT-OS) in uiop.lisp if you don't believe it,
+    ;;; and watch it in action after (require "ASDF") -
+    ;;;
+    ;;; * *FEATURES* =>
+    ;;; (:X86-64 :64-BIT :ANSI-CL :COMMON-LISP :ELF :GENCGC :HAIKU :IEEE-FLOATING-POINT
+    ;;; :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES :SB-LDB
+    ;;; :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
+    ;;;
+    ;;; * (require :asdf)
+    ;;; ("ASDF" "asdf" "UIOP" "uiop")
+    ;;; * *FEATURES*
+    ;;; (:ASDF3.3 :ASDF3.2 :ASDF3.1 :ASDF3 :ASDF2 :ASDF :OS-UNIX
+    ;;; :NON-BASE-CHARS-EXIST-P :ASDF-UNICODE :X86-64 :64-BIT :ANSI-CL :COMMON-LISP
+    ;;; :ELF :GENCGC :IEEE-FLOATING-POINT :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES
+    ;;; :SB-LDB :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
+    ;;;
+    ;;; So, what the heck happened to :HAIKU? It's gone.
+    ;;; Well this is pure evil. Just madness.
+    ;;; However, by stashing an extra copy of :HAIKU in the internal feature list,
+    ;;; we can stuff it back in because our contrib builder first loads ASDF
+    ;;; and then rebinds *FEATURES* with the union of the internal ones.
+    (append #+haiku '(:haiku)
+            (remove-if (lambda (x) (member x removable-features)) *features*)))
   (setq *features* (remove-if-not (lambda (x) (member x public-features))
                                   *features*)))
 
@@ -371,6 +390,8 @@ Please check that all strings which were not recognizable to the compiler
         #.(find-package "SB-ASSEM")
         #.(find-package "SB-DISASSEM")
         #.(find-package "SB-IMPL")
+        #.(find-package "SB-PCL")
+        #.(find-package "SB-MOP")
         #.(find-package "SB-PRETTY")
         #.(find-package "SB-KERNEL"))
        ;; Assume all and only external symbols must be retained
@@ -407,10 +428,8 @@ Please check that all strings which were not recognizable to the compiler
           (if winp (unintern symbol "CL-USER") (return)))))
 
 (setq sb-c:*compile-to-memory-space* :auto)
-(when (find-package "SB-FASTEVAL") (setq sb-ext:*evaluator-mode* :interpret))
-;; folding doesn't actually do anything unless the backend supports it,
-;; but the interface exists no matter what.
-(sb-ext:fold-identical-code :aggressive t :preserve-docstrings t)
+(when (find-package "SB-INTERPRETER") (setq sb-ext:*evaluator-mode* :interpret))
+#+x86-64 (sb-ext:fold-identical-code :aggressive t :preserve-docstrings t)
 
 ;; See comments in 'readtable.lisp'
 (setf (readtable-base-char-preference *readtable*) :symbols)

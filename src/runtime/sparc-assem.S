@@ -1,4 +1,4 @@
-#ifdef __ELF__
+#ifdef __linux__
 // Mark the object as not requiring an executable stack.
 .section .note.GNU-stack,"",%progbits
 #endif
@@ -166,9 +166,9 @@ call_into_c:
 	/*
 	 * Note: C calling conventions (32-bit) say that %o0 and %o1
 	 * are used to return function results.  In particular 64-bit
-	 * results are in %o0 (hi) and %o1 (low).  
+	 * results are in %o0 (hi) and %o1 (low).
 	 */
-	
+
         /* Re-establish NIL */
         set     NIL, reg_NULL
 

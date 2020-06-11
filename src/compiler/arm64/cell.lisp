@@ -336,14 +336,9 @@
                                          :pre-index)))
       (store-binding-stack-pointer bsp))))
 
-(define-vop (unbind-to-here)
-  (:args (arg :scs (descriptor-reg any-reg) :target where))
-  (:temporary (:scs (any-reg) :from (:argument 0)) where)
-  (:temporary (:scs (descriptor-reg)) symbol value)
-  (:temporary (:scs (any-reg)) bsp)
-  (:generator 0
+(defun unbind-to-here (where symbol value bsp)
+  (assemble ()
     (load-binding-stack-pointer bsp)
-    (move where arg)
     (inst cmp where bsp)
     (inst b :eq DONE)
 
@@ -366,6 +361,16 @@
 
     DONE
     (store-binding-stack-pointer bsp)))
+
+(define-vop (unbind-to-here)
+  (:args (arg :scs (descriptor-reg any-reg) :target where))
+  (:temporary (:scs (any-reg) :from (:argument 0)) where)
+  (:temporary (:scs (descriptor-reg)) symbol value)
+  (:temporary (:scs (any-reg)) bsp)
+  (:generator 0
+    (move where arg)
+    (unbind-to-here where symbol value bsp)))
+
 #-sb-thread
 (progn
   (define-vop (dynbind)
@@ -440,17 +445,15 @@
 
 ;;;; Instance hackery:
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (loadw temp struct 0 instance-pointer-lowtag)
-    (inst ubfm res temp n-widetag-bits
-          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
+    (loadw res struct 0 instance-pointer-lowtag)
+    (inst lsr res res instance-length-shift)))
 
 (define-full-reffer instance-index-ref * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-ref)

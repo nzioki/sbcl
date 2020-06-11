@@ -112,7 +112,7 @@
 (define-load-time-global *room-info* (!compute-room-infos))
 
 (defconstant-eqx +heap-spaces+
-  '((:dynamic   "Dynamic space"   sb-kernel:dynamic-usage)
+  '((:dynamic   "Dynamic space"   dynamic-usage)
     #+immobile-space
     (:immobile  "Immobile space"  sb-kernel::immobile-space-usage)
     (:read-only "Read-only space" sb-kernel::read-only-space-usage)
@@ -176,6 +176,22 @@
 (defun round-to-dualword (size)
   (logand (the word (+ size lowtag-mask)) (lognot lowtag-mask)))
 
+(defun instance-length (instance) ; excluding header, not aligned to even
+  ;; Add 1 if expressed length PLUS header (total number of words) would be
+  ;; an even number, and the hash state bits indicate hashed-and-moved.
+  (+ (%instance-length instance)
+     ;; Compute 1 or 0 depending whether the instance was physically extended
+     ;; by one word for the stable hash value. Extension occurs when and only when
+     ;; the hash state is hashed-and-moved, and the apparent total number of words
+     ;; inclusive of header (and exclusive of extension) is even. ANDing the least
+     ;; significant bit of the payload size with HASH-SLOT-PRESENT arrives at the
+     ;; desired boolean value. If apparent size is odd in hashed-and-moved state,
+     ;; the physical size undergoes no change.
+     (let ((header-word (instance-header-word instance)))
+       (logand (ash header-word (- instance-length-shift))
+               (ash header-word (- hash-slot-present-flag))
+               1))))
+
 ;;; Return the vector OBJ, its WIDETAG, and the number of octets
 ;;; required for its storage (including padding and alignment).
 (defun reconstitute-vector (obj saetp)
@@ -195,22 +211,30 @@
             (round-to-dualword (+ (* vector-data-offset n-word-bytes)
                                   n-data-octets)))))
 
+;;; * If symbols are 7 words incl header, as they are on 32-bit w/threads,
+;;;   then the part of NIL that manifests as symbol slots consumes 6 words
+;;;   (less the header) because NIL's symbol widetag precedes it by 1 word.
+;;;   So, there are 6 post-header words and 2 pre-header: one containing
+;;;   the widetag (not that it is ever read), and one 0 word.
+;;; * If symbols are 6 words incl header, as they are on 64-bit and
+;;;   32-bit w/o threads, then the symbol-like part of NIL is 5 words,
+;;;   which aligns up to 6, plus the two pre-header words.
+;;; So either way, NIL's alignment padding makes it come out to 8 words in total.
+(defconstant sizeof-nil-in-words (+ 2 (sb-int:align-up (1- sb-vm:symbol-size) 2)))
+
 (defun primitive-object-size (object)
   "Return number of bytes of heap or stack directly consumed by OBJECT"
   (if (is-lisp-pointer (get-lisp-obj-address object))
       (let ((words
               (typecase object
                 (cons 2)
-                (instance (1+ (%instance-length object)))
+                (instance (1+ (instance-length object)))
                 (function
                  (when (= (fun-subtype object) simple-fun-widetag)
                    (return-from primitive-object-size
                      (primitive-object-size (fun-code-header object))))
                  (1+ (get-closure-length object)))
-                ;; NIL is larger than a symbol. I don't care to think about
-                ;; why these fudge factors are right, but they make the result
-                ;; equal to what MAP-ALLOCATED-OBJECTS reports.
-                (null (+ symbol-size 1 #+64-bit 1))
+                (null sizeof-nil-in-words)
                 (code-component
                  (return-from primitive-object-size (code-object-size object)))
                 (fdefn 4) ; no length stored in the header
@@ -228,8 +252,7 @@
                        ;; Other things (symbol, value-cell, etc)
                        ;; don't have a sizer, so use GET-HEADER-DATA
                        (1+ (logand (get-header-data object)
-                                   (logand (get-header-data object)
-                                           (room-info-mask room-info))))))))))
+                                   (room-info-mask room-info)))))))))
         (* (align-up words 2) n-word-bytes))
       0))
 
@@ -270,9 +293,10 @@
                    (* 2 n-word-bytes)))
 
           (:instance
-           (values (tagged-object instance-pointer-lowtag)
-                   widetag
-                   (boxed-size (logand header-value short-header-max-words))))
+           (let ((instance (tagged-object instance-pointer-lowtag)))
+             (values instance
+                     widetag
+                     (boxed-size (instance-length instance)))))
 
           (:closure ; also funcallable-instance
            (values (tagged-object fun-pointer-lowtag)
@@ -439,14 +463,13 @@ We could try a few things to mitigate this:
        ;; Static space starts with NIL, which requires special
        ;; handling, as the header and alignment are slightly off.
        (multiple-value-bind (start end) (%space-bounds space)
-         ;; This "8" is very magical. It happens to work for both
-         ;; word sizes, even though symbols differ in length
-         ;; (they can be either 6 or 7 words).
-         (funcall fun nil symbol-widetag (* 8 n-word-bytes))
-         (map-objects-in-range fun
-                               (+ (ash (* 8 n-word-bytes) (- n-fixnum-tag-bits))
-                                  start)
-                               end)))
+         (declare (ignore start))
+         (funcall fun nil symbol-widetag (* sizeof-nil-in-words n-word-bytes))
+         (let ((start (+ (logandc2 sb-vm:nil-value sb-vm:lowtag-mask)
+                         (ash (- sizeof-nil-in-words 2) sb-vm:word-shift))))
+           (map-objects-in-range fun
+                                 (ash start (- sb-vm:n-fixnum-tag-bits))
+                                 end))))
 
       ((:read-only #-gencgc :dynamic)
        ;; Read-only space (and dynamic space on cheneygc) is a block
@@ -494,7 +517,6 @@ We could try a few things to mitigate this:
        ;; prove to be an issue with concurrent systems, or with
        ;; spectacularly poor timing for closing an allocation region
        ;; in a single-threaded system.
-       #+sb-thread
        (close-current-gc-region)
        (do ((initial-next-free-page next-free-page)
             ;; This is a "funny" fixnum - essentially the bit cast of a pointer
@@ -568,7 +590,6 @@ We could try a few things to mitigate this:
         (without-gcing (do-1-space space))
         (do-1-space space)))))
 
-#+(and sb-thread gencgc)
 ;; Start with a Lisp rendition of ensure_region_closed() on the active
 ;; thread's region, since users are often surprised to learn that a
 ;; just-consed object can't necessarily be seen by MAP-ALLOCATED-OBJECTS.
@@ -578,15 +599,19 @@ We could try a few things to mitigate this:
 ;; by doing that.
 ;; (And seeing small consing by other threads is hopeless either way)
 (defun close-current-gc-region ()
-  (unless (eql (sap-int (current-thread-offset-sap
-                         (+ thread-alloc-region-slot 3)))
-               0)                       ; start_addr
-    (alien-funcall
-     (extern-alien "gc_close_region" (function void unsigned int))
-     (truly-the word
-                (+ (sb-thread::thread-primitive-thread sb-thread:*current-thread*)
-                   (ash thread-alloc-region-slot word-shift)))
-     1)))
+  #+gencgc
+  (let ((region-struct
+          #+sb-thread (sap+ (sb-thread::current-thread-sap)
+                            (ash thread-alloc-region-slot word-shift))
+          ;; If no threads, the region structure is 2 words past the static space start,
+          ;; embedded in an unboxed array.
+          #-sb-thread (int-sap (+ static-space-start (* 2 n-word-bytes)))))
+    ;; The 'start_addr' field is at word index 3 of the structure (see gencgc-alloc-region.h).
+    (unless (eql (sap-ref-word region-struct (ash 3 word-shift)) 0)
+      (alien-funcall (extern-alien "gc_close_region" (function void system-area-pointer int))
+                     region-struct
+                     1))
+    nil))
 
 ;;;; MEMORY-USAGE
 
@@ -793,7 +818,7 @@ We could try a few things to mitigate this:
                  (eql type funcallable-instance-widetag))
          (incf total-objects)
          (let* ((layout (if (eql type funcallable-instance-widetag)
-                            (%funcallable-instance-layout obj)
+                            (%fun-layout obj)
                             (%instance-layout obj)))
                 (classoid (layout-classoid layout))
                 (found (ensure-gethash classoid totals (cons 0 0)))
@@ -1087,9 +1112,9 @@ We could try a few things to mitigate this:
                   ;; if functoid is a macro that does nothing.
                   (,functoid .o. ,@more)))
             ,.(make-case* 'funcallable-instance
-               `(let ((.l. (%funcallable-instance-layout ,obj)))
+               `(let ((.l. (%fun-layout ,obj)))
                   ;; As for INSTANCE, allow the functoid to see the access form
-                  (,functoid (%funcallable-instance-layout ,obj) ,@more)
+                  (,functoid (%fun-layout ,obj) ,@more)
                   (,functoid (%funcallable-instance-fun ,obj) ,@more)
                   (ecase (layout-bitmap .l.)
                     (#.sb-kernel:+layout-all-tagged+
@@ -1407,7 +1432,8 @@ We could try a few things to mitigate this:
                                 ;; pass NIL explicitly if T crashes on you
                                 (decode t))
   (multiple-value-bind (obj addr count)
-      (if (integerp thing)
+      (if (typep thing 'word) ; ambiguous in the edge case, but assume it's
+          ;; an address (though you might be trying to dump a bignum's data)
           (values nil thing (if wordsp n-words 1))
           (values
            thing
@@ -1424,7 +1450,12 @@ We could try a few things to mitigate this:
     (with-pinned-objects (obj)
       (dotimes (i count)
         (let ((word (sap-ref-word (int-sap addr) (ash i word-shift))))
-          (multiple-value-bind (lispobj ok) (if decode (make-lisp-obj word nil))
+          (multiple-value-bind (lispobj ok)
+              (cond ((and (typep thing 'code-component)
+                          (< 1 i (code-header-words thing)))
+                     (values (code-header-ref thing i) t))
+                    (decode
+                     (make-lisp-obj word nil)))
             (let ((*print-lines* 1)
                   (*print-pretty* t))
               (format t "~x: ~v,'0x~:[~; = ~S~]~%"

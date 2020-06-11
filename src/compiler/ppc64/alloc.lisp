@@ -44,14 +44,15 @@
              (let* ((dx-p (node-stack-allocate-p node))
                     (cons-cells (if star (1- num) num))
                     (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag)
+               (pseudo-atomic (pa-flag :sync nil)
                  (if dx-p
                      (progn
                        (align-csp res)
                        (inst clrrdi res csp-tn n-lowtag-bits)
                        (inst ori res res list-pointer-lowtag)
                        (inst addi csp-tn csp-tn alloc))
-                     (allocation res alloc list-pointer-lowtag :temp-tn alloc-temp
+                     (allocation 'list alloc list-pointer-lowtag res
+                                 :temp-tn alloc-temp
                                  :flag-tn pa-flag))
                  (move ptr res)
                  (dotimes (i (1- cons-cells))
@@ -112,8 +113,8 @@
               (inst ori result result fun-pointer-lowtag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag)))
             (progn
-              (allocation result (pad-data-block size)
-                          fun-pointer-lowtag :temp-tn temp :flag-tn pa-flag)
+              (allocation nil (pad-data-block size) fun-pointer-lowtag result
+                          :temp-tn temp :flag-tn pa-flag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag))))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
@@ -180,10 +181,10 @@
            (inst sldi bytes extra (- word-shift n-fixnum-tag-bits))
            (inst addi bytes bytes (* (1+ words) n-word-bytes))))
     ;; store 1+nwords into header-data, downscaling bytes to words
-    (inst sldi header bytes (- n-widetag-bits word-shift))
+    (inst sldi header bytes (- (length-field-shift type) word-shift))
     ;; subtract the excess length and add in the widetag
-    (inst addi header header (+ (ash -2 n-widetag-bits) type))
+    (inst addi header header (+ (ash -2 (length-field-shift type)) type))
     (inst clrrdi bytes bytes n-lowtag-bits) ; round down to even
     (pseudo-atomic (pa-flag)
-      (allocation result bytes lowtag :temp-tn temp :flag-tn pa-flag)
+      (allocation nil bytes lowtag result :temp-tn temp :flag-tn pa-flag)
       (storew header result 0 lowtag))))

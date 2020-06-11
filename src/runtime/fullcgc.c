@@ -167,12 +167,6 @@ static inline int cons_markedp(lispobj pointer) {
     return (bits[index / 8] >> (index % 8)) & 1;
 }
 
-#ifdef RETURN_PC_WIDETAG
-#define embedded_obj_p(tag) tag==RETURN_PC_WIDETAG || tag==SIMPLE_FUN_WIDETAG
-#else
-#define embedded_obj_p(tag) tag==SIMPLE_FUN_WIDETAG
-#endif
-
 /* Return true if OBJ has already survived the current GC. */
 static inline int pointer_survived_gc_yet(lispobj pointer)
 {
@@ -277,13 +271,13 @@ static void trace_object(lispobj* where)
 #endif
         if (!layout) break; // fall into general case
         // mixed boxed/unboxed objects
-        bitmap = ((struct layout*)native_pointer(layout))->bitmap;
+        bitmap = LAYOUT(layout)->bitmap;
         // If no raw slots, just scan without use of the bitmap.
         // A bitmap of -1 implies that not only are all slots tagged,
         // there is no special GC method for any slot.
         if (bitmap == make_fixnum(-1)) break;
         // Otherwise, the first slot might merit special treatment.
-        if (*where & CUSTOM_GC_SCAVENGE_FLAG) {
+        if (lockfree_list_node_layout_p(LAYOUT(layout))) {
             struct instance* node = (struct instance*)where;
             lispobj next = node->slots[INSTANCE_DATA_START];
             if (fixnump(next) && next) // ignore initially 0 heap words
@@ -334,6 +328,20 @@ static void trace_object(lispobj* where)
 #endif
     case CODE_HEADER_WIDETAG:
         scan_to = code_header_words((struct code*)where);
+#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
+        struct code* code = (struct code*)where;
+        lispobj* fdefns_start = code->constants + code_n_funs(code) * 4;
+        lispobj* fdefns_end  = fdefns_start + code_n_named_calls(code);
+        lispobj* limit = where + scan_to;
+        where = where + scan_from;
+        while (where < limit) {
+            lispobj word = *where;
+            if (where >= fdefns_start && where < fdefns_end) word |= OTHER_POINTER_LOWTAG;
+            gc_mark_obj(word);
+            ++where;
+        }
+        return;
+#endif
         break;
     case FDEFN_WIDETAG:
         gc_mark_obj(fdefn_callee_lispobj((struct fdefn*)where));
@@ -463,7 +471,8 @@ static int sweep_mode = 1;
     if (sweep_mode & 1) { erase; } }
 
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
-#define __immobile_obj_gen_bits(x) (lose("No page index?"),0)
+#undef immobile_obj_gen_bits
+#define immobile_obj_gen_bits(x) (lose("No page index?"),0)
 #else
 static void sweep_fixedobj_pages(long *zeroed)
 {
@@ -485,7 +494,7 @@ static void sweep_fixedobj_pages(long *zeroed)
             } else if (header & markbit) { // live object
                 *obj = header ^ markbit;
             } else {
-                NOTE_GARBAGE(__immobile_obj_gen_bits(obj), obj, nwords, zeroed,
+                NOTE_GARBAGE(immobile_obj_gen_bits(obj), obj, nwords, zeroed,
                              memset(obj, 0, nwords * N_WORD_BYTES));
             }
         }
@@ -500,27 +509,16 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
 
     // TODO: consecutive dead objects on same page should be merged.
     for ( ; where < end ; where += nwords ) {
-        lispobj header = *where;
-        if (is_cons_half(header)) {
-            nwords = 2;
-            if (!cons_markedp((lispobj)where)) {
-                if (where[0] | where[1]) {
-               cons:
-                    gc_dcheck(!immobile_space_p((lispobj)where));
-                    NOTE_GARBAGE(page_table[find_page_index(where)].gen,
-                                 where, 2, zeroed,
-                                 where[0] = where[1] = 0);
-                }
-            }
-        } else {
-            nwords = sizetab[header_widetag(header)](where);
+        lispobj word = *where;
+        if (is_header(word)) {
+            nwords = sizetab[header_widetag(word)](where);
             lispobj markbit = MARK_BIT;
-            switch (header_widetag(header)) {
+            switch (header_widetag(word)) {
             case BIGNUM_WIDETAG: markbit = BIGNUM_MARK_BIT; break;
             case FDEFN_WIDETAG : markbit = FDEFN_MARK_BIT; break;
             }
-            if (header & markbit)
-                *where = header ^ markbit;
+            if (word & markbit)
+                *where = word ^ markbit;
             else {
                 // Turn the object into either a (0 . 0) cons
                 // or an unboxed filler depending on size.
@@ -531,13 +529,24 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                 if (!filler_obj_p((lispobj*)code)) {
                     page_index_t page = find_page_index(where);
                     int gen = page >= 0 ? page_table[page].gen
-                      : __immobile_obj_gen_bits(where);
+                      : immobile_obj_gen_bits(where);
                     NOTE_GARBAGE(gen, where, nwords, zeroed, {
                         code->boxed_size = 0;
                         code->header = (nwords << CODE_HEADER_SIZE_SHIFT)
                                      | CODE_HEADER_WIDETAG;
                         memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
                     })
+                }
+            }
+        } else {
+            nwords = 2;
+            if (!cons_markedp((lispobj)where)) {
+                if (where[0] | where[1]) {
+               cons:
+                    gc_dcheck(!immobile_space_p((lispobj)where));
+                    NOTE_GARBAGE(page_table[find_page_index(where)].gen,
+                                 where, 2, zeroed,
+                                 where[0] = where[1] = 0);
                 }
             }
         }

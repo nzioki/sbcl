@@ -44,13 +44,13 @@
 #include "interr.h"             /* for lose() */
 #include "alloc.h"
 #include "gc-internal.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "interrupt.h"
 #include "lispregs.h"
 
 #ifdef LISP_FEATURE_SB_THREAD
 
-#ifdef LISP_FEATURE_OPENBSD
+#if defined LISP_FEATURE_OPENBSD || defined LISP_FEATURE_FREEBSD || defined LISP_FEATURE_DRAGONFLY
 #include <pthread_np.h>
 #endif
 
@@ -203,7 +203,7 @@ initial_thread_trampoline(struct thread *th)
 # endif
 #endif
 #if defined THREADS_USING_GCSIGNAL && \
-    (defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64)
+    (defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 || defined LISP_FEATURE_ARM64 || defined LISP_FEATURE_RISCV)
     /* SIG_STOP_FOR_GC defaults to blocked on PPC? */
     unblock_gc_signals(0,0);
 #endif
@@ -548,7 +548,7 @@ attach_os_thread(init_thread_data *scribble)
     stack_addr = (char*)pthread_get_stackaddr_np(os) - stack_size;
 #else
     pthread_attr_t attr;
-#ifdef LISP_FEATURE_FREEBSD
+#if defined LISP_FEATURE_FREEBSD || defined LISP_FEATURE_DRAGONFLY
     pthread_attr_get_np(os, &attr);
 #else
     int pthread_getattr_np(pthread_t, pthread_attr_t *);

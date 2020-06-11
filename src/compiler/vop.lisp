@@ -16,17 +16,17 @@
 ;;; in any block
 (defconstant local-tn-limit 64)
 
-(def!type local-tn-number () `(integer 0 (,local-tn-limit)))
+(deftype local-tn-number () `(integer 0 (,local-tn-limit)))
 (deftype local-tn-count () `(integer 0 ,local-tn-limit))
 (deftype local-tn-vector () `(simple-vector ,local-tn-limit))
-(def!type local-tn-bit-vector () `(simple-bit-vector ,local-tn-limit))
+(deftype local-tn-bit-vector () `(simple-bit-vector ,local-tn-limit))
 
 ;;; vectors indexed by SC numbers
-(def!type sc-vector () `(simple-vector ,sb-vm:sc-number-limit))
+(deftype sc-vector () `(simple-vector ,sb-vm:sc-number-limit))
 (deftype sc-bit-vector () `(simple-bit-vector ,sb-vm:sc-number-limit))
 
 ;;; Bitset representation of a set of locations in a finite SC.
-(def!type sc-locations ()
+(deftype sc-locations ()
   `(unsigned-byte ,sb-vm:finite-sc-offset-limit))
 
 (defun make-sc-locations (locations)
@@ -90,7 +90,7 @@
            ,result)))))
 
 ;;; the different policies we can use to determine the coding strategy
-(def!type ltn-policy ()
+(deftype ltn-policy ()
   '(member :safe :small :small-safe :fast :fast-safe))
 
 ;;;; PRIMITIVE-TYPEs
@@ -100,7 +100,7 @@
 ;;; done on the basis of the primitive types of the operands, and the
 ;;; primitive type of a value is used to constrain the possible
 ;;; representations of that value.
-(def!struct (primitive-type (:copier nil))
+(defstruct (primitive-type (:copier nil))
   ;; the name of this PRIMITIVE-TYPE
   (name nil :type symbol :read-only t)
   ;; a list of the SC numbers for all the SCs that a TN of this type
@@ -286,7 +286,7 @@
 
 ;;; An IR2-COMPONENT serves mostly to accumulate non-code information
 ;;; about the component being compiled.
-(def!struct (ir2-component (:copier nil))
+(defstruct (ir2-component (:copier nil))
   ;; the counter used to allocate global TN numbers
   (global-tn-counter 0 :type index)
   ;; NORMAL-TNS is the head of the list of all the normal TNs that
@@ -336,13 +336,24 @@
   ;;    a function. <function> is the XEP lambda for the called
   ;;    function; its LEAF-INFO should be an ENTRY-INFO structure.
   ;;
-  ;; (:label <label>)
-  ;;    Is replaced with the byte offset of that label from the start
-  ;;    of the code vector (including the header length.)
+  ;; (:fdefinition <name>)
+  ;;    Is replaced with the fdefn for NAME.
+  ;;
+  ;; (:known-fun <name>)
+  ;;    Is replaced with #'NAME for a system-internal function.
+  ;;
+  ;; (:load-time-value <handle>)
+  ;;    Is replaced with the result of executing the forms
+  ;;    to compute <handle>.
   ;;
   ;; A null entry in this vector is a placeholder for implementation
   ;; overhead that is eventually stuffed in somehow.
-  (constants (make-array 10 :fill-pointer 0 :adjustable t) :type vector)
+  ;; Prior to performing SORT-BOXED-CONSTANTS, the index 0 is reserved
+  ;; to signify something (other than NIL) if stored as a TN-OFFSET,
+  ;; though nothing makes use of this at present.
+  (constants (make-array 10 :fill-pointer 1 :adjustable t
+                         :initial-element :ignore)
+             :type vector :read-only t)
   ;; some kind of info about the component's run-time representation.
   ;; This is filled in by the VM supplied SELECT-COMPONENT-FORMAT function.
   format
@@ -363,7 +374,9 @@
   ;; setup-dynamic-count-info. (But only if we are generating code to
   ;; collect dynamic statistics.)
   #+sb-dyncount
-  (dyncount-info nil :type (or null dyncount-info)))
+  (dyncount-info nil :type (or null dyncount-info))
+  #+avx2
+  (avx2-used-p nil))
 
 ;;; An ENTRY-INFO condenses all the information that the dumper needs
 ;;; to create each XEP's function entry data structure. ENTRY-INFO
@@ -487,25 +500,25 @@
   ;; the saved control stack pointer
   (save-sp nil :type (or tn null))
   ;; the list of dynamic state save TNs
-
-  (dynamic-state #-x86-64
-                 (list* (make-stack-pointer-tn)
+  #-unbind-in-unwind
+  (dynamic-state (list* (make-stack-pointer-tn)
                         (make-dynamic-state-tns))
-                 #+x86-64 nil
                  :type list)
   ;; the target label for NLX entry
-  (target (gen-label) :type label))
+  (target (gen-label) :type label)
+  (block-tn nil :type (or tn null)))
 (defprinter (ir2-nlx-info)
   home
   save-sp
+  #-unbind-in-unwind
   dynamic-state)
 
 ;;;; VOPs and templates
 
 ;;; A VOP is a Virtual Operation. It represents an operation and the
 ;;; operands to the operation.
-(def!struct (vop (:constructor make-vop (block node info args results))
-                 (:copier nil))
+(defstruct (vop (:constructor make-vop (block node info args results))
+                (:copier nil))
   ;; VOP-INFO structure containing static info about the operation
   (info nil :type vop-info)
   ;; the IR2-BLOCK this VOP is in
@@ -539,8 +552,8 @@
 ;;; A TN-REF object contains information about a particular reference
 ;;; to a TN. The information in TN-REFs largely determines how TNs are
 ;;; packed.
-(def!struct (tn-ref (:constructor make-tn-ref (tn write-p))
-                    (:copier nil))
+(defstruct (tn-ref (:constructor make-tn-ref (tn write-p))
+                   (:copier nil))
   ;; the TN referenced
   (tn (missing-arg) :type tn)
   ;; Is this is a write reference? (as opposed to a read reference)
@@ -568,9 +581,10 @@
 
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
-(def!struct (template (:constructor nil)
-                      (:copier nil)
-                      #-sb-xc-host (:pure t))
+(defstruct (template (:constructor nil)
+                     (:copier nil)
+                     #-sb-xc-host
+                     (:pure t))
   ;; the symbol name of this VOP. This is used when printing the VOP
   ;; and is also used to provide a handle for definition and
   ;; translation.
@@ -642,7 +656,7 @@
 ;;; A VOP-INFO object holds the constant information for a given
 ;;; virtual operation. We include TEMPLATE so that functions with a
 ;;; direct VOP equivalent can be translated easily.
-(def!struct (vop-info (:include template) (:copier nil))
+(defstruct (vop-info (:include template) (:copier nil))
   ;; If true, causes special casing of TNs live after this VOP that
   ;; aren't results:
   ;; -- If T, all such TNs that are allocated in a SC with a defined
@@ -778,7 +792,7 @@
 
 ;;; The SB structure represents the global information associated with
 ;;; a storage base.
-(def!struct (storage-base (:copier nil) (:conc-name sb-))
+(defstruct (storage-base (:copier nil) (:conc-name sb-))
   ;; name, for printing and reference
   (name nil :type symbol :read-only t)
   ;; the kind of storage base (which determines the packing
@@ -863,7 +877,7 @@
 
 ;;; the STORAGE-CLASS structure holds the storage base that storage is allocated
 ;;; in and information used to select locations within the SB
-(def!struct (storage-class (:conc-name "SC-") (:copier nil) (:predicate nil))
+(defstruct (storage-class (:conc-name "SC-") (:copier nil) (:predicate nil))
   ;; name, for printing and reference
   (name nil :type symbol)
   ;; the number used to index SC cost vectors
@@ -938,7 +952,7 @@
 
 ;;;; TNs
 
-(def!struct (tn (:include sset-element)
+(defstruct (tn (:include sset-element)
                (:constructor make-random-tn)
                (:constructor make-tn (number kind primitive-type sc))
                (:copier nil))
@@ -1073,7 +1087,7 @@
   ;; physical environment that the TN is live throughout.
   (physenv nil :type (or physenv null))
   ;; Used by pack-iterative
-  vertex)
+  (vertex nil))
 
 (declaim (freeze-type tn))
 (defmethod print-object ((tn tn) stream)
@@ -1091,7 +1105,7 @@
 ;;; lifetime analysis, the global conflicts structure is used during
 ;;; lifetime analysis to represent the set of TNs live at the start of
 ;;; the IR2 block.
-(def!struct (global-conflicts
+(defstruct (global-conflicts
             (:constructor make-global-conflicts (kind tn block number))
             (:copier nil))
   ;; the IR2-BLOCK that this structure represents the conflicts for

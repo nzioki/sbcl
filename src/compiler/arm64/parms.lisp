@@ -103,7 +103,7 @@
 
   (defconstant linkage-table-space-start #x0a000000)
   (defconstant linkage-table-space-end   #x0b000000)
-  #+linux
+  #+(or linux openbsd)
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x66fff000)))
@@ -111,6 +111,7 @@
 #+gencgc
 (!gencgc-space-setup #xF0000000 :dynamic-space-start #x1000000000)
 
+(defconstant linkage-table-growth-direction :up)
 (defconstant linkage-table-entry-size 16)
 
 ;;;; other miscellaneous constants

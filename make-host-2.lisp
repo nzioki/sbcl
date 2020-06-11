@@ -14,6 +14,9 @@
 ;; Supress function/macro redefinition warnings under clisp.
 #+clisp (setf custom:*suppress-check-redefinition* t)
 
+;; Avoid natively compiling new code under ecl
+#+ecl (ext:install-bytecodes-compiler)
+
 ;;; Run the cross-compiler to produce cold fasl files.
 (setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
 (setq sb-c::*static-vop-usage-counts* (make-hash-table))
@@ -156,8 +159,8 @@ Sample output
 ;;; but can be handy for experimenting with the system. (See slam.sh
 ;;; for an example.)
 ;;; FIXME: can we just always do this for supported hosts, and remove the choice?
-(when (member :sb-after-xc-core sb-xc:*features*)
-  #+cmu (ext:save-lisp "output/after-xc.core" :load-init-file nil)
-  #+sbcl (host-sb-ext:save-lisp-and-die "output/after-xc.core")
-  #+openmcl (ccl::save-application "output/after-xc.core")
-  #+clisp (ext:saveinitmem "output/after-xc.core"))
+(cond #+sbcl (t (host-sb-ext:save-lisp-and-die "output/after-xc.core"))
+      ((member :sb-after-xc-core sb-xc:*features*)
+       #+cmu (ext:save-lisp "output/after-xc.core" :load-init-file nil)
+       #+openmcl (ccl::save-application "output/after-xc.core")
+       #+clisp (ext:saveinitmem "output/after-xc.core")))

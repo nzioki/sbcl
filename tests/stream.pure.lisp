@@ -472,7 +472,7 @@
 
 #+sb-unicode
 (with-test (:name (:default-char-stream-resets))
-  (let ((s (sb-impl::%make-default-string-ostream)))
+  (sb-impl::%with-output-to-string (s)
     (dotimes (i 2)
       (write-char (code-char 1000) s)
       (assert (equal (type-of (get-output-stream-string s))
@@ -481,3 +481,24 @@
       ;; result type reverts back to simple-base-string after get-output-stream-string
       (assert (equal (type-of (get-output-stream-string s))
                      '(simple-base-string 1))))))
+
+(with-test (:name :with-input-from-string-nowarn)
+  (checked-compile '(lambda ()
+                     (with-input-from-string (s "muffin")))))
+
+(with-test (:name :with-input-from-string-declarations)
+  (checked-compile-and-assert
+      ()
+      `(lambda (string)
+         (with-input-from-string (x string)
+           (declare (optimize safety))
+           (read-char x)))
+    (("a") #\a)))
+
+(defun input-from-dynamic-extent-stream ()
+  (handler-case (with-input-from-string (stream "#w") (read stream nil nil))
+    (error (condition)
+      (format nil "~A" condition))))
+(compile 'input-from-dynamic-extent-stream)
+(with-test (:name :with-input-from-string-signal-stream-error)
+  (assert (search "unavailable" (input-from-dynamic-extent-stream))))

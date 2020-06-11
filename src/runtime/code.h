@@ -91,6 +91,14 @@ static inline unsigned int code_serialno(struct code* code) {
     return table ? *table >> 14 : 0;
 }
 
+static inline unsigned int code_n_named_calls(struct code* code) {
+#ifdef LISP_FEATURE_64_BIT
+    return code->boxed_size >> 32;
+#else
+    return 0;
+#endif
+}
+
 // How many elements in 'code->constants[]' are taken by each simple-fun
 #define CODE_SLOTS_PER_SIMPLE_FUN 4
 
@@ -142,6 +150,21 @@ static inline lispobj* fun_code_header(lispobj* fun) {
 }
 static inline lispobj fun_code_tagged(lispobj* fun) {
     return make_lispobj(fun_code_header(fun), OTHER_POINTER_LOWTAG);
+}
+
+#ifdef RETURN_PC_WIDETAG
+#define embedded_obj_p(tag) (tag==RETURN_PC_WIDETAG || tag==SIMPLE_FUN_WIDETAG)
+#else
+#define embedded_obj_p(tag) (tag==SIMPLE_FUN_WIDETAG)
+#endif
+/* Convert from a lispobj with lowtag bits to the starting address
+ * of the heap object. */
+static inline lispobj *
+base_pointer(lispobj ptr)
+{
+    lispobj *obj = native_pointer(ptr);
+    int widetag = widetag_of(obj);
+    return embedded_obj_p(widetag) ? fun_code_header(obj) : obj;
 }
 
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64

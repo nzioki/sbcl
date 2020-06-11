@@ -157,6 +157,12 @@
               (emit-move node block (make-load-time-constant-tn :known-fun name)
                          res))
              (t
+              #+untagged-fdefns
+              (let ((fdefn-tn (make-load-time-constant-tn :named-call name)))
+                (if unsafe
+                    (vop sb-vm::untagged-fdefn-fun node block fdefn-tn res)
+                    (vop sb-vm::safe-untagged-fdefn-fun node block fdefn-tn res)))
+              #-untagged-fdefns
               (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
                 (if unsafe
                     (vop fdefn-fun node block fdefn-tn res)
@@ -970,7 +976,8 @@
   (declare (type combination node) (type ir2-block block))
   (let* ((fun (ref-leaf (lvar-uses (basic-combination-fun node))))
          (kind (functional-kind fun)))
-    (cond ((eq kind :let)
+    (cond ((eq kind :deleted))
+          ((eq kind :let)
            (ir2-convert-let node block fun))
           ((eq kind :assignment)
            (ir2-convert-assignment node block fun))
@@ -1018,7 +1025,7 @@
                          name
                          ;; Calls to immobile space fdefns won't use this constant,
                          ;; but it needs to exist for GC's pointer tracing.
-                         (make-load-time-constant-tn :fdefinition name))
+                         (make-load-time-constant-tn :named-call name))
                      name)))
           (t
            (values (lvar-tn node block lvar) nil)))))
@@ -1277,20 +1284,6 @@
     (when (consp fname)
       (aver (legal-fun-name-p fname))))) ;; FIXME: needless check?
 
-#+call-symbol
-(defun remove-%coerce-callable-for-call (call)
-  (let* ((fun (basic-combination-fun call))
-         (use (lvar-uses fun)))
-    (when (and (combination-p use)
-               (eq (lvar-fun-name (combination-fun use) t)
-                   '%coerce-callable-for-call))
-      (let ((callable (car (combination-args use))))
-        ;; Everything else can't handle NIL, just don't
-        ;; bother optimizing it.
-        (unless (and (constant-lvar-p callable)
-                     (null (lvar-value callable)))
-          (setf (basic-combination-fun call) callable))))))
-
 ;;; If the call is in a tail recursive position and the return
 ;;; convention is standard, then do a tail full call. If one or fewer
 ;;; values are desired, then use a single-value call, otherwise use a
@@ -1298,8 +1291,6 @@
 (defun ir2-convert-full-call (node block)
   (declare (type combination node) (type ir2-block block))
   (ponder-full-call node)
-  #+call-symbol
-  (remove-%coerce-callable-for-call node)
   (cond ((node-tail-p node)
          (ir2-convert-tail-full-call node block))
         ((let ((lvar (node-lvar node)))
@@ -1601,8 +1592,6 @@
 (defun ir2-convert-mv-call (node block)
   (declare (type mv-combination node) (type ir2-block block))
   (aver (basic-combination-args node))
-  #+call-symbol
-  (remove-%coerce-callable-for-call node)
   (let* ((start-lvar (lvar-info (first (basic-combination-args node))))
          (start (first (ir2-lvar-locs start-lvar)))
          (tails (and (node-tail-p node)
@@ -1764,21 +1753,10 @@ not stack-allocated LVAR ~S." source-lvar)))))
                 nil)
                ((reference-tn-list locs t))))))))
 
-;;; If ir2-convert-full-call gets to it first REMOVE-%COERCE-CALLABLE-FOR-CALL does the job.
 #+call-symbol
 (defoptimizer (%coerce-callable-for-call ir2-convert) ((fun) node block)
-  (let ((dest (node-dest node)))
-    (if (and (basic-combination-p dest)
-             (eq (basic-combination-kind dest) :full)
-             ;; Everything else can't handle NIL, just don't
-             ;; bother optimizing it.
-             (not (and (constant-lvar-p fun)
-                       (null (lvar-value fun))))
-             (let ((dest-fun (basic-combination-fun dest)))
-               (or (eq dest-fun fun) ;; already removed
-                   (eq (lvar-uses dest-fun) node))))
-        (setf (basic-combination-fun dest) fun)
-        (ir2-convert-full-call node block))))
+  (when fun
+    (ir2-convert-full-call node block)))
 
 ;;;; special binding
 
@@ -1919,21 +1897,13 @@ not stack-allocated LVAR ~S." source-lvar)))))
            (type (or lvar null) tag))
   (let* ((2info (nlx-info-info info))
          (kind (cleanup-kind (nlx-info-cleanup info)))
-         (block-tn (physenv-live-tn
-                    (make-normal-tn
-                     (primitive-type-or-lose
-                      (ecase kind
-                        (:catch
-                         'catch-block)
-                        ((:unwind-protect :block :tagbody)
-                         'unwind-block))))
-                    (node-physenv node)))
+         (block-tn (ir2-nlx-info-block-tn 2info))
          (res (make-stack-pointer-tn))
          (target-label (ir2-nlx-info-target 2info)))
-    #-x86-64
+    #-unbind-in-unwind
     (vop current-binding-pointer node block
          (car (ir2-nlx-info-dynamic-state 2info)))
-    #-x86-64
+    #-unbind-in-unwind
     (vop* save-dynamic-state node block
           (nil)
           ((reference-tn-list (cdr (ir2-nlx-info-dynamic-state 2info)) t)))
@@ -2003,14 +1973,14 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let* ((info (lvar-value info-lvar))
          (lvar (node-lvar node))
          (2info (nlx-info-info info))
-         (top-loc (ir2-nlx-info-save-sp 2info))
-         (start-loc (make-nlx-entry-arg-start-location))
-         (count-loc (make-arg-count-location))
          (target (ir2-nlx-info-target 2info)))
 
     (ecase (cleanup-kind (nlx-info-cleanup info))
       ((:catch :block :tagbody)
-       (let ((2lvar (and lvar (lvar-info lvar))))
+       (let ((top-loc (ir2-nlx-info-save-sp 2info))
+             (start-loc (make-nlx-entry-arg-start-location))
+             (count-loc (make-arg-count-location))
+             (2lvar (and lvar (lvar-info lvar))))
          (if (and 2lvar (eq (ir2-lvar-kind 2lvar) :unknown))
              (vop* nlx-entry-multiple node block
                    (top-loc start-loc count-loc nil)
@@ -2023,13 +1993,22 @@ not stack-allocated LVAR ~S." source-lvar)))))
                      target
                      (length locs))
                (move-lvar-result node block locs lvar)))))
-      (:unwind-protect
-       (let ((block-loc (standard-arg-location 0)))
+      #-no-continue-unwind
+      ((:unwind-protect)
+       (let ((start-loc (make-nlx-entry-arg-start-location))
+             (count-loc (make-arg-count-location))
+             (block-loc (standard-arg-location 0)))
          (vop uwp-entry node block target block-loc start-loc count-loc)
          (move-lvar-result
           node block
           (list block-loc start-loc count-loc)
-          lvar))))
+          lvar)))
+      #+no-continue-unwind
+      ((:unwind-protect)
+       (if lvar
+           (vop sb-vm::uwp-entry-block node block target
+                (car (ir2-lvar-locs (lvar-info lvar))))
+           (vop uwp-entry node block target))))
 
     #+sb-dyncount
     (when *collect-dynamic-statistics*
@@ -2038,14 +2017,20 @@ not stack-allocated LVAR ~S." source-lvar)))))
     ;; Make sure this is done before NSP is reset, as that may leave
     ;; *free-interrupt-context-index* unprotected below the stack
     ;; pointer.
-    #-x86-64
+    #-unbind-in-unwind
     (vop unbind-to-here node block
          (car (ir2-nlx-info-dynamic-state 2info)))
 
-    #-x86-64
+    #-unbind-in-unwind
     (vop* restore-dynamic-state node block
           ((reference-tn-list (cdr (ir2-nlx-info-dynamic-state 2info)) nil))
           (nil))))
+
+(defoptimizer (%unwind-protect-breakup ir2-convert) ((info-lvar) node block)
+  (vop %unwind-protect-breakup node block (ir2-nlx-info-block-tn (nlx-info-info (lvar-value info-lvar)))))
+
+(defoptimizer (%catch-breakup ir2-convert) ((info-lvar) node block)
+  (vop %catch-breakup node block (ir2-nlx-info-block-tn (nlx-info-info (lvar-value info-lvar)))))
 
 ;;;; n-argument functions
 

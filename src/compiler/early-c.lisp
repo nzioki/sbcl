@@ -18,8 +18,7 @@
 ;;; An OPAQUE-BOX instance is used to pass data from IR1 to IR2 as
 ;;; a quoted object in a "source form" (not user-written) such that the
 ;;; contained object is in a for-evaluation position but ignored by
-;;; the compiler's constant-dumping logic. In addition to this structure
-;;; type, a few other IR1 object types are implicitly opaque.
+;;; the compiler's constant-dumping logic.
 (defstruct (opaque-box (:constructor opaquely-quote (value))
                        (:copier nil)
                        (:predicate opaque-box-p))
@@ -75,7 +74,7 @@
 ;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
 ;;;             instantiated once per component, INLINE - for all
 ;;;             references (even under #'without FUNCALL)."
-(def!type inlinep ()
+(deftype inlinep ()
   '(member inline maybe-inline notinline nil))
 
 (defstruct (dxable-args (:constructor make-dxable-args (list))
@@ -95,10 +94,17 @@
   (free-vars (make-hash-table :test 'eq) :read-only t :type hash-table)
   ;; FREE-FUNS is like FREE-VARS, only it deals with function names.
   (free-funs (make-hash-table :test 'equal) :read-only t :type hash-table)
-  ;; We use the same CONSTANT structure to represent all equal anonymous
-  ;; constants. This hashtable translates from constants to the LEAFs that
+  ;; These hashtables translate from constants to the LEAFs that
   ;; represent them.
-  (constants (make-hash-table :test 'equal) :read-only t :type hash-table))
+  ;; Table 1: one entry for each distinct constant (according to object identity)
+  (eq-constants (make-hash-table :test 'eq) :read-only t :type hash-table)
+  ;; Table 2: one hash-table entry per EQUAL constant,
+  ;; with the caveat that lookups must discriminate amongst constants that
+  ;; are EQUAL but not similar.  The value in the hash-table is a list of candidates
+  ;; (#<constant1> #<constant2> ... #<constantN>) such that CONSTANT-VALUE
+  ;; of each is EQUAL to the key for the hash-table entry, but dissimilar
+  ;; from each other. Notably, strings of different element types can't be similar.
+  (similar-constants (make-hash-table :test 'equal) :read-only t :type hash-table))
 (declaim (freeze-type ir1-namespace))
 
 (sb-impl::define-thread-local *ir1-namespace*)
@@ -148,12 +154,18 @@ possible. Potentially long (over one page in size) vectors are, however, not
 stack allocated except in zero SAFETY code, as such a vector could overflow
 the stack without triggering overflow protection.")
 
+;;; *BLOCK-COMPILE-ARGUMENT* holds the original value of the :BLOCK-COMPILE
+;;; argument, which overrides any internal declarations.
+(defvar *block-compile-argument*)
+(declaim (type (member nil t :specified)
+               *block-compile-default* *block-compile-argument*))
+
 ;;; This lock is seized in the compiler, and related areas -- like the
 ;;; classoid/layout/class system.
 ;;; Assigning a literal object enables genesis to dump and load it
 ;;; without need of a cold-init function.
 #-sb-xc-host
-(!define-load-time-global **world-lock** #.(sb-thread:make-mutex :name "World Lock"))
+(!define-load-time-global **world-lock** (sb-thread:make-mutex :name "World Lock"))
 
 #-sb-xc-host
 (define-load-time-global *static-linker-lock*
@@ -174,7 +186,6 @@ the stack without triggering overflow protection.")
        (!define-load-time-global *type-cache-nonce* 0))
 
 (defstruct (undefined-warning
-            #-no-ansi-print-object
             (:print-object (lambda (x s)
                              (print-unreadable-object (x s :type t)
                                (prin1 (undefined-warning-name x) s))))
@@ -232,10 +243,11 @@ the stack without triggering overflow protection.")
                 :format-arguments (list symbol)))
   (values))
 
-(defstruct (debug-name-marker (:print-function print-debug-name-marker)
-                              ;; make these satisfy SB-XC:INSTANCEP
-                              #+sb-xc-host (:include structure!object)
-                              (:copier nil)))
+;;; This is DEF!STRUCT so that when SB-C:DUMPABLE-LEAFLIKE-P invokes
+;;; SB-XC:TYPEP in make-host-2, it does not need need to signal PARSE-UNKNOWN
+;;; for each and every constant seen up until this structure gets defined.
+(def!struct (debug-name-marker (:print-function print-debug-name-marker)
+                               (:copier nil)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -353,16 +365,27 @@ the stack without triggering overflow protection.")
                         (:predicate nil)
                         (:conc-name ""))
   (fun-names-in-this-file)
+  ;; for constant coalescing across code components, and/or for situations
+  ;; where SIMILARP does not do what you want.
+  (constant-cache)
+  ;; When compiling within the extent of *macro-policy* we have to store up
+  ;; any DECLAIMs for later replay. The logic is explained in EVAL-COMPILE-TLF.
+  ;; This slot is set to NIL before use and reset when done.
+  (saved-optimize-decls :none)
   (coverage-metadata nil :type (or (cons hash-table hash-table) null) :read-only t)
   (msan-unpoison nil :read-only t)
   (sset-counter 1 :type fixnum)
   ;; if emitting a cfasl, the fasl stream to that
   (compile-toplevel-object nil :read-only t)
-  ;; these are all historical baggage from here down,
-  ;; unused unless we ever decide to fix block compilation
+  ;; The current block compilation state.  These are initialized to
+  ;; the :Block-Compile and :Entry-Points arguments that COMPILE-FILE
+  ;; was called with.  Subsequent START-BLOCK or END-BLOCK
+  ;; declarations alter the values.
   (block-compile nil :type (member nil t :specified))
-  ;; When block compiling, used by PROCESS-FORM to accumulate top level
-  ;; lambdas resulting from compiling subforms. (In reverse order.)
+  (entry-points nil :type list)
+  ;; When block compiling, used by PROCESS-FORM to accumulate top
+  ;; level lambdas resulting from compiling subforms. (In reverse
+  ;; order.)
   (toplevel-lambdas nil :type list)
 
   ;; Bidrectional map between IR1/IR2/assembler abstractions and a corresponding

@@ -10,7 +10,14 @@
           (format t "~&target ~S = ~S~%" sym  val))))))
 (in-package "SB-COLD")
 (progn
-  (let ((*readtable* *xc-readtable*)) (load "tools-for-build/ldso-stubs.lisp"))
+  ;; Generating ldso-stubs should be driven by GNUmakefile, but that won't work
+  ;; because we generate it using Lisp code, and we don't presume the target
+  ;; to have a lisp implementation. So we generate it on the host by knowing
+  ;; something about which Config files depend on ldso-stubs.
+  (when (or (member :alpha sb-xc:*features*)
+            (member :hppa sb-xc:*features*))
+    (let ((*readtable* *xc-readtable*)) (load "tools-for-build/ldso-stubs.lisp")))
+
   (setf *host-obj-prefix* "obj/from-host/")
   (load "src/cold/set-up-cold-packages.lisp")
   (load "src/cold/defun-load-or-cload-xcompiler.lisp")
@@ -154,19 +161,11 @@
 
 (maybe-with-compilation-unit
  (let ((*feature-evaluation-results* nil))
+  ;; If make-host-1 is parallelized, it will produce host fasls without loading
+  ;; them. The host will have interpreted definitions of most everything,
+  ;; which is OK because writing out the C headers is not compute-intensive.
   (load-or-cload-xcompiler #'host-cload-stem)
   (write-feature-eval-results))
-
- ;; Let's check that the type system, and various other things, are
- ;; reasonably sane. (It's easy to spend a long time wandering around
- ;; confused trying to debug cross-compilation if it isn't.)
- (let ((*readtable* *xc-readtable*)
-       (*load-verbose* t))
-   (with-math-journal
-     (load "tests/type.before-xc.lisp")
-     (load "tests/info.before-xc.lisp")
-     (load "tests/vm.before-xc.lisp")))
-
  ;; propagate structure offset and other information to the C runtime
  ;; support code.
  (load "tools-for-build/corefile.lisp" :verbose nil)

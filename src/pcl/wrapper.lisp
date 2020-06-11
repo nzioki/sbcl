@@ -29,16 +29,10 @@
 (defmacro wrapper-class (wrapper)
   `(classoid-pcl-class (layout-classoid ,wrapper)))
 
-(declaim (inline make-wrapper-internal))
-(defun make-wrapper-internal (hash &key (bitmap -1) length classoid)
-  (make-layout hash classoid
-               :length length :invalid nil
-               :flags +pcl-object-layout-flag+ :bitmap bitmap))
-
 ;;; This is called in BRAID when we are making wrappers for classes
 ;;; whose slots are not initialized yet, and which may be built-in
 ;;; classes. We pass in the class name in addition to the class.
-(defun !boot-make-wrapper (length name &optional class)
+(defun !boot-make-wrapper (length name &optional class (bitmap -1))
   (let ((found (find-classoid name nil)))
     (cond
      (found
@@ -49,10 +43,12 @@
         (aver layout)
         layout))
      (t
-      (make-wrapper-internal (randomish-layout-clos-hash name)
-                             :length length
-                             :classoid (make-standard-classoid
-                                        :name name :pcl-class class))))))
+      (set-layout-valid
+       (make-layout (hash-layout-name name)
+                    (make-standard-classoid :name name :pcl-class class)
+                    :length length
+                    :flags +pcl-object-layout-flag+
+                    :bitmap bitmap))))))
 
 ;;; In SBCL, as in CMU CL, the layouts (a.k.a wrappers) for built-in
 ;;; and structure classes already exist when PCL is initialized, so we
@@ -78,9 +74,9 @@
                                               :name (and (symbolp name) name)))
                      (t
                       (bug "Got to T branch in ~S" 'make-wrapper))))))
-       (make-wrapper-internal (randomish-layout-clos-hash name)
-                              :length length
-                              :classoid classoid)))
+       (set-layout-valid
+        (make-layout (hash-layout-name name)
+                     classoid :length length :flags +pcl-object-layout-flag+))))
     (t
      (let* ((found (find-classoid (slot-value class 'name)))
             (layout (classoid-layout found)))
@@ -120,6 +116,15 @@
 ;;; SLOT-VALUE-USING-CLASS check the wrapper validity as well. This is
 ;;; done by calling CHECK-WRAPPER-VALIDITY.
 
+;;; This "simple" function hides a horrible inconsistency: we don't have a single
+;;; canonical atomically checkable validity indicator. We carry around invalid layouts
+;;; with nonzero hashes. Why else would there be so may places that can do:
+;;;   (setf (layout-invalid layout) nil
+;;; whilst the layout in question already has a "valid" hash?
+;;; It's hard to know what the right thing is, but since internal code uses
+;;; this test to decide how to handle layouts that have been invalidated,
+;;; I don't think we can just change it to examine the hash value
+;;; even though logically that *should* be the canonical test.
 (declaim (inline invalid-wrapper-p))
 (defun invalid-wrapper-p (wrapper)
   (not (null (layout-invalid wrapper))))
@@ -201,10 +206,13 @@
 
     ;; FIXME: We are here inside PCL lock, but might someone be
     ;; accessing the wrapper at the same time from outside the lock?
-    (setf (layout-clos-hash owrapper) 0)
-    ;; And shouldn't these assignments be flipped, so that if an observer
-    ;; sees a 0 hash in owrapper, it can find the new layout?
+    ;; Inform readers of the reason for wrapper invalidity before marking
+    ;; the wrapper as invalid.
     (setf (layout-invalid owrapper) new-state)
+    ;; Ensure that the INVALID slot conveying ancillary data describing the
+    ;; invalidity reason is published before causing the invalid layout trap.
+    (sb-thread:barrier (:write))
+    (setf (layout-clos-hash owrapper) 0)
     (push (make-weak-pointer owrapper) new-previous)
     ;; This function is called for effect; return value is arbitrary.
     (setf  (sb-kernel::standard-classoid-old-layouts classoid)
@@ -220,7 +228,7 @@
       (aver (not (eq state :uninitialized)))
       (cond ((not state)
              owrapper)
-            ((not (layout-for-std-class-p owrapper))
+            ((not (layout-for-pcl-obj-p owrapper))
              ;; Obsolete structure trap.
              (%obsolete-instance-trap owrapper nil instance))
             ((eq t state)
@@ -264,7 +272,7 @@
                   (cond ((std-instance-p instance)
                          (setf (%instance-layout instance) new))
                         ((fsc-instance-p instance)
-                         (setf (%funcallable-instance-layout instance) new))
+                         (setf (%fun-layout instance) new))
                         (t
                          (bug "unrecognized instance type")))))
                (:obsolete

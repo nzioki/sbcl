@@ -6,8 +6,6 @@
 #include <image.h>
 #include <stdio.h>
 
-size_t os_vm_page_size;
-
 os_vm_address_t
 os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
 {
@@ -54,21 +52,17 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
     }
 }
 
-char *os_get_runtime_executable_path(int __attribute__((unused)) external)
+char *os_get_runtime_executable_path()
 {
     int cookie = 0;
     image_info info;
     int status = _get_next_image_info(0, &cookie, &info, sizeof(info));
-    if (status == 0)
-        return info.name;
-    else
-        return NULL;
+    return (status == 0) ? copied_string(info.name) : 0;
 }
 
 void
 os_init(char __attribute__((unused)) *argv[], char __attribute__((unused)) *envp[])
 {
-    os_vm_page_size = BACKEND_PAGE_BYTES;
 }
 
 static void

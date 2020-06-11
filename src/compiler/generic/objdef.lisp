@@ -47,7 +47,7 @@
 
 (define-primitive-object (bignum :lowtag other-pointer-lowtag
                                  :widetag bignum-widetag
-                                 :alloc-trans sb-bignum::%allocate-bignum)
+                                 :alloc-trans sb-bignum:%allocate-bignum)
   (digits :rest-p t :c-type #-alpha "sword_t" #+alpha "u32"))
 
 (define-primitive-object (ratio :type ratio
@@ -197,9 +197,15 @@ during backtrace.
   (boxed-size :type fixnum ; see above figure
               :ref-known (flushable movable)
               :ref-trans %code-boxed-size)
+  ;; This slot usually holds an instance of SB-C::COMPILED-DEBUG-FUN
+  ;; but the debugger can replace it with a cons of that and something else.
+  ;; It could also be the symbol :BPT-LRA, or, as a special case
+  ;; for the assembler code component, a cons holding a hash-table.
+  ;; (the cons points from read-only to static space, but the hash-table
+  ;; wants to be in dynamic space)
   (debug-info :type t
               :ref-known (flushable)
-              :ref-trans %code-debug-info
+              :ref-trans %%code-debug-info
               :set-known ()
               :set-trans (setf %code-debug-info))
   ;; Define this slot if the architecture might ever use fixups.
@@ -325,9 +331,10 @@ during backtrace.
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
-  #+x86-64 bsp
-  #+x86-64
-  current-catch)
+  #+(and unbind-in-unwind (not c-stack-is-control-stack)) nfp
+  #+(and unbind-in-unwind (not c-stack-is-control-stack)) nsp
+  #+unbind-in-unwind bsp
+  #+unbind-in-unwind current-catch)
 
 (define-primitive-object (catch-block)
   (uwp :c-type #-alpha "struct unwind_block *" #+alpha "u32")
@@ -336,7 +343,9 @@ during backtrace.
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
-  #+x86-64 bsp
+  #+(and unbind-in-unwind (not c-stack-is-control-stack)) nfp
+  #+(and unbind-in-unwind (not c-stack-is-control-stack)) nsp
+  #+unbind-in-unwind bsp
   (previous-catch :c-type #-alpha "struct catch_block *" #+alpha "u32")
   tag)
 
@@ -360,22 +369,17 @@ during backtrace.
   ;; HASH and VALUE are the first two slots.
   ;; Traditionally VALUE was the first slot, corresponding to the CAR of
   ;; NIL-as-end-of-list; and HASH was the second, corresponding to CDR.
-  ;; Some architectures reverse the order because by storing HASH in the word
-  ;; after the object header it becomes a memory-safe operation to read
-  ;; SYMBOL-HASH-SLOT from _any_ object whatsoever (the minimum size is 2 words)
+  ;; By storing HASH in the word after the object header it becomes a memory-safe
+  ;; operation to read SYMBOL-HASH-SLOT from _any_ object whatsoever
   ;; using lisp code equivalent to "native_pointer(ptr)[1]".
-  ;; Either order should work on any backend; it is merely a question of checking
-  ;; that backend-specific files don't rely on a certain order.
-  ;; Also note that in general, accessing the hash requires masking off bits to
-  ;; yield a fixnum result, all the more so if the object is any random type.
-
-  #+(or arm arm64 ppc ppc64 x86 x86-64) (hash :set-trans %set-symbol-hash)
-
+  ;; This improves the code for CASE and ECASE over symbols
+  ;; regardless of whether the object being tested is known to be a symbol.
+  ;; Accessing the hash requires masking off bits to yield a fixnum result,
+  ;; all the more so if the object is any random type.
+  (hash :set-trans %set-symbol-hash)
   (value :init :unbound
          :set-trans %set-symbol-global-value
          :set-known ())
-
-  #-(or arm arm64 ppc ppc64 x86 x86-64) (hash :set-trans %set-symbol-hash)
 
   (info :ref-trans symbol-info :ref-known (flushable)
         :set-trans (setf symbol-info)
@@ -392,6 +396,12 @@ during backtrace.
   ;; For the 32-bit architectures, reading this slot as a descriptor
   ;; makes it "off" by N-FIXNUM-TAG-BITS, which is bothersome,
   ;; so there's a transform on SYMBOL-TLS-INDEX to make it sane.
+  ;; The issue with not having this in the header - supposing we used
+  ;; the high 2 bytes for it - is that NIL's 0th word would suggest
+  ;; that it has a nonzero TLS index, namely:
+  ;; * (sb-vm:hexdump nil)
+  ;;   1100008: 0110000B = NIL ; looks like NIL's TLS index is 0x110
+  ;;   110000C: 0110000B = NIL
   #+(and sb-thread (not 64-bit))
   (tls-index :type (and fixnum unsigned-byte) ; too generous still?
              :ref-known (flushable)
@@ -487,9 +497,9 @@ during backtrace.
   (binding-stack-pointer :c-type "lispobj *" :pointer t
                          :special *binding-stack-pointer*)
   ;; next two not used in C, but this wires the TLS offsets to small values
-  #+(and x86-64 sb-thread)
+  #+(and (or riscv x86-64 arm64) sb-thread)
   (current-catch-block :special *current-catch-block*)
-  #+(and x86-64 sb-thread)
+  #+(and (or riscv x86-64 arm64) sb-thread)
   (current-unwind-protect-block :special *current-unwind-protect-block*)
   #+sb-thread (pseudo-atomic-bits #+(or x86 x86-64) :special #+(or x86 x86-64) *pseudo-atomic-bits*)
   (alien-stack-pointer :c-type "lispobj *" :pointer t

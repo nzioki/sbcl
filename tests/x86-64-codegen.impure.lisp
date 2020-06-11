@@ -12,6 +12,21 @@
 #-x86-64 (sb-ext:exit :code 104)
 
 (load "compiler-test-util.lisp")
+(defun disassembly-lines (fun)
+  ;; FIXME: I don't remember what this override of the hook is for.
+  (sb-int:encapsulate 'sb-disassem::add-debugging-hooks 'test
+                      (lambda (f &rest args) (declare (ignore f args))))
+  (prog1
+      (mapcar (lambda (x) (string-left-trim " ;" x))
+              (cddr
+               (split-string
+                (with-output-to-string (s)
+                  (let ((sb-disassem:*disassem-location-column-width* 0)
+                        (*print-pretty* nil))
+                    (disassemble fun :stream s)))
+                #\newline)))
+    (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)))
+
 (defun disasm (safety expr &optional (remove-epilogue t))
   ;; This lambda has a name because if it doesn't, then the name
   ;; is something stupid like (lambda () in ...) which pretty-prints
@@ -19,18 +34,9 @@
   (let ((fun (compile nil
                       `(sb-int:named-lambda test ()
                          (declare (optimize (debug 0) (safety ,safety)
-                                            (sb-c::verify-arg-count 0)))
+                                            (sb-c:verify-arg-count 0)))
                          ,expr))))
-    (sb-int:encapsulate 'sb-disassem::add-debugging-hooks 'test
-                        (lambda (f &rest args) (declare (ignore f args))))
-    (let ((lines
-            (split-string
-             (with-output-to-string (s)
-               (let ((sb-disassem:*disassem-location-column-width* 0))
-                 (disassemble fun :stream s)))
-             #\newline)))
-      (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)
-      (setq lines (cddr lines))         ; remove "Disassembly for"
+    (let ((lines (disassembly-lines fun)))
       ;; For human-readability, kill the whitespace
       (setq lines (mapcar (lambda (x) (string-left-trim " ;" x)) lines))
       (when (string= (car (last lines)) "")
@@ -185,15 +191,15 @@
       (let ((lines (disassembly-lines 'c)))
         (expect "#<FUNCTION H>" lines))
       (let ((lines (disassembly-lines 'd)))
-        (expect "#<FDEFN F>" lines)
-        (expect "#<FDEFN G>" lines))
-      (handler-bind ((warning #'muffle-warning))
-        (defun g (x) (- x)))
+        (expect "#<FUNCTION H>" lines))
+      (setf (symbol-function 'g) #'+)
       (let ((lines (disassembly-lines 'c)))
-        (expect "#<FDEFN G>" lines)))))
+        (expect "#<FDEFN G>" lines))
+      (let ((lines (disassembly-lines 'd)))
+        (expect "#<FDEFN G>" lines)
+        (expect "#<FUNCTION H>" lines)))))
 
-(with-test (:name :c-call
-            :skipped-on (not :sb-dynamic-core))
+(with-test (:name :c-call)
   (let* ((lines (split-string
                  (with-output-to-string (s)
                    (let ((sb-disassem:*disassem-location-column-width* 0))
@@ -338,12 +344,12 @@
     (try '(cdr obj) '("hi" . 1) '("hi"))))
 
 (with-test (:name :huge-code :skipped-on (not :immobile-code))
-  (sb-vm::allocate-code-object :immobile 4 (* 2 1024 1024)))
+  (sb-vm::allocate-code-object :immobile 0 4 (* 2 1024 1024)))
 
 (defun bbb (x y z)
   ;; I don't want the number of expected comparisons to depend on whether
   ;; the code gets disassembled with versus without the initial segment.
-  (declare (optimize (sb-c::verify-arg-count 0)))
+  (declare (optimize (sb-c:verify-arg-count 0)))
   (if x
       (ecase y
         (-2 'a) (2 'b) (3 'c) (4 (error "no")) (5 'd) (6 'e) (7 'wat) (8 '*) (9 :hi))
@@ -351,7 +357,7 @@
         (#\a :a) (#\b :b) (#\e :c) (#\f :d) (#\g :e) (#\h :f) (t nil))))
 
 (defun try-case-known-fixnum (x)
-  (declare (optimize (sb-c::verify-arg-count 0)))
+  (declare (optimize (sb-c:verify-arg-count 0)))
   (case (the fixnum x)
     (0 :a) (1 :b) (2 :c) (5 :d) (6 :c) (-1 :blah)))
 (defun try-case-maybe-fixnum (x)
@@ -360,11 +366,11 @@
       (0 :a) (1 :b) (2 :c) (5 :d) (6 :c) (-1 :blah))))
 
 (defun try-case-known-char (x)
-  (declare (optimize (sb-c::verify-arg-count 0)))
+  (declare (optimize (sb-c:verify-arg-count 0)))
   (case (the character x)
     (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e :e) (#\f :b)))
 (defun try-case-maybe-char (x)
-  (declare (optimize (sb-c::verify-arg-count 0)))
+  (declare (optimize (sb-c:verify-arg-count 0)))
   (when (characterp x)
     (case x (#\a :a) (#\b :b)(#\c :c) (#\d :d) (#\e :e) (#\f :a))))
 
@@ -495,7 +501,7 @@
 (with-test (:name :disassembler-label-jump-table-targets)
   (let* ((f (checked-compile
              '(lambda (x)
-               (declare (optimize (sb-c::verify-arg-count 0)))
+               (declare (optimize (sb-c:verify-arg-count 0)))
                (case (truly-the fixnum x)
                  (0 (a)) (1 (b)) (2 (c)) (3 (d))))
              :allow-style-warnings t))
@@ -670,7 +676,10 @@ sb-vm::(define-vop (cl-user::test)
 (with-test (:name :typep-compiled-with-jump-table)
   ;; Expect to reference the CTYPE layout because %%TYPEP declares its argument
   ;; to be that.  Expect to reference the UNKNOWN-TYPE layout because of an
-  ;; explicit call to UNKNOWN-TYPE-P. I do not know why NUMERIC-TYPE is there.
+  ;; explicit call to UNKNOWN-TYPE-P; same for FUN-DESIGNATOR-TYPE-P.
+
+  ;; The other types are referenced from other functions in the code
+  ;; component.
   (let ((names
           (mapcar (lambda (x)
                     (sb-kernel:classoid-name (sb-kernel:layout-classoid x)))
@@ -678,7 +687,11 @@ sb-vm::(define-vop (cl-user::test)
     (assert (null (set-difference names
                                   '(sb-kernel:ctype
                                     sb-kernel:unknown-type
-                                    sb-kernel:numeric-type
+                                    sb-kernel:fun-designator-type
+                                    sb-c::abstract-lexenv
+                                    sb-kernel::classoid-cell
+                                    sb-kernel:layout
+                                    sb-kernel:classoid
                                     #-immobile-space null))))))
 
 ;; lp#1857861
@@ -690,8 +703,39 @@ sb-vm::(define-vop (cl-user::test)
                                      #\newline)
              thereis (let ((p (search expect line)))
                        ;; expect no end-of-line comment
-                       (and p (not (find #\; line :start p)))))))
+                       (and p (not (find #\; line :start p))))))
+  (let ((f (compile nil '(lambda (x) (sb-ext:process-p x)))))
+     (loop for line in (split-string (with-output-to-string (string)
+                                       (disassemble f :stream string))
+                                     #\newline)
+             thereis (and (search "LAYOUT for" line)
+                          (search "CMP DWORD PTR" line)))))
 
 (with-test (:name :thread-local-unbound)
   (let ((c (nth-value 1 (ignore-errors sb-c::*compilation*))))
     (assert (eq (cell-error-name c) 'sb-c::*compilation*))))
+
+#+immobile-code
+(with-test (:name :debug-fun-from-pc-more-robust)
+  (let ((trampoline
+          (sb-di::code-header-from-pc
+           (sb-sys:int-sap (sb-vm::fdefn-raw-addr
+                            (sb-kernel::find-fdefn 'sb-kernel::get-internal-real-time))))))
+    (assert (zerop (sb-kernel:code-n-entries trampoline)))
+    (assert (typep (sb-di::debug-fun-from-pc trampoline 8)
+                   'sb-di::bogus-debug-fun))))
+
+(defstruct foo (s 0 :type (or null string)))
+(with-test (:name :reduce-stringp-to-not-null)
+  (let ((f1 (disassembly-lines
+             '(lambda (x) (if (null (foo-s (truly-the foo x))) 'not 'is))))
+        (f2 (disassembly-lines
+             '(lambda (x) (if (stringp (foo-s (truly-the foo x))) 'is 'not)))))
+    ;; the comparison of X to NIL should be a single-byte test
+    (assert (loop for line in f1
+                  thereis (search (format nil "CMP AL, ~D"
+                                          (logand sb-vm:nil-value #xff))
+                                  line)))
+    ;; the two variations of the test compile to the identical code
+    (dotimes (i 4)
+      (assert (string= (nth i f1) (nth i f2))))))
