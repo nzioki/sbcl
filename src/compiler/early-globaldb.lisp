@@ -21,7 +21,7 @@
                       ((or (atom result)
                            (not (eq (car result) 'values)))
                        `(values ,result &optional))
-                      ((intersection (cdr result) sb-xc:lambda-list-keywords)
+                      ((intersection (cdr result) lambda-list-keywords)
                        result)
                       (t `(values ,@(cdr result) &optional)))))
     `(function ,args ,result)))
@@ -81,7 +81,7 @@
 (defconstant +info-metainfo-type-num+ 0)
 
 ;; Refer to info-vector.lisp for the meaning of this constant.
-(defconstant +no-auxilliary-key+ 0)
+(defconstant +no-auxiliary-key+ 0)
 
 ;;; Return the globaldb info for SYMBOL. With respect to the state diagram
 ;;; presented at the definition of SYMBOL-PLIST, if the object in SYMBOL's
@@ -92,19 +92,13 @@
 ;;;
 ;;; Define SYMBOL-INFO-VECTOR as an inline function unless a vop translates it.
 ;;; (Inlining occurs first, which would cause the vop not to be used.)
-;;; Also note that we have to guard the appearance of VOP-TRANSLATES here
-;;; so that it does not get tested when building the cross-compiler.
-;;; This was the best way I could see to work around a spurious warning
-;;; about a wrongly ordered VM definition in make-host-1.
-;;; The #+/- reader can't see that a VOP-TRANSLATES term is not for the
-;;; host compiler unless the whole thing is one expression.
-#-(or sb-xc-host (vop-translates sb-kernel:symbol-info-vector))
-(progn
-(declaim (inline symbol-info-vector))
-(defun symbol-info-vector (symbol)
-  (let ((info-holder (symbol-info symbol)))
-    (truly-the (or null simple-vector)
-               (if (listp info-holder) (cdr info-holder) info-holder)))))
+#-sb-xc-host
+(sb-c::unless-vop-existsp (:translate sb-kernel:symbol-info-vector)
+  (declaim (inline symbol-info-vector))
+  (defun symbol-info-vector (symbol)
+    (let ((info-holder (symbol-info symbol)))
+      (truly-the (or null simple-vector)
+                 (if (listp info-holder) (cdr info-holder) info-holder)))))
 
 ;;; SYMBOL-INFO is a primitive object accessor defined in 'objdef.lisp'
 ;;; But in the host Lisp, there is no such thing as a symbol-info slot.
@@ -122,7 +116,7 @@
 (defmacro !get-meta-infos (kind)
   `(let* ((info-vector (symbol-info-vector ,kind))
           (index (if info-vector
-                     (packed-info-value-index info-vector +no-auxilliary-key+
+                     (packed-info-value-index info-vector +no-auxiliary-key+
                                               +info-metainfo-type-num+))))
      (if index (svref info-vector index))))
 
@@ -313,8 +307,8 @@
          "Automagically generated boolean attribute setter. See
  !DEF-BOOLEAN-ATTRIBUTE."
          (multiple-value-bind (temps values stores setter getter)
-             (#+sb-xc-host get-setf-expansion
-              #-sb-xc-host sb-xc:get-setf-expansion place env)
+             (#+sb-xc-host cl:get-setf-expansion
+              #-sb-xc-host get-setf-expansion place env)
            (when (cdr stores)
              (error "multiple store variables for ~S" place))
            (let ((newval (sb-xc:gensym))
@@ -349,6 +343,6 @@
   `(the attributes
         (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
 (declaim (ftype (function (attributes attributes) boolean) attributes=))
-#-sb-fluid (declaim (inline attributes=))
+(declaim (inline attributes=))
 (defun attributes= (attr1 attr2)
   (eql attr1 attr2))

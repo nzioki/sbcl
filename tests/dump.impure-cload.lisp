@@ -246,7 +246,7 @@
       (assert-canonical '(y x)))
     ;; specifying only one slot is not canonical
     (assert (equal (let ((*foo-save-slots* '(x))) (sb-c::%make-load-form foo))
-                   '(sb-kernel::new-instance foo)))))
+                   '(sb-kernel::new-struct foo)))))
 
 ;; A huge constant vector. This took 9 seconds to compile (on a MacBook Pro)
 ;; prior to the optimization for using fops to dump.
@@ -422,6 +422,17 @@
     (assert (eq (aref pairs 2) 'first))
     (assert (eq (aref pairs 4) 'second))))
 
+(defun int= (a b) (= (the integer x) (the integer b)))
+(define-hash-table-test int= sb-impl::number-sxhash)
+(defun get-sync-hash-table () #.(make-hash-table :synchronized t))
+(with-test (:name :dump-hash-tables)
+  ;; Don't lose the :synchronized option.
+  (assert (hash-table-synchronized-p (get-sync-hash-table)))
+  ;; Disallow nonstandard hash that disagrees with test.
+  (assert-error (make-load-form (make-hash-table :test 'int= :hash-function 'sxhash)))
+  ;; Allow nonstandard test as long as it was registered
+  (assert (make-load-form (make-hash-table :test 'int=))))
+
 (defun list-coalescing-test-fun-1 ()
   (declare (optimize (debug 1)))
   ;; base coalesces with base, non-base coalesces with non-base
@@ -472,3 +483,45 @@
   (let ((z (eval `(test-constant-identity ,(intern "+CONSY-CONSTANT+")))))
     (assert (equal (car z) +consy-constant+))
     (assert (cadr z))))
+
+(macrolet ((expand ()
+             `(progn
+                ,@(loop for i from 0 below sb-vm:n-word-bits
+                        collect
+                        `(sb-int:defconstant-eqx ,(intern (format nil "MYSAP~d" i))
+                             ,(sb-sys:int-sap (ash 1 i))
+                           #'sb-sys:sap=)))))
+  (expand))
+(with-test (:name :dump-sap)
+  (dotimes (i sb-vm:n-word-bits)
+    (let ((s (intern (format nil "MYSAP~d" i))))
+      (assert (= (sb-sys:sap-int (symbol-value s))
+                 (ash 1 i))))))
+
+(eval-when (:compile-toplevel :load-toplevel)
+  (defstruct monkey
+    (x t)
+    (y 1 :type fixnum)
+    (data (cons 1 2))
+    (str "hi"))
+
+  (defmethod make-load-form ((self monkey) &optional e)
+    (make-load-form-saving-slots self :slot-names '(data) :environment e)))
+
+(defvar *amonkey* #.(make-monkey :x nil :y 3 :data '(ok)))
+(eval-when (:compile-toplevel) (makunbound '*amonkey*))
+(with-test (:name :dump-monkey)
+  (let ((a *amonkey*))
+    (assert (sb-kernel::unbound-marker-p (monkey-x a)))
+    (assert (sb-kernel::unbound-marker-p (monkey-y a)))
+    (assert (sb-kernel::unbound-marker-p (monkey-str a)))
+    (assert (equal (monkey-data a) '(ok)))))
+
+(defun use-numeric-vector-a ()
+  #.(make-array 5 :element-type '(signed-byte 8) :initial-contents '(90 100 5 -2 3)))
+
+(defun use-numeric-vector-b ()
+  #.(make-array 5 :element-type '(signed-byte 8) :initial-contents '(90 100 5 -2 3)))
+
+(with-test (:name :coalesce-numeric-arrays)
+  (assert (eq (use-numeric-vector-a) (use-numeric-vector-b))))

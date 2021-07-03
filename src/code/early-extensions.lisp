@@ -13,10 +13,42 @@
 
 (in-package "SB-IMPL")
 
+;;; FIXME: a lot of places in the code that should use ARRAY-RANGE
+;;; instead use INDEX and vice-versa, but the thing is, we have
+;;; a ton of fenceposts errors all over the place regardless.
+;;; CLHS glosary reference:
+;;; "array total size n. the total number of elements in an array,
+;;;  computed by taking the product of the dimensions of the array."
+;;; and ARRAY-TOTAL-SIZE-LIMIT:
+;;; "The upper exclusive bound on the array total size of an array."
+
+;;; Consider a reduced example for the sake of argument in which
+;;; ARRAY-TOTAL-SIZE-LIMIT were 21.
+;;; - the largest vector would have LENGTH 20.
+;;; - the largest legal index for AREF on it would be 19.
+;;; - the largest legal :END on sequence functions would be 20.
+;;; Nothing should allow 21. So DEFTYPE ARRAY-RANGE is wrong
+;;; and must never be used for anything.
+;;; Unfortunately, it's all over mb-util and enc-utf etc.
+;;;
+;;; *Also* INDEX is wrong, as the comment there says.
+;;; To fix these and also SEQUENCE-END:
+;;; - INDEX should be `(integer 0 (,1- array-dimension-limit))
+;;; - ARRAY-RANGE should be `(integer 0 (,array-dimension-limit))
+;;; - SEQUENCE-END (in deftypes-for-target) should be
+;;;   `(OR NULL ARRAY-RANGE)
+;;;
+;;; A further consideration for INDEX on 64-bit machines is that
+;;; if INDEX were equivalent to (UNSIGNED-BYTE n) for some 'n'
+;;; then (TYPEP X 'INDEX) can combines FIXNUMP and the range test into
+;;; one bit-masking test, depending on the architecture.
+;;; Probably it should be (UNSIGNED-BYTE 61) except on ppc64
+;;; where it would have to be (UNSIGNED-BYTE 59).
+
 ;;; A number that can represent an index into a vector, including
 ;;; one-past-the-end
 (deftype array-range ()
-  `(integer 0 ,sb-xc:array-dimension-limit))
+  `(integer 0 ,array-dimension-limit))
 
 ;;; a type used for indexing into sequences, and for related
 ;;; quantities like lengths of lists and other sequences.
@@ -35,13 +67,13 @@
 ;;; MOST-POSITIVE-FIXNUM lets the system know it can increment a value
 ;;; of type INDEX without having to worry about using a bignum to
 ;;; represent the result.
-(def!type index () `(integer 0 (,sb-xc:array-dimension-limit)))
+(def!type index () `(integer 0 (,array-dimension-limit)))
 
 ;;; like INDEX, but augmented with -1 (useful when using the index
 ;;; to count downwards to 0, e.g. LOOP FOR I FROM N DOWNTO 0, with
 ;;; an implementation which terminates the loop by testing for the
 ;;; index leaving the loop range)
-(def!type index-or-minus-1 () `(integer -1 (,sb-xc:array-dimension-limit)))
+(def!type index-or-minus-1 () `(integer -1 (,array-dimension-limit)))
 
 ;;; The smallest power of two that is equal to or greater than X.
 (declaim (inline power-of-two-ceiling))
@@ -277,7 +309,7 @@
                        ,result)))
     `(let ((,n-table ,table))
        ,(if locked
-            `(with-locked-system-table (,n-table) ,iter-form)
+            `(with-system-mutex ((hash-table-lock ,n-table)) ,iter-form)
             iter-form))))
 
 ;;; Executes BODY for all entries of PLIST with KEY and VALUE bound to
@@ -285,6 +317,7 @@
 (defmacro doplist ((key val) plist &body body)
   (with-unique-names (tail)
     `(let ((,tail ,plist) ,key ,val)
+       (declare (ignorable ,key ,val))
        (loop (when (null ,tail) (return nil))
              (setq ,key (pop ,tail))
              (when (null ,tail)
@@ -435,6 +468,7 @@ NOTE: This interface is experimental and subject to change."
 
 ;; Make a new hash-cache and optionally create the statistics vector.
 (defun alloc-hash-cache (size symbol)
+  (declare (type index size))
   (let (cache)
     ;; It took me a while to figure out why infinite recursion could occur
     ;; in VALUES-SPECIFIER-TYPE. It's because SET calls VALUES-SPECIFIER-TYPE.
@@ -1039,6 +1073,12 @@ NOTE: This interface is experimental and subject to change."
 (defun print-type (stream type &optional colon at)
   (print-type-specifier stream (type-specifier type) colon at)))
 
+(defun print-lambda-list (stream lambda-list &optional colon at)
+  (declare (ignore colon at))
+  (let ((sb-pretty:*pprint-quote-with-syntactic-sugar* nil)
+        (*package* *cl-package*))
+    (format stream "~:A" lambda-list)))
+
 
 ;;;; Deprecating stuff
 
@@ -1126,7 +1166,7 @@ NOTE: This interface is experimental and subject to change."
     ((or symbol cons)
      (%check-deprecated-type type-specifier))
     (class
-     (let ((name (class-name type-specifier)))
+     (let ((name (cl:class-name type-specifier)))
        (when (and name (symbolp name)
                   (eq type-specifier (find-class name nil)))
          (%check-deprecated-type name))))))
@@ -1196,7 +1236,7 @@ NOTE: This interface is experimental and subject to change."
 (defun setup-type-in-final-deprecation
     (software version name replacement-spec)
   (declare (ignore software version replacement-spec))
-  (%compiler-deftype name (constant-type-expander name t) nil))
+  (%deftype name (constant-type-expander name t) nil))
 
 ;; Given DECLS as returned by from parse-body, and SYMBOLS to be bound
 ;; (with LET, MULTIPLE-VALUE-BIND, etc) return two sets of declarations:
@@ -1216,7 +1256,9 @@ NOTE: This interface is experimental and subject to change."
                                 ((or (listp id) ; must be a type-specifier
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
-                                                truly-dynamic-extent))
+                                                truly-dynamic-extent
+                                                sb-c::constant-value
+                                                sb-c::no-constraints))
                                      (info :type :kind id))
                                  (cdr decl))))))
            (partition (spec)

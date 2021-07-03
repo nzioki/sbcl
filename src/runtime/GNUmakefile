@@ -22,7 +22,6 @@ SBCL_PAXCTL ?= :
 # Config file. Most of them are same on most systems right now.
 # If you need to override one of these, do it in Config.
 LINKFLAGS += -g
-NM = nm -gp
 DEPEND_FLAGS = -MM
 GREP = grep
 LD = ld
@@ -75,12 +74,12 @@ COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
 	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
 	interr.c interrupt.c largefile.c main.c                         \
 	monitor.c murmur_hash.c os-common.c parse.c print.c             \
-	purify.c pthread-futex.c regnames.c runtime.c			\
-	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
+	purify.c regnames.c runtime.c			                \
+	safepoint.c save.c sc-offset.c search.c thread.c time.c \
 	validate.c var-io.c vars.c wrap.c
 
 ifndef LISP_FEATURE_WIN32
-COMMON_SRC += run-program.c
+COMMON_SRC += run-program.c sprof.c
 endif
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}
@@ -89,13 +88,9 @@ SRCS = $(C_SRC) ${ASSEM_SRC}
 
 OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o)
 
-LIBS = ${OS_LIBS} -lm
+LIBS = ${OS_LIBS} $(LDLIBS) -lm
 
-ifdef LISP_FEATURE_SUNOS # don't bother running 'nm' (or 'gnm')
 targets: $(TARGET) $(OBJTARGET) sbcl.mk
-else
-targets: $(TARGET) $(OBJTARGET) sbcl.nm sbcl.mk
-endif
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
@@ -163,10 +158,6 @@ sbcl.mk: Config
 	  fi ; \
 	  : ) > $@
 
-sbcl.nm: $(TARGET)
-	$(NM) $(TARGET) | $(GREP) -v " [FUw] " > ,$@
-	mv -f ,$@ $@
-
 sbcl.h: $(wildcard genesis/*.h)
 	echo '#include "genesis/config.h"' >sbcl.h
 	echo '#include "genesis/constants.h"' >>sbcl.h
@@ -178,7 +169,7 @@ TAGS tags: $(SRCS) $(HEADERS)
 	@etags $(SRCS) $(HEADERS) || true
 
 clean:
-	-rm -f *.[do] $(TARGET) sbcl.nm sbcl.h core *.tmp $(OS_CLEAN_FILES) libsbcl.a shrinkwrap-sbcl* sbcl.mk
+	-rm -f *.[do] $(TARGET) sbcl.h core *.tmp $(OS_CLEAN_FILES) libsbcl.a shrinkwrap-sbcl* sbcl.mk
 
 %.d: %.c sbcl.h
 	@$(CC) $(DEPEND_FLAGS) $(CPPFLAGS) $< > $@.tmp; \

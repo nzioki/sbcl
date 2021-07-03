@@ -19,6 +19,21 @@
 #include "getallocptr.h"
 #include "genesis/code.h"
 
+lispobj* atomic_bump_static_space_free_ptr(int nbytes)
+{
+    gc_assert((nbytes & LOWTAG_MASK) == 0);
+    lispobj* claimed_ptr = static_space_free_pointer;
+    do {
+        lispobj* new = (lispobj*)((char*)claimed_ptr + nbytes);
+        // Fail if space exhausted or bogusly wrapped around
+        if (new > (lispobj*)STATIC_SPACE_END || new < claimed_ptr) return 0;
+        lispobj* actual_old = __sync_val_compare_and_swap(&static_space_free_pointer,
+                                                          claimed_ptr, new);
+        if (actual_old == claimed_ptr) return claimed_ptr;
+        claimed_ptr = actual_old;
+    } while (1);
+}
+
 // Work space for the deterministic allocation profiler.
 // Only supported on x86-64, but the variables are always referenced
 // to reduce preprocessor conditionalization.
@@ -30,12 +45,16 @@ boolean alloc_profiling;              // enabled flag
 #ifdef LISP_FEATURE_GENCGC
 #ifdef LISP_FEATURE_SB_THREAD
 /* This lock is used to protect non-thread-local allocation. */
-static pthread_mutex_t allocation_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef LISP_FEATURE_WIN32
+CRITICAL_SECTION code_allocator_lock, alloc_profiler_lock;
+#else
+static pthread_mutex_t code_allocator_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t alloc_profiler_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 #endif
 lispobj alloc_code_object (unsigned total_words)
 {
-    struct thread *th = arch_os_get_current_thread();
+    struct thread *th = get_sb_vm_thread();
 #if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
 #  define REQUIRE_GC_INHIBIT 0
 #else
@@ -51,19 +70,27 @@ lispobj alloc_code_object (unsigned total_words)
 
     /* Allocations of code are all serialized. We might also acquire
      * free_pages_lock depending on availability of space in the region */
-    int result = thread_mutex_lock(&allocation_lock);
+    int result = thread_mutex_lock(&code_allocator_lock);
     gc_assert(!result);
     struct code *code = (struct code *)
-      lisp_alloc(&gc_alloc_region[CODE_PAGE_TYPE-1], total_words*N_WORD_BYTES,
-                 CODE_PAGE_TYPE, th);
-    result = thread_mutex_unlock(&allocation_lock);
+      lisp_alloc(&code_region, total_words*N_WORD_BYTES, CODE_PAGE_TYPE, th);
+    result = thread_mutex_unlock(&code_allocator_lock);
     gc_assert(!result);
+    THREAD_JIT(0);
 
     code->header = ((uword_t)total_words << CODE_HEADER_SIZE_SHIFT) | CODE_HEADER_WIDETAG;
     code->boxed_size = 0;
     code->debug_info = 0;
     ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
+    THREAD_JIT(1);
+
     return make_lispobj(code, OTHER_POINTER_LOWTAG);
+}
+void close_code_region() {
+    __attribute__((unused)) int result = thread_mutex_lock(&code_allocator_lock);
+    gc_assert(!result);
+    ensure_region_closed(&code_region, CODE_PAGE_TYPE);
+    thread_mutex_unlock(&code_allocator_lock);
 }
 #endif
 
@@ -83,8 +110,7 @@ void allocation_profiler_start()
     int __attribute__((unused)) ret = thread_mutex_lock(&alloc_profiler_lock);
     gc_assert(ret == 0);
     if (!alloc_profiling && simple_vector_p(alloc_profile_data)) {
-        max_alloc_point_counters =
-            fixnum_value(VECTOR(alloc_profile_data)->length)/2;
+        max_alloc_point_counters = vector_len(VECTOR(alloc_profile_data))/2;
         size_t size = N_WORD_BYTES * max_alloc_point_counters;
         os_vm_address_t old_buffer = 0;
         if (size != profile_buffer_size) {
@@ -142,3 +168,25 @@ void allocation_profiler_stop()
     }
 #endif
 }
+
+#ifdef LISP_FEATURE_METASPACE
+#include "gc-private.h"
+lispobj valid_metaspace_ptr_p(void* addr)
+{
+    struct slab_header* slab = (void*)ALIGN_DOWN((lispobj)addr, METASPACE_SLAB_SIZE);
+    fprintf(stderr, "slab base %p chunk_size %d capacity %d\n", slab, slab->chunksize, slab->capacity);
+    if (!slab->capacity) return 0;
+    lispobj slab_end = (lispobj)slab + METASPACE_SLAB_SIZE;
+    int index = (slab_end - (lispobj)addr) / slab->chunksize;
+    //    for(int i=0; i<slab->capacity; ++i) fprint(stderr, "goober @ %p\n", slab_end - (1+i)*chunksize);
+    //    fprintf(stderr, "index=%d\n", index);
+    if (index < slab->capacity) {
+        lispobj* obj_base = (lispobj*)(slab_end - (index+1)*slab->chunksize);
+        if (widetag_of(obj_base) == INSTANCE_WIDETAG) {
+            fprintf(stderr, "word @ %p is good\n", obj_base);
+            return (lispobj)obj_base;
+        }
+    }
+    return 0;
+}
+#endif

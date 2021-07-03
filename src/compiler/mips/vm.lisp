@@ -11,6 +11,8 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :jmp :lui :addi) #'equalp)
+
 
 ;;;; Registers
 
@@ -291,7 +293,7 @@
      (if (static-symbol-p value)
          immediate-sc-number
          nil))
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     #-sb-xc-host ; There is no such object type in the host

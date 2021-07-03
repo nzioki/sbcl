@@ -203,9 +203,7 @@
   (values))
 
 ;;; Emit code to load a function object implementing FUNCTIONAL into
-;;; RES. This gets interesting when the referenced function is a
-;;; closure: we must make the closure and move the closed-over values
-;;; into it.
+;;; RES.
 ;;;
 ;;; FUNCTIONAL is either a :TOPLEVEL-XEP functional or the XEP lambda
 ;;; for the called function, since local call analysis converts all
@@ -272,63 +270,54 @@
     current-fp
     (find-in-physenv what this-env)))
 
-(defoptimizer (%allocate-closures ltn-annotate) ((leaves) node ltn-policy)
-  (declare (ignore ltn-policy))
-  (when (lvar-dynamic-extent leaves)
-    (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
-      (setf (ir2-lvar-kind info) :delayed)
-      (setf (lvar-info leaves) info)
-      (setf (ir2-lvar-stack-pointer info)
-            (make-stack-pointer-tn)))))
-
-(defoptimizer (%allocate-closures ir2-convert) ((leaves) call 2block)
-  (let ((dx-p (lvar-dynamic-extent leaves)))
+;;; Emit code to create function objects implementing the FUNCTIONALs
+;;; of the enclose node. This gets interesting when the functions are
+;;; mutually referential closures as in LABELS constructs: we must
+;;; make the closures first and move the closed-over values into them
+;;; in such a way that any closed over closures are initialized before
+;;; they are moved into environments. A simple solution: we postpone
+;;; the initialization of the closures until after they have all been
+;;; created, though this may require more registers. TODO: it may be
+;;; possible to improve on this somehow.
+(defun ir2-convert-enclose (node ir2-block)
+  (declare (type enclose node)
+           (type ir2-block ir2-block))
+  (let ((funs (enclose-funs node))
+        (lvar (node-lvar node))) ; non-null when DX
+    (when lvar
+      (vop current-stack-pointer node ir2-block (ir2-lvar-stack-pointer (lvar-info lvar))))
     (collect ((delayed))
-      (when dx-p
-        (vop current-stack-pointer call 2block
-             (ir2-lvar-stack-pointer (lvar-info leaves))))
-      (dolist (leaf (lvar-value leaves))
-        (binding* ((xep (awhen (functional-entry-fun leaf)
-                          ;; if the xep's been deleted then we can skip it
-                          (if (eq (functional-kind it) :deleted)
-                              nil it))
-                        :exit-if-null)
-                   (nil (aver (xep-p xep)))
-                   (entry-info (lambda-info xep) :exit-if-null)
-                   (tn (entry-info-closure-tn entry-info) :exit-if-null)
-                   (closure (physenv-closure (get-lambda-physenv xep)))
-                   #-x86-64
-                   (entry (make-load-time-constant-tn :entry xep)))
-          (let ((this-env (node-physenv call))
-                (leaf-dx-p (and dx-p (leaf-dynamic-extent leaf))))
-            (aver (entry-info-offset entry-info))
-            (vop make-closure call 2block #-x86-64 entry
-                 (entry-info-offset entry-info) (length closure)
-                 leaf-dx-p tn)
-            (loop for what in closure and n from 0 do
-                  (unless (and (lambda-var-p what)
-                               (null (leaf-refs what)))
-                    ;; In LABELS a closure may refer to another closure
-                    ;; in the same group, so we must be sure that we
-                    ;; store a closure only after its creation.
-                    ;;
-                    ;; TODO: Here is a simple solution: we postpone
-                    ;; putting of all closures after all creations
-                    ;; (though it may require more registers).
-                    (if (lambda-p what)
-                      (delayed (list tn (find-in-physenv what this-env) n))
-                      (let ((initial-value (closure-initial-value
-                                            what this-env nil)))
-                        (if initial-value
-                          (vop closure-init call 2block
-                               tn initial-value n)
-                          ;; An initial-value of NIL means to stash
-                          ;; the frame pointer... which requires a
-                          ;; different VOP.
-                          (vop closure-init-from-fp call 2block tn n)))))))))
+      (dolist (fun funs)
+        (let ((xep (functional-entry-fun fun)))
+          ;; If there is no XEP then no closure needs to be created.
+          (when (and xep (not (eq (functional-kind xep) :deleted)))
+            (aver (xep-p xep))
+            (let ((closure (physenv-closure (get-lambda-physenv xep))))
+              (when closure
+                (let* ((entry-info (lambda-info xep))
+                       (tn (entry-info-closure-tn entry-info))
+                       #-x86-64
+                       (entry (make-load-time-constant-tn :entry xep))
+                       (env (node-physenv node))
+                       (leaf-dx-p (and lvar (leaf-dynamic-extent fun))))
+                  (aver (entry-info-offset entry-info))
+                  (vop make-closure node ir2-block #-x86-64 entry
+                                    (entry-info-offset entry-info) (length closure)
+                                    leaf-dx-p tn)
+                  (loop for what in closure and n from 0 do
+                    (unless (and (lambda-var-p what)
+                                 (null (leaf-refs what)))
+                      (if (lambda-p what)
+                          (delayed (list tn (find-in-physenv what env) n))
+                          (let ((initial-value (closure-initial-value what env nil)))
+                            (if initial-value
+                                (vop closure-init node ir2-block tn initial-value n)
+                                ;; An initial-value of NIL means to stash
+                                ;; the frame pointer... which requires a
+                                ;; different VOP.
+                                (vop closure-init-from-fp node ir2-block tn n))))))))))))
       (loop for (tn what n) in (delayed)
-            do (vop closure-init call 2block
-                    tn what n))))
+            do (vop closure-init node ir2-block tn what n))))
   (values))
 
 ;;; Convert a SET node. If the NODE's LVAR is annotated, then we also
@@ -449,7 +438,8 @@
 ;;; IR2-LVAR-LOCS. Otherwise we make a new list padded as necessary by
 ;;; discarded TNs. We always return a TN of the specified type, using
 ;;; the lvar locs only when they are of the correct type.
-(defun lvar-result-tns (lvar types &optional primitive-types)
+(defun lvar-result-tns (lvar types &optional primitive-types
+                                             call)
   (declare (type (or lvar null) lvar)
            (type list primitive-types types))
   (let ((primitive-types (or primitive-types
@@ -466,13 +456,21 @@
                               for prim-type in primitive-types
                               always (eq (tn-primitive-type loc) prim-type)))
                    locs
-                   (loop for prim-type in primitive-types
+                   (loop with optional = (and call
+                                              (vop-info-p (combination-info call))
+                                              (vop-info-optional-results (combination-info call)))
+                         for prim-type in primitive-types
                          for type in types
+                         for i from 0
                          for loc = (pop locs)
-                         collect (if (and loc
-                                          (eq (tn-primitive-type loc) prim-type))
-                                     loc
-                                     (make-normal-tn prim-type type))))))
+                         collect (cond ((and loc
+                                             (eq (tn-primitive-type loc) prim-type))
+                                        loc)
+                                       ((and (not loc)
+                                             (member i optional))
+                                        (make-unused-tn))
+                                       (t
+                                        (make-normal-tn prim-type type)))))))
             (:unknown
              (mapcar #'make-normal-tn primitive-types types))))
         (mapcar #'make-normal-tn primitive-types types))))
@@ -513,6 +511,7 @@
         (ndest (length dest)))
     (mapc (lambda (from to)
             (unless (or (eq from to)
+                        (eq (tn-kind from) :unused)
                         (eq (tn-kind to) :unused))
               (emit-move node block from to)))
           (if (> ndest nsrc)
@@ -590,7 +589,7 @@
                                               (lvar-value bound))
                                              ((and (integer-type-p bound-type)
                                                    (nth-value 1 (integer-type-numeric-bounds bound-type))))
-                                             (sb-xc:array-dimension-limit))))))
+                                             (array-dimension-limit))))))
          (index-type (lvar-type index)))
     (when (eq (type-intersection bound-type index-type)
               *empty-type*)
@@ -713,7 +712,9 @@
                  (return nil))))
         locs
         (lvar-result-tns lvar
-                         (find-template-result-types call rtypes)))))
+                         (find-template-result-types call rtypes)
+                         nil
+                         call))))
 
 ;;; Get the operands into TNs, make TN-REFs for them, and then call
 ;;; the template emit function.
@@ -1245,8 +1246,8 @@
             (warn-if-inline-failed/call fname (node-lexenv node) cell))
           (case *track-full-called-fnames*
             (:detailed
-             (when (boundp 'sb-xc:*compile-file-pathname*)
-               (pushnew sb-xc:*compile-file-pathname* (cdr cell)
+             (when (boundp '*compile-file-pathname*)
+               (pushnew *compile-file-pathname* (cdr cell)
                         :test #'equal)))
             (:very-detailed
              (pushnew (component-name *component-being-compiled*)
@@ -1275,8 +1276,8 @@
       ;; check to see if we know anything about the function
       (let ((info (info :function :info fname)))
         ;; if we know something, check to see if the full call was valid
-        (when (and info (ir1-attributep (fun-info-attributes info)
-                                        always-translatable))
+        (when (and info
+                   (ir1-attributep (fun-info-attributes info) always-translatable))
           (/show (policy node speed) (policy node safety))
           (/show (policy node compilation-speed))
           (bug "full call to ~S" fname))))
@@ -1303,7 +1304,9 @@
 
 ;;;; entering functions
 (defun xep-verify-arg-count (node block fun arg-count-location)
-  (when (policy fun (plusp verify-arg-count))
+  (when (and (policy fun (plusp verify-arg-count))
+             ;; this property will be absent in most cases
+             (getf (functional-plist fun) 'verify-arg-count t))
     (let* ((ef (functional-entry-fun fun))
            (optional (optional-dispatch-p ef))
            (min (and optional
@@ -1350,7 +1353,7 @@
               ;; not all backends have been updated yet.  On backends
               ;; that have not been updated, we still need to use
               ;; XEP-SETUP-SP here.
-              #+(or alpha hppa mips sparc)
+              #+(or mips sparc)
               (vop xep-setup-sp node block)
               (vop copy-more-arg node block (optional-dispatch-max-args ef)
                    #+x86-64 verified))
@@ -1472,7 +1475,7 @@
       (setf (ir2-physenv-environment-start env) lab)
       (vop note-environment-start node block lab)
       #+sb-safepoint
-      (unless (policy fun (>= inhibit-safepoints 2))
+      (when (policy fun (/= insert-safepoints 0))
         (vop sb-vm::insert-safepoint node block))))
 
   (values))
@@ -1733,17 +1736,16 @@ not stack-allocated LVAR ~S." source-lvar)))))
        (loop for loc in (ir2-lvar-locs 2lvar)
              for idx upfrom 0
              unless (eq (tn-kind loc) :unused)
-             do #+(vop-named sb-vm::more-arg-or-nil)
-                (vop sb-vm::more-arg-or-nil node block
-                     (lvar-tn node block context)
-                     (lvar-tn node block count)
-                     idx
-                     loc)
-                #-(vop-named sb-vm::more-arg-or-nil)
-                (vop sb-vm::more-arg node block
-                     (lvar-tn node block context)
-                     (emit-constant idx)
-                     loc)))
+             do (if-vop-existsp (:named sb-vm::more-arg-or-nil)
+                    (vop sb-vm::more-arg-or-nil node block
+                         (lvar-tn node block context)
+                         (lvar-tn node block count)
+                         idx
+                         loc)
+                    (vop sb-vm::more-arg node block
+                         (lvar-tn node block context)
+                         (emit-constant idx)
+                         loc))))
       (:unknown
        (let ((locs (ir2-lvar-locs 2lvar)))
          (vop* %more-arg-values node block
@@ -1787,9 +1789,9 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 (defoptimizer (%special-unbind ir2-convert) ((&rest symbols) node block)
   (declare (ignorable symbols))
-  #-(vop-named sb-c:unbind-n) (vop unbind node block)
-  #+(vop-named sb-c:unbind-n) (vop unbind-n node block
-                                    (mapcar #'lvar-value symbols)))
+  (if-vop-existsp (:named sb-c:unbind-n)
+    (vop unbind-n node block (mapcar #'lvar-value symbols))
+    (vop unbind node block)))
 
 ;;; ### It's not clear that this really belongs in this file, or
 ;;; should really be done this way, but this is the least violation of
@@ -2131,6 +2133,32 @@ not stack-allocated LVAR ~S." source-lvar)))))
     (emit-move node block (lvar-tn node block x) (first results))
     (move-lvar-result node block results lvar)))
 
+(defoptimizer (%compile-time-type-error ir2-convert)
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context))
+  ;; Remove %COMPILE-TIME-TYPE-ERROR bits
+  (setf (node-source-path node)
+        (cdr (node-source-path node)))
+  (%compile-time-type-error-warn node
+                                 (lvar-value atype)
+                                 (lvar-value dtype)
+                                 (lvar-value detail)
+                                 :cast-context (lvar-value cast-context))
+  (ir2-convert-full-call node block))
+
+(defoptimizer (%compile-time-type-style-warn ir2-convert)
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context block))
+  ;; Remove %COMPILE-TIME-TYPE-ERROR bits
+  (setf (node-source-path node)
+        (cddr (node-source-path node)))
+  (%compile-time-type-error-warn node
+                                 (lvar-value atype)
+                                 (lvar-value dtype)
+                                 (lvar-value detail)
+                                 :cast-context (lvar-value cast-context)
+                                 :condition 'type-style-warning))
+
 #-sb-xc-host ;; package-lock-violation-p is not present yet
 (defoptimizer (set ir2-hook) ((symbol value) node block)
   (declare (ignore value block))
@@ -2203,7 +2231,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                              (member (loop-kind (block-loop block))
                                      '(:natural :strange))
                              (eq block (loop-head (block-loop block)))
-                             (policy first-node (< inhibit-safepoints 2)))
+                             (policy first-node (/= insert-safepoints 0)))
                     (vop sb-vm::insert-safepoint first-node 2block))))
             (ir2-convert-block block)
             (incf num))))))
@@ -2313,7 +2341,9 @@ not stack-allocated LVAR ~S." source-lvar)))))
          (when (exit-entry node)
            (ir2-convert-exit node 2block)))
         (entry
-         (ir2-convert-entry node 2block)))))
+         (ir2-convert-entry node 2block))
+        (enclose
+         (ir2-convert-enclose node 2block)))))
 
   (finish-ir2-block block)
 

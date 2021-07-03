@@ -96,6 +96,8 @@
             (:conc-name fd-stream-)
             (:predicate fd-stream-p)
             (:include ansi-stream
+             ;; FIXME: would a type constraint on IN-BUFFER
+             ;; and/or CIN-BUFFER improve anything?
                       (misc #'fd-stream-misc-routine))
             (:copier nil))
 
@@ -462,16 +464,16 @@
 
 (defun file-perror (pathname errno &optional datum &rest arguments)
   (declare (optimize allow-non-returning-tail-call))
-  (multiple-value-bind (condition-type arguments)
-      (typecase datum
-        (format-control
-         (values 'simple-file-error
-                 (list :format-control "~@<~?~@[: ~2I~_~A~]~:>"
-                       :format-arguments (list datum arguments
-                                               (when errno (strerror errno))))))
-        (t
-         (values datum arguments)))
-    (apply #'error condition-type :pathname pathname arguments)))
+  (let ((message (when errno (strerror errno))))
+    (multiple-value-bind (condition-type arguments)
+        (typecase datum
+          (format-control
+           (values 'simple-file-error (list :format-control datum
+                                            :format-arguments arguments)))
+          (t
+           (values datum arguments)))
+      (apply #'error condition-type :pathname pathname :message message
+             arguments))))
 
 (defun c-string-encoding-error (external-format code)
   (declare (optimize allow-non-returning-tail-call))
@@ -964,7 +966,7 @@
 ;;; further assurance than "may" versus "will definitely not".
 (defun sysread-may-block-p (stream)
   #+win32
-  ;; This answers T at EOF on win32, I think.
+  ;; This answers T at EOF on win32.
   (not (sb-win32:handle-listen (fd-stream-fd stream)))
   #-win32
   (not (sb-unix:unix-simple-poll (fd-stream-fd stream) :input 0)))
@@ -1468,6 +1470,7 @@
                        (let* ((byte (aref string start))
                               (bits (char-code byte))
                               (size ,out-size-expr))
+                         (declare (ignorable byte bits))
                          ,out-expr
                          (incf tail size)
                          (setf (buffer-tail obuf) tail)
@@ -1606,7 +1609,7 @@
           (let* ((stream ,name)
                  (size 0) (head 0) (byte 0) (char nil)
                  (decode-break-reason nil)
-                 (length (dotimes (count (1- sb-xc:array-dimension-limit) count)
+                 (length (dotimes (count (1- array-dimension-limit) count)
                            (setf decode-break-reason
                                  (block decode-break-reason
                                    (setf byte (sap-ref-8 sap head)
@@ -1628,7 +1631,7 @@
                             (make-string length :element-type 'character))
                            (t
                             (make-string length :element-type element-type)))))
-            (declare (ignorable stream)
+            (declare (ignorable stream byte)
                      (type index head length) ;; size
                      (type (unsigned-byte 8) byte)
                      (type (or null character) char)
@@ -1942,17 +1945,13 @@
     t))
 
 ;;; Handle miscellaneous operations on FD-STREAM.
-(defun fd-stream-misc-routine (fd-stream operation &optional arg1 arg2)
-  (declare (ignore arg2))
-  (case operation
+(defun fd-stream-misc-routine (fd-stream operation arg1)
+  (stream-misc-case (operation :default nil)
     (:listen
      (labels ((do-listen ()
                 (let ((ibuf (fd-stream-ibuf fd-stream)))
                   (or (not (eql (buffer-head ibuf) (buffer-tail ibuf)))
                       (fd-stream-listen fd-stream)
-                      #+win32
-                      (sb-win32:handle-listen (fd-stream-fd fd-stream))
-                      #-win32
                       ;; If the read can block, LISTEN will certainly return NIL.
                       (if (sysread-may-block-p fd-stream)
                           nil
@@ -2102,10 +2101,8 @@
      (etypecase arg1
        (character (fd-stream-character-size fd-stream arg1))
        (string (fd-stream-string-size fd-stream arg1))))
-    (:file-position
-     (if arg1
-         (fd-stream-set-file-position fd-stream arg1)
-         (fd-stream-get-file-position fd-stream)))))
+    (:get-file-position (fd-stream-get-file-position fd-stream))
+    (:set-file-position (fd-stream-set-file-position fd-stream arg1))))
 
 ;; FIXME: Think about this.
 ;;
@@ -2312,10 +2309,8 @@
          "~@<couldn't rename ~2I~_~S ~I~_to ~2I~_~S~:>" namestring original))))
 
 (defun %open-error (pathname errno if-exists if-does-not-exist)
-  (flet ((signal-it (&optional (condition 'simple-file-error))
-           (file-perror pathname errno condition
-                        :format-control "Error opening ~S"
-                        :format-arguments (list pathname))))
+  (flet ((signal-it (&rest arguments)
+           (apply #'file-perror pathname errno arguments)))
     (restart-case
         (case errno
           (#-win32 #.sb-unix:enoent
@@ -2351,14 +2346,14 @@
                    :report "Reopen with :if-exists :append"
                    '(:new-if-exists :append)))))
           (t
-           (signal-it)))
+           (signal-it "Error opening ~S" pathname)))
       (continue ()
         :report "Retry opening."
         '())
       (use-value (value)
         :report "Try opening a different file."
         :interactive read-evaluated-form
-        (list :filename (the pathname-designator value))))))
+        (list :new-filename (the pathname-designator value))))))
 
 (defun open (filename
              &key
@@ -2396,16 +2391,17 @@
       (declare (type index mask))
       (let* (;; PATHNAME is the pathname we associate with the stream.
              (pathname (merge-pathnames filename))
-             (physical (physicalize-pathname pathname))
-             (truename (probe-file physical))
-             ;; NAMESTRING is the native namestring we open the file with.
-             (namestring (cond (truename
-                                (native-namestring truename :as-file t))
-                               ((or (not input)
-                                    (and input (eq if-does-not-exist :create))
-                                    (and (eq direction :io)
-                                         (not if-does-not-exist-given)))
-                                (native-namestring physical :as-file t)))))
+             (physical (native-namestring (physicalize-pathname pathname) :as-file t))
+             ;; One call to access() is reasonable. 40 calls to lstat() is not.
+             ;; So DO NOT CALL TRUENAME HERE.
+             (existsp (sb-unix:unix-access physical sb-unix:f_ok))
+             ;; Leave NAMESTRING as NIL if nonexistent and not creating a file.
+             (namestring (when (or existsp
+                                   (or (not input)
+                                       (and input (eq if-does-not-exist :create))
+                                       (and (eq direction :io)
+                                            (not if-does-not-exist-given))))
+                           physical)))
         ;; Process if-exists argument if we are doing any output.
         (cond (output
                (unless if-exists-given
@@ -2435,9 +2431,7 @@
                        nil)
                       (t
                        :create))))
-        (cond ((and if-exists-given
-                    truename
-                    (eq if-exists :new-version))
+        (cond ((and existsp if-exists-given (eq if-exists :new-version))
                (sb-kernel::%file-error
                 pathname "OPEN :IF-EXISTS :NEW-VERSION is not supported ~
                           when a new version must be created."))
@@ -2454,7 +2448,7 @@
                 pathname "OPEN :IF-DOES-NOT-EXIST ~s ~
                           :IF-EXISTS ~s will always signal an error."
                 if-does-not-exist if-exists))
-              (truename
+              (existsp
                (if if-exists
                    (sb-kernel::%file-error pathname 'file-exists)
                    (return)))
@@ -2486,15 +2480,16 @@
                               (when (and output (= (logand orig-mode #o170000)
                                                    #o40000))
                                 (file-perror
-                                 pathname
-                                 "can't open ~A for output: is a directory" pathname))
+                                 pathname nil
+                                 "Can't open ~S for output: is a directory"
+                                 pathname))
                               (setf mode (logand orig-mode #o777))
                               t)
                              ((eql err/dev sb-unix:enoent)
                               nil)
                              (t
-                              (file-perror
-                               namestring err/dev "can't find ~S" namestring)))))))
+                              (file-perror namestring err/dev
+                                           "Can't find ~S" namestring)))))))
               (unless (and exists
                            (rename-the-old-one namestring original))
                 (setf original nil)
@@ -2699,7 +2694,10 @@
 ;;;
 ;;; FIXME: misleading name, screwy interface
 (defun file-name (stream &optional new-name)
-  (when (typep stream 'fd-stream)
+  (stream-api-dispatch (stream)
+    :gray (declare (ignore stream))
+    :native
+    (when (typep stream 'fd-stream)
       (cond (new-name
              (setf (fd-stream-pathname stream) new-name)
              (setf (fd-stream-file stream)
@@ -2707,7 +2705,8 @@
                                       :as-file t))
              t)
             (t
-             (fd-stream-pathname stream)))))
+             (fd-stream-pathname stream))))
+    :simple (s-%file-name stream new-name)))
 
 ;; Fix the INPUT-CHAR-POS slot of STREAM after having consumed characters
 ;; from the CIN-BUFFER. This operation is done upon exit from a FAST-READ-CHAR
@@ -2726,17 +2725,14 @@
         (setf (form-tracking-stream-last-newline stream) pos))
       (incf pos))))
 
-(defun tracking-stream-misc (stream operation &optional arg1 arg2)
+(defun tracking-stream-misc (stream operation arg1)
   ;; The :UNREAD operation will never be invoked because STREAM has a buffer,
   ;; so unreading is implemented entirely within ANSI-STREAM-UNREAD-CHAR.
   ;; But we do need to prevent attempts to change the absolute position.
-  (case operation
-    (:file-position
-     (if arg1
-         (simple-stream-perror "~S is not positionable" stream)
-         (fd-stream-get-file-position stream)))
+  (stream-misc-case (operation)
+    (:set-file-position (simple-stream-perror "~S is not positionable" stream))
     (t ; call next method
-     (fd-stream-misc-routine stream operation arg1 arg2))))
+     (fd-stream-misc-routine stream operation arg1))))
 
 (!define-load-time-global *!cold-stderr-buf* " ")
 (declaim (type (simple-base-string 1) *!cold-stderr-buf*))
@@ -2763,8 +2759,8 @@
                      ;; will croak if there is any non-BASE-CHAR in the string
                      (out (replace (make-array n :element-type 'base-char)
                                    string :start2 start) 0 n)))))
-     :misc (lambda (stream operation &optional arg1 arg2)
-             (declare (ignore stream arg1 arg2))
-             (case operation
+     :misc (lambda (stream operation arg1)
+             (declare (ignore stream arg1))
+             (stream-misc-case (operation :default nil)
                (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
                 (if (eql (char *!cold-stderr-buf* 0) #\newline) 0 1)))))))

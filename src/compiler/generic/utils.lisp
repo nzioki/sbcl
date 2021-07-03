@@ -50,13 +50,11 @@
       0))
 
 ;;; the address of the linkage table entry for table index I.
-#+linkage-table
 (defun linkage-table-entry-address (i)
   (ecase linkage-table-growth-direction
     (:up   (+ (* i linkage-table-entry-size) linkage-table-space-start))
     (:down (- linkage-table-space-end (* (1+ i) linkage-table-entry-size)))))
 
-#+linkage-table
 (defun linkage-table-index-from-address (addr)
   (ecase linkage-table-growth-direction
     (:up
@@ -217,8 +215,29 @@
       instance-length-shift
       n-widetag-bits))
 
-(defun compute-object-header (size widetag)
-  (logior (case widetag
-            (#.fdefn-widetag 0)
-            (t (ash (1- size) (length-field-shift widetag))))
-          widetag))
+(defconstant array-rank-byte-pos 16)
+(defconstant array-rank-mask 255)
+;;; Rank is encoded as a (UNSIGNED-BYTE 8) minus one.
+;;; Initialization of simple rank 1 array header words is completely unaffected-
+;;; they store 0 for the rank, which is the correct encoding for 1.
+;;; The encoding 1 means 2, encoding 2 means 3, and so on.
+;;; Decoding is just an addition and bitwise AND.
+(defun encode-array-rank (rank)
+  (declare (type (unsigned-byte 8) rank))
+  (logand (1- rank) array-rank-mask))
+
+(defun compute-object-header (nwords widetag)
+  (let ((array-header-p
+         (or (= widetag simple-array-widetag)
+             (>= widetag complex-base-string-widetag))))
+    (logior (if array-header-p
+                (let ((rank (- nwords array-dimensions-offset)))
+                  (ash (encode-array-rank rank) array-rank-byte-pos))
+                (case widetag
+                  (#.fdefn-widetag 0)
+                  (t (ash (1- nwords) (length-field-shift widetag)))))
+            widetag)))
+
+(defmacro id-bits-offset ()
+  (let ((slot (get-dsd-index layout sb-kernel::id-word0)))
+    (ash (+ sb-vm:instance-slots-offset slot) sb-vm:word-shift)))

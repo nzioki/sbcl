@@ -9,42 +9,56 @@
 ;;; Remove symbols from CL:*FEATURES* that should not be exposed to users.
 (export 'sb-impl::+internal-features+ 'sb-impl)
 (let* ((non-target-features
-        '(;; :SB-AFTER-XC-CORE is essentially an option flag to make-host-2
+        ;;
+        ;; FIXME: I suspect that this list should be changed to its inverse-
+        ;; features that _SHOULD_ go into SB-IMPL:+INTERNAL-FEATURES+ and
+        ;; comments about the reasoning behind each, rather than features to
+        ;; discard and reasons they're not needed. The default assumption should be
+        ;; to drop any build-time feature that lacks a rationale to preserve it.
+        ;;
+        ;; READ-FROM-STRING prevents making references to
+        ;; all these keywords from the source form itself.
+        (read-from-string "
+         (;; :SB-AFTER-XC-CORE is essentially an option flag to make-host-2
           :SB-AFTER-XC-CORE
           ;; CONS-PROFILING sets the initial compiler policy which persists
           ;; into the default baseline policy. It has no relevance post-build
           ;; in as much as policy can be changed later arbitrarily.
           :CONS-PROFILING
+          ;; Used by nothing after compiling 'target-thread.lisp' or 'thread.c'
+          :SB-FUTEX :OS-THREAD-STACK
+          ;; These affect the BREAK instruction emitter, but the C code is able
+          ;; to handle anything, and post-build we don't care which it is.
+          :UD2-BREAKPOINTS :INT4-BREAKPOINTS
           ;; Uses of OS-PROVIDES-DLOPEN and -DLADDR are confined to src/code/foreign.lisp
           :OS-PROVIDES-DLOPEN :OS-PROVIDES-DLADDR
           ;; more-or-less confined to serve-event, except for a test which now
           ;; detects whether COMPUTE-POLLFDS is defined and therefore testable.
           :OS-PROVIDES-POLL
-          ;; The final batch of symbols is strictly for C. The prefix of
-          ;; "LISP_FEATURE_" on the corresponding #define is unfortunate.
-          :GCC-TLS
-          :RESTORE-FS-SEGMENT-REGISTER-FROM-TLS ; only for 'src/runtime/thread.h'
-          :OS-PROVIDES-BLKSIZE-T ; only for 'src/runtime/wrap.h'
-          :OS-PROVIDES-PUTWC)) ; only for 'src/runtime/backtrace.c'
+          ;; The final batch of symbols is strictly for C. The LISP_FEATURE_
+          ;; prefix on the corresponding #define is unfortunate.
+          :GCC-TLS :USE-SYS-MMAP
+          :OS-PROVIDES-BLKSIZE-T)")) ; only for 'src/runtime/wrap.h'
        (public-features
         (cons
          sb-impl::!sbcl-architecture
-         '(:COMMON-LISP :SBCL :ANSI-CL :IEEE-FLOATING-POINT
+         (read-from-string "
+          (:COMMON-LISP :SBCL :ANSI-CL :IEEE-FLOATING-POINT
            :64-BIT ; choice of word size. 32-bit if absent
            :BIG-ENDIAN :LITTLE-ENDIAN ; endianness: pick one and only one
            :BSD :UNIX :LINUX :WIN32 :DARWIN :SUNOS :ANDROID ; OS: pick one or more
-           :FREEBSD :GNU-KFREEBSD :OPENBSD :NETBSD :DRAGONFLY :HAIKU :HPUX
+           :FREEBSD :GNU-KFREEBSD :OPENBSD :NETBSD :DRAGONFLY :HAIKU
            :MACH-O :ELF ; obj file format: pick zero or one
            ;; I would argue that this should not be exposed,
-           ;; but I would also anticipate blowblack from removing it.
+           ;; but I would also anticipate blowback from removing it.
            :CHENEYGC :GENCGC ; GC: pick one and only one
            ;; Can't use s-l-a-d :compression safely without it
            :SB-CORE-COMPRESSION
            ;; Features that are also in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
            ;; and would probably mess up something if made non-public,
            ;; though I don't think they should all be public.
-           :MSAN
-           :SB-SAFEPOINT :SB-SAFEPOINT-STRICTLY
+           :MSAN :UBSAN
+           :SB-SAFEPOINT
            :SB-THREAD :SB-UNICODE
            ;; Things which (I think) at least one person has requested be kept around
            :SB-LDB
@@ -56,7 +70,8 @@
            :PACKAGE-LOCAL-NICKNAMES
            ;; Developer mode features. A release build will never have them,
            ;; hence it makes no difference whether they're public or not.
-           :SB-FLUID :SB-DEVEL)))
+           :METASPACE
+           :SB-FLUID :SB-DEVEL :SB-DEVEL-LOCK-PACKAGES)")))
        (removable-features
         (append non-target-features public-features)))
   (defconstant sb-impl:+internal-features+
@@ -118,9 +133,9 @@
     ;; can't be uninterned if referenced by a defstruct-description.
     ;; So loop over all structure classoids and clobber any
     ;; symbol that should be uninternable.
-    (maphash (lambda (classoid layout)
+    (maphash (lambda (classoid wrapper)
                (when (structure-classoid-p classoid)
-                 (let ((dd (layout-info layout)))
+                 (let ((dd (wrapper-%info wrapper)))
                    (setf (dd-constructors dd)
                          (delete-if (lambda (x)
                                       (and (consp x) (uninternable-p (car x))))
@@ -239,7 +254,10 @@ Please check that all strings which were not recognizable to the compiler
        :all)
       ;; 2. Variables, types, and anything else
       (do-all-symbols (s)
-        (dolist (category '(:variable :type :typed-structure :setf))
+        (let ((expander (sb-int:info :setf :expander s)))
+          (when (typep expander '(cons t (cons string)))
+            (setf (second expander) nil)))
+        (dolist (category '(:variable :type :typed-structure))
           (clear-it (sb-int:info category :documentation s)))
         (clear-it (sb-int:info :random-documentation :stuff s))))
     (when (plusp count)
@@ -308,9 +326,8 @@ Please check that all strings which were not recognizable to the compiler
   ;; Except that symbols which existed at SBCL build time must be.
   (do-all-symbols (symbol)
     (when (sb-kernel:immobile-space-obj-p symbol)
-      (sb-kernel:set-header-data
-           symbol (logior (sb-kernel:get-header-data symbol)
-                          (ash 1 sb-vm::+initial-core-symbol-bit+)))))
+      (sb-kernel:logior-header-bits
+       symbol (ash 1 sb-vm::+initial-core-symbol-bit+))))
 
   ;; A symbol whose INFO slot underwent any kind of manipulation
   ;; such that it now has neither properties nor globaldb info,
@@ -357,8 +374,28 @@ Please check that all strings which were not recognizable to the compiler
   (sb-c::repack-xref :verbose 1))
 (fmakunbound 'sb-c::repack-xref)
 
-(progn
-  (load (merge-pathnames "src/code/shaketree" *load-pathname*))
+(load (merge-pathnames "src/code/shaketree" *load-pathname*))
+(defun asm-inst-p (symbol)
+    ;; Assembler instruction names can't be made external because to do so would
+    ;; conflict with common-lisp symbols. Notable examples are PUSH and POP.
+    ;; So other criteria must pertain to detecting the important symbols.
+    ;; And as we don't need to preserve Lisp macros but do need to retain
+    ;; assembler macro instructions, those merit special consideration.
+    ;; Additionally, a DEFUN may co-exist with an identically named macro
+    ;; instruction. (I'm not happy about it, but that's historical baggage).
+    ;; A macro instruction is recognizable to INST by a naming convention
+    ;; that is unused for anything else by way of being inconvenient to use -
+    ;; a symbol whose print name start with "M:" is a macro instruction.
+    (or (get symbol 'sb-disassem::instructions)
+        (let ((name (string symbol)))
+          (and (> (length name) 2)
+               (string= name "M:" :end1 2)))))
+(let ((counts
+       (mapcar (lambda (x)
+                 (list x
+                       (sb-impl::package-external-symbol-count x)
+                       (sb-impl::package-internal-symbol-count x)))
+               (sort (list-all-packages) #'string< :key 'package-name))))
   (sb-impl::shake-packages
    ;; Development mode: retain all symbols with any system-related properties
    #+sb-devel
@@ -375,27 +412,33 @@ Please check that all strings which were not recognizable to the compiler
            ;; overapproximate what we need for contribs and tests
            (member symbol '(sb-vm::map-referencing-objects
                             sb-vm::map-stack-references
-                            sb-vm::thread-profile-data-slot
-                            sb-vm::thread-alloc-region-slot
-                            sb-vm::primitive-object-size
+                            sb-vm::reconstitute-object
                             ;; need this for defining a vop which
                             ;; tests the x86-64 allocation profiler
                             sb-vm::pseudo-atomic
                             ;; Naughty outside-world code uses these.
-                            #+x86-64 sb-vm::reg-in-size
-                            sb-vm::thread-control-stack-start-slot))
+                            #+x86-64 sb-vm::reg-in-size))
+           (let ((s (string symbol))) (and (search "THREAD-" s) (search "-SLOT" s)))
            (search "-OFFSET" (string symbol))
            (search "-TN" (string symbol))))
       ((#.(find-package "SB-C")
         #.(find-package "SB-ASSEM")
         #.(find-package "SB-DISASSEM")
         #.(find-package "SB-IMPL")
+        #.(find-package "SB-UNIX")
         #.(find-package "SB-PCL")
         #.(find-package "SB-MOP")
         #.(find-package "SB-PRETTY")
         #.(find-package "SB-KERNEL"))
        ;; Assume all and only external symbols must be retained
        (eq accessibility :external))
+      (#.(find-package "SB-THREAD")
+       (or (eq accessibility :external)
+           ;; for some reason a recent change caused the tree-shaker to drop MAKE-SPINLOCK
+           ;; which makes sense. I'm not sure what was rooting the symbol.
+           ;; However the :spinlock-api test in threads.impure asserts that spinlock symbols
+           ;; exist despite being internal symbols.
+           (sb-int:info :function :deprecated symbol)))
       (#.(find-package "SB-FASL")
        ;; Retain +BACKEND-FASL-FILE-IMPLEMENTATION+ and +FASL-FILE-VERSION+
        ;; (and anything else otherwise reachable)
@@ -407,17 +450,34 @@ Please check that all strings which were not recognizable to the compiler
        (member symbol '(sb-bignum:%allocate-bignum
                         sb-bignum:make-small-bignum)))
       (t
-       ;; By default, retain any symbol with any attachments
-       (or (sb-kernel:symbol-info symbol)
-           (and (boundp symbol) (not (keywordp symbol)))))))
+       (if (eq (symbol-package symbol)
+               sb-assem::*backend-instruction-set-package*)
+           (or (eq accessibility :external) (asm-inst-p symbol))
+           ;; By default, retain any symbol with any attachments
+           (or (sb-kernel:symbol-info symbol)
+               (and (boundp symbol) (not (keywordp symbol))))))))
    :verbose nil :print nil)
-  (unintern 'sb-impl::shake-packages 'sb-impl))
-
-;;; Use historical (stupid) behavior for storing pathname namestrings
-;;; in fasls.
-(setq sb-c::*name-context-file-path-selector* 'truename)
+  (unintern 'sb-impl::shake-packages 'sb-impl)
+  (let ((sum-delta-ext 0)
+        (sum-delta-int 0))
+    (format t "~&~26TExternal   |    Internal~%")
+    (dolist (entry counts)
+      (let* ((ext (sb-impl::package-external-symbol-count (car entry)))
+             (int (sb-impl::package-internal-symbol-count (car entry)))
+             (delta-ext (- ext (cadr entry)))
+             (delta-int (- int (caddr entry))))
+        (incf sum-delta-ext delta-ext)
+        (incf sum-delta-int delta-int)
+        (format t "~20a | ~5d (~5@d) | ~5d (~5@d)~%"
+                (package-name (car entry))
+                ext delta-ext int delta-int)))
+    (format t "~28t (~5@d) |       (~5@d) = (~d)~%"
+            sum-delta-ext sum-delta-int
+            (+ sum-delta-ext sum-delta-int))))
 
 ;;; Lock internal packages
+#-(and sb-devel
+       (not sb-devel-lock-packages))
 (dolist (p (list-all-packages))
   (unless (member p (mapcar #'find-package '("KEYWORD" "CL-USER")))
     (sb-ext:lock-package p)))

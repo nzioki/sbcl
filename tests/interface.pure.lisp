@@ -53,6 +53,13 @@
              (length (apropos-list "" "SB-VM" t))
              (length (apropos-list "" "SB-VM")))))
 
+(with-test (:name :apropos-symbol-values)
+  (let ((string
+         (with-output-to-string (*standard-output*)
+           (apropos "*print-"))))
+    (assert (search "=" string))
+    (assert (search "PPRINT-DISPATCH" string))))
+
 ;;; TYPEP, SUBTYPEP, UPGRADED-ARRAY-ELEMENT-TYPE and
 ;;; UPGRADED-COMPLEX-PART-TYPE should be able to deal with NIL as an
 ;;; environment argument
@@ -108,7 +115,8 @@
                   :timeout)))))
 
 ;;; SLEEP should work with large integers as well
-(with-test (:name (sleep :pretty-much-forever))
+(with-test (:name (sleep :pretty-much-forever)
+            :skipped-on (:and :darwin :sb-safepoint)) ; hangs
   (assert (eq :timeout
               (handler-case
                   (sb-ext:with-timeout 1

@@ -36,7 +36,7 @@
   (flet ((proclaim-ftype-for-name (kind name type)
            (ecase kind
              (condition
-              (sb-xc:proclaim `(ftype ,(type-specifier type) ,name)))
+              (proclaim `(ftype ,(type-specifier type) ,name)))
              (class
               (when (eq (info :function :where-from name) :assumed)
                 (sb-c:proclaim-ftype name type nil :defined))))))
@@ -88,37 +88,26 @@
       (insured-find-classoid name
                              #'condition-classoid-p
                              #'make-condition-classoid)
-    (setf (layout-classoid layout) class)
+    (setf (wrapper-classoid layout) class)
     (setf (classoid-direct-superclasses class)
           (mapcar #'find-classoid direct-supers))
     (cond ((not old-layout)
            (register-layout layout))
           ((not *type-system-initialized*)
-           (setf (layout-classoid old-layout) class)
+           (setf (wrapper-classoid old-layout) class)
            (setq layout old-layout)
-           (unless (eq (classoid-layout class) layout)
+           (unless (eq (classoid-wrapper class) layout)
              (register-layout layout)))
-          ((redefine-layout-warning "current"
+          ((warn-if-altered-layout  "current"
                                     old-layout
                                     "new"
-                                    (layout-length layout)
-                                    (layout-inherits layout)
-                                    (layout-depthoid layout)
-                                    (layout-bitmap layout))
+                                    (wrapper-length layout)
+                                    (wrapper-inherits layout)
+                                    (wrapper-depthoid layout)
+                                    (wrapper-bitmap layout))
            (register-layout layout :invalidate t))
-          ((not (classoid-layout class))
+          ((not (classoid-wrapper class))
            (register-layout layout)))
-
-    ;; This looks totally bogus - it essentially means that the LAYOUT-INFO
-    ;; of a condition is good for nothing, because it describes something
-    ;; that is not the condition class being defined.
-    ;; In addition to which, the INFO for CONDITION itself describes
-    ;; slots which do not exist, viz:
-    ;;  (dd-slots (layout-info (classoid-layout (find-classoid 'condition))))
-    ;; => (#<DEFSTRUCT-SLOT-DESCRIPTION ACTUAL-INITARGS>
-    ;;     #<DEFSTRUCT-SLOT-DESCRIPTION ASSIGNED-SLOTS>)
-    (setf (layout-info layout)
-          (layout-info (classoid-layout (find-classoid 'condition))))
 
     (setf (find-classoid name) class)
 

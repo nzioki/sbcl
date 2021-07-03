@@ -26,8 +26,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -41,9 +39,6 @@
 int
 arch_os_thread_init(struct thread *thread)
 {
-#ifdef LISP_FEATURE_SB_THREAD
-    pthread_setspecific(specials,thread);
-#endif
     return 1;                  /* success */
 }
 

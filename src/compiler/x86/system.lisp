@@ -48,14 +48,33 @@
                                       word-shift)
                                  instance-pointer-lowtag)
                        :base layout)))
-  (define-vop (sb-c::layout-depthoid-gt)
-    (:translate sb-c::layout-depthoid-gt)
+  (define-vop ()
+    (:translate sb-c::layout-depthoid-ge)
     (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:info k)
     (:arg-types * (:constant (unsigned-byte 16)))
-    (:conditional :g)
+    (:conditional :ge)
     (:generator 1 (inst cmp (read-depthoid) (fixnumize k)))))
+
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:info test)
+  (:policy :fast-safe)
+  (:conditional :e)
+  (:generator 1
+    (inst cmp
+          (make-ea :dword
+                   :disp (+ (id-bits-offset)
+                            (ash (- (wrapper-depthoid test) 2) 2)
+                            (- instance-pointer-lowtag))
+                   :base x)
+          (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
+                  (not (sb-c::producing-fasl-file)))
+              (layout-id test)
+              (make-fixup test :layout-id)))))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -68,8 +87,8 @@
                                       :disp (- other-pointer-lowtag)))))
 
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -103,6 +122,19 @@
     (load-type al-tn x (- other-pointer-lowtag))
     (storew eax x 0 other-pointer-lowtag)
     (move res x)))
+
+(define-vop (test-header-bit)
+  (:translate test-header-bit)
+  (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg)))
+  (:arg-types t (:constant t))
+  (:info mask)
+  (:conditional :ne)
+  (:generator 1
+    ;; Assert that the mask is in header-data byte index 0
+    ;; which is byte index 1 of the whole header word.
+    (aver (typep mask '(unsigned-byte 8)))
+    (inst test (make-ea :byte :disp (- 1 other-pointer-lowtag) :base array) mask)))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)

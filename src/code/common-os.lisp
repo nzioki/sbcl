@@ -35,7 +35,7 @@
 (define-load-time-global *core-string* "")
 (define-load-time-global *core-pathname* nil
     "The absolute pathname of the running SBCL core.")
-
+(define-load-time-global *software-version* nil)
 (define-load-time-global *runtime-pathname* nil
     "The absolute pathname of the running SBCL runtime.")
 (define-load-time-global *sbcl-homedir-pathname* nil)
@@ -61,7 +61,10 @@
   (init-var-ignoring-errors
    *posix-argv*
    (loop for i from 0
-         for arg = (sb-alien:deref (sb-alien:extern-alien posix_argv (* sb-alien:c-string)) i)
+         for arg = (sb-alien:deref (sb-alien:extern-alien posix_argv
+                                                          (* (sb-alien:c-string
+                                                              #+win32 :external-format #+win32 :ucs-2)))
+                                   i)
          while arg
          collect arg))
   (/show0 "setting *DEFAULT-PATHNAME-DEFAULTS*")

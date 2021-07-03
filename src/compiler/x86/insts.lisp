@@ -14,7 +14,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(conditional-opcode
+  (import '(conditional-opcode negate-condition
             register-p ; FIXME: rename to GPR-P
             make-ea ea-disp width-bits) "SB-VM")
   ;; Imports from SB-VM into this package
@@ -167,17 +167,19 @@
     (:le . 14) (:ng . 14)
     (:nle . 15) (:g . 15))
   #'equal)
-(defconstant-eqx sb-vm::+condition-name-vec+
+(defconstant-eqx +condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
-(define-arg-type condition-code :printer sb-vm::+condition-name-vec+)
+(define-arg-type condition-code :printer +condition-name-vec+)
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
+(defun negate-condition (name)
+  (aref +condition-name-vec+ (logxor 1 (conditional-opcode name))))
 
 ;;;; disassembler instruction formats
 
@@ -1029,23 +1031,26 @@
   (let ((size (matching-operand-size dst src)))
     (maybe-emit-operand-size-prefix segment size)
     (cond
-     ((integerp src)
-      (cond ((and (not (eq size :byte)) (<= -128 src 127))
+     ((or (integerp src)
+          (and (fixup-p src) (memq (fixup-flavor src) '(:layout-id))))
+      (cond ((and (neq size :byte) (typep src '(signed-byte 8)))
              (emit-byte segment #b10000011)
              (emit-ea segment dst opcode)
              (emit-byte segment src))
-            ((accumulator-p dst)
-             (emit-byte segment
-                        (dpb opcode
-                             (byte 3 3)
-                             (if (eq size :byte)
-                                 #b00000100
-                                 #b00000101)))
-             (emit-imm-operand segment src size))
             (t
-             (emit-byte segment (if (eq size :byte) #b10000000 #b10000001))
-             (emit-ea segment dst opcode)
-             (emit-imm-operand segment src size))))
+             (cond ((accumulator-p dst)
+                    (emit-byte segment
+                               (dpb opcode
+                                    (byte 3 3)
+                                    (if (eq size :byte)
+                                        #b00000100
+                                        #b00000101))))
+                   (t
+                    (emit-byte segment (if (eq size :byte) #b10000000 #b10000001))
+                    (emit-ea segment dst opcode)))
+             (if (fixup-p src)
+                 (emit-absolute-fixup segment src)
+                 (emit-imm-operand segment src size)))))
      ((register-p src)
       (emit-byte segment
                  (dpb opcode
@@ -1631,7 +1636,7 @@
 
 ;;;; conditional byte set
 
-(define-instruction set (segment dst cond)
+(define-instruction set (segment cond dst)
   (:printer cond-set ())
   (:emitter
    (emit-byte segment #b00001111)
@@ -2528,6 +2533,46 @@
                           (loop repeat size
                                 collect (prog1 (ldb (byte 8 0) val)
                                           (setf val (ash val -8))))))))))
+
+;;; This gets called by LOAD to resolve newly positioned objects
+;;; with things (like code instructions) that have to refer to them.
+;;; Return T if and only if the fixup needs to be recorded in %CODE-FIXUPS
+(defun fixup-code-object (code offset value kind flavor)
+  (declare (type index offset))
+  #+sb-xc-host (declare (notinline code-object-size)) ; forward ref
+  (sb-vm::with-code-instructions (sap code)
+    (ecase kind
+      (:absolute
+       (case flavor
+         (:layout-id
+          (setf (signed-sap-ref-32 sap offset) value)
+          nil) ; do not record this
+         (t
+          ;; Word at sap + offset contains a value to be replaced by
+          ;; adding that value to fixup.
+          (let ((final-val (+ value (sap-ref-32 sap offset))))
+            (setf (sap-ref-32 sap offset) final-val)
+            ;; Record absolute fixups that point into CODE itself, with one
+            ;; exception: fixups within the range of unboxed words containing
+            ;; jump tables are automatically adjusted if the code moves.
+            (and (sb-vm::self-referential-code-fixup-p final-val code)
+                 (>= offset (ash (code-jump-table-words code) word-shift)))))))
+      (:relative
+       ;; VALUE is the actual address wanted.
+       ;; Replace word with displacement to get there.
+       (let* ((loc-sap (+ (sap-int sap) offset))
+              ;; Use modular arithmetic so that if the offset
+              ;; doesn't fit into signed-byte-32 it'll wrap around
+              ;; when added to EIP.
+              ;; "-4" is for the number of remaining bytes in the current instruction.
+              ;; The CPU calculates based off the next instruction.
+              (rel-val (ldb (byte 32 0) (- value loc-sap 4))))
+         (declare (type (unsigned-byte 32) loc-sap rel-val))
+         (setf (sap-ref-32 sap offset) rel-val))
+       ;; Record relative fixups pointing outside of this object.
+       (when (eq (sb-vm::containing-memory-space code) :dynamic)
+         (aver (not (sb-vm::self-referential-code-fixup-p value code)))
+         t)))))
 
 ;;; Perform exhaustive analysis here because of the extreme degree
 ;;; of confusion I have about what is allowed to reach the instruction

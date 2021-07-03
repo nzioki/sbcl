@@ -1,21 +1,20 @@
+;;; This comment might make sourceforge stop thinking that the file
+;;; is binary its diff view.
+;;; Or not.
 (("aprof.impure.lisp"
   "src/code/aprof.lisp"
   "src/code/shaketree.lisp")
+ ("avltree.pure.lisp" "tests/bbtree-test-util.lisp")
  ("bit-vector.impure.lisp" "contrib/sb-posix.fasl")
  ("case.pure.lisp" "tests/case-test.lisp")
  ("chill.test.sh"
   "src/cold/chill.lisp"
-  "src/cold/shebang.lisp"
   "package-data-list.lisp-expr")
  ("clos.impure.lisp"
   "contrib/sb-cltl2.fasl"
   "tests/package-ctor-bug.lisp"
   "tests/bug-503095.lisp"
   "tests/bug-503095-2.lisp")
- ("compiler.pure.lisp"
-  "tests/data/wonky1.lisp"
-  "tests/data/wonky2.lisp"
-  "tests/data/wonky3.lisp")
  ("compiler.impure.lisp"
   "tests/bad-mlf-test.lisp"
   "tests/bug204-test.lisp"
@@ -37,6 +36,14 @@
  ("debug.impure.lisp" "tests/bug-414.lisp")
  ("defstruct.impure-cload.lisp" "tests/block-compile-defstruct-test.lisp")
  ("elfcore.test.sh" "src/runtime/shrinkwrap-sbcl")
+ ("exit-hang.impure.lisp" "tests/fcb-threads.so")
+ ("fcb-threads.impure.lisp" "tests/fcb-threads.so")
+ ("filecompile.impure.lisp"
+  "tests/data/wonky1.lisp"
+  "tests/data/wonky2.lisp"
+  "tests/data/wonky3.lisp"
+  "tests/data/wonky4.lisp"
+  "src/code/primordial-extensions.lisp")
  ("init.test.sh"
   "contrib/sb-introspect.fasl"
   "tests/custom-sysinit.lisp"
@@ -46,15 +53,18 @@
   "tests/parallel-fasl-load-test.lisp"
   "tests/data/wonky1.lisp"
   "tests/data/wonky2.lisp"
-  "tests/data/wonky3.lisp")
+  "tests/data/wonky3.lisp"
+  "tests/data/wonky4.lisp")
  ("load.pure.lisp"
   "tests/data/wonky1.lisp")
  ("octets.pure.lisp"
   "tests/data/compile-file-pos.lisp"
   "tests/data/compile-file-pos-utf16be.lisp")
+ ("redblack.pure.lisp" "tests/bbtree-test-util.lisp")
  ("run-program.impure.lisp" "contrib/sb-posix.fasl")
  ("signals.impure.lisp" "contrib/sb-posix.fasl")
  ("stream.impure.lisp" "contrib/sb-posix.fasl")
+ ("sprof.impure.lisp" "../contrib/sb-sprof/test.lisp" "../contrib/sb-sprof/graph.lisp")
  ("threads.impure.lisp"
   "tests/alloca.so"
   "tests/threads-foreign.so")
@@ -83,4 +93,6 @@
   "tests/data/SentenceBreakProperty.txt")
  ("undefined-classoid-bug.test.sh"
   "tests/undefined-classoid-bug-1.lisp"
-  "tests/undefined-classoid-bug-2.lisp"))
+  "tests/undefined-classoid-bug-2.lisp")
+ ("x86-64-codegen.impure.lisp"
+  "tests/typep-golden-data.txt"))

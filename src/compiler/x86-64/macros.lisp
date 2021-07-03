@@ -17,25 +17,8 @@
 ;;; the support for SC-dependent move instructions needed here makes
 ;;; that expand into so large an expression that the resulting code
 ;;; bloat is not justifiable.
-(defun move (dst src)
+(defun move (dst src &optional size)
   "Move SRC into DST unless they are location=."
-  ;; The first case is for backward-compatibility. It's not necessary
-  ;; for any of our code, but it is for code that performs
-  ;;   (MOVE (REG-IN-SIZE blah :dword) (REG-IN-SIZE from :dword))
-  ;; Most of this garbage will go away because eventually I'd like to preserve
-  ;; all seemingly redundant moves, and then eliminate them before emission.
-  ;; This way we can track movement of TNs into the same physical reg in a
-  ;; different SC which will give useful information to a peephole optimizer.
-  (when (and (sb-x86-64-asm::register-p dst)
-             (sb-x86-64-asm::register-p src))
-    (let ((dst (sb-x86-64-asm::reg-id dst))
-          (src (sb-x86-64-asm::reg-id src)))
-      (aver (sb-x86-64-asm::is-gpr-id-p dst))
-      (aver (sb-x86-64-asm::is-gpr-id-p src))
-      (unless (= (sb-x86-64-asm::reg-id-num dst)
-                 (sb-x86-64-asm::reg-id-num src))
-        (inst mov dst src)))
-    (return-from move))
   (unless (location= dst src)
     (sc-case dst
       ((single-reg complex-single-reg)
@@ -61,11 +44,9 @@
        (aver (xmm-tn-p src))
        (inst vmovaps dst src))
       (t
-       (inst mov dst src)))))
-
-(defun 32bit-move (dst src)
-  (unless (location= dst src)
-    (inst mov :dword dst src)))
+       (if size
+           (inst mov size dst src)
+           (inst mov dst src))))))
 
 (defmacro object-slot-ea (ptr slot lowtag)
   `(ea (- (* ,slot n-word-bytes) ,lowtag) ,ptr))
@@ -203,13 +184,17 @@
 
 #+sb-safepoint
 (defun emit-safepoint ()
-  (inst test :byte rax-tn (ea (- nil-value n-word-bytes other-pointer-lowtag
-                                 gc-safepoint-trap-offset))))
+  ;; FIXME: need to get the node and policy to decide not to emit this safepoint.
+  ;; Also, it would be good to emit only the last of consecutive safepoints in
+  ;; straight-line code, e.g. (LIST (LIST X Y) (LIST Z W)) should emit 1 safepoint
+  ;; not 3, even if we consider it 3 separate pointer bumps.
+  ;; (Ideally we'd only do 1 pointer bump, but that's a separate issue)
+  (inst test :byte rax-tn (ea (- static-space-start gc-safepoint-trap-offset))))
 
 (defmacro pseudo-atomic ((&key elide-if) &rest forms)
-  #+sb-safepoint-strictly
+  #+sb-safepoint
   `(progn ,@forms (unless ,elide-if (emit-safepoint)))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   (with-unique-names (label pa-bits-ea)
     `(let ((,label (gen-label))
            (,pa-bits-ea
@@ -224,13 +209,7 @@
          ;; if PAI was set, interrupts were disabled at the same time
          ;; using the process signal mask.
          (inst break pending-interrupt-trap)
-         (emit-label ,label)
-         #+sb-safepoint
-         ;; In this case, when allocation thinks a GC should be done, it
-         ;; does not mark PA as interrupted, but schedules a safepoint
-         ;; trap instead.  Let's take the opportunity to trigger that
-         ;; safepoint right now.
-         (emit-safepoint)))))
+         (emit-label ,label)))))
 
 ;;;; indexed references
 
@@ -263,14 +242,14 @@
        (:result-types ,el-type)
        (:generator 5
          (move rax old-value)
-         (inst cmpxchg
+         (inst cmpxchg :lock
                (ea (- (* (+ (if (sc-is index immediate) (tn-value index) 0) ,offset)
                          n-word-bytes)
                       ,lowtag)
                    object
                    (unless (sc-is index immediate) index)
                    (ash 1 (- word-shift n-fixnum-tag-bits)))
-               new-value :lock)
+               new-value)
          (move value rax)))))
 
 (defmacro define-full-reffer (name type offset lowtag scs el-type &optional translate)
@@ -302,138 +281,81 @@
          (inst mov value (ea (- (* (+ ,offset index) n-word-bytes) ,lowtag)
                              object))))))
 
-(defmacro define-full-reffer+offset (name type offset lowtag scs el-type &optional translate)
+(defmacro define-full-reffer+addend (name type offset lowtag scs el-type &optional translate)
+  (flet ((trap (index-to-encode)
+           (declare (ignorable index-to-encode))
+           #+ubsan
+           ;; It's OK that the cell is read twice when testing for a trap value.
+           ;; The value should only change from trapping to non-trapping, so if we loaded
+           ;; a trap, and then one instruction later the data is valid (due to being
+           ;; stored in another thread), then it's a false positive that is indicative
+           ;; of a race. A false negative (failure to signal on a trap value) can not
+           ;; occur unless unsafely using REPLACE into this vector.
+           (when (memq name '(data-vector-ref-with-offset/simple-vector
+                              data-vector-ref-with-offset/simple-vector-c))
+             `((when (sb-c::policy (sb-c::vop-node vop) (> sb-c::aref-trapping 0))
+                 (inst cmp :byte ea no-tls-value-marker-widetag)
+                 (inst jmp :e (generate-error-code
+                               vop 'uninitialized-element-error object
+                               ,index-to-encode)))))))
   `(progn
      (define-vop (,name)
-       ,@(when translate
-           `((:translate ,translate)))
+       ,@(when translate `((:translate ,translate)))
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg)))
-       (:info offset)
+       (:info addend)
        (:arg-types ,type tagged-num
                    (:constant (constant-displacement other-pointer-lowtag
                                                      n-word-bytes vector-data-offset)))
        (:results (value :scs ,scs))
-       (:result-types ,el-type)
-       (:generator 3                    ; pw was 5
-         (inst mov value (ea (- (* (+ ,offset offset) n-word-bytes) ,lowtag)
-                             object index (ash 1 (- word-shift n-fixnum-tag-bits))))))
-     (define-vop (,(symbolicate name "-C"))
-       ,@(when translate
-           `((:translate ,translate)))
-       (:policy :fast-safe)
-       (:args (object :scs (descriptor-reg)))
-       (:info index offset)
-       (:arg-types ,type
-                   (:constant (load/store-index ,n-word-bytes ,(eval lowtag)
-                                                ,(eval offset)))
-                   (:constant (constant-displacement other-pointer-lowtag
-                                                     n-word-bytes vector-data-offset)))
-       (:results (value :scs ,scs))
-       (:result-types ,el-type)
-       (:generator 2                    ; pw was 5
-         (inst mov value (ea (- (* (+ ,offset index offset) n-word-bytes) ,lowtag)
-                             object))))))
-
-(defmacro define-full-setter (name type offset lowtag scs el-type &optional translate)
-  (let ((want-both-variants
-         (cond ((symbolp name) t)
-               (t
-                (aver (typep name '(cons symbol (cons (eql :no-constant-variant) null))))
-                (setq name (car name))
-                nil))))
-  `(progn
-     (define-vop (,name)
-       ,@(when translate
-           `((:translate ,translate)))
-       (:policy :fast-safe)
-       (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg))
-              (value :scs ,scs :target result))
-       (:arg-types ,type tagged-num ,el-type)
-       (:results (result :scs ,scs))
        (:result-types ,el-type)
        (:vop-var vop)
-       (:generator 4                    ; was 5
-         ,@(if (eq name 'code-header-set)
-               '((inst push value)
-                 ;; the asm routine wants a natural machine integer as the index,
-                 ;; but this macro declares the index arg as 'any-reg', so it has a tag bit,
-                 ;; so we'll push the arg and then shift right as the next instruction.
-                 (inst push index)
-                 (inst shr :qword (ea rsp-tn) n-fixnum-tag-bits)
-                 (inst push object)
-                 (invoke-asm-routine 'call 'code-header-set vop)
-                 (move result value))
-               `((gen-cell-set
-                   (ea (- (* ,offset n-word-bytes) ,lowtag)
-                       object index (ash 1 (- word-shift n-fixnum-tag-bits)))
-                   value result vop
-                   ,(eq name 'set-funcallable-instance-info))))))
-     ,@(when want-both-variants
-         `((define-vop (,(symbolicate name "-C"))
-            ,@(when translate
-                `((:translate ,translate)))
-            (:policy :fast-safe)
-            (:args (object :scs (descriptor-reg))
-                   (value :scs ,scs :target result))
-            (:info index)
-            (:arg-types ,type
-                        (:constant (load/store-index ,n-word-bytes ,(eval lowtag)
-                                                     ,(eval offset)))
-                        ,el-type)
-            (:results (result :scs ,scs))
-            (:result-types ,el-type)
-            (:vop-var vop)
-            (:generator 3                    ; was 5
-              (gen-cell-set
-                   (ea (- (* (+ ,offset index) n-word-bytes) ,lowtag)
-                       object)
-                   value result vop
-                   ,(eq name 'set-funcallable-instance-info)))))))))
-
-(defmacro define-full-setter+offset (name type offset lowtag scs el-type &optional translate)
-  `(progn
-     (define-vop (,name)
-       ,@(when translate
-           `((:translate ,translate)))
-       (:policy :fast-safe)
-       (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg))
-              (value :scs ,scs :target result))
-       (:info offset)
-       (:arg-types ,type tagged-num
-                   (:constant (constant-displacement other-pointer-lowtag
-                                                     n-word-bytes
-                                                     vector-data-offset))
-                   ,el-type)
-       (:results (result :scs ,scs))
-       (:result-types ,el-type)
-       (:generator 4                    ; was 5
-         (gen-cell-set
-                   (ea (- (* (+ ,offset offset) n-word-bytes) ,lowtag)
-                       object index (ash 1 (- word-shift n-fixnum-tag-bits)))
-                   value result)))
+       (:generator 3
+         (let ((ea (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
+                       object index (ash 1 (- word-shift n-fixnum-tag-bits)))))
+           ,@(trap 'index)
+           (inst mov value ea))))
+     ;; This vop is really not ideal to have.  Couldn't we recombine two constants
+     ;; and use a vop that only takes the object and just ONE index?
      (define-vop (,(symbolicate name "-C"))
-       ,@(when translate
-           `((:translate ,translate)))
+       ,@(when translate `((:translate ,translate)))
        (:policy :fast-safe)
-       (:args (object :scs (descriptor-reg))
-              (value :scs ,scs :target result))
-       (:info index offset)
+       (:args (object :scs (descriptor-reg)))
+       (:info index addend)
        (:arg-types ,type
                    (:constant (load/store-index ,n-word-bytes ,(eval lowtag)
                                                 ,(eval offset)))
                    (:constant (constant-displacement other-pointer-lowtag
-                                                     n-word-bytes
-                                                     vector-data-offset))
-                   ,el-type)
-       (:results (result :scs ,scs))
+                                                     n-word-bytes vector-data-offset)))
+       (:results (value :scs ,scs))
        (:result-types ,el-type)
-       (:generator 3                    ; was 5
-         (gen-cell-set
-                   (ea (- (* (+ ,offset index offset) n-word-bytes) ,lowtag)
-                       object)
-                   value result)))))
+       (:vop-var vop)
+       (:generator 2
+         (let ((ea (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag) object)))
+           ,@(trap '(emit-constant (+ index addend)))
+           (inst mov value ea)))))))
 
+;;; used for (SB-BIGNUM:%BIGNUM-SET %SET-FUNCALLABLE-INSTANCE-INFO
+;;;           %SET-ARRAY-DIMENSION %SET-VECTOR-RAW-BITS)
+(defmacro define-full-setter (name type offset lowtag scs el-type translate)
+  `(define-vop (,name)
+       ,@(when translate `((:translate ,translate)))
+       (:policy :fast-safe)
+       (:args (object :scs (descriptor-reg))
+              (index :scs (any-reg immediate))
+              (value :scs ,scs))
+       (:arg-types ,type tagged-num ,el-type)
+       (:vop-var vop)
+       (:generator 4
+         (let ((ea (if (sc-is index immediate)
+                       (ea (- (* (+ ,offset (tn-value index)) n-word-bytes) ,lowtag)
+                           object)
+                       (ea (- (* ,offset n-word-bytes) ,lowtag)
+                           object index (ash 1 (- word-shift n-fixnum-tag-bits))))))
+           ,(if (eq name 'set-funcallable-instance-info)
+                '(pseudo-atomic () ; if immobile space, need to touch a card mark bit
+                  (inst push object)
+                  (invoke-asm-routine 'call 'touch-gc-card vop)
+                  (gen-cell-set ea value))
+                '(gen-cell-set ea value))))))

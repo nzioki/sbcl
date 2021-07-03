@@ -84,7 +84,7 @@
           (or *source-namestring*
               (when source-info
                 (make-file-info-namestring
-                 *compile-file-pathname*
+                 cl:*compile-file-pathname*
                  (get-toplevelish-file-info source-info)))))
          tlf-number
          form-number)
@@ -96,10 +96,10 @@
     (%make-definition-source-location namestring tlf-number form-number)))
 
 (defun make-file-info-namestring (name file-info)
-  (let* ((untruename (file-info-untruename file-info))
-         (dir (and untruename (pathname-directory untruename))))
+  (let* ((pathname (file-info-pathname file-info))
+         (dir (and pathname (pathname-directory pathname))))
     (if (and dir (eq (first dir) :absolute))
-        (namestring untruename)
+        (namestring pathname)
         (if name
             (namestring name)
             nil))))

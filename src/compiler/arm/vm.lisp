@@ -11,6 +11,7 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :layout-id) #'equalp)
 
 ;;;; register specs
 
@@ -229,7 +230,7 @@
   (typecase value
     (null
      null-sc-number)
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol

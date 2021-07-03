@@ -14,6 +14,10 @@
 
 (declaim (special *compiler-error-bailout*))
 
+;;; the lexical environment we are currently converting in
+(defvar *lexenv*)
+(declaim (type lexenv *lexenv*))
+
 ;;; *CURRENT-FORM-NUMBER* is used in FIND-SOURCE-PATHS to compute the
 ;;; form number to associate with a source path. This should be bound
 ;;; to an initial value of 0 before the processing of each truly
@@ -34,10 +38,18 @@
   (when (source-form-has-path-p form)
     (gethash form *source-paths*)))
 
+(defvar *transforming* nil)
+
 (defun ensure-source-path (form)
   (or (get-source-path form)
-      (cons (simplify-source-path-form form)
-            *current-path*)))
+      (if (and *transforming*
+               (not (memq 'transformed *current-path*)))
+          ;; Don't hide all the transformed paths, since we might want
+          ;; to look at the final form for error reporting.
+          (list* (simplify-source-path-form form)
+                 'transformed *current-path*)
+          (cons (simplify-source-path-form form)
+                *current-path*))))
 
 (defun simplify-source-path-form (form)
   (if (consp form)
@@ -55,6 +67,11 @@
   (when (source-form-has-path-p form)
     (setf (gethash form *source-paths*)
           (apply #'list* 'original-source-start *current-form-number* arguments))))
+
+(defun proper-list (form)
+  (if (proper-list-p form)
+      form
+      (compiler-error "~@<~S is not a proper list.~@:>" form)))
 
 ;;; *CURRENT-COMPONENT* is the COMPONENT structure which we link
 ;;; blocks into as we generate them. This just serves to glue the
@@ -92,6 +109,34 @@
 
 ;;;; namespace management utilities
 
+;;; Unpack (INFO :FUNCTION :INLINING-DATA FUN-NAME). If an explicit expansion
+;;; is not stored but FUN-NAME is a structure constructor, reconstitute the
+;;; expansion from the defstruct description. Secondary value is T if the expansion
+;;; was explicit. See SAVE-INLINE-EXPANSION-P for why we care.
+;;; (Essentially, once stored then always stored, lest inconsistency result)
+;;; If we have just a DXABLE-ARGS, or nothing at all, return NIL and NIL.
+;;; If called on a string or anything that is not a function designator,
+;;; return NIL and NIL.
+(declaim (ftype (sfunction (t) (values list boolean))
+                fun-name-inline-expansion))
+(defun fun-name-inline-expansion (fun-name)
+  (multiple-value-bind (answer winp) (info :function :inlining-data fun-name)
+    (typecase answer
+      ;; an INLINING-DATA is a DXABLE-ARGS, so test it first
+      (inlining-data (setq answer (inlining-data-expansion answer)))
+      (dxable-args   (setq answer nil winp nil)))
+    (when (and (not winp) (symbolp fun-name))
+      (let ((info (info :function :source-transform fun-name)))
+        (when (typep info '(cons defstruct-description (eql :constructor)))
+          (let* ((dd (car info)) (spec (assq fun-name (dd-constructors dd))))
+            (aver spec)
+            (setq answer `(lambda ,@(structure-ctor-lambda-parts dd (cdr spec))))))))
+    (values answer winp)))
+(defun fun-name-dx-args (fun-name)
+  (let ((answer (info :function :inlining-data fun-name)))
+    (when (typep answer 'dxable-args)
+      (dxable-args-list answer))))
+
 ;; As with LEXENV-FIND, we assume use of *LEXENV*, but macroexpanders
 ;; receive an explicit environment and should pass it.
 ;; A declaration will trump a proclamation.
@@ -113,7 +158,7 @@
 
 #-sb-devel
 (declaim (start-block find-free-fun find-lexically-apparent-fun
-                      ;; needed by with-fun-name-leaf
+                      ;; needed by ir1-translators
                       find-global-fun))
 
 (defun maybe-defined-here (name where)
@@ -305,11 +350,6 @@
                        (type (type-specifier (info :variable :type name))))
                    `(macro . (the ,type ,expansion))))
                 (:constant
-                 #+sb-xc-host ; check that we never reference host constants
-                 (unless (member name '(nil t)) ; other than these 2
-                   (when (eq (find-symbol (string name) "XC-STRICT-CL")
-                             name)
-                     (error "Using a constant from the host ~s" name)))
                  (find-constant (symbol-value name) name))
                 (t
                  (make-global-var :kind kind
@@ -321,64 +361,79 @@
 ;;; processed with MAKE-LOAD-FORM. We have to be careful, because
 ;;; CONSTANT might be circular. We also check that the constant (and
 ;;; any subparts) are dumpable at all.
-(defun maybe-emit-make-load-forms (constant &optional (name nil namep))
-  (let ((xset (alloc-xset)))
-    (labels ((grovel (value)
-               ;; Unless VALUE is an object which which obviously
-               ;; can't contain other objects
-               (unless (dumpable-leaflike-p value)
-                 (if (xset-member-p value xset)
-                     (return-from grovel nil)
-                     (add-to-xset value xset))
-                 (typecase value
-                   (cons
-                    (grovel (car value))
-                    (grovel (cdr value)))
-                   (simple-vector
-                    (dotimes (i (length value))
-                      (grovel (svref value i))))
-                   ((vector t)
-                    (dotimes (i (length value))
-                      (grovel (aref value i))))
-                   ((simple-array t)
-                    ;; Even though the (ARRAY T) branch does the exact
-                    ;; same thing as this branch we do this separately
-                    ;; so that the compiler can use faster versions of
-                    ;; array-total-size and row-major-aref.
-                    (dotimes (i (array-total-size value))
-                      (grovel (row-major-aref value i))))
-                   ((array t)
-                    (dotimes (i (array-total-size value))
-                      (grovel (row-major-aref value i))))
-                   (instance
-                    ;; In the target SBCL, we can dump any instance, but
-                    ;; in the cross-compilation host, %INSTANCE-FOO
-                    ;; functions don't work on general instances, only on
-                    ;; STRUCTURE!OBJECTs.
-                    ;;
-                    ;; Behold the wonderfully clear sense of this-
-                    ;;  WHEN (EMIT-MAKE-LOAD-FORM VALUE)
-                    ;; meaning "when you're _NOT_ using a custom load-form"
-                    ;;
-                    ;; FIXME: What about funcallable instances with
-                    ;; user-defined MAKE-LOAD-FORM methods?
-                    (when (emit-make-load-form value)
-                      #+sb-xc-host
-                      (aver (eql (layout-bitmap (%instance-layout value))
-                                 sb-kernel:+layout-all-tagged+))
-                      (do-instance-tagged-slot (i value)
-                        (grovel (%instance-ref value i)))))
-                   (t
-                    (compiler-error
-                      "Objects of type ~/sb-impl:print-type-specifier/ ~
-                       can't be dumped into fasl files."
-                     (type-of value)))))))
-      ;; Dump all non-trivial named constants using the name.
-      (if (and namep (not (sb-xc:typep constant '(or symbol character fixnum
-                                                  #+64-bit single-float))))
-          (emit-make-load-form constant name)
-          (grovel constant))))
+(defun maybe-emit-make-load-forms (constant)
+  (declare #-sb-xc-host (inline alloc-xset))
+  (dx-let ((xset (alloc-xset)))
+    (named-let grovel ((value constant))
+      ;; Unless VALUE is an object which which can't contain other objects,
+      ;; or was visited, or is acccessible in a named constant ...
+      (unless (or (dumpable-leaflike-p value)
+                  (xset-member-p value xset)
+                  (gethash value (eql-constants *ir1-namespace*)))
+        (add-to-xset value xset)
+        ;; FIXME: shouldn't this be something like SB-XC:TYPECASE ?
+        (typecase value
+          (cons
+           (grovel (car value))
+           (grovel (cdr value)))
+          (simple-vector
+           (dotimes (i (length value))
+             (grovel (svref value i))))
+          ((vector t)
+           (dotimes (i (length value))
+             (grovel (aref value i))))
+          ((simple-array t)
+           ;; Even though the (ARRAY T) branch does the exact
+           ;; same thing as this branch we do this separately
+           ;; so that the compiler can use faster versions of
+           ;; array-total-size and row-major-aref.
+           (dotimes (i (array-total-size value))
+             (grovel (row-major-aref value i))))
+          ((array t)
+           (dotimes (i (array-total-size value))
+             (grovel (row-major-aref value i))))
+          (instance
+           ;; In the target SBCL, we can dump any instance, but
+           ;; in the cross-compilation host, %INSTANCE-FOO
+           ;; functions don't work on general instances, only on
+           ;; STRUCTURE!OBJECTs.
+           ;;
+           ;; Behold the wonderfully clear sense of this-
+           ;;  WHEN (EMIT-MAKE-LOAD-FORM VALUE)
+           ;; meaning "when you're _NOT_ using a custom load-form"
+           ;;
+           ;; FIXME: What about funcallable instances with
+           ;; user-defined MAKE-LOAD-FORM methods?
+           (when (emit-make-load-form value)
+             #+sb-xc-host
+             (aver (eql (wrapper-bitmap (%instance-wrapper value))
+                        sb-kernel:+layout-all-tagged+))
+             (do-instance-tagged-slot (i value)
+               (grovel (%instance-ref value i)))))
+          (t
+           (compiler-error
+            "Objects of type ~/sb-impl:print-type-specifier/ can't be dumped into fasl files."
+            (type-of value)))))))
   (values))
+
+;;; A constant is trivially externalizable if it involves no INSTANCE types
+;;; or any un-dumpable object.
+(defun trivially-externalizable-p (constant)
+  (declare #-sb-xc-host (inline alloc-xset))
+  (dx-let ((xset (alloc-xset)))
+    (named-let ok ((value constant))
+      (if (or (dumpable-leaflike-p value) (xset-member-p value xset))
+          t
+          (progn
+            (add-to-xset value xset)
+            (typecase value
+             (cons (and (ok (car value)) (ok (cdr value))))
+             (vector
+              (dotimes (i (length value) t)
+                (unless (ok (aref value i)) (return nil))))
+             (array
+              (dotimes (i (array-total-size value) t)
+                (unless (ok (row-major-aref value i)) (return nil))))))))))
 
 ;;;; some flow-graph hacking utilities
 
@@ -394,7 +449,7 @@
 ;;; determine what is evaluated next. If the ctran has no block, then
 ;;; we make it be in the block that the node is in. If the ctran heads
 ;;; its block, we end our block and link it to that block.
-#-sb-fluid (declaim (inline use-ctran))
+(declaim (inline use-ctran))
 (defun use-ctran (node ctran)
   (declare (type node node) (type ctran ctran))
   (if (eq (ctran-kind ctran) :unused)
@@ -423,16 +478,6 @@
 (defun insert-node-before (old new)
   (let ((prev (node-prev old))
         (temp (make-ctran)))
-    (ensure-block-start prev)
-    (setf (ctran-next prev) nil)
-    (link-node-to-previous-ctran new prev)
-    (use-ctran new temp)
-    (link-node-to-previous-ctran old temp))
-  (values))
-
-(defun insert-node-before-no-split (old new)
-  (let ((prev (node-prev old))
-        (temp (make-ctran)))
     (setf (ctran-next prev) nil)
     (link-node-to-previous-ctran new prev)
     (use-ctran new temp)
@@ -456,7 +501,7 @@
            (setf (lvar-uses lvar) (list node (lvar-uses lvar)))))
     (reoptimize-lvar lvar)))
 
-#-sb-fluid(declaim (inline use-continuation))
+(declaim (inline use-continuation))
 (defun use-continuation (node ctran lvar)
   (use-ctran node ctran)
   (use-lvar node lvar))
@@ -593,8 +638,6 @@
                       (reference-leaf start next result form))
                      (t
                       (reference-constant start next result form))))
-              ((not (proper-list-p form))
-               (compiler-error "~@<~S is not a proper list.~@:>" form))
               (t
                (ir1-convert-functoid start next result form)))))
     (values))
@@ -649,6 +692,11 @@
                      (maybe-reanalyze-functional leaf))
                    leaf))
          (ref (make-ref leaf name)))
+    (when (and result
+               (lambda-var-p leaf)
+               (lambda-var-constant leaf))
+      (push (make-lvar-lambda-var-annotation :lambda-var leaf)
+            (lvar-annotations result)))
     (push ref (leaf-refs leaf))
     (when (and (functional-p leaf)
                (functional-ignore leaf))
@@ -721,17 +769,17 @@
   (flet ((legal-cm-name-p (name)
            (and (legal-fun-name-p name)
                 (or (not (symbolp name))
-                    (not (sb-xc:macro-function name *lexenv*))))))
+                    (not (macro-function name *lexenv*))))))
     (if (eq opname 'funcall)
         (let ((fun-form (cadr form)))
           (cond ((and (consp fun-form) (eq 'function (car fun-form))
                       (not (cddr fun-form)))
                  (let ((real-fun (cadr fun-form)))
                    (if (legal-cm-name-p real-fun)
-                       (values (sb-xc:compiler-macro-function real-fun *lexenv*)
+                       (values (compiler-macro-function real-fun *lexenv*)
                                real-fun)
                        (values nil nil))))
-                ((sb-xc:constantp fun-form *lexenv*)
+                ((constantp fun-form *lexenv*)
                  (let ((fun (constant-form-value fun-form *lexenv*)))
                    (if (legal-cm-name-p fun)
                        ;; CLHS tells us that local functions must shadow
@@ -743,12 +791,12 @@
                        ;; a list (function name)", that means that
                        ;; (funcall 'name) that gets here doesn't fit the
                        ;; definition.
-                       (values (sb-xc:compiler-macro-function fun nil) fun)
+                       (values (compiler-macro-function fun nil) fun)
                        (values nil nil))))
                 (t
                  (values nil nil))))
         (if (legal-fun-name-p opname)
-            (values (sb-xc:compiler-macro-function opname *lexenv*) opname)
+            (values (compiler-macro-function opname *lexenv*) opname)
             (values nil nil)))))
 
 ;;; If FORM has a usable compiler macro, use it; otherwise return FORM itself.
@@ -778,7 +826,7 @@
   (let* ((op (car form))
          (translator (and (symbolp op) (info :function :ir1-convert op))))
     (if translator
-        (funcall translator start next result form)
+        (funcall translator start next result (proper-list form))
         (multiple-value-bind (res cmacro-fun-name)
                (expand-compiler-macro form)
              (cond ((eq res form)
@@ -936,30 +984,13 @@
             ;; If this source path has already been instrumented in
             ;; this block, don't instrument it again.
             start
-            (let ((store
-                   ;; Get an interned record cons for the path. A cons
-                   ;; with the same object identity must be used for
-                   ;; each instrument for the same block.
-                   (ensure-gethash path (code-coverage-records metadata)
-                                   (cons path +code-coverage-unmarked+)))
-                  (next (make-ctran))
+            (let ((next (make-ctran))
                   (*allow-instrumenting* nil))
-              #+(or x86-64 x86) (declare (ignore store)) ; eval'd for side-effect only
+              (ensure-gethash path (code-coverage-records metadata)
+                              (cons path +code-coverage-unmarked+))
               (push (ctran-block start)
                     (gethash path (code-coverage-blocks metadata)))
-              (ir1-convert start next nil
-                           #+(or x86-64 x86)
-                           `(%primitive mark-covered ',path)
-                           #-(or x86-64 x86)
-                           `(locally
-                                (declare (optimize speed
-                                                   (safety 0)
-                                                   (debug 0)
-                                                   (check-constant-modification 0)))
-                              ;; We're being naughty here, and
-                              ;; modifying constant data. That's ok,
-                              ;; we know what we're doing.
-                              (%rplacd ',store t)))
+              (ir1-convert start next nil `(%primitive mark-covered ',path))
               next)))
       start))
 
@@ -1014,7 +1045,7 @@
     (ir1-convert start ctran fun-lvar `(the (or function symbol) ,fun))
     (let ((combination
            (ir1-convert-combination-args fun-lvar ctran next result
-                                         (cdr form))))
+                                         (cdr (proper-list form)))))
       (when (step-form-p form)
         ;; Store a string representation of the form in the
         ;; combination node. This will let the IR2 translator know
@@ -1060,8 +1091,13 @@
         (setf (combination-args node) (arg-lvars))))
     node))
 
+(defun show-transform-p (showp fun-name)
+  (or (and (listp showp) (member fun-name showp :test 'equal))
+      (eq showp t)))
 (defun show-transform (kind name new-form)
-  (let ((*print-right-margin* 100))
+  (let ((*print-length* 100)
+        (*print-level* 50)
+        (*print-right-margin* 128))
     (format *trace-output* "~&xform (~a) ~S~% -> ~S~%"
             kind name new-form)))
 ;;; Convert a call to a global function. If not NOTINLINE, then we do
@@ -1085,14 +1121,20 @@
                       (struct-fun-transform transform form name))
                 ;; Note that "pass" means fail. Gotta love it.
                 (cond (pass
-                       (ir1-convert-maybe-predicate start next result form var))
+                       (ir1-convert-maybe-predicate start next result
+                                                    (proper-list form)
+                                                    var))
                       (t
                        (unless (policy *lexenv* (zerop store-xref-data))
                          (record-call name (ctran-block start) *current-path*))
-                       (when *show-transforms-p*
+                       (when (show-transform-p *show-transforms-p* name)
                          (show-transform "src" name transformed))
-                       (ir1-convert start next result transformed))))
-              (ir1-convert-maybe-predicate start next result form var))))))
+                       (let ((*transforming* t))
+                         (ir1-convert start next result transformed)))))
+              (ir1-convert-maybe-predicate start next result
+                                           (proper-list form)
+                                           var))))))
+
 
 ;;; KLUDGE: If we insert a synthetic IF for a function with the PREDICATE
 ;;; attribute, don't generate any branch coverage instrumentation for it.
@@ -1315,6 +1357,10 @@
       ;; to be bound... yet nowhere does it say that the special declaration
       ;; removes the constantness. Call it a spec bug and prohibit it. Same
       ;; for GLOBAL variables.
+      (unless (symbolp name)
+        (compiler-error
+         "~S is not a symbol and thus can't be declared special."
+         name))
       (let ((kind (info :variable :kind name)))
         (unless (member kind '(:special :unknown))
           (compiler-error
@@ -1358,6 +1404,15 @@
          (warn "No ~s variable" name))
         (t
          (setf (lambda-var-no-constraints var) t))))))
+
+(defun process-constant-decl (spec vars)
+  (dolist (name (rest spec))
+    (let ((var (find-in-bindings vars name)))
+      (cond
+        ((not var)
+         (warn "No ~s variable" name))
+        (t
+         (setf (lambda-var-constant var) t))))))
 
 ;;; Return a DEFINED-FUN which copies a GLOBAL-VAR but for its INLINEP
 ;;; (and TYPE if notinline), plus type-restrictions from the lexenv.
@@ -1611,6 +1666,9 @@
          :flushable (cdr spec)))
        (no-constraints
         (process-no-constraints-decl spec vars)
+        res)
+       (constant-value
+        (process-constant-decl spec vars)
         res)
        ;; We may want to detect LAMBDA-LIST and VALUES decls here,
        ;; and report them as "Misplaced" rather than "Unrecognized".

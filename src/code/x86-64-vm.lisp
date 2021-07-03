@@ -13,64 +13,7 @@
 (defun machine-type ()
   "Return a string describing the type of the local machine."
   "X86-64")
-
-;;;; :CODE-OBJECT fixups
 
-;;; This gets called by LOAD to resolve newly positioned objects
-;;; with things (like code instructions) that have to refer to them.
-;;; Return KIND  if the fixup needs to be recorded in %CODE-FIXUPS.
-;;; The code object we're fixing up is pinned whenever this is called.
-(defun fixup-code-object (code offset fixup kind flavor)
-  (declare (type index offset) (ignorable flavor))
-  (let* ((sap (code-instructions code))
-         (fixup (+ (if (eq kind :absolute64)
-                       (signed-sap-ref-64 sap offset)
-                       (signed-sap-ref-32 sap offset))
-                   fixup)))
-    (ecase kind
-      (:absolute64
-         ;; Word at sap + offset contains a value to be replaced by
-         ;; adding that value to fixup.
-         (setf (sap-ref-64 sap offset) fixup))
-      (:absolute
-         ;; Word at sap + offset contains a value to be replaced by
-         ;; adding that value to fixup.
-         (setf (sap-ref-32 sap offset) fixup))
-      (:relative
-         ;; Fixup is the actual address wanted.
-         ;; Replace word with value to add to that loc to get there.
-         ;; In the #-immobile-code case, there's nothing to assert.
-         ;; Relative fixups don't exist with movable code.
-         #+immobile-code
-         (unless (immobile-space-obj-p code)
-           (error "Can't compute fixup relative to movable object ~S" code))
-         (setf (signed-sap-ref-32 sap offset)
-               ;; JMP/CALL are relative to the next instruction,
-               ;; so add 4 bytes for the size of the displacement itself.
-               (- fixup (sap-int (sap+ sap (+ offset 4))))))))
-  ;; An absolute fixup is stored in the code header's %FIXUPS slot if it
-  ;; references an immobile-space (but not static-space) object.
-  ;; Note that:
-  ;;  (1) Call fixups occur in both :RELATIVE and :ABSOLUTE kinds.
-  ;;      We can ignore the :RELATIVE kind, except for foreign call,
-  ;;      as those point to the linkage table which has an absolute address
-  ;;      and therefore might change in displacement from the call site
-  ;;      if the immobile code space is relocated on startup.
-  ;;  (2) :STATIC-CALL fixups point to immobile space, not static space.
-  #+immobile-space
-  (return-from fixup-code-object
-    (case flavor
-      ((:named-call :layout :immobile-symbol :symbol-value ; -> fixedobj subspace
-        :assembly-routine :assembly-routine* :static-call) ; -> varyobj subspace
-       (if (eq kind :absolute) :absolute))
-      (:foreign
-       ;; linkage-table calls using the "CALL rel32" format need to be saved,
-       ;; because the linkage table resides at a fixed address.
-       ;; Space defragmentation can handle the fixup automatically,
-       ;; but core relocation can't - it can't find all the call sites.
-       (if (eq kind :relative) :relative))))
-  nil) ; non-immobile-space builds never record code fixups
-
 #+(or darwin linux openbsd win32 sunos (and freebsd x86-64))
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
@@ -173,6 +116,18 @@
            (sb-kernel::decode-internal-error-args (sap+ pc 1) trap-number)))))
 
 
+#+immobile-space
+(defun alloc-immobile-fdefn ()
+  (or #+nil ; Avoid creating new objects in the text segment for now
+      (and (= (alien-funcall (extern-alien "lisp_code_in_elf" (function int))) 1)
+           (alloc-immobile-code (* fdefn-size n-word-bytes)
+                                  (logior (ash undefined-fdefn-header 16)
+                                          fdefn-widetag) ; word 0
+                                  0 other-pointer-lowtag nil)) ; word 1, lowtag, errorp
+      (alloc-immobile-fixedobj fdefn-size
+                               (logior (ash undefined-fdefn-header 16)
+                                       fdefn-widetag)))) ; word 0
+
 #+immobile-code
 (progn
 (defconstant trampoline-entry-offset n-word-bytes)
@@ -194,7 +149,7 @@
       ;; in arch_write_linkage_table_entry() and arch_do_displaced_inst().
       (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
             (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7))) ; disp
-      (let ((i (if (/= (fun-subtype fun) funcallable-instance-widetag)
+      (let ((i (if (/= (%fun-pointer-widetag fun) funcallable-instance-widetag)
                    7
                    (let ((disp8 (- (ash funcallable-instance-function-slot
                                         word-shift)
@@ -214,25 +169,11 @@
 ;;; Return T if FUN can't be called without loading RAX with its descriptor.
 ;;; This is true of any funcallable instance which is not a GF, and closures.
 (defun fun-requires-simplifying-trampoline-p (fun)
-  (let ((kind (fun-subtype fun)))
-    (or (and (eql kind sb-vm:funcallable-instance-widetag)
-             ;; if the FIN has no raw words then it has no internal trampoline
-             (eql (layout-bitmap (%fun-layout fun))
-                  sb-kernel:+layout-all-tagged+))
-        (eql kind sb-vm:closure-widetag))))
-
-(defconstant sb-pcl::+machine-code-embedding-fsc-instance-bitmap+
-  (logxor (1- (ash 1 funcallable-instance-info-offset))
-          (ash 1 (1- funcallable-instance-trampoline-slot))))
-
-;;; This allocator is in its own function because the immobile allocator
-;;; VOPs are impolite (i.e. bad) and trash all registers.
-;;; Since there are no callee-saved registers, this makes it legit'
-;;; to put in a separate function.
-#+immobile-code
-(defun alloc-immobile-funinstance ()
-  (values (%primitive alloc-immobile-fixedobj fun-pointer-lowtag 6 ; kludge
-                      (logior (ash 5 n-widetag-bits) funcallable-instance-widetag))))
+  (case (%fun-pointer-widetag fun)
+    (#.sb-vm:closure-widetag t)
+    (#.sb-vm:funcallable-instance-widetag
+     ;; if the FIN has no raw words then it has no internal trampoline
+     (sb-kernel::bitmap-all-taggedp (%fun-layout fun)))))
 
 ;; TODO: put a trampoline in all fins and allocate them anywhere.
 ;; Revision e7cd2bd40f5b9988 caused some FINs to go in dynamic space
@@ -260,13 +201,15 @@
 ;; self-pointer (trampoline) slot. Scavenging the self-pointer is unnecessary
 ;; though harmless. This intricate and/or obfuscated calculation of #b110
 ;; is insensitive to the index of the trampoline slot, probably.
-#+immobile-code
 (defun make-immobile-funinstance (layout slot-vector)
-  (let ((gf (truly-the funcallable-instance (alloc-immobile-funinstance))))
+  (let ((gf (truly-the funcallable-instance
+             (alloc-immobile-fixedobj 6 ; KLUDGE
+                                      (logior (ash 5 n-widetag-bits)
+                                              funcallable-instance-widetag)))))
     ;; Assert that raw bytes will not cause GC invariant lossage
-    (aver (/= (layout-bitmap layout) +layout-all-tagged+))
+    (aver (not (sb-kernel::bitmap-all-taggedp layout)))
     ;; Set layout prior to writing raw slots
-    (setf (%fun-layout gf) layout)
+    (setf (%fun-wrapper gf) layout)
     ;; just being pedantic - liveness is preserved by the stack reference.
     (with-pinned-objects (gf)
       (let* ((addr (logandc2 (get-lisp-obj-address gf) lowtag-mask))
@@ -278,19 +221,6 @@
               (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
     (%set-funcallable-instance-info gf 0 slot-vector)
     gf))
-
-#+immobile-space
-(defun alloc-immobile-fdefn ()
-  (or #+nil ; Avoid creating new objects in the text segment for now
-      (and (= (alien-funcall (extern-alien "lisp_code_in_elf" (function int))) 1)
-           (allocate-immobile-obj (* fdefn-size n-word-bytes)
-                                  (logior (ash undefined-fdefn-header 16)
-                                          fdefn-widetag) ; word 0
-                                  0 other-pointer-lowtag nil)) ; word 1, lowtag, errorp
-      (values (%primitive alloc-immobile-fixedobj other-pointer-lowtag
-                          fdefn-size
-                          (logior (ash undefined-fdefn-header 16)
-                                  fdefn-widetag))))) ; word 0
 
 (defun fdefn-has-static-callers (fdefn)
   (declare (type fdefn fdefn))
@@ -391,7 +321,7 @@
   #+immobile-code
   (let* ((fdefns-start (+ code-constants-offset
                           (* code-slots-per-simple-fun (code-n-entries code))))
-         (fdefns-count (code-n-named-calls code))
+         (fdefns-count (the index (code-n-named-calls code)))
          (replacements (make-array fdefns-count :initial-element nil))
          (ambiguous (make-array fdefns-count :initial-element 0 :element-type 'bit))
          (any-replacements)
@@ -439,7 +369,7 @@
             (setf (aref replacements fdefn-index) nil))))
       (let ((stored-locs (if any-ambiguous
                              (make-array fdefns-count :initial-element nil))))
-        (sb-thread::with-system-mutex (sb-c::*static-linker-lock*)
+        (with-system-mutex (sb-c::*static-linker-lock*)
           (dolist (fixup fixups)
             (binding* ((fdefn-index (car fixup) :exit-if-null)
                        (offset (cdr fixup))

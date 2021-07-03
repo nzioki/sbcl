@@ -223,19 +223,9 @@
     (load-store-annotation :fields (list (byte 5 21) (byte 16 0))
                            :type 'load-store-annotation))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter jump-printer
-    #'(lambda (value stream dstate)
-        (let ((addr (ash value 2)))
-          (cond (stream
-                 (maybe-note-assembler-routine addr t dstate)
-                 (write addr :base 16 :radix t :stream stream))
-                (t
-                 (operand addr dstate)))))))
-
 (define-instruction-format (jump 32 :default-printer '(:name :tab target))
   (op :field (byte 6 26))
-  (target :field (byte 26 0) :printer jump-printer))
+  (target :field (byte 26 0) :printer #'jump-printer))
 
 (defconstant-eqx reg-printer
   '(:name :tab rd (:unless (:same-as rd) ", " rs) ", " rt)
@@ -1035,41 +1025,6 @@
 
 ;;;; Random system hackery and other noise
 
-(define-instruction-macro entry-point ()
-  nil)
-
-(defmacro break-cases (breaknum &body cases)
-  (let ((bn-temp (gensym)))
-    (collect ((clauses))
-      (dolist (case cases)
-        (clauses `((= ,bn-temp ,(car case)) ,@(cdr case))))
-      `(let ((,bn-temp ,breaknum))
-         (cond ,@(clauses))))))
-
-(defun break-control (chunk inst stream dstate)
-  (declare (ignore inst))
-  (flet ((nt (x) (if stream (note x dstate))))
-    (let ((trap (break-subcode chunk dstate)))
-      (case trap
-        (#.halt-trap
-         (nt "Halt trap"))
-        (#.pending-interrupt-trap
-         (nt "Pending interrupt trap"))
-        (#.breakpoint-trap
-         (nt "Breakpoint trap"))
-        (#.fun-end-breakpoint-trap
-         (nt "Function end breakpoint trap"))
-        (#.after-breakpoint-trap
-         (nt "After breakpoint trap"))
-        (#.single-step-around-trap
-         (nt "Single step around trap"))
-        (#.single-step-before-trap
-         (nt "Single step before trap"))
-        (t
-         (when (or (and (= trap cerror-trap) (progn (nt "cerror trap") t))
-                   (>= trap error-trap))
-           (handle-break-args #'snarf-error-junk trap stream dstate)))))))
-
 (define-instruction break (segment code &optional (subcode 0))
   (:declare (type (unsigned-byte 10) code subcode))
   (:printer break ((op special-op) (funct #b001101))
@@ -1247,12 +1202,21 @@
 
 (define-instruction lw (segment reg base &optional (index 0))
   (:declare (type tn reg base)
-            (type (or (signed-byte 16) fixup) index))
+            (type (or (signed-byte 16) fixup label) index))
   (:printer load-store ((op #b100011)))
   (:dependencies (reads base) (reads :memory) (writes reg))
   (:delay 1)
   (:emitter
-   (emit-load/store-inst segment #b100011 base reg index)))
+   (if (and (label-p index) (eq base sb-vm::code-tn))
+       (emit-back-patch segment 4
+        (lambda (segment posn)
+          (declare (ignore posn))
+          (emit-load/store-inst segment #b100011
+                                base reg
+                                (+ (component-header-length)
+                                   (label-position index)
+                                   (- sb-vm:other-pointer-lowtag)))))
+       (emit-load/store-inst segment #b100011 base reg index))))
 
 ;; next is just for ease of coding double-in-int c-call convention
 (define-instruction lw-odd (segment reg base &optional (index 0))
@@ -1377,3 +1341,83 @@
   (:emitter
    (emit-fp-load/store-inst segment #b111001 reg 1 base index)))
 
+;;; This mechanism is more complicated than minimally necessary for it to do its job.
+;;; Consequently each backend has its own completely screwy way of canonicalizing
+;;; because each one is better than the other.
+;;; CONSTANT is just the &REST list passed to REGISTER-INLINE-CONSTANT which acts as
+;;; a key in an EQUAL table for collapsing multiple references to the same data
+;;; so that we only emit it once (or possibly not even once, if we fuse bytes from
+;;; adjacent constants as suggested by comments in codegen. e.g. an 8-byte constant
+;;; may contain a naturally-aligned 4-byte constant whose bytes match).
+;;; The question is - why doesn't the vop just pass the proper key in the first place?
+(defun canonicalize-inline-constant (constant)
+  constant)
+
+;;; Again this is too complex in the simplest case- you return an assembler label,
+;;; and a cookie to hand to the consumer of the constant, which is {often,always}
+;;; redundant, because the consumer knows what shape the value is - float, octaword, etc.
+;;; The label alone conveys enough data to access the bits stored, however
+;;; in some cases the sorting logic might need a way to determine the storage size.
+(defun inline-constant-value (constant)
+  (declare (ignore constant))
+  (let ((label (gen-label)))
+    (values label label)))
+
+;;; Trivial "sort"
+(defun sort-inline-constants (constants) constants)
+
+;;; This is called once per unboxed constant, to emit its bytes.
+;;; In general the bytes may be literal octets, or a fixup (as here)
+;;; which is in turn emitted with a pseudo-instruction.
+(defun emit-inline-constant (section constant label)
+  (aver (typep constant '(cons (eql :layout-id) (cons t null))))
+  (emit section
+        `(.align 2) ; 2 bits of alignment (just to be pedantic I suppose)
+        label
+        `(.layout-id ,(cadr constant))))
+
+(sb-assem::%def-inst-encoder
+ '.layout-id
+ (lambda (segment layout)
+   (sb-c:note-fixup segment :absolute (sb-c:make-fixup layout :layout-id))
+   (sb-assem::%emit-skip segment 4)))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset))
+  (declare (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  (let ((sap (code-instructions code)))
+    (ecase kind
+      (:absolute
+       (setf (sap-ref-32 sap offset) value))
+      (:jump
+       (aver (zerop (ash value -28)))
+       (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
+             (ash value -2)))
+      (:lui
+       (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
+             (ash (1+ (ash value -15)) -1)))
+      (:addi
+       (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
+             (ldb (byte 16 0) value)))))
+  nil)
+
+(define-instruction store-coverage-mark (segment path-index)
+  ;; Don't need to annotate the dependence on code-tn, I think?
+  (:dependencies (writes :memory))
+  (:delay 0)
+  (:emitter
+   ;; No backpatch is needed to compute the offset into the code header
+   ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   ;;
+   ;; If someone wants to be clever and allow larger offsets from code-tn,
+   ;; feel free to try to improve this, but given that ASSEM-SCHEDULER-P is T
+   ;; for MIPS, I very much suspect that something would go wrong
+   ;; by emitting more than 1 CPU instruction from within an emitter.
+   (let ((offset (+ (component-header-length)
+                    n-word-bytes ; skip over jump table word
+                    path-index
+                    (- other-pointer-lowtag))))
+     (inst* segment 'sb sb-vm::null-tn sb-vm::code-tn
+            (the (unsigned-byte 15) offset)))))

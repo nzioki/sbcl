@@ -204,13 +204,13 @@
   `(flet ((emit (r x y)
             (cond ((typep y '(unsigned-byte 16))
                    (inst ,op r x y))
-                  ((and (typep (ash y -16) '(unsigned-byte 16))
+                  ((and (typep (ash y -16) '(unsigned-byte 16)) ; effectively (unsigned-byte 32)
                         ;; logical AND can't be split into two instructions
                         ,@(if (eq translate 'logand) '((zerop (ldb (byte 16 0) y)))))
                    (inst ,shifted-op r x (ash y -16))
                    (when (ldb-test (byte 16 0) y)
-                     (inst ,op r x (ldb (byte 16 0) y)))) ; not sign-extended
-                  (t
+                     (inst ,op r r (ldb (byte 16 0) y)))) ; not sign-extended
+                  (t ; everything else: just load the constant from memory
                    (inst lr temp-reg-tn y)
                    (inst ,general-op r x temp-reg-tn)))))
      (define-vop (,(symbolicate 'fast- translate '-c/fixnum=>fixnum) fast-fixnum-logop-c)
@@ -834,32 +834,22 @@
 
 ;;;; 64-bit logical operations
 
-(define-vop (shift-towards-someplace)
-  (:policy :fast-safe)
-  (:args (num :scs (unsigned-reg))
-         (amount :scs (signed-reg)))
-  (:arg-types unsigned-num tagged-num)
-  (:temporary (:sc unsigned-reg) temp)
-  (:results (r :scs (unsigned-reg)))
-  (:result-types unsigned-num))
-
-(define-vop (shift-towards-start shift-towards-someplace)
-  (:translate shift-towards-start)
-  (:note "shift-towards-start")
-  (:generator 1
-    (inst andi. temp amount #b111111)
-    (ecase *backend-byte-order*
-      (:big-endian    (inst sld r num temp))
-      (:little-endian (inst srd r num temp)))))
-
-(define-vop (shift-towards-end shift-towards-someplace)
-  (:translate shift-towards-end)
-  (:note "shift-towards-end")
-  (:generator 1
-    (inst andi. temp amount #b111111)
-    (ecase *backend-byte-order*
-      (:big-endian    (inst srd r num temp))
-      (:little-endian (inst sld r num temp)))))
+(macrolet ((define (translate operation)
+             `(define-vop ()
+                (:translate ,translate)
+                (:note ,(string translate))
+                (:policy :fast-safe)
+                (:args (num :scs (unsigned-reg))
+                       (amount :scs (signed-reg)))
+                (:arg-types unsigned-num tagged-num)
+                (:temporary (:sc unsigned-reg) temp)
+                (:results (r :scs (unsigned-reg)))
+                (:result-types unsigned-num)
+                (:generator 1
+                 (inst andi. temp amount #b111111)
+                 (inst ,operation r num temp)))))
+  (define shift-towards-start #+big-endian sld #+little-endian srd)
+  (define shift-towards-end   #+big-endian srd #+little-endian sld))
 
 ;;;; Bignum stuff.
 
@@ -877,15 +867,13 @@
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
-(define-vop (bignum-set word-index-set)
+(define-vop (bignum-set word-index-set-nr)
   (:variant bignum-digits-offset other-pointer-lowtag)
   (:translate sb-bignum:%bignum-set)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg immediate))
          (value :scs (unsigned-reg)))
-  (:arg-types t positive-fixnum unsigned-num)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num))
+  (:arg-types t positive-fixnum unsigned-num))
 
 (define-vop (digit-0-or-plus)
   (:translate sb-bignum:%digit-0-or-plusp)

@@ -20,17 +20,21 @@
 (define-source-transform values (x) `(prog1 ,x))
 
 (deftransform constantly ((value) * * :node node)
-  (let ((lvar (node-lvar node)))
-    (map-all-lvar-dests
-     lvar
-     (lambda (lvar node)
-       (unless (lvar-called-by-node-p lvar node)
-         (give-up-ir1-transform))))
-    `#'(lambda (&rest rest)
-         (declare (ignore rest))
-         value)))
+  (if (constant-lvar-p value)
+      `#'(lambda (&rest rest)
+           (declare (ignore rest))
+           ',(lvar-value value))
+      (let ((lvar (node-lvar node)))
+        ;; Is it destined to a funcall? Then don't create a closure
+        (map-all-lvar-dests
+         lvar
+         (lambda (lvar node)
+           (unless (lvar-called-by-node-p lvar node)
+             (give-up-ir1-transform))))
+        `#'(lambda (&rest rest)
+             (declare (ignore rest))
+             value))))
 
-;;; CONSTANTLY is pretty much never worth transforming, but it's good to get the type.
 (defoptimizer (constantly derive-type) ((value))
   (specifier-type
    `(function (&rest t) (values ,(type-specifier (lvar-type value)) &optional))))
@@ -155,11 +159,7 @@
           ;; Use of &KEY in source xforms doesn't have all the usual semantics.
           ;; It's better to hand-roll it - cf. transforms for WRITE[-TO-STRING].
           (typep rest '(cons (eql :initial-element) (cons t null))))
-      ;; Something fishy here- If THE is removed, OPERAND-RESTRICTION-OK
-      ;; returns NIL because type inference on MAKE-LIST never happens.
-      ;; But the fndb entry for %MAKE-LIST is right, so I'm slightly bewildered.
-      `(%make-list (the (integer 0 (,(1- sb-xc:array-dimension-limit))) ,length)
-                   ,(second rest))
+      `(%make-list ,length ,(second rest))
       (values nil t))) ; give up
 
 (deftransform %make-list ((length item) ((constant-arg (eql 0)) t)) nil)
@@ -240,7 +240,7 @@
        ,n-x)))
 
 (deftransform last ((list &optional n) (t &optional t))
-  (let ((c (constant-lvar-p n)))
+  (let ((c (and n (constant-lvar-p n))))
     (cond ((or (not n)
                (and c (eql 1 (lvar-value n))))
            '(%last1 list))
@@ -340,16 +340,17 @@
   (let ((type (two-arg-derive-type x y
                                    #'logand-derive-type-aux
                                    #'logand)))
-    (multiple-value-bind (typep definitely)
-        (ctypep 0 type)
-      (cond ((and (not typep) definitely)
-             t)
-            ((type= type (specifier-type '(eql 0)))
-             nil)
-            ((neq :default (combination-implementation-style node))
-             (give-up-ir1-transform))
-            (t
-             `(not (zerop (logand x y))))))))
+    (when type
+     (multiple-value-bind (typep definitely)
+         (ctypep 0 type)
+       (cond ((and (not typep) definitely)
+              t)
+             ((type= type (specifier-type '(eql 0)))
+              nil)
+             ((neq :default (combination-implementation-style node))
+              (give-up-ir1-transform))
+             (t
+              `(not (zerop (logand x y)))))))))
 
 (deftransform logbitp ((index integer))
   (let ((integer-type (lvar-type integer))
@@ -472,7 +473,7 @@
 
 (defun safe-double-coercion-p (x)
   (or (typep x 'double-float)
-      (sb-xc:<= sb-xc:most-negative-double-float x sb-xc:most-positive-double-float)))
+      (sb-xc:<= most-negative-double-float x most-positive-double-float)))
 
 (defun safe-single-coercion-p (x)
   (or (typep x 'single-float)
@@ -506,7 +507,7 @@
        #+x86
        (not (typep x `(or (integer * (,most-negative-exactly-single-float-fixnum))
                           (integer (,most-positive-exactly-single-float-fixnum) *))))
-       (sb-xc:<= sb-xc:most-negative-single-float x sb-xc:most-positive-single-float))))
+       (sb-xc:<= most-negative-single-float x most-positive-single-float))))
 
 ;;; Apply a binary operator OP to two bounds X and Y. The result is
 ;;; NIL if either is NIL. Otherwise bound is computed and the result
@@ -586,12 +587,12 @@
        (if (coercion-loses-precision-p (car val) type)
            xbound
            (list xbound))))
-    ((sb-xc:subtypep type 'double-float)
-     (if (sb-xc:<= sb-xc:most-negative-double-float val sb-xc:most-positive-double-float)
+    ((subtypep type 'double-float)
+     (if (sb-xc:<= most-negative-double-float val most-positive-double-float)
          (coerce val type)))
-    ((or (sb-xc:subtypep type 'single-float) (sb-xc:subtypep type 'float))
+    ((or (subtypep type 'single-float) (subtypep type 'float))
      ;; coerce to float returns a single-float
-     (if (sb-xc:<= sb-xc:most-negative-single-float val sb-xc:most-positive-single-float)
+     (if (sb-xc:<= most-negative-single-float val most-positive-single-float)
          (coerce val type)))
     (t (coerce val type))))
 
@@ -603,17 +604,17 @@
               xbound
               (list xbound)))
         (cond
-          ((sb-xc:subtypep type 'double-float)
-           (if (sb-xc:<= sb-xc:most-negative-double-float val sb-xc:most-positive-double-float)
+          ((subtypep type 'double-float)
+           (if (sb-xc:<= most-negative-double-float val most-positive-double-float)
                (coerce val type)
-               (if (sb-xc:< val sb-xc:most-negative-double-float)
-                   sb-xc:most-negative-double-float sb-xc:most-positive-double-float)))
-          ((or (sb-xc:subtypep type 'single-float) (sb-xc:subtypep type 'float))
+               (if (sb-xc:< val most-negative-double-float)
+                   most-negative-double-float most-positive-double-float)))
+          ((or (subtypep type 'single-float) (subtypep type 'float))
            ;; coerce to float returns a single-float
-           (if (sb-xc:<= sb-xc:most-negative-single-float val sb-xc:most-positive-single-float)
+           (if (sb-xc:<= most-negative-single-float val most-positive-single-float)
                (coerce val type)
-               (if (sb-xc:< val sb-xc:most-negative-single-float)
-                   sb-xc:most-negative-single-float sb-xc:most-positive-single-float)))
+               (if (sb-xc:< val most-negative-single-float)
+                   most-negative-single-float most-positive-single-float)))
           (t (coerce val type))))))
 
 ;;; Convert a numeric-type object to an interval object.
@@ -1483,14 +1484,14 @@
   (flet ((ash-outer (n s)
            (when (and (fixnump s)
                       (<= s 64)
-                      (> s sb-xc:most-negative-fixnum))
+                      (> s most-negative-fixnum))
              (ash n s)))
          ;; KLUDGE: The bare 64's here should be related to
          ;; symbolic machine word size values somehow.
 
          (ash-inner (n s)
            (if (and (fixnump s)
-                    (> s sb-xc:most-negative-fixnum))
+                    (> s most-negative-fixnum))
              (ash n (min s 64))
              (if (minusp n) -1 0))))
     (or (and (csubtypep n-type (specifier-type 'integer))
@@ -1632,9 +1633,12 @@
          (number-interval (numeric-type->interval number-type))
          (divisor-interval (numeric-type->interval divisor-type))
          (rem (truncate-rem-bound number-interval divisor-interval)))
-    ;;(declare (type (member '(integer rational float)) rem-type))
-    ;; We have real numbers now.
-    (cond ((eq rem-type 'integer)
+    (cond ((and (numberp (interval-low divisor-interval))
+                (numberp (interval-high divisor-interval))
+                (zerop (interval-low divisor-interval))
+                (zerop (interval-high divisor-interval)))
+           nil)
+          ((eq rem-type 'integer)
            ;; Since the remainder type is INTEGER, both args are
            ;; INTEGERs.
            (specifier-type `(,rem-type ,(or (interval-low rem) '*)
@@ -1688,33 +1692,6 @@
     (when (and quot rem)
       (make-values-type :required (list quot rem)))))
 
-(defun ftruncate-derive-type-quot (number-type divisor-type)
-  ;; The bounds are the same as for truncate. However, the first
-  ;; result is a float of some type. We need to determine what that
-  ;; type is. Basically it's the more contagious of the two types.
-  (let ((q-type (truncate-derive-type-quot number-type divisor-type))
-        (format (numeric-type-format
-                 (numeric-contagion number-type divisor-type))))
-    (make-numeric-type :class 'float
-                       :format format
-                       :low (coerce-for-bound (numeric-type-low q-type) format)
-                       :high (coerce-for-bound (numeric-type-high q-type) format))))
-
-(defun ftruncate-derive-type-quot-aux (n d same-arg)
-  (declare (ignore same-arg))
-  (when (and (numeric-type-real-p n)
-             (numeric-type-real-p d))
-    (ftruncate-derive-type-quot n d)))
-
-(defoptimizer (ftruncate derive-type) ((number divisor))
-  (let ((quot
-         (two-arg-derive-type number divisor
-                              #'ftruncate-derive-type-quot-aux #'ftruncate))
-        (rem (two-arg-derive-type number divisor
-                                  #'truncate-derive-type-rem-aux #'rem)))
-    (when (and quot rem)
-      (make-values-type :required (list quot rem)))))
-
 (defun %unary-truncate-derive-type-aux (number)
   (truncate-derive-type-quot number (specifier-type '(integer 1 1))))
 
@@ -1732,13 +1709,69 @@
   (one-arg-derive-type number
                        #'%unary-truncate-derive-type-aux
                        #'%unary-truncate))
+#-round-float
+(progn
+  (defun ftruncate-derive-type-quot (number-type divisor-type)
+    ;; The bounds are the same as for truncate. However, the first
+    ;; result is a float of some type. We need to determine what that
+    ;; type is. Basically it's the more contagious of the two types.
+    (let ((q-type (truncate-derive-type-quot number-type divisor-type))
+          (format (numeric-type-format
+                   (numeric-contagion number-type divisor-type))))
+      (make-numeric-type :class 'float
+                         :format format
+                         :low (coerce-for-bound (numeric-type-low q-type) format)
+                         :high (coerce-for-bound (numeric-type-high q-type) format))))
 
-(defoptimizer (%unary-ftruncate derive-type) ((number))
-  (let ((divisor (specifier-type '(integer 1 1))))
-    (one-arg-derive-type number
-                         #'(lambda (n)
-                             (ftruncate-derive-type-quot-aux n divisor nil))
-                         #'%unary-ftruncate)))
+  (defun ftruncate-derive-type-quot-aux (n d same-arg)
+    (declare (ignore same-arg))
+    (when (and (numeric-type-real-p n)
+               (numeric-type-real-p d))
+      (ftruncate-derive-type-quot n d)))
+
+
+  (defoptimizer (ftruncate derive-type) ((number divisor))
+    (let ((quot
+            (two-arg-derive-type number divisor
+                                 #'ftruncate-derive-type-quot-aux #'ftruncate))
+          (rem (two-arg-derive-type number divisor
+                                    #'truncate-derive-type-rem-aux #'rem)))
+      (when (and quot rem)
+        (make-values-type :required (list quot rem)))))
+
+
+  (defoptimizer (%unary-ftruncate derive-type) ((number))
+    (let ((divisor (specifier-type '(integer 1 1))))
+      (one-arg-derive-type number
+                           #'(lambda (n)
+                               (ftruncate-derive-type-quot-aux n divisor nil))
+                           #'%unary-ftruncate))))
+
+#+round-float
+(macrolet ((derive (type)
+             `(case (lvar-value mode)
+                ,@(loop for mode in '(:round :floor :ceiling :truncate)
+                        for fun in '(fround ffloor fceiling ftruncate)
+                        collect
+                        `(,mode
+                          (one-arg-derive-type number
+                                               (lambda (type)
+                                                 (when (numeric-type-p type)
+                                                   (let ((lo (numeric-type-low type))
+                                                         (hi (numeric-type-high type)))
+                                                     (specifier-type (list ',type
+                                                                           (if lo
+                                                                               (,fun (type-bound-number lo))
+                                                                               '*)
+                                                                           (if hi
+                                                                               (,fun (type-bound-number hi))
+                                                                               '*))))))
+                                               (lambda (x)
+                                                 (values (,fun x)))))))))
+  (defoptimizer (round-single derive-type) ((number mode))
+    (derive single-float))
+  (defoptimizer (round-double derive-type) ((number mode))
+    (derive double-float)))
 
 (defoptimizer (%unary-round derive-type) ((number))
   (one-arg-derive-type number
@@ -1834,55 +1867,6 @@
 
   (def floor floor-quotient-bound floor-rem-bound)
   (def ceiling ceiling-quotient-bound ceiling-rem-bound))
-
-;;; Define optimizers for FFLOOR and FCEILING
-(macrolet ((def (name q-name r-name)
-             (let ((q-aux (symbolicate "F" q-name "-AUX"))
-                   (r-aux (symbolicate r-name "-AUX")))
-               `(progn
-                  ;; Compute type of quotient (first) result.
-                  (defun ,q-aux (number-type divisor-type)
-                    (let* ((number-interval
-                             (numeric-type->interval number-type))
-                           (divisor-interval
-                             (numeric-type->interval divisor-type))
-                           (quot (,q-name (interval-div number-interval
-                                                        divisor-interval)))
-                           (res-type (numeric-contagion number-type
-                                                        divisor-type))
-                           (format (numeric-type-format res-type)))
-                      (make-numeric-type
-                       :class (numeric-type-class res-type)
-                       :format format
-                       :low  (coerce-for-bound (interval-low quot) format)
-                       :high (coerce-for-bound (interval-high quot) format))))
-
-                  (defoptimizer (,name derive-type) ((number divisor))
-                    (flet ((derive-q (n d same-arg)
-                             (declare (ignore same-arg))
-                             (when (and (numeric-type-real-p n)
-                                        (numeric-type-real-p d))
-                               (,q-aux n d)))
-                           (derive-r (num div same-arg)
-                             (declare (ignore same-arg))
-                             (cond ((not (and (numeric-type-real-p num)
-                                              (numeric-type-real-p div)))
-                                    nil)
-                                   ;; Floats introduce rounding errors
-                                   ((and (memq (numeric-type-class num) '(integer rational))
-                                         (memq (numeric-type-class div) '(integer rational)))
-                                    (,r-aux num div))
-                                   (t
-                                    (numeric-contagion num div)))))
-                      (let ((quot (two-arg-derive-type
-                                   number divisor #'derive-q #',name))
-                            (rem (two-arg-derive-type
-                                  number divisor #'derive-r #'mod)))
-                        (when (and quot rem)
-                          (make-values-type :required (list quot rem))))))))))
-
-  (def ffloor floor-quotient-bound floor-rem-bound)
-  (def fceiling ceiling-quotient-bound ceiling-rem-bound))
 
 ;;; The quotient for floats depends on the divisor,
 ;;; make the result conservative, without letting it cross 0
@@ -2300,7 +2284,7 @@
             `(mod ,base-char-code-limit)))
           (t
            (specifier-type
-            `(mod ,sb-xc:char-code-limit))))))
+            `(mod ,char-code-limit))))))
 
 (defoptimizer (code-char derive-type) ((code))
   (let ((type (lvar-type code)))
@@ -2546,12 +2530,7 @@
 
 ;;; Rightward ASH
 
-;;; Assert correctness of build order. (Need not be exhaustive)
-#-(vop-translates sb-kernel:%ash/right)
-(eval-when (:compile-toplevel) #+x86-64 (error "Expected %ASH/RIGHT vop"))
-
-#+(vop-translates sb-kernel:%ash/right)
-(progn
+(when-vop-existsp (:translate sb-kernel:%ash/right)
   (defun %ash/right (integer amount)
     (ash integer (- amount)))
 
@@ -2690,22 +2669,22 @@
     (give-up-ir1-transform "BOOLE code is not a constant."))
   (let ((control (lvar-value op)))
     (case control
-      (#.sb-xc:boole-clr 0)
-      (#.sb-xc:boole-set -1)
-      (#.sb-xc:boole-1 'x)
-      (#.sb-xc:boole-2 'y)
-      (#.sb-xc:boole-c1 '(lognot x))
-      (#.sb-xc:boole-c2 '(lognot y))
-      (#.sb-xc:boole-and '(logand x y))
-      (#.sb-xc:boole-ior '(logior x y))
-      (#.sb-xc:boole-xor '(logxor x y))
-      (#.sb-xc:boole-eqv '(logeqv x y))
-      (#.sb-xc:boole-nand '(lognand x y))
-      (#.sb-xc:boole-nor '(lognor x y))
-      (#.sb-xc:boole-andc1 '(logandc1 x y))
-      (#.sb-xc:boole-andc2 '(logandc2 x y))
-      (#.sb-xc:boole-orc1 '(logorc1 x y))
-      (#.sb-xc:boole-orc2 '(logorc2 x y))
+      (#.boole-clr 0)
+      (#.boole-set -1)
+      (#.boole-1 'x)
+      (#.boole-2 'y)
+      (#.boole-c1 '(lognot x))
+      (#.boole-c2 '(lognot y))
+      (#.boole-and '(logand x y))
+      (#.boole-ior '(logior x y))
+      (#.boole-xor '(logxor x y))
+      (#.boole-eqv '(logeqv x y))
+      (#.boole-nand '(lognand x y))
+      (#.boole-nor '(lognor x y))
+      (#.boole-andc1 '(logandc1 x y))
+      (#.boole-andc2 '(logandc2 x y))
+      (#.boole-orc1 '(logorc1 x y))
+      (#.boole-orc2 '(logorc2 x y))
       (t
        (abort-ir1-transform "~S is an illegal control arg to BOOLE."
                             control)))))
@@ -2938,13 +2917,96 @@
                `(ash (%multiply-high (logandc2 x ,(1- (ash 1 shift1))) ,m)
                      ,(- (+ shift1 shift2)))))))))
 
-#-(vop-translates sb-kernel:%multiply-high)
-(progn
-;;; Assert correctness of build order. (Need not be exhaustive)
-(eval-when (:compile-toplevel) #+x86-64 (error "Expected %MULTIPLY-HIGH vop"))
-(define-source-transform %multiply-high (x y)
-  `(values (sb-bignum:%multiply ,x ,y)))
-)
+(when-vop-existsp (:translate %signed-multiply-high)
+ (defun %signed-multiply-high (x y)
+   (%signed-multiply-high x y))
+
+ (defun gen-signed-truncate-by-constant-expr (y precision)
+   (declare (type sb-vm:signed-word y)
+            (type fixnum precision))
+   (aver (not (zerop (logand y (1- y)))))
+   (labels ((ld (x)
+              ;; the floor of the binary logarithm of (positive) X
+              (integer-length (1- x)))
+            (choose-multiplier (y precision)
+              (do* ((l (ld y))
+                    (shift l (1- shift))
+                    (expt-2-n+l (expt 2 (+ sb-vm:n-word-bits l)))
+                    (m-low (truncate expt-2-n+l y) (ash m-low -1))
+                    (m-high (truncate (+ expt-2-n+l
+                                         (ash expt-2-n+l (- precision)))
+                                      y)
+                            (ash m-high -1)))
+                   ((not (and (< (ash m-low -1) (ash m-high -1))
+                              (> shift 0)))
+                    (values m-high shift)))))
+     (let ((n (expt 2 sb-vm:n-word-bits))
+           (n-1 (expt 2 (1- sb-vm:n-word-bits))))
+       (multiple-value-bind (m shift) (choose-multiplier (abs y) precision)
+         (let ((code
+                 (cond ((< m n-1)
+                        `(ash (%signed-multiply-high x ,m)
+                                 ,(- shift)))
+                       (t
+                        `(ash (truly-the sb-vm:signed-word
+                                         (+ x (%signed-multiply-high x ,(- m n))))
+                              ,(- shift))))))
+           (if (minusp y)
+               `(- (ash x (- 1 sb-vm:n-word-bits)) ,code)
+               `(- ,code (ash x (- 1 sb-vm:n-word-bits)))))))))
+
+ (deftransform truncate ((x y) (sb-vm:signed-word
+                                (constant-arg sb-vm:signed-word))
+                         *
+                         :policy (and (> speed compilation-speed)
+                                      (> speed space)))
+   "convert integer division to multiplication"
+   (let* ((y      (lvar-value y))
+          (abs-y  (abs y))
+          (x-type (lvar-type x)))
+     (multiple-value-bind (precision max-x)
+         (if (and (numeric-type-p x-type)
+                  (numeric-type-high x-type)
+                  (numeric-type-low x-type))
+             (values (max (integer-length (numeric-type-high x-type))
+                          (integer-length (numeric-type-low x-type)))
+                     (max (numeric-type-high x-type)
+                          (abs (numeric-type-low x-type))))
+             (values (1- sb-vm:n-word-bits)
+                     (expt 2 (1- sb-vm:n-word-bits))))
+         ;; Division by zero, one or powers of two is handled elsewhere.
+         (when (or (zerop (logand y (1- y)))
+                   ;; Leave it for the unsigned transform
+                   (and (plusp y)
+                        (not (types-equal-or-intersect x-type
+                                                       (specifier-type
+                                                        '(and sb-vm:signed-word
+                                                          (not unsigned-byte)))))))
+           (give-up-ir1-transform))
+      `(let* ((quot (truly-the
+                     (integer ,(- (truncate max-x abs-y)) ,(truncate max-x abs-y))
+                     ,(gen-signed-truncate-by-constant-expr y precision)))
+              (rem (truly-the (integer ,(- 1 abs-y) ,(1- abs-y))
+                              (- x (truly-the sb-vm:signed-word (* quot ,y))))))
+         (values quot rem))))))
+
+;;; The paper also has this,
+;;; but it seems to overflow when adding to X
+;; (defun gen-signed-floor-by-constant-expr (y max-x)
+;;   (declare (type sb-vm:signed-word y)
+;;            (type word max-x))
+;;   (let ((trunc (gen-signed-truncate-by-constant-expr y
+;;                                                      max-x)))
+;;     (let ((y-sign (xsign y)))
+;;       `(let* ((x-sign (xsign (logior x (+ x ,y-sign))))
+;;               (x (+ ,y-sign (- x-sign) x)))
+;;          (truly-the sb-vm:signed-word
+;;                     (+ ,trunc
+;;                        (logxor x-sign ,y-sign)))))))
+
+(unless-vop-existsp (:translate %multiply-high)
+                    (define-source-transform %multiply-high (x y)
+                      `(values (sb-bignum:%multiply ,x ,y))))
 
 ;;; If the divisor is constant and both args are positive and fit in a
 ;;; machine word, replace the division by a multiplication and possibly
@@ -2968,10 +3030,12 @@
     ;; Division by zero, one or powers of two is handled elsewhere.
     (when (zerop (logand y (1- y)))
       (give-up-ir1-transform))
-    `(let* ((quot ,(gen-unsigned-div-by-constant-expr y max-x))
-            (rem (ldb (byte #.sb-vm:n-word-bits 0)
-                      (- x (* quot ,y)))))
+    `(let* ((quot (truly-the (integer 0 ,(truncate max-x y))
+                             ,(gen-unsigned-div-by-constant-expr y max-x)))
+            (rem (truly-the (mod ,y)
+                            (- x (* quot ,y)))))
        (values quot rem))))
+
 
 ;;;; arithmetic and logical identity operation elimination
 
@@ -3293,12 +3357,12 @@
       ((same-leaf-ref-p x y) t)
       ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
        nil)
-      #+(vop-translates sb-kernel:%instance-ref-eq)
       ;; Reduce (eq (%instance-ref x i) Y) to 1 instruction
       ;; if possible, but do not defer the memory load unless doing
       ;; so can have no effect, i.e. Y is a constant or provably not
       ;; effectful. For now, just handle constant Y.
-      ((and (constant-lvar-p y)
+      ((and (vop-existsp :translate %instance-ref-eq)
+            (constant-lvar-p y)
             (combination-p use)
             (almost-immediately-used-p x use)
             (eql '%instance-ref (lvar-fun-name (combination-fun use)))
@@ -3347,6 +3411,19 @@
       #+integer-eql-vop
       ((or (csubtypep x-type int-type) (csubtypep y-type int-type))
        '(%eql/integer x y))
+      (t
+       (give-up-ir1-transform)))))
+
+#+integer-eql-vop
+(deftransform %eql/integer ((x y) * * :node node)
+  (let* ((x-type (lvar-type x))
+         (y-type (lvar-type y)))
+    (cond
+      ((same-leaf-ref-p x y) t)
+      ((not (types-equal-or-intersect x-type y-type))
+       nil)
+      ((or (eq-comparable-type-p x-type) (eq-comparable-type-p y-type))
+       '(eq y x))
       (t
        (give-up-ir1-transform)))))
 
@@ -3610,11 +3687,11 @@
                     (csubtypep y-type (specifier-type 'float)))
                (and (csubtypep x-type (specifier-type '(complex float)))
                     (csubtypep y-type (specifier-type '(complex float))))
-               #+(vop-named sb-vm::=/complex-single-float)
-               (and (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
+               (and (vop-existsp :named sb-vm::=/complex-single-float)
+                    (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
                     (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
-               #+(vop-named sb-vm::=/complex-double-float)
-               (and (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
+               (and (vop-existsp :named sb-vm::=/complex-double-float)
+                    (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
                     (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
            ;; They are both floats. Leave as = so that -0.0 is
            ;; handled correctly.
@@ -3751,7 +3828,7 @@
           (t
            (do* ((i (1- nargs) (1- i))
                  (last nil current)
-                 (current (gensym) (gensym))
+                 (current (sb-xc:gensym) (sb-xc:gensym))
                  (vars (list current) (cons current vars))
                  (result t (if not-p
                                `(if (,predicate ,current ,last)
@@ -3975,7 +4052,7 @@
   (source-transform-transitive 'logxor args 0 'integer))
 (define-source-transform logand (&rest args)
   (source-transform-transitive 'logand args -1 'integer))
-#-(or arm arm64 hppa mips x86 x86-64 riscv) ; defined in compiler/target/arith.lisp
+#-(or arm arm64 mips x86 x86-64 riscv) ; defined in compiler/{arch}/arith.lisp
 (define-source-transform logeqv (&rest args)
   (source-transform-transitive 'logeqv args -1 'integer))
 (define-source-transform gcd (&rest args)
@@ -4011,7 +4088,7 @@
                      ((and (typep (abs low)
                                   `(integer 0
                                             ,(min (expt 2 32)
-                                                  sb-xc:most-positive-fixnum)))
+                                                  most-positive-fixnum)))
                            ;; Get some extra points
                            (positive-primep (abs low)))
                       (pushnew (abs low) primes)))
@@ -4091,7 +4168,7 @@
      (case (let ((name (lvar-fun-name (combination-fun thing))))
              (or (modular-version-info name :untagged nil) name))
        ((+ -)
-        (let ((min sb-xc:most-positive-fixnum)
+        (let ((min most-positive-fixnum)
               (itype (specifier-type 'integer)))
           (dolist (arg (combination-args thing) min)
             (if (csubtypep (lvar-type arg) itype)
@@ -4118,7 +4195,7 @@
         0)))
     (integer
      (if (zerop thing)
-         sb-xc:most-positive-fixnum
+         most-positive-fixnum
          (do ((result 0 (1+ result))
               (num thing (ash num -1)))
              ((logbitp 0 num) result))))
@@ -4326,7 +4403,8 @@
 (deftransform %rest-ref ((n list context count &optional length-checked-p))
   (cond ((not (rest-var-more-context-ok list))
          `(nth n list))
-        ((and (constant-lvar-p length-checked-p)
+        ((and length-checked-p
+              (constant-lvar-p length-checked-p)
               (lvar-value length-checked-p))
          `(%more-arg context n))
         (t
@@ -4626,7 +4704,7 @@
                (and car-good cdr-good
                     (values (cons car cdr) t)))))))))
 
-(defoptimizer (coerce derive-type) ((value type) node)
+(defoptimizer (coerce derive-type) ((value type))
   (multiple-value-bind (type constant)
       (if (constant-lvar-p type)
           (values (lvar-value type) t)
@@ -4673,12 +4751,6 @@
               (type-union result-typeoid
                           (type-intersection (lvar-type value)
                                              (specifier-type 'rational))))))
-          ;; At zero safety the deftransform for COERCE can elide dimension
-          ;; checks for the things like (COERCE X '(SIMPLE-VECTOR 5)) -- so we
-          ;; need to simplify the type to drop the dimension information.
-          ((and (policy node (zerop safety))
-                (csubtypep result-typeoid (specifier-type '(array * (*))))
-                (simplify-vector-type result-typeoid)))
           (t
            result-typeoid))))))
 
@@ -4792,7 +4864,7 @@
                        (start-1 (1- ,',start))
                        (current-heap-size (- ,',end ,',start))
                        (keyfun ,keyfun))
-                   (declare (type (integer -1 #.(1- sb-xc:most-positive-fixnum))
+                   (declare (type (integer -1 #.(1- most-positive-fixnum))
                                   start-1))
                    (declare (type index current-heap-size))
                    (declare (type function keyfun))
@@ -4989,7 +5061,8 @@
   `(write-string object stream))
 
 #+sb-thread
-(defoptimizer (sb-thread::call-with-recursive-lock derive-type) ((function mutex waitp timeout))
+(progn
+(defoptimizer (sb-thread::call-with-mutex derive-type) ((function mutex waitp timeout))
   (declare (ignore mutex))
   (let ((type (lvar-fun-type function)))
     (when (fun-type-p type)
@@ -5002,19 +5075,8 @@
                                (values-specifier-type '(values null &optional)))
             (fun-type-returns type))))))
 
-#+sb-thread
-(defoptimizer (sb-thread::call-with-mutex derive-type) ((function mutex value waitp timeout))
-  (declare (ignore mutex value))
-  (let ((type (lvar-fun-type function)))
-    (when (fun-type-p type)
-      (let ((null-p (not (and (constant-lvar-p waitp)
-                              (lvar-value waitp)
-                              (constant-lvar-p timeout)
-                              (null (lvar-value timeout))))))
-        (if null-p
-            (values-type-union (fun-type-returns type)
-                               (values-specifier-type '(values null &optional)))
-            (fun-type-returns type))))))
+(setf (fun-info-derive-type (fun-info-or-lose 'sb-thread::call-with-recursive-lock))
+      (fun-info-derive-type (fun-info-or-lose 'sb-thread::call-with-mutex))))
 
 (deftransform pointerp ((object))
   (let ((type (lvar-type object)))
@@ -5024,3 +5086,10 @@
            't)
           (t
            (give-up-ir1-transform)))))
+
+;;; Normally we don't create fdefns by side-effect of calling FBOUNDP,
+;;; but this transform is neutral in terms of the sum of code and data size.
+;;; So for the cost of an FDEFN that might never store a function, the code
+;;; is smaller by about the size of an fdefn; and it's faster, so do it.
+(deftransform fboundp ((name) ((constant-arg symbol)))
+  `(fdefn-fun (load-time-value (find-or-create-fdefn ',(lvar-value name)) t)))

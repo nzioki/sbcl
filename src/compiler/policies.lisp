@@ -126,6 +126,10 @@ debugger.")
 (define-optimization-quality insert-array-bounds-checks
     (if (= safety 0) 0 3)
   ("no" "yes" "yes" "yes"))
+(define-optimization-quality aref-trapping
+    #-ubsan (if (= safety 3) 3 0) ; equiv. to safety unless expressed otherwise
+    #+ubsan 2 ; default to yes
+  ("no" "yes" "yes" "yes"))
 
 (define-optimization-quality store-xref-data
     (if (= space 3)
@@ -142,10 +146,10 @@ debugger.")
   ("no" "no" "yes" "yes"))
 
 #+sb-safepoint
-(define-optimization-quality inhibit-safepoints
-    0
-  ("no" "no" "yes" "yes")
-  "When disabled, the compiler will insert safepoints at strategic
+(define-optimization-quality insert-safepoints
+    1
+  ("no" "yes" "yes" "yes")
+  "When enabled, the compiler will insert safepoints at strategic
 points (loop edges, function prologues) to ensure that potentially
 long-running code can be interrupted.
 

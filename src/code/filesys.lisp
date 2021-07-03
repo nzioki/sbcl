@@ -266,20 +266,25 @@
                   :newest)))))
 
 
-;;;; Grabbing the kind of file when we have a namestring.
-(defun native-file-kind (namestring)
+;;;; Grabbing the kind of file when we have a native-namestring.
+(defun native-file-kind (namestring &optional resolve-symlinks)
+  #+win32 (declare (ignore resolve-symlinks))
+  #+win32 (nth-value 1 (sb-win32::native-probe-file-name namestring))
+  #-win32
   (multiple-value-bind (existsp errno ino mode)
-      #-win32
-      (sb-unix:unix-lstat namestring)
-      #+win32
-      (sb-unix:unix-stat namestring)
+      ;; Note that when resolve-symlinks is true, we'll return NIL if
+      ;; there are circular and dangling symlinks anywhere in the
+      ;; path. That's different than what our TRUENAME does; this is
+      ;; intended as an efficient internal routine.
+      (if resolve-symlinks
+          (sb-unix:unix-stat namestring)
+          (sb-unix:unix-lstat namestring))
     (declare (ignore errno ino))
     (when existsp
       (let ((ifmt (logand mode sb-unix:s-ifmt)))
        (case ifmt
          (#.sb-unix:s-ifreg :file)
          (#.sb-unix:s-ifdir :directory)
-         #-win32
          (#.sb-unix:s-iflnk :symlink)
          (t :special))))))
 
@@ -360,13 +365,13 @@
                      :as-directory (eq :directory kind))))
            (errorp
             (file-perror filename (sb-win32:get-last-error)
-                         "Failed to find the ~a of ~A" query-for filename)))))
+                         "Failed to find the ~A of ~S" query-for filename)))))
       (:write-date
        (cond
          ((sb-win32::native-file-write-date filename))
          (errorp
           (file-perror filename (sb-win32:get-last-error)
-                       "Failed to find the ~a of ~A" query-for filename)))))))
+                       "Failed to find the ~A of ~S" query-for filename)))))))
 
 #-win32
 (defun %query-file-system (pathname query-for errorp)
@@ -404,7 +409,7 @@
                  (realpath
                   (parse realpath :as-directory t))
                  (errorp
-                  (file-perror filename errno "couldn't resolve ~A")))))
+                  (file-perror filename errno "Couldn't resolve ~S" filename)))))
            (resolve-problematic-symlink (filename errno realpath-failed)
              ;; SBCL has for many years had a policy that a pathname
              ;; that names an existing, dangling or self-referential
@@ -442,7 +447,8 @@
                  ;; The file doesn't exist; maybe error.
                  (errorp
                   (file-perror
-                   pathname errno "Failed to find the ~A of ~A" query-for pathname))))))
+                   pathname errno
+                   "Failed to find the ~A of ~A" query-for pathname))))))
     (binding* ((filename (native-namestring pathname :as-file t))
                ((existsp errno nil mode nil uid nil nil nil nil mtime)
                 (sb-unix:unix-stat filename)))
@@ -543,9 +549,7 @@ per standard Unix unlink() behaviour."
                      (values nil (sb-win32:get-last-error)))
         (unless res
           (with-simple-restart (continue "Return T")
-            (file-perror namestring err 'delete-file-error
-                         :format-control "Couldn't delete ~A"
-                         :format-arguments (list namestring))))))
+            (file-perror namestring err 'delete-file-error)))))
   t)
 
 (defun directorize-pathname (pathname)
@@ -619,9 +623,8 @@ exist or if is a file or a symbolic link."
                   (get-errno))
                  (if res
                      dir
-                     (file-perror
-                      namestring errno
-                      "Could not delete directory ~A" namestring))))))
+                     (file-perror namestring errno
+                                  "Could not delete directory ~S" namestring))))))
     (let ((physical (directorize-pathname
                      (physicalize-pathname
                       (merge-pathnames
@@ -1242,6 +1245,15 @@ Experimental: interface subject to change."
        (null (pathname-name pathname))
        (null (pathname-type pathname))))
 
+;; FIXME: repeatedly poking at the file system ought to be
+;; unnecessary, and walking the directory hierarchy from the top down
+;; is probably a waste of effort in most cases. If we can trust mkdir
+;; returning ENOENT and EEXIST always and only where it's supposed to,
+;; we could get this down to two syscalls in the optimal success case
+;; case, one in the pessimal failure case, and no worse than this in a
+;; hypothetical average. (It looks like we inherited this approach
+;; from CMUCL; maybe some ancient Unix's mkdir errno values weren't
+;; reliable?)
 (defun ensure-directories-exist (pathspec &key verbose (mode #o777))
   "Test whether the directories containing the specified file
   actually exist, and attempt to create them if they do not.
@@ -1251,37 +1263,37 @@ Experimental: interface subject to change."
         (created-p nil))
     (when (wild-pathname-p pathname)
       (sb-kernel::%file-error pathspec "bad place for a wild pathname"))
-    (let* ((dir (pathname-directory pathname))
-           (*default-pathname-defaults*
-             (make-pathname :directory dir :device (pathname-device pathname)))
-          (dev (pathname-device pathname)))
+    (let* ((host (pathname-host pathname))
+           (dir (pathname-directory pathname))
+           (dev (pathname-device pathname)))
       (loop for i from (case dev (:unc 3) (otherwise 2))
               upto (length dir)
             do
             (let* ((newpath (make-pathname
-                             :host (pathname-host pathname)
+                             :host host
                              :device dev
                              :directory (subseq dir 0 i)))
-                   (probed (probe-file newpath)))
-              (unless (directory-pathname-p probed)
-                (let ((namestring (coerce (native-namestring newpath)
-                                          'string)))
-                  (when verbose
-                    (format *standard-output*
-                            "~&creating directory: ~A~%"
-                            namestring))
-                  (sb-unix:unix-mkdir namestring mode)
-                  (unless (directory-pathname-p (probe-file newpath))
+                   (namestring (coerce (native-namestring newpath :as-file t)
+                                       'string))
+                   (kind (native-file-kind namestring t)))
+              (unless (eq :directory kind)
+                (when verbose
+                  (format *standard-output*
+                          "~&creating directory: ~A~%"
+                          namestring))
+                (sb-unix:unix-mkdir namestring mode)
+                (let ((newkind (native-file-kind namestring t)))
+                  (unless (eq :directory newkind)
                     (restart-case
                         (sb-kernel::%file-error
                          pathspec
                          "Can't create directory ~A~:[~;,~%a file with ~
                           the same name already exists.~]"
                          namestring
-                         (and probed (not (directory-pathname-p probed))))
+                         (and kind (not (eq :directory newkind))))
                       (retry ()
                         :report "Retry directory creation."
                         (ensure-directories-exist
-                         pathspec :verbose verbose :mode mode))))
-                  (setf created-p t)))))
+                         pathspec :verbose verbose :mode mode)))))
+                (setf created-p t))))
       (values pathspec created-p))))

@@ -28,15 +28,23 @@
 
 (deftest function-lambda-list.1
     (function-lambda-list 'cl-user::one)
-  (cl-user::a cl-user::b cl-user::c))
+  (cl-user::a cl-user::b cl-user::c)
+  nil)
+
+(deftest function-lambda-list.1a
+    (function-lambda-list 'cl-user::0-debug)
+  ()
+  t)
 
 (deftest function-lambda-list.2
     (function-lambda-list 'the)
-  (sb-c::value-type sb-c::form))
+  (sb-c::value-type sb-c::form)
+  nil)
 
 (deftest function-lambda-list.3
     (function-lambda-list #'(sb-pcl::slow-method cl-user::j (t)))
-  (sb-pcl::method-args sb-pcl::next-methods))
+  (sb-pcl::method-args sb-pcl::next-methods)
+  nil)
 
 (deftest macro-lambda-list.1
     (equal (function-lambda-list (defmacro macro-lambda-list.1-m (x b)
@@ -320,6 +328,24 @@
   (&optional sb-kernel::element-type sb-kernel::size)
   t)
 
+;;; Check correctness of METHOD-COMBINATION-LAMBDA-LIST
+(deftest method-combination-lambda-list.1
+    (method-combination-lambda-list 'standard)
+  nil)
+
+(deftest method-combination-lambda-list.2
+    (method-combination-lambda-list
+     (sb-mop:find-method-combination #'documentation 'cl-user::r nil))
+  (&optional (sb-pcl::order :most-specific-first)))
+
+(declaim (sb-ext:muffle-conditions style-warning))
+(define-method-combination long-form-mc (foo &rest args &key bar) ())
+
+(deftest method-combination-lambda-list.3
+    (method-combination-lambda-list 'long-form-mc)
+  (foo &rest args &key bar))
+
+
 ;;; Test allocation-information
 
 (defun tai (x kind info &key ignore)
@@ -384,7 +410,7 @@
 (setq sb-ext:*evaluator-mode* :compile)
 (sb-ext:defglobal *large-obj* nil)
 
-#+(and gencgc (or riscv x86 x86-64 ppc) (not win32))
+#+(and gencgc (or riscv x86 x86-64 ppc) (not win32) (not ubsan))
 (progn
   (setq *print-array* nil)
   (setq *large-obj* (make-array (* sb-vm:gencgc-card-bytes 4)
@@ -565,7 +591,9 @@
       (type-equal (function-type #'f)
                   (if (expect-wild-return-type-p #'f)
                       '(function (symbol) *)
-                      '(function (symbol) (values simple-string &optional)))))
+                      '(function (symbol) (values #+sb-unicode simple-string
+                                                  #-sb-unicode simple-base-string
+                                                  &optional)))))
   t)
 
 ;; Closures
@@ -761,24 +789,25 @@
 
 ;;; ASDF.  I can't even.
 (compile 'sb-introspect:map-root)
-(defun count-pointees (x simple &aux (n 0))
-  (sb-introspect:map-root (lambda (obj)
-                            (declare (ignore obj))
-                            (incf n))
-                          x
-                          :simple simple)
-  n)
+(defun list-pointees (x simple)
+  (sb-int:collect ((result))
+    (sb-introspect:map-root (lambda (obj) (result obj))
+                            x :simple simple)
+    (result)))
+(defun count-pointees (x simple)
+  (length (list-pointees x simple)))
 
 ;;; A closure points to its underlying function, all closed-over values,
 ;;; and possibly the closure's name.
-;;; #'SB-INT:CONSTANTLY-T is a nameless closure over 1 value
-(deftest map-root-closure-un (count-pointees #'SB-INT:CONSTANTLY-T nil) 2)
-;;; (SYMBOL-FUNCTION 'AND) is a named closure over 1 value
+(deftest map-root-closure-unnamed
+    (count-pointees (funcall (compile nil `(lambda (x) (lambda () x))) t) nil)
+  2)
+;;; (SYMBOL-FUNCTION 'AND) is a named closure over 1 value.
+;;; The closed-over value is AND, and the name of the closure is (:MACRO AND).
 (deftest map-root-closure-named (count-pointees (symbol-function 'and) nil) 3)
 
-;;; GFs point to their layout, implementation, slots,
-;;; and a hash-code, except that 64-bit headers can store the hash code
-;;; in the slot vector's high header bytes.
+;;; GFs point to their layout, implementation function, and slot vector.
+;;; There's also a hash-code which is stored is one of two different ways.
 ;;; However, in either case we expect only 3 referenced objects,
 ;;; because due to a strange design choice in MAP-ROOT,
 ;;; it does not invoke the funarg on fixnums (or characters).

@@ -74,6 +74,37 @@
                         word-shift))
                 instance-pointer-lowtag))))))
 
+;;; This could be split into two vops to avoid wasting an allocation for 'temp'
+;;; when the immediate form is used.
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional :eq)
+  (:info test-layout)
+  (:temporary (:sc unsigned-reg) this-id temp)
+  (:generator 4
+    (let ((test-id (layout-id test-layout))
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (declare (ignorable test-id))
+      (inst ldr (32-bit-reg this-id) (@ x offset))
+      ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
+      (cond ((typep test-id '(and (signed-byte 8) (not (eql 0))))
+             (if (minusp test-id)
+                 (inst cmn (32-bit-reg this-id) (- test-id))
+                 (inst cmp (32-bit-reg this-id) test-id)))
+            (t
+             (destructuring-bind (size . label)
+                 ;; This uses the bogus definition of :dword, the one which
+                 ;; emits 4 bytes. _technically_ dword should be 8 bytes.
+                 (register-inline-constant :dword `(:layout-id ,test-layout))
+               (declare (ignore size))
+               (inst load-from-label (32-bit-reg temp) label))
+             (inst cmp (32-bit-reg this-id) (32-bit-reg temp)))))))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -83,8 +114,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -195,6 +226,17 @@
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
 ;;;
+
+(defun load-symbol-info-vector (result symbol temp)
+  (assemble ()
+    (loadw result symbol symbol-info-slot other-pointer-lowtag)
+    ;; If RESULT has list-pointer-lowtag, take its CDR. If not, use it as-is.
+    (inst and temp result lowtag-mask)
+    (inst cmp temp list-pointer-lowtag)
+    (inst b :ne NE)
+    (loadw result result cons-cdr-slot list-pointer-lowtag)
+    NE))
+
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -202,13 +244,7 @@
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp)
   (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst and temp res lowtag-mask)
-    (inst cmp temp list-pointer-lowtag)
-    (inst b :ne NE)
-    (loadw res res cons-cdr-slot list-pointer-lowtag)
-    NE))
+    (load-symbol-info-vector res x temp)))
 
 (define-vop (symbol-plist)
   (:policy :fast-safe)
@@ -297,3 +333,12 @@
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
   (:generator 3))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:temporary (:sc unsigned-reg) tmp)
+ (:temporary (:sc descriptor-reg) vector)
+ (:generator 4
+   ;; Can't compute code-tn-relative index until the boxed header length
+   ;; is known. Some vops emit new boxed words via EMIT-CONSTANT.
+   (inst store-coverage-mark index tmp vector)))

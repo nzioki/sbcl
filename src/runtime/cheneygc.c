@@ -108,7 +108,7 @@ collect_garbage(generation_index_t ignore)
     unsigned long size_retained;
     lispobj *current_static_space_free_pointer;
     sigset_t old;
-    struct thread *th=arch_os_get_current_thread();
+    struct thread *th=get_sb_vm_thread();
 
 #ifdef PRINTNOISE
     printf("[Collecting garbage ... \n");
@@ -150,11 +150,9 @@ collect_garbage(generation_index_t ignore)
     scavenge_interrupt_contexts(th);
 
 #ifdef PRINTNOISE
-    printf("Scavenging interrupt handlers (%d bytes) ...\n",
-           (int)sizeof(interrupt_handlers));
+    printf("Scavenging interrupt handlers ...\n");
 #endif
-    scavenge((lispobj *) interrupt_handlers,
-             sizeof(interrupt_handlers) / sizeof(lispobj));
+    scavenge(lisp_sig_handlers, NSIG);
 
 #ifdef PRINTNOISE
     printf("Scavenging the control stack ...\n");
@@ -201,10 +199,6 @@ collect_garbage(generation_index_t ignore)
     /* Maybe FIXME: it's possible that we could significantly reduce
      * RSS by zeroing the from_space or madvise(MADV_DONTNEED) or
      * similar os-dependent tricks here */
-#ifdef LISP_FEATURE_HPUX
-    /* hpux cant handle unmapping areas that are not 100% mapped */
-    clear_auto_gc_trigger();
-#endif
     os_zero((os_vm_address_t) from_space,
             (os_vm_size_t) dynamic_space_size);
 
@@ -362,7 +356,7 @@ search_dynamic_space(void *pointer)
 void
 gc_init(void)
 {
-    weakobj_init();
+    gc_common_init();
 }
 
 /* noise to manipulate the gc trigger stuff */
@@ -394,7 +388,7 @@ void set_auto_gc_trigger(os_vm_size_t dynamic_usage)
     uword_t end = (uword_t)addr + length - 1;
     if (((uword_t)addr >= DYNAMIC_0_SPACE_START && end < semispace_0_end) ||
         ((uword_t)addr >= DYNAMIC_1_SPACE_START && end < semispace_1_end)) {
-#if defined(SUNOS) || defined(SOLARIS) || defined(LISP_FEATURE_HPUX)
+#if defined(SUNOS) || defined(SOLARIS)
         os_invalidate(addr, length);
 #else
         os_protect(addr, length, 0);
@@ -417,7 +411,7 @@ void clear_auto_gc_trigger(void)
     addr = (os_vm_address_t)current_auto_gc_trigger;
     length = dynamic_space_size + (os_vm_address_t)current_dynamic_space - addr;
 
-#if defined(SUNOS) || defined(SOLARIS) || defined(LISP_FEATURE_HPUX)
+#if defined(SUNOS) || defined(SOLARIS)
     /* don't want to force whole space into swapping mode... */
     os_validate(NOT_MOVABLE, addr, length);
 #else
@@ -442,7 +436,7 @@ boolean
 cheneygc_handle_wp_violation(os_context_t *context, void *addr)
 {
     if(!foreign_function_call_active && gc_trigger_hit(addr)){
-        struct thread *thread=arch_os_get_current_thread();
+        struct thread *thread=get_sb_vm_thread();
         clear_auto_gc_trigger();
         /* Don't flood the system with interrupts if the need to gc is
          * already noted. This can happen for example when SUB-GC

@@ -61,7 +61,7 @@
       (sap-reg
        (move y x))
       (sap-stack
-       (if (= (tn-offset fp) esp-offset)
+       (if (= (tn-offset fp) rsp-offset)
            (storew x fp (tn-offset y))  ; c-call
            (storew x fp (frame-word-offset (tn-offset y))))))))
 (define-move-vop move-sap-arg :move-arg
@@ -203,14 +203,19 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
    (t
     (sb-assem:inst* insn modifier result ea))))
 
-(defun emit-sap-set (size ea value result)
+(defun emit-sap-set (size ea value)
   #+linux
   (when (sb-c:msan-unpoison sb-c:*compilation*)
     (inst lea temp-reg-tn ea)
     (inst xor temp-reg-tn (thread-slot-ea thread-msan-xor-constant-slot))
     (inst mov size (ea temp-reg-tn) 0))
-  (inst mov size ea value)
-  (move result value))
+  (when (sc-is value constant immediate)
+    (cond ((plausible-signed-imm32-operand-p (tn-value value))
+           (setq value (tn-value value)))
+          (t
+           (inst mov temp-reg-tn (tn-value value))
+           (setq value temp-reg-tn))))
+  (inst mov size ea value))
 
 (macrolet ((def-system-ref-and-set (ref-name
                                     set-name
@@ -218,9 +223,16 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                                     sc
                                     type
                                     size)
-             (let ((ref-name-c (symbolicate ref-name "-C"))
-                   (set-name-c (symbolicate set-name "-C"))
-                   (modifier (if (eq ref-insn 'mov) size `(,size :qword))))
+             (let ((value-scs (cond ((member ref-name '(sap-ref-64 signed-sap-ref-64))
+                                     `(,sc constant immediate))
+                                    ((not (member ref-name '(sap-ref-single sap-ref-sap
+                                                             sap-ref-lispobj)))
+                                     `(,sc immediate))
+                                    (t
+                                     `(,sc))))
+                   (modifier (if (eq ref-insn 'mov)
+                                 size
+                                 `(,size ,(if (eq ref-insn 'movzx) :dword :qword)))))
                `(progn
                   (define-vop (,ref-name)
                     (:translate ,ref-name)
@@ -234,7 +246,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                     (:vop-var vop)
                     (:generator 3 (emit-sap-ref ,size ',ref-insn
                                                 ',modifier result (ea sap offset) node vop)))
-                  (define-vop (,ref-name-c)
+                  (define-vop (,(symbolicate ref-name "-C"))
                     (:translate ,ref-name)
                     (:policy :fast-safe)
                     (:args (sap :scs (sap-reg)))
@@ -249,23 +261,21 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                   (define-vop (,set-name)
                     (:translate ,set-name)
                     (:policy :fast-safe)
-                    (:args (sap :scs (sap-reg) :to (:eval 0))
-                           (offset :scs (signed-reg) :to (:eval 0))
-                           (value :scs (,sc) :target result))
-                    (:arg-types system-area-pointer signed-num ,type)
-                    (:results (result :scs (,sc)))
-                    (:result-types ,type)
-                    (:generator 5 (emit-sap-set ,size (ea sap offset) value result)))
-                  (define-vop (,set-name-c)
+                    (:args (value :scs ,value-scs)
+                           (sap :scs (sap-reg))
+                           (offset :scs (signed-reg)))
+                    (:arg-types ,type system-area-pointer signed-num)
+                    (:generator 5
+                      (emit-sap-set ,size (ea sap offset) value)))
+                  (define-vop (,(symbolicate set-name "-C"))
                     (:translate ,set-name)
                     (:policy :fast-safe)
-                    (:args (sap :scs (sap-reg) :to (:eval 0))
-                           (value :scs (,sc) :target result))
-                    (:arg-types system-area-pointer (:constant (signed-byte 32)) ,type)
+                    (:args (value :scs ,value-scs)
+                           (sap :scs (sap-reg)))
+                    (:arg-types ,type system-area-pointer (:constant (signed-byte 32)))
                     (:info offset)
-                    (:results (result :scs (,sc)))
-                    (:result-types ,type)
-                    (:generator 4 (emit-sap-set ,size (ea offset sap) value result)))))))
+                    (:generator 4
+                      (emit-sap-set ,size (ea offset sap) value)))))))
 
   (def-system-ref-and-set sap-ref-8 %set-sap-ref-8 movzx
     unsigned-reg positive-fixnum :byte)
@@ -275,7 +285,7 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
     unsigned-reg positive-fixnum :word)
   (def-system-ref-and-set signed-sap-ref-16 %set-signed-sap-ref-16 movsx
     signed-reg tagged-num :word)
-  (def-system-ref-and-set sap-ref-32 %set-sap-ref-32 movzx
+  (def-system-ref-and-set sap-ref-32 %set-sap-ref-32 mov
     unsigned-reg unsigned-num :dword)
   (def-system-ref-and-set signed-sap-ref-32 %set-signed-sap-ref-32 movsx
     signed-reg signed-num :dword)
@@ -314,23 +324,19 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
                 (define-vop (,set-fun)
                   (:translate ,set-fun)
                   (:policy :fast-safe)
-                  (:args (sap :scs (sap-reg) :to (:eval 0))
-                         (offset :scs (signed-reg) :to (:eval 0))
-                         (value :scs (,res-sc)))
-                  (:arg-types system-area-pointer signed-num ,res-type)
-                  (:results (result :scs (,res-sc)))
-                  (:result-types ,res-type)
-                  (:generator 5 (inst ,insn (ea sap offset) value) (move result value)))
+                  (:args (value :scs (,res-sc immediate))
+                         (sap :scs (sap-reg))
+                         (offset :scs (signed-reg)))
+                  (:arg-types ,res-type system-area-pointer signed-num)
+                  (:generator 5 (inst ,insn (ea sap offset) value)))
                 (define-vop (,(symbolicate set-fun "-C"))
                   (:translate ,set-fun)
                   (:policy :fast-safe)
-                  (:args (sap :scs (sap-reg) :to (:eval 0))
-                         (value :scs (,res-sc)))
-                  (:arg-types system-area-pointer (:constant (signed-byte 32)) ,res-type)
+                  (:args (value :scs (,res-sc))
+                         (sap :scs (sap-reg)))
+                  (:arg-types ,res-type system-area-pointer (:constant (signed-byte 32)))
                   (:info offset)
-                  (:results (result :scs (,res-sc)))
-                  (:result-types ,res-type)
-                  (:generator 4 (inst ,insn (ea offset sap) value) (move result value))))))
+                  (:generator 4 (inst ,insn (ea offset sap) value))))))
   (def-system-ref-and-set sap-ref-single single-reg single-float movss)
   (def-system-ref-and-set sap-ref-double double-reg double-float movsd))
 
@@ -355,13 +361,13 @@ https://llvm.org/doxygen/MemorySanitizer_8cpp.html
          (offset :scs (signed-reg) :to (:eval 0))
          (oldval :scs (signed-reg) :target eax)
          (newval :scs (signed-reg) :to (:eval 0)))
-  (:temporary (:sc unsigned-reg :offset eax-offset
+  (:temporary (:sc unsigned-reg :offset rax-offset
                    :from (:argument 2) :to (:result 0)) eax)
   (:arg-types system-area-pointer signed-num signed-num signed-num)
   (:results (result :scs (signed-reg)))
   (:result-types signed-num)
   (:generator 5
     (inst mov :dword eax oldval)
-    (inst cmpxchg :dword (ea sap offset) newval :lock)
+    (inst cmpxchg :lock :dword (ea sap offset) newval)
     (inst movsx '(:dword :qword) result eax)))
 

@@ -44,10 +44,6 @@
 #include "validate.h"
 #include "gc-internal.h"
 
-#if defined(LISP_FEATURE_SB_WTIMER) && !defined(LISP_FEATURE_DARWIN)
-# include <sys/event.h>
-#endif
-
 
 
 #ifdef __NetBSD__
@@ -63,7 +59,7 @@ static os_vm_size_t max_allocation_size;
 
 #if defined LISP_FEATURE_FREEBSD
 #include <sys/sysctl.h>
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#ifdef LISP_FEATURE_SB_FUTEX
 #include <sys/umtx.h>
 #endif
 
@@ -122,11 +118,33 @@ os_context_sigmask_addr(os_context_t *context)
 }
 
 os_vm_address_t
-os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
+os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executable, int jit)
 {
-    int protection = attributes & IS_GUARD_PAGE ? OS_VM_PROT_NONE : OS_VM_PROT_ALL;
-    attributes &= ~IS_GUARD_PAGE;
+    int protection;
     int flags = 0;
+
+    if (attributes & IS_GUARD_PAGE)
+        protection = OS_VM_PROT_NONE;
+    else
+#ifndef LISP_FEATURE_DARWIN_JIT
+        protection = OS_VM_PROT_ALL;
+#else
+    if (jit) {
+        if (jit == 2)
+            protection = OS_VM_PROT_ALL;
+        else
+            protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
+        flags = MAP_JIT;
+    }
+    else if (executable) {
+        protection = OS_VM_PROT_READ | OS_VM_PROT_EXECUTE;
+    }
+    else {
+        protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
+    }
+#endif
+
+    attributes &= ~IS_GUARD_PAGE;
 
 #ifndef LISP_FEATURE_DARWIN // Do not use MAP_FIXED, because the OS is sane.
 
@@ -201,7 +219,12 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
     } else
 #endif
     {
+        os_vm_address_t requested = addr;
         addr = mmap(addr, len, protection, flags, -1, 0);
+        if (requested && requested != addr && !(attributes & MOVABLE)) {
+            return 0;
+        }
+
     }
 
     if (addr == MAP_FAILED) {
@@ -211,7 +234,7 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
                     " mounted with wxallowed?\n");
         else
 #endif
-        perror("mmap");
+            perror("mmap");
         return NULL;
     }
 
@@ -229,7 +252,11 @@ void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
     if (mprotect(address, length, prot) == -1) {
+
         perror("mprotect");
+#ifdef LISP_FEATURE_DARWIN_JIT
+        lose("%p %lu", address, length);
+#endif
     }
 }
 
@@ -258,11 +285,12 @@ memory_fault_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     FSHOW((stderr, "Memory fault at: %p, PC: %p\n", fault_addr, *os_context_pc_addr(context)));
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-    if (!handle_safepoint_violation(context, fault_addr))
+    if (handle_safepoint_violation(context, fault_addr)) return;
 #endif
 
-    if (!gencgc_handle_wp_violation(fault_addr))
-        if(!handle_guard_page_triggered(context,fault_addr))
+    if (gencgc_handle_wp_violation(fault_addr)) return;
+
+    if (!handle_guard_page_triggered(context,fault_addr))
             lisp_memory_fault_error(context, fault_addr);
 }
 
@@ -280,28 +308,21 @@ os_install_interrupt_handlers(void)
     SHOW("os_install_interrupt_handlers()/bsd-os/defined(GENCGC)");
     if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
 #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
-    undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
-                                                 mach_error_memory_fault_handler);
+    ll_install_handler(SIG_MEMORY_FAULT, mach_error_memory_fault_handler);
 #else
-    undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
+    ll_install_handler(SIG_MEMORY_FAULT,
 #if defined(LISP_FEATURE_FREEBSD) && !defined(__GLIBC__)
                                                  (__siginfohandler_t *)
 #endif
                                                  memory_fault_handler);
 #endif
-    }
 
-#ifdef LISP_FEATURE_SB_THREAD
-# ifdef LISP_FEATURE_SB_SAFEPOINT
-#  ifdef LISP_FEATURE_SB_THRUPTION
-    undoably_install_low_level_interrupt_handler(SIGPIPE, thruption_handler);
-#  endif
-# else
-    undoably_install_low_level_interrupt_handler(SIG_STOP_FOR_GC,
-                                                 sig_stop_for_gc_handler);
-# endif
+#ifdef LISP_FEATURE_DARWIN
+    /* Unmapped pages get this and not SIGBUS. */
+    ll_install_handler(SIGSEGV, memory_fault_handler);
 #endif
-    SHOW("leaving os_install_interrupt_handlers()");
+
+    }
 }
 
 #else /* Currently PPC/Darwin/Cheney only */
@@ -312,17 +333,16 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     os_vm_address_t addr;
 
     addr = arch_get_bad_addr(signal, info, context);
-    if (!cheneygc_handle_wp_violation(context, addr))
-        if (!handle_guard_page_triggered(context, addr))
+    if (cheneygc_handle_wp_violation(context, addr)) return;
+
+    if (!handle_guard_page_triggered(context, addr))
             interrupt_handle_now(signal, info, context);
 }
 
 void
 os_install_interrupt_handlers(void)
 {
-    SHOW("os_install_interrupt_handlers()/bsd-os/!defined(GENCGC)");
-    undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
-                                                 sigsegv_handler);
+    ll_install_handler(SIG_MEMORY_FAULT, sigsegv_handler);
 }
 
 #endif /* defined GENCGC */
@@ -450,8 +470,7 @@ static void freebsd_init()
 #endif /* LISP_FEATURE_X86 */
 }
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) \
-    && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#ifdef LISP_FEATURE_SB_FUTEX
 int
 futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
 {
@@ -459,30 +478,24 @@ futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
     int ret;
 
     if (sec < 0)
-        ret = umtx_wait((void *)lock_word, oldval, NULL);
+        ret = _umtx_op((void *)lock_word, UMTX_OP_WAIT, oldval, 0, 0);
     else {
         timeout.tv_sec = sec;
         timeout.tv_nsec = usec * 1000;
-        ret = umtx_wait((void *)lock_word, oldval, &timeout);
+        ret = _umtx_op((void *)lock_word, UMTX_OP_WAIT, oldval, (void*)sizeof timeout, &timeout);
     }
-
-    switch (ret) {
-    case 0:
-        return 0;
-    case ETIMEDOUT:
-        return 1;
-    case EINTR:
-        return 2;
-    default:
-        /* EWOULDBLOCK and others, need to check the lock */
-        return -1;
-    }
+    if (ret == 0) return 0;
+    // technically we would not need to check any of the error codes if the lisp side
+    // could just avoid looping if there is no time remaining.
+    if (errno == ETIMEDOUT) return 1;
+    if (errno == EINTR) return 2;
+    return -1;
 }
 
 int
 futex_wake(int *lock_word, int n)
 {
-    return umtx_wake((void *)lock_word, n);
+    return _umtx_op((void *)lock_word, UMTX_OP_WAKE, n, 0, 0);
 }
 #endif
 #endif /* __FreeBSD__ */
@@ -504,8 +517,7 @@ static void dragonfly_init()
 }
 
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) \
-    && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#ifdef LISP_FEATURE_SB_FUTEX
 int
 futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
 {
@@ -668,61 +680,4 @@ os_dlsym(void *handle, const char *symbol)
     return ret;
 }
 
-#endif
-
-#if defined(LISP_FEATURE_SB_WTIMER) && !defined(LISP_FEATURE_DARWIN)
-/*
- * Waitable timer implementation for the safepoint-based (SIGALRM-free)
- * timer facility using kqueue.
- */
-int
-os_create_wtimer()
-{
-    int kq = kqueue();
-    if (kq == -1)
-        lose("os_create_wtimer: kqueue");
-    return kq;
-}
-
-int
-os_wait_for_wtimer(int kq)
-{
-    struct kevent ev;
-    int n;
-    if ( (n = kevent(kq, 0, 0, &ev, 1, 0)) == -1) {
-        if (errno != EINTR)
-            lose("os_wtimer_listen failed");
-        n = 0;
-    }
-    return n != 1;
-}
-
-void
-os_close_wtimer(int kq)
-{
-    if (close(kq) == -1)
-        lose("os_close_wtimer failed");
-}
-
-void
-os_set_wtimer(int kq, int sec, int nsec)
-{
-    long long msec
-        = ((long long) sec) * 1000 + (long long) (nsec+999999) / 1000000;
-    if (msec > INT_MAX) msec = INT_MAX;
-
-    struct kevent ev;
-    EV_SET(&ev, 1, EVFILT_TIMER, EV_ADD|EV_ENABLE|EV_ONESHOT, 0, (int)msec, 0);
-    if (kevent(kq, &ev, 1, 0, 0, 0) == -1)
-        perror("os_set_wtimer: kevent");
-}
-
-void
-os_cancel_wtimer(int kq)
-{
-    struct kevent ev;
-    EV_SET(&ev, 1, EVFILT_TIMER, EV_DISABLE, 0, 0, 0);
-    if (kevent(kq, &ev, 1, 0, 0, 0) == -1 && errno != ENOENT)
-        perror("os_cancel_wtimer: kevent");
-}
 #endif

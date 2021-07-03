@@ -16,7 +16,6 @@
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
-#include "sbcl.h"
 #include "arch.h"
 #include "lispregs.h"
 #include "signal.h"
@@ -28,7 +27,6 @@
 #include "getallocptr.h"
 #include "unaligned.h"
 #include "search.h"
-#include "globals.h" // for asm_routines_start,end
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
@@ -40,7 +38,6 @@
 #define UD2_INST 0x0b0f
 #define BREAKPOINT_WIDTH 1
 
-unsigned int cpuid_fn1_ecx;
 int avx_supported = 0, avx2_supported = 0;
 
 static void cpuid(unsigned info, unsigned subinfo,
@@ -77,6 +74,7 @@ static void xgetbv(unsigned *eax, unsigned *edx)
 void tune_asm_routines_for_microarch(void)
 {
     unsigned int eax, ebx, ecx, edx;
+    unsigned int cpuid_fn1_ecx = 0;
 
     cpuid(0, 0, &eax, &ebx, &ecx, &edx);
     if (eax >= 1) { // see if we can execute basic id function 1
@@ -94,7 +92,13 @@ void tune_asm_routines_for_microarch(void)
             }
         }
     }
-    SetSymbolValue(CPUID_FN1_ECX, (lispobj)make_fixnum(cpuid_fn1_ecx), 0);
+    int our_cpu_feature_bits = 0;
+    // avx2_supported gets copied into bit 1 of *CPU-FEATURE-BITS*
+    if (avx2_supported) our_cpu_feature_bits |= 1;
+    // POPCNT = ECX bit 23, which gets copied into bit 2 in *CPU-FEATURE-BITS*
+    if (cpuid_fn1_ecx & (1<<23)) our_cpu_feature_bits |= 2;
+    SetSymbolValue(CPU_FEATURE_BITS, make_fixnum(our_cpu_feature_bits), 0);
+
     // I don't know if this works on Windows
 #ifndef _MSC_VER
     cpuid(0, 0, &eax, &ebx, &ecx, &edx);
@@ -113,6 +117,7 @@ void tune_asm_routines_for_microarch(void)
 void untune_asm_routines_for_microarch(void)
 {
     asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
+    SetSymbolValue(CPU_FEATURE_BITS, 0, 0);
 }
 
 #ifndef _WIN64
@@ -219,20 +224,20 @@ arch_internal_error_arguments(os_context_t *context)
 boolean
 arch_pseudo_atomic_atomic(os_context_t __attribute__((unused)) *context)
 {
-    return get_pseudo_atomic_atomic(arch_os_get_current_thread());
+    return get_pseudo_atomic_atomic(get_sb_vm_thread());
 }
 
 void
 arch_set_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
     set_pseudo_atomic_interrupted(thread);
 }
 
 void
 arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
     clear_pseudo_atomic_interrupted(thread);
 }
 
@@ -361,7 +366,7 @@ sigtrap_handler(int __attribute__((unused)) signal,
 
     /* This is just for info in case the monitor wants to print an
      * approximation. */
-    access_control_stack_pointer(arch_os_get_current_thread()) =
+    access_control_stack_pointer(get_sb_vm_thread()) =
         (lispobj *)*os_context_sp_addr(context);
 
     /* On entry %rip points just after the INT3 byte and aims at the
@@ -406,6 +411,10 @@ sigill_handler(int __attribute__((unused)) signal,
 #endif
 
     fake_foreign_function_call(context);
+#ifdef LISP_FEATURE_LINUX
+    extern void sb_dump_mcontext(char*,void*);
+    sb_dump_mcontext("SIGILL received", context);
+#endif
     lose("Unhandled SIGILL at %p.", pc);
 }
 
@@ -478,12 +487,12 @@ arch_install_interrupt_handlers()
      * CL way, I hope there will at least be a comment to explain
      * why.. -- WHN 2001-06-07 */
 #if !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER) && !defined(LISP_FEATURE_WIN32)
-    undoably_install_low_level_interrupt_handler(SIGILL , sigill_handler);
-    undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
+    ll_install_handler(SIGILL , sigill_handler);
+    ll_install_handler(SIGTRAP, sigtrap_handler);
 #endif
 
 #if defined(X86_64_SIGFPE_FIXUP) && !defined(LISP_FEATURE_WIN32)
-    undoably_install_low_level_interrupt_handler(SIGFPE, sigfpe_handler);
+    ll_install_handler(SIGFPE, sigfpe_handler);
 #endif
 
     SHOW("returning from arch_install_interrupt_handlers()");
@@ -604,7 +613,11 @@ lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
 extern unsigned int alloc_profile_n_counters;
 extern unsigned int max_alloc_point_counters;
 #ifdef LISP_FEATURE_SB_THREAD
+#ifdef LISP_FEATURE_WIN32
+extern CRITICAL_SECTION alloc_profiler_lock;
+#else
 extern pthread_mutex_t alloc_profiler_lock;
+#endif
 #endif
 
 static unsigned int claim_index(int qty)
@@ -621,7 +634,8 @@ static unsigned int claim_index(int qty)
     return 0; // use the overflow bin(s)
 }
 
-static boolean instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
+static boolean NO_SANITIZE_MEMORY
+instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 {
     int __attribute__((unused)) ret = thread_mutex_lock(&alloc_profiler_lock);
     gc_assert(ret == 0);
@@ -694,9 +708,10 @@ allocation_tracker_counted(uword_t* sp)
         unsigned int index = claim_index(1);
         if (index == 0)
             index = 2; // reserved overflow counter for fixed-size alloc
+        uword_t disp = index * 8;
         // rewrite call into: LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
         uword_t new_inst =
-          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | ((index*8L) << 32);
+          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | (disp << 32);
         // Ensure atomicity of the write. A plain store would probably do,
         // but since this is self-modifying code, the most stringent memory
         // order is prudent.
@@ -728,14 +743,15 @@ allocation_tracker_sized(uword_t* sp)
         }
         // rewrite call into:
         //  LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
+        uword_t disp = index * 8;
         uword_t new_inst1 =
-          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | ((index * 8L) << 32);
+          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | (disp << 32);
         //  LOCK ADD [R11+n], Rxx ; opcode = 0x01
         prefix = 0x49 | ((prefix & 1) << 2); // 'b' bit becomes 'r' bit
         modrm  = 0x83 | (modrm & (7<<3)); // copy 'reg' into new modrm byte
+        disp = (1 + index) * 8;
         uword_t new_inst2 =
-          0xF0 | (prefix << 8) | (0x01 << 16) | ((long)modrm << 24)
-            | (((1 + index) * 8L) << 32);
+          0xF0 | (prefix << 8) | (0x01 << 16) | ((long)modrm << 24) | (disp << 32);
         // Overwrite the second instruction first, because as soon as the CALL
         // opcode is changed, fallthrough to the next instruction occurs.
         if (!__sync_bool_compare_and_swap(pc+1, word_after_pc, new_inst2) ||

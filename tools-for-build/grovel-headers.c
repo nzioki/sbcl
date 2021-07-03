@@ -55,17 +55,18 @@
 #include <errno.h>
 #include <time.h>
 
-#ifdef LISP_FEATURE_HPUX
-#include <sys/bsdtty.h> /* for TIOCGPGRP */
-#endif
-
 #ifdef LISP_FEATURE_BSD
   #include <sys/param.h>
   #include <sys/sysctl.h>
 #endif
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-  #include "pthreads_win32.h"
+#ifdef LISP_FEATURE_SB_THREAD
+# ifdef LISP_FEATURE_WIN32
+#  include "pthreads_win32.h"
+# elif defined LISP_FEATURE_OS_THREAD_STACK
+#  include <limits.h> // PTHREAD_STACK_MIN is possibly in here
+#  include <pthread.h> // instead of in here
+# endif
 #endif
 
 #include "wrap.h"
@@ -85,11 +86,14 @@
            (((bar.cname=-1)<0) ? "signed" : "unsigned"), \
            (8LU * (sizeof bar.cname)))
 
-void
-defconstant(char* lisp_name, unsigned long unix_number)
-{
-    printf("(defconstant %s %lu) ; #x%lx\n",
-           lisp_name, unix_number, unix_number);
+#define DEFCONSTANT(lispname,cname) \
+  if (cname<0) defconstant_neg(lispname, cname); else defconstant(lispname,cname)
+
+void defconstant(char* lisp_name, unsigned long unix_number) {
+    printf("(defconstant %s %lu) ; #x%lx\n", lisp_name, unix_number, unix_number);
+}
+void defconstant_neg(char* lisp_name, long unix_number) {
+    printf("(defconstant %s %ld)\n", lisp_name, unix_number);
 }
 
 #ifdef __HAIKU__
@@ -144,7 +148,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 \n\
 ");
 #ifdef _WIN32
-    #include "grovel-headers-win32.h"
+    #include "grovel-headers-win32.inc"
 #else
     printf("(in-package \"SB-ALIEN\")\n\n");
 
@@ -154,7 +158,12 @@ main(int argc, char __attribute__((unused)) *argv[])
     defconstant ("rtld-now", RTLD_NOW);
     defconstant ("rtld-global", RTLD_GLOBAL);
 
-    printf("(in-package \"SB-UNIX\")\n\n");
+    printf("\n(in-package \"SB-UNIX\")\n\n");
+
+#if defined LISP_FEATURE_OS_THREAD_STACK
+    defconstant("pthread-min-stack", PTHREAD_STACK_MIN);
+    printf("\n");
+#endif
 
     printf(";;; select()\n");
     defconstant("fd-setsize", FD_SETSIZE);
@@ -262,6 +271,10 @@ main(int argc, char __attribute__((unused)) *argv[])
     printf("\n");
 
     printf(";;; signals\n");
+    defconstant("sizeof-sigset_t", sizeof (sigset_t));
+    defconstant("sig_block", SIG_BLOCK);
+    defconstant("sig_unblock", SIG_UNBLOCK);
+    defconstant("sig_setmask", SIG_SETMASK);
     defsignal("sigalrm", SIGALRM);
     defsignal("sigbus", SIGBUS);
     defsignal("sigchld", SIGCHLD);
@@ -330,6 +343,29 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif // !WIN32
     printf("\n");
 
+#ifdef LISP_FEATURE_UNIX
+    DEFCONSTANT("clock-realtime", CLOCK_REALTIME);
+    DEFCONSTANT("clock-monotonic", CLOCK_MONOTONIC);
+    DEFCONSTANT("clock-process-cputime-id", CLOCK_PROCESS_CPUTIME_ID);
+#endif
+#ifdef LISP_FEATURE_LINUX
+#ifdef CLOCK_REALTIME_ALARM
+    defconstant("clock-realtime-alarm", CLOCK_REALTIME_ALARM);
+#endif
+    defconstant("clock-realtime-coarse", CLOCK_REALTIME_COARSE);
+#ifdef CLOCK_TAI
+    defconstant("clock-tai", CLOCK_TAI); // International Atomic Time.
+#endif
+    defconstant("clock-monotonic-coarse", CLOCK_MONOTONIC_COARSE);
+    defconstant("clock-monotonic-raw", CLOCK_MONOTONIC_RAW);
+#ifdef CLOCK_BOOTTIME
+    defconstant("clock-boottime", CLOCK_BOOTTIME);
+#endif
+#ifdef CLOCK_BOOTTIME_ALARM
+    defconstant("clock-boottime-alarn", CLOCK_BOOTTIME_ALARM);
+#endif
+    DEFCONSTANT("clock-thread-cputime-id", CLOCK_THREAD_CPUTIME_ID);
+#endif
     printf(";;; structures\n");
     DEFSTRUCT(timeval, struct timeval,
         DEFSLOT(tv-sec, tv_sec);

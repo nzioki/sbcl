@@ -211,7 +211,7 @@
                          (ash (ldb (byte pkgnick-index-bits 0) token) 1))))))
 
 ;;; This would have to be bumped ~ 2*most-positive-fixnum times to overflow.
-(define-load-time-global *package-names-cookie* sb-xc:most-negative-fixnum)
+(define-load-time-global *package-names-cookie* most-negative-fixnum)
 (declaim (fixnum *package-names-cookie*))
 
 (defmacro with-package-names ((table-var &key) &body body)
@@ -219,10 +219,6 @@
      (sb-thread::with-recursive-system-lock ((info-env-mutex ,table-var))
        ,@body)))
 
-(defmethod make-load-form ((p package) &optional environment)
-  (declare (ignore environment))
-  `(find-undeleted-package-or-lose ,(package-name p)))
-
 ;;;; iteration macros
 
 (defmacro with-package-iterator ((mname package-list &rest symbol-types) &body body)
@@ -547,7 +543,7 @@ error if any of PACKAGES is not a valid package designator."
 ;;; making this a generic function then packages with custom package classes
 ;;; could hook into this to provide their own resolution.
 ;;; (Any such generic solution will turn the performance to crap, so let's not)
-(declaim (inline find-package-using-package))
+(declaim (maybe-inline find-package-using-package))
 (defun find-package-using-package (package-designator base)
   (let ((string (typecase package-designator
                   (package
@@ -579,11 +575,11 @@ Example:
 
 See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (inline find-package-using-package))
   ;; We had a BOUNDP check on *PACKAGE* here, but it's effectless due to the
   ;; always-bound proclamation.
   (find-package-using-package package-designator *package*))
-(declaim (notinline find-package-using-package))
 
 ;;; ANSI says (in the definition of DELETE-PACKAGE) that these, and
 ;;; most other operations, are unspecified for deleted packages. We
@@ -897,7 +893,7 @@ Experimental: interface subject to change."
 ;;; of STRING. ENTRY-HASH is the entry-hash of the string and length.
 ;;; If the symbol is found, then FORMS are executed; otherwise not.
 
-(defmacro with-symbol (((symbol-var &optional (index-var (gensym))) table
+(defmacro with-symbol (((symbol-var &optional (index-var (sb-xc:gensym))) table
                        string length sxhash) &body forms)
   (with-unique-names (vec len h2 probed-thing name)
     `(let* ((,vec (package-hashtable-cells ,table))
@@ -1796,7 +1792,10 @@ PACKAGE."
   (fresh-line)
   (prin1 symbol)
   (when (boundp symbol)
-    (write-string " (bound)"))
+    (let ((value (symbol-value symbol)))
+      (if (typep value '(or fixnum symbol hash-table))
+          (format t " = ~S" value)
+          (format t " (bound, ~S)" (type-of value)))))
   (when (fboundp symbol)
     (write-string " (fbound)")))
 
@@ -1855,6 +1854,9 @@ PACKAGE."
         (cons (make-info-hashtable :comparator #'pkg-name=
                                    :hash-function #'sxhash)
               1))
+  (setf (sb-thread:mutex-name (info-env-mutex *package-names*)) "package names"
+        (sb-thread:mutex-name (info-env-mutex (car *package-nickname-ids*)))
+        "package nicknames")
   (with-package-names (names)
     (dolist (spec *!initial-symbols*)
       (let ((pkg (car spec)) (symbols (cdr spec)))

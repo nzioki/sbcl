@@ -343,10 +343,9 @@
 
 
 (with-test (:name :sequence-lvar-dimensions-dotted-list)
-  (assert (nth-value 3
+  (assert (nth-value 1
                      (checked-compile
                       '(lambda () (position 0 '(1 2 0 5 . 5)))
-                      :allow-style-warnings t
                       :allow-warnings t))))
 
 (with-test (:name :source-form-context-dotted-list)
@@ -430,19 +429,27 @@
                         (search '(a . b) x))
                       :allow-warnings t))))
 
+(with-test (:name :improper-list.3)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                          (let ((x '(1 2 . 3)))
+                            (position c x)))
+                      :allow-warnings t))))
+
 (with-test (:name :call-nil)
   (checked-compile-and-assert
-   ()
-   `(lambda ()
-      (funcall nil))
-   (() (condition 'undefined-function)))
+      ()
+      `(lambda ()
+         (funcall nil))
+    (() (condition 'undefined-function)))
   (checked-compile-and-assert
-   ()
-   `(lambda (x)
-      (if x
-          10
-          (funcall x)))
-   ((nil) (condition 'undefined-function))))
+      ()
+      `(lambda (x)
+         (if x
+             10
+             (funcall x)))
+    ((nil) (condition 'undefined-function))))
 
 (with-test (:name (:valid-callable-argument :toplevel-xep))
   (assert (nth-value 2 (checked-compile `(lambda (l) (find-if (lambda ()) l))
@@ -522,7 +529,7 @@
                     (f)))
                :allow-style-warnings t))))
 
-(with-test (:name :inapprorate-declare)
+(with-test (:name :inappropriate-declare)
   (assert
    (nth-value 5
               (checked-compile
@@ -538,3 +545,63 @@
               (checked-compile
                `(lambda () (prog1 10 (declare (optimize))))
                :allow-failure t))))
+
+(with-test (:name :reduce-initial-value)
+  (assert
+   (nth-value 2
+              (checked-compile
+               `(lambda ()
+                  (reduce (lambda (x y)
+                            (declare (fixnum x))
+                            (+ x (char-code y)))
+                          "abc"))
+               :allow-warnings t)))
+  (assert
+   (nth-value 2
+              (checked-compile
+               `(lambda ()
+                  (reduce (lambda (x y)
+                            (declare (fixnum x))
+                            (+ x (char-code y)))
+                          "abc"
+                          :initial-value #\a))
+               :allow-warnings t)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (s)
+         (declare (string s))
+         (reduce (lambda (x y)
+                   (declare (fixnum x))
+                   (+ x (char-code y)))
+                 s
+                 :initial-value 0))
+    (("abc") 294)))
+
+(with-test (:name :get-defined-fun-lambda-list-error)
+  (assert (nth-value 1 (checked-compile '(lambda () (defun x 10)) :allow-failure t))))
+
+(with-test (:name :dolist-mismatch)
+  (assert (nth-value 2
+                     (checked-compile '(lambda (x)
+                                        (dolist (x (the integer x))))
+                                      :allow-warnings 'sb-int:type-warning))))
+
+(with-test (:name :loop-list-mismatch)
+  (assert (nth-value 2
+                     (checked-compile '(lambda (x)
+                                        (loop for y in (the integer x)))
+                                      :allow-warnings 'sb-int:type-warning)))
+  (assert (nth-value 2
+                     (checked-compile '(lambda (x)
+                                        (loop for y on (the integer x)))
+                                      :allow-warnings 'sb-int:type-warning))))
+
+(with-test (:name :mapcar-list-mismatch)
+  (assert (nth-value 2
+                     (checked-compile '(lambda (z)
+                                        (mapl #'car  (the integer z)))
+                                      :allow-warnings 'sb-int:type-warning)))
+  (assert (nth-value 2
+                     (checked-compile '(lambda (f z x)
+                                        (mapcar f  (the integer z) (the integer x)))
+                                      :allow-warnings 'sb-int:type-warning))))

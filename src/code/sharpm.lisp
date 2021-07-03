@@ -49,42 +49,33 @@
 (defun sharp-star (stream ignore numarg)
   (declare (ignore ignore))
   (declare (type (or null integer) numarg))
-  (binding* (((buffer escape-appearedp) (read-extended-token stream))
+  (binding* (((buffer escaped) (read-extended-token stream))
              (input-len (token-buf-fill-ptr buffer))
              (bstring (token-buf-string buffer)))
-    (cond (*read-suppress* nil)
-          (escape-appearedp
-           (simple-reader-error stream
-                                "An escape character appeared after #*."))
-          ((and numarg (zerop input-len) (not (zerop numarg)))
-           (simple-reader-error
-            stream
-            "You have to give a little bit for non-zero #* bit-vectors."))
-          ((or (null numarg) (>= numarg input-len))
-           (do ((bvec
-                 (make-array (or numarg input-len)
-                             :element-type 'bit
-                             :initial-element
-                             (if (and (plusp input-len)
-                                      (char= (char bstring (1- input-len)) #\1))
-                                 1 0)))
-                (i 0 (1+ i)))
-               ((= i input-len) bvec)
-             (declare (index i) (optimize (sb-c::insert-array-bounds-checks 0)))
-             (let ((char (char bstring i)))
-               (setf (elt bvec i)
-                     (case char
-                       (#\0 0)
-                       (#\1 1)
-                       (t (simple-reader-error
-                           stream "illegal element given for bit-vector: ~S"
-                           char)))))))
-          (t
-           (simple-reader-error
-            stream
-            "Bit vector is longer than specified length #~A*~A"
-            numarg
-            (copy-token-buf-string buffer))))))
+    (when *read-suppress* (return-from sharp-star nil))
+    (when escaped (simple-reader-error stream "An escape character appeared after #*."))
+    (when numarg
+      (cond ((and (not (eql numarg 0)) (zerop input-len))
+             (simple-reader-error
+              stream "#~D* requires at least 1 bit of input." numarg))
+            ((> input-len numarg)
+             (simple-reader-error
+              stream "Too many bits in ~S: expected ~D or fewer"
+              (copy-token-buf-string buffer) numarg)))
+      (when (eql numarg 0) (setq numarg nil)))
+    (let* ((fill (if numarg (logand (char-code (char bstring (1- input-len))) 1) 0))
+           (bvec (make-array (or numarg input-len)
+                             :element-type 'bit :initial-element fill)))
+      (do ((i 0 (1+ i)))
+          ((= i input-len) bvec)
+        (declare (index i) (optimize (sb-c::insert-array-bounds-checks 0)))
+        (let ((char (char bstring i)))
+          (setf (elt bvec i)
+                (case char
+                  (#\0 0)
+                  (#\1 1)
+                  (t (simple-reader-error
+                      stream "illegal element given for bit-vector: ~S"  char)))))))))
 
 (defun sharp-A (stream ignore rank)
   (declare (ignore ignore))
@@ -157,8 +148,9 @@
         (simple-reader-error stream
                              "~S is not a defined structure type."
                              (car body)))
-      (let ((default-constructor (dd-default-constructor
-                                  (layout-info (classoid-layout classoid)))))
+      (let ((default-constructor
+             (dd-default-constructor
+              (sb-kernel::wrapper-%info (classoid-wrapper classoid)))))
         (unless default-constructor
           (simple-reader-error
            stream
@@ -236,6 +228,9 @@
          ;; though the docs say this is undefined behavior, so it's ok,
          ;; other than it being something we should complain about
          ;; for portability reasons.
+         ;; Some other things that shouldn't work:
+         ;; * (read-from-string "#x a") => 10
+         ;; * (read-from-string "#x #+foo a b") => 11
          (let ((res (let ((*read-base* radix))
                       (read stream t nil t))))
            (unless (typep res 'rational)
@@ -280,7 +275,9 @@
                      `(let* ((old ,place)
                              (new (recurse old)))
                         (unless (eq old new)
-                          (setf ,place new)))))
+                          ,(if (eq (car place) '%instance-ref)
+                               `(%instance-set ,@(cdr place) new)
+                               `(setf ,place new))))))
           (typecase tree
             (cons
              (process (car tree))
@@ -294,25 +291,21 @@
             (instance
              ;; Don't refer to the DD-SLOTS unless there is reason to,
              ;; that is, unless some slot might be raw.
-             (if (/= +layout-all-tagged+ (layout-bitmap (%instance-layout tree)))
-                 (let ((dd (layout-info (%instance-layout tree))))
-                   (dolist (dsd (dd-slots dd))
-                     (when (eq (dsd-raw-type dsd) t)
-                       (process (%instance-ref tree (dsd-index dsd))))))
+             (if (sb-kernel::bitmap-all-taggedp (%instance-layout tree))
                  (do ((len (%instance-length tree))
                       (i sb-vm:instance-data-start (1+ i)))
                      ((>= i len))
-                   (process (%instance-ref tree i)))))
-             ;; It is not safe to iterate over %FUNCALLABLE-INSTANCE-INFO without knowing
-             ;; where the raw slots are, if any. We can safely process FSC-INSTANCE-SLOTS
-             ;; though, and that's the *only* slot to look at.
-             ;; No other funcallable structure (%METHOD-FUNCTION, INTERPRETED-FUNCTION, etc)
-             ;; has a reader syntax.
-             ;; ASSUMPTION: all funcallable structures have at least 1 slot beyond
-             ;; %FUNCALLABLE-INSTANCE-FUN (overlapping with FSC-INSTANCE-SLOTS)
-             ;; and that slot is never a raw slot.
+                   (process (%instance-ref tree i)))
+                 (let ((dd (wrapper-dd (%instance-wrapper tree))))
+                   (dolist (dsd (dd-slots dd))
+                     (when (eq (dsd-raw-type dsd) t)
+                       (process (%instance-ref tree (dsd-index dsd))))))))
+            ;; ASSUMPTION: all funcallable instances have at least 1 slot
+            ;; accessible via FUNCALLABLE-INSTANCE-INFO.
+            ;; The only such objects with reader syntax are CLOS objects,
+            ;; and those have exactly 1 slot in the primitive object.
             (funcallable-instance
-             (process (sb-pcl::%fsc-instance-slots tree))))))
+             (process (%funcallable-instance-info tree 0))))))
       tree)))
 
 ;;; Sharp-equal works as follows.
@@ -434,7 +427,6 @@
              'sb-kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
-    (let ((stream (in-stream-from-designator stream)))
       (macrolet ((munch (get-char &optional finish)
                    `(do ((level 1)
                          (prev ,get-char char)
@@ -453,7 +445,7 @@
             (prepare-for-fast-read-char stream
               (munch (fast-read-char) (done-with-fast-read-char)))
             ;; fundamental-stream
-            (munch (read-char stream t)))))))
+            (munch (read-char stream t))))))
 
 ;;;; a grab bag of other sharp readmacros: #', #:, and #.
 

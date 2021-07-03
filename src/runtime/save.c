@@ -19,7 +19,7 @@
 #include <sys/file.h>
 
 #include "sbcl.h"
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#ifdef LISP_FEATURE_WIN32
 #include "pthreads_win32.h"
 #else
 #include <signal.h>
@@ -77,7 +77,7 @@ write_lispobj(lispobj obj, FILE *file)
 }
 
 static void
-write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
+write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
 {
     if (compression == COMPRESSION_LEVEL_NONE) {
         while (bytes > 0) {
@@ -145,14 +145,23 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
     }
 };
 
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_64_BIT)
+#define FTELL _ftelli64
+#define FSEEK _fseeki64
+typedef __int64 ftell_type;
+#else
+#define FTELL ftell
+#define FSEEK fseek
+typedef long ftell_type;
+#endif
 
-static long write_bytes(FILE *file, char *addr, long bytes,
+static long write_bytes(FILE *file, char *addr, size_t bytes,
                         os_vm_offset_t file_offset, int compression)
 {
-    long here, data;
+    ftell_type here, data;
 
 #ifdef LISP_FEATURE_WIN32
-    long count;
+    size_t count;
     /* touch every single page in the space to force it to be mapped. */
     for (count = 0; count < bytes; count += 0x1000) {
         volatile int temp = addr[count];
@@ -160,12 +169,12 @@ static long write_bytes(FILE *file, char *addr, long bytes,
 #endif
 
     fflush(file);
-    here = ftell(file);
-    fseek(file, 0, SEEK_END);
-    data = ALIGN_UP(ftell(file), os_vm_page_size);
-    fseek(file, data, SEEK_SET);
+    here = FTELL(file);
+    FSEEK(file, 0, SEEK_END);
+    data = ALIGN_UP(FTELL(file), os_vm_page_size);
+    FSEEK(file, data, SEEK_SET);
     write_bytes_to_file(file, addr, bytes, compression);
-    fseek(file, here, SEEK_SET);
+    FSEEK(file, here, SEEK_SET);
     return ((data - file_offset) / os_vm_page_size) - 1;
 }
 
@@ -186,7 +195,12 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
     words = end - addr;
     write_lispobj(words, file);
 
-    bytes = words * sizeof(lispobj);
+#ifdef LISP_FEATURE_METASPACE
+    if (id == READ_ONLY_CORE_SPACE_ID)
+        bytes = (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START);
+    else
+#endif
+        bytes = words * sizeof(lispobj);
 
 #ifdef LISP_FEATURE_CHENEYGC
     /* KLUDGE: cheneygc can not restart a saved core if the dynamic space is empty,
@@ -245,7 +259,7 @@ void unwind_binding_stack()
     int i;
     if (!sym || !simple_vector_p(value = ((struct symbol*)sym)->value))
         fprintf(stderr, "warning: bad value in %s\n", symbol_name);
-    else for(i=fixnum_value(VECTOR(value)->length)-1; i>=0; --i)
+    else for(i=vector_len(VECTOR(value))-1; i>=0; --i)
         SYMBOL(VECTOR(value)->data[i])->value = UNBOUND_MARKER_WIDETAG;
     if (verbose) printf("done]\n");
 }
@@ -265,7 +279,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
         fflush(stdout);
     }
 
-    os_vm_offset_t core_start_pos = ftell(file);
+    os_vm_offset_t core_start_pos = FTELL(file);
     write_lispobj(CORE_MAGIC, file);
 
     /* If 'save_runtime_options' is specified then the saved thread stack size
@@ -306,6 +320,14 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  static_space_free_pointer,
                  core_start_pos,
                  core_compression_level);
+#ifdef LISP_FEATURE_DARWIN_JIT
+    output_space(file,
+                 STATIC_CODE_CORE_SPACE_ID,
+                 (lispobj *)STATIC_CODE_SPACE_START,
+                 static_code_space_free_pointer,
+                 core_start_pos,
+                 core_compression_level);
+#endif
     output_space(file,
                  DYNAMIC_CORE_SPACE_ID,
                  current_dynamic_space,

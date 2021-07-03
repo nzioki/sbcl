@@ -9,9 +9,8 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS += -m32
+CFLAGS += -m32 -std=gnu99
 LINKFLAGS += -m32 -Wl,--export-dynamic
-NM = ./linux-nm
 
 ASSEM_SRC = ppc-assem.S
 ARCH_SRC = ppc-arch.c

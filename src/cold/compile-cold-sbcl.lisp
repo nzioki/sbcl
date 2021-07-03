@@ -13,8 +13,17 @@
 
 (in-package "SB-COLD")
 
+;;; FIXME: I think it's a mistake that we load muffler twice in
+;;; make-host-2 (once for the host, once for XC), because the host
+;;; should produce no new warnings, and because it's really hard
+;;; to think straight when you figure that we're using the host's
+;;; SIGNAL and type system but mixing it with our types.
+;;; We can just bake in some behavior to the cross-compiler never to warn
+;;; about sh*t that we think isn't warning-worthy.
+;;; (i.e. do it in source code using #[-+]sb-xc-host).
+;;; The target compiler will still get everything as usual.
 (let ((*features* (cons :sb-xc *features*)))
-  (load "src/cold/muffler.lisp"))
+  (load (sb-cold:find-bootstrap-file "^muffler")))
 
 ;;; Ordinarily the types carried around as "handled conditions" while compiling
 ;;; have been parsed into internal CTYPE objects. However, using parsed objects
@@ -181,9 +190,10 @@
    (let ((sb-xc:*compile-print* nil))
      (if (make-host-2-parallelism)
          (funcall 'parallel-make-host-2 (make-host-2-parallelism))
-         (let ((total
+         (let ((total-files
                 (count-if (lambda (x) (not (find :not-target (cdr x))))
                           (get-stems-and-flags 2)))
+               (total-time 0)
                (n 0)
                (sb-xc:*compile-verbose* nil))
            ;; Workaround memory exhaustion in SB-FASTEVAL.
@@ -193,6 +203,16 @@
            (with-math-journal
             (do-stems-and-flags (stem flags 2)
               (unless (position :not-target flags)
-                (format t "~&[~D/~D] ~A" (incf n) total (stem-remap-target stem))
-                (target-compile-stem stem flags)
-                (terpri)))))))))
+                (format t "~&[~3D/~3D] ~40A" (incf n) total-files (stem-remap-target stem))
+                (let ((start (get-internal-real-time)))
+                  (target-compile-stem stem flags)
+                  (let ((elapsed (/ (- (get-internal-real-time) start)
+                                    internal-time-units-per-second)))
+                    (format t " (~f sec)~%" elapsed)
+                    (incf total-time elapsed)))
+                ;; The specialized array registry has file-wide scope. Hacking that aspect
+                ;; into the xc build scaffold seemed slightly easier than hacking the
+                ;; compiler (i.e. making the registry a slot of the fasl-output struct)
+                (clear-specialized-array-registry)))
+             (format t "~&~50t ~f~%" total-time))
+           (sb-c::dump/restore-interesting-types 'write))))))

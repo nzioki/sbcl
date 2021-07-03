@@ -30,8 +30,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -74,11 +72,6 @@ int arch_os_thread_init(struct thread *thread) {
                           ((entry_number << 3) + 3));
 
     if(entry_number < 0) return 0;
-#ifdef LISP_FEATURE_GCC_TLS
-    current_thread = thread;
-#else
-    pthread_setspecific(specials,thread);
-#endif
 #endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
@@ -95,7 +88,7 @@ int arch_os_thread_init(struct thread *thread) {
 }
 
 struct thread *debug_get_fs() {
-    register u32 fs;
+    register uint32_t fs;
     __asm__ __volatile__ ("movl %%fs,%0" : "=r" (fs)  : );
     return (struct thread *)fs;
 }

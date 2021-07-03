@@ -423,10 +423,11 @@ is not of type
 
 ;;; Instances of LAYOUT for condition classoids created by genesis
 ;;; should resemble ones created normally. Due to a bug, they did not.
+;;; (The LENGTH slot had the wrong value)
 (with-test (:name :condition-layout-lengths)
-  (loop for layout being each hash-value of (sb-kernel:classoid-subclasses
-                                             (sb-kernel:find-classoid 'condition))
-        for len = (sb-kernel:layout-length layout)
+  (loop for wrapper being each hash-value of (sb-kernel:classoid-subclasses
+                                              (sb-kernel:find-classoid 'condition))
+        for len = (sb-kernel:wrapper-length wrapper)
         minimize len into min
         maximize len into max
         finally (assert (= min max))))
@@ -438,7 +439,8 @@ is not of type
     (assert (string= (write-to-string error :escape nil)
                      "odd-length initializer list: (:A 1 :B)."))))
 
-(with-test (:name :type-error-on-dx-object)
+(with-test (:name :type-error-on-dx-object
+            :skipped-on :interpreter)
   (handler-case
     (sb-int:dx-let ((a (make-array 3)))
       (setf (aref a 0) a)
@@ -446,3 +448,23 @@ is not of type
     (error (e)
       (assert (equal (sb-kernel:type-error-datum-stored-type e)
                      '(simple-vector 3))))))
+
+(with-test (:name (:handler-bind-evaluation-count :lp1916302))
+  (let (list)
+    (handler-bind ((condition (let ((x 0))
+                                (lambda (c)
+                                  (declare (ignore c))
+                                  (push (incf x) list)))))
+      (signal 'condition)
+      (signal 'condition))
+    (assert (equalp '(2 1) list))))
+
+(with-test (:name (:handler-bind-evaluation-count :separate-establishment))
+  (let (list)
+    (dotimes (i 2)
+      (handler-bind ((condition (let ((x 0))
+                                  (lambda (c)
+                                    (declare (ignore c))
+                                    (push (incf x) list)))))
+        (signal 'condition)))
+    (assert (equalp '(1 1) list))))

@@ -200,8 +200,6 @@ about function addresses and register values.")
 (define-arg-type branch-fp-condition
   :printer (coerce branch-fp-conditions 'vector))
 
-(define-arg-type call-fixup :use-label t)
-
 (deftype fp-branch-condition ()
   `(member ,@branch-fp-conditions))
 
@@ -247,7 +245,7 @@ about function addresses and register values.")
   #'equalp)
 
 (defconstant-eqx integer-cond-reg-name-vec
-  (coerce integer-condition-registers 'vector)
+  #.(coerce integer-condition-registers 'vector)
   #'equalp)
 
 (deftype integer-condition-register ()
@@ -310,7 +308,7 @@ about function addresses and register values.")
   #'equalp)
 
 (defconstant-eqx fp-cond-reg-name-vec
-  (coerce fp-condition-registers 'vector)
+  #.(coerce fp-condition-registers 'vector)
   #'equalp)
 
 (defparameter fp-condition-reg-symbols
@@ -487,7 +485,7 @@ about function addresses and register values.")
   #'equalp)
 
 (defconstant-eqx cond-move-cond-reg-name-vec
-  (coerce cond-move-condition-registers 'vector)
+  #.(coerce cond-move-condition-registers 'vector)
   #'equalp)
 
 (deftype cond-move-condition-register ()
@@ -1940,3 +1938,49 @@ about function addresses and register values.")
   (define-cond-fp-move-integer fmovrs #b0101)
   (define-cond-fp-move-integer fmovrd #b0110 :extended t)
   (define-cond-fp-move-integer fmovrq #b0111 :extended t))
+
+(define-instruction-macro load-layout-id (reg layout)
+  `(without-scheduling ()
+     (inst .layout-id-fixup ,layout)
+     (inst sethi ,reg 0)
+     (inst add ,reg #x3ff)))
+
+;;; The architectures which use the scheduler get angry if DEFINE-INSTRUCTION
+;;; lacks the read/write dependency specifications.
+;;; But this isn't a real instruction, it's just marks where to fixup.
+(sb-assem::%def-inst-encoder
+ '.layout-id-fixup
+ (lambda (segment layout)
+   (sb-c:note-fixup segment :sethi+add (sb-c:make-fixup layout :layout-id))))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  (let ((sap (code-instructions code)))
+    (ecase kind
+      (:call
+       (error "Can't deal with CALL fixups, yet."))
+      (:sethi
+       (setf (ldb (byte 22 0) (sap-ref-32 sap offset))
+             (ldb (byte 22 10) value)))
+      (:add
+       (setf (ldb (byte 10 0) (sap-ref-32 sap offset))
+             (ldb (byte 10 0) value)))
+      (:sethi+add
+       (sb-vm:fixup-code-object code offset value :sethi flavor)
+       (sb-vm:fixup-code-object code (+ offset 4) value :add flavor))
+      (:absolute
+       (setf (sap-ref-32 sap offset) value))))
+  nil)
+
+(define-instruction store-coverage-mark (segment path-index)
+  (:delay 0)
+  (:emitter
+   ;; This just barely works- INDEX has to fit in (SIGNED-BYTE 13).
+   ;; Honestly I don't care about SPARC, and neither should you.
+   (let ((offset (+ (component-header-length)
+                    n-word-bytes ; skip over jump table word
+                    path-index
+                    (- other-pointer-lowtag))))
+     (inst* segment 'stb sb-vm::null-tn sb-vm::code-tn offset))))

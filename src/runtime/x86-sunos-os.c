@@ -9,8 +9,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -101,8 +99,6 @@ int arch_os_thread_init(struct thread *thread) {
   __asm__ __volatile__ ("mov %0, %%fs" : : "r"(sel));
 
   thread->tls_cookie = sel;
-  pthread_setspecific(specials,thread);
-
 #endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK

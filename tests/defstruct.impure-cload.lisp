@@ -12,6 +12,11 @@
 (eval-when (:compile-toplevel)
   (load "compiler-test-util.lisp"))
 
+;;; This test asserts that each constructor for a defstruct involved in a
+;;; mutually referential cycle with other defstructs inlines the test of the
+;;; as-yet-unseen type when the DEFSTRUCT form is first read.
+;;; We can tell that they're inlined because they use layout-IDs, so the only
+;;; boxed constant is for the constructor to deposit a layout.
 (with-test (:name (:block-compile :defstruct-slot-type-circularity))
   (with-scratch-file (fasl "fasl")
     (compile-file "block-compile-defstruct-test.lisp" :output-file fasl :block-compile t)
@@ -19,30 +24,19 @@
   (dolist (symbol '(make-s1 make-s2 make-s3))
     (let ((constants
            (ctu:find-code-constants (symbol-function symbol)
-                                    :type 'sb-kernel:layout)))
-      (assert (= (length constants) 3)))))
-
-;;; Check an organic (not contrived) use of mutually referential types.
-;;; NEWLINE is defined after SECTION-START, because it is a subtype.
-;;; One of SECTION-START's slot setters refers to type NEWLINE.
-(with-test (:name :pretty-stream-structs)
-  (let ((layouts
-         (ctu:find-code-constants #'(setf sb-pretty::section-start-section-end)
-                                  :type 'sb-kernel:layout)))
-    ;; expect 3 layouts: one for SECTION-START to check the instance itself,
-    ;; one for NEWLINE and one for BLOCK-END.
-    ;; It's entirely coincidental that the above test also has 3.
-    (assert (= (length layouts) 3))
-    (assert (find (sb-kernel:find-layout 'sb-pretty::newline)
-                  layouts))))
+                                    :type 'sb-kernel:wrapper)))
+      (assert (= (length constants) 1)))))
 
 (with-test (:name :mutex-owner-typecheck)
   (let ((layouts
          (ctu:find-code-constants #'(setf sb-thread::mutex-%owner)
-                                  :type 'sb-kernel:layout)))
-    ;; expect 3 layouts: one for THREAD, one for MUTEX, and one for FOREIGN-THREAD
-    (assert (= (length layouts) 3))
-    (assert (find (sb-kernel:find-layout 'sb-thread:thread)
+                                  :type 'sb-kernel:wrapper)))
+    ;; expect exactly 1 layout, that of MUTEX, for signaling OBJECT-NOT-TYPE.
+    ;; To be really pedantic we'd want to assert that in the source file
+    ;; the defstruct of MUTEX appears prior to the defstruct of THREAD,
+    ;; proving without a doubt that block compilation worked.
+    (assert (= (length layouts) 1))
+    (assert (find (sb-kernel:find-layout 'sb-thread:mutex)
                   layouts))))
 
 (defstruct (parent)
@@ -88,7 +82,7 @@ Evaluation took:
 (with-test (:name :no-equalp-calls)
   (dolist (type '(parent child child2))
     (let* ((equalp-impl
-            (sb-kernel:layout-equalp-impl (sb-kernel:find-layout type)))
+            (sb-kernel:wrapper-equalp-impl (sb-kernel:find-layout type)))
            (constants
             (ctu:find-code-constants equalp-impl)))
       (case type

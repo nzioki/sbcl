@@ -26,6 +26,16 @@
  (dovector (pair *!initial-parsed-types*)
    (destructuring-bind (spec . parse) pair
      (drop-all-hash-caches) ; start from a relative vacuum
-     (aver (equal (type-specifier parse) spec)))))
+     (unless (sb-kernel::brute-force-type-specifier-equalp (type-specifier parse) spec)
+       (let ((*print-length* nil))
+         (write-string "parse/unparse: ")
+         (terpri)
+         (write spec)
+         (terpri)
+         (write parse)
+         (terpri)
+         (write (type-specifier parse))
+         (terpri)
+         (bug "type parsed->unparse round-trip fail"))))))
 
 (!defun-from-collected-cold-init-forms !fixup-type-cold-init)

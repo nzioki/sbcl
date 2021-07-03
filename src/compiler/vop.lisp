@@ -354,9 +354,6 @@
   (constants (make-array 10 :fill-pointer 1 :adjustable t
                          :initial-element :ignore)
              :type vector :read-only t)
-  ;; some kind of info about the component's run-time representation.
-  ;; This is filled in by the VM supplied SELECT-COMPONENT-FORMAT function.
-  format
   ;; a list of the ENTRY-INFO structures describing all of the entries
   ;; into this component. Filled in by entry analysis.
   (entries nil :type list)
@@ -396,7 +393,7 @@
   ;; some string that is intended to be informative.
   (name "<not computed>" :type (or simple-string list symbol))
   ;; the argument list that the function was defined with.
-  (arguments nil :type list)
+  (arguments :unknown :type (or list (eql :unknown)))
   ;; source form and/or docstring
   (form/doc nil :type (or list string (cons t string)))
   ;; a function type specifier representing the arguments and results
@@ -576,6 +573,10 @@
   (target nil :type (or null tn-ref))
   ;; the load TN allocated for this operand, if any
   (load-tn nil :type (or tn null))
+  ;; on CISC microprocessors, a representation of the memory load
+  ;; (or store) based on this TN-REF (for which its TN is the base register)
+  ;; and not directly an operand from/into which the TN-REF flows.
+  (memory-access)
   ;; The type of the LVAR the TN of this TN-REF is used for.
   (type nil :type (or ctype null)))
 
@@ -731,7 +732,12 @@
   ;; MAX-VOP-TN-REFS) and the dest ref index.
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1)))
   (optimizer nil :type (or null function))
+  (optional-results nil :type list)
   move-vop-p)
+(declaim (inline vop-name))
+(defun vop-name (vop)
+  (declare (type vop vop))
+  (vop-info-name (vop-info vop)))
 
 ;; These printers follow the definition of VOP-INFO because they
 ;; want to inline VOP-INFO-NAME, and it's less code to move them here
@@ -744,12 +750,8 @@
 (defprinter (tn-ref)
   tn
   write-p
-  (vop :test vop :prin1 (vop-info-name (vop-info vop))))
+  (vop :test vop :prin1 (vop-name vop)))
 
-(declaim (inline vop-name))
-(defun vop-name (vop)
-  (declare (type vop vop))
-  (vop-info-name (vop-info vop)))
 
 ;;;; SBs and SCs
 
@@ -850,7 +852,8 @@
 ;;; The compiler will never look at the toplevel value though.
 (defvar *finite-sbs*
   #-sb-xc-host
-  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)))
+  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)
+              :initial-element (make-unbound-marker)))
 #-sb-xc-host
 (progn
   (declaim (type (simple-vector #.(length *finite-sbs*)) *finite-sbs*)
@@ -1110,8 +1113,7 @@
             (:copier nil))
   ;; the IR2-BLOCK that this structure represents the conflicts for
   (block (missing-arg) :type ir2-block)
-  ;; thread running through all the GLOBAL-CONFLICTSs for BLOCK. This
-  ;; thread is sorted by TN number
+  ;; thread running through all the GLOBAL-CONFLICTSs for BLOCK.
   (next-blockwise nil :type (or global-conflicts null))
   ;; the way that TN is used by BLOCK
   ;;

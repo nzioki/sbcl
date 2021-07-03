@@ -211,7 +211,7 @@
     (setf (gethash #\a tbl) 1)
     #+64-bit (setf (gethash 1.0f0 tbl) 1) ; single-float is a nonpointer
     (let ((data (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))))
-      (assert (not (logtest data sb-vm:vector-addr-hashing-subtype))))))
+      (assert (not (logtest data sb-vm:vector-addr-hashing-flag))))))
 
 (with-test (:name (hash-table :small-rehash-size))
   (let ((ht (make-hash-table :rehash-size 2)))
@@ -227,10 +227,10 @@
     ;; verify that EQ hashing on symbols is address-sensitive
     (let ((h (make-hash-table :test 'eq)))
       (setf (gethash 'foo h) 1)
-      (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-subtype)))
+      (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag)))
     (let ((h (make-hash-table :test 'eq :hash-function 'sb-kernel:symbol-hash)))
       (setf (gethash 'foo h) 1)
-      (assert (not (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-subtype))))
+      (assert (not (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag))))
 
     ;; Verify that any standard hash-function on a function is address-sensitive,
     ;; but a custom hash function makes it not so.
@@ -240,13 +240,13 @@
     (dolist (test '(eq eql equal equalp))
       (let ((h (make-hash-table :test test)))
         (setf (gethash #'car h) 1)
-        (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-subtype)))
+        (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag)))
       (let ((h (make-hash-table :test test :hash-function
                                 (lambda (x)
                                   (sb-kernel:%code-serialno
                                    (sb-kernel:fun-code-header x))))))
         (setf (gethash #'car h) 1)
-        (assert (not (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-subtype)))))))
+        (assert (not (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag)))))))
 
 (defun hash-table-freelist (tbl)
   (sb-int:named-let chain ((index (sb-impl::hash-table-next-free-kv tbl)))
@@ -271,6 +271,7 @@
     ;; Ensure the values remain outside of the stack pointer for scrub-control-stack to work
     (declare (notinline f))
     (f))
+  (eval nil)
   (sb-sys:scrub-control-stack)
   (gc)
   ;; There were 20 items REMHASHed plus the freelist contains a pointer
@@ -353,8 +354,8 @@
 ;;; This affected the performance of TYPECASE.
 (with-test (:name :sxhash-on-layout)
   (dolist (x '(pathname cons array))
-    (let ((l (sb-kernel:find-layout x)))
-      (assert (= (sxhash l) (sb-kernel::layout-clos-hash l))))))
+    (let ((l (sb-kernel:wrapper-friend (sb-kernel:find-layout x))))
+      (assert (= (sxhash l) (sb-kernel:layout-clos-hash l))))))
 
 (with-test (:name :equalp-table-fixnum-equal-to-float)
   (let ((table (make-hash-table :test #'equalp)))
@@ -396,3 +397,7 @@
     ;; and it's extremely dubious that we're totally silent here.
     ;; Also the same issue exists with bit-vectors.
     (assert-error (sxhash displaced-string))))
+
+(with-test (:name :array-psxhash-non-consing :skipped-on :interpreter)
+   (let ((a (make-array 1000 :element-type 'double-float)))
+     (ctu:assert-no-consing (sb-int:psxhash a))))

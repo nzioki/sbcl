@@ -95,7 +95,7 @@
     (link-blocks node-block next-block)))
 
 ;;; an annotated lvar's primitive-type
-#-sb-fluid (declaim (inline lvar-ptype))
+(declaim (inline lvar-ptype))
 (defun lvar-ptype (lvar)
   (declare (type lvar lvar))
   (ir2-lvar-primitive-type (lvar-info lvar)))
@@ -198,6 +198,11 @@
            (setf (node-tail-p call) nil))))
   (values))
 
+(defun signal-delayed-combination-condition (call)
+  (let ((*compiler-error-context* call)
+        (delayed (combination-info call)))
+    (apply #'funcall delayed)))
+
 ;;; We set the kind to :FULL or :FUNNY, depending on whether there is
 ;;; an IR2-CONVERT method. If a funny function, then we inhibit tail
 ;;; recursion normally, since the IR2 convert method is going to want
@@ -225,6 +230,8 @@
        (setf (node-tail-p call) nil))
       (t
        (when (eq kind :error)
+         (when (basic-combination-info call)
+           (signal-delayed-combination-condition call))
          (setf (basic-combination-kind call) :full))
        (setf (basic-combination-info call) :full)
        (rewrite-full-call call))))
@@ -369,13 +376,13 @@
                       (primitive-types))
               (let ((n-values (nth-value 1 (values-types
                                             (lvar-derived-type arg)))))
-                (loop for (prim-type . lvar-type) = (pop types)
-                      repeat n-values
+                (loop repeat n-values
                       do
-                      (primitive-types (or prim-type
-                                           *backend-t-primitive-type*))
-                      (lvar-types (or lvar-type
-                                      *universal-type*)))
+                      (destructuring-bind (&optional prim-type . lvar-type) (pop types)
+                        (primitive-types (or prim-type
+                                             *backend-t-primitive-type*))
+                        (lvar-types (or lvar-type
+                                        *universal-type*))))
                 (annotate-fixed-values-lvar
                  arg
                  (primitive-types) (lvar-types))))))))
@@ -472,6 +479,16 @@
       (annotate-unknown-values-lvar value)))
   (values))
 
+(defun ltn-analyze-enclose (node)
+  (declare (type enclose node))
+  (let ((lvar (node-lvar node)))
+    (when lvar ; only DX encloses use lvars.
+      (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
+        (setf (lvar-info lvar) info)
+        (setf (ir2-lvar-kind info) :delayed)
+        (setf (ir2-lvar-stack-pointer info)
+              (make-stack-pointer-tn))))))
+
 ;;; We need a special method for %UNWIND-PROTECT that ignores the
 ;;; cleanup function. We don't annotate either arg, since we don't
 ;;; need them at run-time.
@@ -567,6 +584,26 @@
         (unless (operand-restriction-ok type (lvar-ptype arg)
                                         :lvar arg)
           (return nil))))))
+(defun diagnose-template-args (template call)
+  ;; Scan all except the MORE args. If you've managed to create not-ok MORE args,
+  ;; you're probably smart enough to figure it out on your own.
+  (let ((args (basic-combination-args call))
+        (types (template-arg-types template)))
+    (unless (= (length args) (length types))
+      (return-from diagnose-template-args "bad length"))
+    (do ((args args (cdr args))
+         (i 0 (1+ i))
+         (any-fail nil)
+         (types types (cdr types)))
+        ((null types) any-fail)
+      (let* ((arg (car args))
+             (type (car types))
+             (ok (operand-restriction-ok type (lvar-ptype arg) :lvar arg)))
+        (let ((*print-pretty* nil))
+          (format t "arg~d: is ~s need ~s, ~a~%" i
+                  (primitive-type-name (lvar-ptype arg))
+                  type (if ok "OK" "FAIL")))
+        (unless ok (setq any-fail :fail))))))
 
 ;;; Check that TEMPLATE can be used with the specifed RESULT-TYPE.
 ;;; Result type checking is pretty different from argument type
@@ -622,7 +659,7 @@
   (let* ((guard (template-guard template))
          (lvar (node-lvar call))
          (dtype (node-derived-type call)))
-    (cond ((and guard (not (funcall guard)))
+    (cond ((and guard (not (funcall guard call)))
            (values nil :guard))
           ((not (template-args-ok template call safe-p))
            (values nil
@@ -787,9 +824,9 @@
                             (template-or-lose 'call-named)))
                        *efficiency-note-cost-threshold*)))
       (dolist (try (fun-info-templates (basic-combination-fun-info call)))
-        (when (> (template-cost try) max-cost) (return)) ; FIXME: UNLESS'd be cleaner.
+        (when (> (template-cost try) max-cost) (return))
         (let ((guard (template-guard try)))
-          (when (and (or (not guard) (funcall guard))
+          (when (and (or (not guard) (funcall guard call))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
                      (not (and (eq ltn-policy :safe)
@@ -977,6 +1014,7 @@
       (exit (ltn-analyze-exit node))
       (cset (ltn-analyze-set node))
       (cast (ltn-analyze-cast node))
+      (enclose (ltn-analyze-enclose node))
       (mv-combination
        (ecase (basic-combination-kind node)
          (:local

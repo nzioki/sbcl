@@ -38,11 +38,9 @@
   (documentation nil :type (or string null)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (/show0 "condition.lisp 103")
   (let ((condition-class (find-classoid 'condition)))
     (setf (condition-classoid-cpl condition-class)
-          (list condition-class)))
-  (/show0 "condition.lisp 103"))
+          (list condition-class))))
 
 (setf (condition-classoid-report (find-classoid 'condition))
       (lambda (cond stream)
@@ -68,17 +66,21 @@
          ;; right thing is..
          (new-inherits
           (order-layout-inherits (concatenate 'simple-vector
-                                              (layout-inherits cond-layout)
-                                              (mapcar #'classoid-layout cpl)))))
+                                              (wrapper-inherits cond-layout)
+                                              (mapcar #'classoid-wrapper cpl)))))
     (if (and olayout
-             (not (mismatch (layout-inherits olayout) new-inherits)))
+             (not (mismatch (wrapper-inherits olayout) new-inherits)))
         olayout
+        ;; All condition classoid layouts carry the same LAYOUT-INFO - the defstruct
+        ;; description for CONDITION - which is a representation of the primitive object
+        ;; and not the lisp-level object.
         (make-layout (hash-layout-name name)
                      (make-undefined-classoid name)
+                     :info (wrapper-info cond-layout)
                      :flags +condition-layout-flag+
                      :inherits new-inherits
                      :depthoid -1
-                     :length (layout-length cond-layout)))))
+                     :length (wrapper-length cond-layout)))))
 
 ) ; EVAL-WHEN
 
@@ -148,7 +150,7 @@
 
 (defun set-condition-slot-value (condition new-value name)
   (dolist (cslot (condition-classoid-class-slots
-                  (layout-classoid (%instance-layout condition)))
+                  (wrapper-classoid (%instance-wrapper condition)))
                  (setf (getf (condition-assigned-slots condition) name)
                        new-value))
     (when (eq (condition-slot-name cslot) name)
@@ -157,7 +159,7 @@
 (defun condition-slot-value (condition name)
   (let ((val (getf (condition-assigned-slots condition) name sb-pcl:+slot-unbound+)))
     (if (unbound-marker-p val)
-        (let ((class (layout-classoid (%instance-layout condition))))
+        (let ((class (wrapper-classoid (%instance-wrapper condition))))
           (dolist (cslot
                    (condition-classoid-class-slots class)
                    (let ((instance-length (%instance-length condition))
@@ -213,11 +215,11 @@
     (flet ((stream-err-p (layout)
              (let ((stream-err-layout (load-time-value (find-layout 'stream-error))))
                (or (eq layout stream-err-layout)
-                   (find stream-err-layout (layout-inherits layout)))))
+                   (find stream-err-layout (wrapper-inherits layout)))))
            (type-err-p (layout)
              (let ((type-err-layout (load-time-value (find-layout 'type-error))))
                (or (eq layout type-err-layout)
-                   (find type-err-layout (layout-inherits layout)))))
+                   (find type-err-layout (wrapper-inherits layout)))))
            ;; avoid full calls to STACK-ALLOCATED-P here
            (stackp (x)
              (let ((addr (get-lisp-obj-address x)))
@@ -227,7 +229,7 @@
       (let* ((any-dx
               (loop for arg-index from 1 below (length initargs) by 2
                     thereis (stackp (fast-&rest-nth arg-index initargs))))
-             (layout (classoid-layout classoid))
+             (layout (classoid-wrapper classoid))
              (extra (if (and any-dx (type-err-p layout)) 2 0)) ; space for secret initarg
              (instance (%make-instance (+ sb-vm:instance-data-start
                                           1 ; ASSIGNED-SLOTS
@@ -237,11 +239,11 @@
              (arg-index 0)
              (have-type-error-datum)
              (type-error-datum))
-        (setf (%instance-layout instance) layout
+        (setf (%instance-wrapper instance) layout
               (condition-assigned-slots instance) nil)
         (macrolet ((store-pair (key val)
-                     `(setf (%instance-ref instance data-index) ,key
-                            (%instance-ref instance (1+ data-index)) ,val)))
+                     `(progn (%instance-set instance data-index ,key)
+                             (%instance-set instance (1+ data-index) ,val))))
           (cond ((not any-dx)
                  ;; uncomplicated way
                  (loop (when (>= arg-index (length initargs)) (return))
@@ -632,8 +634,8 @@
   ((datum :reader type-error-datum :initarg :datum)
    (expected-type :reader type-error-expected-type :initarg :expected-type)
    (context :initform nil :reader type-error-context :initarg :context))
-  (:report
-   (lambda (condition stream)
+  (:report report-general-type-error))
+(defun report-general-type-error (condition stream)
      (let ((type (type-error-expected-type condition)))
        (format stream  "~@<The value ~
                       ~@:_~2@T~S ~
@@ -643,7 +645,7 @@
                (type-error-datum condition)
                type
                (decode-type-error-context (type-error-context condition)
-                                          type))))))
+                                          type))))
 
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
@@ -964,7 +966,15 @@
                      (constant-modified-fun-name c)
                      (constant-modified-values c))))
   (:default-initargs :references '((:ansi-cl :special-operator quote)
-                                   (:ansi-cl :section (3 2 2 3)))))
+                                   (:ansi-cl :section (3 7 1)))))
+
+(define-condition macro-arg-modified (constant-modified)
+  ((variable :initform nil :initarg :variable :reader macro-arg-modified-variable))
+  (:report (lambda (c s)
+             (format s "~@<Destructive function ~S called on a macro argument: ~S.~:>"
+                     (constant-modified-fun-name c)
+                     (macro-arg-modified-variable c))))
+  (:default-initargs :references nil))
 
 (define-condition package-at-variance (reference-condition simple-warning)
   ()
@@ -995,7 +1005,11 @@
   ()
   (:default-initargs
       :references '((:ansi-cl :function make-array)
-                    (:ansi-cl :function sb-xc:upgraded-array-element-type))))
+                    (:ansi-cl :function upgraded-array-element-type))))
+
+(define-condition initial-element-mismatch-style-warning
+    (array-initial-element-mismatch simple-style-warning)
+  ())
 
 (define-condition type-warning (reference-condition simple-warning)
   ()
@@ -1169,6 +1183,33 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
       :references
       (list '(:ansi-cl :function adjust-array))))
 
+(define-condition uninitialized-element-error (cell-error) ()
+  (:report
+   (lambda (condition stream)
+     ;; NAME is a cons of the array and index
+     (destructuring-bind (array . index) (cell-error-name condition)
+       (declare (ignorable index))
+       #+ubsan
+       (let* ((origin-pc
+               (ash (sb-vm::vector-extra-data
+                     (if (simple-vector-p array)
+                         array
+                         (sb-vm::vector-extra-data array)))
+                    -3)) ; XXX: ubsan magic
+              (origin-code (sb-di::code-header-from-pc (int-sap origin-pc))))
+         (let ((*print-array* nil))
+           (format stream "Element ~D of array ~_~S ~_was not assigned a value.~%Origin=~X"
+                   index array (or origin-code origin-pc))))
+       #-ubsan
+       ;; FOLD-INDEX-ADDRESSING could render INDEX wrong. There's no way to know.
+       (let ((*print-array* nil))
+         (format stream "Uninitialized element accessed in array ~S"
+                 array))))))
+
+
+;;; We signal this one for SEQUENCE operations, but INVALID-ARRAY-INDEX-ERROR
+;;; for arrays. Might it be better to use the above condition for operations
+;;; on SEQUENCEs that happen to be arrays?
 (define-condition index-too-large-error (type-error)
   ((sequence :initarg :sequence))
   (:report
@@ -1224,7 +1265,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                      "An attempt to access an array of element-type ~
                       NIL was made.  Congratulations!")))
   (:default-initargs
-      :references '((:ansi-cl :function sb-xc:upgraded-array-element-type)
+      :references '((:ansi-cl :function upgraded-array-element-type)
                     (:ansi-cl :section (15 1 2 1))
                     (:ansi-cl :section (15 1 2 2)))))
 
@@ -1355,7 +1396,7 @@ longer than permitted by the deadline."))
   ()
   (:default-initargs
    :format-control
-   #.(sb-xc:macroexpand-1 ; stuff in a literal #<fmt-control>
+   #.(macroexpand-1 ; stuff in a literal #<fmt-control>
       '(sb-format:tokens "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
      be both the name of a type and the name of a declaration"))
    :references '((:ansi-cl :section (3 8 21)))))
@@ -1598,9 +1639,7 @@ the usual naming convention (names like *FOO*) for special variables"
     (dubious-asterisks-around-variable-name)
   ())
 
-(define-condition &optional-and-&key-in-lambda-list
-    (style-warning simple-condition)
-  ())
+(define-condition &optional-and-&key-in-lambda-list (simple-style-warning) ())
 
 ;; We call this UNDEFINED-ALIEN-STYLE-WARNING because there are some
 ;; subclasses of ERROR above having to do with undefined aliens.
@@ -1902,15 +1941,20 @@ the restart does not exist."))
 
 (define-condition case-failure (type-error)
   ((name :reader case-failure-name :initarg :name)
+   ;; This is an internal symbol of SB-KERNEL, so I can't imagine that anyone
+   ;; expects an invariant that it be a list.
    (possibilities :reader case-failure-possibilities :initarg :possibilities))
   (:report
    (lambda (condition stream)
-     (let ((*print-escape* t))
-       (format stream "~@<~S fell through ~S expression.~@[ ~
+     (let ((possibilities (case-failure-possibilities condition)))
+       (if (symbolp possibilities)
+           (report-general-type-error condition stream)
+           (let ((*print-escape* t))
+             (format stream "~@<~S fell through ~S expression.~@[ ~
                       ~:_Wanted one of (~/pprint-fill/).~]~:>"
-               (type-error-datum condition)
-               (case-failure-name condition)
-               (case-failure-possibilities condition))))))
+                     (type-error-datum condition)
+                     (case-failure-name condition)
+                     (case-failure-possibilities condition))))))))
 
 (define-condition compiled-program-error (program-error)
   ((message :initarg :message :reader program-error-message)
@@ -1923,7 +1967,15 @@ the restart does not exist."))
                        (program-error-message condition)))))
 
 (define-condition simple-control-error (simple-condition control-error) ())
-(define-condition simple-file-error    (simple-condition file-error)    ())
+
+(define-condition simple-file-error (simple-condition file-error)
+  ((message :initarg :message :reader simple-file-error-message :initform nil))
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<~?~@[: ~2I~_~A~]~@:>"
+             (simple-condition-format-control condition)
+             (simple-condition-format-arguments condition)
+             (simple-file-error-message condition)))))
 
 (defun %file-error (pathname &optional datum &rest arguments)
   (typecase datum
@@ -1932,9 +1984,26 @@ the restart does not exist."))
                                               :format-arguments arguments))
     (t (apply #'error datum :pathname pathname arguments))))
 
-(define-condition file-exists (simple-file-error) ())
-(define-condition file-does-not-exist (simple-file-error) ())
-(define-condition delete-file-error (simple-file-error) ())
+(define-condition file-exists (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<The file ~S already exists~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
+
+(define-condition file-does-not-exist (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<The file ~S does not exist~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
+
+(define-condition delete-file-error (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<Could not delete the file ~S~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
 
 (define-condition simple-stream-error (simple-condition stream-error) ())
 (define-condition simple-parse-error  (simple-condition parse-error)  ())

@@ -35,7 +35,7 @@
   (if (and (location= src dst) (stack-tn-p dst)) ; shift right in memory
       (inst shr :dword dst shift)
       (let ((reg (if (stack-tn-p dst) temp-reg-tn dst)))
-        (32bit-move reg src)
+        (move reg src :dword)
         (inst shr :dword reg shift)
         (when (stack-tn-p dst) ; store as qword to ensure upper bytes are 0
           (inst mov dst temp-reg-tn)))))
@@ -56,7 +56,7 @@
   (assert (not (logbitp 7 character-widetag))))
 (define-vop (tagged-char-code) ; valid only if N-FIXNUM-TAG-BITS = 1
   (:args (x :scs (any-reg descriptor-reg control-stack) :target y :load-if nil))
-  (:results (y :scs (any-reg control-stack) :load-if nil))
+  (:results (y :scs (any-reg descriptor-reg control-stack) :load-if nil))
   (:note "character untagging")
   (:generator 1
     (untagify-char y x (- n-widetag-bits n-fixnum-tag-bits))
@@ -68,8 +68,7 @@
   (:results (y :scs (any-reg descriptor-reg)))
   (:note "character tagging")
   (:generator 1
-    (unless (location= x y)
-      (inst mov :dword y x))
+    (move y x :dword)
     (inst shl :dword y n-widetag-bits)
     (inst or :dword y character-widetag)))
 (define-move-vop move-from-character :move
@@ -108,7 +107,7 @@
       (character-reg
        (move y x))
       (character-stack
-       (if (= (tn-offset fp) esp-offset)
+       (if (= (tn-offset fp) rsp-offset)
            (storew x fp (tn-offset y))  ; c-call
            (storew x fp (frame-word-offset (tn-offset y))))))))
 (define-move-vop move-character-arg :move-arg
@@ -150,7 +149,7 @@
   (:policy :fast-safe)
   (:note "inline comparison")
   (:generator 3
-    (inst cmp x y)))
+    (inst cmp :dword x y)))
 
 (define-vop (fast-char=/character character-compare)
   (:translate char=)
@@ -171,7 +170,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp x (sb-xc:char-code y))))
+    (inst cmp :dword x (char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)

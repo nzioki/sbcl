@@ -73,7 +73,7 @@ static boolean eql_comparable_p(lispobj obj)
 static boolean vector_isevery(boolean (*pred)(lispobj), struct vector* v)
 {
     int i;
-    for (i = fixnum_value(v->length)-1; i >= 0; --i)
+    for (i = vector_len(v)-1; i >= 0; --i)
         if (!pred(v->data[i])) return 0;
     return 1;
 }
@@ -88,7 +88,7 @@ static boolean vector_isevery(boolean (*pred)(lispobj), struct vector* v)
 static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
 {
     lispobj ptr = *where;
-    if (lowtag_of(ptr) != OTHER_POINTER_LOWTAG)
+    if (lowtag_of(ptr) != OTHER_POINTER_LOWTAG || !gc_managed_heap_space_p(ptr))
         return;
 
     extern char gc_coalesce_string_literals;
@@ -109,9 +109,9 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
              || specialized_vector_widetag_p(widetag)))
         || coalescible_number_p(obj)) {
         if (widetag == SIMPLE_VECTOR_WIDETAG) {
-            sword_t n_elts = fixnum_value(obj[1]), i;
-            for (i = 2 ; i < n_elts+2 ; ++i)
-                coalesce_obj(obj + i, ht);
+            struct vector* v = (void*)obj;
+            sword_t n_elts = vector_len(v), i;
+            for (i = 0 ; i < n_elts ; ++i) coalesce_obj(v->data+i, ht);
         }
         int index = hopscotch_get(ht, (uword_t)obj, 0);
         if (!index) // Not found
@@ -153,7 +153,7 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
 static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
 {
     struct hopscotch_table* ht = (struct hopscotch_table*)arg;
-    lispobj layout, bitmap, *next;
+    lispobj layout, *next;
     sword_t nwords, i;
 
     for ( ; where < limit ; where = next ) {
@@ -164,14 +164,11 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
             next = where + nwords;
             switch (widetag) {
             case INSTANCE_WIDETAG: // mixed boxed/unboxed objects
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
             case FUNCALLABLE_INSTANCE_WIDETAG:
-#endif
-                layout = instance_layout(where);
-                bitmap = LAYOUT(layout)->bitmap;
-                for(i=1; i<nwords; ++i)
-                    if (layout_bitmap_logbitp(i-1, bitmap))
-                        coalesce_obj(where+i, ht);
+                layout = layout_of(where);
+                struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+                for (i=0; i<(nwords-1); ++i)
+                    if (bitmap_logbitp(i, bitmap)) coalesce_obj(where+1+i, ht);
                 continue;
             case CODE_HEADER_WIDETAG:
                 nwords = code_header_words((struct code*)where);
@@ -206,7 +203,7 @@ void coalesce_similar_objects()
     coalesce_range((lispobj*)READ_ONLY_SPACE_START,
                    (lispobj*)READ_ONLY_SPACE_END,
                    arg);
-    coalesce_range((lispobj*)STATIC_SPACE_START,
+    coalesce_range((lispobj*)STATIC_SPACE_OBJECTS_START,
                    (lispobj*)STATIC_SPACE_END,
                    arg);
 #endif

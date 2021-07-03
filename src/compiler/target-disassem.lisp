@@ -106,7 +106,7 @@
 
 ;;;; choosing an instruction
 
-#-sb-fluid (declaim (inline inst-matches-p choose-inst-specialization))
+(declaim (inline inst-matches-p choose-inst-specialization))
 
 ;;; Return non-NIL if all constant-bits in INST match CHUNK.
 (defun inst-matches-p (inst chunk)
@@ -288,7 +288,7 @@
 ;;; LRA layout (dual word aligned):
 ;;;     header-word
 
-#-sb-fluid (declaim (inline words-to-bytes))
+(declaim (inline words-to-bytes))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;;; Convert a word-offset NUM to a byte-offset.
@@ -360,7 +360,7 @@
            (type alignment size))
   (zerop (logand (1- size) address)))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (progn
 (defconstant lra-size (words-to-bytes 1))
 (defun lra-hook (chunk stream dstate)
@@ -378,33 +378,25 @@
                                       (+ (dstate-cur-offs dstate)
                                          (1- lra-size))))
                 sb-vm:return-pc-widetag))
-    (unless (null stream)
+    (when stream
       (note "possible LRA header" dstate)))
   nil))
 
 ;;; Print the fun-header (entry-point) pseudo-instruction at the
-;;; current location in DSTATE to STREAM.
+;;; current location in DSTATE to STREAM and skip 2 words.
 (defun fun-header-hook (fun-index stream dstate)
   (declare (type (or null stream) stream)
            (type disassem-state dstate))
-  (unless (null stream)
-    (let* ((seg (dstate-segment dstate))
-           (code (seg-code seg))
-           (woffs (+ sb-vm:code-constants-offset (* fun-index sb-vm:code-slots-per-simple-fun)))
-           (name (code-header-ref code (+ woffs sb-vm:simple-fun-name-slot)))
-           (args (code-header-ref code (+ woffs sb-vm:simple-fun-arglist-slot)))
-           (info (code-header-ref code (+ woffs sb-vm:simple-fun-info-slot)))
-           (type (typecase info
-                   ((cons t simple-vector) (car info))
-                   ((not simple-vector) info))))
+  (when stream
+    (let* ((fun (%code-entry-point (seg-code (dstate-segment dstate)) fun-index))
+           (name (%simple-fun-name fun))
+           (args (%simple-fun-arglist fun)))
       ;; if the function's name conveys its args, don't show ARGS too
-      (format stream ".~A ~S~:[~:A~;~]" 'entry name
+      (format stream ".~A ~S~:[~:A~;~]"
+              'entry name
               (and (typep name '(cons (eql lambda) (cons list)))
                    (equal args (second name)))
-              args)
-      (note (lambda (stream)
-              (format stream "~:S" type)) ; use format to print NIL as ()
-            dstate)))
+              args)))
   (incf (dstate-next-offs dstate)
         (words-to-bytes sb-vm:simple-fun-insts-offset)))
 
@@ -492,7 +484,7 @@
 
 (defun handle-bogus-instruction (stream dstate prefix-len)
   (let ((alignment (dstate-alignment dstate)))
-    (unless (null stream)
+    (when stream
       (multiple-value-bind (words bytes)
           (truncate alignment sb-vm:n-word-bytes)
         (when (> words 0)
@@ -624,7 +616,7 @@
     (rewind-current-segment dstate segment)
 
     ;; Do not pin anything yet if using cheneygc, as that would inhibit GC
-    ;; with a larger scope than intended.
+    ;; with a larger scope than strictly necessary.
     (with-pinned-objects (#+gencgc (seg-object (dstate-segment dstate))
                           #+gencgc dstate) ; for SAP access to SCRATCH-BUF
      #+gencgc (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
@@ -795,7 +787,7 @@
                            ;; FIXME: this is strictly redundant.
                            ;; You should combine fields in the prefilter
                            ;; so that the labeller receives a single byte.
-                           ;; AARCH64 and HPPA make use of this though.
+                           ;; AARCH64 makes use of this though.
                            (loop for i from 2 below item-length
                                  collect (extract-byte i)))))
                       dstate)))
@@ -1409,7 +1401,7 @@
       (format stream "#X~2,'0x" (sap-ref-8 sap (+ offs start-offs))))))
 
 (defvar *default-dstate-hooks*
-  (list* #-(or x86 x86-64) #'lra-hook nil))
+  (list* #-(or x86 x86-64 arm64) #'lra-hook nil))
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
@@ -1442,7 +1434,8 @@
   (dotimes (i (code-n-entries (seg-code segment)))
     (let* ((fun (%code-entry-point (seg-code segment) i))
            (length (seg-length segment))
-           (offset (code-offs-to-segment-offs (%fun-code-offset fun) segment)))
+           (code-offs (%fun-code-offset fun))
+           (offset (code-offs-to-segment-offs code-offs segment)))
       (when (<= 0 offset length)
         ;; Up to 2 words (less a byte) of padding might be present to align the
         ;; next simple-fun. Limit on OFFSET is to avoid incorrect triggering
@@ -1455,11 +1448,12 @@
                           (incf (dstate-next-offs dstate) offset))
                  :offset 0) ; at 0 bytes into this seg, skip OFFSET bytes
                 (seg-hooks segment)))
-        (push (make-offs-hook
-               :offset offset
-               :fun (let ((i i)) ; capture the _current_ I, not the final value
-                      (lambda (stream dstate) (fun-header-hook i stream dstate))))
-              (seg-hooks segment))))))
+        (unless (minusp offset)
+          (push (make-offs-hook
+                 :offset offset
+                 :fun (let ((i i)) ; capture the _current_ I, not the final value
+                        (lambda (stream dstate) (fun-header-hook i stream dstate))))
+                (seg-hooks segment)))))))
 
 ;;; A SAP-MAKER is a no-argument function that returns a SAP.
 
@@ -1633,6 +1627,7 @@
 ;;; Assuming that CODE-OBJ is pinned, return true if ADDR is anywhere
 ;;; between the tagged pointer and the first occuring simple-fun.
 (defun points-to-code-constant-p (addr code-obj)
+  (declare (type word addr) (type code-component code-obj))
   (<= (get-lisp-obj-address code-obj)
       addr
       (get-lisp-obj-address (%code-entry-point code-obj 0))))
@@ -2191,6 +2186,10 @@
                           ;; What could it do- disassemble the interpreter?
                           (error "Can't disassemble a special operator"))
                          (t (get-compiled-funs object))))
+      (when (code-component-p object)
+        (let* ((base (- (get-lisp-obj-address object) sb-vm:other-pointer-lowtag))
+               (insts (code-instructions object)))
+        (format t "~&; Base: ~x Data: ~x~%" base (sap-int insts))))
       (disassemble-code-component thing :stream stream)))))
 
 ;;;; code to disassemble assembler segments
@@ -2265,14 +2264,15 @@
                       name->addr)))
       (let ((code sb-fasl:*assembler-routines*))
         (invert (%code-debug-info code)
-                (lambda (x) (sap-int (sap+ (code-instructions code) (car x))))))
-    #-linkage-table
-       (invert *static-foreign-symbols* #'identity))
-    (loop for name across sb-vm::+all-static-fdefns+
-          for address =
-          #+immobile-code (sb-vm::function-raw-address name)
-          #-immobile-code (+ sb-vm:nil-value (sb-vm:static-fun-offset name))
-          do (setf (gethash address addr->name) name))
+                (lambda (x) (sap-int (sap+ (code-instructions code) (car x)))))))
+    (dovector (name sb-vm::+all-static-fdefns+)
+      ;; ENTER-ALIEN-CALLBACK is not fboundp until src/code/alien-callback
+      ;; is compiled, so don't fail in function-raw-address.
+      (when (fboundp name)
+        (let ((address
+               #+immobile-code (sb-vm::function-raw-address name)
+               #-immobile-code (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
+          (setf (gethash address addr->name) name))))
     ;; Not really a routine, but it uses the similar logic for annotations
     #+sb-safepoint
     (setf (gethash (+ sb-vm:gc-safepoint-page-addr
@@ -2388,10 +2388,10 @@
               (ecase how
                (:relative
                 ;; When CODE-TN has a lowtag (as it usually does), we add it in here.
-                ;; x86-64 does not have a code-tn, but it behaves like ppc64
+                ;; x86-64 and arm64 do not have a code-tn, but they behave like ppc64
                 ;; in that the displacement is relative to the base of the code.
                 (let ((addr (+ location
-                               #-(or x86-64 ppc64) sb-vm:other-pointer-lowtag)))
+                               #-(or x86-64 ppc64 arm64) sb-vm:other-pointer-lowtag)))
                   (values addr (ash addr (- sb-vm:word-shift)))))
                (:absolute
                 ;; Concerning object movement:
@@ -2449,7 +2449,7 @@
                     (let ((base-obj
                             (if (simple-fun-p thing) (fun-code-header thing) thing)))
                       (+ (logandc2 (get-lisp-obj-address base-obj) sb-vm:lowtag-mask)
-                         (sb-vm::primitive-object-size base-obj)
+                         (primitive-object-size base-obj)
                          -1)))
             (return thing)))))))
 
@@ -2503,7 +2503,6 @@
   (unless (typep address 'address)
     (return-from maybe-note-assembler-routine nil))
   (multiple-value-bind (name offs) (find-assembler-routine address)
-    #+linkage-table
     (unless name
       (setq name (sap-foreign-symbol (int-sap address))))
     (when name
@@ -2587,7 +2586,18 @@
                      to sb-vm:code-constants-offset
                      for const = (code-header-ref code i)
                      when (eql (get-lisp-obj-address const) address)
-                     do (return-from found const))))
+                     do (return-from found const))
+               ;; Kludge: layout of STREAM, FILE-STREAM, and STRING-STREAM can be used
+               ;; as immediate operands without a corresponding boxed header constant.
+               ;; I think we always elide the boxed constant for builtin layouts,
+               ;; but these three have some slightly unusual codegen that causes a PUSH
+               ;; instruction to need some help to show its operand as a lisp object.
+               (dolist (thing (load-time-value (list (find-layout 'stream)
+                                                     (find-layout 'file-stream)
+                                                     (find-layout 'string-stream))
+                                               t))
+                 (when (eql (get-lisp-obj-address thing) address)
+                   (return-from found thing)))))
            (return-from maybe-note-static-symbol))))
     (note (lambda (s) (prin1 symbol s)) dstate)))
 

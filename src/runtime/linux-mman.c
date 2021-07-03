@@ -8,35 +8,15 @@
 #include "os.h"
 #include "interr.h"
 
-#ifdef LISP_FEATURE_ALPHA
-/* The Alpha is a 64 bit CPU.  SBCL is a 32 bit application.  Due to all
- * the places that assume we can get a pointer into a fixnum with no
- * information loss, we have to make sure it allocates all its ram in the
- * 0-2Gb region.  */
-
-static void * under_2gb_free_pointer;
-os_set_cheneygc_spaces(uword_t space0_start, uword_t space1_start)
-{
-    uword_t max;
-    max = (space1_start > space0_start) ? space1_start : space0_start;
-    under_2gb_free_pointer = max + dynamic_space_size;
-}
-
-#endif
-
 os_vm_address_t
-os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
+os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len,
+            int __attribute__((unused)) execute, int __attribute__((unused)) jit)
 {
     int protection = attributes & IS_GUARD_PAGE ? OS_VM_PROT_NONE : OS_VM_PROT_ALL;
     attributes &= ~IS_GUARD_PAGE;
     int flags =  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
     os_vm_address_t actual;
 
-#ifdef LISP_FEATURE_ALPHA
-    if (!addr) {
-        addr=under_2gb_free_pointer;
-    }
-#endif
 #ifdef MAP_32BIT
     if (attributes & ALLOCATE_LOW)
         flags |= MAP_32BIT;
@@ -61,12 +41,6 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
         }
         return 0;
     }
-
-#ifdef LISP_FEATURE_ALPHA
-
-    len=(len+(os_vm_page_size-1))&(~(os_vm_page_size-1));
-    under_2gb_free_pointer+=len;
-#endif
 
     return actual;
 }

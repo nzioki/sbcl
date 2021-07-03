@@ -300,34 +300,35 @@
                  (inst jmp :ge POSITIVE)
                  (inst not rdx)
                  POSITIVE))
-           (unless (memq :popcnt *backend-subfeatures*)
-             ;; POPCNT = ECX bit 23
-             (multiple-value-bind (byte bit) (floor (+ 23 n-fixnum-tag-bits)
-                                                    n-byte-bits)
-               (inst test :byte
-                     (static-symbol-value-ea '*cpuid-fn1-ecx* byte) (ash 1 bit)))
-             (inst jmp :z slow))
+           (when (memq :popcnt *backend-subfeatures*) ; always use POPCNT
            ;; Intel's implementation of POPCNT on some models treats it as
            ;; a 2-operand ALU op in the manner of ADD,SUB,etc which means that
            ;; it falsely appears to need data from the destination register.
            ;; The workaround is to clear the destination.
            ;; See http://stackoverflow.com/questions/25078285
-           (unless (location= result arg)
+             (unless (location= result arg)
              ;; We only break the spurious dep. chain if result isn't the same
              ;; register as arg. (If they're location=, don't trash the arg!)
-             (inst xor result result))
+               (inst xor :dword result result))
+             (inst popcnt result arg)
+             (return-from ,name))
+
+           ;; Conditionally use POPCNT
+           (test-cpu-feature cpu-has-popcnt)
+           (inst jmp :z slow)
+           (unless (location= result arg)
+             (inst xor :dword result result))
            (inst popcnt result arg)
            (inst jmp done)
          slow
-           (unless (memq :popcnt *backend-subfeatures*)
-             (move rdx arg)
-             (invoke-asm-routine 'call 'logcount vop)
-             (move result rdx))
+           (move rdx arg)
+           (invoke-asm-routine 'call 'logcount vop)
+           (move result rdx)
          done))))
   (def-it unsigned-byte-64-count 14 unsigned-reg unsigned-num)
   (def-it signed-byte-64-count 15 signed-reg signed-num :signed t)
   (def-it positive-fixnum-count 12 any-reg positive-fixnum)
-  (def-it positive-fixnum-count 13 any-reg fixnum :signed t))
+  (def-it signed-fixnum-count 13 any-reg fixnum :signed t))
 
 ;;; General case of EQL
 

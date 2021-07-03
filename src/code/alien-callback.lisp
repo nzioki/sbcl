@@ -110,16 +110,13 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
        ;; bother anyone about that sad fact
        (declare (muffle-conditions compiler-note)
                 (optimize speed))
-       ;; FIXME: the saps are not gc safe
-       (let ((args-sap (int-sap
-                        (sb-kernel:get-lisp-obj-address args-pointer)))
-             (res-sap (int-sap
-                       (sb-kernel:get-lisp-obj-address result-pointer))))
+       (let ((args-sap (descriptor-sap args-pointer))
+             (res-sap (descriptor-sap result-pointer)))
          (declare (ignorable args-sap res-sap))
-         (with-alien
+         (let
              ,(loop
                  with offset = 0
-                 for spec in argument-specs
+                for spec in argument-specs
                  ;; KLUDGE: At least one platform requires additional
                  ;; alignment beyond a single machine word for certain
                  ;; arguments.  Accept an additional delta (for the
@@ -130,8 +127,7 @@ ENTER-ALIEN-CALLBACK pulls the corresponding trampoline out and calls it.")
                  for (accessor-form alignment)
                    = (multiple-value-list
                       (alien-callback-accessor-form spec 'args-sap offset))
-                 collect `(,(pop argument-names) ,spec
-                            :local ,accessor-form)
+                 collect `(,(pop argument-names) ,accessor-form)
                  do (incf offset (+ (alien-callback-argument-bytes spec env)
                                     (or alignment 0))))
            ,(flet ((store (spec real-type)
@@ -295,10 +291,17 @@ the alien callback for that function with the given alien type."
 (in-package "SB-THREAD")
 #+sb-thread
 (defun enter-foreign-callback (index return arguments)
-  (let ((thread (without-gcing
-                  ;; Hold off GCing until *current-thread* is set up
-                  (setf *current-thread*
-                        (make-foreign-thread :name "foreign callback")))))
-    (dx-flet ((enter ()
-                (sb-alien::enter-alien-callback index return arguments)))
-      (new-lisp-thread-trampoline thread nil #'enter nil))))
+  (let ((thread (init-thread-local-storage (make-foreign-thread))))
+    #+pauseless-threadstart
+    (dx-let ((startup-info (vector nil ; trampoline is n/a
+                                   nil ; cell in *STARTING-THREADS* is n/a
+                                   #'sb-alien::enter-alien-callback
+                                   (list index return arguments)
+                                   nil nil))) ; sigmask + fpu state bits
+      (copy-primitive-thread-fields thread)
+      (setf (thread-startup-info thread) startup-info)
+      (update-all-threads (thread-primitive-thread thread) thread)
+      (run))
+    #-pauseless-threadstart
+    (dx-let ((args (list index return arguments)))
+      (run thread nil #'sb-alien::enter-alien-callback args))))

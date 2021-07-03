@@ -47,7 +47,7 @@ default_lossage_handler(void)
         // This may not be exactly the right condition for determining
         // whether it might be possible to backtrace, but at least it prevents
         // lose() from itself losing early in startup.
-        if (arch_os_get_current_thread()) lisp_backtrace(100);
+        if (get_sb_vm_thread()) lisp_backtrace(100);
     }
     exit(1);
 }
@@ -99,10 +99,7 @@ void disable_lossage_handler(void)
 static
 void print_message(char *fmt, va_list ap)
 {
-    fprintf(stderr, " in SBCL pid %d",getpid());
-#if defined(LISP_FEATURE_SB_THREAD)
-    fprintf(stderr, "(tid %p)", (void*)thread_self());
-#endif
+    fprintf(stderr, " in SBCL pid %d" THREAD_ID_LABEL, getpid(), THREAD_ID_VALUE);
     if (fmt) {
         fprintf(stderr, ":\n");
         vfprintf(stderr, fmt, ap);
@@ -136,6 +133,32 @@ lose(char *fmt, ...)
     fflush(stderr);
     call_lossage_handler();
 }
+
+#if 0
+/// thread printf. This was used to produce the 2-column output
+/// at the bottom of "src/code/final". The main thread'd os_kernel_tid
+/// must be assigned a constant in main_thread_trampoline().
+void tprintf(char *fmt, ...)
+{
+    va_list ap;
+    char buf[200];
+    char *ptr;
+    const char spaces[] = "                                           ";
+    struct thread*th = get_sb_vm_thread();
+    buf[0] = ';'; buf[1] = ' ';
+    ptr = buf+2;
+    if (th->os_kernel_tid == 'A') {
+        strcpy(ptr, spaces);
+        ptr += (sizeof spaces)-1;
+    }
+    va_start(ap, fmt);
+    int n = vsprintf(ptr, fmt, ap);
+    va_end(ap);
+    ptr += n;
+    *ptr++ = '\n';
+    write(2, buf, ptr-buf);
+}
+#endif
 
 boolean lose_on_corruption_p = 0;
 
@@ -203,7 +226,7 @@ void skip_internal_error (os_context_t *context) {
     // value, and therefore shifting right by 13 bits extracts a 0.
     // Internal error number 0 has 0 arguments, so we skip nothing in the varint
     // decoder loop, which is the right thing for the wrong reason.
-    u32 trap_instruction = *(u32 *)ptr;
+    uint32_t trap_instruction = *(uint32_t *)ptr;
     unsigned char code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
@@ -235,7 +258,7 @@ describe_internal_error(os_context_t *context)
     unsigned char code;
 
 #ifdef LISP_FEATURE_ARM64
-    u32 trap_instruction = *(u32 *)ptr;
+    uint32_t trap_instruction = *(uint32_t *)ptr;
     code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
@@ -318,27 +341,4 @@ describe_internal_error(os_context_t *context)
             break;
         }
     }
-}
-
-/* utility routines used by miscellaneous pieces of code */
-
-lispobj debug_print(lispobj string)
-{
-    /* This is a kludge.  It's not actually safe - in general - to use
-       %primitive print on the alpha, because it skips half of the
-       number stack setup that should usually be done on a function
-       call, so the called routine (i.e. this one) ends up being able
-       to overwrite local variables in the caller.  Rather than fix
-       this everywhere that %primitive print is used (it's only a
-       debugging aid anyway) we just guarantee our safety by putting
-       an unused buffer on the stack before doing anything else
-       here */
-    char untouched[32];
-    if (header_widetag(VECTOR(string)->header) != SIMPLE_BASE_STRING_WIDETAG)
-        fprintf(stderr, "debug_print: can't display string\n");
-    else
-        fprintf(stderr, "%s\n", (char *)(VECTOR(string)->data));
-    /* shut GCC up about not using this, because that's the point.. */
-    (void)untouched;
-    return NIL;
 }

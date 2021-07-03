@@ -13,6 +13,21 @@
 
 (in-package "SB-IMPL")
 
+(macrolet ((def (name &rest args)
+             `(defun ,name ,args
+                (,name ,@args))))
+  (def word-logical-not x)
+  (def word-logical-and x y)
+  (def word-logical-or x y)
+  (def word-logical-xor x y)
+  (def word-logical-nor x y)
+  (def word-logical-eqv x y)
+  (def word-logical-nand x y)
+  (def word-logical-andc1 x y)
+  (def word-logical-andc2 x y)
+  (def word-logical-orc1 x y)
+  (def word-logical-orc2 x y))
+
 (macrolet ((def (name &optional (args '(x)))
              `(defun ,name ,args
                 (,@(if (listp name) `(funcall #',name) `(,name)) ,@args)))
@@ -29,7 +44,8 @@
   (def sap-int)
   (def int-sap)
   (macrolet ((def-accessor (name)
-               `(progn (def ,(symbolicate "%SET-" name) (sap offset value))
+               ;; the low-level %SET functions should not need stubs
+               `(progn (def (setf ,name) (value sap offset))
                        (def ,name (sap offset)))))
     (def-accessor sap-ref-8)
     (def-accessor sap-ref-16)
@@ -46,6 +62,8 @@
     (def-accessor sap-ref-single)
     (def-accessor sap-ref-double))
   (def %byte-blt (src src-start dst dst-start dst-end))
+  (def shift-towards-start (number count))
+  (def shift-towards-end (number count))
   (def get-header-data)
   (def set-header-data (x val))
   (def widetag-of)
@@ -58,9 +76,7 @@
   #-(or x86 x86-64) (def dynamic-space-free-pointer ())
   (def control-stack-pointer-sap ())
   (def sb-c:safe-fdefn-fun)
-  (def fun-subtype)
-  (def simple-fun-p)
-  (def closurep)
+  (def %fun-pointer-widetag)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
   (def fdefn-name)
@@ -70,7 +86,6 @@
   (def make-array-header (type rank))
   (def code-instructions)
   #-untagged-fdefns (def code-header-ref (code-obj index))
-  (def code-header-set (code-obj index new))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
   (def single-float-bits)
@@ -88,19 +103,22 @@
   (def %make-instance) ; Allocate a new instance with X data slots.
   (def %instance-length) ; Given an instance, return its length.
   (def %instance-layout)
+  (def %instance-wrapper)
   (def %set-instance-layout (instance new-value))
   ; (def %instance-ref (instance index)) ; defined in 'target-defstruct'
   (def %instance-set (instance index new-value))
   ;; funcallable instances
   (def %make-funcallable-instance)
   (def %fun-layout)
-  (def %set-funcallable-instance-layout (fin new-value))
+  (def %fun-wrapper)
+  (def %set-fun-layout (fin new-value))
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
   (def %set-funcallable-instance-info (fin i new-value))
-  #+(and compact-instance-header x86-64) (def layout-of)
-  #+64-bit (def layout-depthoid)
+  #+compact-instance-header (progn (def wrapper-of)
+                                   (def %instanceoid-layout))
+
   ;; lists
   (def %rplaca (x val))
   (def %rplacd (x val))
@@ -131,7 +149,6 @@
   (def current-sp ())
   (def current-fp ())
   (def stack-ref (s n))
-  (def %set-stack-ref (s n value))
   (def fun-code-header)
   (def symbol-hash)
   (def sb-vm::symbol-extra)
@@ -149,6 +166,16 @@
   "Hints the processor that the current thread is spin-looping."
   (spin-loop-hint))
 
+;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
+;;; that the vop does, however, because the all 64-bit architectures other than
+;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
+;;; I should add a vop for uint32 access to raw slots.
+(defun sb-c::%structure-is-a (object-layout test-layout)
+  (or (eq object-layout test-layout)
+      (let ((depthoid (wrapper-depthoid test-layout))
+            (inherits (wrapper-inherits object-layout)))
+        (and (> (length inherits) depthoid)
+             (eq (svref inherits depthoid) test-layout)))))
 
 (defun %other-pointer-subtype-p (x choices)
   (and (%other-pointer-p x)

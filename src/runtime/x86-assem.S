@@ -19,10 +19,7 @@
 #endif
 
 #include "sbcl.h"
-#include "validate.h"
 #include "genesis/closure.h"
-#include "genesis/funcallable-instance.h"
-#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "genesis/thread.h"
@@ -165,7 +162,11 @@
 /* the CSP page sits right before the thread */
 #define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
+#define TRAP ud2
+#else
 #define TRAP int3
+#endif
 
 	.text
 	.globl	GNAME(all_threads)
@@ -322,7 +323,7 @@ Lfp_rtn_value:
 	SIZE(GNAME(call_into_c))
 
 
-#ifdef OS_THREAD_STACK
+#ifdef LISP_FEATURE_OS_THREAD_STACK
         .text
 	.globl  GNAME(funcall1_switching_stack)
 	TYPE(GNAME(funcall1_switching_stack))
@@ -688,6 +689,7 @@ GNAME(post_signal_tramp):
 	SIZE(GNAME(post_signal_tramp))
 
 
+#ifndef LISP_FEATURE_LINUX
         /* fast_bzero implementations and code to detect which implementation
          * to use.
          */
@@ -823,6 +825,7 @@ Lend_base:
         pop %eax
 	ret
 	SIZE(GNAME(fast_bzero_base))
+#endif /* LISP_FEATURE_LINUX */
 
 
 /* When LISP_FEATURE_C_STACK_IS_CONTROL_STACK, we cannot safely scrub
@@ -847,7 +850,7 @@ GNAME(arch_scrub_control_stack):
 	 * guard page upper bound in ECX, and our hard guard
 	 * page upper bound in EDX. */
 	lea	-4(%esp), %eax
-	mov	GNAME(os_vm_page_size),%edx
+	mov	$BACKEND_PAGE_BYTES,%edx
 	mov	%edx, %ecx
 	add	8(%esp), %ecx
 	add	12(%esp), %edx
@@ -873,7 +876,8 @@ ascs_check_guard_page:
 	jae	ascs_clear_loop
 	cmp	8(%esp), %eax
 	jbe	ascs_clear_loop
-	cmpl	$(NIL), THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET(%ecx)
+	/* test state_word.control_stack_guard_page_protected */
+	cmpb	$0, THREAD_STATE_WORD_OFFSET(%ecx)
 	jne	ascs_finished
 
 	/* Clear memory backwards to the start of the (4KiB) page */

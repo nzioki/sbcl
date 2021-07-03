@@ -163,7 +163,7 @@
   (verify-backtrace test-function expected-frames :details details
                                                   :error t))
 
-(defvar *p* (namestring *load-truename*))
+(defvar *p* (namestring (if sb-c::*merge-pathnames* *load-truename* *load-pathname*)))
 
 (defvar *undefined-function-frame*
   '("undefined function"))
@@ -189,7 +189,7 @@
 
   (with-test (:name (:backtrace :undefined-function :bug-346)
               :skipped-on :interpreter
-              ;; Failures on SPARC, and probably HPPA are due to
+              ;; Failures on SPARC are due to
               ;; not having a full and valid stack frame for the
               ;; undefined function frame.  See PPC
               ;; undefined_tramp for details.
@@ -656,3 +656,22 @@
                    (sb-debug:print-backtrace :count 100 :stream stream))))
         (foo 100 (let ((list (list t)))
                    (nconc list list)))))))
+
+(with-test (:name :uninitialized-optionals)
+  (let ((fun (checked-compile
+              `(lambda (l &optional m n)
+                 (declare (fixnum l))
+                 (values l m n)))))
+    (checked-compile-and-assert
+        ()
+        `(lambda (fun &rest args)
+           (block nil
+             (handler-bind ((error
+                              (lambda (c)
+                                c
+                                (return (cdar (sb-debug:list-backtrace :count 1))))))
+               (apply fun args))))
+      ((fun t) (list t *unavailable-argument* *unavailable-argument*) :test #'equalp)
+      ((fun t 1) (list t 1 *unavailable-argument*) :test #'equalp)
+      ((fun t 1 2) (list t 1 2) :test #'equalp)
+      ((fun 1 2 3) (values 1 2 3)))))

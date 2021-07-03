@@ -60,7 +60,7 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
      * to arch_pseudo_atomic_atomic, but this seems clearer.
      * --NS 2007-05-15 */
 #ifdef LISP_FEATURE_GENCGC
-    return get_pseudo_atomic_atomic(arch_os_get_current_thread());
+    return get_pseudo_atomic_atomic(get_sb_vm_thread());
 #else
     return (!foreign_function_call_active)
         && (NIL != SymbolValue(PSEUDO_ATOMIC_ATOMIC,0));
@@ -69,12 +69,12 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
 
 void arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    set_pseudo_atomic_interrupted(arch_os_get_current_thread());
+    set_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 void arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
-    clear_pseudo_atomic_interrupted(arch_os_get_current_thread());
+    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 unsigned int arch_install_breakpoint(void *pc)
@@ -121,14 +121,14 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    uint32_t trap_instruction = *((uint32_t *)*os_context_pc_addr(context));
 
     if (trap_instruction != 0x100073) {
         lose("Unrecognized trap instruction %08x in sigtrap_handler()",
              trap_instruction);
     }
 
-    u32 code = *((u32 *)(4 + *os_context_pc_addr(context)));
+    uint32_t code = *((uint32_t *)(4 + *os_context_pc_addr(context)));
 
     if (code == trap_PendingInterrupt) {
       arch_skip_instruction(context);
@@ -140,7 +140,7 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 void
 arch_install_interrupt_handlers(void)
 {
-    undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
+    ll_install_handler(SIGTRAP, sigtrap_handler);
 }
 
 /* Linkage table */
@@ -154,5 +154,5 @@ void arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 
 lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs) {
     return ((lispobj(*)(lispobj, lispobj *, int, struct thread*))SYMBOL(CALL_INTO_LISP)->value)
-      (fun, args, nargs, arch_os_get_current_thread());
+      (fun, args, nargs, get_sb_vm_thread());
 }

@@ -21,6 +21,12 @@
 
 (in-package "SB-C")
 
+(defstruct (local-call-context
+            (:constructor make-local-call-context (fun var))
+            (:copier nil))
+  (fun nil :read-only t)
+  (var nil :read-only t))
+
 ;;; This function propagates information from the variables in the
 ;;; function FUN to the actual arguments in CALL. This is also called
 ;;; by the VALUES IR1 optimizer when it sleazily converts MV-BINDs to
@@ -36,10 +42,13 @@
   (declare (type combination call) (type clambda fun))
   (loop with policy = (lexenv-policy (node-lexenv call))
         for args on (basic-combination-args call)
-        and var in (lambda-vars fun)
+        for var in (lambda-vars fun)
+        for name = (lambda-var-%source-name var)
         do (assert-lvar-type (car args) (leaf-type var) policy
-                             (lambda-var-%source-name var))
-        do (unless (leaf-refs var)
+                             (if (eq (functional-kind fun) :optional)
+                                 (opaquely-quote (make-local-call-context fun name))
+                                 name))
+           (unless (leaf-refs var)
              (flush-dest (car args))
              (setf (car args) nil)))
   (values))
@@ -62,10 +71,10 @@
                                   (make-entry)))
                          (cleanup (make-cleanup :kind :dynamic-extent
                                                 :mess-up entry
-                                                :info dx-lvars
-                                                :lexenv (lambda-lexenv fun))))
+                                                :info dx-lvars)))
                     (setf (entry-cleanup entry) cleanup)
                     (insert-node-before call entry)
+                    (ensure-block-start (node-prev entry))
                     (setf (node-lexenv call)
                           (make-lexenv :default (node-lexenv call)
                                        :cleanup cleanup))
@@ -157,7 +166,7 @@
   (declare (type functional fun))
   (etypecase fun
     (clambda
-     (let* ((n-supplied (gensym))
+     (let* ((n-supplied (sb-xc:gensym))
             (nargs (length (lambda-vars fun)))
             (temps (make-gensym-list nargs)))
        `(lambda (,n-supplied ,@temps)
@@ -165,12 +174,12 @@
                    (ignore ,n-supplied))
           (%funcall ,fun ,@temps))))
     (optional-dispatch
-     ;; Force convertion of all entries
+     ;; Force conversion of all entries
      (optional-dispatch-entry-point-fun fun 0)
      (let* ((min (optional-dispatch-min-args fun))
             (max (optional-dispatch-max-args fun))
             (more (optional-dispatch-more-entry fun))
-            (n-supplied (gensym))
+            (n-supplied (sb-xc:gensym))
             (temps (make-gensym-list max))
             (main (optional-dispatch-main-entry fun))
             (optional-vars (nthcdr min (lambda-vars main)))
@@ -416,9 +425,12 @@
         (multiple-value-bind (losing-local-object converted-lambda)
             (catch 'locall-already-let-converted
               (with-ir1-environment-from-node call
-                (let ((*inline-expansions*
-                        (register-inline-expansion original-functional call))
-                      (*lexenv* (functional-lexenv original-functional)))
+                (let* ((*inline-expansions*
+                         (register-inline-expansion original-functional call))
+                       (*lexenv* (functional-lexenv original-functional))
+                       (*transforming*
+                         (and (functional-inline-expanded original-functional)
+                              (system-inline-fun-p (leaf-source-name original-functional)))))
                   (values nil
                           (ir1-convert-lambda
                            (functional-inline-expansion original-functional)
@@ -1040,32 +1052,42 @@
 ;;; the RETURN-RESULT, because the return might have been deleted (if
 ;;; all calls were TR.)
 (defun unconvert-tail-calls (fun call next-block)
-  (do-sset-elements (called (lambda-calls-or-closes fun))
-    (when (lambda-p called)
-      (dolist (ref (leaf-refs called))
-        (let ((this-call (node-dest ref)))
-          (when (and this-call
-                     (node-tail-p this-call)
-                     (not (node-to-be-deleted-p this-call))
-                     (eq (node-home-lambda this-call) fun))
-            (setf (node-tail-p this-call) nil)
-            (ecase (functional-kind called)
-              ((nil :cleanup :optional)
-               (let ((block (node-block this-call))
-                     (lvar (node-lvar call)))
-                 (unlink-blocks block (first (block-succ block)))
-                 (link-blocks block next-block)
-                 (if (eq (node-derived-type this-call) *empty-type*)
-                     (maybe-terminate-block this-call nil)
-                     (add-lvar-use this-call lvar))))
-              (:deleted)
-              ;; The called function might be an assignment in the
-              ;; case where we are currently converting that function.
-              ;; In steady-state, assignments never appear as a called
-              ;; function.
-              (:assignment
-               (aver (eq called fun)))))))))
-  (values))
+  (let (maybe-terminate)
+    (do-sset-elements (called (lambda-calls-or-closes fun))
+      (when (lambda-p called)
+        (dolist (ref (leaf-refs called))
+          (let ((this-call (node-dest ref)))
+            (when (and this-call
+                       (node-tail-p this-call)
+                       (not (node-to-be-deleted-p this-call))
+                       (eq (node-home-lambda this-call) fun))
+              (setf (node-tail-p this-call) nil)
+              (ecase (functional-kind called)
+                ((nil :cleanup :optional)
+                 (let ((block (node-block this-call))
+                       (lvar (node-lvar call)))
+                   (unlink-blocks block (first (block-succ block)))
+                   (link-blocks block next-block)
+                   (if (eq (node-derived-type this-call) *empty-type*)
+                       ;; Delay terminating the block, because there may be more calls
+                       ;; to be processed here and this may prematurely delete NEXT-BLOCK
+                       ;; before we attach more preceding blocks to it.
+                       ;; Although probably if one call to a function
+                       ;; is derived to be NIL all other calls would
+                       ;; be NIL too, but that may not be available at the same time.
+                       ;; (Or something is smart in the future to
+                       ;; derive different results from different
+                       ;; calls.)
+                       (push this-call maybe-terminate)
+                       (add-lvar-use this-call lvar))))
+                (:deleted)
+                ;; The called function might be an assignment in the
+                ;; case where we are currently converting that function.
+                ;; In steady-state, assignments never appear as a called
+                ;; function.
+                (:assignment
+                 (aver (eq called fun)))))))))
+    maybe-terminate))
 
 ;;; Deal with returning from a LET or assignment that we are
 ;;; converting. FUN is the function we are calling, CALL is a call to
@@ -1093,9 +1115,9 @@
 (defun move-return-stuff (fun call next-block)
   (declare (type clambda fun) (type basic-combination call)
            (type (or cblock null) next-block))
-  (when next-block
-    (unconvert-tail-calls fun call next-block))
-  (let* ((return (lambda-return fun))
+  (let* ((maybe-terminate-calls (when next-block
+                                  (unconvert-tail-calls fun call next-block)))
+         (return (lambda-return fun))
          (call-fun (node-home-lambda call))
          (call-return (lambda-return call-fun)))
     (when (and call-return
@@ -1120,8 +1142,11 @@
            (aver (node-tail-p call))
            (setf (lambda-return call-fun) return)
            (setf (return-lambda return) call-fun)
-           (setf (lambda-return fun) nil))))
-  (delete-lvar-use call) ; LET call does not have value semantics
+           (setf (lambda-return fun) nil)))
+    ;; Delayed because otherwise next-block could become deleted
+    (dolist (call maybe-terminate-calls)
+      (maybe-terminate-block call nil)))
+  (delete-lvar-use call)      ; LET call does not have value semantics
   (values))
 
 ;;; Actually do LET conversion. We call subfunctions to do most of the

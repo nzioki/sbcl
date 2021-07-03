@@ -17,7 +17,7 @@
 (declaim (type byte-buffer *byte-buffer*))
 (defvar *contexts*)
 (declaim (type (vector t) *contexts*))
-
+(defvar *local-call-context*)
 
 ;;;; debug blocks
 
@@ -77,7 +77,7 @@
                          (- posn (segment-header-skew segment))))))
   (values))
 
-#-sb-fluid (declaim (inline ir2-block-physenv))
+(declaim (inline ir2-block-physenv))
 (defun ir2-block-physenv (2block)
   (declare (type ir2-block 2block))
   (block-physenv (ir2-block-block 2block)))
@@ -104,6 +104,37 @@
 (defun leaf-visible-to-debugger-p (leaf node)
   (gethash leaf (make-lexenv-var-cache (node-lexenv node))))
 
+(defun optional-leaf-p (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (case (functional-kind home)
+      (:external
+       (let ((entry (lambda-entry-fun home)))
+         (when (optional-dispatch-p entry)
+           (let ((pos (position leaf (lambda-vars home))))
+             (and pos
+                  (>= (1- pos) (optional-dispatch-min-args entry))))))))))
+
+;;; Type checks of the arguments in an external function happen before
+;;; all the &optionals are initialized. PROPAGATE-TO-ARGS marks such
+;;; locations with the entry point, which allows to deduce if an
+;;; optional is alive at that point.
+(defun optional-processed (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (case (functional-kind home)
+      (:external
+       (let ((entry (lambda-entry-fun home)))
+         (if (and (optional-dispatch-p entry)
+                  *local-call-context*)
+             (let ((pos (position leaf (lambda-vars home)))
+                   (entry-pos (position *local-call-context*
+                                        (optional-dispatch-entry-points entry)
+                                        :key #'force)))
+               (not (and pos
+                         entry-pos
+                         (>= (1- pos) (+ (optional-dispatch-min-args entry) entry-pos)))))
+             t)))
+      (t t))))
+
 ;;; Given a local conflicts vector and an IR2 block to represent the
 ;;; set of live TNs, and the VAR-LOCS hash-table representing the
 ;;; variables dumped, compute a bit-vector representing the set of
@@ -126,9 +157,11 @@
                                     '(:environment :debug-environment)))
                        (leaf-visible-to-debugger-p leaf node))
                    (or (null spilled)
-                       (not (member tn spilled))))
+                       (not (member tn spilled)))
+                   (optional-processed leaf))
           (let ((num (gethash leaf var-locs)))
             (when num
+
               (setf (sbit res num) 1))))))
     res))
 
@@ -173,6 +206,12 @@
   (let* ((byte-buffer *byte-buffer*)
          (stepping (and (combination-p node)
                         (combination-step-info node)))
+         (*local-call-context*
+           (if (local-call-context-p context)
+               (local-call-context-fun context)))
+         (context (if (local-call-context-p context)
+                      (local-call-context-var context)
+                      context))
          (live (and live
                     (compute-live-vars live node block var-locs vop)))
          (anything-alive (and live
@@ -182,7 +221,10 @@
 
          (path (node-source-path node))
          (loc (if (fixnump label) label (label-position label)))
-         (form-number (source-path-form-number path)))
+         (form-number (source-path-form-number path))
+         (context (if (opaque-box-p context)
+                      (opaque-box-value context)
+                      context)))
     (vector-push-extend
      (logior
       (if context
@@ -305,19 +347,19 @@
   (declare (type source-info info))
   (let ((file-info (get-toplevelish-file-info info)))
     (multiple-value-call
-        (if function #'sb-c::make-core-debug-source #'make-debug-source)
+        (if function 'sb-di::make-core-debug-source 'make-debug-source)
      :namestring (or *source-namestring*
                      (make-file-info-namestring
                       (let ((pathname
                              (case *name-context-file-path-selector*
-                               (pathname (file-info-untruename file-info))
-                               (truename (file-info-name file-info)))))
+                               (pathname (file-info-pathname file-info))
+                               (truename (file-info-truename file-info)))))
                         (if (pathnamep pathname) pathname))
                       file-info))
      :created (file-info-write-date file-info)
      (if function
          (values :form (let ((direct-file-info (source-info-file-info info)))
-                         (when (eq :lisp (file-info-name direct-file-info))
+                         (when (eq :lisp (file-info-truename direct-file-info))
                            (elt (file-info-forms direct-file-info) 0)))
                  :function function)
          (values)))))
@@ -365,12 +407,12 @@
       (if (zerop length)
           #()
           (logically-readonlyize
-           (sb-xc:coerce seq
-                         `(simple-array
-                            ,(smallest-element-type (max max-positive
-                                                         (1- max-negative))
-                                                    (plusp max-negative))
-                            1)))))))
+           (coerce seq
+                   `(simple-array
+                     ,(smallest-element-type (max max-positive
+                                                  (1- max-negative))
+                                             (plusp max-negative))
+                     1)))))))
 
 (defun compact-vector (sequence)
   (cond ((and (= (length sequence) 1)
@@ -408,9 +450,9 @@
                         (neq (lambda-physenv fun)
                              (lambda-physenv (lambda-var-home var)))))
          ;; Keep this condition in sync with PARSE-COMPILED-DEBUG-VARS
-         (large-fixnums (>= (integer-length sb-xc:most-positive-fixnum) 62))
+         (large-fixnums (>= (integer-length most-positive-fixnum) 62))
          more)
-    (declare (type index flags))
+    (declare (type (and sb-xc:fixnum unsigned-byte) flags))
     (when minimal
       (setq flags (logior flags compiled-debug-var-minimal-p))
       (unless (and tn (tn-offset tn))
@@ -421,7 +463,8 @@
                (not (gethash tn (ir2-component-spilled-tns
                                  (component-info *component-being-compiled*))))
                (lexenv-contains-lambda fun
-                                       (lambda-lexenv (lambda-var-home var))))
+                                       (lambda-lexenv (lambda-var-home var)))
+               (not (optional-leaf-p var))) ;; not always initialized
       (setq flags (logior flags compiled-debug-var-environment-live)))
     (when save-tn
       (setq flags (logior flags compiled-debug-var-save-loc-p)))

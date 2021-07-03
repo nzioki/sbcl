@@ -67,7 +67,8 @@
              (add-info (var kind &key (default nil defaultp) suppliedp-var key)
                (let ((info (make-arg-info :kind kind)))
                  (when defaultp
-                   (setf (arg-info-default info) default))
+                   (setf (arg-info-default info) default
+                         (arg-info-default-p info) t))
                  (when suppliedp-var
                    (setf (arg-info-supplied-p info)
                          (varify-lambda-arg suppliedp-var)))
@@ -304,7 +305,7 @@
          (fun (collect ((default-bindings)
                         (default-vals))
                 (dolist (default defaults)
-                  (if (sb-xc:constantp default)
+                  (if (constantp default)
                       (default-vals default)
                       (let ((var (sb-xc:gensym)))
                         (default-bindings `(,var ,default))
@@ -358,7 +359,7 @@
          (default (arg-info-default info))
          (supplied-p (arg-info-supplied-p info))
          (force (or force
-                    (not (sb-xc:constantp (arg-info-default info)))))
+                    (not (constantp (arg-info-default info)))))
          (ep (if supplied-p
                  (ir1-convert-hairy-args
                   res
@@ -636,7 +637,7 @@
     (dolist (key keys)
       (let* ((info (lambda-var-arg-info key))
              (default (arg-info-default info))
-             (hairy-default (not (sb-xc:constantp default)))
+             (hairy-default (not (constantp default)))
              (supplied-p (arg-info-supplied-p info))
              ;; was: (format nil "~A-DEFAULTING-TEMP" (leaf-source-name key))
              (n-val (make-symbol ".DEFAULTING-TEMP."))
@@ -1055,6 +1056,121 @@
         (careful-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
 #-sb-devel
+(declaim (start-block maybe-inline-syntactic-closure))
+
+;;; Take the lexenv surrounding an inlined function and extract things
+;;; needed for the inline expansion suitable for dumping into fasls.
+;;; Right now it's MACROLET, SYMBOL-MACROLET, SPECIAL and
+;;; INLINE/NOTINLINE declarations. Upon encountering something else return NIL.
+;;; This is later used by PROCESS-INLINE-LEXENV to reproduce the lexenv.
+;;;
+;;; Previously it just used the functions and vars of the innermost
+;;; lexenv, but the body of macrolet can refer to other macrolets
+;;; defined earlier, so it needs to process all the parent lexenvs to
+;;; recover the proper order.
+(defun reconstruct-lexenv (lexenv)
+  (let (shadowed-funs
+        shadowed-vars
+        result)
+    (loop for env = lexenv then parent
+          for parent = (lexenv-parent env)
+          for vars = (lexenv-vars env)
+          for funs = (lexenv-funs env)
+          for declarations = nil
+          for symbol-macros = nil
+          for macros = nil
+          do
+          (loop for binding in vars
+                for (name . what) = binding
+                unless (and parent
+                            (find binding (lexenv-vars parent)))
+                do (typecase what
+                     (cons
+                      (aver (eq (car what) 'macro))
+                      (push name shadowed-vars)
+                      (push (list name (cdr what)) symbol-macros))
+                     (global-var
+                      (aver (eq (global-var-kind what) :special))
+                      (push `(special ,name) declarations))
+                     (t
+                      (unless (memq name shadowed-vars)
+                        (return-from reconstruct-lexenv)))))
+          (loop for binding in funs
+                for (name . what) = binding
+                unless (and parent
+                            (find binding (lexenv-funs parent)))
+                do
+                (typecase what
+                  (cons
+                   (push name shadowed-funs)
+                   (let ((expression (function-lambda-expression (cdr what))))
+                     (aver expression)
+                     (push (cons name expression) macros)))
+                  ;; FIXME: Is there a good reason for this not to be
+                  ;; DEFINED-FUN (which :INCLUDEs GLOBAL-VAR, in case
+                  ;; you're wondering how this ever worked :-)? Maybe
+                  ;; in conjunction with an AVERrance that it's not an
+                  ;; (AND GLOBAL-VAR (NOT GLOBAL-FUN))? -- CSR,
+                  ;; 2002-07-08
+                  (global-var
+                   (unless (defined-fun-p what)
+                     (return-from reconstruct-lexenv))
+                   (push `(,(car (defined-fun-inlinep what))
+                           ,name)
+                         declarations))
+                  (t
+                   (unless (memq name shadowed-funs)
+                     (return-from reconstruct-lexenv)))))
+          (when declarations
+            (setf result (list* :declare declarations (and result (list result)))))
+          (when symbol-macros
+            (setf result (list* :symbol-macro symbol-macros (and result (list result)))))
+          (when macros
+            (setf result (list* :macro macros (and result (list result)))))
+          while (and parent
+                     (not (null-lexenv-p parent))))
+    result))
+
+;;; Return a sexpr for LAMBDA in LEXENV such that loading it from fasl
+;;; preserves the original lexical environment for inlining.
+;;; Return NIL if the lexical environment is too complicated.
+(defun maybe-inline-syntactic-closure (lambda lexenv)
+  (declare (type list lambda) (type lexenv-designator lexenv))
+  (aver (eql (first lambda) 'lambda))
+  ;; We used to have a trivial implementation, verifying that lexenv
+  ;; was effectively null. However, this fails to take account of the
+  ;; idiom
+  ;;
+  ;; (declaim (inline foo))
+  ;; (macrolet ((def (x) `(defun ,x () ...)))
+  ;;   (def foo))
+  ;;
+  ;; which, while too complicated for the cross-compiler to handle in
+  ;; unfriendly foreign lisp environments, would be good to support in
+  ;; the target compiler. -- CSR, 2002-05-13 and 2002-11-02
+  (typecase lexenv
+   (lexenv
+    (let ((vars (lexenv-vars lexenv))
+          (funs (lexenv-funs lexenv)))
+      (acond ((or (lexenv-blocks lexenv) (lexenv-tags lexenv)) nil)
+             ((and (null vars) (null funs)) lambda)
+             ;; If the lexenv is too hairy for cross-compilation,
+             ;; you'll find out later, when trying to perform inlining.
+             ;; This is fine, because if the inline expansion is only
+             ;; for the target, it's totally OK to cross-compile this
+             ;; defining form. The syntactic env is correctly captured.
+             ((reconstruct-lexenv lexenv)
+              `(lambda-with-lexenv ,it ,@(cdr lambda))))))
+   #+(and sb-fasteval (not sb-xc-host))
+   (sb-interpreter:basic-env
+    (awhen (sb-interpreter::reconstruct-syntactic-closure-env lexenv)
+      `(lambda-with-lexenv ,it ,@(cdr lambda))))
+   #+sb-fasteval
+   (null lambda))) ; trivial case. Never occurs in the compiler.
+
+(declaim (end-block))
+
+#-sb-devel
 (declaim (start-block ir1-convert-inline-lambda))
 
 ;;; Convert the forms produced by RECONSTRUCT-LEXENV to LEXENV
@@ -1160,7 +1276,8 @@
                           :type (if (eq :declared where-from)
                                     (leaf-type found)
                                     (or (and lp
-                                             (ftype-from-lambda-list lambda-list))
+                                             (ignore-errors
+                                              (ftype-from-lambda-list lambda-list)))
                                         (specifier-type 'function))))))
                (substitute-leaf res found)
                (setf (gethash name free-funs) res)))
@@ -1373,27 +1490,3 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
             (specifier-type 'function))))
 
   (values))
-
-;; Similar to above, detect duplicate definitions within a file,
-;; but the package lock check is unnecessary - it's handled elsewhere.
-;;
-;; Additionally, this is a STYLE-WARNING, not a WARNING, because there is
-;; meaningful behavior that can be ascribed to some redefinitions, e.g.
-;;  (defmacro foo () first-definition)
-;;  (defun f () (use-it (foo )))
-;;  (defmacro foo () other-definition)
-;; will use the first definition when compiling F, but make the second available
-;; in the loaded fasl. In this usage it would have made sense to wrap the
-;; respective definitions with EVAL-WHEN for different situations,
-;; but as long as the compile-time behavior is deterministic, it's just bad style
-;; and not flat-out wrong, though there is indeed some waste in the fasl.
-;;
-;; KIND is the globaldb KIND of this NAME
-(defun %compiler-defmacro (kind name)
-  (let ((name-key `(,kind ,name)))
-    (when (boundp '*lexenv*)
-      (aver (producing-fasl-file))
-      ;; a slight OAOO issue here wrt %COMPILER-DEFUN
-      (if (member name-key (fun-names-in-this-file *compilation*) :test #'equal)
-          (compiler-style-warn 'same-file-redefinition-warning :name name)
-          (push name-key (fun-names-in-this-file *compilation*))))))

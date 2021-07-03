@@ -16,12 +16,12 @@
 
 (defstruct (modular-class (:copier nil))
   ;; hash: name -> { :GOOD | optimizer | ({modular-fun-info}*)}
-  (funs (make-hash-table :test 'eq))
+  (funs (make-hash-table)) ; keys are symbols
   ;; hash: modular-variant -> (prototype width)
   ;;
   ;; FIXME: Reimplement with generic function names of kind
   ;; (MODULAR-VERSION prototype width)
-  (versions (make-hash-table :test 'eq))
+  (versions (make-hash-table))
   ;; list of increasing widths + signedps
   (widths nil))
 (define-load-time-global *untagged-unsigned-modular-class* (make-modular-class))
@@ -96,7 +96,7 @@
     (check-type kind (member :untagged :tagged))
     (when lambda-list-p
       (dolist (arg lambda-list)
-        (when (member arg sb-xc:lambda-list-keywords)
+        (when (member arg lambda-list-keywords)
           (error "Lambda list keyword ~S is not supported for modular ~
                 function lambda lists." arg))))))
 
@@ -200,8 +200,10 @@
                       (return-from insert-lvar-cut)))))
                (filter-lvar lvar
                             (if signedp
-                                `(mask-signed-field ,width 'dummy)
-                                `(logand 'dummy ,(ldb (byte width 0) -1))))
+                                (lambda (dummy)
+                                  `(mask-signed-field ,width ,dummy))
+                                (lambda (dummy)
+                                  `(logand ,dummy ,(ldb (byte width 0) -1)))))
                (do-uses (node lvar)
                  (setf (block-reoptimize (node-block node)) t)
                  (reoptimize-component (node-component node) :maybe))

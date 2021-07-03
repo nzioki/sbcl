@@ -11,6 +11,8 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:call :sethi :add :absolute :sethi+add) #'equalp)
+
 ;;;; Additional constants
 
 ;;; NUMBER-STACK-DISPLACEMENT
@@ -294,7 +296,7 @@
      zero-sc-number)
     (null
      null-sc-number)
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol

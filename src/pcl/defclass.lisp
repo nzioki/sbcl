@@ -161,7 +161,6 @@
            options)
   (let (metaclass
         default-initargs
-        documentation
         canonized-options)
       (dolist (option options)
         (unless (listp option)
@@ -191,7 +190,6 @@
           (:documentation
            (unless (stringp (second option))
              (error "~S is not a legal :documentation value" (second option)))
-           (setf documentation t)
            (push `(:documentation ,(second option)) canonized-options))
           (otherwise
            (push `(',(car option) ',(cdr option)) canonized-options))))
@@ -293,15 +291,15 @@
                                              source-form)
   (cond ((and (or (eq initform t)
                   (equal initform ''t))
-              (neq type t))
+              (eq type t))
          '(function constantly-t))
         ((and (or (eq initform nil)
                   (equal initform ''nil))
-              (neq type t))
+              (eq type t))
          '(function constantly-nil))
         ((and (or (eql initform 0)
                   (equal initform ''0))
-              (neq type t))
+              (eq type t))
          '(function constantly-0))
         (t
          (let* ((initform (if (eq type t)

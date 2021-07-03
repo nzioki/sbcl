@@ -32,7 +32,7 @@ for d in tools-for-build; do
     $GNUMAKE -I ../src/runtime -s clean
     cd "$original_pwd" > /dev/null
 done
-( cd ./doc ; sh ./clean.sh )
+( cd ./doc && sh ./clean.sh )
 
 # Within all directories, remove things which don't look like source
 # files. Some explanations:
@@ -118,4 +118,15 @@ find . \( \
         -name 'TAGS' -o \
         -name 'tags' -o \
         -name 'test-passed' -o \
-        -name 'local-target-features.lisp-expr' \) -print | xargs rm -fr
+        -name 'local-target-features.lisp-expr' \) -print | \
+    if test -f .cleanignore; then
+        # Because this file deletes all symlinks, it prevents building
+        # in a tree of symlinks. Here's a low-tech workaround: have
+        # whatever tool creates your tree of symlinks enumerate
+        # relative paths to each one in a file called .cleanignore,
+        # and this script won't delete them. This .cleanignore file
+        # doesn't support any wildcards or comments.
+        awk 'BEGIN{while(getline <".cleanignore"!=0){ign["./" $0]=1}} ign[$0]!=1';
+    else
+        cat;
+    fi | xargs rm -fr

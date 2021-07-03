@@ -100,6 +100,9 @@
 
 (defun describe (object &optional (stream-designator *standard-output*))
   "Print a description of OBJECT to STREAM-DESIGNATOR."
+  ;; This DECLARE works around a compiler bug that FTYPE does not force
+  ;; type-checking of the optional argument.
+  (declare (stream-designator stream-designator))
   (let ((stream (out-stream-from-designator stream-designator))
         (*print-right-margin* (or *print-right-margin* 72))
         (*print-circle* t)
@@ -246,6 +249,15 @@
 (defmethod describe-object ((object sb-pcl::slot-object) stream)
   (print-standard-describe-header object stream)
   (describe-instance object stream))
+
+(defmethod describe-object ((object pathname) stream)
+  (print-standard-describe-header object stream)
+  (loop for name across #(host device directory name type version)
+        for i from (get-dsd-index pathname host)
+        do (awhen (%instance-ref object i)
+             (format stream "~%  ~10A = ~A" name
+                     (prin1-to-line (if (eq name 'directory) (car it) it)))))
+  (terpri stream))
 
 (defmethod describe-object ((object character) stream)
   (print-standard-describe-header object stream)
@@ -527,13 +539,15 @@
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Lambda-list: ~:S" lambda-list)))
+    (format stream "~@:_Lambda-list: ~/sb-impl:print-lambda-list/" lambda-list)))
 
 (defun describe-argument-precedence-order (argument-list stream)
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Argument precedence order: ~:A" argument-list)))
+    (format stream "~@:_Argument precedence order: ~
+                    ~/sb-impl:print-lambda-list/"
+            argument-list)))
 
 (defun describe-function-source (function stream)
   (declare (function function))
@@ -587,7 +601,7 @@
                   (t
                    (let* ((fun (or function (fdefinition name)))
                           (derived-type (and function
-                                             (%fun-type function)))
+                                             (%fun-ftype function)))
                           (legal-name-p (legal-fun-name-p name))
                           (ctype (and legal-name-p
                                       (global-ftype name)))
@@ -602,7 +616,7 @@
                                  (member from '(:defined-method :defined)))
                             (setf derived-type type)))
                      (unless derived-type
-                       (setf derived-type (%fun-type fun)))
+                       (setf derived-type (%fun-ftype fun)))
                      (if (typep fun 'standard-generic-function)
                          (values fun
                                  "a generic function"
@@ -671,7 +685,8 @@
                        (format stream "Methods:")
                        (dolist (method methods)
                          (pprint-indent :block 2 stream)
-                         (format stream "~@:_(~A ~{~S ~}~:S)"
+                         (format stream "~@:_(~A ~{~S ~}~
+                                         ~/sb-impl:print-lambda-list/)"
                                  name
                                  (method-qualifiers method)
                                  (sb-pcl::unparse-specializers
@@ -684,12 +699,14 @@
       (describe-block (stream "~A has a compiler-macro:" name)
         (describe-documentation it t stream)
         (describe-function-source it stream)))
+    ;; It seems entirely bogus to claim that, for example (SETF CAR)
+    ;; has a setf expander when what we mean is that CAR has.
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
              (expander (info :setf :expander name2)))
-        (cond ((typep expander '(and symbol (not null)))
+        (cond ((typep expander '(cons symbol))
                (describe-block (stream "~A has setf-expansion: ~S"
-                                       name expander)
+                                       name (car expander))
                  (describe-documentation name2 'setf stream)))
               (expander
                (when (listp expander)

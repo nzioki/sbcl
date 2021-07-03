@@ -13,6 +13,18 @@
 
 ;;;; general warm init compilation policy
 
+;;; First things first, bootstrap the WARNING handler.
+sb-kernel::
+(setq **initial-handler-clusters**
+      `(((,(find-classoid-cell 'warning) .
+           ,(named-lambda "MAYBE-MUFFLE" (warning)
+              (when (muffle-warning-p warning)
+                (muffle-warning warning))))
+         (,(find-classoid-cell 'step-condition) . sb-impl::invoke-stepper))))
+;;;; And now a trick: splice those into the oldest *HANDLER-CLUSTERS*
+;;;; which had a placeholder NIL reserved for this purpose.
+sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
+
 ;;;; Use the same settings as PROCLAIM-TARGET-OPTIMIZATION
 ;;;; I could not think of a trivial way to ensure that this stays functionally
 ;;;; identical to the corresponding code in 'compile-cold-sbcl'.
@@ -115,8 +127,8 @@
 ;;;     ((:or :macro (:match "$EARLY-") (:match "$BOOT-"))
 ;;;     (declare (optimize (speed 0))))))
 ;;;
-(let ((sources (with-open-file (f (merge-pathnames "../../build-order.lisp-expr"
-                                                   *load-pathname*))
+(defvar *sbclroot* "")
+(let ((sources (with-open-file (f (merge-pathnames "build-order.lisp-expr" *load-pathname*))
                  (read f) ; skip over the make-host-{1,2} input files
                  (read f)))
       (sb-c::*handled-conditions* sb-c::*handled-conditions*))
@@ -131,7 +143,8 @@
                            ;; a literal (when compiling in the LOAD step)
                            t))
                 (output
-                  (compile-file-pathname stem
+                  (compile-file-pathname
+                   (concatenate 'string *sbclroot* stem)
                    :output-file
                    (merge-pathnames
                     (concatenate
@@ -145,9 +158,21 @@
               retry-compile-file
                 (multiple-value-bind (output-truename warnings-p failure-p)
                     (ecase (if (boundp '*compile-files-p*) *compile-files-p* t)
-                     ((t)   (let ((sb-c::*source-namestring* fullname))
-                              (ensure-directories-exist output)
-                              (compile-file stem :output-file output)))
+                     ((t)
+                      (let ((sb-c::*source-namestring* fullname)
+                            (sb-ext:*derive-function-types*
+                              (unless (search "/pcl/" stem)
+                                t)))
+                        (ensure-directories-exist output)
+                        ;; Like PROCLAIM-TARGET-OPTIMIZATION in 'compile-cold-sbcl'
+                        ;; We should probably stash a copy of the POLICY instance from
+                        ;; make-host-2 in a global var and apply it here.
+                        (proclaim '(optimize
+                                    (safety 2) (speed 2)
+                                    (sb-c:insert-step-conditions 0)
+                                    (sb-c:alien-funcall-saves-fp-and-pc #+x86 3 #-x86 0)))
+                        (compile-file (concatenate 'string *sbclroot* stem)
+                                      :output-file output)))
                      ((nil) output))
                   (cond ((not output-truename)
                          (error "COMPILE-FILE of ~S failed." stem))
@@ -180,9 +205,14 @@
                     (error "LOAD of ~S failed." output-truename))
                   (sb-int:/show "done loading" output-truename))))))))
 
-  (let ((*compile-print* nil))
+  (let ((cl:*compile-print* nil))
     (dolist (group sources)
-      (handler-bind ((#+x86-64 warning #-x86-64 simple-warning
+      ;; For the love of god, what are we trying to do here???
+      ;; It's gone through so many machinations that I can't figure it out.
+      ;; The goal should be to build warning-free, not layer one
+      ;; kludge upon another so that it can be allowed not to.
+      (handler-bind (((and #+x86-64 warning #-x86-64 simple-warning
+                           (not sb-kernel:redefinition-warning))
                       (lambda (c)
                         ;; escalate "undefined variable" warnings to errors.
                         ;; There's no reason to allow them in our code.
@@ -190,8 +220,18 @@
                                    (search "undefined variable"
                                            (write-to-string c :escape nil)))
                           (cerror "Finish warm compile ignoring the problem" c)))))
-        (with-compilation-unit () (do-srcs group)))))))
+        (with-compilation-unit ()
+          (do-srcs group)
+          ;; I do not know why #+sb-show gets several "undefined-type CLASS" warnings
+          ;; that #-sb-show doesn't. And CLASS is a reserved name not defined as yet,
+          ;; so we have to pretend that didn't happen, otherwise the warning about
+          ;; not being able to define CLASS as a type name breaks the build.
+          #+sb-show
+          (setq sb-c::*undefined-warnings*
+                (delete 'class sb-c::*undefined-warnings*
+                        :key #'sb-c::undefined-warning-name))))))))
 
+(sb-c::dump/restore-interesting-types 'write)
 (when (hash-table-p sb-c::*static-vop-usage-counts*)
   (with-open-file (output "output/warm-vop-usage.txt"
                           :direction :output :if-exists :supersede)

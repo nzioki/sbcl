@@ -174,7 +174,7 @@
 
 (defun-with-dx dx-value-cell (x)
   ;; Not implemented everywhere, yet.
-  #+(or x86 x86-64 mips hppa)
+  #+(or x86 x86-64 mips)
   (let ((cell x))
     (declare (sb-int:truly-dynamic-extent cell))
     (flet ((f ()
@@ -343,7 +343,7 @@
   (let ((thing sb-c::*backend-parsed-vops*))
     ;; check some preconditions
     (assert (typep thing 'hash-table))
-    (assert (/= (sb-kernel:layout-bitmap (sb-kernel:%instance-layout thing))
+    (assert (/= (sb-kernel:wrapper-bitmap (sb-kernel:%instance-wrapper thing))
                 sb-kernel:+layout-all-tagged+))
     (assert-no-consing
      (sb-int:dx-let ((x (copy-structure thing)))
@@ -873,7 +873,7 @@
     (assert (every (lambda (x) (eql x 0)) a))))
 
 (with-test (:name (:dx-bug-misc :bdowning-2005-iv-16))
-  #+(or hppa mips x86 x86-64)
+  #+(or mips x86 x86-64)
   (assert-no-consing (bdowning-2005-iv-16))
   (bdowning-2005-iv-16))
 
@@ -928,7 +928,7 @@
       (multiple-value-bind (y pos2) (read-from-string res nil nil :start pos)
         (assert (equalp f2 y))
         (assert (equalp f3 (read-from-string res nil nil :start pos2))))))
-  #+(or hppa mips x86 x86-64)
+  #+(or mips x86 x86-64)
   (assert-no-consing (assert (eql n (funcall fun nil))))
   (assert (eql n (funcall fun nil))))
 
@@ -949,7 +949,7 @@
                   (with-test (:name (:dx-flet-test ,n))
                     (test-dx-flet-test #',name ,n ,f1 ,f2 ,f3))))))
   (def 0 (list :one) (list :two) (list :three))
-  (def 1 (make-array 128) (list 1 2 3 4 5 6 7 8) (list 'list))
+  (def 1 (make-array 128 :initial-element nil) (list 1 2 3 4 5 6 7 8) (list 'list))
   (def 2 (list 1) (list 2 3) (list 4 5 6 7)))
 
 ;;; Test that unknown-values coming after a DX value won't mess up the
@@ -1587,3 +1587,15 @@
     (assert-no-consing
      (with-output-to-string (*standard-output* s)
        (write-char #\x)))))
+
+(with-test (:name :cycles-without-dx-lvars)
+  (checked-compile-and-assert
+   ()
+   `(lambda (f x z)
+      (let ((l (if x
+                   (loop while z)
+                   (list (list 1)))))
+        (declare (dynamic-extent l))
+        (funcall f l)))
+   (((lambda (l) (equal l '((1)))) nil nil) t)
+   (((lambda (l) (equal l nil)) t nil) t)))

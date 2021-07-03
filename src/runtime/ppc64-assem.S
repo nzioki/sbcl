@@ -129,11 +129,6 @@ Low Address
 	ld 0, 16(sp) ; mtlr 0       /* Restore LR  */ ; \
 	lwz 0, 8(sp) ; mtcr 0       /* Restore CR */
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-/* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
-#endif
-
 /* We create a pointer into the actual csymbol
    This way the symbol ptr_ symbol lives within a 32 bits offset
    of the TOC. See Store and Load macros in this file */
@@ -148,9 +143,6 @@ indirect_ptr(dynamic_space_free_pointer)
 indirect_ptr(foreign_function_call_active)
 #endif
 indirect_ptr(all_threads)
-#if defined(LISP_FEATURE_SB_THREAD)
-indirect_ptr(specials)
-#endif
 
 	.text
 
@@ -163,26 +155,10 @@ indirect_ptr(specials)
 	C_FULL_PROLOG
 	/* NL0 - function, NL1 - frame pointer, NL2 - nargs. */
 #ifdef LISP_FEATURE_SB_THREAD
-	/* We need to obtain a pointer to our TLS block before we do
-	 * anything else.  For this, we call pthread_getspecific().
-	 * We've preserved all of the callee-saves registers, so we
-	 * can use them to stash our arguments temporarily while we
-	 * make the call. */
-	mr reg_A0, reg_NL0
-	mr reg_A1, reg_NL1
-	mr reg_A2, reg_NL2
-
-	/* Call out to obtain our TLS block. */
-	load(reg_NL0,specials)
-        bl pthread_getspecific
-        nop
-
-	mr reg_THREAD, reg_NL0
-
-	/* Restore our original parameters. */
-	mr reg_NL2, reg_A2
-	mr reg_NL1, reg_A1
-	mr reg_NL0, reg_A0
+	// Copy ABI TLS value of current_thread into lisp thread base
+	addis reg_THREAD,13,current_thread@tprel@ha
+	addi reg_THREAD,reg_THREAD,current_thread@tprel@l
+	ld reg_THREAD,0(reg_THREAD)
 #endif
 	/* Initialize tagged registers */
 	li reg_ZERO,0
@@ -363,16 +339,6 @@ lra:
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3, 0
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* OK to run GC without stopping this thread from this point on. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	std reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_CFUNC,all_threads)
-	std reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
-#  endif
-#endif
-
 	mr reg_NL3,reg_NARGS
 
 	/* "If a function changes the value of the TOC pointer register,
@@ -429,16 +395,6 @@ lra:
 	li reg_THREAD,0
 #endif
 	li reg_LIP,0
-
-# ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* No longer OK to run GC except at safepoints. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	std reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_BSP,all_threads)
-	std reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
-#  endif
-# endif
 
 	/* Atomic ... */
 	li reg_ALLOC,flag_PseudoAtomic
@@ -504,11 +460,6 @@ lra:
 	.globl fun_end_breakpoint_trap
 	.globl fun_end_breakpoint_end
 
-	/* Due to pointer verification in MAKE-LISP-OBJ, this must
-	include its header data (the offset from the start of the
-	code-object to the LRA). */
-	.quad  (((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
-
 	/* We are receiving unknown multiple values, thus must deal
 	with the single-value and multiple-value cases separately. */
 	b fun_end_breakpoint_multiple_values
@@ -523,7 +474,8 @@ lra:
 	boxed words (see calculation for RETURN_PC_WIDETAG, above).
 	Restoring reg_CODE doesn't appear to be strictly necessary
 	here, but let's observe the niceties.*/
-	addi reg_CODE, reg_LRA, ((CODE_SIZE+1)&~1)*-N_WORD_BYTES-OTHER_POINTER_LOWTAG
+        /* KLUDGE: the extra 2 words are for the jump table prefix and padding. */
+	addi reg_CODE, reg_LRA, (2+((CODE_SIZE+1)&~1))*-N_WORD_BYTES-OTHER_POINTER_LOWTAG
 
 	/* Multiple values are stored relative to reg_OCFP, which we
 	set to be the current top-of-stack. */

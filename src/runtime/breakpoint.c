@@ -94,11 +94,7 @@ lispobj find_code(os_context_t *context)
 static long compute_offset(os_context_t *context, lispobj code)
 {
   if (code != NIL) {
-#ifdef LISP_FEATURE_HPPA
-        uword_t pc = *os_context_pc_addr(context) & ~3;
-#else
         uword_t pc = *os_context_pc_addr(context);
-#endif
         struct code *codeptr = (struct code *)native_pointer(code);
         uword_t code_start = (uword_t)code_text_start(codeptr);
         int offset;
@@ -117,7 +113,7 @@ void handle_breakpoint(os_context_t *context)
     fake_foreign_function_call(context);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals(0, 0);
+    unblock_gc_signals();
 #endif
     code = find_code(context);
 
@@ -144,7 +140,7 @@ void *handle_fun_end_breakpoint(os_context_t *context)
     fake_foreign_function_call(context);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals(0, 0);
+    unblock_gc_signals();
 #endif
 
     code = find_code(context);

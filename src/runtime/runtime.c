@@ -33,16 +33,16 @@
 #include "runtime.h"
 #ifndef LISP_FEATURE_WIN32
 #include <sched.h>
+#else
+#include <shellapi.h>
 #endif
 #include <errno.h>
 #include <locale.h>
 #include <limits.h>
 
-#if defined(SVR4) || defined(__linux__)
 #include <time.h>
-#endif
 
-#if !(defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD))
+#ifndef LISP_FEATURE_WIN32
 #include "signal.h"
 #endif
 
@@ -64,36 +64,12 @@
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 
+struct timespec lisp_init_time;
+
 static char libpath[] = "../lib/sbcl";
 char *sbcl_runtime_home;
 char *sbcl_runtime;
 
-#ifdef LISP_FEATURE_HPUX
-extern void *return_from_lisp_stub;
-#include "genesis/closure.h"
-#include "genesis/simple-fun.h"
-#endif
-
-
-/* SIGINT handler that invokes the monitor (for when Lisp isn't up to it) */
-static void
-sigint_handler(int __attribute__((unused)) signal,
-               siginfo_t __attribute__((unused)) *info,
-               os_context_t *context)
-{
-    lose("\nSIGINT hit at 0x%08lX",
-         (unsigned long) *os_context_pc_addr(context));
-}
-
-/* (This is not static, because we want to be able to call it from
- * Lisp land.) */
-void
-sigint_init(void)
-{
-    SHOW("entering sigint_init()");
-    install_handler(SIGINT, sigint_handler, 0, 1);
-    SHOW("leaving sigint_init()");
-}
 
 /*
  * helper functions for dealing with command line args
@@ -365,12 +341,14 @@ parse_size_arg(char *arg, char *arg_name)
   return res;
 }
 
-char **posix_argv;
-char *core_string;
-
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-void pthreads_win32_init();
+#ifdef LISP_FEATURE_WIN32
+    wchar_t
+#else
+    char
 #endif
+    **posix_argv;
+
+char *core_string;
 
 static void print_environment(int argc, char *argv[])
 {
@@ -424,11 +402,26 @@ sbcl_main(int argc, char *argv[], char *envp[])
     /* Exception handling support structure. Evil Win32 hack. */
     struct lisp_exception_frame exception_frame;
 #endif
+#ifdef LISP_FEATURE_UNIX
+    clock_gettime(
+#ifdef LISP_FEATURE_LINUX
+        CLOCK_MONOTONIC_COARSE
+#else
+        CLOCK_MONOTONIC
+#endif
+        , &lisp_init_time);
+#endif
 
     /* the name of the core file we're to execute. Note that this is
      * a malloc'ed string which should be freed eventually. */
     char *core = 0;
-    char **sbcl_argv = 0;
+
+#ifdef LISP_FEATURE_WIN32
+    wchar_t
+#else
+        char
+#endif
+        **sbcl_argv = 0;
     os_vm_offset_t embedded_core_offset = 0;
 
     /* other command line options */
@@ -448,12 +441,14 @@ sbcl_main(int argc, char *argv[], char *envp[])
     memsize_options.present_in_core = 0;
 
     boolean have_hardwired_spaces = os_preinit(argv, envp);
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-    pthreads_win32_init();
-#endif
 
     interrupt_init();
+#ifdef LISP_FEATURE_UNIX
+    /* Not sure why anyone sends signals to this process so early.
+     * But win32 models the signal mask as part of 'struct thread'
+     * which doesn't exist yet, so don't do this */
     block_blockable_signals(0);
+#endif
 
     /* Check early to see if this executable has an embedded core,
      * which also populates runtime_options if the core has runtime
@@ -479,7 +474,12 @@ sbcl_main(int argc, char *argv[], char *envp[])
         dynamic_space_size = memsize_options.dynamic_space_size;
         thread_control_stack_size = memsize_options.thread_control_stack_size;
         dynamic_values_bytes = memsize_options.thread_tls_bytes;
+#ifndef LISP_FEATURE_WIN32
         sbcl_argv = argv;
+#else
+        int wargc;
+        sbcl_argv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+#endif
     } else {
         int argi = 1;
 
@@ -586,6 +586,7 @@ sbcl_main(int argc, char *argv[], char *envp[])
         {
             char *argi0 = argv[argi];
             int argj = 1;
+#ifndef LISP_FEATURE_WIN32
             /* (argc - argi) for the arguments, one for the binary,
                and one for the terminating NULL. */
             sbcl_argv = successful_malloc((2 + argc - argi) * sizeof(char *));
@@ -603,6 +604,24 @@ sbcl_main(int argc, char *argv[], char *envp[])
                 }
                 sbcl_argv[argj++] = arg;
             }
+#else
+            /* The runtime options are processed as chars above, which may
+             * not always work but may be good enough for now, as it
+             * has been for a long time. */
+            int wargc;
+            wchar_t** wargv;
+            wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+            sbcl_argv = successful_malloc((2 + wargc - argi) * sizeof(wchar_t *));
+            sbcl_argv[0] = wargv[0];
+            while (argi < wargc) {
+                wchar_t *warg = wargv[argi++];
+                if (!end_runtime_options &&
+                    0 == wcscmp(warg, L"--end-runtime-options")) {
+                    lose("bad runtime option \"%s\"", argi0);
+                }
+                sbcl_argv[argj++] = warg;
+            }
+#endif
             sbcl_argv[argj] = 0;
         }
     }
@@ -620,12 +639,6 @@ sbcl_main(int argc, char *argv[], char *envp[])
         print_environment(argc, argv);
     }
     dyndebug_init();
-#ifdef LISP_FEATURE_ALPHA // When we remove Alpha, this #if can go away
-    /* KLUDGE: os_vm_page_size is set by os_init(), and on some
-     * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
-     * it must follow os_init(). -- WHN 2000-01-26 */
-    arch_init();
-#endif
     // FIXME: if the 'have' flag is 0 and you've disabled disabling of ASLR
     // then we haven't done an exec(), nor unmapped the mappings that were obtained
     // already obtained (if any) so it is unhelpful to try again here.
@@ -702,17 +715,15 @@ sbcl_main(int argc, char *argv[], char *envp[])
      * since it was too soon earlier to handle write faults. */
     write_protect_immobile_space();
 #endif
-#ifdef LISP_FEATURE_HPUX
-    // FIXME: obvious bitrot here. 23 isn't the offset to anything.
-    /* -1 = CLOSURE_FUN_OFFSET, 23 = SIMPLE_FUN_CODE_OFFSET, we are
-     * not in __ASSEMBLER__ so we cant reach them. */
-    return_from_lisp_stub = (void *) ((char *)*((unsigned long *)
-                 ((char *)initial_function + -1)) + 23);
-#endif
 
     arch_install_interrupt_handlers();
 #ifndef LISP_FEATURE_WIN32
     os_install_interrupt_handlers();
+# ifdef LISP_FEATURE_SB_SAFEPOINT
+    ll_install_handler(SIGURG, thruption_handler);
+# elif defined LISP_FEATURE_SB_THREAD
+    ll_install_handler(SIG_STOP_FOR_GC, sig_stop_for_gc_handler);
+# endif
 #else
 /*     wos_install_interrupt_handlers(handler); */
     wos_install_interrupt_handlers(&exception_frame);
@@ -726,7 +737,7 @@ sbcl_main(int argc, char *argv[], char *envp[])
 
     FSHOW((stderr, "/funcalling initial_function=0x%lx\n",
           (unsigned long)initial_function));
-    create_initial_thread(initial_function);
+    create_main_lisp_thread(initial_function);
     lose("unexpected return from initial thread in main()");
     return 0;
 }

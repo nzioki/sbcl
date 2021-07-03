@@ -26,40 +26,20 @@
 (declaim (freeze-type opaque-box))
 
 ;;; ANSI limits on compilation
-(defconstant sb-xc:call-arguments-limit sb-xc:most-positive-fixnum
+(defconstant call-arguments-limit most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(defconstant sb-xc:lambda-parameters-limit sb-xc:most-positive-fixnum
+(defconstant lambda-parameters-limit most-positive-fixnum
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant sb-xc:multiple-values-limit sb-xc:most-positive-fixnum
+(defconstant multiple-values-limit most-positive-fixnum
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
-;;;; cross-compiler-only versions of CL special variables, so that we
-;;;; don't have weird interactions with the host compiler
 
-(defvar sb-xc:*compile-file-pathname*)
-(defvar sb-xc:*compile-file-truename*)
-(defvar sb-xc:*compile-print*)
-(defvar sb-xc:*compile-verbose*)
-
 ;;;; miscellaneous types used both in the cross-compiler and on the target
 
-;;;; FIXME: The INDEX and LAYOUT-DEPTHOID definitions probably belong
-;;;; somewhere else, not "early-c", since they're after all not part
-;;;; of the compiler.
-
-;;; the type of LAYOUT-DEPTHOID and LAYOUT-LENGTH values.
-;;; Each occupies two bytes of the %BITS slot when possible,
-;;; otherwise a slot unto itself.
-(def!type layout-depthoid () '(integer -1 #x7FFF))
-(def!type layout-length () '(integer 0 #xFFFF))
-(def!type layout-bitmap ()
-  ;; FIXME: Probably should exclude negative bignum
-  #+compact-instance-header 'integer
-  #-compact-instance-header '(and integer (not (eql 0))))
 
 ;;; An INLINEP value describes how a function is called. The values
 ;;; have these meanings:
@@ -96,15 +76,17 @@
   (free-funs (make-hash-table :test 'equal) :read-only t :type hash-table)
   ;; These hashtables translate from constants to the LEAFs that
   ;; represent them.
-  ;; Table 1: one entry for each distinct constant (according to object identity)
-  (eq-constants (make-hash-table :test 'eq) :read-only t :type hash-table)
-  ;; Table 2: one hash-table entry per EQUAL constant,
+  ;; Table 1: one entry per named constant
+  (named-constants (make-hash-table :test 'eq) :read-only t :type hash-table)
+  ;; Table 2: one entry for each unnamed constant as compared by EQL
+  (eql-constants (make-hash-table :test 'eql) :read-only t :type hash-table)
+  ;; Table 3: one key per EQUAL constant,
   ;; with the caveat that lookups must discriminate amongst constants that
   ;; are EQUAL but not similar.  The value in the hash-table is a list of candidates
   ;; (#<constant1> #<constant2> ... #<constantN>) such that CONSTANT-VALUE
   ;; of each is EQUAL to the key for the hash-table entry, but dissimilar
   ;; from each other. Notably, strings of different element types can't be similar.
-  (similar-constants (make-hash-table :test 'equal) :read-only t :type hash-table))
+  (similar-constants (sb-fasl::make-similarity-table) :read-only t :type hash-table))
 (declaim (freeze-type ir1-namespace))
 
 (sb-impl::define-thread-local *ir1-namespace*)
@@ -132,7 +114,6 @@
 (defvar *constraint-universe*)
 (defvar *current-path*)
 (defvar *current-component*)
-(defvar *delayed-ir1-transforms*)
 #+sb-dyncount
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere-label*)
@@ -146,6 +127,9 @@
 (defvar *lambda-conversions*)
 (defvar *compile-object* nil)
 (defvar *location-context* nil)
+
+(defvar *handled-conditions* nil)
+(defvar *disabled-package-locks* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
@@ -162,8 +146,6 @@ the stack without triggering overflow protection.")
 
 ;;; This lock is seized in the compiler, and related areas -- like the
 ;;; classoid/layout/class system.
-;;; Assigning a literal object enables genesis to dump and load it
-;;; without need of a cold-init function.
 #-sb-xc-host
 (!define-load-time-global **world-lock** (sb-thread:make-mutex :name "World Lock"))
 
@@ -185,69 +167,9 @@ the stack without triggering overflow protection.")
 (progn (declaim (fixnum *type-cache-nonce*))
        (!define-load-time-global *type-cache-nonce* 0))
 
-(defstruct (undefined-warning
-            (:print-object (lambda (x s)
-                             (print-unreadable-object (x s :type t)
-                               (prin1 (undefined-warning-name x) s))))
-            (:copier nil))
-  ;; the name of the unknown thing
-  (name nil :type (or symbol list))
-  ;; the kind of reference to NAME
-  (kind (missing-arg) :type (member :function :type :variable))
-  ;; the number of times this thing was used
-  (count 0 :type unsigned-byte)
-  ;; a list of COMPILER-ERROR-CONTEXT structures describing places
-  ;; where this thing was used. Note that we only record the first
-  ;; *UNDEFINED-WARNING-LIMIT* calls.
-  (warnings () :type list))
-(declaim (freeze-type undefined-warning))
-
-;;; Delete any undefined warnings for NAME and KIND. This is for the
-;;; benefit of the compiler, but it's sometimes called from stuff like
-;;; type-defining code which isn't logically part of the compiler.
-(declaim (ftype (function ((or symbol cons) keyword) (values))
-                note-name-defined))
-(defun note-name-defined (name kind)
-  #-sb-xc-host (atomic-incf *type-cache-nonce*)
-  ;; We do this BOUNDP check because this function can be called when
-  ;; not in a compilation unit (as when loading top level forms).
-  (when (boundp '*undefined-warnings*)
-    (let ((name (uncross name)))
-      (setq *undefined-warnings*
-            (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
-                       *undefined-warnings*))))
-  (values))
-
-;;; to be called when a variable is lexically bound
-(declaim (ftype (function (symbol) (values)) note-lexical-binding))
-(defun note-lexical-binding (symbol)
-    ;; This check is intended to protect us from getting silently
-    ;; burned when we define
-    ;;   foo.lisp:
-    ;;     (DEFVAR *FOO* -3)
-    ;;     (DEFUN FOO (X) (+ X *FOO*))
-    ;;   bar.lisp:
-    ;;     (DEFUN BAR (X)
-    ;;       (LET ((*FOO* X))
-    ;;         (FOO 14)))
-    ;; and then we happen to compile bar.lisp before foo.lisp.
-  (when (looks-like-name-of-special-var-p symbol)
-    ;; FIXME: should be COMPILER-STYLE-WARNING?
-    (style-warn 'asterisks-around-lexical-variable-name
-                :format-control
-                "using the lexical binding of the symbol ~
-                 ~/sb-ext:print-symbol-with-prefix/, not the~@
-                 dynamic binding"
-                :format-arguments (list symbol)))
-  (values))
-
-;;; This is DEF!STRUCT so that when SB-C:DUMPABLE-LEAFLIKE-P invokes
-;;; SB-XC:TYPEP in make-host-2, it does not need need to signal PARSE-UNKNOWN
-;;; for each and every constant seen up until this structure gets defined.
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)
-                               (:copier nil)))
+(defstruct (debug-name-marker (:print-function print-debug-name-marker)
+                              (:copier nil)))
+(declaim (freeze-type debug-name-marker))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -291,6 +213,8 @@ the stack without triggering overflow protection.")
                  ((or symbol number string)
                   x)
                  (t
+                  ;; wtf?? This looks like a source of sensitivity to the cross-compiler host
+                  ;; in addition to which it seems generally a stupid idea.
                   (type-of x)))))
       (let ((name (list* type (walk thing) (when context (name-context)))))
         (when (legal-fun-name-p name)
@@ -407,18 +331,6 @@ the stack without triggering overflow protection.")
 
 (sb-impl::define-thread-local *compilation*)
 (declaim (type compilation *compilation*))
-
-(in-package "SB-ALIEN")
-
-;;; Information describing a heap-allocated alien.
-(def!struct (heap-alien-info (:copier nil))
-  ;; The type of this alien.
-  (type (missing-arg) :type alien-type)
-  ;; Its name.
-  (alien-name (missing-arg) :type simple-string)
-  ;; Data or code?
-  (datap (missing-arg) :type boolean))
-(!set-load-form-method heap-alien-info (:xc :target))
 
 ;; from 'llvm/projects/compiler-rt/lib/msan/msan.h':
 ;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"

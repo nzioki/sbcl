@@ -264,7 +264,7 @@
                                        (if (and (not colon) (stringp (car input)))
                                            (string-left-trim
                                             ;; #\Tab is a nonstandard char
-                                            `(#-sb-xc-host ,(sb-xc:code-char tab-char-code)
+                                            `(#-sb-xc-host ,(code-char tab-char-code)
                                               #\space #\newline)
                                             (pop input))
                                            ""))))
@@ -284,7 +284,7 @@
                         (when (or (plusp n) (emit-placeholder-p))
                           (let ((char (case char
                                         (#\% #\Newline)
-                                        (#\| (sb-xc:code-char form-feed-char-code))
+                                        #-sb-xc-host (#\| (code-char form-feed-char-code))
                                         (t char))))
                             (emit-string (make-string n :initial-element char))))
                         (return)))))
@@ -503,7 +503,7 @@
                ,directives))))
 
 (defun %set-format-directive-expander (char fn)
-  (let ((code (sb-xc:char-code (char-upcase char))))
+  (let ((code (char-code (char-upcase char))))
     (setf (aref *format-directive-expanders* code) fn))
   char)
 
@@ -1075,9 +1075,9 @@
 ;;;; format directives and support functions for justification
 
 (defconstant-eqx !illegal-inside-justification
-  (mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
-          '("~:>" "~:@>"
-            "~:T" "~:@T"))
+  '#.(mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
+             '("~:>" "~:@>"
+               "~:T" "~:@T"))
   #'equal)
 
 ;;; Reject ~W, ~_, ~I and certain other specific values of modifier+character.
@@ -1436,7 +1436,7 @@
                    ((not (directive-colonp close))
                     (values 0 0 directives))
                    ((directive-atsignp justification)
-                    (values 0 sb-xc:call-arguments-limit directives))
+                    (values 0 call-arguments-limit directives))
                    ;; FIXME: here we could assert that the
                    ;; corresponding argument was a list.
                    (t (values 1 1 remaining))))))
@@ -1472,7 +1472,7 @@
                  ;; a format control (either a function or a string).
                  (if (directive-atsignp iteration)
                      (values (if (zerop posn) 1 0)
-                             sb-xc:call-arguments-limit
+                             call-arguments-limit
                              remaining)
                      ;; FIXME: the argument corresponding to this
                      ;; directive must be a list.
@@ -1483,7 +1483,7 @@
                (loop
                 (let ((directive (pop directives)))
                   (when (null directive)
-                    (return (values min (min max sb-xc:call-arguments-limit))))
+                    (return (values min (min max call-arguments-limit))))
                   (when (format-directive-p directive)
                     (incf-both (count :arg (directive-params directive)
                                       :key #'cdr))
@@ -1508,7 +1508,7 @@
                          (cond
                            ((directive-atsignp directive)
                             (incf min)
-                            (setq max sb-xc:call-arguments-limit))
+                            (setq max call-arguments-limit))
                            (t (incf-both 2))))
                         (t (throw 'give-up-format-string-walk nil))))))))))
         (catch 'give-up-format-string-walk

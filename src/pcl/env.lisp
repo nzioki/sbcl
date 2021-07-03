@@ -158,7 +158,7 @@
 (fmakunbound 'make-load-form)
 (defgeneric make-load-form (object &optional environment))
 
-(defun !incorporate-cross-compiled-methods (gf-name &key except)
+(defun !install-cross-compiled-methods (gf-name &key except)
   (assert (generic-function-p (fdefinition gf-name)))
   ;; Reversing installs less-specific methods first,
   ;; so that if perchance we crash mid way through the loop,
@@ -171,15 +171,19 @@
           (fmf         (svref method 3))
           (lambda-list (svref method 4))
           (source-loc  (svref method 5)))
+      (when (sb-kernel::wrapper-p specializer)
+        (setq specializer (wrapper-classoid-name specializer)))
       (unless (member specializer except)
         (multiple-value-bind (specializers arg-info)
-               (ecase gf-name
+               (case gf-name
                  (print-object
                   (values (list (find-class specializer) (find-class t))
                           '(:arg-info (2))))
-                 (make-load-form
+                 ((make-load-form close)
                   (values (list (find-class specializer))
-                          '(:arg-info (1 . t)))))
+                          '(:arg-info (1 . t))))
+                 (t
+                  (values (list (find-class specializer)) '(:arg-info (1)))))
              (load-defmethod
               'standard-method gf-name
               (if qualifier (list qualifier)) specializers lambda-list
@@ -190,7 +194,7 @@
                    mf)
                 plist ,arg-info simple-next-method-call t)
               source-loc))))))
-(!incorporate-cross-compiled-methods 'make-load-form :except '(layout))
+(!install-cross-compiled-methods 'make-load-form :except '(wrapper))
 
 (defmethod make-load-form ((class class) &optional env)
   ;; FIXME: should we not instead pass ENV to FIND-CLASS?  Probably
@@ -202,13 +206,13 @@
         (error "~@<Can't use anonymous or undefined class as constant: ~S~:@>"
                class))))
 
-(defmethod make-load-form ((object layout) &optional env)
+(defmethod make-load-form ((object wrapper) &optional env)
   (declare (ignore env))
-  (let ((pname (classoid-proper-name (layout-classoid object))))
+  (let ((pname (classoid-proper-name (wrapper-classoid object))))
     (unless pname
       (error "can't dump wrapper for anonymous class:~%  ~S"
-             (layout-classoid object)))
-    `(classoid-layout (find-classoid ',pname))))
+             (wrapper-classoid object)))
+    `(classoid-wrapper (find-classoid ',pname))))
 
 ;; FIXME: this seems wrong. NO-APPLICABLE-METHOD should be signaled.
 (defun dont-know-how-to-dump (object)
@@ -222,11 +226,6 @@
   (define-default-make-load-form-method structure-object)
   (define-default-make-load-form-method standard-object)
   (define-default-make-load-form-method condition))
-
-sb-impl::
-(defmethod make-load-form ((host (eql *physical-host*)) &optional env)
-  (declare (ignore env))
-  '*physical-host*)
 
 ;;; I guess if the user defines other kinds of EQL specializers, she would
 ;;; need to implement this? And how is she supposed to know that?

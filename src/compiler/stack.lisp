@@ -148,7 +148,8 @@
                   t)
                  ((eq (block-flag current-block) flag)
                   t)
-                 ((eq (block-flag current-block) cycle))
+                 ((eq (block-flag current-block) cycle)
+                  nil)
                  ;; Don't go back past START-BLOCK.
                  ((not (eq current-block start-block))
                   (setf (block-flag current-block) cycle)
@@ -437,7 +438,7 @@
                   for lvar in after-stack
                   unless (memq lvar before-stack)
                   do (cleanup-code
-                      `(%dummy-dx-alloc ',lvar ',previous-lvar)))))
+                      `(%dummy-dx-alloc ,(opaquely-quote lvar) ,(opaquely-quote previous-lvar))))))
       (let* ((end-stack (ir2-block-end-stack (block-info block1)))
              (start-stack (ir2-block-start-stack (block-info block2)))
              (pruned-start-stack (ordered-list-intersection

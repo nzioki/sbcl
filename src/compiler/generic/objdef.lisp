@@ -48,7 +48,7 @@
 (define-primitive-object (bignum :lowtag other-pointer-lowtag
                                  :widetag bignum-widetag
                                  :alloc-trans sb-bignum:%allocate-bignum)
-  (digits :rest-p t :c-type #-alpha "sword_t" #+alpha "u32"))
+  (digits :rest-p t :c-type "sword_t"))
 
 (define-primitive-object (ratio :type ratio
                                 :lowtag other-pointer-lowtag
@@ -101,11 +101,6 @@
                 :ref-known (flushable foldable)
                 :set-trans (setf %array-fill-pointer)
                 :set-known ())
-  (fill-pointer-p :type (member t nil)
-                  :ref-trans %array-fill-pointer-p
-                  :ref-known (flushable foldable)
-                  :set-trans (setf %array-fill-pointer-p)
-                  :set-known ())
   (elements :type index
             :ref-trans %array-available-elements
             :ref-known (flushable foldable)
@@ -140,7 +135,7 @@
   ;; VECTOR -- see SHRINK-VECTOR.
   (length :ref-trans sb-c::vector-length
           :type index)
-  (data :rest-p t :c-type #-alpha "uword_t" #+alpha "u32"))
+  (data :rest-p t :c-type "uword_t"))
 
 #|
 Code header representation:
@@ -207,7 +202,8 @@ during backtrace.
               :ref-known (flushable)
               :ref-trans %%code-debug-info
               :set-known ()
-              :set-trans (setf %code-debug-info))
+              :set-trans (setf #-darwin-jit %code-debug-info
+                               #+darwin-jit %%code-debug-info))
   ;; Define this slot if the architecture might ever use fixups.
   ;; x86-64 doesn't necessarily use them, depending on the feature set,
   ;; but this keeps things consistent.
@@ -235,7 +231,7 @@ during backtrace.
   ;;   pertain to undefined functions, FINs, and closures.
   ;; - all others store a native pointer to the function entry address
   ;;   or closure tramp
-  (raw-addr :c-type #-alpha "char *" #+alpha "u32"))
+  (raw-addr :c-type "char *"))
 
 ;;; a simple function (as opposed to hairier things like closures
 ;;; which are also subtypes of Common Lisp's FUNCTION type)
@@ -263,7 +259,7 @@ during backtrace.
 (defconstant simple-fun-source-slot  2) ; form and/or docstring
 (defconstant simple-fun-info-slot    3) ; type and possibly xref
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (define-primitive-object (return-pc :lowtag other-pointer-lowtag :widetag t)
   (return-point :c-type "unsigned char" :rest-p t))
 
@@ -276,6 +272,10 @@ during backtrace.
                                    :alloc-trans %alloc-closure)
   (fun :init :arg :ref-trans #+(or x86 x86-64) %closure-callee
                              #-(or x86 x86-64) %closure-fun)
+  ;; 'fun' is an interior pointer to code, but we also need the base pointer
+  ;; for MPS. I'm trying to figure out how to avoid this word of overhead,
+  ;; but it works for the time being.
+  #+metaspace (code :ref-known (flushable) :ref-trans %closure-code)
   (info :rest-p t))
 
 (define-primitive-object (funcallable-instance
@@ -283,6 +283,7 @@ during backtrace.
                           :widetag funcallable-instance-widetag
                           :alloc-trans %make-funcallable-instance)
   (trampoline :init :funcallable-instance-tramp)
+  #-compact-instance-header (layout :set-trans %set-fun-layout :ref-trans %fun-layout)
   ;; TODO: if we can switch places of 'function' and 'fsc-instance-slots'
   ;; (at least for the builds with compact-instance-header)
   ;; then for both funcallable and non-funcallable instances,
@@ -316,7 +317,7 @@ during backtrace.
                                        :alloc-trans make-weak-pointer)
   (value :ref-trans %weak-pointer-value :ref-known (flushable)
          :init :arg)
-  (next :c-type #-alpha "struct weak_pointer *" #+alpha "u32"))
+  (next :c-type "struct weak_pointer *"))
 
 ;;;; other non-heap data blocks
 
@@ -325,9 +326,9 @@ during backtrace.
   symbol) ;; on sb-thread, this is actually a tls-index
 
 (define-primitive-object (unwind-block)
-  (uwp :c-type #-alpha "struct unwind_block *" #+alpha "u32")
-  (cfp :c-type #-alpha "lispobj *" #+alpha "u32")
-  #-(or x86 x86-64) code
+  (uwp :c-type "struct unwind_block *")
+  (cfp :c-type "lispobj *")
+  #-(or x86 x86-64 arm64) code
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
@@ -337,16 +338,16 @@ during backtrace.
   #+unbind-in-unwind current-catch)
 
 (define-primitive-object (catch-block)
-  (uwp :c-type #-alpha "struct unwind_block *" #+alpha "u32")
-  (cfp :c-type #-alpha "lispobj *" #+alpha "u32")
-  #-(or x86 x86-64) code
+  (uwp :c-type "struct unwind_block *")
+  (cfp :c-type "lispobj *")
+  #-(or x86 x86-64 arm64) code
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
   #+(and unbind-in-unwind (not c-stack-is-control-stack)) nfp
   #+(and unbind-in-unwind (not c-stack-is-control-stack)) nsp
   #+unbind-in-unwind bsp
-  (previous-catch :c-type #-alpha "struct catch_block *" #+alpha "u32")
+  (previous-catch :c-type "struct catch_block *")
   tag)
 
 ;;;; symbols
@@ -452,40 +453,46 @@ during backtrace.
 ;;; If we can't do that for some reason - like, say, the safepoint page
 ;;; is located prior to 'struct thread', then these just become ordinary slots.
 (defglobal *thread-header-slot-names*
-  (append '(msan-xor-constant)
+  (append #+x86-64
+          '(t-nil-constants
+            msan-xor-constant
+            ;; The following slot's existence must NOT be conditional on #+msan
+            msan-param-tls) ; = &__msan_param_tls
           #+immobile-space '(function-layout
                              varyobj-space-addr
                              varyobj-card-count
                              varyobj-card-marks)))
 
-#+sb-safepoint
-(defglobal *thread-trailer-slots* (mapcar #'list *thread-header-slot-names*))
-#-sb-safepoint
 (macrolet ((assign-header-slot-indices ()
              (let ((i 0))
                `(progn
                   ,@(mapcar (lambda (x)
                               `(defconstant ,(symbolicate "THREAD-" x "-SLOT") ,(decf i)))
                             *thread-header-slot-names*)))))
-  (assign-header-slot-indices)
-  (defglobal *thread-trailer-slots* nil))
+  (assign-header-slot-indices))
 
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
 ;;; can take care of maintaining Lisp and C versions.
-(define-primitive-object (thread :size primitive-thread-object-length)
+#.`(define-primitive-object (thread :size primitive-thread-object-length)
   ;; no_tls_value_marker is borrowed very briefly at thread startup to
   ;; pass the address of the start routine into new_thread_trampoline.
   ;; tls[0] = NO_TLS_VALUE_MARKER_WIDETAG because a the tls index slot
   ;; of a symbol is initialized to zero
   (no-tls-value-marker)
+
   ;; Technically this slot violates our requirement that the size of the thread
   ;; primitive object be computable by assuming one word per slot. POSIX says
   ;; "IEEE Std 1003.1-2001/Cor 2-2004, item XBD/TC2/D6/26 is applied,
   ;;  adding pthread_t to the list of types that are not required to be arithmetic
   ;;  types, thus allowing pthread_t to be defined as a structure."
-  (os-thread :c-type "os_thread_t")
+  ;;
+  ;; Furthermore, it is technically possibly for a pthread_t to be smaller than a word
+  ;; (a 4-byte identifier, not a pointer, on 64-bit) but that seems not to be true
+  ;; for any system that we care about.
+  (os-thread :c-type #+(or win32 (not sb-thread)) "lispobj" ; actually is HANDLE
+                     #-(or win32 (not sb-thread)) "pthread_t")
 
   ;; Keep this first bunch of slots from binding-stack-pointer through alloc-region
   ;; near the beginning of the structure so that x86[-64] assembly code
@@ -505,8 +512,6 @@ during backtrace.
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   (stepping)
-  ;; The following slot's existence must NOT be conditional on #+msan
-  #+x86-64 (msan-param-tls) ; = &__msan_param_tls
   (dynspace-addr)
   (dynspace-card-count)
   (dynspace-pte-base)
@@ -522,6 +527,7 @@ during backtrace.
   ;; Kept here so that when the thread dies we can release the whole
   ;; memory we reserved.
   (os-address :c-type "void *" :pointer t)
+  (os-kernel-tid) ; the kernel's thread identifier, 32 bits on linux
 
   ;; These aren't accessed (much) from Lisp, so don't really care
   ;; if it takes a 4-byte displacement.
@@ -529,32 +535,21 @@ during backtrace.
   (binding-stack-start :c-type "lispobj *" :pointer t
                        :special *binding-stack-start*)
 
-  #+(and sb-thread (not sb-safepoint))
-  (state-sem :c-type "os_sem_t *" :pointer t)
-  #+(and sb-thread (not sb-safepoint))
-  (state-not-running-sem :c-type "os_sem_t *" :pointer t)
-  #+(and sb-thread (not sb-safepoint))
-  (state-not-running-waitcount :c-type "int" :length 1)
-  #+(and sb-thread (not sb-safepoint))
-  (state-not-stopped-sem :c-type "os_sem_t *" :pointer t)
-  #+(and sb-thread (not sb-safepoint))
-  (state-not-stopped-waitcount :c-type "int" :length 1)
   (control-stack-start :c-type "lispobj *" :pointer t
                        :special *control-stack-start*)
   (control-stack-end :c-type "lispobj *" :pointer t
                      :special *control-stack-end*)
-  (control-stack-guard-page-protected)
-  #+win32 (private-events :c-type "struct private_events" :length 2)
   (this :c-type "struct thread *" :pointer t)
   (prev :c-type "struct thread *" :pointer t)
   (next :c-type "struct thread *" :pointer t)
-  ;; starting, running, suspended, dead
-  (state :c-type "lispobj")
+  ;; a struct containing {starting, running, suspended, dead}
+  ;; and some other state fields.
+  (state-word :c-type "struct thread_state_word")
+  ;; Statistical CPU profiler data recording buffer
+  (sprof-data)
 
   #+x86 (tls-cookie)                          ;  LDT index
   #+sb-thread (tls-size)
-  (interrupt-data :c-type "struct interrupt_data *"
-                  :pointer t)
   ;; For various reasons related to pseudo-atomic and interrupt
   ;; handling, we need to know if the machine context is in Lisp code
   ;; or not.  On non-threaded targets, this is a global variable in
@@ -571,21 +566,14 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
-  ;; Context base pointer for running on top of system libraries built using
-  ;; -fomit-frame-pointer.  Currently truly required and implemented only
-  ;; for (and win32 x86-64), but could be generalized to other platforms if
-  ;; needed:
-  #+win32 (carried-base-pointer :c-type "os_context_register_t")
-  #+sb-safepoint (csp-around-foreign-call :c-type "lispobj *")
-  #+win32 (synchronous-io-handle-and-flag :c-type "HANDLE" :length 1)
-  #+(and sb-safepoint-strictly (not win32))
-  (sprof-alloc-region :c-type "struct alloc_region" :length 4)
-  ;; If we need the header slots, but they can't precede this structure
-  ;; for technical reasons having to do with no writable memory being there,
-  ;; then stuff them at the end, for lack of any place better.
-  . #.*thread-trailer-slots*)
+  ;; The *current-thread* MUST be the last slot in the C thread structure.
+  ;; It it the only slot that needs to be noticed by the garbage collector.
+  (lisp-thread :pointer t :special sb-thread:*current-thread*))
 
 (defconstant code-header-size-shift #+64-bit 32 #-64-bit n-widetag-bits)
+(defconstant-eqx code-serialno-byte
+  #+64-bit (byte 32 32) #-64-bit (byte 18 14)
+  #'equalp)
 (declaim (inline code-object-size code-header-words %code-code-size))
 #-sb-xc-host
 (progn
@@ -625,6 +613,6 @@ during backtrace.
     (if (eql (code-header-ref code code-boxed-size-slot) 0)
         0
         (with-pinned-objects (code)
-          (ldb (byte 18 14) (sap-ref-word (code-instructions code) 0)))))
+          (ldb code-serialno-byte (sap-ref-word (code-instructions code) 0)))))
 
 ) ; end PROGN

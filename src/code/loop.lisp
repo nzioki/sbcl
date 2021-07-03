@@ -177,7 +177,7 @@ constructed.
 (declaim (sb-ext:freeze-type loop-minimax))
 
 (defconstant-eqx +loop-minimax-type-infinities-alist+
-    '((fixnum            sb-xc:most-positive-fixnum            sb-xc:most-negative-fixnum)
+    '((fixnum            most-positive-fixnum                  most-negative-fixnum)
       (single-float      sb-ext:single-float-positive-infinity sb-ext:single-float-negative-infinity)
       (double-float      sb-ext:double-float-positive-infinity sb-ext:double-float-negative-infinity))
   #'equal)
@@ -185,7 +185,7 @@ constructed.
 (defun make-loop-minimax (answer-variable type)
   (let ((infinity-data (cdr (assoc type
                                    +loop-minimax-type-infinities-alist+
-                                   :test #'sb-xc:subtypep))))
+                                   :test #'subtypep))))
     (make-loop-minimax-internal
       :answer-variable answer-variable
       :type type
@@ -521,7 +521,7 @@ code to be loaded.
 ;;;; code analysis stuff
 
 (defun loop-constant-fold-if-possible (form &optional expected-type)
-  (let* ((constantp (sb-xc:constantp form))
+  (let* ((constantp (constantp form))
          (value (and constantp (constant-form-value form))))
     (when (and constantp expected-type)
       (unless (sb-xc:typep value expected-type)
@@ -576,7 +576,7 @@ code to be loaded.
                              &optional (default-type required-type))
   (if (null specified-type)
       default-type
-      (multiple-value-bind (a b) (sb-xc:subtypep specified-type required-type)
+      (multiple-value-bind (a b) (subtypep specified-type required-type)
         (cond ((not b)
                (loop-warn "LOOP couldn't verify that ~S is a subtype of the required type ~S."
                           specified-type required-type))
@@ -769,6 +769,9 @@ code to be loaded.
                   "")))
            #+sb-unicode
            ((csubtypep ctype (specifier-type 'extended-char))
+            #+sb-xc-host
+            (error "Unimplemented on cross-compiler.")
+            #-sb-xc-host
             (code-char base-char-code-limit))
            ((csubtypep ctype (specifier-type 'character))
             #\x)
@@ -905,6 +908,12 @@ code to be loaded.
          (check-var-name name)
          (loop-declare-var name dtype :step-var-p step-var-p
                                       :initialization initialization)
+         ;; IGNORABLEize every variable because neither binding nor assignment constitutes
+         ;; a "use". Unfortunately there is no syntax for declaring what to ignore in LOOP.
+         ;; The idiom is to use NIL as a variable, but sometimes users don't, because they
+         ;; want variables names as information within a destructuring operation,
+         ;;  e.g. (for (this . that-not-used) in stuff do (frob this))
+         (push `(ignorable ,name) (declarations loop))
          ;; We use ASSOC on this list to check for duplications (above),
          ;; so don't optimize out this list:
          (push (list name (or initialization (loop-typed-init dtype step-var-p)))
@@ -958,7 +967,7 @@ code to be loaded.
                                          desetq &aux (loop *loop*))
   (cond ((or (null name) (null dtype) (eq dtype t)) nil)
         ((symbolp name)
-         (unless (or (sb-xc:subtypep t dtype)
+         (unless (or (subtypep t dtype)
                      (and (eq (sb-xc:symbol-package name) *cl-package*)
                           (eq :special (info :variable :kind name))))
            (let ((dtype `(type ,(if initialization
@@ -1358,7 +1367,7 @@ code to be loaded.
 
 (defun loop-for-across (var val data-type)
   (loop-make-var var nil data-type)
-  (let ((vector-var (gensym "LOOP-ACROSS-VECTOR-"))
+  (let ((vector-var (sb-xc:gensym "LOOP-ACROSS-VECTOR-"))
         (index-var (gensym "LOOP-ACROSS-INDEX-")))
     (multiple-value-bind (vector-form constantp vector-value)
         (loop-constant-fold-if-possible val 'vector)
@@ -1399,15 +1408,17 @@ code to be loaded.
       (loop-constant-fold-if-possible val)
     (let ((listvar var))
       (cond ((and var (symbolp var))
-             (loop-make-var var list data-type))
+             (loop-make-var var
+                            ;; Don't want to assert the type, as ENDP will do that
+                            `(the* (list :use-annotations t :source-form ,list) ,list)
+                            data-type))
             (t
              (loop-make-var (setq listvar (gensym)) list 't)
              (loop-make-var var nil data-type)))
       (let ((list-step (loop-list-step listvar)))
         (let* ((first-endtest
-                ;; mysterious comment from original CMU CL sources:
-                ;;   the following should use `atom' instead of `endp',
-                ;;   per [bug2428]
+                ;; the following should use `atom' instead of `endp',
+                ;; per 6.1.2.1.3
                 `(atom ,listvar))
                (other-endtest first-endtest))
           (when (and constantp (listp list-value))
@@ -1428,7 +1439,10 @@ code to be loaded.
       (loop-constant-fold-if-possible val)
     (let ((listvar (gensym "LOOP-LIST-")))
       (loop-make-var var nil data-type)
-      (loop-make-var listvar list t)
+      (loop-make-var listvar
+                     ;; Don't want to assert the type, as ENDP will do that
+                     `(the* (list :use-annotations t :source-form ,list) ,list)
+                     t)
       (let ((list-step (loop-list-step listvar)))
         (let* ((first-endtest `(endp ,listvar))
                (other-endtest first-endtest)
@@ -1635,14 +1649,14 @@ code to be loaded.
             (setq endform (if limit-constantp
                               `',limit-value
                               (loop-make-var
-                                 (gensym "LOOP-LIMIT-") form
+                                 (sb-xc:gensym "LOOP-LIMIT-") form
                                  `(and ,indexv-type real)))))
            (:by
             (multiple-value-setq (form stepby-constantp stepby)
               (loop-constant-fold-if-possible form
                                               `(and ,indexv-type (real (0)))))
             (unless stepby-constantp
-              (loop-make-var (setq stepby (gensym "LOOP-STEP-BY-"))
+              (loop-make-var (setq stepby (sb-xc:gensym "LOOP-STEP-BY-"))
                  form
                  `(and ,indexv-type (real (0)))
                  t)))

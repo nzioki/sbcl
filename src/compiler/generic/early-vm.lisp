@@ -61,10 +61,10 @@
 ;;; a mask to extract the type from a data block header word
 (defconstant widetag-mask (1- (ash 1 n-widetag-bits)))
 
-(defconstant sb-xc:most-positive-fixnum
+(defconstant most-positive-fixnum
     (1- (ash 1 n-positive-fixnum-bits))
   "the fixnum closest in value to positive infinity")
-(defconstant sb-xc:most-negative-fixnum
+(defconstant most-negative-fixnum
     (ash -1 n-positive-fixnum-bits)
   "the fixnum closest in value to negative infinity")
 
@@ -76,7 +76,33 @@
   ;; leaving one bit for a GC mark bit.
   (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1))
 
-(defconstant sb-xc:char-code-limit #-sb-unicode 256 #+sb-unicode #x110000
+;;; The ANSI-specified minimum is 8.
+(defconstant array-rank-limit 256
+  "the exclusive upper bound on the rank of an array")
+
+;;; FIXME: these limits are wrong at the most basic level according to the spec,
+;;; because if there are different limits for different element types, then
+;;; this constant should be the _smallest_ of the limits for any element type.
+;;; The largest element size is (COMPLEX DOUBLE-FLOAT) taking 16 bytes per element.
+;;; If you had an array of this size on 32-bit machines, it would consume about
+;;; 8GB of payload. So not only is it larger than a fixnum - a problem for the
+;;; allocator vops - it exceeds the address space.
+#-ubsan ; usual way
+(progn
+;;; - 2 to leave space for the array header
+(defconstant array-dimension-limit (- most-positive-fixnum 2)
+  "the exclusive upper bound on any given dimension of an array")
+
+(defconstant array-total-size-limit (- most-positive-fixnum 2)
+  "the exclusive upper bound on the total number of elements in an array")
+)
+
+#+ubsan ; only supported if 64-bit
+(progn
+(defconstant array-dimension-limit (ash 1 30))
+(defconstant array-total-size-limit (ash 1 30)))
+
+(defconstant char-code-limit #-sb-unicode 256 #+sb-unicode #x110000
   "the upper exclusive bound on values produced by CHAR-CODE")
 
 (defconstant base-char-code-limit #-sb-unicode 256 #+sb-unicode 128)
@@ -94,13 +120,13 @@
 (defconstant sb-kernel::internal-time-bits 61)
 
 (defconstant most-positive-exactly-single-float-fixnum
-  (min (expt 2 single-float-digits) sb-xc:most-positive-fixnum))
+  (min (expt 2 single-float-digits) most-positive-fixnum))
 (defconstant most-negative-exactly-single-float-fixnum
-  (max (- (expt 2 single-float-digits)) sb-xc:most-negative-fixnum))
+  (max (- (expt 2 single-float-digits)) most-negative-fixnum))
 (defconstant most-positive-exactly-double-float-fixnum
-  (min (expt 2 double-float-digits) sb-xc:most-positive-fixnum))
+  (min (expt 2 double-float-digits) most-positive-fixnum))
 (defconstant most-negative-exactly-double-float-fixnum
-  (max (- (expt 2 double-float-digits)) sb-xc:most-negative-fixnum))
+  (max (- (expt 2 double-float-digits)) most-negative-fixnum))
 
 ;;;; Point where continuous area starting at dynamic-space-start bumps into
 ;;;; next space. Computed for genesis/constants.h, not used in Lisp.
@@ -109,7 +135,6 @@
     (let ((stop (1- (ash 1 n-word-bits)))
           (start dynamic-space-start))
       (dolist (other-start (list read-only-space-start static-space-start
-                                 #+linkage-table
                                  linkage-table-space-start))
         (declare (notinline <)) ; avoid dead code note
         (when (< start other-start)
@@ -141,31 +166,36 @@
 #+sb-xc-host
 (defun fixnump (x)
   (and (integerp x)
-       (<= sb-xc:most-negative-fixnum x sb-xc:most-positive-fixnum)))
+       (<= most-negative-fixnum x most-positive-fixnum)))
 
-;;; Helper macro for defining FIXUP-CODE-OBJECT so that its body
-;;; can be the same between the host and target.
-;;; In the target, the byte offset supplied is relative to CODE-INSTRUCTIONS.
-;;; Genesis works differently - it adjusts the offset so that it is relative
-;;; to the containing gspace since that's what bvref requires.
-(defmacro !with-bigvec-or-sap (&body body)
-  `(macrolet #-sb-xc-host ()
-             #+sb-xc-host
-             ((code-instructions (code) `(sb-fasl::descriptor-mem ,code))
-              (sap-int (sap)
-                ;; KLUDGE: SAP is a bigvec; it doesn't know its address.
-                ;; Note that this shadows the uncallable stub function for SAP-INT
-                ;; that placates the host when compiling 'compiler/*/move.lisp'.
-                (declare (ignore sap))
-                `(locally
-                     (declare (notinline sb-fasl::descriptor-gspace)) ; fwd ref
-                   (sb-fasl::gspace-byte-address
-                    (sb-fasl::descriptor-gspace code)))) ; use CODE, not SAP
-              (sap-ref-8 (sap offset) `(sb-fasl::bvref-8 ,sap ,offset))
-              (sap-ref-32 (sap offset) `(sb-fasl::bvref-32 ,sap ,offset))
-              (sap-ref-64 (sap offset) `(sb-fasl::bvref-64 ,sap ,offset))
-              (sap-ref-word (sap offset) `(sb-fasl::bvref-word ,sap ,offset)))
-     ,@body))
+;;; Helper macro for defining FIXUP-CODE-OBJECT with emulation of SAP
+;;; accessors so that the host and target can use the same fixup logic.
+#+(or x86 x86-64)
+(defmacro with-code-instructions ((sap-var code-var) &body body)
+  #+sb-xc-host
+  `(macrolet ((self-referential-code-fixup-p (value self)
+                `(let* ((base (sb-fasl::descriptor-base-address ,self))
+                        (limit (+ base (1- (code-object-size ,self)))))
+                   (<= base ,value limit)))
+              (containing-memory-space (code)
+                `(sb-fasl::descriptor-gspace-name ,code)))
+     (let ((,sap-var (code-instructions ,code-var)))
+       ,@body))
+  #-sb-xc-host
+  `(macrolet ((self-referential-code-fixup-p (value self)
+                ;; Using SAPs keeps all the arithmetic machine-word-sized.
+                ;; Otherwise it would potentially involve bignums on 32-bit
+                ;; if code starts at #x20000000 and up.
+                `(let* ((base (sap+ (int-sap (get-lisp-obj-address ,self))
+                                    (- sb-vm:lowtag-mask)))
+                        (limit (sap+ base (1- (code-object-size ,self))))
+                        (value-sap (int-sap ,value)))
+                   (and (sap>= value-sap base) (sap<= value-sap limit))))
+              (containing-memory-space (code)
+                (declare (ignore code))
+                :dynamic))
+    (let ((,sap-var (code-instructions ,code-var)))
+      ,@body)))
 
 #+sb-safepoint
 ;;; The offset from the fault address reported to the runtime to the
@@ -173,3 +203,82 @@
 (defconstant gc-safepoint-trap-offset n-word-bytes)
 
 #+sb-xc-host (deftype sb-xc:fixnum () `(signed-byte ,n-fixnum-bits))
+
+#-darwin-jit
+(progn
+  (declaim (inline (setf sap-ref-word-jit)
+                   (setf signed-sap-ref-32-jit)
+                   signed-sap-ref-32-jit
+                   (setf sap-ref-32-jit)
+                   sap-ref-32-jit
+                   (setf sap-ref-8-jit)))
+  (defun (setf sap-ref-word-jit) (value sap offset)
+    (setf (sap-ref-word sap offset) value))
+
+  (defun (setf signed-sap-ref-32-jit) (value sap offset)
+    (setf (signed-sap-ref-32 sap offset) value))
+
+  (defun signed-sap-ref-32-jit (sap offset)
+    (signed-sap-ref-32 sap offset))
+
+  (defun (setf sap-ref-32-jit) (value sap offset)
+    (setf (sap-ref-32 sap offset) value))
+
+  (defun sap-ref-32-jit (sap offset)
+    (sap-ref-32 sap offset))
+
+  #-sb-xc-host
+  (defun (setf sap-ref-8-jit) (value sap offset)
+    (setf (sap-ref-8 sap offset) value)))
+
+;;; Supporting code for LAYOUT allocated in metadata space a/k/a "metaspace".
+;;; These objects are manually allocated and freed.
+;;; Tracts are the unit of allocation requested from the OS.
+;;; Following the nomenclature in https://en.wikipedia.org/wiki/Slab_allocation
+;;; - A slab is the quantum requested within a tract.
+;;; - Chunks are the units of allocation ("objects") within a slab.
+
+(defconstant metaspace-tract-size (* 2 1024 1024)) ; 2 MiB
+(defconstant metaspace-slab-size 2048) ; 2 KiB
+
+;;; Chunks are all the same size per slab, which makes finding the next available
+;;; slot simply a pop from a freelist. The object stored in the chunk can be anything
+;;; not to exceed the chunk size. (You can't span chunks with one object)
+;;; All slabs of a given size with any available space are kept in a doubly-linked
+;;; list for the slab's chunk size.  A slab is removed from the doubly-linked list and
+;;; moved to the slab recycle list when all chunks within it become free.
+;;;
+;;; There are 4 words of overhead per slab.
+;;; At present only 64-bit word size is supported, so we assume
+;;; that pointer-sized words in the slab header consume 8 bytes.
+;;;   word 0: 2 bytes : sizeclass (as a FIXNUM)
+;;;           2 bytes : capacity in objects
+;;;           2 bytes : chunk size
+;;;           2 bytes : number of objects allocated in it
+;;;   word 1: head of freelist
+;;;   word 2: next slab with any holes in the same sizeclass
+;;;   word 3: previous slab with any holes in the same sizeclass
+;;;
+;;; The FIXNUM representation of sizeclass causes the entire lispword
+;;; to read as a fixnum, which makes it possible to map-allocated-objects
+;;; over the slabs in a chunk without fuss. The slab heade appears
+;;; just like 2 conses. (The next/prev pointers look like fixnums)
+;;;
+;;; #+big-endian will need to flip the positions of these sub-fields
+;;; to make the lispword read as fixnum.
+
+;;; Keep in sync with the structure definition in src/runtime/alloc.c
+(defconstant slab-overhead-words 4)
+(defmacro slab-sizeclass (slab) `(sap-ref-16 ,slab 0))
+(defmacro slab-capacity (slab) `(sap-ref-16 ,slab 2))
+(defmacro slab-chunk-size (slab) `(sap-ref-16 ,slab 4))
+(defmacro slab-usage (slab) `(sap-ref-16 ,slab 6))
+(defmacro slab-freelist (slab) `(sap-ref-sap ,slab 8))
+(defmacro slab-next (slab) `(sap-ref-sap ,slab 16))
+(defmacro slab-prev (slab) `(sap-ref-sap ,slab 24))
+(defmacro slab-usable-range-start (slab) `(sap+ ,slab (* 4 n-word-bytes)))
+
+(defmacro init-slab-header (slab sizeclass chunksize capacity)
+  `(setf (slab-sizeclass ,slab) (ash ,sizeclass n-fixnum-tag-bits)
+         (slab-capacity ,slab) ,capacity
+         (slab-chunk-size ,slab) ,chunksize))

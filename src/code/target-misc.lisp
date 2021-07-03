@@ -26,15 +26,16 @@
   #+win32 (sb-win32::get-computer-name)
   #-win32 (truly-the simple-string (sb-unix:unix-gethostname)))
 
-(declaim (type (or null string) *machine-version*))
-(defvar *machine-version*)
+(declaim (type (or null simple-string) *machine-version*))
+(declaim (global *machine-version*))
 
 (defun machine-version ()
   "Return a string describing the version of the computer hardware we
 are running on, or NIL if we can't find any useful information."
-  (unless (boundp '*machine-version*)
-    (setf *machine-version* (get-machine-version)))
-  *machine-version*)
+  (if (boundp '*machine-version*)
+      *machine-version*
+      (setf *machine-version*
+            (awhen (get-machine-version) (possibly-base-stringize it)))))
 
 ;;; FIXME: Don't forget to set these in a sample site-init file.
 ;;; FIXME: Perhaps the functions could be SETFable instead of having the
@@ -42,7 +43,7 @@ are running on, or NIL if we can't find any useful information."
 ;;; from ANSI 11.1.2.1.1 "Constraints on the COMMON-LISP Package
 ;;; for Conforming Implementations" it is kosher to add a SETF function for
 ;;; a symbol in COMMON-LISP..
-(declaim (type (or null string) *short-site-name* *long-site-name*))
+(declaim (type (or null simple-string) *short-site-name* *long-site-name*))
 (define-load-time-global *short-site-name* nil
   "The value of SHORT-SITE-NAME.")
 (define-load-time-global *long-site-name* nil
@@ -255,3 +256,24 @@ version 1[.0.0...] or greater."
   (declare (type (or null string) string))
   (push (list string name doc-type) sb-pcl::*!docstrings*)
   string)
+
+(in-package "SB-LOCKLESS")
+(defstruct (list-node
+            (:conc-name nil)
+            (:constructor %make-sentinel-node ())
+            (:copier nil))
+  (%node-next nil))
+
+;;; Specialized list variants will be created for
+;;;  fixnum, integer, real, string, generic "comparable"
+;;; but the node type and list type is the same regardless of key type.
+(defstruct (linked-list
+            (:constructor %make-lfl
+                          (head inserter deleter finder inequality equality))
+            (:conc-name list-))
+  (head       nil :type list-node :read-only t)
+  (inserter   nil :type function :read-only t)
+  (deleter    nil :type function :read-only t)
+  (finder     nil :type function :read-only t)
+  (inequality nil :type function :read-only t)
+  (equality   nil :type function :read-only t))

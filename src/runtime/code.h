@@ -86,9 +86,12 @@ static inline unsigned int jumptable_count(lispobj* table) {
     return table ? *table & 0x3FFF : 0;
 }
 static inline unsigned int code_serialno(struct code* code) {
-    // extract next 18 bits regardless of machine word size
     lispobj* table = code_jumptable_start(code);
-    return table ? *table >> 14 : 0;
+#ifdef LISP_FEATURE_64_BIT
+    return table ? *table >> 32 : 0; // high 4 bits are the serialno
+#else
+    return table ? *table >> 14 : 0; // else it only gets 18 (= 32 - 14) bits
+#endif
 }
 
 static inline unsigned int code_n_named_calls(struct code* code) {
@@ -98,9 +101,6 @@ static inline unsigned int code_n_named_calls(struct code* code) {
     return 0;
 #endif
 }
-
-// How many elements in 'code->constants[]' are taken by each simple-fun
-#define CODE_SLOTS_PER_SIMPLE_FUN 4
 
 // Iterate over the native pointers to each function in 'code_var'
 // offsets are stored as the number of bytes into the instructions

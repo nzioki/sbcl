@@ -247,12 +247,15 @@
          (length :scs (any-reg immediate))
          (words :scs (any-reg immediate)))
   (:results (result :scs (descriptor-reg) :from :load))
-  (:arg-types positive-fixnum
-              positive-fixnum
-              positive-fixnum)
+  (:arg-types positive-fixnum positive-fixnum positive-fixnum)
   (:policy :fast-safe)
   (:node-var node)
   (:generator 100
+   (flet ((store-widetag (value ptr slot lowtag)
+             (inst mov (object-slot-ea
+                        ptr slot lowtag
+                        (if (typep value '(and integer (not (unsigned-byte 8)))) :word :byte))
+                   value)))
     (let ((size (sc-case words
                   (immediate
                    (logandc2 (+ (fixnumize (tn-value words))
@@ -285,7 +288,7 @@
                (storew fixnum-length result
                        vector-length-slot other-pointer-lowtag)))))
          (t
-          (storew length result vector-length-slot other-pointer-lowtag)))))))
+          (storew length result vector-length-slot other-pointer-lowtag))))))))
 
 (define-vop (allocate-vector-on-stack)
   (:args (type :scs (unsigned-reg immediate) :to :save)
@@ -298,7 +301,6 @@
   (:arg-types positive-fixnum
               positive-fixnum
               positive-fixnum)
-  (:translate allocate-vector)
   (:policy :fast-safe)
   (:generator 100
     (inst lea result (make-ea :byte :base words :disp
@@ -316,7 +318,7 @@
     (sc-case type
       (immediate
        (aver (typep (tn-value type) '(unsigned-byte 8)))
-       (store-widetag (tn-value type) result 0 other-pointer-lowtag))
+       (storew (tn-value type) result 0 other-pointer-lowtag))
       (t
        (storew type result 0 other-pointer-lowtag)))
     (storew length result vector-length-slot other-pointer-lowtag)
@@ -411,7 +413,7 @@
         (pseudo-atomic (:elide-if stack-allocate-p)
          (allocation nil (pad-data-block words) lowtag node stack-allocate-p result)
          (when type
-           (storew (logior (ash (1- words) (length-field-shift type)) type)
+           (storew (compute-object-header words type)
                    result
                    0
                    lowtag))))))

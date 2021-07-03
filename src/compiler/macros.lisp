@@ -266,6 +266,8 @@
 ;;;           - Don't actually instantiate a transform, instead just DEFUN
 ;;;             Name with the specified transform definition function. This
 ;;;             may be later instantiated with %DEFTRANSFORM.
+;;;   :INFO   - an extra piece of information the transform receives,
+;;;             typically for use with :DEFUN-ONLY
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
@@ -275,24 +277,30 @@
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
                                           &key result policy node defun-only
+                                          (info nil info-p)
                                           (important :slightly))
                              &body body-decls-doc)
   (declare (type (member nil :slightly t) important))
+  (cond (defun-only
+         (aver (eq important :slightly)) ; can't be specified
+         (aver (not policy))) ; has no effect on the defun
+        (t
+         (aver (not info))))
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
-    (let ((n-node (or node (make-symbol "NODE")))
-          (n-decls (sb-xc:gensym))
-          (n-lambda (sb-xc:gensym)))
+    (let ((n-node (or node '#:node))
+          (n-decls '#:decls)
+          (n-lambda '#:lambda))
       (multiple-value-bind (bindings vars)
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
         (let ((stuff
-                `((,n-node &aux ,@bindings
+                `((,n-node ,@(if info-p (list info)) &aux ,@bindings
                            ,@(when result
                                `((,result (node-lvar ,n-node)))))
                   (declare (ignorable ,@(mapcar #'car bindings)))
                   (declare (lambda-list (node)))
                   ,@decls
-                  ,@(and defun-only doc `(,doc))
+                  ,@(if doc `(,doc))
                   ;; What purpose does it serve to allow the transform's body
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
@@ -307,15 +315,11 @@
                            ,,n-lambda)))))))
           (if defun-only
               `(defun ,name ,@stuff)
-              `(%deftransform
-                ',name
-                '(function ,arg-types ,result-type)
-                (named-lambda (deftransform ,name) ,@stuff)
-                ,doc
-                ,important
-                ,(and policy
-                      `(lambda (,n-node)
-                         (policy ,n-node ,policy))))))))))
+              `(%deftransform ',name
+                              ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
+                              '(function ,arg-types ,result-type)
+                              (named-lambda (deftransform ,name) ,@stuff)
+                              ,important)))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
@@ -323,24 +327,18 @@
                          &body body-decls-doc)
 
   (let ((transform-name (symbolicate (car names) '-transform))
-        (type (list 'function arg-types result-type))
-        (doc (nth-value 2 (parse-body body-decls-doc t))))
+        (type (list 'function arg-types result-type)))
     `(progn
        (deftransform ,transform-name
            (,lambda-list ,arg-types ,result-type
             :defun-only t
             :result ,result :policy ,policy :node ,node)
          ,@body-decls-doc)
-       ,@(loop for name in names
-               collect
-               `(let ((policy ,(and policy
-                                    (let ((node-sym (gensym "NODE")))
-                                      `(lambda (,node-sym)
-                                         (policy ,node-sym ,policy))))))
-                  (%deftransform ',name ',type #',transform-name
-                                 ,doc
-                                 ,important
-                                 policy))))))
+       (flet ,(if policy `((policy-test (node) (policy node ,policy))))
+         ,@(mapcar (lambda (name)
+                     `(%deftransform ',name ,(if policy '#'policy-test) ',type
+                                     #',transform-name ,important))
+                   names)))))
 
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
@@ -433,7 +431,7 @@
 (defmacro do-blocks ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (gensym))
+  (let ((n-component (sb-xc:gensym))
         (n-tail (gensym)))
     `(let* ((,n-component ,component)
             (,n-tail ,(if (member ends '(:both :tail))
@@ -449,7 +447,7 @@
 (defmacro do-blocks-backwards ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (gensym))
+  (let ((n-component (sb-xc:gensym))
         (n-head (gensym)))
     `(let* ((,n-component ,component)
             (,n-head ,(if (member ends '(:both :head))
@@ -747,7 +745,7 @@
 ;;;; functions on directly-linked lists (linked through specialized
 ;;;; NEXT operations)
 
-#-sb-fluid (declaim (inline find-in position-in))
+(declaim (inline find-in position-in))
 
 ;;; Find ELEMENT in a null-terminated LIST linked by the accessor
 ;;; function NEXT. KEY and TEST are the same as for generic sequence functions.
@@ -783,7 +781,7 @@
 
 (defmacro deletef-in (next place item &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#-sb-xc-host get-setf-expansion #+sb-xc-host cl:get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     (let ((n-item (gensym))
@@ -809,7 +807,7 @@
 ;;;
 (defmacro push-in (next item place &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#-sb-xc-host get-setf-expansion #+sb-xc-host cl:get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     `(let (,@(mapcar #'list temps vals)

@@ -19,8 +19,8 @@
 ;;; For blocks it's a cons with (pred . succ)
 ;;; For labels it maps to the label block
 (defvar *2block-info*)
-(defmacro vop-predecessors (vop) `(car (gethash ,vop *2block-info*)))
-(defmacro vop-successors (vop) `(cdr (gethash ,vop *2block-info*)))
+(defmacro ir2block-predecessors (x) `(car (gethash (the ir2-block ,x) *2block-info*)))
+(defmacro ir2block-successors (x) `(cdr (gethash (the ir2-block ,x) *2block-info*)))
 
 (defun initialize-ir2-blocks-flow-info (component)
   (labels ((block-last-2block (block)
@@ -67,7 +67,7 @@
                 (remove 2block (car info)))))
       (setf (cdr info) succ)
       (dolist (new succ)
-        (pushnew 2block (vop-predecessors new))))))
+        (pushnew 2block (ir2block-predecessors new))))))
 
 ;;;; Conditional move insertion support code
 (defun move-value-target (2block)
@@ -110,6 +110,11 @@
                (values (block-label (car succ-a))
                        target value-a value-b)))))))
 
+#-x86-64
+(defun sb-vm::computable-from-flags-p (res x y flags)
+  (declare (ignorable res x y flags))
+  nil)
+
 ;; To convert a branch to a conditional move:
 ;; 1. Convert both possible values to the chosen common representation
 ;; 2. Execute the conditional VOP
@@ -122,10 +127,20 @@
                          target res
                          flags info
                          label
-                         vop node 2block)
-  (let ((prev (vop-prev vop)))
-    (delete-vop vop)
-    (flet ((reuse-if-eq-arg (value-if vop)
+                         vop node 2block
+                         &aux (prev (vop-prev vop)))
+  (delete-vop vop)
+  (cond
+    ((and (constant-tn-p arg-if)
+          (constant-tn-p arg-else)
+          (sb-vm::computable-from-flags-p
+           res (tn-value arg-if) (tn-value arg-else) flags))
+     (emit-template node 2block (template-or-lose 'sb-vm::compute-from-flags)
+                    (reference-tn-list (list arg-if arg-else) nil)
+                    (reference-tn res t)
+                    (list* flags info)))
+    (t
+     (flet ((reuse-if-eq-arg (value-if vop)
              ;; Most of the time this means:
              ;; if X is already NIL, don't load it again.
              (when (and (eq (vop-name vop) 'if-eq)
@@ -139,26 +154,26 @@
                             (eq (tn-primitive-type x-tn)
                                 (tn-primitive-type res)))
                    x-tn))))
-           (load-and-coerce (dst src)
+            (load-and-coerce (dst src)
              (when (and dst (neq dst src))
                (emit-and-insert-vop node 2block
                                     (template-or-lose 'move)
                                     (reference-tn src nil)
                                     (reference-tn dst t)
                                     (ir2-block-last-vop 2block)))))
-      (let ((reuse (reuse-if-eq-arg value-if prev)))
-        (if reuse
-            (setf arg-if reuse)
-            (load-and-coerce arg-if   value-if)))
-      (load-and-coerce arg-else value-else))
-    (emit-template node 2block (template-or-lose cmove-vop)
-                   (reference-tn-list (remove nil (list arg-if arg-else))
-                                      nil)
-                   (reference-tn res t)
-                   (list* flags info))
+       (let ((reuse (reuse-if-eq-arg value-if prev)))
+         (if reuse
+             (setf arg-if reuse)
+             (load-and-coerce arg-if   value-if)))
+       (load-and-coerce arg-else value-else))
+     (emit-template node 2block (template-or-lose cmove-vop)
+                    (reference-tn-list (remove nil (list arg-if arg-else))
+                                       nil)
+                    (reference-tn res t)
+                    (list* flags info))))
     (emit-move node 2block res target)
     (vop branch node 2block label)
-    (update-block-succ 2block (list label))))
+    (update-block-succ 2block (list label)))
 
 ;; Since conditional branches are always at the end of blocks,
 ;; it suffices to look at the last VOP in each block.
@@ -430,7 +445,9 @@
   (let ((primitive-types (list (primitive-type-or-lose 'character)
                                (primitive-type-or-lose 'fixnum)
                                (primitive-type-or-lose 'sb-vm::positive-fixnum)
+                               #-x86 ;; i387 is weird
                                (primitive-type-or-lose 'double-float)
+                               #-x86
                                (primitive-type-or-lose 'single-float)
                                .
                                #+(or 64-bit 64-bit-registers)
@@ -510,7 +527,7 @@
 (defun next-start-vop (block)
   (loop for 2block = block then (ir2-block-next 2block)
         while (and 2block
-                   (= (length (vop-predecessors 2block)) 1))
+                   (= (length (ir2block-predecessors 2block)) 1))
         when (ir2-block-start-vop 2block) return it))
 
 (defun branch-destination (branch &optional (true t))
@@ -519,6 +536,69 @@
     (if (eq not-p true)
         (next-start-vop (ir2-block-next (vop-block branch)))
         (next-start-vop (gethash label *2block-info*)))))
+
+;;; Replace (BOUNDP X) + (BRANCH-IF) + {(SYMBOL-VALUE X) | anything}
+;;; by (FAST-SYMBOL-VALUE X) + (UNBOUND-MARKER-P) + BRANCH-IF
+;;; and delete SYMBOL-VALUE, with the result of FAST-SYMBOL-VALUE flowing
+;;; into the same TN as symbol-value's result.
+;;; This is a valid substitution on any of the architectures, but
+;;; it requires that UNBOUND-MARKER-P return its result in a flag,
+;;; so presently is enabled only for x86-64.
+#+x86-64
+(defoptimizer (vop-optimize boundp) (vop)
+  (let ((sym (tn-ref-tn (vop-args vop)))
+        (next (vop-next vop)))
+    (unless (and (boundp '*2block-info*)
+                 next (eq (vop-name next) 'branch-if))
+      (return-from vop-optimize-boundp-optimizer nil))
+    ;; Only replace if the BOUNDP=T consequent starts with SYMBOL-VALUE so that
+    ;; a bad example such as (IF (BOUNDP '*FOO*) (PRINT 'HI) *FOO*)
+    ;; - which has SYMBOL-VALUE as the wrong consequent of the IF - is unaffected.
+    (let* ((successors (ir2block-successors (vop-block next)))
+           (info (vop-codegen-info next))
+           (label-block (gethash (car info) *2block-info*))
+           (symeval-vop
+            (ir2-block-start-vop
+             (cond ((eq (second info) nil) label-block) ; not negated test.
+                   ;; When negated, the BOUNDP case goes to the "other" successor
+                   ;; block, i.e. whichever is not started by the #<label>.
+                   ((eq label-block (first successors)) (second successors))
+                   (t (first successors))))))
+      (when (and symeval-vop
+                 (or (eq (vop-name symeval-vop) 'symbol-value)
+                     ;; Expect SYMBOL-GLOBAL-VALUE only for variables of kind :GLOBAL.
+                     (and (eq (vop-name symeval-vop) 'symbol-global-value)
+                          (constant-tn-p sym)
+                          (eq (info :variable :kind (tn-value sym)) :global)))
+                 (eq sym (tn-ref-tn (vop-args symeval-vop)))
+                 ;; If the symbol is either a compile-time known symbol,
+                 ;; or can only be the same thing for both vops,
+                 ;; then we're fine to combine.
+                 (or (constant-tn-p sym)
+                     (not (tn-ref-next (tn-writes sym))))
+                 ;; Elide the SYMBOL-VALUE only if there is exactly one way to get there.
+                 ;; Technically we could split the IR2 block and peel off the SYMBOL-VALUE,
+                 ;; and if coming from the BRANCH-IF, jump to the block that contained
+                 ;; everything else except the SYMBOL-VALUE vop.
+                 (not (cdr (ir2block-predecessors (vop-block symeval-vop)))))
+        (let ((replacement (if (eq (vop-name symeval-vop) 'symbol-global-value)
+                               'fast-symbol-global-value
+                               'fast-symbol-value))
+              (result-tn (tn-ref-tn (vop-results symeval-vop))))
+          (emit-and-insert-vop (vop-node vop) (vop-block vop)
+                               (template-or-lose replacement)
+                               (reference-tn sym nil) (reference-tn result-tn t) next)
+          (emit-and-insert-vop (vop-node vop) (vop-block vop)
+                               (template-or-lose 'unbound-marker-p)
+                               (reference-tn result-tn nil) nil next)
+          ;; We need to invert the test since BOUNDP and UNBOUND-MARKER-P have
+          ;; the opposite meaning in the language. But by chance, they specify
+          ;; opposite flags in the vop, which means that the sense of the
+          ;; BRANCH-IF test is automagically correct after substitution.
+          ;; Of course, this is machine-dependent.
+          (delete-vop vop)
+          (delete-vop symeval-vop)
+          next)))))
 
 ;;; Optimize (if x ... nil) to reuse the NIL coming from X.
 (defoptimizer (vop-optimize if-eq) (if-eq)
@@ -647,7 +727,7 @@
                       (tn-value (tn-ref-tn (tn-ref-across (vop-args conditional))))
                       ;; "-eq-/C" vops take a codegen arg
                       (car (vop-codegen-info conditional))))
-             (else-block-predecessors (vop-predecessors else-block))
+             (else-block-predecessors (ir2block-predecessors else-block))
              (else-vop (ir2-block-start-vop else-block)))
          (push (cons val then-block) chain)
          ;; If ELSE block has more than one predecessor, that's OK,
@@ -697,7 +777,7 @@
     (let ((values (mapcar #'car choices)))
       (cond ((every #'fixnump values)) ; ok
             ((every #'characterp values)
-             (setq values (mapcar #'sb-xc:char-code values)))
+             (setq values (mapcar #'char-code values)))
             (t
              (return-from should-use-jump-table-p nil)))
       (let* ((min (reduce #'min values))
@@ -738,7 +818,7 @@
           (destructuring-bind (clauses else-block test-vop-name) culled-chain
             (let* ((key-type (if (characterp (caar clauses)) 'character 'fixnum))
                    (clause-keyfn (if (eq key-type 'character)
-                                     (lambda (x) (sb-xc:char-code (car x)))
+                                     (lambda (x) (char-code (car x)))
                                      #'car))
                    ;; Sort and unzip the alist
                    (ordered (sort (copy-list clauses) #'< :key clause-keyfn))
@@ -830,9 +910,19 @@
         (reads (tn-reads tn)))
     (and writes reads (not (tn-ref-next writes)) (not (tn-ref-next reads)))))
 
-(defun next-vop-is (vop name)
+(defun next-vop-is (vop names)
   (let ((next (vop-next vop)))
-    (and next (eq (vop-name next) name))))
+    (and next
+         (let ((name (vop-name next)))
+           (if (atom names) (eq name names) (memq name names)))
+         next)))
+
+(defun previous-vop-is (vop names)
+  (let ((prev (vop-prev vop)))
+    (and prev
+         (let ((name (vop-name prev)))
+           (if (atom names) (eq name names) (memq name names)))
+         prev)))
 
 ;;; Possibly replace HOWMANY vops starting at FIRST with a vop named REPLACEMENT.
 ;;; Each deleted vop must have exactly one argument and one result.

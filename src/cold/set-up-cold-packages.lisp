@@ -201,7 +201,105 @@
     ;;
     "BYTE" "BYTE-POSITION" "BYTE-SIZE"
     "DPB" "LDB" "LDB-TEST"
-    "DEPOSIT-FIELD" "MASK-FIELD"))
+    "DEPOSIT-FIELD" "MASK-FIELD"
+    ;;
+    ;; the constants (except for T and NIL which have
+    ;; a specially hacked correspondence between
+    ;; cross-compilation host Lisp and target Lisp)
+
+    ;; We include these here since there is no reason to reference
+    ;; host constants.
+    "ARRAY-DIMENSION-LIMIT"
+    "ARRAY-RANK-LIMIT"
+    "ARRAY-TOTAL-SIZE-LIMIT"
+    "BOOLE-1"
+    "BOOLE-2"
+    "BOOLE-AND"
+    "BOOLE-ANDC1"
+    "BOOLE-ANDC2"
+    "BOOLE-C1"
+    "BOOLE-C2"
+    "BOOLE-CLR"
+    "BOOLE-EQV"
+    "BOOLE-IOR"
+    "BOOLE-NAND"
+    "BOOLE-NOR"
+    "BOOLE-ORC1"
+    "BOOLE-ORC2"
+    "BOOLE-SET"
+    "BOOLE-XOR"
+    "CALL-ARGUMENTS-LIMIT"
+    "CHAR-CODE-LIMIT"
+    "DOUBLE-FLOAT-EPSILON"
+    "DOUBLE-FLOAT-NEGATIVE-EPSILON"
+    "INTERNAL-TIME-UNITS-PER-SECOND"
+    "LAMBDA-LIST-KEYWORDS"
+    "LAMBDA-PARAMETERS-LIMIT"
+    "LEAST-NEGATIVE-DOUBLE-FLOAT"
+    "LEAST-NEGATIVE-LONG-FLOAT"
+    "LEAST-NEGATIVE-NORMALIZED-DOUBLE-FLOAT"
+    "LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT"
+    "LEAST-NEGATIVE-NORMALIZED-SHORT-FLOAT"
+    "LEAST-NEGATIVE-NORMALIZED-SINGLE-FLOAT"
+    "LEAST-NEGATIVE-SHORT-FLOAT"
+    "LEAST-NEGATIVE-SINGLE-FLOAT"
+    "LEAST-POSITIVE-DOUBLE-FLOAT"
+    "LEAST-POSITIVE-LONG-FLOAT"
+    "LEAST-POSITIVE-NORMALIZED-DOUBLE-FLOAT"
+    "LEAST-POSITIVE-NORMALIZED-LONG-FLOAT"
+    "LEAST-POSITIVE-NORMALIZED-SHORT-FLOAT"
+    "LEAST-POSITIVE-NORMALIZED-SINGLE-FLOAT"
+    "LEAST-POSITIVE-SHORT-FLOAT"
+    "LEAST-POSITIVE-SINGLE-FLOAT"
+    "LONG-FLOAT-EPSILON"
+    "LONG-FLOAT-NEGATIVE-EPSILON"
+    "MOST-NEGATIVE-DOUBLE-FLOAT"
+    "MOST-NEGATIVE-FIXNUM"
+    "MOST-NEGATIVE-LONG-FLOAT"
+    "MOST-NEGATIVE-SHORT-FLOAT"
+    "MOST-NEGATIVE-SINGLE-FLOAT"
+    "MOST-POSITIVE-DOUBLE-FLOAT"
+    "MOST-POSITIVE-FIXNUM"
+    "MOST-POSITIVE-LONG-FLOAT"
+    "MOST-POSITIVE-SHORT-FLOAT"
+    "MOST-POSITIVE-SINGLE-FLOAT"
+    "MULTIPLE-VALUES-LIMIT"
+    "PI"
+    "SHORT-FLOAT-EPSILON"
+    "SHORT-FLOAT-NEGATIVE-EPSILON"
+    "SINGLE-FLOAT-EPSILON"
+    "SINGLE-FLOAT-NEGATIVE-EPSILON"
+
+    ;; The cross-compiler itself shouldn't really need to use the host
+    ;; versions of these in target code except in exceptional cases.
+    "CHAR-CODE"
+    "CODE-CHAR"
+    "COMPILE-FILE"
+    "COMPILE-FILE-PATHNAME"
+    "*COMPILE-FILE-PATHNAME*"
+    "*COMPILE-FILE-TRUENAME*"
+    "*COMPILE-PRINT*"
+    "*COMPILE-VERBOSE*"
+    "COMPILER-MACRO-FUNCTION"
+    "CONSTANTP"
+    "GET-SETF-EXPANSION"
+    "*GENSYM-COUNTER*"
+    "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
+    "MACRO-FUNCTION"
+    "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
+    "MAKE-LOAD-FORM"
+    "MAKE-LOAD-FORM-SAVING-SLOTS"
+    "PROCLAIM"
+    "SPECIAL-OPERATOR-P"
+    "SUBTYPEP"
+    "UPGRADED-ARRAY-ELEMENT-TYPE"
+    "UPGRADED-COMPLEX-PART-TYPE"
+    "WITH-COMPILATION-UNIT"
+
+    ;; For debugging purposes, we want to be able to intercept inline
+    ;; and block compilation declamations in the host.
+    "DECLAIM"
+    ))
 
 ;;; A symbol in the "dual personality" list refers to the symbol in CL unless
 ;;; package-prefixed with SB-XC:.  The main reason for not putting these
@@ -251,105 +349,17 @@
 ;; compilation of the target.
 ;;
 (let ((package-name "SB-XC"))
-  (dolist (name (append (append *undefineds* *dual-personality-math-symbols*)))
+  (dolist (name (append *undefineds* *dual-personality-math-symbols*))
     (export (intern name package-name) package-name))
-  (dolist (name '(;; the constants (except for T and NIL which have
-                  ;; a specially hacked correspondence between
-                  ;; cross-compilation host Lisp and target Lisp)
-                  "ARRAY-DIMENSION-LIMIT"
-                  "ARRAY-RANK-LIMIT"
-                  "ARRAY-TOTAL-SIZE-LIMIT"
-                  "BOOLE-1"
-                  "BOOLE-2"
-                  "BOOLE-AND"
-                  "BOOLE-ANDC1"
-                  "BOOLE-ANDC2"
-                  "BOOLE-C1"
-                  "BOOLE-C2"
-                  "BOOLE-CLR"
-                  "BOOLE-EQV"
-                  "BOOLE-IOR"
-                  "BOOLE-NAND"
-                  "BOOLE-NOR"
-                  "BOOLE-ORC1"
-                  "BOOLE-ORC2"
-                  "BOOLE-SET"
-                  "BOOLE-XOR"
-                  "CALL-ARGUMENTS-LIMIT"
-                  "CHAR-CODE-LIMIT"
-                  "DOUBLE-FLOAT-EPSILON"
-                  "DOUBLE-FLOAT-NEGATIVE-EPSILON"
-                  "INTERNAL-TIME-UNITS-PER-SECOND"
-                  "LAMBDA-LIST-KEYWORDS"
-                  "LAMBDA-PARAMETERS-LIMIT"
-                  "LEAST-NEGATIVE-DOUBLE-FLOAT"
-                  "LEAST-NEGATIVE-LONG-FLOAT"
-                  "LEAST-NEGATIVE-NORMALIZED-DOUBLE-FLOAT"
-                  "LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT"
-                  "LEAST-NEGATIVE-NORMALIZED-SHORT-FLOAT"
-                  "LEAST-NEGATIVE-NORMALIZED-SINGLE-FLOAT"
-                  "LEAST-NEGATIVE-SHORT-FLOAT"
-                  "LEAST-NEGATIVE-SINGLE-FLOAT"
-                  "LEAST-POSITIVE-DOUBLE-FLOAT"
-                  "LEAST-POSITIVE-LONG-FLOAT"
-                  "LEAST-POSITIVE-NORMALIZED-DOUBLE-FLOAT"
-                  "LEAST-POSITIVE-NORMALIZED-LONG-FLOAT"
-                  "LEAST-POSITIVE-NORMALIZED-SHORT-FLOAT"
-                  "LEAST-POSITIVE-NORMALIZED-SINGLE-FLOAT"
-                  "LEAST-POSITIVE-SHORT-FLOAT"
-                  "LEAST-POSITIVE-SINGLE-FLOAT"
-                  "LONG-FLOAT-EPSILON"
-                  "LONG-FLOAT-NEGATIVE-EPSILON"
-                  "MOST-NEGATIVE-DOUBLE-FLOAT"
-                  "MOST-NEGATIVE-FIXNUM"
-                  "MOST-NEGATIVE-LONG-FLOAT"
-                  "MOST-NEGATIVE-SHORT-FLOAT"
-                  "MOST-NEGATIVE-SINGLE-FLOAT"
-                  "MOST-POSITIVE-DOUBLE-FLOAT"
-                  "MOST-POSITIVE-FIXNUM"
-                  "MOST-POSITIVE-LONG-FLOAT"
-                  "MOST-POSITIVE-SHORT-FLOAT"
-                  "MOST-POSITIVE-SINGLE-FLOAT"
-                  "MULTIPLE-VALUES-LIMIT"
-                  "PI"
-                  "SHORT-FLOAT-EPSILON"
-                  "SHORT-FLOAT-NEGATIVE-EPSILON"
-                  "SINGLE-FLOAT-EPSILON"
-                  "SINGLE-FLOAT-NEGATIVE-EPSILON"
-                  "*READ-DEFAULT-FLOAT-FORMAT*"
-
+  (dolist (name '("*READ-DEFAULT-FLOAT-FORMAT*"
                   "ARRAY-ELEMENT-TYPE"
-                  "CHAR-CODE"
-                  "CODE-CHAR"
-                  "COMPILE-FILE"
-                  "COMPILE-FILE-PATHNAME"
-                  "*COMPILE-FILE-PATHNAME*"
-                  "*COMPILE-FILE-TRUENAME*"
-                  "*COMPILE-PRINT*"
-                  "*COMPILE-VERBOSE*"
-                  "COMPILER-MACRO-FUNCTION"
-                  "CONSTANTP"
-                  "DEFCONSTANT"
-                  "DEFINE-MODIFY-MACRO"
-                  "DEFINE-SETF-EXPANDER"
-                  "DEFMACRO" "DEFSETF" "DEFSTRUCT" "DEFTYPE"
-                  "GENSYM" "*GENSYM-COUNTER*"
-                  "GET-SETF-EXPANSION"
-                  "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
-                  "MACRO-FUNCTION"
-                  "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
+                  "DEFMACRO" "DEFSTRUCT" "DEFTYPE"
+                  "GENSYM"
                   "MAKE-ARRAY"
-                  "MAKE-LOAD-FORM"
-                  "MAKE-LOAD-FORM-SAVING-SLOTS"
-                  "PROCLAIM"
                   "SIMPLE-VECTOR"
-                  "SPECIAL-OPERATOR-P"
-                  "SUBTYPEP"
-                  "TYPE-OF" "TYPEP"
-                  "UPGRADED-ARRAY-ELEMENT-TYPE"
-                  "UPGRADED-COMPLEX-PART-TYPE"
-                  "WITH-COMPILATION-UNIT"))
-      (export (intern name package-name) package-name)))
+                  "TYPEP"
+                  ))
+    (export (intern name package-name) package-name)))
 
 (defun count-symbols (pkg)
   (let ((n 0))
@@ -359,7 +369,7 @@
 
 ;;; Build a new package that exports a not-necessarily-strict subset of
 ;;; what the host CL exports. This deals with hosts that have too many
-;;; symbols exported froM CL.
+;;; symbols exported from CL.
 (let ((cl-model-package (make-package "XC-STRICT-CL" :use nil)))
   (flet ((new-external (x package &aux (s (intern x package)))
            (export s package)
@@ -368,7 +378,7 @@
            (import x cl-model-package)
            (export x cl-model-package)))
     (reexport (list nil))
-    (dolist (string (read-from-file "common-lisp-exports.lisp-expr"))
+    (dolist (string (read-from-file "^common-lisp-exports.lisp-expr"))
       (unless (string= string "NIL") ; already done
         (cond ((member string *undefineds* :test #'string=)
                (new-external string cl-model-package))
@@ -469,16 +479,16 @@
           (reexport x))
         (assert (= (length done) (length package-data-list)))))))
 
-(export '*undefined-fun-whitelist*)
-(defvar *undefined-fun-whitelist* (make-hash-table :test 'equal))
+(export '*undefined-fun-allowlist*)
+(defvar *undefined-fun-allowlist* (make-hash-table :test 'equal))
 (let ((list
-       (with-open-file (data (prepend-genfile-path "package-data-list.lisp-expr"))
+       (with-open-file (data (find-bootstrap-file "^package-data-list.lisp-expr"))
          ;; There's no need to use the precautionary READ-FROM-FILE function
          ;; with package-data-list because it is not a customization file.
          (create-target-packages (let ((*readtable* *xc-readtable*)) (read data)))
          (let ((*readtable* *xc-readtable*)) (read data)))))
   (dolist (name (apply #'append list))
-    (setf (gethash name *undefined-fun-whitelist*) t)))
+    (setf (gethash name *undefined-fun-allowlist*) t)))
 
 (defvar *asm-package-use-list*
   '("SB-ASSEM" "SB-DISASSEM"
@@ -505,7 +515,7 @@
 
 (defun package-list-for-genesis ()
   (append (let ((*readtable* *xc-readtable*))
-            (read-from-file "package-data-list.lisp-expr" nil))
+            (read-from-file "^package-data-list.lisp-expr" nil))
           (let ((asm-package (backend-asm-package-name)))
             (list (make-package-data :name asm-package
                                      :use (list* "CL" *asm-package-use-list*)
@@ -515,7 +525,8 @@
 ;;; by the tree-shaker as intended.
 #+nil
 (defun show-unused-exports (&aux nonexistent uninteresting)
-  (dolist (entry (with-open-file (f "package-data-list.lisp-expr") (read f)))
+  (dolist (entry (with-open-file (find-bootstrap-file "^package-data-list.lisp-expr")
+                   (read f)))
     (let ((pkg (find-package (package-data-name entry))))
       (dolist (string (mapcan (lambda (x) (if (stringp x) (list x) x))
                               (package-data-export entry)))

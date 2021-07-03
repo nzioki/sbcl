@@ -32,12 +32,12 @@
     `((count nil
              nil
              (etypecase count
-               (null (1- sb-xc:most-positive-fixnum))
+               (null (1- most-positive-fixnum))
                (fixnum (max 0 count))
                (integer (if (minusp count)
                             0
-                            (1- sb-xc:most-positive-fixnum))))
-             (mod #.sb-xc:most-positive-fixnum))
+                            (1- most-positive-fixnum))))
+             (mod #.most-positive-fixnum))
       ;; Entries for {start,end}{,1,2}
       ,@(mapcan (lambda (names)
                   (destructuring-bind (start end length sequence) names
@@ -470,6 +470,12 @@
 ;;;; SUBSEQ
 ;;;;
 
+;;; FIXME: surely we can emit tighter code by not having 16 copies of the
+;;; vector allocator buried inside this (and similar) functions.
+;;; Instead there can be a size calculation up front, then ALLOCATE-VECTOR
+;;; with the underlying widetag, then perform an N-way dispatch for the copy.
+;;; Also, there should only be as many different ways to copy
+;;; as there are different element sizes.
 (!define-array-dispatch :jump-table vector-subseq-dispatch (array start end)
   (declare (optimize speed (safety 0)))
   (declare (type index start end))
@@ -603,7 +609,8 @@
                 do (setf pointer (cdr (rplaca pointer item)))))))
   sequence)
 
-(define-load-time-global %%fill-bashers%% (make-array (1+ sb-vm:widetag-mask)))
+(define-load-time-global %%fill-bashers%% (make-array (1+ sb-vm:widetag-mask)
+                                                      :initial-element 0))
 #.`(progn
    ,@(loop for saetp across sb-vm:*specialized-array-element-type-properties*
            for et = (sb-vm:saetp-specifier saetp)
@@ -853,7 +860,7 @@
   "Destructively modifies SEQUENCE1 by copying successive elements
 into it from the SEQUENCE2.
 
-Elements are copied to the subseqeuence bounded by START1 and END1,
+Elements are copied to the subsequence bounded by START1 and END1,
 from the subsequence bounded by START2 and END2. If these subsequences
 are not of the same length, then the shorter length determines how
 many elements are copied."
@@ -926,7 +933,8 @@ many elements are copied."
                       :check-fill-pointer t)
       (declare (ignore start))
       (let* ((tag (%other-pointer-widetag vector))
-             (new-vector (sb-vm::allocate-vector-with-widetag tag length nil)))
+             (new-vector (sb-vm::allocate-vector-with-widetag #+ubsan nil
+                                                              tag length nil)))
         (cond ((= tag sb-vm:simple-vector-widetag)
                (do ((left-index 0 (1+ left-index))
                     (right-index end))
@@ -958,6 +966,7 @@ many elements are copied."
       ((atom 2nd) 3rd)
     (rplacd 2nd 3rd)))
 
+(declaim (inline nreverse-word-specialized-vector))
 (defun nreverse-word-specialized-vector (vector start end)
   (do ((left-index start (1+ left-index))
        (right-index (1- end) (1- right-index)))
@@ -1153,7 +1162,8 @@ many elements are copied."
     (declare (index length))
     (do-rest-arg ((seq) sequences)
       (incf length (length seq)))
-    (let ((result (sb-vm::allocate-vector-with-widetag widetag length nil))
+    (let ((result (sb-vm::allocate-vector-with-widetag #+ubsan nil
+                                                       widetag length nil))
           (setter (the function (svref %%data-vector-setters%% widetag)))
           (index 0))
       (declare (index index))
@@ -1422,17 +1432,15 @@ many elements are copied."
            (setf (car node) (apply really-fun args))
            (setf node (cdr node)))))
       (sequence
-       (multiple-value-bind (iter limit from-end)
+       (multiple-value-bind (iter limit from-end step endp elt set)
            (sb-sequence:make-sequence-iterator result-sequence)
+         (declare (ignore elt) (type function step endp set))
          (map-into-lambda sequences (&rest args)
            (declare (truly-dynamic-extent args) (optimize speed))
-           (when (sb-sequence:iterator-endp result-sequence
-                                            iter limit from-end)
+           (when (funcall endp result-sequence iter limit from-end)
              (return-from map-into result-sequence))
-           (setf (sb-sequence:iterator-element result-sequence iter)
-                 (apply really-fun args))
-           (setf iter (sb-sequence:iterator-step result-sequence
-                                                           iter from-end)))))))
+           (funcall set (apply really-fun args) result-sequence iter)
+           (setf iter (funcall step result-sequence iter from-end)))))))
   result-sequence)
 
 ;;;; REDUCE

@@ -19,7 +19,7 @@
 ;;; to running into any errors, or else you've got twice the trouble.
 ;;;
 ;;; There are other thread-locals which are used by C code, and those are all
-;;; defined in !PER-THREAD-C-INTERFACE-SYMBOLS. Those other symbols must have
+;;; defined in PER-THREAD-C-INTERFACE-SYMBOLS. Those other symbols must have
 ;;; initial values of either a fixnum or a static symbol (typically T or NIL).
 ;;;
 ;;; In contrast, DEFINE-THREAD-LOCAL allows more-or-less an arbitrary form,
@@ -65,15 +65,14 @@
       (let ((found (assq symbol (cdr list))))
         (if found
             (setf (cadr found) initform)
-            (let* ((thread-struct (find 'sb-vm::thread sb-vm:*primitive-objects*
-                                        :key #'sb-vm:primitive-object-name))
+            (let* ((thread-struct (sb-vm::primitive-object 'sb-vm::thread))
                    (n-fixed (+ (sb-vm:primitive-object-length thread-struct)
                                (count-if-not
                                 (lambda (x)
                                   (find (car (ensure-list x))
                                         (sb-vm:primitive-object-slots thread-struct)
                                         :key #'sb-vm:slot-special))
-                                sb-vm::!per-thread-c-interface-symbols)))
+                                sb-vm::per-thread-c-interface-symbols)))
                    (tls-slot (+ n-fixed (length (cdr list)))))
               (nconc list (list (list symbol initform)))
               (setf (info :variable :wired-tls symbol) (ash tls-slot sb-vm:word-shift))
@@ -84,7 +83,7 @@
 ;;; by RESTART-BIND.
 (define-thread-local *restart-clusters* nil)
 
-(define-load-time-global sb-kernel::**initial-handler-clusters** nil)
+(!define-load-time-global sb-kernel::**initial-handler-clusters** '(nil))
 ;;; a list of handlers maintained by HANDLER-BIND
 (define-thread-local *handler-clusters* sb-kernel::**initial-handler-clusters**)
 
@@ -95,7 +94,6 @@
                   *posix-argv*))
 ;;; This constant is assigned by Genesis and never read by Lisp code.
 ;;; (To prove that it isn't used, it's not a toplevel form)
-#+linkage-table
 (let ()
   (defconstant sb-vm::+required-foreign-symbols+
     (symbol-value 'sb-vm::+required-foreign-symbols+)))

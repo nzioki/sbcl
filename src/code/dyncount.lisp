@@ -35,7 +35,7 @@ comments from CMU CL:
   "Return a hash-table containing only the entries in Table1 whose key is not
    also a key in Table2." (declare (type hash-table table1 table2))
   (let ((res (make-hash-table-like table1)))
-    (with-locked-system-table (table2)
+    (with-system-mutex ((hash-table-lock table2))
       (dohash ((k v) table1 :locked t)
         (unless (nth-value 1 (gethash k table2))
           (setf (gethash k res) v))))
@@ -109,7 +109,7 @@ comments from CMU CL:
     (setf (vop-stats-cost res) cost)
     res))
 
-#-sb-fluid (declaim (freeze-type dyncount-info vop-stats))
+(declaim (freeze-type dyncount-info vop-stats))
 
 ;;;    Add the Info into the cumulative result on the VOP name plist. We use
 ;;; plists so that we will touch minimal system code outside of this file
@@ -389,7 +389,7 @@ comments from CMU CL:
 (defun entry-report (entries cut-off compensated compare total-cost)
   (let ((counter (if (and cut-off (> (length entries) cut-off))
                      cut-off
-                     sb-xc:most-positive-fixnum)))
+                     most-positive-fixnum)))
   (dolist (entry entries)
     (let* ((cost (vop-stats-cost entry))
            (name (vop-stats-name entry))

@@ -25,9 +25,10 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
+
+#ifndef LISP_FEATURE_DARWIN
 #include <machine/sysarch.h>
+#endif
 
 #include <sys/types.h>
 #include <signal.h>
@@ -39,16 +40,12 @@
 #include "validate.h"
 size_t os_vm_page_size;
 
+int arch_os_thread_cleanup(struct thread *thread) {
+    return 1;                   /* success */
+}
 
 int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
-#ifdef LISP_FEATURE_SB_THREAD
-#ifdef LISP_FEATURE_GCC_TLS
-    current_thread = thread;
-#else
-    pthread_setspecific(specials,thread);
-#endif
-#endif
     /* Signal handlers are normally run on the main stack, but we've
      * swapped stacks, require that the control stack contain only
      * boxed data, and expands upwards while the C stack expands
@@ -61,9 +58,7 @@ int arch_os_thread_init(struct thread *thread) {
 
     return 1;                   /* success */
 }
-int arch_os_thread_cleanup(struct thread *thread) {
-    return 1;                   /* success */
-}
+
 
 #if defined(LISP_FEATURE_OPENBSD)
 
@@ -94,8 +89,6 @@ os_restore_fp_control(os_context_t *context)
 {
 }
 
-#endif
-
 os_context_register_t *
 os_context_lr_addr(os_context_t *context)
 {
@@ -109,3 +102,76 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
         = (os_vm_address_t)(((uintptr_t) address) + length);
     __clear_cache(address, end_address);
 }
+
+#elif defined(LISP_FEATURE_NETBSD)
+os_context_register_t   *
+os_context_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t *)&(context->uc_mcontext.__gregs[offset]);
+}
+
+os_context_register_t *
+os_context_pc_addr(os_context_t *context)
+{
+    return os_context_register_addr(context, 32);
+}
+
+os_context_register_t *
+os_context_lr_addr(os_context_t *context)
+{
+    return os_context_register_addr(context, reg_LR);
+}
+
+void
+os_restore_fp_control(os_context_t *context)
+{
+    /* FIXME: Implement. */
+}
+
+os_context_register_t   *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t*)
+        &context->uc_mcontext.__fregs.__qregs[offset];
+}
+
+void
+os_flush_icache(os_vm_address_t address, os_vm_size_t length)
+{
+    __builtin___clear_cache(address, address + length);
+}
+
+#elif defined (LISP_FEATURE_DARWIN)
+os_context_register_t   *
+os_context_register_addr(os_context_t *context, int regno)
+{
+    switch (regno) {
+        case reg_LR:    return (os_context_register_t*)(&context->uc_mcontext->__ss.__lr);
+        case reg_NSP:   return (os_context_register_t*)(&context->uc_mcontext->__ss.__sp);
+        default:        return (os_context_register_t*)(&context->uc_mcontext->__ss.__x[regno]);
+    }
+}
+
+os_context_register_t *
+os_context_pc_addr(os_context_t *context)
+{
+    return (os_context_register_t*)(&context->uc_mcontext->__ss.__pc);
+}
+
+os_context_register_t   *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return NULL;
+}
+
+void
+os_restore_fp_control(os_context_t *context)
+{
+}
+
+os_context_register_t *
+os_context_lr_addr(os_context_t *context)
+{
+    return os_context_register_addr(context, reg_LR);
+}
+#endif

@@ -90,13 +90,7 @@
 
 (define-move-fun (load-constant 5) (vop x y)
   ((constant) (descriptor-reg))
-  (let ((offset (- (tn-byte-offset x) other-pointer-lowtag)))
-    (cond
-      ((ldr-str-offset-encodable offset)
-       (inst ldr y (@ code-tn offset)))
-      (t
-       (load-immediate-word tmp-tn offset)
-       (inst ldr y (@ code-tn tmp-tn))))))
+  (inst load-constant y (tn-byte-offset x)))
 
 (define-move-fun (load-stack 5) (vop x y)
   ((control-stack) (any-reg descriptor-reg))
@@ -408,7 +402,7 @@
   (:generator 4
     (inst adds y x x)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
+    (load-constant vop (emit-constant (1+ most-positive-fixnum))
                    y)
     DONE))
 
@@ -416,7 +410,7 @@
   (:generator 4
     (inst adds y x x)
     (inst b :vc DONE)
-    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
+    (load-constant vop (emit-constant (1- most-negative-fixnum))
                    y)
     DONE))
 

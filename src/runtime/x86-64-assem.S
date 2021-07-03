@@ -25,9 +25,6 @@
 #include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
-#ifdef MEMORY_SANITIZER
-#include "genesis/symbol.h"
-#endif
 #include "genesis/ratio.h"
 #include "genesis/complex.h"
 
@@ -41,17 +38,12 @@
 
 // Produce position-independent code.
 // macOS does not like the general way we do this, so do something different.
-// I don't know about win32, so conservatively exclude that too.
-#if !defined LISP_FEATURE_DARWIN && !defined LISP_FEATURE_WIN32
-#define PIC_CALL(x) x@PLT
-#define LOAD_PIC_VAR(x,dest) mov GNAME(x)@GOTPCREL(%rip), dest ; mov (dest), dest
-#else
+#if defined(LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_WIN32)
 #define PIC_CALL(x) x
-#ifdef LISP_FEATURE_DARWIN
 #define LOAD_PIC_VAR(x,dest) mov GNAME(x)(%rip), dest
 #else
-#define LOAD_PIC_VAR(x,dest) mov GNAME(x), dest
-#endif
+#define PIC_CALL(x) x@PLT
+#define LOAD_PIC_VAR(x,dest) mov GNAME(x)@GOTPCREL(%rip), dest ; mov (dest), dest
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
@@ -92,7 +84,17 @@
 
 #define THREAD_BASE_REG %r13
 
-#ifdef OS_THREAD_STACK
+#ifdef LISP_FEATURE_WIN32
+#define CARG1 %rcx
+#define CARG2 %rdx
+#define CARG3 %r8
+#else
+#define CARG1 %rdi
+#define CARG2 %rsi
+#define CARG3 %rdx
+#endif
+	
+#ifdef LISP_FEATURE_OS_THREAD_STACK
         .text
 	.globl  GNAME(funcall1_switching_stack)
 	TYPE(GNAME(funcall1_switching_stack))
@@ -104,8 +106,16 @@ GNAME(funcall1_switching_stack):
         push    %rbp
         mov     %rsp,%rbp
 
-        mov     THREAD_CONTROL_STACK_END_OFFSET(%rdi),%rsp
-        call    *%rsi
+        mov     THREAD_CONTROL_STACK_END_OFFSET(CARG1),%rsp
+
+#ifdef LISP_FEATURE_WIN32	
+	/* _chkstk() is called at some unknown points and is
+           expecting that
+	*/
+	mov 	THREAD_CONTROL_STACK_START_OFFSET(CARG1), %rax
+	movq    %rax, %gs:16
+#endif
+        call    *CARG2
 
         mov     %rbp, %rsp
         pop     %rbp
@@ -127,13 +137,6 @@ GNAME(call_into_lisp_first_time):
 GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
-#ifdef MEMORY_SANITIZER // Presumes GCC_TLS and SB_THREAD
-	movq	GNAME(current_thread)@GOTTPOFF(%rip), %r8 // Clobberable
-	movq	%fs:(%r8), %r8
-	movq	%fs:0, %rax
-	leaq	__msan_param_tls@TPOFF(%rax), %rax
-	movq	%rax, THREAD_MSAN_PARAM_TLS_OFFSET(%r8)
-#endif
 	LOAD_PIC_VAR(all_threads, %rax)
 	mov     THREAD_CONTROL_STACK_END_OFFSET(%rax) ,%rsp
 	jmp     Lstack
@@ -180,15 +183,14 @@ Lstack:
 #ifdef LISP_FEATURE_GCC_TLS
 	movq	GNAME(current_thread)@GOTTPOFF(%rip), THREAD_BASE_REG
 	movq	%fs:(THREAD_BASE_REG), THREAD_BASE_REG
+#elif defined LISP_FEATURE_WIN32
+	call    PIC_CALL(GNAME(read_current_thread))
+	mov	%rax, THREAD_BASE_REG
 #else
 	LOAD_PIC_VAR(specials, %rdi)
 	call    PIC_CALL(GNAME(pthread_getspecific))
 	mov	%rax, THREAD_BASE_REG
 #endif
-#elif defined(LISP_FEATURE_SB_SAFEPOINT)
-        /* We need this to find the CSP trap page.  This does no harm,
-	 * as the compiler doesn't use THREAD_BASE_REG on non-threaded builds. */
-        LOAD_PIC_VAR(all_threads, THREAD_BASE_REG)
 #endif
 	pop	%rcx	# num args
 	pop	%rbx	# arg vector
@@ -444,7 +446,8 @@ ascs_check_guard_page:
 	jae	ascs_clear_loop
 	cmp	%rax, %rsi
 	ja	ascs_clear_loop
-	cmpq	$(NIL), THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET(%rdi)
+	/* test state_word.control_stack_guard_page_protected */
+	cmpb	$0, THREAD_STATE_WORD_OFFSET(%rdi)
 	jne	ascs_finished
 
 	/* Clear memory backwards to the start of the (4KiB) page */

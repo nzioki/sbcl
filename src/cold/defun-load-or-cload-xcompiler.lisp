@@ -97,6 +97,10 @@
           (sb-cold::exit-process 1)))))
   (format t "~&; Parallel build: Skipping fasl load~%"))
 
+;;; Read the version file once and once only,
+;;; or not at all if you've otherwise defined this.
+(defvar *target-sbcl-version* (read-from-file "version.lisp-expr"))
+
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
 (defun load-or-cload-xcompiler (load-or-cload-stem)
@@ -113,6 +117,8 @@
   (if (and (make-host-1-parallelism)
            (eq load-or-cload-stem #'host-cload-stem))
       (progn
+        ;; FIXME: muffler not working in forked children?
+        (setq *fail-on-warnings* nil)
         ;; Multiprocess build uses the in-memory math ops cache but not
         ;; the persistent cache file because we don't need each child
         ;; to be forced to read the file. Moreover, newly inserted values
@@ -135,6 +141,8 @@
       (with-math-journal
        (do-stems-and-flags (stem flags 1)
          (unless (find :not-host flags)
+           ;; Enforce naming convention: target-* files are not for make-host-1
+           (assert (not (search "code/target-" stem)))
            (funcall load-or-cload-stem stem flags)
            (when (member :sb-show sb-xc:*features*)
              (funcall 'warn-when-cl-snapshot-diff *cl-snapshot*))))))
@@ -155,6 +163,7 @@
   ;; Let's check that the type system, and various other things, are
   ;; reasonably sane. (It's easy to spend a long time wandering around
   ;; confused trying to debug cross-compilation if it isn't.)
+  (funcall 'sb-c::check-vop-existence-correctness)
   (let ((*readtable* *xc-readtable*)
         (*load-verbose* t))
     (with-math-journal

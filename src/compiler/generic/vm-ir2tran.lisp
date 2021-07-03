@@ -39,7 +39,9 @@
 
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
   (let* ((lvar (node-lvar node))
-         (locs (lvar-result-tns lvar (list *universal-type*)))
+         (locs (lvar-result-tns lvar (list (if lvar
+                                               (lvar-type lvar)
+                                               *universal-type*))))
          (res (first locs)))
     (vop slot node block (lvar-tn node block object)
          name offset lowtag res)
@@ -73,11 +75,6 @@
          res)
     (move-lvar-result node block locs lvar)))
 
-(eval-when (:compile-toplevel)
-  ;; Assert correctness of build order. (Need not be exhaustive)
-  #+(and x86-64 (not (vop-named sb-vm::raw-instance-init/word)))
-  (error "Expected raw-instance-init vops"))
-
 (defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
@@ -105,7 +102,7 @@
                            (zero-init-p arg))
                 (let ((arg-tn (lvar-tn node block arg)))
                   (macrolet
-                      ((make-case (&optional rsd-list)
+                      ((make-case (&aux (rsd-list sb-kernel::*raw-slot-data*))
                          `(ecase raw-type
                             ((t)
                              (vop init-slot node block object arg-tn
@@ -113,11 +110,10 @@
                             ,@(map 'list
                                (lambda (rsd)
                                  `(,(sb-kernel::raw-slot-data-raw-type rsd)
-                                   (vop ,(sb-kernel::raw-slot-data-init-vop rsd)
-                                        node block object arg-tn slot)))
-                               (symbol-value rsd-list)))))
-                    (make-case #+(vop-named sb-vm::raw-instance-init/word)
-                               sb-kernel::*raw-slot-data*))))))
+                                   (vop ,(sb-kernel::raw-slot-data-writer-name rsd)
+                                        node block object (emit-constant slot) arg-tn)))
+                               rsd-list))))
+                    (make-case))))))
            (:dd
             (vop init-slot node block object
                  (emit-constant (sb-kernel::dd-layout-or-lose slot))
@@ -218,46 +214,54 @@
                         (array-type-specialized-element-type vector-ctype)
                         (bug "Unknown vector type in IR2 conversion for ~S."
                              'initialize-vector)))
+         (bit-vector-p (type= elt-ctype (specifier-type 'bit)))
          (saetp (find-saetp-by-ctype elt-ctype))
          (lvar (node-lvar node))
          (locs (lvar-result-tns lvar (list vector-ctype)))
          (result (first locs))
          (elt-ptype (primitive-type elt-ctype))
          (tmp (make-normal-tn elt-ptype)))
+    (declare (ignorable bit-vector-p))
     (emit-move node block (lvar-tn node block vector) result)
     (flet ((compute-setter ()
+             ;; Such cringe. I had no idea why all the "-C" vops were mandatory.
+             ;; Too bad we can't let the backend decide how it would like to do things.
+             ;; Not to mention, this code is confusing because RESULT is the argument,
+             ;; and TN - the value to store - is the result, and an argument.
+             ;; Also note that the constant-index vops want the operands to the
+             ;; VOP macro as (VECTOR VALUE INDEX OFFSET) + (RESULT)
+             ;; but the non-constant want (VECTOR INDEX VALUE OFFSET) + (RESULT).
+             ;; They could totally have been made the same.
              (macrolet
                  ((frob ()
-                    (let ((*package* (find-package :sb-vm))
-                          (clauses nil))
-                      (map nil (lambda (s)
-                                 (when (sb-vm:saetp-specifier s)
-                                   (push
-                                    `(,(sb-vm:saetp-typecode s)
-                                       (lambda (index tn)
-                                         #+x86-64
-                                         (vop ,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/"
-                                                            (sb-vm:saetp-primitive-type-name s)
-                                                            "-C")
-                                              node block result tn index 0 tn)
-                                         #+x86
-                                         (vop ,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/"
-                                                            (sb-vm:saetp-primitive-type-name s))
-                                              node block result index tn 0 tn)
-                                         #-(or x86 x86-64)
-                                         (vop ,(symbolicate "DATA-VECTOR-SET/"
-                                                            (sb-vm:saetp-primitive-type-name s))
-                                              node block result index tn tn)))
-                                    clauses)))
-                           sb-vm:*specialized-array-element-type-properties*)
-                      `(ecase (sb-vm:saetp-typecode saetp)
-                         ,@(nreverse clauses)))))
+                    `(ecase (sb-vm:saetp-typecode saetp)
+                       ,@(map 'list
+                          (lambda (s &aux (ptype (sb-vm:saetp-primitive-type-name s))
+                                          (*package* (find-package "SB-VM")))
+                            `(,(sb-vm:saetp-typecode s)
+                              (lambda (index tn)
+                                #+x86-64
+                                ,(if (eq ptype 'simple-bit-vector) ; no "-C" setter exists
+                                     `(vop ,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype)
+                                           node block result index tn 0)
+                                     `(vop ,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype "-C")
+                                           node block result tn index 0))
+                                #+x86
+                                (vop ,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype)
+                                     node block result index tn 0)
+                                #-(or x86 x86-64)
+                                (vop ,(symbolicate "DATA-VECTOR-SET/" ptype)
+                                     node block result index tn))))
+                          (remove nil sb-vm:*specialized-array-element-type-properties*
+                                  :key #'sb-vm:saetp-specifier)))))
                (frob)))
            (tnify (index)
              #-x86-64
              (emit-constant index)
              #+x86-64
-             index))
+             (if bit-vector-p ; moar cringe
+                 (emit-constant index)
+                 index)))
       (let ((setter (compute-setter))
             (length (length initial-contents))
             (dx-p (and lvar
@@ -272,20 +276,25 @@
                          (if character
                              (eql (char-code (lvar-value value)) 0)
                              (eql (lvar-value value) 0)))
-              (emit-move node block (lvar-tn node block value) tmp)
-              (funcall setter (tnify i) tmp))))))
+              ;; With SIMPLE-BIT-VECTOR, prefer to pass a constant TN if we can, as it emits
+              ;; better code (at least on x86-64) by using the constant to discern between
+              ;; the BTS or BTR opcode. However, a new suboptimality comes from that,
+              ;; which is that by not passing a LOCATION= TN for the output, the final MOVE
+              ;; in the setter thinks that it has to do something.
+              ;; Nonetheless it's far better than it was. In all other scenarios, don't pass
+              ;; a constant TN, because we don't know that generated code is better.
+              (cond #+x86-64 ; still moar cringe
+                    ((and bit-vector-p (constant-lvar-p value))
+                     (funcall setter (tnify i) (emit-constant (lvar-value value))))
+                    (t
+                     (emit-move node block (lvar-tn node block value) tmp)
+                     (funcall setter (tnify i) tmp))))))))
     (move-lvar-result node block locs lvar)))
-
-(defun vector-initialized-p (call)
-  (let ((lvar (node-lvar call)))
-    (when lvar
-      (let ((dest (principal-lvar-dest lvar)))
-        (and (basic-combination-p dest)
-             (lvar-fun-is (basic-combination-fun dest) '(initialize-vector)))))))
 
 ;;; An array header for simple non-unidimensional arrays is a fixed alloc,
 ;;; because the rank has to be known.
 ;;; (There are no compile-time optimizations for unknown rank arrays)
+;;; WIDETAG may have ORed into it 1 bit for +ARRAY-FILL-POINTER-P+
 (defoptimizer (make-array-header* ir2-convert) ((widetag &rest args) node block)
   (let ((n-args (length args)))
     ;; Remove the widetag lvar
@@ -320,8 +329,8 @@
     args dx
     t)
 (defoptimizer (allocate-vector stack-allocate-result)
-      ((type length words) node dx)
-    (declare (ignorable type) (ignore length))
+      ((#+ubsan poisoned type length words) node dx)
+    (declare (ignorable #+ubsan poisoned type length))
     (and
      ;; Can't put unboxed data on the stack unless we scavenge it
      ;; conservatively.
@@ -339,11 +348,14 @@
                           (specifier-type
                            `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
                                            sb-vm:vector-data-offset)))))))
-(defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
-    (declare (ignore type length words))
-    (vectorish-ltn-annotate-helper call ltn-policy
-                                   'sb-vm::allocate-vector-on-stack
-                                   'sb-vm::allocate-vector-on-heap))
+(defoptimizer (allocate-vector ltn-annotate)
+    ((#+ubsan poisoned type length words) call ltn-policy)
+  (declare (ignore #+ubsan poisoned type length words))
+  (vectorish-ltn-annotate-helper call ltn-policy
+                                 (if (sb-c:msan-unpoison sb-c:*compilation*)
+                                     'sb-vm::allocate-vector-on-stack+msan-unpoison
+                                     'sb-vm::allocate-vector-on-stack)
+                                 'sb-vm::allocate-vector-on-heap))
 
 (defun vectorish-ltn-annotate-helper (call ltn-policy dx-template not-dx-template)
     (let* ((args (basic-combination-args call))
@@ -354,12 +366,9 @@
       (dolist (arg args)
         (setf (lvar-info arg)
               (make-ir2-lvar (primitive-type (lvar-type arg)))))
-      (unless (is-ok-template-use template call (ltn-policy-safe-p ltn-policy))
-        (ltn-default-call call)
-        (return-from vectorish-ltn-annotate-helper (values)))
+      (aver (is-ok-template-use template call (ltn-policy-safe-p ltn-policy)))
       (setf (basic-combination-info call) template)
       (setf (node-tail-p call) nil)
-
       (dolist (arg args)
         (annotate-1-value-lvar arg))))
 
@@ -404,34 +413,64 @@
                                    'sb-vm::allocate-list-on-stack
                                    'sb-vm::allocate-list-on-heap)))
 
+;;; Return the vop that wrote the TN referenced by TN-REF,
+;;; but look through MOVEs.
+(defun producer-vop (tn-ref)
+  (let ((vop (tn-ref-vop (tn-writes (tn-ref-tn tn-ref)))))
+    (if (neq (vop-name vop) 'move)
+        vop
+        (tn-ref-vop (tn-writes (tn-ref-tn (vop-args vop)))))))
+
+(defun elide-zero-fill (vop)
+  (let* ((writer (producer-vop (vop-args vop)))
+         ;; Take the last of the info arguments
+         ;; in case WORDS is also an info argument.
+         (value
+          (the (or sb-vm:word
+                   (member :trap :unbound :safe-default :unsafe-default))
+               (car (last (vop-codegen-info vop)))))
+         (elidep
+          (ecase (vop-name writer)
+            (sb-vm::allocate-vector-on-heap
+             (member value '(0 :safe-default :unsafe-default)))
+            ((sb-vm::allocate-vector-on-stack
+              sb-vm::allocate-vector-on-stack+msan-unpoison)
+             ;; For most specialized vectors, any random bits can
+             ;; be regarded as a :SAFE-DEFAULT. If :UNSAFE-DEFAULT, then random
+             ;; bits are OK (even for SIMPLE-VECTOR if not using precise gencgc).
+             (eq value :unsafe-default)))))
+    (when elidep ; change it to a MOVE
+      (let ((new (emit-and-insert-vop (vop-node vop) (vop-block vop)
+                                      (template-or-lose 'move)
+                                      (reference-tn (tn-ref-tn (vop-args vop)) nil)
+                                      (reference-tn (tn-ref-tn (vop-results vop)) t)
+                                      vop)))
+        (delete-vop vop)
+        new))))
 
 (in-package "SB-VM")
 ;;; Return a list of parameters with which to call MAKE-ARRAY-HEADER*
 ;;; given the mandatory slots for a simple array of rank 0 or > 1.
 (defun make-array-header-inits (storage n-elements dimensions)
-  (macrolet ((expand ()
-               `(list* sb-vm:simple-array-widetag
-                       ,@(mapcar (lambda (slot)
-                                   (ecase (slot-name slot)
-                                     (data           'storage)
-                                     (fill-pointer   'n-elements)
-                                     (elements       'n-elements)
-                                     (fill-pointer-p nil)
-                                     (displacement   0)
-                                     (displaced-p    nil)
-                                     (displaced-from nil)))
-                                 (butlast (primitive-object-slots
-                                           (find 'array *primitive-objects*
-                                                 :key 'primitive-object-name))))
-                       dimensions)))
-    (expand)))
+  (let ((primitive-obj (load-time-value (primitive-object 'array) t)))
+    (nconc (loop with slots = (primitive-object-slots primitive-obj)
+                 for i from 0 below (1- (length slots))
+                 collect
+                 (let ((slot (svref slots i)))
+                     (ecase (slot-name slot)
+                       (data           storage)
+                       (fill-pointer   n-elements)
+                       (elements       n-elements)
+                       (displacement   0)
+                       (displaced-p    nil)
+                       (displaced-from nil))))
+           dimensions)))
 
 ;;; This order is used by SB-C::TRANSFORM-MAKE-ARRAY-VECTOR
-(assert (equal (mapcar #'slot-name
-                       (primitive-object-slots
-                        (find 'array *primitive-objects*
-                              :key 'primitive-object-name)))
-               '(fill-pointer fill-pointer-p elements data
+;;; The slot formerly known as FILL-POINTER-P is 1 bit in the header now.
+(assert (equal (map 'list #'slot-name
+                    (primitive-object-slots (primitive-object 'array)))
+               '(fill-pointer elements data
                  displacement displaced-p displaced-from dimensions)))
 
 (defun emit-code-page-write-barrier-p (fun-name)

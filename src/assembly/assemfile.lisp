@@ -157,7 +157,7 @@
          (emit-alignment sb-vm:n-lowtag-bits
                          ;; EMIT-LONG-NOP does not exist for (not x86-64)
                          #+x86-64 :long-nop))
-       (when *compile-print*
+       (when cl:*compile-print*
          (format *error-output* "~S assembled~%" ',name)))))
 
 (defun arg-or-res-spec (reg)
@@ -226,15 +226,9 @@
                       :key #'car)
          (:generator ,cost
            ,@(mapcar (lambda (arg)
-                       #+(or hppa alpha) `(move ,(reg-spec-name arg)
-                                                 ,(reg-spec-temp arg))
-                       #-(or hppa alpha) `(move ,(reg-spec-temp arg)
-                                                 ,(reg-spec-name arg)))
+                       `(move ,(reg-spec-temp arg) ,(reg-spec-name arg)))
                      args)
            ,@call-sequence
            ,@(mapcar (lambda (res)
-                       #+(or hppa alpha) `(move ,(reg-spec-temp res)
-                                                 ,(reg-spec-name res))
-                       #-(or hppa alpha) `(move ,(reg-spec-name res)
-                                                 ,(reg-spec-temp res)))
+                       `(move ,(reg-spec-name res) ,(reg-spec-temp res)))
                      results))))))

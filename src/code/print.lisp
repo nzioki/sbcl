@@ -54,7 +54,7 @@ Does not affect the cases that are already controlled by *PRINT-LENGTH*")
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
-  (sb-pretty::make-pprint-dispatch-table nil nil nil) ; for type-correctness
+  (sb-pretty::make-pprint-dispatch-table #() nil nil) ; for type-correctness
   "The pprint-dispatch-table that controls how to pretty-print objects.")
 (defparameter *suppress-print-errors* nil
   "Suppress printer errors when the condition is of the type designated by this
@@ -218,7 +218,7 @@ variable: an unreadable object representing the error is printed instead.")
   ;; This is exact for bases which are exactly a power-of-2, or an overestimate
   ;; otherwise, as mandated by the finite output stream.
   (let ((bits-per-char
-         (aref #.(sb-xc:coerce
+         (aref #.(coerce
                   ;; base 2 or base 3  = 1 bit per character
                   ;; base 4 .. base 7  = 2 bits per character
                   ;; base 8 .. base 15 = 3 bits per character, etc
@@ -342,7 +342,7 @@ variable: an unreadable object representing the error is printed instead.")
                (if (eq initiate :initiate)
                    (let ((*circularity-hash-table*
                           (make-hash-table :test 'eq)))
-                     (check-it (make-broadcast-stream))
+                     (check-it *null-broadcast-stream*)
                      (let ((*circularity-counter* 0))
                        (check-it stream)))
                    ;; otherwise
@@ -378,15 +378,24 @@ variable: an unreadable object representing the error is printed instead.")
         (return-from output-ugly-object
           (print-unreadable-object (object stream :identity t)
             (prin1 'instance stream))))
-      (let ((classoid (layout-classoid layout)))
-        ;; Additionally, if the object is an obsolete CONDITION, don't crash.
-        ;; (There is no update-instance protocol for conditions)
+      (let* ((wrapper (layout-friend layout))
+             (classoid (wrapper-classoid wrapper)))
+        ;; Additionally, don't crash if the object is an obsolete thing with
+        ;; no update protocol.
         (when (or (sb-kernel::undefined-classoid-p classoid)
-                  (and (layout-invalid layout)
-                       (logtest (layout-flags layout) +condition-layout-flag+)))
+                  (and (wrapper-invalid wrapper)
+                       (logtest (layout-flags layout)
+                                (logior +structure-layout-flag+
+                                        +condition-layout-flag+))))
           (return-from output-ugly-object
             (print-unreadable-object (object stream :identity t)
               (format stream "UNPRINTABLE instance of ~W" classoid)))))))
+  (when (funcallable-instance-p object)
+    (let ((layout (%fun-layout object)))
+      (unless (logtest (get-lisp-obj-address layout) sb-vm:widetag-mask)
+        (return-from output-ugly-object
+          (print-unreadable-object (object stream :identity t)
+            (prin1 'funcallable-instance stream))))))
   (print-object object stream))
 
 ;;;; symbols
@@ -488,20 +497,23 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;; For each character, the value of the corresponding element is the
 ;;; lowest base in which that character is a digit.
-(defconstant +digit-bases+
+(defconstant-eqx +digit-bases+
   #.(let ((a (sb-xc:make-array 128 ; FIXME
+                               :retain-specialization-for-after-xc-core t
                                :element-type '(unsigned-byte 8)
                                :initial-element 36)))
       (dotimes (i 36 a)
         (let ((char (digit-char i 36)))
-          (setf (aref a (sb-xc:char-code char)) i)))))
+          (setf (aref a (char-code char)) i))))
+  #'equalp)
 
-(defconstant +character-attributes+
+(defconstant-eqx +character-attributes+
   #.(let ((a (sb-xc:make-array 160 ; FIXME
+                               :retain-specialization-for-after-xc-core t
                                :element-type '(unsigned-byte 16)
                                :initial-element 0)))
       (flet ((set-bit (char bit)
-               (let ((code (sb-xc:char-code char)))
+               (let ((code (char-code char)))
                  (setf (aref a code) (logior bit (aref a code))))))
 
         (dolist (char '(#\! #\@ #\$ #\% #\& #\* #\= #\~ #\[ #\] #\{ #\}
@@ -511,12 +523,12 @@ variable: an unreadable object representing the error is printed instead.")
         (dotimes (i 10)
           (set-bit (digit-char i) number-attribute))
 
-        (do ((code (sb-xc:char-code #\A) (1+ code))
-             (end (sb-xc:char-code #\Z)))
+        (do ((code (char-code #\A) (1+ code))
+             (end (char-code #\Z)))
             ((> code end))
           (declare (fixnum code end))
-          (set-bit (sb-xc:code-char code) uppercase-attribute)
-          (set-bit (char-downcase (sb-xc:code-char code)) lowercase-attribute))
+          (set-bit (code-char code) uppercase-attribute)
+          (set-bit (char-downcase (code-char code)) lowercase-attribute))
 
         (set-bit #\- sign-attribute)
         (set-bit #\+ sign-attribute)
@@ -529,7 +541,8 @@ variable: an unreadable object representing the error is printed instead.")
         (dotimes (i 160) ; FIXME
           (when (zerop (aref a i))
             (setf (aref a i) funny-attribute))))
-      a))
+      a)
+  #'equalp)
 
 ;;; A FSM-like thingie that determines whether a symbol is a potential
 ;;; number or has evil characters in it.
@@ -835,7 +848,8 @@ variable: an unreadable object representing the error is printed instead.")
                     (write-char #\" stream))
                    (t
                     (write-string vector stream))))
-            ((not (or *print-array* readably))
+            ((or (null (array-element-type vector))
+                 (not (or *print-array* readably)))
              (output-terse-array vector stream))
             ((bit-vector-p vector)
              (cond ((cut-length))
@@ -886,7 +900,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; Output the printed representation of any array in either the #< or #A
 ;;; form.
 (defmethod print-object ((array array) stream)
-  (if (or *print-array* *print-readably*)
+  (if (and (or *print-array* *print-readably*) (array-element-type array))
       (output-array-guts array stream)
       (output-terse-array array stream)))
 
@@ -894,7 +908,10 @@ variable: an unreadable object representing the error is printed instead.")
 (defun output-terse-array (array stream)
   (let ((*print-level* nil)
         (*print-length* nil))
-    (print-unreadable-object (array stream :type t :identity t))))
+    (if (and (not (array-element-type array)) *print-readably* *read-eval*)
+        (format stream "#.(~S '~D :ELEMENT-TYPE ~S)"
+                'make-array (array-dimensions array) nil)
+        (print-unreadable-object (array stream :type t :identity t)))))
 
 ;;; Convert an array into a list that can be used with MAKE-ARRAY's
 ;;; :INITIAL-CONTENTS keyword argument.
@@ -1348,8 +1365,14 @@ variable: an unreadable object representing the error is printed instead.")
             (double-float double-float-min-e)
             #+long-float
             (long-float long-float-min-e))))
-    (multiple-value-bind (f e)
-        (integer-decode-float float)
+    (multiple-value-bind (f e) (integer-decode-float float)
+      ;; An extra step became necessary here for subnormals because the
+      ;; algorithm assumes that the fraction is left-aligned in a field
+      ;; that is FLOAT-DIGITS wide.
+      (when (< (float-precision float) float-digits)
+        (let ((shift (- float-digits (integer-length f))))
+          (setq f (ash f shift)
+                e (- e shift))))
       (let ( ;; FIXME: these even tests assume normal IEEE rounding
             ;; mode.  I wonder if we should cater for non-normal?
             (high-ok (evenp f))
@@ -1689,7 +1712,7 @@ variable: an unreadable object representing the error is printed instead.")
                       (write-string ", " stream)
                       (output-object (sb-c::debug-info-name dinfo) stream)))))))))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (defmethod print-object ((lra lra) stream)
   (print-unreadable-object (lra stream :identity t)
     (write-string "return PC object" stream)))
@@ -1798,9 +1821,9 @@ variable: an unreadable object representing the error is printed instead.")
     ;; ":TYPE T" is no good, since CLOSURE doesn't have full-fledged status.
     (print-unreadable-object (object stream :identity (not proper-name-p))
       (format stream "~A~@[ ~S~]"
-              ;; TYPE-OF is so that GFs print as #<STANDARD-GENERIC-FUNCTION>
-              ;; and not #<FUNCTION> before SRC;PCL;PRINT-OBJECT is loaded.
-              (if (closurep object) 'closure (type-of object))
+              ;; CLOSURE and SIMPLE-FUN should print as #<FUNCTION>
+              ;; but anything else prints as its exact type.
+              (if (funcallable-instance-p object) (type-of object) 'function)
               name))))
 
 ;;;; catch-all for unknown things
@@ -1813,6 +1836,9 @@ variable: an unreadable object representing the error is printed instead.")
     ;; If specifically the unbound marker with 0 data,
     ;; as opposed to any other unbound marker.
     (print-unreadable-object (object stream) (write-string "unbound" stream))
+    (return-from print-object))
+  (when (eql (get-lisp-obj-address object) sb-vm:no-tls-value-marker-widetag)
+    (print-unreadable-object (object stream) (write-string "novalue" stream))
     (return-from print-object))
   (print-unreadable-object (object stream :identity t)
     (let ((lowtag (lowtag-of object)))

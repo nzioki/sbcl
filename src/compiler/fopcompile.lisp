@@ -62,10 +62,6 @@
   ;; Special forms which we don't currently handle, but might consider
   ;; supporting in the future are LOCALLY (with declarations),
   ;; MACROLET, SYMBOL-MACROLET and THE.
-  ;; Also, if (FLET ((F () ...)) (DEFUN A () ...) (DEFUN B () ...))
-  ;; were handled, then it would probably automatically work in
-  ;; the cold loader too, providing definitions for A and B before
-  ;; executing all other toplevel forms.
   (flet ((expand (form)
            (if expand
                (handler-case
@@ -188,20 +184,12 @@
             (let ((function (car form)))
               ;; Certain known functions have a special way of checking
               ;; their fopcompilability in the cross-compiler.
-              (or ;; allow %DEFUN, also ensuring that any inline lambda gets
-                  ;; its constant structures (possibly containing COMMAs) noted
-                  ;; as dumpable literals.
-                  (and (eq function 'sb-impl::%defun) (fopcompilable-p (fourth form)))
-                  (member function '(sb-pcl::!trivial-defmethod
+              (or (member function '(sb-pcl::!trivial-defmethod
                                      sb-kernel::%defstruct
                                      sb-thread:make-mutex))
                   ;; allow DEF{CONSTANT,PARAMETER} only if the value form is ok
-                  (and (member function '(%defconstant sb-impl::%defparameter))
+                  (and (member function '(sb-impl::%defconstant sb-impl::%defparameter))
                        (fopcompilable-p (third form)))
-                  (and (symbolp function) ; no ((lambda ...) ...)
-                       (get-properties (symbol-plist function)
-                                       '(:sb-cold-funcall-handler/for-effect
-                                         :sb-cold-funcall-handler/for-value)))
                   (and (eq function 'setf)
                        (fopcompilable-p (%macroexpand form *lexenv*)))
                   (and (eq function 'sb-kernel:%svset)
@@ -257,13 +245,25 @@
 ;;; containing pointers; similarly (COMPLEX RATIONAL) and RATIO.
 (defun dumpable-leaflike-p (obj)
   (or (sb-xc:typep obj '(or symbol number character unboxed-array
-                            debug-name-marker
+                            system-area-pointer
                             #+sb-simd-pack simd-pack
                             #+sb-simd-pack-256 simd-pack-256))
+      (cl:typep obj 'debug-name-marker)
+      ;; STANDARD-OBJECT layouts use MAKE-LOAD-FORM, but all other layouts
+      ;; have the same status as symbols - composite objects but leaflike.
+      (and (typep obj 'wrapper) (not (layout-for-pcl-obj-p obj)))
+      ;; PACKAGEs are also leaflike.
+      (cl:typep obj 'package)
       ;; The cross-compiler wants to dump CTYPE instances as leaves,
       ;; but CLASSOIDs are excluded since they have a MAKE-LOAD-FORM method.
       #+sb-xc-host (cl:typep obj '(and ctype (not classoid)))
-      (sb-fasl:dumpable-layout-p obj)))
+      ;; FIXME: The target compiler wants to dump NAMED-TYPE instances,
+      ;; or maybe it doesn't, but we're forgetting to OPAQUELY-QUOTE them.
+      ;; For the moment I've worked around this with a backward-compatibility
+      ;; hack in FIND-CONSTANT which causes anonymous uses of #<named-type t>
+      ;; to be dumped as *UNIVERSAL-TYPE*.
+      ;; #+sb-xc (named-type-p obj)
+      ))
 
 ;;; Check that a literal form is fopcompilable. It would not be, for example,
 ;;; when the form contains structures with funny MAKE-LOAD-FORMS.
@@ -360,7 +360,7 @@
                        ;; Lexical
                        (let* ((var (cdr (assoc form (lexenv-vars *lexenv*))))
                               (handle (and (lambda-var-p var)
-                                           (lambda-var-fop-value var))))
+                                           (leaf-info var))))
                          (cond (handle
                                 (setf (lambda-var-ever-used var) t)
                                 (when for-value-p
@@ -450,7 +450,7 @@
                                (let* ((obj (sb-fasl::dump-pop fasl))
                                       (var (make-lambda-var
                                             :%source-name name
-                                            :fop-value obj)))
+                                            :info obj)))
                                  (push var vars)
                                  (setf *lexenv*
                                        (make-lexenv
@@ -463,7 +463,7 @@
                                   (*compiler-error-context*
                                     (make-compiler-error-context
                                      :original-form form
-                                     :file-name (file-info-name file-info)
+                                     :file-name (file-info-truename file-info)
                                      :initialized t
                                      :file-position
                                      (nth-value 1 (find-source-root tlf *source-info*))

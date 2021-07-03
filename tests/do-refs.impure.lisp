@@ -4,17 +4,19 @@
 ;;;; While most of SBCL is derived from the CMU CL system, the test
 ;;;; files (like this one) were written from scratch after the fork
 ;;;; from CMU CL.
-;;;
+;;;;
 ;;;; This software is in the public domain and is provided with
 ;;;; absoluely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
 (in-package sb-vm)
 
-(defun collect-slot-values (obj)
-  (collect ((slots))
+(defun collect-slot-values (obj &aux result)
+  (flet ((slots (x)
+           #+metaspace (if (typep x 'sb-vm:layout) (setq x (sb-kernel::layout-friend x)))
+           (push x result)))
     (do-referenced-object (obj slots))
-    (slots)))
+    (nreverse result)))
 
 (defun walk-slots-test (obj expect)
   (assert (equal (collect-slot-values obj) expect)))
@@ -64,18 +66,21 @@
                                         :key 'widetag-of :test #'/=)))))))
 
 (test-util:with-test (:name :walk-slots-fdefn)
-  (walk-slots-test*
-   (sb-kernel::find-fdefn 'constantly-t)
-   (lambda (slots)
-     #+immobile-code
-     (and (= (length slots) 3)
-          (symbolp (first slots))
-          (closurep (second slots))
-          (code-component-p (third slots)))
-     #-immobile-code
-     (and (= (length slots) 2)
-          (symbolp (first slots))
-          (closurep (second slots))))))
+  (let* ((closure (funcall (compile nil '(lambda (x)  (lambda () x))) t))
+         (symbol (gensym)))
+    (setf (fdefinition symbol) closure)
+    (walk-slots-test*
+     (sb-kernel::find-fdefn symbol)
+     (lambda (slots)
+       #+immobile-code
+       (and (= (length slots) 3)
+            (symbolp (first slots))
+            (closurep (second slots))
+            (code-component-p (third slots)))
+       #-immobile-code
+       (and (= (length slots) 2)
+            (symbolp (first slots))
+            (closurep (second slots)))))))
 
 (defclass mystdinst ()
   ((a :initform 1) (b :initform 2)
@@ -86,24 +91,37 @@
     (walk-slots-test* o
                       (lambda (slots)
                         (destructuring-bind (layout clos-slots) slots
-                          (and (eq layout (%instance-layout o))
+                          (and (eq layout (%instance-wrapper o))
                                (eq clos-slots (sb-pcl::std-instance-slots o))))))))
 
 (define-condition cfoo (simple-condition) ((a :initarg :a) (b :initarg :b) (c :initform 'c)))
 (test-util:with-test (:name :walk-slots-condition-instance)
   (let ((instance (make-condition 'cfoo :a 'ay :b 'bee :format-arguments "wat")))
     (walk-slots-test instance
-                     `(,(find-layout 'cfoo)
-                       (c c format-control nil)
+                     `(,(find-layout 'cfoo) (c c format-control nil)
                        :a  ay :b bee :format-arguments "wat"))))
+
+(defun make-random-funinstance (&rest values)
+  (let* ((ctor (apply #'sb-pcl::%make-ctor values))
+         (wrapper (sb-kernel:%fun-wrapper ctor)))
+    ;; If the number of payload words is even, then there's a padding word
+    ;; because adding the header makes the unaligned total an odd number.
+    ;; Fill that padding word with something - it should not be visible.
+    ;; Whether GC should trace the word is a different question,
+    ;; on whose correct answer I waver back and forth.
+    (when (evenp (sb-kernel:get-closure-length ctor)) ; payload length
+      (let ((max (reduce #'max (sb-kernel:dd-slots (sb-kernel:wrapper-dd wrapper))
+                         :key 'sb-kernel:dsd-index)))
+        (setf (sb-kernel:%funcallable-instance-info ctor (1+ max))
+              (elt sb-vm:+static-symbols+ 0))))
+    ;; stuff in a random function as the implementation
+    (setf (sb-kernel:%funcallable-instance-fun ctor) #'error)
+    ctor))
+(compile 'make-random-funinstance)
 
 (test-util:with-test (:name :walk-slots-pcl-ctor)
   (let* ((slot-vals '("A" "B" "C" "D" "E" "F"))
-         (f (apply (compile nil '(lambda (&rest args)
-                                  (let ((ctor (apply #'sb-pcl::%make-ctor args)))
-                                    (setf (%funcallable-instance-fun ctor) #'error)
-                                    ctor)))
-                   slot-vals)))
+         (f (apply #'make-random-funinstance slot-vals)))
     (walk-slots-test f `(,(find-layout 'sb-pcl::ctor) ,#'error ,@slot-vals))))
 
 #+sb-fasteval
@@ -113,9 +131,9 @@
     (funcall f 1 2 3) ; compute the digested slots
     (walk-slots-test* f
                       (lambda (slots)
-                        (destructuring-bind (layout fin-fun a b c d) slots
+                        (destructuring-bind (type fin-fun a b c d) slots
                           (declare (ignore a b c))
-                          (and (typep layout 'layout)
+                          (and (typep type 'wrapper)
                                (typep fin-fun 'closure)
                                (typep d '(and integer (not (eql 0))))))))))
 
@@ -129,7 +147,7 @@
 (defun deep-size (obj &optional (leafp (lambda (x)
                                          (typep x '(or package symbol fdefn
                                                        function code-component
-                                                       layout classoid)))))
+                                                       wrapper classoid)))))
   (let ((worklist (list obj))
         (seen (make-hash-table :test 'eq))
         (tot-bytes 0))

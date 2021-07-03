@@ -23,8 +23,7 @@
 (defconstant extended-symbol-size (1+ symbol-size))
 
 #+sb-thread
-(dolist (slot (primitive-object-slots
-               (find 'thread *primitive-objects* :key #'primitive-object-name)))
+(dovector (slot (primitive-object-slots (primitive-object 'thread)))
   (when (slot-special slot)
     (setf (info :variable :wired-tls (slot-special slot))
           (ash (slot-offset slot) word-shift))))
@@ -63,10 +62,9 @@
     ;; The sizer is short_boxed.
     (closure ,(or #+(or x86 x86-64) "closure" "short_boxed") "lose" "short_boxed")
     ;; Like closure, but these can also have a layout pointer in the high header bytes.
-    (funcallable-instance ,(or #+compact-instance-header "funinstance" "short_boxed")
-                          "lose" "short_boxed")
+    (funcallable-instance "funinstance" "lose" "short_boxed")
     ;; These have a scav and trans function, but no size function.
-    #-(or x86 x86-64) (return-pc "return_pc_header" "return_pc_header" "lose")
+    #-(or x86 x86-64 arm64) (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
     (symbol "tiny_boxed")
@@ -85,7 +83,7 @@
     #+sb-simd-pack-256 (simd-pack-256 "unboxed")
     (filler "unboxed")
 
-    (simple-array "boxed")
+    (simple-array "array")
     (simple-array-unsigned-byte-2 "vector_unsigned_byte_2")
     (simple-array-unsigned-byte-4 "vector_unsigned_byte_4")
     (simple-array-unsigned-byte-7 "vector_unsigned_byte_8")
@@ -112,21 +110,23 @@
     (simple-array-complex-double-float "vector_unsigned_byte_128")
 
     (simple-bit-vector "vector_bit")
-    (simple-vector "vector")
+    (simple-vector "vector_t")
 
     (simple-array-nil "vector_nil")
     (simple-base-string "base_string")
-    #+sb-unicode (simple-character-string "character_string")
-    #+sb-unicode (complex-character-string "boxed")
-    (complex-base-string "boxed")
-    (complex-vector-nil "boxed")
+    ;; UB32 works fine for character string, unless we decide to reimplement
+    ;; using 3 octets per code point.
+    #+sb-unicode (simple-character-string "vector_unsigned_byte_32")
+    #+sb-unicode (complex-character-string "array")
+    (complex-base-string "array")
 
-    (complex-bit-vector "boxed")
-    (complex-vector "boxed")
-    (complex-array "boxed"))))
+    (complex-bit-vector "array")
+    (complex-vector "array")
+    (complex-array "array"))))
 
 #+sb-xc-host
 (defun write-gc-tables (stream)
+  (format stream "#include \"lispobj.h\"~%")
   ;; Compute a bitmask of all specialized vector types,
   ;; not including array headers, for maybe_adjust_large_object().
   (let ((min #xff) (bits 0))
@@ -135,14 +135,14 @@
         (let ((widetag (saetp-typecode saetp)))
           (setf min (min widetag min)
                 bits (logior bits (ash 1 (ash widetag -2)))))))
-    (format stream "static inline boolean specialized_vector_widetag_p(unsigned char widetag) {
+    (format stream "static inline int specialized_vector_widetag_p(unsigned char widetag) {
   return widetag>=0x~X && (0x~8,'0XU >> ((widetag-0x80)>>2)) & 1;~%}~%"
             min (ldb (byte 32 32) bits))
     ;; Union in the bits for other unboxed object types.
     (dolist (entry *scav/trans/size*)
       (when (string= (second entry) "unboxed")
         (setf bits (logior bits (ash 1 (ash (car entry) -2))))))
-    (format stream "static inline boolean leaf_obj_widetag_p(unsigned char widetag) {~%")
+    (format stream "static inline int leaf_obj_widetag_p(unsigned char widetag) {~%")
     #+64-bit (format stream "  return (0x~XLU >> (widetag>>2)) & 1;" bits)
     #-64-bit (format stream "  int bit = widetag>>2;
   return (bit<32 ? 0x~XU >> bit : 0x~XU >> (bit-32)) & 1;"

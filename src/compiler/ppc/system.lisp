@@ -48,6 +48,33 @@
 
     DONE))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional)
+  ;; "extra" info in conditional vops follows the 2 super-magical info args
+  (:info target not-p test-layout)
+  (:temporary (:scs (non-descriptor-reg)) this-id that-id)
+  (:generator 4
+    (let ((test-id (layout-id test-layout))
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (inst lwz this-id x offset)
+      ;; Always prefer 'cmpwi' if compiling to memory.
+      ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
+      (cond ((or (typep test-id '(and (signed-byte 8) (not (eql 0))))
+                 (and (not (sb-c::producing-fasl-file))
+                      (typep test-id '(signed-byte 16))))
+             (inst cmpwi this-id test-id))
+            (t
+             (inst lwz that-id code-tn
+                   (register-inline-constant `(:layout-id . ,test-layout) :word))
+             (inst cmpw this-id that-id))))
+    (inst b? (if not-p :ne :eq) target)))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -57,8 +84,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -259,3 +286,11 @@
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:temporary (:sc unsigned-reg) tmp)
+ (:generator 4
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index tmp)))

@@ -11,93 +11,40 @@
 
 (in-package "SB-THREAD")
 
-;;; N.B.: If you alter this definition, then you need to verify that FOP-FUNCALL
-;;; in genesis can properly emulate MAKE-MUTEX for the altered structure,
-;;; or even better, make sure that genesis can emulate any constructor,
-;;; provided that it is sufficiently trivial.
-(defstruct (mutex (:constructor make-mutex (&key name))
-                  (:copier nil))
-  "Mutex type."
-  ;; C code could (but doesn't currently) access the name
-  #+(and sb-thread sb-futex)
-  (state    0 :type fixnum)
-  ;; If adding slots between STATE and NAME, please see futex_name() in linux_os.c
-  ;; which attempts to divine a string from a futex word address.
-  (name   nil :type (or null simple-string))
-  (%owner nil :type (or null thread)))
-
-(defstruct (thread (:constructor %make-thread (&key name %alive-p %ephemeral-p))
-                   (:copier nil))
-  "Thread type. Do not rely on threads being structs as it may change
-in future versions."
-  (name          nil :type (or null simple-string)) ; C code could read this
-  (%alive-p      nil :type boolean)
-  (%ephemeral-p  nil :type boolean :read-only t)
-  ;; 0 is used on thread-less builds
-  (os-thread  (ldb (byte sb-vm:n-word-bits 0) -1) :type sb-vm:word)
-  ;; Keep a copy of CONTROL-STACK-END from the "primitive" thread (C memory).
-  ;; Reading that memory for any thread except *CURRENT-THREAD* is not safe
-  ;; due to possible unmapping on thread death. Technically this is a fixed amount
-  ;; below PRIMITIVE-THREAD, but the exact offset varies by build configuration.
-  (stack-end 0 :type sb-vm:word)
-  ;; Points to the SB-VM::THREAD primitive object.
-  ;; Yes, there are three different thread structures.
-  (primitive-thread 0 :type sb-vm:word)
-  (interruptions nil :type list)
-  ;; Gotta have half a dozen or more different ways to identify a thread.
-  #+linux (os-tid 0 :type (unsigned-byte 32))
-  ;; On succesful execution of the thread's lambda a list of values.
-  (result 0)
-  (interruptions-lock
-   (make-mutex :name "thread interruptions lock")
-   :type mutex :read-only t)
-  (result-lock
-   (make-mutex :name "thread result lock")
-   :type mutex :read-only t)
-  waiting-for)
-
 (declaim (inline thread-alive-p))
 (defun thread-alive-p (thread)
   "Return T if THREAD is still alive. Note that the return value is
 potentially stale even before the function returns, as the thread may exit at
 any time."
-  (thread-%alive-p thread))
+  (declare (ignorable thread))
+  (barrier (:read))
+  #+sb-thread (/= (thread-primitive-thread thread) 0)
+  #-sb-thread t)
 
-(sb-impl::define-thread-local *current-thread*
-      ;; This initform is magical - DEFINE-THREAD-LOCAL stuffs the initial
-      ;; value form into a SETQ in INIT-THREAD-LOCAL-STORAGE, and the name
-      ;; of its first and only argument is THREAD.
-      thread
+(setf (documentation '*current-thread* 'variable)
       "Bound in each thread to the thread itself.")
-(declaim (type thread *current-thread*))
-
-(defstruct (foreign-thread
-             (:copier nil)
-             (:include thread)
-             (:conc-name "THREAD-"))
-  "Type of native threads which are attached to the runtime as Lisp threads
-temporarily.")
-
-#+(and sb-safepoint-strictly (not win32))
-(defstruct (signal-handling-thread
-             (:copier nil)
-             (:include foreign-thread)
-             (:conc-name "THREAD-"))
-  "Asynchronous signal handling thread."
-  (signal-number nil :type integer))
-
-(declaim (sb-ext:freeze-type mutex thread))
 
 (defun mutex-value (mutex)
   "Current owner of the mutex, NIL if the mutex is free. May return a
 stale value, use MUTEX-OWNER instead."
   (mutex-%owner mutex))
 
+(declaim (inline holding-mutex-p))
 (defun holding-mutex-p (mutex)
   "Test whether the current thread is holding MUTEX."
   ;; This is about the only use for which a stale value of owner is
   ;; sufficient.
   (eq sb-thread:*current-thread* (mutex-%owner mutex)))
+
+(declaim (inline mutex-owner))
+(defun mutex-owner (mutex)
+  "Current owner of the mutex, NIL if the mutex is free. Naturally,
+this is racy by design (another thread may acquire the mutex after
+this function returns), it is intended for informative purposes. For
+testing whether the current thread is holding a mutex see
+HOLDING-MUTEX-P."
+  ;; Make sure to get the current value.
+  (sb-ext:compare-and-swap (mutex-%owner mutex) nil nil))
 
 (defsetf mutex-value set-mutex-value)
 
@@ -143,6 +90,10 @@ stale value, use MUTEX-OWNER instead."
           (function with-recursive-spinlock :replacement with-recursive-lock)
           (function with-spinlock :replacement with-mutex)))
 
+;;; Needed to pacify deadlock detection if inerrupting wait-for-mutex,
+;;; otherwise it would appear that if there is a lock grabbed inside
+;;; of BODY it would appear backwards--waiting on a lock while holding
+;;; the new one, which looks like a deadlock.
 (defmacro without-thread-waiting-for ((&key already-without-interrupts) &body body)
   (with-unique-names (thread prev)
     (let ((without (if already-without-interrupts
@@ -170,7 +121,7 @@ stale value, use MUTEX-OWNER instead."
                     (barrier (:write)))))
                (exec)))))))
 
-(defmacro with-mutex ((mutex &key (wait-p t) timeout value)
+(defmacro with-mutex ((mutex &key (wait-p t) timeout (value nil valuep))
                             &body body)
   "Acquire MUTEX for the dynamic scope of BODY. If WAIT-P is true (the default),
 and the MUTEX is not immediately available, sleep until it is available.
@@ -192,9 +143,20 @@ current thread."
      (call-with-mutex
       #'with-mutex-thunk
       ,mutex
-      ,value
       ,wait-p
-      ,timeout)))
+      ;; Users should not pass VALUE. If they do, the overhead of validity checking
+      ;; is at the call site so that normal invocations of CALL-WITH-MUTEX receive
+      ;; only the useful arguments.
+      ;; And as is true of so many macros, strict left-to-right evaluation of args
+      ;; is not promised, but let's try to be consistent with the order in the lambda list.
+      ;; (i.e. You don't know if the source form was ":value me :wait-p nil")
+      ,(if valuep
+           `(prog1 ,timeout
+              (let ((value ,value))
+                (unless (or (null value) (eq *current-thread* value))
+                  (error "~S called with non-nil :VALUE that isn't the current thread."
+                         'with-mutex))))
+           timeout))))
 
 (defmacro with-recursive-lock ((mutex &key (wait-p t) timeout) &body body)
   "Acquire MUTEX for the dynamic scope of BODY.
@@ -247,12 +209,9 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
 
 #-sb-thread
 (progn
-  (defun call-with-mutex (function mutex value waitp timeout)
+  (defun call-with-mutex (function mutex waitp timeout)
     (declare (ignore mutex waitp timeout)
              (function function))
-    (unless (or (null value) (eq *current-thread* value))
-      (error "~S called with non-nil :VALUE that isn't the current thread."
-             'with-mutex))
     (funcall function))
 
   (defun call-with-recursive-lock (function mutex waitp timeout)
@@ -267,12 +226,9 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
 
 #+sb-thread
 (progn
-  (defun call-with-mutex (function mutex value waitp timeout)
+  (defun call-with-mutex (function mutex waitp timeout)
     (declare (function function))
     (declare (dynamic-extent function))
-    (unless (or (null value) (eq *current-thread* value))
-      (error "~S called with non-nil :VALUE that isn't the current thread."
-             'with-mutex))
     (let ((got-it nil))
       (without-interrupts
         (unwind-protect
@@ -286,13 +242,13 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
   (defun call-with-recursive-lock (function mutex waitp timeout)
     (declare (function function))
     (declare (dynamic-extent function))
-    (let ((inner-lock-p (eq (mutex-%owner mutex) *current-thread*))
+    (let ((had-it (holding-mutex-p mutex))
           (got-it nil))
       (without-interrupts
         (unwind-protect
-             (when (or inner-lock-p (setf got-it (allow-with-interrupts
-                                                   (grab-mutex mutex :waitp waitp
-                                                                     :timeout timeout))))
+             (when (or had-it
+                       (setf got-it (allow-with-interrupts
+                                     (grab-mutex mutex :waitp waitp :timeout timeout))))
                (with-local-interrupts (funcall function)))
           (when got-it
             (release-mutex mutex))))))
@@ -301,11 +257,12 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
     (declare (function function))
     (declare (dynamic-extent function))
     (without-interrupts
-      (let ((inner-lock-p (eq *current-thread* (mutex-owner lock)))
+      (let ((had-it (holding-mutex-p lock))
             (got-it nil))
         (unwind-protect
-             (when (or inner-lock-p
-                       (setf got-it (grab-mutex lock)))
+             (when (or had-it (setf got-it (grab-mutex lock)))
                (funcall function))
           (when got-it
             (release-mutex lock)))))))
+
+(sb-ext:define-load-time-global *make-thread-lock* nil)

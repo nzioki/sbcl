@@ -54,7 +54,7 @@
   (define-gprs t *qword-regs* +qword-register-names+
     #("RAX" "RCX" "RDX" "RBX" "RSP" "RBP" "RSI" "RDI"
       "R8"  "R9"  "R10" "R11" "R12" "R13" "R14" "R15"))
-  (define-gprs t *dword-regs* +dword-register-names+
+  (define-gprs nil *dword-regs* +dword-register-names+
     #("EAX" "ECX" "EDX"  "EBX"  "ESP"  "EBP"  "ESI"  "EDI"
       "R8D" "R9D" "R10D" "R11D" "R12D" "R13D" "R14D" "R15D"))
   (define-gprs nil *word-regs* +word-register-names+
@@ -401,7 +401,7 @@
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
   (typecase value
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol ; Symbols in static and immobile space are immediate
@@ -424,9 +424,8 @@
 
                (static-symbol-p value))
        immediate-sc-number))
-    #+immobile-space
-    (layout
-       immediate-sc-number)
+    #+metaspace (sb-vm:layout (bug "Can't reference layout as a constant"))
+    #+(and immobile-space (not metaspace)) (wrapper immediate-sc-number)
     (single-float
        (if (eql value $0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
     (double-float
@@ -463,8 +462,8 @@
           (symbol   (if (static-symbol-p val)
                         (+ nil-value (static-symbol-offset val))
                         (make-fixup val :immobile-symbol)))
-          #+immobile-space
-          (layout
+          #+(and immobile-space (not metaspace))
+          (wrapper
            (make-fixup val :layout))
           (character (if tag
                          (logior (ash (char-code val) n-widetag-bits)
@@ -542,4 +541,7 @@
       (t
        (values :default nil)))))
 
-(defparameter *register-names* +qword-register-names+)
+(defvar *register-names* +qword-register-names+)
+
+(defmacro unbound-marker-bits ()
+  (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag))

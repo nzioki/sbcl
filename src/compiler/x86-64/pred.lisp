@@ -36,29 +36,45 @@
 
 (define-vop (branch-if)
   (:info dest not-p flags)
+  (:vop-var vop)
   (:generator 0
+    (when (cdr flags)
+      ;; Specifying multiple flags is an extremely confusing convention that supports
+      ;; floating-point inequality tests utilizing the flag register in an unusual way,
+      ;; as documented in the COMISS and COMISD instructions:
+      ;; "the ZF, PF, and CF flags in the EFLAGS register according
+      ;;  to the result (unordered, greater than, less than, or equal)"
+      ;; I think it would have been better if, instead of allowing more than one flag,
+      ;; we passed in a pseudo-condition code such as ':sf<=' and deferred to this vop
+      ;; to interpret the abstract condition in terms of how to CPU sets the bits
+      ;; in those particular instructions.
+      ;; Note that other architectures allow only 1 flag in branch-if, if it works at all.
+      ;; Enable this assertion if you need to sanity-check the preceding claim.
+      ;; There's really no "dynamic" reason for it to fail.
+      #+nil
+      (aver (memq (vop-name (sb-c::vop-prev vop))
+                  '(<single-float <double-float <=single-float <=double-float
+                    >single-float >double-float >=single-float >=double-float
+                    =/single-float =/double-float))))
      (when (eq (car flags) 'not)
        (pop flags)
        (setf not-p (not not-p)))
-     (flet ((negate-condition (name)
-              (let ((code (logxor 1 (conditional-opcode name))))
-                (aref +condition-name-vec+ code))))
-       (cond ((null (rest flags))
+     (cond ((null (rest flags))
               (inst jmp
                     (if not-p
                         (negate-condition (first flags))
                         (first flags))
                     dest))
-             (not-p
+           (not-p
               (let ((not-lab (gen-label))
                     (last    (car (last flags))))
                 (dolist (flag (butlast flags))
                   (inst jmp flag not-lab))
                 (inst jmp (negate-condition last) dest)
                 (emit-label not-lab)))
-             (t
+           (t
               (dolist (flag flags)
-                (inst jmp flag dest)))))))
+                (inst jmp flag dest))))))
 
 (define-vop (multiway-branch-if-eq)
   ;; TODO: also accept signed-reg, unsigned-reg, character-reg
@@ -187,10 +203,7 @@
   (:generator 0
      (let ((not-p (eq (first flags) 'not)))
        (when not-p (pop flags))
-       (flet ((negate-condition (name)
-                (let ((code (logxor 1 (conditional-opcode name))))
-                  (aref +condition-name-vec+ code)))
-              (load-immediate (dst constant-tn
+       (flet ((load-immediate (dst constant-tn
                                &optional (sc (sc-name (tn-sc dst))))
                 ;; Can't use ZEROIZE, since XOR will affect the flags.
                 (inst mov dst
@@ -254,6 +267,80 @@
   #+sb-unicode
   (def-move-if move-if/char character character-reg character-stack)
   (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
+
+;;; Return a hint about how to calculate the answer from X,Y and flags.
+;;; Return NIL to give up.
+(defun computable-from-flags-p (res x y flags)
+  ;; TODO: handle unsigned-reg
+  (unless (and (singleton-p flags)
+               (sc-is res sb-vm::any-reg sb-vm::descriptor-reg))
+    (return-from computable-from-flags-p nil))
+  ;; There are plenty more algebraic transforms possible,
+  ;; but this picks off some very common cases.
+  (flet ((try-shift (x y)
+           (and (eql x 0)
+                (typep y '(and fixnum unsigned-byte))
+                (= (logcount y) 1)
+                'shl))
+         (try-add (x y) ; commutative
+           ;; (signed-byte 32) is gonna work for sure.
+           ;; Other things might too, but "perfect is the enemy of good".
+           ;; The constant in LEA is pre-fixnumized.
+           ;; Post-fixnumizing instead would open up a few more possibilities.
+           (and (fixnump x)
+                (fixnump y)
+                (typep (fixnumize x) '(signed-byte 32))
+                (typep (fixnumize y) '(signed-byte 32))
+                (member (abs (fixnumize (- x y))) '(2 4 8))
+                'add)))
+    (or #+sb-thread (or (and (eq x t) (eq y nil) 'boolean)
+                        (and (eq x nil) (eq y t) 'boolean))
+        (try-shift x y)
+        (try-shift y x)
+        (try-add x y))))
+
+(define-vop (compute-from-flags)
+  (:args (x-tn :scs (immediate constant))
+         (y-tn :scs (immediate constant)))
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:info flags)
+  (:generator 3
+    (let* ((x (tn-value x-tn))
+           (y (tn-value y-tn))
+           (hint (computable-from-flags-p res x y flags))
+           (flag (car flags)))
+      (ecase hint
+        (boolean
+         ;; FIXNUMP -> {T,NIL} could be special-cased, reducing the instruction count by
+         ;; 1 or 2 depending on whether the argument and result are in the same register.
+         ;; Best case would be "AND :dword res, arg, 1 ; MOV res, [ea]".
+         (when (eql x t)
+           ;; T is at the lower address, so to pick it out we need index=0
+           ;; which makes the condition in (IF BIT T NIL) often flipped.
+           (setq flag (negate-condition flag)))
+         (inst set flag res)
+         (inst movzx '(:byte :dword) res res)
+         (inst mov :dword res
+               (ea (ash thread-t-nil-constants-slot word-shift) thread-base-tn res 4)))
+        (shl
+         (when (eql x 0)
+           (setq flag (negate-condition flag)))
+         (let ((bit (1- (integer-length (fixnumize (logior x y))))))
+           (inst set flag res)
+           (inst movzx '(:byte :dword) res res)
+           (inst shl (if (> bit 31) :qword :dword) res bit)))
+        (add
+         (let* ((x (fixnumize x))
+                (y (fixnumize y))
+                (min (min x y))
+                (delta (abs (- x y)))
+                (ea (ea min nil res delta)))
+           (when (eql x min)
+             (setq flag (negate-condition flag)))
+           (inst set flag res)
+           (inst movzx '(:byte :dword) res res)
+           ;; Retain bit 63... if either is negative
+           (inst lea (if (or (minusp x) (minusp y)) :qword :dword) res ea)))))))
 
 ;;;; conditional VOPs
 
@@ -341,32 +428,6 @@
                 (ash (+ slot instance-slots-offset) word-shift))
              instance)
          (encode-value-if-immediate x))))
-
-(define-vop (fixnump-instance-ref)
-  (:args (instance :scs (descriptor-reg)))
-  (:arg-types * (:constant (unsigned-byte 16)))
-  (:info slot)
-  (:translate fixnump-instance-ref)
-  (:conditional :e)
-  (:policy :fast-safe)
-  (:generator 1
-   (inst test :byte
-         (ea (+ (- instance-pointer-lowtag)
-                (ash (+ slot instance-slots-offset) word-shift))
-             instance)
-         fixnum-tag-mask)))
-(macrolet ((def-fixnump-cxr (name index)
-             `(define-vop (,name)
-                (:args (x :scs (descriptor-reg)))
-                (:translate ,name)
-                (:conditional :e)
-                (:policy :fast-safe)
-                (:generator 1
-                 (inst test :byte
-                       (ea (- (ash ,index word-shift) list-pointer-lowtag) x)
-                       fixnum-tag-mask)))))
-  (def-fixnump-cxr fixnump-car cons-car-slot)
-  (def-fixnump-cxr fixnump-cdr cons-cdr-slot))
 
 ;;; See comment below about ASSUMPTIONS
 (eval-when (:compile-toplevel)

@@ -88,16 +88,6 @@ will be signalled when the core is saved -- this is orthogonal from DONT-SAVE."
           (dlopen-or-lose obj))
         (setf *shared-objects* (append (remove obj *shared-objects*)
                                        (list obj)))
-        ;; FIXME: Why doesn't the linkage table work on Windows? (Or maybe it
-        ;; does and this can be just #+linkage-table?) Note: remember to change
-        ;; FOREIGN-DEINIT as well then!
-        ;;
-        ;; Kovalenko 2010-11-24: I think so. Alien _data_ references
-        ;; are the only thing on win32 that is even slightly
-        ;; problematic. Handle function references in the same way as
-        ;; other linkage-table platforms is easy.
-        ;;
-        #+linkage-table
         (when (or old (cdr *linkage-info*))
           ;; If OLD is non-NIL, then we're passing "true" which causes all foreign
           ;; symbols to get looked up again. Otherwise we're passing "false"
@@ -116,9 +106,8 @@ Experimental."
                        :key #'shared-object-pathname
                        :test #'equal)))
         (when old
-          #-hpux (dlclose-or-lose old)
+          (dlclose-or-lose old)
           (setf *shared-objects* (remove old *shared-objects*))
-          #+linkage-table
           (update-linkage-table t)
           ;; Return T for unloaded, vs whatever update-linkage-info returns
           t)))))
@@ -168,32 +157,8 @@ Experimental."
 (defun close-shared-objects ()
   (let (saved)
     (dolist (obj (reverse *shared-objects*))
-      #-hpux (dlclose-or-lose obj)
+      (dlclose-or-lose obj)
       (unless (shared-object-dont-save obj)
         (push obj saved)))
     (setf *shared-objects* saved))
-  #-hpux
   (dlclose-or-lose))
-
-;;; This table is unsynchronized, but the only platforms that use it
-;;; lack thread support, and they don't work anyway.
-#-linkage-table
-(let ((symbols (make-hash-table :test #'equal)))
-  (defun ensure-dynamic-foreign-symbol-address (symbol &optional datap)
-    "Returns the address of the foreign symbol as an integer. On linkage-table
-ports if the symbols isn't found a special guard address is returned instead,
-accesses to which will result in an UNDEFINED-ALIEN-ERROR. On other ports an
-error is immediately signalled if the symbol isn't found. The returned address
-is never in the linkage-table."
-    (declare (ignorable datap))
-    (let ((addr (find-dynamic-foreign-symbol-address symbol)))
-      (cond  ((not addr)
-              (error 'undefined-alien-error :name symbol))
-             (t
-              (setf (gethash symbol symbols) t)
-              addr))))
-  (defun dynamic-foreign-symbols-p ()
-    (plusp (hash-table-count symbols)))
-  (defun list-dynamic-foreign-symbols ()
-    (loop for symbol being each hash-key in symbols
-          collect symbol)))

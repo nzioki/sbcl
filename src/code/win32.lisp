@@ -146,9 +146,11 @@
                         handle))
         (t
          (with-alien ((avail dword))
-
-           (unless (zerop (peek-named-pipe handle nil 0 nil (addr avail) nil))
-             (return-from handle-listen (plusp avail))))
+           (let* ((res (peek-named-pipe handle nil 0 nil (addr avail) nil))
+                  (code (get-last-error)))
+             (cond
+               ((not (zerop res)) (return-from handle-listen (plusp avail)))
+               ((= code error-broken-pipe) (return-from handle-listen t)))))
          (let ((res (socket-input-available handle)))
            (unless (zerop res)
              (return-from handle-listen (= res 1))))
@@ -343,7 +345,7 @@
 ;;;; Process time information
 
 (defconstant 100ns-per-internal-time-unit
-  (/ 10000000 sb-xc:internal-time-units-per-second))
+  (/ 10000000 internal-time-units-per-second))
 
 ;; FILETIME
 ;; The FILETIME structure is a 64-bit value representing the number of
@@ -376,6 +378,12 @@
                (addr ,kernel-time)
                (addr ,user-time))))
 
+#+64-bit
+(progn
+  (defun reinit-internal-real-time () nil)
+  (defun get-internal-real-time ()
+    (alien-funcall (extern-alien "get_monotonic_time" (function unsigned)))))
+#-64-bit
 (let ((epoch 0))
   (declare (unsigned-byte epoch))
   ;; FIXME: For optimization ideas see the unix implementation.
@@ -427,7 +435,6 @@
 (defconstant +filetime-unit+ 10000000)
 (defconstant +common-lisp-epoch-filetime-seconds+ 9435484800)
 
-#-sb-fluid
 (declaim (inline get-time-of-day))
 (defun get-time-of-day ()
   "Return the number of seconds and microseconds since the beginning of the
@@ -889,7 +896,7 @@ absense."
 
 (defun windows-pipe ()
   (multiple-value-bind (created read-handle write-handle)
-      (create-pipe nil 256)
+      (create-pipe nil 0)
     (if created (values read-handle write-handle)
         (win32-error 'create-pipe))))
 

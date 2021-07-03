@@ -32,30 +32,25 @@
          (list* (car options) (cadr options)
                 (remove-keywords (cddr options) keywords)))))
 
-(defstruct (prim-object-slot
-             (:constructor make-slot (name rest-p offset special options))
-             (:copier nil)
-             (:conc-name slot-))
-  (name nil :type symbol :read-only t)
-  (rest-p nil :type (member t nil) :read-only t)
-  (offset 0 :type fixnum :read-only t)
-  (options nil :type list :read-only t)
-  ;; On some targets (e.g. x86-64) slots of the thread structure are
-  ;; referenced as special variables, this slot holds the name of that variable.
-  (special nil :type symbol :read-only t))
-
 (defstruct (primitive-object (:copier nil))
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
-  (options nil :type list :read-only t)
-  (slots nil :type list :read-only t)
   (length 0 :type fixnum :read-only t)
-  (variable-length-p nil :type (member t nil) :read-only t))
+  (variable-length-p nil :type boolean :read-only t)
+  (slots #() :type vector :read-only t))
 
-(declaim (freeze-type prim-object-slot primitive-object))
+(defun slot-offset (slot) (car slot))
+(defun slot-name (slot) (cadr slot))
+(defun slot-special (slot) (getf (cddr slot) :special))
+
+(declaim (freeze-type primitive-object))
 
 (define-load-time-global *primitive-objects* nil)
+(defun primitive-object (name)
+  (find name *primitive-objects* :key #'primitive-object-name))
+(defun primitive-object-slot (obj name)
+  (find name (primitive-object-slots obj):key #'slot-name))
 
 (defun !%define-primitive-object (primobj)
   (let ((name (primitive-object-name primobj)))
@@ -88,25 +83,16 @@
                        pointer
                        &allow-other-keys)
             (if (atom spec) (list spec) spec)
-          #-alpha
           (declare (ignorable pointer))
-          #+alpha
-          (when pointer
-            ;; Pointer values on ALPHA are 64 bits wide, and
-            ;; double-word aligned.  We may also wish to have such a
-            ;; mode for other 64-bit hardware outside of any defined
-            ;; 32-on-64 ABI (which would presumably have 32-bit
-            ;; pointers in the first place, obviating the alignment
-            ;; and size requirements).
-            (unless rest-p
-              (setf length 2))
-            (when (oddp offset)
-              (incf offset)))
-          (slots `(make-slot ',slot-name ,rest-p ,offset ',special
-                             ',(remove-keywords options '(:rest-p :length))))
+          (slots (list* offset slot-name
+                        (remove-keywords
+                         options
+                         `(#+sb-xc :c-type :rest-p ,@(if (= length 1) '(:length))))))
           (let ((offset-sym (symbolicate name "-" slot-name
                                          (if rest-p "-OFFSET" "-SLOT"))))
-            (constants `(defconstant ,offset-sym ,offset))
+            (constants
+             `(progn (defconstant ,offset-sym ,offset)
+                     (setf (info :variable :kind ',offset-sym) :constant)))
             (when special
               (specials `(progn
                            (defvar ,special)
@@ -152,7 +138,7 @@
             (make-primitive-object :name ',name
                                    :widetag ',widetag
                                    :lowtag ',lowtag
-                                   :slots (list ,@(slots))
+                                   :slots ,(coerce (slots) 'vector)
                                    :length ,offset
                                    :variable-length-p ,variable-length-p))
          ,@(constants)
@@ -194,8 +180,8 @@
 (deftype sc-offset () `(integer 0 (,sc-offset-limit)))
 
 (defconstant finite-sc-offset-limit
-  #-(or sparc alpha hppa) 32
-  #+(or sparc alpha hppa) 64)
+  #-(or sparc) 32
+  #+(or sparc) 64)
 (defconstant finite-sc-offset-bits
   (integer-length (1- finite-sc-offset-limit)))
 (deftype finite-sc-offset () `(integer 0 (,finite-sc-offset-limit)))

@@ -25,8 +25,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -39,13 +37,6 @@
 
 int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
-#ifdef LISP_FEATURE_SB_THREAD
-#ifdef LISP_FEATURE_GCC_TLS
-    current_thread = thread;
-#else
-    pthread_setspecific(specials,thread);
-#endif
-#endif
     /* Signal handlers are normally run on the main stack, but we've
      * swapped stacks, require that the control stack contain only
      * boxed data, and expands upwards while the C stack expands

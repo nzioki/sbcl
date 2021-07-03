@@ -19,6 +19,15 @@
 (when (eq sb-ext:*evaluator-mode* :interpret)
   (sb-ext:exit :code 104))
 
+#+(or x86 x86-64)
+(with-test (:name :legal-bpt-lra-object)
+  (sb-int:binding* ((code (sb-kernel:fun-code-header #'read))
+                    (sap (sb-sys:sap+ (sb-kernel:code-instructions code) 13)) ; random
+                    ((bpt-sap bpt-code-obj) (sb-di::make-bpt-lra sap)))
+    (declare (ignore bpt-sap))
+    ;; This was causing heap corruption
+    (assert (zerop (sb-kernel:code-jump-table-words bpt-code-obj)))))
+
 
 ;;;; Check that we get debug arglists right.
 
@@ -99,7 +108,7 @@
 ;;; bug 379
 (with-test (:name (trace :encapsulate nil)
             :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on (or :hppa :freebsd))
+            :broken-on (or :freebsd))
   (let ((output (with-traced-function (trace-this :encapsulate nil)
                   (assert (eq 'ok (trace-this))))))
     (assert (search "TRACE-THIS" output))
@@ -107,7 +116,7 @@
 
 (with-test (:name (trace :encapsulate nil :recursive)
             :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on (or :hppa :freebsd))
+            :broken-on (or :freebsd))
   (let ((output (with-traced-function (trace-fact :encapsulate nil)
                   (assert (= 120 (trace-fact 5))))))
     (assert (search "TRACE-FACT" output))
@@ -441,7 +450,8 @@
 
 (with-test (:name (:print-frame-call :respect *debug-print-variable-alist*
                    *print-length* :bug-1261646))
-  (let* ((printed (print-backtrace-to-string/debug-print-variable-alist (make-array 200)))
+  (let* ((printed (print-backtrace-to-string/debug-print-variable-alist
+                   (make-array 200 :initial-element 0)))
          (call "(PRINT-BACKTRACE-TO-STRING/DEBUG-PRINT-VARIABLE-ALIST ")
          (position (+ (search call printed) (length call))))
     (assert (eql position (search "#(0 0 0 0 0 ...)" printed :start2 position)))))
@@ -654,14 +664,14 @@
     (assert (= count 1))))
 
 (with-test (:name :properly-tagged-p-internal
-            :fails-on (not (or :x86 :x86-64)))
+            :fails-on (not (or :x86 :x86-64 :arm64)))
   ;; Pick a code component that has a ton of restarts.
   (let* ((code (sb-kernel:fun-code-header #'sb-impl::update-package-with-variance))
          (n (sb-kernel:code-n-entries code)))
     (sb-sys:with-pinned-objects (code)
       (let* ((base (logandc2 (sb-kernel:get-lisp-obj-address code)
                              sb-vm:lowtag-mask))
-             (limit (+ base (sb-vm::primitive-object-size code))))
+             (limit (+ base (sb-ext:primitive-object-size code))))
         (flet ((properly-tagged-p (ptr)
                  (eql (alien-funcall (extern-alien "properly_tagged_p_internal"
                                                    (function int unsigned unsigned))
@@ -700,3 +710,9 @@
           (assert (= (file-length fasl1) (file-length fasl2)))
           (loop repeat (file-length fasl1)
                 do (assert (= (read-byte fasl1) (read-byte fasl2)))))))))
+
+;; lp#1901781
+(defun ll-unknown (x y) (declare (optimize (debug 0))) (+ x y))
+(compile 'll-unknown)
+(with-test (:name :unknown-lambda-list)
+  (assert (eq (sb-kernel:%fun-lambda-list #'ll-unknown) :unknown)))

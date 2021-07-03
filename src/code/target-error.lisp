@@ -12,6 +12,22 @@
 
 (in-package "SB-KERNEL")
 
+(defun decode-internal-error-args (sap trap-number &optional error-number)
+  (let ((error-number (cond (error-number)
+                            ((>= trap-number sb-vm:error-trap)
+                             (prog1
+                                 (- trap-number sb-vm:error-trap)
+                               (setf trap-number sb-vm:error-trap)))
+                            (t
+                             (prog1 (sap-ref-8 sap 0)
+                               (setf sap (sap+ sap 1)))))))
+    (let ((length (error-length error-number)))
+      (declare (type (unsigned-byte 8) length))
+      (values error-number
+              (loop repeat length with index = 0
+                    collect (sb-c:sap-read-var-integerf sap index))
+              trap-number))))
+
 (defun muffle-warning-p (warning)
   (declare (special *muffled-warnings*))
   (typep warning *muffled-warnings*))
@@ -30,19 +46,6 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-
-(defun !target-error-cold-init ()
-  ;; Anonymous lambdas are too complicated to dump as constants in genesis.
-  ;; (that's sad, I wish we could do something about it)
-  (setq **initial-handler-clusters**
-        `(((,(find-classoid-cell 'warning :create t)
-            .
-            ,(named-lambda "MAYBE-MUFFLE" (warning)
-               (when (muffle-warning-p warning)
-                 (muffle-warning warning))))
-           (,(find-classoid-cell 'step-condition)
-            .
-            sb-impl::invoke-stepper)))))
 
 (defmethod print-object ((restart restart) stream)
   (if *print-escape*
@@ -296,7 +299,7 @@ with that condition (or with no condition) will be returned."
   (error 'case-failure
          :name 'etypecase
          :datum value
-         :expected-type `(or ,@keys)
+         :expected-type (if (symbolp keys) keys `(or ,@keys))
          :possibilities keys))
 
 (defun ecase-failure (value keys)

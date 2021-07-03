@@ -204,7 +204,7 @@
                     (,body-name))))
              (t
               (let ((*circularity-hash-table* (make-hash-table :test 'eq)))
-                (output-object ,object (make-broadcast-stream))
+                (output-object ,object *null-broadcast-stream*)
                 (let ((*circularity-counter* 0))
                   (let ((,marker (check-for-circularity ,object t
                                                         :logical-block)))

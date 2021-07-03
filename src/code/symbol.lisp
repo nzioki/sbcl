@@ -88,7 +88,7 @@ distinct from the global value. Can also be SETF."
       (return-from compute-symbol-hash (sxhash nil)))
   ;; And make a symbol's hash not the same as (sxhash name) in general.
   (let ((sxhash (logxor (%sxhash-simple-substring string 0 length)
-                        sb-xc:most-positive-fixnum)))
+                        most-positive-fixnum)))
     ;; The low 32 bits of the word in memory should have at least a 1 bit somewhere.
     ;; If not, OR in a constant value.
     (if (ldb-test (byte (- 32 sb-vm:n-fixnum-tag-bits) 0) sxhash)
@@ -204,12 +204,11 @@ distinct from the global value. Can also be SETF."
 
 (defun symbol-plist (symbol)
   "Return SYMBOL's property list."
-  #+(vop-translates cl:symbol-plist)
-  (symbol-plist symbol)
-  #-(vop-translates cl:symbol-plist)
-  (let ((list (car (truly-the list (symbol-info symbol))))) ; a white lie
-    ;; Just ensure the result is not a fixnum, and we're done.
-    (if (fixnump list) nil list)))
+  (if (sb-c::vop-existsp :translate cl:symbol-plist)
+      (symbol-plist symbol)
+      (let ((list (car (truly-the list (symbol-info symbol))))) ; a harmless lie
+        ;; Just ensure the result is not a fixnum, and we're done.
+        (if (fixnump list) nil list))))
 
 (declaim (ftype (sfunction (symbol t) cons) %ensure-plist-holder)
          (inline %ensure-plist-holder))
@@ -330,7 +329,7 @@ distinct from the global value. Can also be SETF."
 #+immobile-space
 (defun %make-symbol (kind name)
   (declare (ignorable kind) (type simple-string name))
-  (set-header-data name sb-vm:+vector-shareable+) ; Set "logically read-only" bit
+  (logior-header-bits name sb-vm:+vector-shareable+) ; Set "logically read-only" bit
   (if #-immobile-symbols
       (or (eql kind 1) ; keyword
           (and (eql kind 2) ; random interned symbol

@@ -44,16 +44,6 @@
     (dolist (form (cdr d))
       (when (and (consp form) (eq (car form) name))
         (return-from get-declaration (cdr form))))))
-
-(defmacro dolist-carefully ((var list improper-list-handler) &body body)
-  `(let ((,var nil)
-         (.dolist-carefully. ,list))
-     (loop (when (null .dolist-carefully.) (return nil))
-           (if (consp .dolist-carefully.)
-               (progn
-                 (setq ,var (pop .dolist-carefully.))
-                 ,@body)
-               (,improper-list-handler)))))
 
 ;;;; FIND-CLASS
 ;;;;
@@ -181,12 +171,3 @@
       (if bind-object
           `(let ,bind-object ,form)
           form))))
-
-(defmacro function-funcall (form &rest args)
-  `(funcall (the function ,form) ,@args))
-
-(defmacro function-apply (form &rest args)
-  `(apply (the function ,form) ,@args))
-
-(defun get-setf-fun-name (name)
-  `(setf ,name))

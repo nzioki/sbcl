@@ -35,7 +35,7 @@
         (let* ((2comp (component-info component))
                (constants (ir2-component-constants 2comp)))
           (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
-      (* sb-vm:n-word-bytes 4)))
+      (* sb-vm:n-word-bytes 4))) ; FIXME: what is 4 ?
 
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
@@ -125,19 +125,23 @@
 ;;; to get handles (as returned by sb-vm:inline-constant-value) from constant
 ;;; descriptors.
 ;;;
-#+(or x86 x86-64 arm64 ppc ppc64)
+#+(or arm64 mips ppc ppc64 x86 x86-64)
 (defun register-inline-constant (&rest constant-descriptor)
-  (declare (dynamic-extent constant-descriptor))
+  ;; N.B.: Please do not think yourself so clever as to declare DYNAMIC-EXTENT on
+  ;; CONSTANT-DESCRIPTOR. Giving the list indefinite extent allows backends to simply
+  ;; return it as the key to the hash-table in the most trivial possible implementation.
+  ;; The cost of listifying a &REST arg is unnoticeable here.
   (let ((asmstream *asmstream*)
         (constant (sb-vm:canonicalize-inline-constant constant-descriptor)))
-    (ensure-gethash
-     constant
-     (asmstream-constant-table asmstream)
-     (multiple-value-bind (label value) (sb-vm:inline-constant-value constant)
-       (vector-push-extend (cons constant label)
-                           (asmstream-constant-vector asmstream))
-       value))))
-#-(or x86 x86-64 arm64 ppc ppc64)
+    (values ; kill the second value
+     (ensure-gethash
+      constant
+      (asmstream-constant-table asmstream)
+      (multiple-value-bind (label value) (sb-vm:inline-constant-value constant)
+        (vector-push-extend (cons constant label)
+                            (asmstream-constant-vector asmstream))
+        value)))))
+#-(or arm64 mips ppc ppc64 x86 x86-64)
 (progn (defun sb-vm:sort-inline-constants (constants) constants)
        (defun sb-vm:emit-inline-constant (&rest args)
          (error "EMIT-INLINE-CONSTANT called with ~S" args)))
@@ -264,17 +268,43 @@
 (defglobal *static-vop-usage-counts* nil)
 (defparameter *do-instcombine-pass* t)
 
-(defun generate-code (component)
+(defun generate-code (component &aux (ir2-component (component-info component)))
+  (declare (type ir2-component ir2-component))
   (when *compiler-trace-output*
     (format *compiler-trace-output*
             "~|~%assembly code for ~S~2%"
             component))
   (let* ((prev-env nil)
+         ;; The first function's alignment word is zero-filled, but subsequent
+         ;; ones can use a NOP which helps the disassembler not lose sync.
+         (filler-pattern 0)
          (asmstream (make-asmstream))
+         (coverage-map)
          (*asmstream* asmstream))
 
+    (declare (ignorable coverage-map))
     (emit (asmstream-elsewhere-section asmstream)
           (asmstream-elsewhere-label asmstream))
+
+    #-(or x86 x86-64)
+    (let ((path->index (make-hash-table :test 'equal)))
+      ;; Pre-scan for MARK-COVERED vops and collect the set of
+      ;; distinct source paths that occur. Delay adding the coverage map to
+      ;; the boxed constant vector until all vop generators have run, because
+      ;; they can use EMIT-CONSTANT to add more constants,
+      ;; while the coverage map has to be the very last entry in the vector.
+      (do-ir2-blocks (block component)
+        (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+            ((null vop))
+          (when (eq (vop-name vop) 'mark-covered)
+            (setf (vop-codegen-info vop)
+                  (list (ensure-gethash (car (vop-codegen-info vop))
+                                        path->index
+                                        (hash-table-count path->index)))))))
+      (when (plusp (hash-table-count path->index))
+        (setf coverage-map (make-array (hash-table-count path->index)))
+        (maphash (lambda (path index) (setf (aref coverage-map index) path))
+                 path->index)))
 
     (do-ir2-blocks (block component)
       (let ((1block (ir2-block-block block)))
@@ -294,7 +324,8 @@
                                        (not (loop-info cloop)))
                               ;; Mark the loop as aligned by saving the IR1 block aligned.
                               (setf (loop-info cloop) 1block)
-                              t))))
+                              filler-pattern))))
+              (setf filler-pattern :long-nop)
               (emit-block-header (block-label 1block)
                                  (ir2-block-%trampoline-label block)
                                  (ir2-block-dropped-thru-to block)
@@ -310,7 +341,7 @@
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
           (awhen *static-vop-usage-counts*
-            (let ((name (vop-info-name (vop-info vop))))
+            (let ((name (vop-name vop)))
               (incf (gethash name it 0))))
           (assemble (:code vop)
             (cond ((not gen)
@@ -331,28 +362,43 @@
       #+x86-64
       (sb-assem::combine-instructions (asmstream-code-section asmstream)))
 
+    (emit (asmstream-data-section asmstream)
+          (sb-assem::asmstream-data-origin-label asmstream))
     ;; Jump tables precede the coverage mark bytes to simplify locating
     ;; them in trans_code().
     (emit-jump-tables)
     ;; Todo: can we implement the flow-based aspect of coverage mark compression
     ;; in IR2 instead of waiting until assembly generation?
-    (coverage-mark-lowering-pass component asmstream)
+    #+(or x86 x86-64) (coverage-mark-lowering-pass component asmstream)
+    #-(or x86 x86-64)
+    (when coverage-map
+      #+arm64
+      (vector-push-extend (make-constant (make-array (length coverage-map)
+                                                     :element-type '(unsigned-byte 8)
+                                                     :initial-element #xFF))
+                          (ir2-component-constants ir2-component))
+      (vector-push-extend (make-constant (cons 'coverage-map coverage-map))
+                          (ir2-component-constants ir2-component))
+      ;; The mark vop can store the low byte from either ZERO-TN or NULLL-TN
+      ;; to avoid loading a constant. Either one won't match #xff.
+      #-arm64
+      (emit (asmstream-data-section asmstream)
+            `(.skip ,(length coverage-map) #xff)))
+
     (emit-inline-constants)
 
-    (let* ((info (component-info component))
-           (simple-fun-labels
-            (mapcar #'entry-info-offset (ir2-component-entries info)))
-           (n-boxed (length (ir2-component-constants info)))
+    (let* ((n-boxed (length (ir2-component-constants ir2-component)))
            ;; Skew is either 0 or N-WORD-BYTES depending on whether the boxed
            ;; header length is even or odd
            (skew (if (and (= code-boxed-words-align 1) (oddp n-boxed))
                      sb-vm:n-word-bytes
                      0)))
       (multiple-value-bind (segment text-length fixup-notes fun-table)
-          (assemble-sections asmstream
-                             simple-fun-labels
-                             (make-segment :header-skew skew
-                                           :run-scheduler (default-segment-run-scheduler)))
+          (assemble-sections
+           asmstream
+           (mapcar #'entry-info-offset (ir2-component-entries ir2-component))
+           (make-segment :header-skew skew
+                         :run-scheduler (default-segment-run-scheduler)))
         (values segment text-length fun-table
                 (asmstream-elsewhere-label asmstream) fixup-notes)))))
 

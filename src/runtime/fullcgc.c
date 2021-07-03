@@ -207,6 +207,16 @@ void __mark_obj(lispobj pointer)
             if (header & markbit) return; // already marked
             *base |= markbit;
         }
+#ifdef LISP_FEATURE_UBSAN
+        if (specialized_vector_widetag_p(widetag) && is_lisp_pointer(base[1]))
+            gc_mark_obj(base[1]);
+        else if (widetag == SIMPLE_VECTOR_WIDETAG && fixnump(base[1])) {
+            char *origin_pc = (char*)(base[1]>>4);
+            lispobj* code = component_ptr_from_pc(origin_pc);
+            if (code) gc_mark_obj(make_lispobj(code, OTHER_POINTER_LOWTAG));
+            /* else lose("can't find code containing %p (vector=%p)", origin_pc, base); */
+        }
+#endif
         if (leaf_obj_widetag_p(widetag)) return;
     } else {
         uword_t key = compute_page_key(pointer);
@@ -244,56 +254,64 @@ void gc_mark_range(lispobj* where, long count) {
 #define HT_ENTRY_LIVENESS_FUN_ARRAY_NAME alivep_funs
 #include "weak-hash-pred.inc"
 
+static void trace_using_layout(lispobj layout, lispobj* where, int nslots)
+{
+    // Apart from the allowance for untagged pointers in lockfree list nodes,
+    // this contains almost none of the special cases that gencgc does.
+    if (!layout) return;
+#ifdef LISP_FEATURE_METASPACE
+    gc_mark_obj(LAYOUT(layout)->friend);
+#else
+    gc_mark_obj(layout);
+#endif
+    if (lockfree_list_node_layout_p(LAYOUT(layout))) { // allow untagged 'next'
+        struct instance* node = (struct instance*)where;
+        lispobj next = node->slots[INSTANCE_DATA_START];
+        // ignore if 0
+        if (fixnump(next) && next) __mark_obj(next|INSTANCE_POINTER_LOWTAG);
+    }
+    struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+    int i;
+    lispobj* slots = where+1;
+    for (i=0; i<nslots; ++i)
+        if (bitmap_logbitp(i, bitmap) && is_lisp_pointer(slots[i]))
+            __mark_obj(slots[i]);
+}
+
 static void trace_object(lispobj* where)
 {
     lispobj header = *where;
     int widetag = header_widetag(header);
+
+    switch (widetag) {
+    case INSTANCE_WIDETAG:
+        return trace_using_layout(instance_layout(where),
+                                  where, instance_length(header));
+    case FUNCALLABLE_INSTANCE_WIDETAG:
+        return trace_using_layout(funinstance_layout(where),
+                                  where, HeaderValue(header) & SHORT_HEADER_MAX_WORDS);
+    }
     sword_t scan_from = 1;
     sword_t scan_to = sizetab[widetag](where);
     sword_t i;
     struct weak_pointer *weakptr;
-    lispobj layout, bitmap;
-
-    /* If the C compiler emits this switch as a jump table, order doesn't matter.
-     * But if as consecutive tests, instance and vector should be tested first
-     * as they are the most freequent */
     switch (widetag) {
-    case INSTANCE_WIDETAG:
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-    /* No need to deal with FINs for non-compact header, because the layout
-       pointer isn't in the header word, the trampoline pointer can only point
-       to readonly space, and all slots are tagged. */
-    case FUNCALLABLE_INSTANCE_WIDETAG:
-        layout = instance_layout(where);
-        gc_mark_obj(layout);
-#else
-        layout = instance_layout(where); // will be marked as where[1]
-#endif
-        if (!layout) break; // fall into general case
-        // mixed boxed/unboxed objects
-        bitmap = LAYOUT(layout)->bitmap;
-        // If no raw slots, just scan without use of the bitmap.
-        // A bitmap of -1 implies that not only are all slots tagged,
-        // there is no special GC method for any slot.
-        if (bitmap == make_fixnum(-1)) break;
-        // Otherwise, the first slot might merit special treatment.
-        if (lockfree_list_node_layout_p(LAYOUT(layout))) {
-            struct instance* node = (struct instance*)where;
-            lispobj next = node->slots[INSTANCE_DATA_START];
-            if (fixnump(next) && next) // ignore initially 0 heap words
-                __mark_obj(next|INSTANCE_POINTER_LOWTAG);
-        }
-        for(i=1; i<scan_to; ++i)
-            if (layout_bitmap_logbitp(i-1, bitmap) && is_lisp_pointer(where[i]))
-                __mark_obj(where[i]);
-        return; // do not scan slots
     case SIMPLE_VECTOR_WIDETAG:
+#ifdef LISP_FEATURE_UBSAN
+        if (is_lisp_pointer(where[1])) gc_mark_obj(where[1]);
+#endif
         // non-weak hashtable kv vectors are trivial in fullcgc. Keys don't move
         // so the table will not need rehash as a result of gc.
-        if ((vector_subtype(header) & ~subtype_VectorAddrHashing)
-            == subtype_VectorHashing + subtype_VectorWeak) { // weak table
+        // Ergo, those may be treated just like ordinary simple vectors.
+        // However, weakness remains as a special case.
+        if (vector_flagp(header, VectorWeak)) {
+            if (!vector_flagp(header, VectorHashing)) {
+                add_to_weak_vector_list(where, header);
+                return;
+            }
+            // Ok, we're looking at a weak hash-table.
             struct vector* v = (struct vector*)where;
-            lispobj lhash_table = v->data[fixnum_value(v->length)-1];
+            lispobj lhash_table = v->data[vector_len(v)-1];
             gc_dcheck(instancep(lhash_table));
             __mark_obj(lhash_table);
             struct hash_table* hash_table
@@ -313,10 +331,6 @@ static void trace_object(lispobj* where)
             }
             return;
         }
-        if (is_vector_subtype(header, VectorWeak)) {
-            add_to_weak_vector_list(where, header);
-            return;
-        }
         break;
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     /* on x86[-64], closure->fun is a fixnum-qua-pointer. Convert it to a lisp
@@ -330,7 +344,8 @@ static void trace_object(lispobj* where)
         scan_to = code_header_words((struct code*)where);
 #ifdef LISP_FEATURE_UNTAGGED_FDEFNS
         struct code* code = (struct code*)where;
-        lispobj* fdefns_start = code->constants + code_n_funs(code) * 4;
+        lispobj* fdefns_start = code->constants
+                                + code_n_funs(code) * CODE_SLOTS_PER_SIMPLE_FUN;
         lispobj* fdefns_end  = fdefns_start + code_n_named_calls(code);
         lispobj* limit = where + scan_to;
         where = where + scan_from;
@@ -387,13 +402,22 @@ void execute_full_mark_phase()
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
-    lispobj* where = (lispobj*)STATIC_SPACE_START;
+    lispobj* where = (lispobj*)STATIC_SPACE_OBJECTS_START;
     lispobj* end = static_space_free_pointer;
     while (where < end) {
         lispobj obj = compute_lispobj(where);
         gc_enqueue(obj);
         where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
+#ifdef LISP_FEATURE_METASPACE
+    where = (lispobj*)METASPACE_START;
+    end = (lispobj*)READ_ONLY_SPACE_END;
+    while (where < end) {
+        lispobj obj = compute_lispobj(where);
+        gc_enqueue(obj);
+        where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
+    }
+#endif
     do {
         lispobj ptr = gc_dequeue();
         gc_dcheck(ptr != 0);
@@ -437,7 +461,7 @@ static void local_smash_weak_pointers()
         struct vector* vector = (struct vector*)vectors->car;
         vectors = (struct cons*)vectors->cdr;
         UNSET_WEAK_VECTOR_VISITED(vector);
-        sword_t len = fixnum_value(vector->length);
+        sword_t len = vector_len(vector);
         sword_t i;
         for (i = 0; i<len; ++i) {
             lispobj obj = vector->data[i];
@@ -485,7 +509,7 @@ static void sweep_fixedobj_pages(long *zeroed)
         int obj_spacing = fixedobj_page_obj_align(page);
         if (!obj_spacing)
             continue;
-        int nwords = fixedobj_page_obj_size(page);
+        int nwords = obj_spacing >> WORD_SHIFT;
         lispobj *limit = (lispobj*)((char*)obj + IMMOBILE_CARD_BYTES - obj_spacing);
         for ( ; obj <= limit ; obj = (lispobj*)((char*)obj + obj_spacing) ) {
             lispobj header = *obj;
@@ -498,6 +522,15 @@ static void sweep_fixedobj_pages(long *zeroed)
                              memset(obj, 0, nwords * N_WORD_BYTES));
             }
         }
+    }
+    // The reserved fixedobj page has the vector of primitive object layouts.
+    lispobj* obj = fixedobj_page_address(0);
+    lispobj* limit = fixedobj_page_address(FIXEDOBJ_RESERVED_PAGES);
+    while (obj < limit) {
+        lispobj header = *obj;
+        uword_t markbit = (header_widetag(header) == FDEFN_WIDETAG) ? FDEFN_MARK_BIT : MARK_BIT;
+        if (header & markbit) *obj = header ^ markbit;
+        obj += sizetab[widetag_of(obj)](obj);
     }
 }
 #endif

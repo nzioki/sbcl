@@ -625,7 +625,8 @@
             (emit-d-form-inst segment opcode rt ra
                               (+ (component-header-length)
                                  (segment-header-skew segment)
-                                 (label-position si))))))
+                                 (label-position si)
+                                 (- sb-vm::code-tn-lowtag))))))
         (t
          (when (typep si 'fixup)
            (note-fixup segment :l si)
@@ -2369,16 +2370,80 @@
 (defun sort-inline-constants (constants)
   (stable-sort constants #'> :key (lambda (x) (align-of (car x)))))
 
+(sb-assem::%def-inst-encoder
+ '.layout-id
+ (lambda (segment layout)
+   (sb-c:note-fixup segment :layout-id (sb-c:make-fixup layout :layout-id))
+   (sb-assem::%emit-skip segment 4)))
+
 (defun emit-inline-constant (section constant label)
   (let ((size (align-of constant)))
     (emit section
           `(.align ,(integer-length (1- size)))
           label
-          (if (eq (car constant) :jump-table)
-              `(.lispword ,@(coerce (cdr constant) 'list))
-              (let* ((val (cdr constant))
-                     (bytes (loop repeat size
-                                  collect (prog1 (ldb (byte 8 0) val)
-                                            (setf val (ash val -8))))))
-                #+big-endian (setq bytes (nreverse bytes))
-                `(.byte ,@bytes))))))
+          (cond ((eq (car constant) :jump-table)
+                 `(.lispword ,@(coerce (cdr constant) 'list)))
+                ((typep (cdr constant) '(cons (eql :layout-id)))
+                 `(.layout-id ,(cddr constant)))
+                (t
+                 (let* ((val (cdr constant))
+                        (bytes (loop repeat size
+                                     collect (prog1 (ldb (byte 8 0) val)
+                                               (setf val (ash val -8))))))
+                   #+big-endian (setq bytes (nreverse bytes))
+                   `(.byte ,@bytes)))))))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset) (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  (let ((sap (code-instructions code)))
+    (ecase kind
+      (:absolute
+       ;; There is an implicit addend currently stored in the fixup location.
+       (incf (sap-ref-32 sap offset) value))
+      (:absolute64
+       (incf (sap-ref-64 sap offset) value))
+      (:layout-id
+       (aver (zerop (sap-ref-32 sap offset)))
+       (setf (signed-sap-ref-32 sap offset) (the layout-id value)))
+      (:b
+       (error "Can't deal with CALL fixups, yet."))
+      (:ba
+       (setf (ldb (byte 24 2) (sap-ref-32 sap offset)) (ash value -2)))
+      (:ha
+       (let* ((h (ldb (byte 16 16) value))
+              (l (ldb (byte 16 0) value)))
+          ; Compensate for possible sign-extension when the low half
+          ; is added to the high.  We could avoid this by ORI-ing
+          ; the low half in 32-bit absolute loads, but it'd be
+          ; nice to be able to do:
+          ;  lis rX,foo@ha
+          ;  lwz rY,foo@l(rX)
+          ; and lwz/stw and friends all use a signed 16-bit offset.
+          (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
+                 (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
+      (:l
+       (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
+             (ldb (byte 16 0) value)))))
+  nil)
+
+(define-instruction store-coverage-mark (segment path-index temp)
+  (:emitter
+   ;; No backpatch is needed to compute the offset into the code header
+   ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   (let ((offset (+ (component-header-length)
+                    n-word-bytes ; skip over jump table word
+                    path-index
+                    (- code-tn-lowtag))))
+     (inst* segment 'stb sb-vm::null-tn sb-vm::code-tn
+            (etypecase offset
+              ((unsigned-byte 15) offset)
+              ((unsigned-byte 31)
+               ;; This is redundant with the logic in %LR, but unfortunately
+               ;; %LR does not take a SEGMENT argument.
+               ;; We could probably do this whole sequence in just 2 instructions-
+               ;; an "ADDIS LIP, CODE, something" and a STB using LIP as the base.
+               (inst* segment 'lis temp (ldb (byte 15 16) offset))
+               (inst* segment 'ori temp (ldb (byte 16 16) offset))
+               temp))))))

@@ -482,9 +482,9 @@
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :target r
+  (:temporary (:sc unsigned-reg :offset rax-offset :target r
                    :from (:argument 0) :to :result) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset
+  (:temporary (:sc unsigned-reg :offset rdx-offset
                    :from :eval :to :result) edx)
   (:ignore edx)
   (:results (r :scs (unsigned-reg)))
@@ -502,9 +502,9 @@
   (:args (x :scs (unsigned-reg) :target eax))
   (:info y)
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
-  (:temporary (:sc unsigned-reg :offset eax-offset :target r
+  (:temporary (:sc unsigned-reg :offset rax-offset :target r
                    :from (:argument 0) :to :result) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset
+  (:temporary (:sc unsigned-reg :offset rdx-offset
                    :from :eval :to :result) edx)
   (:ignore edx)
   (:results (r :scs (unsigned-reg)))
@@ -524,9 +524,9 @@
          (y :scs (any-reg control-stack)))
   (:args-var args)
   (:arg-types tagged-num tagged-num)
-  (:temporary (:sc signed-reg :offset eax-offset :target quo
+  (:temporary (:sc signed-reg :offset rax-offset :target quo
                    :from (:argument 0) :to (:result 0)) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :target rem
+  (:temporary (:sc unsigned-reg :offset rdx-offset :target rem
                    :from (:argument 0) :to (:result 1)) edx)
   (:results (quo :scs (any-reg))
             (rem :scs (any-reg)))
@@ -556,9 +556,9 @@
   (:args (x :scs (any-reg) :target eax))
   (:info y)
   (:arg-types tagged-num (:constant fixnum))
-  (:temporary (:sc signed-reg :offset eax-offset :target quo
+  (:temporary (:sc signed-reg :offset rax-offset :target quo
                    :from :argument :to (:result 0)) eax)
-  (:temporary (:sc any-reg :offset edx-offset :target rem
+  (:temporary (:sc any-reg :offset rdx-offset :target rem
                    :from :eval :to (:result 1)) edx)
   (:temporary (:sc any-reg :from :eval :to :result) y-arg)
   (:results (quo :scs (any-reg))
@@ -585,9 +585,9 @@
          (y :scs (unsigned-reg signed-stack)))
   (:arg-types unsigned-num unsigned-num)
   (:args-var args)
-  (:temporary (:sc unsigned-reg :offset eax-offset :target quo
+  (:temporary (:sc unsigned-reg :offset rax-offset :target quo
                :from (:argument 0) :to (:result 0)) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :target rem
+  (:temporary (:sc unsigned-reg :offset rdx-offset :target rem
                    :from (:argument 0) :to (:result 1)) edx)
   (:results (quo :scs (unsigned-reg))
             (rem :scs (unsigned-reg)))
@@ -603,7 +603,7 @@
           (inst cmp y 0))
       (inst jmp :eq (generate-error-code vop 'division-by-zero-error x y)))
     (move eax x)
-    (inst xor edx edx)
+    (zeroize edx)
     (inst div eax y)
     (move quo eax)
     (move rem edx)))
@@ -613,9 +613,9 @@
   (:args (x :scs (unsigned-reg) :target eax))
   (:info y)
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
-  (:temporary (:sc unsigned-reg :offset eax-offset :target quo
+  (:temporary (:sc unsigned-reg :offset rax-offset :target quo
                    :from :argument :to (:result 0)) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :target rem
+  (:temporary (:sc unsigned-reg :offset rdx-offset :target rem
                    :from :eval :to (:result 1)) edx)
   (:temporary (:sc unsigned-reg :from :eval :to :result) y-arg)
   (:results (quo :scs (unsigned-reg))
@@ -626,7 +626,7 @@
   (:save-p :compute-only)
   (:generator 32
     (move eax x)
-    (inst xor edx edx)
+    (zeroize edx)
     (inst mov y-arg y)
     (inst div eax y-arg)
     (move quo eax)
@@ -638,9 +638,9 @@
          (y :scs (signed-reg signed-stack)))
   (:args-var args)
   (:arg-types signed-num signed-num)
-  (:temporary (:sc signed-reg :offset eax-offset :target quo
+  (:temporary (:sc signed-reg :offset rax-offset :target quo
                    :from (:argument 0) :to (:result 0)) eax)
-  (:temporary (:sc signed-reg :offset edx-offset :target rem
+  (:temporary (:sc signed-reg :offset rdx-offset :target rem
                    :from (:argument 0) :to (:result 1)) edx)
   (:results (quo :scs (signed-reg))
             (rem :scs (signed-reg)))
@@ -666,9 +666,9 @@
   (:args (x :scs (signed-reg) :target eax))
   (:info y)
   (:arg-types signed-num (:constant (signed-byte 64)))
-  (:temporary (:sc signed-reg :offset eax-offset :target quo
+  (:temporary (:sc signed-reg :offset rax-offset :target quo
                    :from :argument :to (:result 0)) eax)
-  (:temporary (:sc signed-reg :offset edx-offset :target rem
+  (:temporary (:sc signed-reg :offset rdx-offset :target rem
                    :from :eval :to (:result 1)) edx)
   (:temporary (:sc signed-reg :from :eval :to :result) y-arg)
   (:results (quo :scs (signed-reg))
@@ -742,7 +742,7 @@ constant shift greater than word length")))
                                     (location= number result))))
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types tagged-num positive-fixnum)
-  (:temporary (:sc unsigned-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (any-reg) :from (:argument 0)
                     :load-if (not (and (sc-is number control-stack)
                                        (sc-is result control-stack)
@@ -837,7 +837,7 @@ constant shift greater than word length")))
                                     (location= number result))))
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types signed-num positive-fixnum)
-  (:temporary (:sc unsigned-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (signed-reg) :from (:argument 0)
                     :load-if (not (and (sc-is number signed-stack)
                                        (sc-is result signed-stack)
@@ -858,7 +858,7 @@ constant shift greater than word length")))
                                     (location= number result))))
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types unsigned-num positive-fixnum)
-  (:temporary (:sc unsigned-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (unsigned-reg) :from (:argument 0)
                     :load-if (not (and (sc-is number unsigned-stack)
                                        (sc-is result unsigned-stack)
@@ -891,7 +891,7 @@ constant shift greater than word length")))
   (:arg-types signed-num signed-num)
   (:results (result :scs (signed-reg) :from (:argument 0)))
   (:result-types signed-num)
-  (:temporary (:sc signed-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:note "inline ASH")
   (:generator 5
     (move result number)
@@ -920,7 +920,7 @@ constant shift greater than word length")))
   (:arg-types unsigned-num signed-num)
   (:results (result :scs (unsigned-reg) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:temporary (:sc signed-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:note "inline ASH")
   (:generator 5
     (move result number)
@@ -1051,7 +1051,7 @@ constant shift greater than word length")))
   (:arg-types unsigned-num signed-num)
   (:results (result :scs (unsigned-reg) :from (:argument 0)))
   (:result-types unsigned-num)
-  (:temporary (:sc signed-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:temporary (:sc any-reg :from (:eval 0) :to (:eval 1)) zero)
   (:note "inline ASH")
   (:guard (member :cmov *backend-subfeatures*))
@@ -1180,41 +1180,35 @@ constant shift greater than word length")))
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
-  (:args (x :scs (any-reg)
-            :load-if (not (and (sc-is x control-stack)
-                               (sc-is y any-reg))))
+  (:args (x :scs (any-reg control-stack))
          (y :scs (any-reg control-stack)))
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison"))
 
 (define-vop (fast-conditional-c/fixnum fast-conditional/fixnum)
-  (:args (x :scs (any-reg) :load-if t))
+  (:args (x :scs (any-reg control-stack)))
   (:arg-types tagged-num (:constant fixnum))
   (:info y))
 
 (define-vop (fast-conditional/signed fast-conditional)
-  (:args (x :scs (signed-reg)
-            :load-if (not (and (sc-is x signed-stack)
-                               (sc-is y signed-reg))))
+  (:args (x :scs (signed-reg signed-stack))
          (y :scs (signed-reg signed-stack)))
   (:arg-types signed-num signed-num)
   (:note "inline (signed-byte 64) comparison"))
 
 (define-vop (fast-conditional-c/signed fast-conditional/signed)
-  (:args (x :scs (signed-reg) :load-if t))
+  (:args (x :scs (signed-reg signed-stack)))
   (:arg-types signed-num (:constant (signed-byte 64)))
   (:info y))
 
 (define-vop (fast-conditional/unsigned fast-conditional)
-  (:args (x :scs (unsigned-reg)
-            :load-if (not (and (sc-is x unsigned-stack)
-                               (sc-is y unsigned-reg))))
+  (:args (x :scs (unsigned-reg unsigned-stack))
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
   (:note "inline (unsigned-byte 64) comparison"))
 
 (define-vop (fast-conditional-c/unsigned fast-conditional/unsigned)
-  (:args (x :scs (unsigned-reg) :load-if t))
+  (:args (x :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
   (:info y))
 
@@ -1298,43 +1292,106 @@ constant shift greater than word length")))
                (inst test :byte `(,x . :high-byte) (ash y -8))
                (inst test size x y))))))
 
-;; Stolen liberally from the x86 32-bit implementation.
 (macrolet ((define-logtest-vops ()
              `(progn
                ,@(loop for suffix in '(/fixnum -c/fixnum
                                        /signed -c/signed
                                        /unsigned -c/unsigned)
-                       ;; FIXME: remove, after changing the ancestor vops
-                       ;; to not pessimize their allowable SCs
-                       for scs = (case (let ((s (string suffix)))
-                                         (intern (subseq s (1+ (position #\/ s)))))
-                                   (fixnum '(any-reg control-stack))
-                                   (signed '(signed-reg signed-stack))
-                                   (unsigned '(unsigned-reg unsigned-stack)))
-                       ;;
                        for cost in '(4 3 6 5 6 5)
                        collect
                        `(define-vop (,(symbolicate "FAST-LOGTEST" suffix)
                                      ,(symbolicate "FAST-CONDITIONAL" suffix))
                          (:translate logtest)
-                         ;; Simplify the lambda made by MAKE-GENERATOR-FUNCTION:
-                         ;; LOAD-IF can be NIL because the only alternate SCs to
-                         ;; register SCs are stack SCs. And since we're pretending
-                         ;; that the CPU can directly receive two stack operands,
-                         ;; loading would just check that each argument individually
-                         ;; is either in a register or on the stack - which it is -
-                         ;; and do nothing.
-                         (:args (x :scs ,scs :load-if nil)
-                                ,@(unless (search "-C/" (string suffix)) `((y :scs ,scs :load-if nil))))
-                         ;; This temp spec is just being cautious. TEMP-REG-TN is reserved
-                         (:temporary (:sc unsigned-reg :offset #.(tn-offset temp-reg-tn)) scratch)
-                         (:ignore scratch)
                          (:conditional :ne)
                          (:generator ,cost
                           (emit-optimized-test-inst x
                            ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)
                            nil)))))))
   (define-logtest-vops))
+
+;;; This works for tagged or untagged values, but the vop optimizer
+;;; has to pre-adjust Y if tagged.
+(define-vop (logtest-instance-ref fast-conditional)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant integer))
+  (:info y)
+  (:args-var arg-ref)
+  (:conditional :ne)
+  (:generator 1
+   (let ((disp (cdr (tn-ref-memory-access arg-ref))))
+     ;; Try as :BYTE, :WORD, :DWORD
+     (macrolet ((try (size bits)
+                  `(let ((disp disp) (y y) (mask ,(ldb (byte bits 0) -1)))
+                     (dotimes (i ,(/ 64 bits))
+                       (when (zerop (logandc2 y mask))
+                         (inst test ,size (ea disp x) (ash y (* i ,(- bits))))
+                         (return-from logtest-instance-ref))
+                       (setq mask (ash mask ,bits))
+                       (incf disp ,(/ bits 8))))))
+       (try :byte   8)
+       (try :word  16)
+       (try :dword 32))
+     (let ((val (ea disp x))
+           (y (constantize y)))
+       (cond ((integerp y)
+              (inst test :qword val y))
+             (t
+              (inst mov temp-reg-tn val)
+              (inst test :qword temp-reg-tn y)))))))
+
+;;; Try to absorb a memory load into LOGTEST.
+;;; This removes one instruction and possibly shortens the TEST by eliding
+;;; a REX prefix.
+(defoptimizer (sb-c::vop-optimize fast-logtest-c/fixnum) (vop)
+  (unless (tn-ref-memory-access (sb-c::vop-args vop))
+    (let ((prev (sb-c::previous-vop-is
+                 ;; TODO: missing data-vector-ref/simple-vector-c
+                 vop '(raw-instance-ref-c/signed-word
+                       raw-instance-ref-c/word
+                       instance-index-ref-c
+                       ;; This would only happen in unsafe code most likely,
+                       ;; because CAR,CDR, etc would need to cast/assert the loaded
+                       ;; value to fixnum. However, in practive it doesn't work anyway
+                       ;; because there seems to be a spurious MOVE vop in between
+                       ;; the SLOT and the FAST-LOGTEST-C/FIXNUM.
+                       ;; But ironically enough we _did_ seem to want to optimize
+                       ;; an expression in GENERATE-CODE along the lines of:
+                       ;;  (if (oddp (length (ir2-component-constants ir2-component))) ...)
+                       ;; which, if #+ubsan, would not be admissible
+                       ;; because VECTOR-LENGTH is not in a slot.
+                       ;; Obviously a GENERATE-CODE bug is the mother of all bugs.
+                       #-ubsan slot))))
+      (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
+      (when (and prev (eq (vop-block prev) (vop-block vop)))
+        (let ((arg (sb-c::vop-args vop)))
+          (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
+                     (sb-c::very-temporary-p (tn-ref-tn arg)))
+            (binding* ((mem-op (cons (vop-name prev) (vop-codegen-info prev)))
+                       (disp (valid-memref-byte-disp mem-op) :exit-if-null)
+                       (arg-ref
+                        (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
+                       (codegen-info
+                        (if (eq (vop-name vop) 'fast-logtest-c/fixnum)
+                            (list (fixnumize (car (vop-codegen-info vop))))
+                            (vop-codegen-info vop)))
+                       (new (sb-c::emit-and-insert-vop
+                             (sb-c::vop-node vop) (vop-block vop)
+                             (template-or-lose 'logtest-instance-ref)
+                             arg-ref nil prev codegen-info)))
+              (setf (tn-ref-memory-access arg-ref) `(:read . ,disp))
+              (sb-c::delete-vop prev)
+              (sb-c::delete-vop vop)
+              new)))))))
+(setf (sb-c::vop-info-optimizer (template-or-lose 'fast-logtest-c/signed))
+      #'vop-optimize-fast-logtest-c/fixnum-optimizer)
+(setf (sb-c::vop-info-optimizer (template-or-lose 'fast-logtest-c/unsigned))
+      #'vop-optimize-fast-logtest-c/fixnum-optimizer)
+
+;;; TODO: The TEST instruction preceding this JEQ is entirely superfluous
+;;; and can be removed with a vop optimizer:
+;;; E1:       25FE0F0000       AND EAX, 4094
+;;; E6:       4885C0           TEST RAX, RAX
+;;; E9:       74C9             JEQ L2
 
 ;;; %LOGBITP has the same argument order as ordinary LOGBITP which is * backwards *
 ;;; relative to every other architecture.
@@ -1407,23 +1464,14 @@ constant shift greater than word length")))
              `(progn
                 ,@(mapcar
                    (lambda (suffix cost signed)
-                     (let ((scs (case (let ((s (string suffix)))
-                                        (intern (subseq s (1+ (position #\/ s)))))
-                                  (fixnum '(any-reg control-stack))
-                                  (signed '(signed-reg signed-stack))
-                                  (unsigned '(unsigned-reg unsigned-stack)))))
                      `(define-vop (,(symbolicate "FAST-IF-" tran suffix)
                                    ,(symbolicate "FAST-CONDITIONAL"  suffix))
-                        (:args (x :scs ,scs :load-if nil)
-                               ,@(unless (search "-C/" (string suffix))
-                                   `((y :scs ,scs :load-if nil))))
                         (:translate ,tran)
                         (:conditional ,(if signed cond unsigned))
                         (:generator ,cost
                           (emit-optimized-cmp
-                           x ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y))))))
+                           x ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)))))
                    '(/fixnum -c/fixnum /signed -c/signed /unsigned -c/unsigned)
-;                  '(/fixnum  /signed  /unsigned)
                    '(4 3 6 5 6 5)
                    '(t t t t nil nil)))))
 
@@ -1494,29 +1542,19 @@ constant shift greater than word length")))
 
 (define-vop (fast-if-eql/signed fast-conditional/signed)
   (:translate eql %eql/integer)
-  (:generator 6
-    (inst cmp x y)))
+  (:generator 6 (emit-optimized-cmp x y)))
 
 (define-vop (fast-if-eql-c/signed fast-conditional-c/signed)
   (:translate eql %eql/integer)
-  (:generator 5
-    (cond ((and (sc-is x signed-reg) (zerop y))
-           (inst test x x))  ; smaller instruction
-          (t
-           (inst cmp x (constantize y))))))
+  (:generator 5 (emit-optimized-cmp x y)))
 
 (define-vop (fast-if-eql/unsigned fast-conditional/unsigned)
   (:translate eql %eql/integer)
-  (:generator 6
-    (inst cmp x y)))
+  (:generator 6 (emit-optimized-cmp x y)))
 
 (define-vop (fast-if-eql-c/unsigned fast-conditional-c/unsigned)
   (:translate eql %eql/integer)
-  (:generator 5
-    (cond ((and (sc-is x unsigned-reg) (zerop y))
-           (inst test x x))  ; smaller instruction
-          (t
-           (inst cmp x (constantize y))))))
+  (:generator 5 (emit-optimized-cmp x y)))
 
 ;;; EQL/FIXNUM is funny because the first arg can be of any type, not just a
 ;;; known fixnum.
@@ -1528,69 +1566,54 @@ constant shift greater than word length")))
 ;;; consing the argument.
 
 (define-vop (fast-eql/fixnum fast-conditional)
-  (:args (x :scs (any-reg)
-            :load-if (not (and (sc-is x control-stack)
-                               (sc-is y any-reg))))
+  (:args (x :scs (any-reg control-stack))
          (y :scs (any-reg control-stack)))
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison")
   (:translate eql %eql/integer)
-  (:generator 4
-    (inst cmp x y)))
+  (:generator 4 (emit-optimized-cmp x y)))
 
 (define-vop (generic-eql/fixnum fast-eql/fixnum)
-  (:args (x :scs (any-reg descriptor-reg)
-            :load-if (not (and (sc-is x control-stack)
-                               (sc-is y any-reg))))
+  (:args (x :scs (any-reg descriptor-reg control-stack))
          (y :scs (any-reg control-stack)))
   (:arg-types * tagged-num)
   (:variant-cost 7))
 
 (define-vop (fast-eql-c/fixnum fast-conditional-c/fixnum)
-  (:args (x :scs (any-reg) :load-if t))
+  (:args (x :scs (any-reg control-stack)))
   (:arg-types tagged-num (:constant fixnum))
   (:info y)
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eql %eql/integer)
-  (:generator 2
-    (cond ((and (sc-is x any-reg descriptor-reg) (zerop y))
-           (inst test x x))  ; smaller instruction
-          (t
-           (inst cmp x (constantize (fixnumize y)))))))
+  (:generator 2 (emit-optimized-cmp x (fixnumize y))))
 
+;;; FIXME: this seems never to be invoked any more. What did we either break or improve?
 (define-vop (generic-eql-c/fixnum fast-eql-c/fixnum)
-  (:args (x :scs (any-reg descriptor-reg) :load-if t))
+  (:args (x :scs (any-reg descriptor-reg control-stack)))
   (:arg-types * (:constant fixnum))
   (:variant-cost 6))
 
 ;;;; 64-bit logical operations
 
 ;;; Only the lower 6 bits of the shift amount are significant.
-(define-vop (shift-towards-someplace)
-  (:policy :fast-safe)
-  (:args (num :scs (unsigned-reg) :target r)
-         (amount :scs (signed-reg) :target ecx))
-  (:arg-types unsigned-num tagged-num)
-  (:temporary (:sc signed-reg :offset ecx-offset :from (:argument 1)) ecx)
-  (:results (r :scs (unsigned-reg) :from (:argument 0)))
-  (:result-types unsigned-num))
-
-(define-vop (shift-towards-start shift-towards-someplace)
-  (:translate shift-towards-start)
-  (:note "SHIFT-TOWARDS-START")
-  (:generator 1
-    (move r num)
-    (move ecx amount)
-    (inst shr r :cl)))
-
-(define-vop (shift-towards-end shift-towards-someplace)
-  (:translate shift-towards-end)
-  (:note "SHIFT-TOWARDS-END")
-  (:generator 1
-    (move r num)
-    (move ecx amount)
-    (inst shl r :cl)))
+(macrolet ((define (translate operation)
+             `(define-vop ()
+                (:translate ,translate)
+                (:note ,(string translate))
+                (:policy :fast-safe)
+                (:args (num :scs (unsigned-reg) :target r)
+                       (amount :scs (signed-reg) :target rcx))
+                (:arg-types unsigned-num tagged-num)
+                (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
+                (:results (r :scs (unsigned-reg) :from (:argument 0)))
+                (:result-types unsigned-num)
+                (:generator 1
+                 (move r num)
+                 (move rcx amount :dword)
+                 (inst ,operation r :cl)))))
+  (define shift-towards-start shr)
+  (define shift-towards-end   shl))
 
 ;;;; Modular functions
 
@@ -1829,7 +1852,7 @@ constant shift greater than word length")))
 
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
-(define-full-reffer+offset bignum-ref-with-offset * bignum-digits-offset
+(define-full-reffer+addend bignum-ref-with-offset * bignum-digits-offset
   other-pointer-lowtag (unsigned-reg) unsigned-num
   sb-bignum:%bignum-ref-with-offset)
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
@@ -1858,14 +1881,16 @@ constant shift greater than word length")))
   (:temporary (:sc any-reg :from (:argument 2) :to :eval) temp)
   (:results (result :scs (unsigned-reg) :from (:argument 0))
             (carry :scs (unsigned-reg)))
+  (:optional-results carry)
   (:result-types unsigned-num positive-fixnum)
   (:generator 4
     (move result a)
     (move temp c)
     (inst neg temp) ; Set the carry flag to 0 if c=0 else to 1
     (inst adc result b)
-    (inst set carry :c)
-    (inst and :dword carry 1)))
+    (unless (eq (tn-kind carry) :unused)
+     (inst set :c carry)
+     (inst and :dword carry 1))))
 
 ;;; Note: the borrow is 1 for no borrow and 0 for a borrow, the opposite
 ;;; of the x86-64 convention.
@@ -1878,14 +1903,15 @@ constant shift greater than word length")))
   (:arg-types unsigned-num unsigned-num positive-fixnum)
   (:results (result :scs (unsigned-reg) :from :eval)
             (borrow :scs (unsigned-reg)))
+  (:optional-results borrow)
   (:result-types unsigned-num positive-fixnum)
   (:generator 5
     (inst cmp c 1) ; Set the carry flag to 1 if c=0 else to 0
     (move result a)
     (inst sbb result b)
-    (inst mov borrow 1)
-    (inst sbb :dword borrow 0)))
-
+    (unless (eq (tn-kind borrow) :unused)
+     (inst mov borrow 1)
+     (inst sbb :dword borrow 0))))
 
 (define-vop (bignum-mult-and-add-3-arg)
   (:translate sb-bignum:%multiply-and-add)
@@ -1894,9 +1920,9 @@ constant shift greater than word length")))
          (y :scs (unsigned-reg unsigned-stack))
          (carry-in :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0)
+  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0)
                    :to (:result 1) :target lo) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 1)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 1)
                    :to (:result 0) :target hi) edx)
   (:results (hi :scs (unsigned-reg))
             (lo :scs (unsigned-reg)))
@@ -1917,9 +1943,9 @@ constant shift greater than word length")))
          (prev :scs (unsigned-reg unsigned-stack))
          (carry-in :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0)
+  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0)
                    :to (:result 1) :target lo) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 1)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 1)
                    :to (:result 0) :target hi) edx)
   (:results (hi :scs (unsigned-reg))
             (lo :scs (unsigned-reg)))
@@ -1941,9 +1967,9 @@ constant shift greater than word length")))
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0)
+  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0)
                    :to (:result 1) :target lo) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 1)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 1)
                    :to (:result 0) :target hi) edx)
   (:results (hi :scs (unsigned-reg))
             (lo :scs (unsigned-reg)))
@@ -1960,9 +1986,9 @@ constant shift greater than word length")))
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0))
+  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0))
               eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 1)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 1)
                    :to (:result 0) :target hi) edx)
   (:results (hi :scs (unsigned-reg)))
   (:result-types unsigned-num)
@@ -1977,8 +2003,8 @@ constant shift greater than word length")))
   (:args (x :scs (any-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
   (:arg-types positive-fixnum unsigned-num)
-  (:temporary (:sc any-reg :offset eax-offset :from (:argument 0)) eax)
-  (:temporary (:sc any-reg :offset edx-offset :from (:argument 1)
+  (:temporary (:sc any-reg :offset rax-offset :from (:argument 0)) eax)
+  (:temporary (:sc any-reg :offset rdx-offset :from (:argument 1)
                    :to (:result 0) :target hi) edx)
   (:results (hi :scs (any-reg)))
   (:result-types positive-fixnum)
@@ -1987,6 +2013,23 @@ constant shift greater than word length")))
     (inst mul eax y)
     (move hi edx)
     (inst and hi (lognot fixnum-tag-mask))))
+
+(define-vop ()
+  (:translate %signed-multiply-high)
+  (:policy :fast-safe)
+  (:args (x :scs (signed-reg) :target eax)
+         (y :scs (signed-reg signed-stack)))
+  (:arg-types signed-num signed-num)
+  (:temporary (:sc signed-reg :offset rax-offset :from (:argument 0))
+              eax)
+  (:temporary (:sc signed-reg :offset rdx-offset :from (:argument 1)
+                   :to (:result 0) :target hi) edx)
+  (:results (hi :scs (signed-reg)))
+  (:result-types signed-num)
+  (:generator 20
+    (move eax x)
+    (inst imul y)
+    (move hi edx)))
 
 (define-vop (bignum-lognot lognot-mod64/unsigned=>unsigned)
   (:translate sb-bignum:%lognot))
@@ -2012,9 +2055,9 @@ constant shift greater than word length")))
          (div-low :scs (unsigned-reg) :target eax)
          (divisor :scs (unsigned-reg unsigned-stack)))
   (:arg-types unsigned-num unsigned-num unsigned-num)
-  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 1)
+  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 1)
                    :to (:result 0) :target quo) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 0)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :from (:argument 0)
                    :to (:result 1) :target rem) edx)
   (:results (quo :scs (unsigned-reg))
             (rem :scs (unsigned-reg)))
@@ -2047,7 +2090,7 @@ constant shift greater than word length")))
   (:args (digit :scs (unsigned-reg unsigned-stack) :target result)
          (count :scs (unsigned-reg) :target ecx))
   (:arg-types unsigned-num positive-fixnum)
-  (:temporary (:sc unsigned-reg :offset ecx-offset :from (:argument 1)) ecx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
   (:results (result :scs (unsigned-reg) :from (:argument 0)
                     :load-if (not (and (sc-is result unsigned-stack)
                                        (location= digit result)))))

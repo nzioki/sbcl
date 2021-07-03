@@ -65,6 +65,11 @@ lispobj *dynamic_space_free_pointer;
 #endif
 lispobj *read_only_space_free_pointer;
 lispobj *static_space_free_pointer;
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+lispobj *static_code_space_free_pointer;
+#endif
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 lispobj *varyobj_free_pointer;
 lispobj *fixedobj_free_pointer;
@@ -80,10 +85,6 @@ lispobj *current_auto_gc_trigger;
  * Gencgc defines it as DYNAMIC_SPACE_START via a C preprocessor macro. */
 #ifdef LISP_FEATURE_CHENEYGC
 lispobj *current_dynamic_space;
-#endif
-
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_GCC_TLS)
-pthread_key_t specials=0;
 #endif
 
 void globals_init(void)
@@ -110,9 +111,5 @@ void globals_init(void)
 #else
     foreign_function_call_active = 1;
 #endif
-#endif
-
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_GCC_TLS)
-    pthread_key_create(&specials,0);
 #endif
 }

@@ -305,9 +305,6 @@ case `uname` in
     CYGWIN* | WindowsNT | MINGW* | MSYS*)
         sbcl_os="win32"
         ;;
-    HP-UX)
-        sbcl_os="hpux"
-        ;;
     Haiku)
         sbcl_os="haiku"
         ;;
@@ -363,7 +360,6 @@ case `uname -m` in
     i86pc) guessed_sbcl_arch=x86 ;;
     *x86_64) guessed_sbcl_arch=x86-64 ;;
     amd64) guessed_sbcl_arch=x86-64 ;;
-    [Aa]lpha) guessed_sbcl_arch=alpha ;;
     sparc*) guessed_sbcl_arch=sparc ;;
     sun*) guessed_sbcl_arch=sparc ;;
     *ppc) guessed_sbcl_arch=ppc ;;
@@ -371,8 +367,6 @@ case `uname -m` in
     ppc64le) guessed_sbcl_arch=ppc64 ;; # is ok because there was never 32-bit LE
     Power*Macintosh) guessed_sbcl_arch=ppc ;;
     ibmnws) guessed_sbcl_arch=ppc ;;
-    parisc*) guessed_sbcl_arch=hppa ;;
-    9000/800) guessed_sbcl_arch=hppa ;;
     mips*) guessed_sbcl_arch=mips ;;
     arm64) guessed_sbcl_arch=arm64 ;;
     *arm*) guessed_sbcl_arch=arm ;;
@@ -395,6 +389,11 @@ fi
 # Under Darwin, uname -m returns "i386" even if CPU is x86_64.
 if [ "$sbcl_os" = "darwin" ] && [ "`/usr/sbin/sysctl -n hw.optional.x86_64`" = "1" ]; then
     guessed_sbcl_arch=x86-64
+fi
+
+# Under NetBSD, uname -m returns "evbarm" even if CPU is arm64.
+if [ "$sbcl_os" = "netbsd" ] && [ `uname -p` = "aarch64" ]; then
+    guessed_sbcl_arch=arm64
 fi
 
 echo //setting up CPU-architecture-dependent information
@@ -491,33 +490,25 @@ case "$sbcl_os" in
     linux)
         printf ' :unix :linux :elf' >> $ltf
         case "$sbcl_arch" in
-          x86 | x86-64 | arm64)
+          arm64 | ppc64 | x86 | x86-64)
 	        printf ' :gcc-tls' >> $ltf
+        esac
+        case "$sbcl_arch" in
+          arm | arm64 | ppc | ppc64 | x86 | x86-64)
+	        printf ' :use-sys-mmap' >> $ltf
         esac
 
         # If you add other platforms here, don't forget to edit
         # src/runtime/Config.foo-linux too.
         case "$sbcl_arch" in
-	    mips | arm)
+	    mips | arm | x86 | x86-64)
 		printf ' :largefile' >> $ltf
-		;;
-            x86 | x86-64)
-		printf ' :sb-futex :largefile' >> $ltf
-		;;
-            ppc | ppc64 | arm64 | riscv)
-		printf ' :sb-futex' >> $ltf
 		;;
         esac
 
         link_or_copy Config.$sbcl_arch-linux Config
         link_or_copy $sbcl_arch-linux-os.h target-arch-os.h
         link_or_copy linux-os.h target-os.h
-        ;;
-    hpux)
-        printf ' :unix :hpux :elf' >> $ltf
-        link_or_copy Config.$sbcl_arch-hpux Config
-        link_or_copy $sbcl_arch-hpux-os.h target-arch-os.h
-        link_or_copy hpux-os.h target-os.h
         ;;
     haiku)
         printf ' :unix :haiku :elf :int4-breakpoints' >> $ltf
@@ -536,10 +527,6 @@ case "$sbcl_os" in
                 printf ' :gcc-tls' >> $ltf
                 if [ $sbcl_os = "gnu-kfreebsd" ]; then
                     printf ' :gnu-kfreebsd' >> $ltf
-                fi
-
-                if [ $sbcl_arch = "x86" ]; then
-                    printf ' :restore-fs-segment-register-from-tls' >> $ltf
                 fi
                 link_or_copy Config.$sbcl_arch-$sbcl_os Config
                 ;;
@@ -564,7 +551,7 @@ case "$sbcl_os" in
     darwin)
         printf ' :unix :bsd :darwin :mach-o' >> $ltf
         if [ $sbcl_arch = "x86" ]; then
-            printf ' :mach-exception-handler :restore-fs-segment-register-from-tls' >> $ltf
+            printf ' :mach-exception-handler' >> $ltf
         fi
         if [ $sbcl_arch = "x86-64" ]; then
             printf ' :mach-exception-handler' >> $ltf
@@ -574,6 +561,9 @@ case "$sbcl_os" in
             if (( 8 < $darwin_version_major )); then
 	        printf ' :inode64' >> $ltf
             fi
+        fi
+        if [ $sbcl_arch = "arm64" ]; then
+            printf ' :darwin-jit' >> $ltf
         fi
         link_or_copy $sbcl_arch-darwin-os.h target-arch-os.h
         link_or_copy bsd-os.h target-os.h
@@ -594,7 +584,6 @@ case "$sbcl_os" in
         # Optional features -- We enable them by default, but the build
         # ought to work perfectly without them:
         #
-        printf ' :sb-futex' >> $ltf
         printf ' :sb-qshow' >> $ltf
         #
         # Required features -- Some of these used to be optional, but
@@ -603,8 +592,7 @@ case "$sbcl_os" in
         # (Of course it doesn't provide dlopen, but there is
         # roughly-equivalent magic nevertheless:)
         printf ' :os-provides-dlopen' >> $ltf
-        printf ' :sb-thread :sb-safepoint :sb-thruption :sb-wtimer' >> $ltf
-        printf ' :sb-safepoint-strictly' >> $ltf
+        printf ' :sb-thread :sb-safepoint' >> $ltf
         #
         link_or_copy Config.$sbcl_arch-win32 Config
         link_or_copy $sbcl_arch-win32-os.h target-arch-os.h
@@ -631,14 +619,6 @@ cd "$original_dir"
 # (define-feature :c-stack-grows-downwards-not-upwards (features)
 #   (member :x86 features))
 
-# KLUDGE: currently the x86 only works with the generational garbage
-# collector (indicated by the presence of :GENCGC in *FEATURES*) and
-# alpha, sparc and ppc with the stop'n'copy collector (indicated by
-# the absence of :GENCGC in *FEATURES*). This isn't a great
-# separation, but for now, rather than have :GENCGC in
-# base-target-features.lisp-expr, we add it into local-target-features
-# if we're building for x86. -- CSR, 2002-02-21 Then we do something
-# similar with :STACK-GROWS-FOOWARD, too. -- WHN 2002-03-03
 case "$sbcl_arch" in
   x86)
     if [ "$sbcl_os" = "win32" ]; then
@@ -713,13 +693,6 @@ case "$sbcl_arch" in
         printf ' :cheneygc' >> $ltf
     fi
     ;;
-esac
-
-# There are only two architectures that don't have linkage tables,
-# and they also don't run for half a dozen other reasons.
-case "$sbcl_arch" in
-    alpha | hppa)  ;;
-    *) printf ' :linkage-table' >> $ltf
 esac
 
 # Use a little C program to try to guess the endianness.  Ware

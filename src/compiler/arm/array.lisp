@@ -33,34 +33,13 @@
       (allocation nil ndescr other-pointer-lowtag header :flag-tn pa-flag)
       ;; Now that we have the space allocated, compute the header
       ;; value.
-      (inst add ndescr rank (fixnumize (1- array-dimensions-offset)))
-      (inst mov ndescr (lsl ndescr (- n-widetag-bits n-fixnum-tag-bits)))
-      (inst orr ndescr ndescr (lsr type n-fixnum-tag-bits))
+      ;; See ENCODE-ARRAY-RANK.
+      (inst sub ndescr rank (fixnumize 1))
+      (inst and ndescr ndescr (fixnumize array-rank-mask))
+      (inst orr ndescr type (lsl ndescr array-rank-byte-pos))
+      (inst mov ndescr (lsr ndescr n-fixnum-tag-bits))
       ;; And store the header value.
       (storew ndescr header 0 other-pointer-lowtag))
-    (move result header)))
-
-(define-vop (make-array-header/c)
-  (:translate make-array-header)
-  (:policy :fast-safe)
-  (:arg-types (:constant t) (:constant t))
-  (:info type rank)
-  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result) header)
-  (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
-  (:results (result :scs (descriptor-reg)))
-  (:generator 4
-    (let* ((header-size (+ rank
-                           (1- array-dimensions-offset)))
-           (bytes (logandc2 (+ (* (1+ header-size) n-word-bytes)
-                               lowtag-mask)
-                            lowtag-mask))
-           (header-bits (logior (ash header-size
-                                     n-widetag-bits)
-                                type)))
-      (pseudo-atomic (pa-flag)
-        (allocation nil bytes other-pointer-lowtag header :flag-tn pa-flag)
-        (load-immediate-word pa-flag header-bits)
-        (storew pa-flag header 0 other-pointer-lowtag)))
     (move result header)))
 
 ;;;; Additional accessors and setters for the array header.
@@ -72,17 +51,17 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
-(define-vop (array-rank-vop)
-  (:translate sb-kernel:%array-rank)
+(define-vop ()
+  (:translate %array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
   (:generator 6
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst mov temp (asr temp n-widetag-bits))
-    (inst sub temp temp (1- array-dimensions-offset))
-    (inst mov res (lsl temp n-fixnum-tag-bits))))
+    (inst ldrb res (@ x #+little-endian (- 2 other-pointer-lowtag)
+                        #+big-endian    (- 1 other-pointer-lowtag)))
+    (inst add res res 1)
+    (inst and res res array-rank-mask)))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)
@@ -204,10 +183,8 @@
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg) :target shift)
-                (value :scs (unsigned-reg immediate) :target result))
+                (value :scs (unsigned-reg immediate)))
          (:arg-types ,type positive-fixnum positive-fixnum)
-         (:results (result :scs (unsigned-reg)))
-         (:result-types positive-fixnum)
          (:temporary (:scs (interior-reg)) lip)
          (:temporary (:scs (non-descriptor-reg)) temp old)
          (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) shift)
@@ -241,13 +218,7 @@
            ;; Write the altered word back to the array.
            (inst str old (@ lip
                             (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag)))
-           ;; And present the result properly.
-           (sc-case value
-             (immediate
-              (inst mov result (tn-value value)))
-             (unsigned-reg
-              (move result value)))))))))
+                               other-pointer-lowtag)))))))))
   (def-small-data-vector-frobs simple-bit-vector 1)
   (def-small-data-vector-frobs simple-array-unsigned-byte-2 2)
   (def-small-data-vector-frobs simple-array-unsigned-byte-4 4))
@@ -276,18 +247,14 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
-         (value :scs (single-reg) :target result))
+         (value :scs (single-reg)))
   (:arg-types simple-array-single-float positive-fixnum single-float)
-  (:results (result :scs (single-reg)))
-  (:result-types single-float)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 5
     (inst add lip object (- (* vector-data-offset n-word-bytes)
                             other-pointer-lowtag))
     (inst add lip lip index)
-    (inst fsts value (@ lip))
-    (unless (location= result value)
-      (inst fcpys result value))))
+    (inst fsts value (@ lip))))
 
 (define-vop (data-vector-ref/simple-array-double-float)
   (:note "inline array access")
@@ -311,18 +278,14 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
-         (value :scs (double-reg) :target result))
+         (value :scs (double-reg)))
   (:arg-types simple-array-double-float positive-fixnum double-float)
-  (:results (result :scs (double-reg)))
-  (:result-types double-float)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 20
     (inst add lip object (- (* vector-data-offset n-word-bytes)
                                other-pointer-lowtag))
     (inst add lip lip (lsl index 1))
-    (inst fstd value (@ lip))
-    (unless (location= result value)
-      (inst fcpyd result value))))
+    (inst fstd value (@ lip))))
 
 ;;; Complex float arrays.
 
@@ -351,26 +314,16 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to :result)
          (index :scs (any-reg))
-         (value :scs (complex-single-reg) :target result))
+         (value :scs (complex-single-reg)))
   (:arg-types simple-array-complex-single-float positive-fixnum
               complex-single-float)
-  (:results (result :scs (complex-single-reg)))
-  (:result-types complex-single-float)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 5
-    (let ((value-real (complex-single-reg-real-tn value))
-          (result-real (complex-single-reg-real-tn result)))
-      (inst add lip object (- (* vector-data-offset n-word-bytes)
-                                 other-pointer-lowtag))
-      (inst add lip lip (lsl index 1))
-      (inst fsts value-real (@ lip))
-      (unless (location= result-real value-real)
-        (inst fcpys result-real value-real)))
-    (let ((value-imag (complex-single-reg-imag-tn value))
-          (result-imag (complex-single-reg-imag-tn result)))
-      (inst fsts value-imag (@ lip n-word-bytes))
-      (unless (location= result-imag value-imag)
-        (inst fcpys result-imag value-imag)))))
+    (inst add lip object (- (* vector-data-offset n-word-bytes)
+                            other-pointer-lowtag))
+    (inst add lip lip (lsl index 1))
+    (inst fsts (complex-single-reg-real-tn value) (@ lip))
+    (inst fsts (complex-single-reg-imag-tn value) (@ lip n-word-bytes))))
 
 (define-vop (data-vector-ref/simple-array-complex-double-float)
   (:note "inline array access")
@@ -397,26 +350,16 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to :result)
          (index :scs (any-reg))
-         (value :scs (complex-double-reg) :target result))
+         (value :scs (complex-double-reg)))
   (:arg-types simple-array-complex-double-float positive-fixnum
               complex-double-float)
-  (:results (result :scs (complex-double-reg)))
-  (:result-types complex-double-float)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 20
-    (let ((value-real (complex-double-reg-real-tn value))
-          (result-real (complex-double-reg-real-tn result)))
-      (inst add lip object (- (* vector-data-offset n-word-bytes)
-                              other-pointer-lowtag))
-      (inst add lip lip (lsl index 2))
-      (inst fstd value-real (@ lip))
-      (unless (location= result-real value-real)
-        (inst fcpyd result-real value-real)))
-    (let ((value-imag (complex-double-reg-imag-tn value))
-          (result-imag (complex-double-reg-imag-tn result)))
-      (inst fstd value-imag (@ lip (* 2 n-word-bytes)))
-      (unless (location= result-imag value-imag)
-        (inst fcpyd result-imag value-imag)))))
+    (inst add lip object (- (* vector-data-offset n-word-bytes)
+                            other-pointer-lowtag))
+    (inst add lip lip (lsl index 2))
+    (inst fstd (complex-double-reg-real-tn value) (@ lip))
+    (inst fstd (complex-double-reg-imag-tn value) (@ lip (* 2 n-word-bytes)))))
 
 ;;; These vops are useful for accessing the bits of a vector irrespective of
 ;;; what type of vector it is.

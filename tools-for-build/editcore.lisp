@@ -78,7 +78,7 @@
   (find id (cdr spaces) :key #'space-id))
 (defun compute-nil-object (spaces)
   (let ((space (get-space static-core-space-id spaces)))
-    (%make-lisp-obj (logior (space-addr space) #x17))))
+    (%make-lisp-obj (logior (space-addr space) #x117))))
 
 ;;; Given OBJ which is tagged pointer into the target core, translate it into
 ;;; the range at which the core is now mapped during execution of this tool,
@@ -130,7 +130,7 @@
 
 (defglobal *editcore-ppd*
   ;; copy no entries for macros/special-operators (flet, etc)
-  (let ((ppd (sb-pretty::make-pprint-dispatch-table nil nil nil)))
+  (let ((ppd (sb-pretty::make-pprint-dispatch-table #() nil nil)))
     (set-pprint-dispatch 'string
                          ;; Write strings without string quotes
                          (lambda (stream string) (write-string string stream))
@@ -403,9 +403,9 @@
            (physaddr start))
      (loop
       (when (>= physaddr end) (return))
-      (multiple-value-bind (obj tag size)
-          (reconstitute-object (ash physaddr (- n-fixnum-tag-bits)))
-        (when (and (= tag symbol-widetag)
+      (let* ((obj (reconstitute-object (ash physaddr (- n-fixnum-tag-bits))))
+             (size (primitive-object-size obj)))
+        (when (and (symbolp obj)
                    (string= symbol-name (translate (symbol-name obj) spaces))
                    (%instancep (symbol-package obj))
                    (string= package-name
@@ -425,7 +425,7 @@
 (defparameter label-prefix (if (member :darwin *features*) "_" ""))
 (defun labelize (x) (concatenate 'string label-prefix x))
 
-(defun compute-linkage-symbols (spaces entry-size)
+(defun compute-linkage-symbols (spaces)
   (let* ((linkage-info (symbol-global-value
                         (find-target-symbol "SB-SYS" "*LINKAGE-INFO*"
                                             spaces :physical)))
@@ -459,8 +459,7 @@
           (symbol-global-value
            (find-target-symbol "SB-VM" "LINKAGE-TABLE-ENTRY-SIZE"
                                spaces :physical)))
-         (linkage-symbols (compute-linkage-symbols spaces linkage-entry-size))
-         (inst-space (get-inst-space))
+         (linkage-symbols (compute-linkage-symbols spaces))
          (nil-object (compute-nil-object spaces))
          (ambiguous-symbols (make-hash-table :test 'equal))
          (core
@@ -838,7 +837,7 @@
           (total-nwords (cdr (pop ranges))))
       (cond ((> jump-table-size 1)
              (format output "# jump table~%")
-             (format output ".quad ~d" jump-table-size)
+             (format output ".quad ~d" (sap-ref-word text-sap 0))
              (dotimes (i (1- jump-table-size))
                (format output ",\"~a\"+0x~x"
                        base-symbol
@@ -1528,19 +1527,17 @@
              (return-from scan-obj))
            (case widetag
              (#.instance-widetag
-              (let* ((layout (truly-the layout
-                              (translate (%instance-layout obj) spaces)))
-                     (bitmap (layout-bitmap layout))
-                     (translated
-                      (if (fixnump bitmap) bitmap (translate bitmap spaces))))
-                (do-instance-tagged-slot (i obj :bitmap translated)
+              (let ((type (translate (%instance-layout obj) spaces)))
+                (do-instance-tagged-slot (i obj t type)
                   (scanptr vaddr obj (1+ i))))
               (return-from scan-obj))
              (#.simple-vector-widetag
               (let ((len (length (the simple-vector obj))))
-                (when (eql (logand (get-header-data obj) #xFF) vector-addr-hashing-subtype)
+                (when (logtest (get-header-data obj) vector-addr-hashing-flag)
                   (do ((i 2 (+ i 2)) (needs-rehash))
-                      ((= i len)
+                      ;; Refer to the figure at the top of src/code/hash-table.lisp.
+                      ;; LEN is an odd number.
+                      ((>= i (1- len))
                        (when needs-rehash
                          (setf (svref obj 1) 1)))
                     ;; A weak or EQ-based hash table any of whose keys is a function
@@ -1565,14 +1562,15 @@
                              (+ core-offs n-word-bytes)
                              word)))
               (when (eq widetag funcallable-instance-widetag)
-                (let ((layout (truly-the layout (translate (%fun-layout obj) spaces))))
-                  (unless (fixnump (layout-bitmap layout))
-                    (error "Can't process bignum bitmap"))
-                  (let ((bitmap (layout-bitmap layout)))
-                    (unless (eql bitmap -1)
+                (let* ((layout (truly-the sb-vm:layout (translate (%fun-layout obj) spaces)))
+                       (bitmap (%raw-instance-ref/signed-word
+                                layout (sb-kernel::type-dd-length sb-vm:layout))))
+                  (unless (= (sb-kernel:bitmap-nwords layout) 1)
+                    (error "Strange funcallable-instance bitmap"))
+                  (unless (eql bitmap sb-kernel:+layout-all-tagged+)
                       ;; tagged slots precede untagged slots,
                       ;; so integer-length is the count of tagged slots.
-                      (setq nwords (1+ (integer-length bitmap))))))))
+                      (setq nwords (1+ (integer-length bitmap)))))))
              ;; mixed boxed/unboxed objects
              (#.code-header-widetag
               (aver (not pie))
@@ -1708,6 +1706,7 @@
           (fixedobj-range) ; = (START . SIZE-IN-BYTES)
           (relocs (make-array 100000 :adjustable t :fill-pointer 1)))
 
+  (declare (ignorable fixedobj-range))
   ;; Remove old files
   (ignore-errors (delete-file asm-pathname))
   (ignore-errors (delete-file elf-core-pathname))

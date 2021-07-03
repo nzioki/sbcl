@@ -340,9 +340,7 @@
      ((setq temp (position-in #'tn-ref-across tn (vop-temps vop)
                               :key #'tn-ref-tn))
       `("~2D: ~A (temporary ~A)" ,loc ,name
-        ,(operand-parse-name (elt (vop-parse-temps
-                                   (vop-parse-or-lose
-                                    (vop-info-name  (vop-info vop))))
+        ,(operand-parse-name (elt (vop-parse-temps (vop-parse-or-lose (vop-name vop)))
                                   temp))))
      ((eq (tn-kind tn) :component)
       `("~2D: ~A (component live)" ,loc ,name))
@@ -391,7 +389,7 @@
                 time. Recompile.~%Compilation order may be incorrect.~]"
                (mapcar #'sc-name scs)
                n arg-p
-               (vop-info-name (vop-info (tn-ref-vop op)))
+               (vop-name (tn-ref-vop op))
                (unused) (used)
                incon))))
 
@@ -471,7 +469,7 @@
     (aver (eq (ir2-block-block block) (ir2-block-block (vop-block vop))))
     (do ((current last (vop-prev current)))
         ((null current))
-      (when (eq (vop-info-name (vop-info current)) name)
+      (when (eq (vop-name current) name)
         (return-from reverse-find-vop current)))))
 
 ;;; For TNs that have other than one writer, we save the TN before
@@ -522,8 +520,7 @@
                       (return nil))))
          (tn-ref-vop res)))
 
-    (unless (eq (vop-info-name (vop-info (tn-ref-vop write)))
-                'move-operand)
+    (unless (eq (vop-name (tn-ref-vop write)) 'move-operand)
       (when res (return nil))
       (setq res write))))
 
@@ -662,7 +659,7 @@
       (do ((vop (ir2-block-last-vop block) (vop-prev vop)))
           ((null vop))
         (let ((info (vop-info vop)))
-          (case (vop-info-name info)
+          (case (vop-name vop)
             (allocate-frame
              (aver skipping)
              (setq skipping nil))
@@ -833,13 +830,13 @@
 (declaim (end-block))
 
 ;; Misc. utilities
-(declaim (inline unbounded-sc-p))
+(declaim (maybe-inline unbounded-sc-p))
 (defun unbounded-sc-p (sc)
   (eq (sb-kind (sc-sb sc)) :unbounded))
 
 (defun unbounded-tn-p (tn)
+  #-sb-xc-host (declare (inline unbounded-sc-p))
   (unbounded-sc-p (tn-sc tn)))
-(declaim (notinline unbounded-sc-p))
 
 
 ;;;; load TN packing
@@ -1093,7 +1090,7 @@
              (do ((ref refs (tn-ref-next ref)))
                  ((null ref))
                (let ((vop (tn-ref-vop ref)))
-                 (if (eq (vop-info-name (vop-info vop)) 'move-operand)
+                 (if (eq (vop-name vop) 'move-operand)
                      (delete-vop vop)
                      (pushnew (vop-block vop) *repack-blocks*))))))
       (zot (tn-reads tn))
@@ -1203,7 +1200,7 @@
 ;;; the restriction, we pack a Load-TN and load the operand into it.
 ;;; If a load-tn has already been allocated, we can assume that the
 ;;; restriction is satisfied.
-#-sb-fluid (declaim (inline check-operand-restrictions))
+(declaim (inline check-operand-restrictions))
 (defun check-operand-restrictions (scs ops)
   (declare (list scs) (type (or tn-ref null) ops))
 
@@ -1585,7 +1582,7 @@
       (walk-tn-refs (tn-reads tn))
       (walk-tn-refs (tn-writes tn))
       (if (eql path t)
-          sb-xc:most-positive-fixnum
+          most-positive-fixnum
           (length path)))))
 
 (declaim (type (member :iterative :greedy :adaptive)

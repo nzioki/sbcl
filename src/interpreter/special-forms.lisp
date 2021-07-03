@@ -308,7 +308,7 @@
     (if (policy env (> speed safety))
         (%eval form env)
         (let ((type (parse-type type-specifier)))
-          (multiple-value-call (if (sb-kernel::%values-type-p type)
+          (multiple-value-call (if (sb-kernel::values-type-p type)
                                    #'enforce-values-types
                                    #'enforce-single-type)
             type (%eval form env))))
@@ -319,7 +319,7 @@
           (if (eq type *universal-type*) ; don't type-check if T
               (handler #'digest-form form)
               (let ((form (%sexpr form)))
-                (if (sb-kernel::%values-type-p type)
+                (if (sb-kernel::values-type-p type)
                     (hlambda THE/MULTI (type form) (env)
                        (multiple-value-call #'enforce-values-types
                          type (dispatch form env)))
@@ -1206,7 +1206,7 @@
  ;; hand-generated lists of useful functions
  (setq *unary-functions*
   (sb-impl::%stuff-hash-table
-   (make-hash-table :test #'eq)
+   (make-hash-table) ; keys are symbols
    (macrolet
        ((def-wrapper (&rest input)
           (cons 'list
@@ -1286,7 +1286,7 @@
 
  (setq *binary-functions*
   (sb-impl::%stuff-hash-table
-   (make-hash-table :test #'eq)
+   (make-hash-table) ; keys are symbols
    (macrolet
        ((def-wrapper (&rest input)
           (cons 'list

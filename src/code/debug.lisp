@@ -465,11 +465,19 @@ information."
                      (< a (get-lisp-obj-address sb-vm:*control-stack-end*)))
                 sb-thread:*current-thread*)
                (all-threads
-                ;; find a stack whose base is nearest and below A.
-                (awhen (sb-thread::avl-find<= a sb-thread::*all-threads*)
-                  (let ((thread (sb-thread::avlnode-data it)))
-                    (when (< a (sb-thread::thread-stack-end thread))
-                      thread))))))))
+                (macrolet ((in-stack-range-p ()
+                             `(and (>= a (sb-thread::thread-control-stack-start thread))
+                                   (< a (sb-thread::thread-control-stack-end thread)))))
+                  #+win32 ; exhaustive search
+                  (dolist (thread (sb-thread:list-all-threads)) ; conses, but I don't care
+                    (when (in-stack-range-p)
+                      (return thread)))
+                  #-win32
+                  ;; find a stack whose primitive-thread is nearest and above A.
+                  (awhen (sb-thread::avl-find>= a sb-thread::*all-threads*)
+                    (let ((thread (sb-thread::avlnode-data it)))
+                      (when (in-stack-range-p)
+                        thread)))))))))
 
 ;;;; frame printing
 
@@ -673,7 +681,7 @@ the current thread are replaced with dummy objects which can safely escape."
 
 (defun ensure-printable-object (object)
   (handler-case
-      (with-open-stream (out (make-broadcast-stream))
+      (with-open-stream (out sb-impl::*null-broadcast-stream*)
         (prin1 object out)
         object)
     (error (cond)
@@ -910,11 +918,19 @@ the current thread are replaced with dummy objects which can safely escape."
   ;; until bug 403 is fixed, PPRINT-LOGICAL-BLOCK (STREAM NIL) is
   ;; definitely preferred, because the FORMAT alternative was acting odd.
   (pprint-logical-block (stream nil)
+    #-sb-thread
+    (format stream "debugger invoked on a ~S: ~2I~_~A" (type-of condition) condition)
+    #+sb-thread
     (format stream
-            "debugger invoked on a ~S~@[ in thread ~_~A~]: ~2I~_~A"
+            "debugger invoked on a ~S~@[ @~x~] in thread ~_~A: ~2I~_~A"
             (type-of condition)
-            #+sb-thread sb-thread:*current-thread*
-            #-sb-thread nil
+            (when (boundp '*current-internal-error-context*)
+              (if (system-area-pointer-p *current-internal-error-context*)
+                  (sb-alien:with-alien ((context (* os-context-t)
+                                                 sb-kernel:*current-internal-error-context*))
+                    (sap-int (sb-vm:context-pc context)))
+                  (sap-int (sb-vm:context-pc *current-internal-error-context*))))
+            sb-thread:*current-thread*
             condition))
   (terpri stream))
 
@@ -1636,7 +1652,7 @@ forms that explicitly control this kind of evaluation.")
   (show-restarts *debug-restarts* *debug-io*))
 
 (!def-debug-command "BACKTRACE" ()
- (print-backtrace :count (read-if-available sb-xc:most-positive-fixnum)))
+ (print-backtrace :count (read-if-available most-positive-fixnum)))
 
 (!def-debug-command "PRINT" ()
   (print-frame-call *current-frame* *debug-io*))
@@ -1802,6 +1818,8 @@ forms that explicitly control this kind of evaluation.")
                            (funcall thunk))
                          #+unbind-in-unwind thunk
                          #+unbind-in-unwind unbind-to
+                         #+(and unbind-in-unwind (not c-stack-is-control-stack))
+                         (%primitive sb-c:current-nsp)
                          #+unbind-in-unwind catch-block)))
   #-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))
@@ -1933,3 +1951,39 @@ forms that explicitly control this kind of evaluation.")
   (if (listen-skip-whitespace *debug-io*)
       (read *debug-io*)
       default))
+
+#+(and sb-devel x86-64)
+(defun show-catch-tags ()
+  (declare (notinline format))
+  (let ((sap (descriptor-sap sb-vm:*current-catch-block*)))
+    (loop
+     (let ((tag (sap-ref-lispobj sap (ash sb-vm:catch-block-tag-slot 3)))
+           (link (sap-ref-sap sap (ash sb-vm:catch-block-previous-catch-slot 3))))
+       (format t "~S ~A~%" tag link)
+       (setq sap link)
+       (if (= (sap-int sap) 0) (return))))))
+
+;;; Sometimes in cold-init it is not possible to call LIST-BACKTRACE
+;;; because that depends on a zillion things being set up correctly.
+;;; This simple version seems to always work.
+#+(or x86 x86-64)
+(defun ultralite-backtrace (&optional (decode-pcs t))
+  ;; this misses the current frame but that's perfectly fine for its intended use
+  (let ((fp (current-fp)) (list))
+    (loop
+     (let ((prev-fp (sap-ref-sap fp 0)))
+       (cond ((and (sap> prev-fp fp)
+                   (sap< prev-fp (descriptor-sap sb-vm:*control-stack-end*)))
+              (push (sap-ref-sap fp sb-vm:n-word-bytes) list) ; pc
+              (setq fp prev-fp))
+             (t
+              (return)))))
+    (setq list (nreverse list))
+    (if decode-pcs
+        (mapcar (lambda (pc)
+                  (let ((code (sb-di::code-header-from-pc pc)))
+                    (if code
+                        (cons code (sap- pc (code-instructions code)))
+                        pc)))
+                list)
+        list)))

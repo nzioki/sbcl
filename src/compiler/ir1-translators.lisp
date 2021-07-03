@@ -298,7 +298,7 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
     ;; Do this after processing, since the definitions can be malformed.
     (unless (= (length definitions)
                (length (remove-duplicates definitions :key #'first)))
-      (compiler-style-warn "Duplicate definitions in ~S" definitions))
+      (compiler-warn "Duplicate definitions in ~S" definitions))
     (funcall fun processed-definitions)))
 
 ;;; Tweak LEXENV to include the DEFINITIONS from a MACROLET, then
@@ -536,8 +536,8 @@ Return VALUE without evaluating it."
                             (lexenv-blocks *lexenv*) :from-end t))
               *source-namestring*
               (awhen (case *name-context-file-path-selector*
-                       (pathname (or sb-xc:*compile-file-pathname* *load-pathname*))
-                       (truename (or sb-xc:*compile-file-truename* *load-truename*)))
+                       (pathname (or *compile-file-pathname* *load-pathname*))
+                       (truename (or *compile-file-truename* *load-truename*)))
                 (namestring it)))))
     (when context
       (list :in context))))
@@ -557,67 +557,65 @@ Return VALUE without evaluating it."
      (compiler-error "Not a valid lambda expression:~%  ~S"
                      thing))))
 
-(defun fun-name-leaf (thing)
+(defun enclose (start next funs)
+  (let ((enclose (make-enclose :funs funs)))
+    (link-node-to-previous-ctran enclose start)
+    (use-ctran enclose next)
+    (dolist (fun funs)
+      (setf (functional-enclose fun) enclose))))
+
+;;; Get the leaf corresponding to THING, allocating and converting it
+;;; if it's a lambda expression or otherwise finding the lexically
+;;; apparent function associated to it.
+(defun find-or-convert-fun-leaf (thing start)
   (cond
-    ((typep thing
-            '(cons (member lambda named-lambda lambda-with-lexenv)))
-     (values (ir1-convert-lambdalike
-              thing :debug-name (name-lambdalike thing))
-             t))
+    ((typep thing '(cons (member lambda named-lambda lambda-with-lexenv)))
+     (let ((ctran (make-ctran))
+           (leaf (ir1-convert-lambdalike thing
+                                         :debug-name (name-lambdalike thing))))
+       (enclose start ctran (list leaf))
+       (values leaf ctran)))
     ((legal-fun-name-p thing)
-     (values (find-lexically-apparent-fun
-              thing "as the argument to FUNCTION")
-             nil))
+     (values (find-lexically-apparent-fun thing "as the argument to FUNCTION")
+             start))
     (t
      (compiler-error "~S is not a legal function name." thing))))
 
-(def-ir1-translator %fun-name-leaf ((thing) start next result)
-  (fun-name-leaf thing)
+;;; Convert a lambda without referencing it, side-effecting the
+;;; compile-time environment. This is useful for converting named
+;;; lambdas not meant to have entry points during block compilation,
+;;; since references will create entry points.
+(def-ir1-translator %refless-defun ((thing) start next result)
+  (ir1-convert-lambdalike thing :debug-name (name-lambdalike thing))
   (ir1-convert start next result nil))
-
-(def-ir1-translator %%allocate-closures ((&rest leaves) start next result)
-  (aver (eq result 'nil))
-  (let ((lambdas leaves))
-    ;; Opaquely quoting this list avoids recursing in find-constant
-    ;; to check for dumpability of sub-parts as it would otherwise do.
-    (ir1-convert start next result `(%allocate-closures ,(opaquely-quote lambdas)))
-    (let ((allocator (node-dest (ctran-next start))))
-      (dolist (lambda lambdas)
-        (setf (functional-allocator lambda) allocator)))))
-
-(defmacro with-fun-name-leaf ((leaf thing start &key global-function) &body body)
-  `(multiple-value-bind (,leaf allocate-p)
-       (if ,global-function
-           (find-global-fun ,thing t)
-           (fun-name-leaf ,thing))
-     (if allocate-p
-         (let ((.new-start. (make-ctran)))
-           (ir1-convert ,start .new-start. nil `(%%allocate-closures ,leaf))
-           (let ((,start .new-start.))
-             ,@body))
-         (locally
-             ,@body))))
 
 (def-ir1-translator function ((thing) start next result)
   "FUNCTION name
 
 Return the lexically apparent definition of the function NAME. NAME may also
 be a lambda expression."
-  (with-fun-name-leaf (leaf thing start)
+  (multiple-value-bind (leaf start)
+      (find-or-convert-fun-leaf thing start)
     (reference-leaf start next result leaf)))
 
 ;;; Like FUNCTION, but ignores local definitions and inline
 ;;; expansions, and doesn't nag about undefined functions.
 ;;; Used for optimizing things like (FUNCALL 'FOO).
 (def-ir1-translator global-function ((thing) start next result)
-  (with-fun-name-leaf (leaf thing start :global-function t)
-    (reference-leaf start next result leaf)))
+  (reference-leaf start next result (find-global-fun thing t)))
 
-(defun constant-global-fun-name (thing)
-  (let ((constantp (sb-xc:constantp thing)))
+;;; Return T if THING is a constant value and either a symbol (if EXTENDEDP is NIL)
+;;; or an extended-function-name (if EXTENDEDP is T).
+;;; Note however that whether THING actually names something is irrelevant.
+;;; This test is only if it _could_ name something. Return NIL if THING is a function
+;;; or a constant form evaluating to a function, or not a legal designator at all.
+(defun constant-global-fun-name (thing lexenv extendedp)
+  (let ((constantp (constantp thing lexenv)))
     (when constantp
-      (let ((name (constant-form-value thing)))
-        (when (legal-fun-name-p name)
+      (let ((name (constant-form-value thing lexenv)))
+        (when (if extendedp
+                  (legal-fun-name-p name)
+                  (symbolp name))
           name)))))
 
 (defun lvar-constant-global-fun-name (lvar)
@@ -626,14 +624,15 @@ be a lambda expression."
       (when (legal-fun-name-p name)
         name))))
 
-(defun ensure-source-fun-form (source &key (coercer '%coerce-callable-for-call) give-up)
+(defun ensure-source-fun-form (source lexenv &key (coercer '%coerce-callable-for-call)
+                                             (extendedp t) give-up)
   (let ((op (when (consp source) (car source))))
     (cond ((memq op '(%coerce-callable-to-fun %coerce-callable-for-call))
-           (ensure-source-fun-form (second source) :coercer coercer))
+           (ensure-source-fun-form (second source) lexenv :coercer coercer))
           ((member op '(function global-function lambda named-lambda))
            (values source nil))
           (t
-           (let ((cname (constant-global-fun-name source)))
+           (let ((cname (constant-global-fun-name source lexenv extendedp)))
              (if cname
                  (values `(global-function ,cname) nil)
                  (values `(,coercer ,source) give-up)))))))
@@ -675,10 +674,14 @@ be a lambda expression."
   (let ((function (handler-case (%macroexpand function *lexenv*)
                     (error () function))))
     (if (typep function '(cons (member function global-function) (cons t null)))
-        (with-fun-name-leaf (leaf (cadr function) start
-                                  :global-function (eq (car function)
-                                                       'global-function))
-          (ir1-convert start next result `(,leaf ,@args)))
+        ;; We manually frob the function to get the leaf like this so
+        ;; we let setf functions have their source transforms fire.
+        (destructuring-bind (operator definition) function
+          (multiple-value-bind (leaf start)
+              (ecase operator
+                (function (find-or-convert-fun-leaf definition start))
+                (global-function (values (find-global-fun definition t) start)))
+            (ir1-convert start next result `(,leaf ,@args))))
         (let ((ctran (make-ctran))
               (fun-lvar (make-lvar)))
           (ir1-convert start ctran fun-lvar `(the function ,function))
@@ -691,8 +694,14 @@ be a lambda expression."
 ;;; compiler. If the called function is a FUNCTION form, then convert
 ;;; directly to %FUNCALL, instead of waiting around for type
 ;;; inference.
-(define-source-transform funcall (function &rest args)
-  `(%funcall ,(ensure-source-fun-form function :coercer '%coerce-callable-for-call) ,@args))
+(define-source-transform funcall (function &rest args &environment env)
+  ;; This transform should not allow violating the type constraint on FUNCALL
+  ;; by sneaking in a use of #'name via %FUNCALL in cases where the name is
+  ;; an extended-function-designator instead of just function-designator.
+  `(%funcall ,(ensure-source-fun-form function env
+                                      :coercer '%coerce-callable-for-call
+                                      :extendedp nil)
+             ,@args))
 
 (deftransform %coerce-callable-to-fun ((thing) * * :node node)
   "optimize away possible call to FDEFINITION at runtime"
@@ -703,8 +712,8 @@ be a lambda expression."
   "optimize away possible call to FDEFINITION at runtime"
   (ensure-lvar-fun-form thing 'thing :give-up t :coercer '%coerce-callable-for-call))
 
-(define-source-transform %coerce-callable-to-fun (thing)
-  (ensure-source-fun-form thing :give-up t))
+(define-source-transform %coerce-callable-to-fun (thing &environment env)
+  (ensure-source-fun-form thing env :give-up t))
 
 
 ;;;; LET and LET*
@@ -847,7 +856,11 @@ also processed as top level forms."
                      ,@decls
                      (block ,(fun-name-block-name name)
                        . ,forms)))))))
-    (values (names) (defs))))
+    (let ((names (names)))
+      (unless (= (length names)
+                 (length (remove-duplicates names :test #'equal)))
+        (compiler-warn "Duplicate definitions in ~S" definitions))
+      (values names (defs)))))
 
 (defun parse-fletish (definitions body context)
   (multiple-value-bind (forms declarations) (parse-body body nil)
@@ -863,14 +876,13 @@ also processed as top level forms."
     (when dx-p
       (ctran-starts-block ctran)
       (ctran-starts-block next))
-    (ir1-convert start ctran nil `(%%allocate-closures ,@funs))
+    (enclose start ctran funs)
     (cond (dx-p
            (let* ((dummy (make-ctran))
                   (entry (make-entry))
                   (cleanup (make-cleanup :kind :dynamic-extent
                                          :mess-up entry
-                                         :info (list (node-dest
-                                                      (ctran-next start))))))
+                                         :info (list (ctran-next start)))))
              (push entry (lambda-entries (lexenv-lambda *lexenv*)))
              (setf (entry-cleanup entry) cleanup)
              (link-node-to-previous-ctran entry ctran)
@@ -974,7 +986,7 @@ other."
                     (values-subtypep (make-single-value-type (leaf-type value))
                                      type))
                (and (not (fun-designator-type-p type))
-                    (sb-xc:constantp value)
+                    (constantp value)
                     (or (not (values-type-p type))
                         (values-type-may-be-single-value-p type))
                     (ctypep (constant-form-value value)
@@ -1198,7 +1210,11 @@ care."
                                                   ,value))
     (let ((res (make-set :var var :value dest-lvar)))
       (setf (lvar-dest dest-lvar) res)
-      (setf (leaf-ever-used var) t)
+      (cond (result ; SETQ with a result counts as a REF also
+             (setf (leaf-ever-used var) t))
+            ((not (leaf-ever-used var)) ; doesn't count as a REF
+             ;; (EVER-USED might already be T, leave it alone if so)
+             (setf (leaf-ever-used var) 'set)))
       (push res (basic-var-sets var))
       (link-node-to-previous-ctran res dest-ctran)
       (use-continuation res next result))))
@@ -1254,7 +1270,7 @@ to TAG."
                 :debug-name (debug-name 'escape-fun tag))))
         (ctran (make-ctran)))
     (setf (functional-kind fun) :escape)
-    (ir1-convert start ctran nil `(%%allocate-closures ,fun))
+    (enclose start ctran (list fun))
     (reference-leaf ctran next result fun)))
 
 ;;; Yet another special special form. This one looks up a local
@@ -1440,7 +1456,10 @@ values from the first VALUES-FORM making up the first argument, etc."
                    ;; important for simplifying compilation of
                    ;; MV-COMBINATIONS.
                    (make-combination fun-lvar))))
-    (ir1-convert start ctran fun-lvar (ensure-source-fun-form fun :coercer '%coerce-callable-for-call))
+    (ir1-convert start ctran fun-lvar
+                 (ensure-source-fun-form fun *lexenv*
+                                         :coercer '%coerce-callable-for-call
+                                         :extendedp nil))
     (setf (lvar-dest fun-lvar) node)
     (collect ((arg-lvars))
       (let ((this-start ctran))

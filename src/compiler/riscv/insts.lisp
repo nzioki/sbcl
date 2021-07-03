@@ -911,3 +911,48 @@
 (define-instruction lra-header-word (segment)
   (:emitter
    (emit-header-data segment return-pc-widetag)))
+
+(define-instruction-macro load-layout-id (reg layout)
+  `(progn (inst .layout-id-fixup ,layout)
+          (inst lui ,reg #xfffff)
+          (inst addi ,reg ,reg -1)))
+
+(define-instruction .layout-id-fixup (segment layout)
+ (:emitter (sb-c:note-fixup segment :u+i-type (sb-c:make-fixup layout :layout-id))))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  #+64-bit
+  (unless (typep value 'u+i-immediate)
+    (error "Tried to fixup with ~a." value))
+  (let ((sap (code-instructions code)))
+    (multiple-value-bind (u i) (u-and-i-inst-immediate value)
+      (ecase kind
+        (:absolute
+         (setf (sap-ref-32 sap offset) value))
+        (:u-type
+         (setf (ldb (byte 20 12) (sap-ref-32 sap offset)) u))
+        (:i-type
+         (setf (ldb (byte 12 20) (sap-ref-32 sap offset)) i))
+        (:u+i-type
+         (sb-vm:fixup-code-object code offset u :u-type flavor)
+         (sb-vm:fixup-code-object code (+ offset 4) i :i-type flavor))
+        (:s-type
+         (setf (ldb (byte 5 7) (sap-ref-32 sap offset))
+               (ldb (byte 5 0) i))
+         (setf (ldb (byte 7 25) (sap-ref-32 sap offset))
+               (ldb (byte 7 5) i))))))
+   nil)
+
+(define-instruction store-coverage-mark (segment path-index)
+  (:emitter
+   ;; No backpatch is needed to compute the offset into the code header
+   ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   (let ((offset (+ (component-header-length)
+                    n-word-bytes ; skip over jump table word
+                    path-index
+                    (- other-pointer-lowtag))))
+     (inst* segment 'sb sb-vm::null-tn sb-vm::code-tn
+            (the (unsigned-byte 15) offset)))))

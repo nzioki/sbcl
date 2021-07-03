@@ -98,3 +98,51 @@
                        ((= i 1) 3)
                        (t i))))))
           '(values (integer 2) &optional))))
+
+(with-test (:name :ir1-phases-delay)
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (n z)
+                     (when (typep n 'fixnum)
+                       (let ((ar (if (integerp n)
+                                     (make-array n)
+                                     z)))
+                         (declare (type vector ar))
+                         (print ar)
+                         (array-has-fill-pointer-p ar)))))))
+          '(values null &optional))))
+
+(with-test (:name :--sign)
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (x y)
+                     (declare (integer x y))
+                     (if (<= x y)
+                         (- x y)
+                         -10)))))
+          '(values (integer * 0) &optional))))
+
+(with-test (:name :--type)
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (x y)
+                     (if (> x y)
+                         (- x y)
+                         1)))))
+          '(values real &optional))))
+
+(with-test (:name :remove-equivalent-blocks-clear-constraints)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a c)
+         (declare ((and fixnum unsigned-byte) a)
+                  (fixnum c))
+         (eql c
+              (if (eql a c)
+                  c
+                  a)))
+    ((3 1) nil)
+    ((3 3) t)))

@@ -49,7 +49,7 @@
 ;;;  :line-length       - Return the length of a line of output.
 ;;;  :charpos           - Return current output position on the line.
 ;;;  :file-length       - Return the file length of a file stream.
-;;;  :file-position     - Return or change the current position of a
+;;;  :[gs]et-file-position  - Return or change the current position of a
 ;;;                       file stream.
 ;;;  :file-name         - Return the name of an associated file.
 ;;;  :interactive-p     - Is this an interactive device?
@@ -90,6 +90,31 @@
 (deftype ansi-stream-cin-buffer ()
   `(simple-array character (,+ansi-stream-in-buffer-length+)))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defun %stream-opcode (name)
+  (ecase name
+    (:listen              0)
+    (:unread              1)
+    (:force-output        2)
+    (:finish-output       3)
+    (:charpos             4)
+    (:get-file-position   5)
+    (:set-file-position   6)
+    (:element-type        7)
+    (:element-mode        8)
+    (:external-format     9)
+    (:line-length        10)
+    (:file-length        11)
+    (:file-string-length 12)
+    (:clear-input        13)
+    (:clear-output       14)
+    (:close              15)
+    (:interactive-p      16)
+    ;; This is used by string streams and is not an opcode seen
+    ;; by STREAM-MISC-DISPATCH. The new stream pseudomethod convention
+    ;; can't pass random keywords to the misc method.
+    (:reset-unicode-p    17))))
+
 ;;; base class for ANSI standard streams (as opposed to the Gray
 ;;; streams extension)
 (defstruct (ansi-stream (:constructor nil)
@@ -105,13 +130,16 @@
   (in-index +ansi-stream-in-buffer-length+
             :type (integer 0 #.+ansi-stream-in-buffer-length+))
 
+  ;; FIXME: declare all these function types more rigorously.
+
   ;; buffered input functions
   (in #'ill-in :type function)                  ; READ-CHAR function
   (bin #'ill-bin :type function)                ; byte input function
   ;; 'n-bin' might not transfer bytes to the consumer.
   ;; A character FD-STREAM uses this method to transfer octets from the
   ;; source buffer into characters of the destination buffer.
-  (n-bin #'ill-bin :type function)              ; n-byte input function
+  (n-bin #'ill-bin :type                        ; n-byte input function
+   (sfunction (stream (simple-unboxed-array (*)) index index t) index))
 
   ;; output functions
   (out #'ill-out :type function)                ; WRITE-CHAR function
@@ -119,7 +147,7 @@
   (sout #'ill-out :type function)               ; string output function
 
   ;; other, less-used methods
-  (misc #'no-op-placeholder :type function)
+  (misc #'no-op-placeholder :type (function (stream (integer 0 17) t) *))
 
   ;; Absolute character position, acting also as a generalized boolean
   ;; in lieu of testing FORM-TRACKING-STREAM-P to see if we must
@@ -143,6 +171,22 @@
   ;; This is the symbol, the value of which is the stream we are synonym to.
   (symbol nil :type symbol :read-only t))
 (declaim (freeze-type synonym-stream))
+
+(defstruct (broadcast-stream (:include ansi-stream
+                                       (out #'broadcast-out)
+                                       (bout #'broadcast-bout)
+                                       (sout #'broadcast-sout)
+                                       (misc #'broadcast-misc))
+                             (:constructor %make-broadcast-stream
+                                           (streams))
+                             (:copier nil)
+                             (:predicate nil))
+  ;; a list of all the streams we broadcast to
+  (streams () :type list :read-only t))
+(declaim (freeze-type broadcast-stream))
+
+(define-load-time-global *null-broadcast-stream* (make-broadcast-stream))
+(declaim (type stream *null-broadcast-stream*))
 
 (defmethod print-object ((x stream) stream)
   (print-unreadable-object (x stream :type t :identity t)))
@@ -289,3 +333,70 @@
 ;;; This is not something that the standard macro permits.
 (defmacro %with-output-to-string ((var) &body body)
   (expand-with-output-to-string var ''character body t))
+
+;;; A macro to better exploit jump tables. Even though jumping based on symbol-hash
+;;; is possible, it is of course slightly faster to dispatch on small integers,
+;;; and for architectures which don't implement jump tables,
+;;; using integers eliminates the load of many code header constants.
+;;; Streams which don't want to handle every operation (don't end in a T clause)
+;;; should specify :DEFAULT NIL to avoid an error.
+(defmacro stream-misc-case ((operation &key (default 'error)) &rest clauses)
+  (let* ((otherwise)
+         (clauses
+          (mapcar (lambda (clause)
+                    (let ((key (car clause)))
+                      (cons (if (eq key 't)
+                                (setq otherwise t)
+                                (mapcar #'%stream-opcode (ensure-list (car clause))))
+                            (cdr clause))))
+                  clauses)))
+    `(,(if (and (not otherwise) (eq default 'error)) 'ecase 'case) ,operation
+      ,@clauses)))
+
+(defmacro call-ansi-stream-misc (stream operation &optional (arg nil argp))
+  ;; Never stuff in a placeholder in the three operations that take an argument.
+  (aver (or argp (not (memq operation '(:set-file-position :file-string-length :unread)))))
+  `(funcall (ansi-stream-misc ,stream) ,stream
+            ;; If operation is a literal keyword, translate it, otherwise
+            ;; it is a variable whose values is the opcode for passthru.
+            ,(if (keywordp operation) (%stream-opcode operation) operation)
+            ,(if argp arg 0)))
+
+;;; This predicate assumes some things:
+;;;  - that a simple-stream class will never be FUNCALLABLE-STANDARD-OBJECT
+;;;    (so that we need only check for %INSTANCEP)
+;;;  - a class will never be redefined such that it moves from one part of the stream
+;;;    hierarchy to the other. (i.e. you don't redefine MY-STREAM-CLASS such that
+;;;    it was a Gray stream and becomes a simple-stream or vice-versa)
+;;;  - instance invalidation, if it needs to happen, will happen somewhere later in
+;;;    the stream protocol. (the layout-invalid trap can be deferred)
+;;;    This is OK because the next level of dispatch is not to a generic function
+;;;    in the simple-stream layering. It is generic at the "device" but not the API.
+(defmacro simple-stream-p (x)
+  `(and (%instancep ,x)
+        (logtest (layout-flags (%instance-layout ,x))
+                 sb-kernel::+simple-stream-layout-flag+)))
+
+;;; This macro is for the first-level of dispatch which usually entails
+;;; deciding whether the argument is actually a stream or merely a designator
+;;; for a stream (T or NIL), and then figuring out which family of stream
+;;; it belongs to: ANSI, Gray, or simple.
+(defmacro stream-api-dispatch ((streamvar &optional initform) &key native simple gray)
+  ;; Most CL: stream APIs use explicit-check, so we should assert that the thing
+  ;; is actually a stream.
+  ;; If the CL interface bypasses STREAM-API-DISPATCH then it is up to generic layer
+  ;; to signal an error, the class of which seems unfortunately subject to debate.
+  (aver (and native (or simple gray)))
+  `(let ,(if initform `((,streamvar ,initform)))
+     ;; Dispatch native first, then if sb-simple-streams have been loaded,
+     ;; those, and finally punt to a generic function.
+     (block stream
+       ;; Assume that simple-stream can not inherit funcallable-standard-object.
+       (when (%instancep ,streamvar)
+         (let ((layout (%instance-layout ,streamvar)))
+           (cond ((sb-c::%structure-is-a layout ,(find-layout 'ansi-stream))
+                  (let ((,streamvar (truly-the ansi-stream ,streamvar)))
+                    (return-from stream ,native)))
+                 ((logtest (layout-flags layout) +simple-stream-layout-flag+)
+                  (return-from stream ,simple)))))
+       (let ((,streamvar (the stream ,streamvar))) ,gray))))

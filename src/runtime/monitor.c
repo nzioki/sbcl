@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <stdlib.h>
-#include <setjmp.h>
 #include <sys/time.h>
 #ifndef LISP_FEATURE_WIN32
 #include <sys/resource.h>
@@ -93,8 +92,6 @@ static struct cmd {
     {NULL, NULL, NULL}
 };
 
-static jmp_buf curbuf;
-
 static int
 visible(unsigned char c)
 {
@@ -151,17 +148,9 @@ dump_cmd(char **ptr)
     lispobj* next_object = decode ? (lispobj*)addr : 0;
 
     while (count-- > 0) {
-#ifndef LISP_FEATURE_ALPHA
         printf("%p: ", (os_vm_address_t) addr);
-#else
-        printf("0x%08X: ", (u32) addr);
-#endif
         if (force || gc_managed_addr_p((lispobj)addr)) {
-#ifndef LISP_FEATURE_ALPHA
             unsigned long *lptr = (unsigned long *)addr;
-#else
-            u32 *lptr = (u32 *)addr;
-#endif
             unsigned char *cptr = (unsigned char *)addr;
 
 #if N_WORD_BYTES == 8
@@ -247,7 +236,7 @@ kill_cmd(char **ptr)
 static int
 regs_cmd(char __attribute__((unused)) **ptr)
 {
-    struct thread __attribute__((unused)) *thread=arch_os_get_current_thread();
+    struct thread __attribute__((unused)) *thread=get_sb_vm_thread();
 
     printf("CSP\t=\t%p   ", access_control_stack_pointer(thread));
 #if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
@@ -425,7 +414,7 @@ static int
 print_context_cmd(char **ptr)
 {
     int free_ici;
-    struct thread *thread=arch_os_get_current_thread();
+    struct thread *thread=get_sb_vm_thread();
 
     free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
@@ -486,24 +475,23 @@ static int
 catchers_cmd(char __attribute__((unused)) **ptr)
 {
     struct catch_block *catch = (struct catch_block *)
-        read_TLS(CURRENT_CATCH_BLOCK, arch_os_get_current_thread());
+        read_TLS(CURRENT_CATCH_BLOCK, get_sb_vm_thread());
 
     if (catch == NULL)
         printf("There are no active catchers!\n");
     else {
         while (catch != NULL) {
-            printf("0x%08lX:\n\tuwp: 0x%08lX\n\tfp: 0x%08lX\n\t"
-                   "code: 0x%08lX\n\tentry: 0x%08lX\n\ttag: ",
-                   (long unsigned)catch,
-                   (long unsigned)(catch->uwp),
-                   (long unsigned)(catch->cfp),
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-                   (long unsigned)component_ptr_from_pc((void*)catch->entry_pc)
-                       + OTHER_POINTER_LOWTAG,
+            printf("%p:\n\tuwp  : %p\n\tfp   : %p\n\t"
+                   "code : %p\n\tentry: %p\n\ttag: ",
+                   catch,
+                   catch->uwp,
+                   catch->cfp,
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
+                   component_ptr_from_pc((void*)catch->entry_pc),
 #else
-                   (long unsigned)(catch->code),
+                   catch->code,
 #endif
-                   (long unsigned)(catch->entry_pc));
+                   (void*)(catch->entry_pc));
             brief_print((lispobj)catch->tag);
             catch = catch->previous_catch;
         }
@@ -511,24 +499,43 @@ catchers_cmd(char __attribute__((unused)) **ptr)
     return 0;
 }
 
+/* SIGINT handler that invokes the monitor (for when Lisp isn't up to it) */
+static void
+sigint_handler(int __attribute__((unused)) signal,
+               siginfo_t __attribute__((unused)) *info,
+               void *context)
+{
+    extern void ldb_monitor();
+    fprintf(stderr, "\nSIGINT hit at %p\n", (void*)*os_context_pc_addr(context));
+    ldb_monitor();
+    fprintf(stderr, "Returning to lisp (if you're lucky).\n");
+}
+
 static int
 grab_sigs_cmd(char __attribute__((unused)) **ptr)
 {
-    extern void sigint_init(void);
-
-    printf("Grabbing signals.\n");
-    sigint_init();
+#ifdef LISP_FEATURE_WIN32
+    fprintf(stderr, "sorry no can do\n"); fflush(stderr);
+#else
+    printf("Grabbing SIGINT.\n");
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = sigint_handler;
+    sigaction(SIGINT, &sa, 0);
+#endif
     return 0;
 }
 
-static void
-sub_monitor(void)
+void
+ldb_monitor(void)
 {
     struct cmd *cmd, *found;
     char buf[256];
     char *line, *ptr, *token;
     int ambig;
 
+    printf("Welcome to LDB, a low-level debugger for the Lisp runtime environment.\n");
     if (!ldb_in) {
 #ifndef LISP_FEATURE_WIN32
         ldb_in = fopen("/dev/tty","r+");
@@ -577,28 +584,6 @@ sub_monitor(void)
             if (done) return;
         }
     }
-}
-
-void
-ldb_monitor()
-{
-    jmp_buf oldbuf;
-
-    memcpy(oldbuf, curbuf, sizeof(oldbuf));
-
-    printf("Welcome to LDB, a low-level debugger for the Lisp runtime environment.\n");
-
-    setjmp(curbuf);
-
-    sub_monitor();
-
-    memcpy(curbuf, oldbuf, sizeof(curbuf));
-}
-
-void
-throw_to_monitor()
-{
-    longjmp(curbuf, 1);
 }
 
 /* what we do when things go badly wrong at a low level */

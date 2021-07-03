@@ -68,14 +68,14 @@
     "Returns a HOST-ENT instance for HOST-NAME or signals a NAME-SERVICE-ERROR.
 HOST-NAME may also be an IP address in dotted quad notation or some other
 weird stuff - see gethostbyname(3) for the details."
-    (sb-thread::with-system-mutex (**gethostby-lock** :allow-with-interrupts t)
+    (sb-int:with-system-mutex (**gethostby-lock** :allow-with-interrupts t)
       (make-host-ent (sockint::gethostbyname host-name))))
 
   (defun get-host-by-address (address)
     "Returns a HOST-ENT instance for ADDRESS, which should be a vector of
  (integer 0 255), or signals a NAME-SERVICE-ERROR. See gethostbyaddr(3)
  for details."
-    (sb-thread::with-system-mutex (**gethostby-lock** :allow-with-interrupts t)
+    (sb-int:with-system-mutex (**gethostby-lock** :allow-with-interrupts t)
       (sockint::with-in-addr packed-addr ()
         (let ((addr-vector (coerce address 'vector)))
           (loop for i from 0 below (length addr-vector)
@@ -148,7 +148,7 @@ weird stuff - see getaddrinfo(3) for the details."
 elements in case of an IPv6 address, or signals a NAME-SERVICE-ERROR.
 See gethostbyaddr(3) for details."
     (declare (optimize speed))
-    (multiple-value-bind (sockaddr sockaddr-free sockaddr-size address-family)
+    (multiple-value-bind (sockaddr sockaddr-size address-family)
         (etypecase address
           ((vector (unsigned-byte 8) 4)
            (let ((sockaddr (sb-alien:make-alien sockint::sockaddr-in)))
@@ -157,7 +157,7 @@ See gethostbyaddr(3) for details."
              (dotimes (i (length address))
                (setf (sb-alien:deref (sockint::sockaddr-in-addr sockaddr) i)
                      (aref address i)))
-             (values sockaddr #'sockint::free-sockaddr-in
+             (values sockaddr
                      (sb-alien:alien-size sockint::sockaddr-in :bytes)
                      sockint::af-inet)))
           #-win32
@@ -167,7 +167,7 @@ See gethostbyaddr(3) for details."
              (dotimes (i (length address))
                (setf (sb-alien:deref (sockint::sockaddr-in6-addr sockaddr) i)
                      (aref address i)))
-             (values sockaddr #'sockint::free-sockaddr-in6
+             (values sockaddr
                      (sb-alien:alien-size sockint::sockaddr-in6 :bytes)
                      sockint::af-inet6))))
       (unwind-protect
@@ -186,7 +186,7 @@ See gethostbyaddr(3) for details."
                                 :type address-family
                                 :aliases nil
                                 :addresses (list address))))
-        (funcall sockaddr-free sockaddr)))))
+        (sb-alien:free-alien sockaddr)))))
 
 ;;; Error handling
 

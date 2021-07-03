@@ -15,6 +15,12 @@
 
 (in-package "SB-X86-64-ASM")
 
+(defmethod print-object ((reg reg) stream)
+  (if *print-readably*
+      ;; cross-compiled DEFMETHOD can't use call-next-method
+      (default-structure-print reg stream *current-level-in-print*)
+      (write-string (reg-name reg) stream)))
+
 ;;; Return the operand size depending on the prefixes and width bit as
 ;;; stored in DSTATE.
 (defun inst-operand-size (dstate)
@@ -258,9 +264,9 @@
     (sap-ref-word (int-sap addr) 0)))
 
 (define-load-time-global thread-slot-names
-    (let* ((slots (primitive-object-slots
-                   (find 'sb-vm::thread *primitive-objects*
-                         :key #'primitive-object-name)))
+    (let* ((slots (coerce (primitive-object-slots
+                           (sb-vm::primitive-object 'sb-vm::thread))
+                          'list))
            (a (make-array (1+ (slot-offset (car (last slots))))
                           :initial-element nil)))
       (dolist (slot slots a)

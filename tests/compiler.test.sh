@@ -15,6 +15,31 @@
 
 use_test_subdirectory
 
+# It's unclear why the majority of these tests are written in shell script when
+# many look as though they would be perfectly happy as lisp tests.
+# This test, on the other hand, would have a tough time as a lisp test,
+# because it needs to make a symlink which would either mean calling run-program
+# or using alien-funcall on symlink(). Shell is easier.
+mkdir -p inscrutable/f00
+echo '(defun zook (x) (declare (integer x)) (length x))' > inscrutable/f00/f00_xyz_bad
+ln -s inscrutable/f00/f00_xyz_bad good.lisp
+run_sbcl --eval '(setq *default-pathname-defaults* #P"")' \
+  --eval '(compile-file "good.lisp" :verbose t)' --quit >stdout.out 2>stderr.out
+egrep -q 'compiling file ".*good' stdout.out
+stdout_ok=$?
+egrep -q 'file:.+good' stderr.out
+stderr_ok=$?
+if [ $stdout_ok = 0 -a $stderr_ok = 0 ] ; then
+    rm -r good.* stdout.out stderr.out inscrutable
+    echo "untruenames: PASS"
+else
+    cat stdout.out stderr.out
+    echo "untruenames: FAIL"
+    exit $EXIT_LOSE
+fi
+
+## FIXME: all these tests need to be more silent. Too much noise to parse
+
 tmpfilename="$TEST_FILESTEM.lisp"
 
 # This should fail, as type inference should show that the call to FOO
@@ -525,15 +550,30 @@ cat > $tmpfilename <<EOF
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (sb-kernel::%invalidate-layout (sb-pcl::class-wrapper (find-class 'subclass))))
 
+;; This test file is weird. It expects to see warnings from a COMPILE inside
+;; a method body that is compiled (and not necessarily invoked).
+;; To force the warnings to happen, we have to force the method to get called,
+;; which we can do by asking a SUBTYPEP question.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defmethod sb-mop:finalize-inheritance :after (class)
     (eval '(defmethod z (x) (abcde)))
-    (funcall (compile nil '(lambda () (defun zz (x) (defgh)))))))
+    (funcall (compile nil '(lambda () (defun zz (x) (defgh))))))
+  (assert (not (sb-kernel:csubtypep (sb-kernel:specifier-type 'subclass)
+                                    (sb-kernel:specifier-type 'condition)))))
 
 (defun subclass-p (x)
   (typep x 'subclass))
 EOF
 expect_warned_compile $tmpfilename
+
+cat > $tmpfilename <<EOF
+(defun foo () 128)
+(let ((a (load-time-value (foo))))
+  (declare (fixnum a))
+  (print a)
+  (terpri))
+EOF
+expect_clean_cload $tmpfilename
 
 # success
 exit $EXIT_TEST_WIN

@@ -80,11 +80,16 @@
           (args (compiler-error-context-format-args context)))
       (collect ((full nil cons)
                 (short nil cons))
-        (let ((forms (source-path-forms path))
-              (n 0))
-          (dolist (src (if (member (first forms) args)
-                           (rest forms)
-                           forms))
+        (let* ((forms (source-path-forms path))
+               (n 0)
+               (forms (if (member (first forms) args)
+                          (rest forms)
+                          forms))
+               (transforms (memq 'transformed forms))
+               (forms (if transforms
+                          (cdr transforms)
+                          forms)))
+          (dolist (src forms)
             (if (>= n *enclosing-source-cutoff*)
                 (short (stringify-form (if (consp src)
                                            (car src)
@@ -260,7 +265,10 @@
                       :original-form form
                       :format-args args
                       :context src-context
-                      :file-name (file-info-name file-info)
+                      :file-name (if (symbolp (file-info-truename file-info)) ; :LISP or :STREAM
+                                     ;; (pathname will be NIL in those two cases)
+                                     (file-info-truename file-info)
+                                     (file-info-pathname file-info))
                       :file-position
                       (nth-value 1 (find-source-root tlf *source-info*))
                       :path path
@@ -429,6 +437,7 @@ a STYLE-WARNING (or any more serious condition)."))
   (:documentation
    "A condition type signalled when the compiler deletes code that the user
 has written, having proved that it is unreachable."))
+(define-condition unknown-typep-note (simple-compiler-note) ())
 
 (define-condition compiler-macro-application-missed-warning
     (style-warning)
@@ -578,10 +587,10 @@ has written, having proved that it is unreachable."))
 ;;; the compiler, hence the BOUNDP check.
 (defun note-undefined-reference (name kind)
   #+sb-xc-host
-  ;; Whitelist functions are looked up prior to UNCROSS,
+  ;; Allowlist functions are looked up prior to UNCROSS,
   ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
   (when (and (eq kind :function)
-             (gethash name sb-cold:*undefined-fun-whitelist*))
+             (gethash name sb-cold:*undefined-fun-allowlist*))
     (return-from note-undefined-reference (values)))
   (setq name (uncross name))
   (unless (and
@@ -640,7 +649,7 @@ has written, having proved that it is unreachable."))
 ;; The current approach is reliable, at a cost of ~3 words per function.
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
-  (unless (sb-xc:compiler-macro-function name)
+  (unless (compiler-macro-function name)
     (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning
@@ -660,7 +669,7 @@ has written, having proved that it is unreachable."))
 ;;
 (defun warn-if-inline-failed/proclaim (name new-inlinep)
   (when (eq new-inlinep 'inline)
-    (let ((warning-count (emitted-full-call-count name)))
+    (let ((warning-count (sb-impl::emitted-full-call-count name)))
       (when (and warning-count
                  ;; Warn only if the the compiler did not have the expansion.
                  (not (fun-name-inline-expansion name))

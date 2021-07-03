@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <errno.h>
 #include <dirent.h>
+#include "interr.h" // for lose()
 
 #ifdef LISP_FEATURE_OPENBSD
 #include <util.h>
@@ -76,7 +77,7 @@ set_pty(char *pty_name)
 {
     int fd;
 
-#if !defined(LISP_FEATURE_HPUX) && !defined(SVR4) && !defined(__HAIKU__)
+#if !defined(SVR4) && !defined(__HAIKU__)
     fd = open("/dev/tty", O_RDWR, 0);
     if (fd >= 0) {
         ioctl(fd, TIOCNOTTY, 0);
@@ -132,8 +133,26 @@ int closefrom_fddir(char *dir, int lowfd)
     return 0;
 }
 
-void closefds_from(int lowfd)
+void closefds_from(int lowfd, int* dont_close)
 {
+    if (dont_close) {
+        /* dont_close is a sorted simple-array of tagged ints */
+        uword_t length = fixnum_value(((uword_t*)dont_close)[-1]);
+        uword_t i;
+        for (i = 0; i < length; i++)
+        {
+            int fd = dont_close[i];
+            int close_fd;
+
+            /* Close the gaps between the fds */
+            for (close_fd = lowfd; close_fd < fd; close_fd++)
+            {
+                close(close_fd);
+            }
+            lowfd = fd+1;
+        }
+    }
+
 #if defined(LISP_FEATURE_OPENBSD) || defined(LISP_FEATURE_NETBSD)       \
     || defined(LISP_FEATURE_DRAGONFLY) || defined(LISP_FEATURE_FREEBSD) \
     || defined(LISP_FEATURE_SUNOS)
@@ -198,7 +217,7 @@ extern char **environ;
 int spawn(char *program, char *argv[], int sin, int sout, int serr,
           int search, char *envp[], char *pty_name,
           int channel[2],
-          char *pwd)
+          char *pwd, int* dont_close)
 {
     pid_t pid;
     sigset_t sset;
@@ -206,7 +225,8 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
 
     channel[0] = -1;
     channel[1] = -1;
-    pipe(channel);
+    // Surely we can do better than to lose()
+    if (pipe(channel)) lose("can't run-program");
 
     pid = fork();
     if (pid) {
@@ -218,7 +238,7 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
      * share stdin with our parent. In the latter case we claim
      * control of the terminal. */
     if (sin >= 0) {
-#if defined(LISP_FEATURE_HPUX) || defined(LISP_FEATURE_OPENBSD)
+#ifdef LISP_FEATURE_OPENBSD
       setsid();
 #elif defined(LISP_FEATURE_DARWIN)
       setpgid(0, getpid());
@@ -250,7 +270,7 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
     /* Close all other fds. First arrange for the pipe fd to be the
      * lowest free fd, then close every open fd above that. */
     channel[1] = dup2(channel[1], 3);
-    closefds_from(4);
+    closefds_from(4, dont_close);
 
     if (-1 != channel[1]) {
         if (-1==fcntl(channel[1], F_SETFD,  FD_CLOEXEC)) {

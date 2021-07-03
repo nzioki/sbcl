@@ -302,6 +302,8 @@
   (more-results nil :type (or operand-parse null))
   ;; a list of all the above together
   (operands nil :type list)
+  ;; Which results can accept :unused TNs
+  (optional-results nil :type list)
   ;; names of variables that should be declared IGNORE
   (ignores () :type list)
   ;; true if this is a :CONDITIONAL VOP. T if a branchful VOP,
@@ -371,7 +373,7 @@
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
     '(arg-types args args-var before-load body conditional-p cost guard ignores info-args inherits
-      ltn-policy more-args more-results move-args name node-var note result-types
+      ltn-policy more-args more-results move-args name node-var note optional-results result-types
       results results-var save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
 ;; get this far in cross-compilaion. So it's probably not worth much.
@@ -607,7 +609,7 @@
           :num-results ,num-results
           :ref-ordering ,ordering
           ,@(when (targets)
-              `(:targets ,(sb-xc:coerce (targets) `(vector ,te-type)))))))))
+              `(:targets ,(coerce (targets) `(vector ,te-type)))))))))
 
 (defun make-emit-function-and-friends (parse)
   `(:temps ,(compute-temporaries-description parse)
@@ -1039,6 +1041,10 @@
          (setf (vop-parse-save-p parse)
                (vop-spec-arg spec
                              '(member t nil :compute-only :force-to-stack))))
+        (:optional-results
+         (setf (vop-parse-optional-results parse)
+               (append (vop-parse-optional-results parse)
+                       (rest spec))))
         (t
          (error "unknown option specifier: ~S" (first spec)))))
     (values)))
@@ -1096,11 +1102,11 @@
     (values costs load-scs)))
 
 (defconstant-eqx +no-costs+
-    (make-array sb-vm:sc-number-limit :initial-element 0)
+    #.(make-array sb-vm:sc-number-limit :initial-element 0)
   #'equalp)
 
 (defconstant-eqx +no-loads+
-    (make-array sb-vm:sc-number-limit :initial-element t)
+    #.(make-array sb-vm:sc-number-limit :initial-element t)
   #'equalp)
 
 ;;; Pick off the case of operands with no restrictions.
@@ -1141,7 +1147,9 @@
         :more-result-costs
         ',(if (vop-parse-more-results parse)
               (compute-loading-costs-if-any (vop-parse-more-results parse) nil)
-              nil)))))
+              nil)
+        :optional-results ',(loop for name in (vop-parse-optional-results parse)
+                                collect (position name (vop-parse-results parse) :key #'operand-parse-name))))))
 
 ;;;; operand checking and stuff
 
@@ -1387,8 +1395,10 @@
     `(make-vop-info
       :name ',(vop-parse-name parse)
       ,@(make-vop-info-types parse)
-      :guard ,(when (vop-parse-guard parse)
-                `(lambda () ,(vop-parse-guard parse)))
+      :guard ,(awhen (vop-parse-guard parse)
+                (if (typep it '(cons (eql lambda)))
+                    it
+                    `(lambda (node) (declare (ignore node)) ,it)))
       :note ',(vop-parse-note parse)
       :info-arg-count ,(length (vop-parse-info-args parse))
       :ltn-policy ',(vop-parse-ltn-policy parse)
@@ -1548,6 +1558,8 @@
 ;;;     Specifies a Form that is evaluated in the global environment.
 ;;;     If form returns NIL, then emission of this VOP is prohibited
 ;;;     even when all other restrictions are met.
+;;;     As an additional possibility, if Form is a lambda expression,
+;;;     then it is funcalled with the node under consideration.
 ;;;
 ;;; :VOP-VAR Name
 ;;; :NODE-VAR Name
@@ -1720,8 +1732,27 @@
       (try-coalescing vop-info-temps)
       (try-coalescing vop-info-ref-ordering)
       (try-coalescing vop-info-targets)))
+  ;; vop rdefinition should be allowed, but a dup in the cross-compiler
+  ;; is probably a mistake. REGISTER-VOP-PARSE is the wrong place
+  ;; to check this, because parsing has both compile-time and load-time
+  ;; effects, since inheritance is computed at compile-time.
+  ;; And there are false positives with any DEFINE-VOP in an assembler file
+  ;; because those are processed twice. I don't know what to do.
+  #+nil (when (gethash (vop-info-name vop-info) *backend-template-names*)
+                 (warn "Duplicate vop name: ~s" vop-info))
   (setf (gethash (vop-info-name vop-info) *backend-template-names*)
         vop-info))
+
+(defun undefine-vop (name)
+  (let ((parse (gethash name *backend-parsed-vops*)))
+    (dolist (translate (vop-parse-translate parse))
+      (let ((info (info :function :info translate)))
+        (setf (fun-info-templates info)
+              (delete name (fun-info-templates info)
+                      :key #'vop-info-name))
+        (format t "~&~s has ~d templates~%" translate (length (fun-info-templates info)))))
+    (remhash name *backend-parsed-vops*)
+    (remhash name *backend-template-names*)))
 
 ;;;; emission macros
 
@@ -1784,8 +1815,8 @@
          (result-count (length (vop-parse-results parse)))
          (info-count (length (vop-parse-info-args parse)))
          (noperands (+ arg-count result-count info-count))
-         (n-node (gensym))
-         (n-block (gensym))
+         (n-node (sb-xc:gensym))
+         (n-block (sb-xc:gensym))
          (n-template (gensym)))
 
     (when (or (vop-parse-more-args parse) (vop-parse-more-results parse))
@@ -1802,7 +1833,7 @@
         (collect ((ibinds)
                   (ivars))
           (dolist (info (subseq operands arg-count (+ arg-count info-count)))
-            (let ((temp (gensym)))
+            (let ((temp (sb-xc:gensym)))
               (ibinds `(,temp ,info))
               (ivars temp)))
 
@@ -1844,7 +1875,7 @@
          (fixed-args (butlast args))
          (fixed-results (butlast results))
          (n-node (gensym))
-         (n-block (gensym))
+         (n-block (sb-xc:gensym))
          (n-template (gensym)))
 
     (unless (or (vop-parse-more-args parse)

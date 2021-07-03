@@ -39,8 +39,14 @@
   ;; performance pathologies with objects for which EQUAL degenerates
   ;; to EQL. Everything entered in the SIMILAR table is also entered in
   ;; the EQ table.
-  (similar-table (make-hash-table :test 'equal) :type hash-table)
-  (eq-table (make-hash-table :test 'eq) :type hash-table)
+  (similar-table (make-similarity-table) :type hash-table :read-only t)
+  (eq-table (make-hash-table :test 'eq) :type hash-table :read-only t)
+  ;; the INSTANCE table maps dumpable instances to unique IDs for calculating
+  ;; a similarity hash of composite objects that contain instances.
+  ;; A user-defined hash function can not use address-based hashing, and it is
+  ;; better not to add a new lazy stable hash slot to instances as a
+  ;; side-effect of compiling.
+  (instance-id-table (make-hash-table :test 'eq) :type hash-table :read-only t)
   ;; the CONS table is an additional EQ table, used for storing CDRs
   ;; of dumped lists which will not have their own direct identity as
   ;; a dumped constant, but which might nevertheless be EQ to some
@@ -48,13 +54,13 @@
   ;; The hash table entry, if present, is a reference to its parent
   ;; list object (which will have a direct entity as a dumped
   ;; constant) along with an index of how many CDRs to take.
-  (cons-table (make-hash-table :test 'eq) :type hash-table)
+  (cons-table (make-hash-table :test 'eq) :type hash-table :read-only t)
   ;; Hashtable mapping a string to a list of fop-table indices of
   ;; symbols whose name is that string. For any name as compared
   ;; by STRING= there can be a symbol whose name is a base string
   ;; and/or a symbol whose name is not a base string.
   (string=-table (make-hash-table :test 'equal) :type hash-table)
-  ;; the table's current free pointer: the next offset to be used
+  ;; the fasloader table's current free pointer: the next offset to be used
   (table-free 0 :type index)
   ;; an alist (PACKAGE . OFFSET) of the table offsets for each package
   ;; we have currently located.
@@ -83,6 +89,119 @@
   ;; DEBUG-SOURCE written at the very beginning
   (source-info nil :type (or null sb-c::debug-source)))
 (declaim (freeze-type fasl-output))
+
+;;; Similarity hash table logic.
+;;; It really seems bogus to me that we do similarity checking in both
+;;; the IR1 namespace and the fasl dumper, even going so far as to use
+;;; two different ways to decide that an object is "harmless" to look up
+;;; (i.e. has no cyclic references).
+
+#-sb-xc-host
+(progn
+(defun similarp (x y)
+  ;; Do almost the same thing that EQUAL does, but:
+  ;;  - consider strings to be dissimilar if their element types differ.
+  ;;  - scan elements of all specialized numeric vectors (BIT is done by EQUAL)
+  (named-let recurse ((x x) (y y))
+    (or (%eql x y)
+        (typecase x
+          (cons
+           (and (consp y)
+                (recurse (car x) (car y))
+                (recurse (cdr x) (cdr y))))
+          (string
+           ;; Incidentally, if we want to preserve non-simpleness of dumped arrays
+           ;; (which is permissible but not required), this case (and below for arrays)
+           ;; would be where to do it by returning non-similar.
+           (and (stringp y)
+                ;; (= (widetag-of ...)) would be too strict, because a simple string
+                ;; can be be similar to a non-simple string.
+                (eq (array-element-type x)
+                    (array-element-type y))
+                (string= x y)))
+          ((or pathname bit-vector) ; fall back to EQUAL
+           ;; This could be slightly wrong, but so it always was, because we use
+           ;; (and have used) EQUAL for PATHNAME in SB-C::FIND-CONSTANT, but:
+           ;;   "Two pathnames S and C are similar if all corresponding pathname components are similar."
+           ;; and we readily admit that similarity of strings requires equal element types.
+           ;; So this is slightly dubious:
+           ;; (EQUAL (MAKE-PATHNAME :NAME (COERCE "A" 'SB-KERNEL:SIMPLE-CHARACTER-STRING))
+           ;;        (MAKE-PATHNAME :NAME (COERCE "A" 'BASE-STRING))) => T
+           ;; On the other hand, nothing says that the pathname constructors such as
+           ;; MAKE-PATHNAME and MERGE-PATHNAMES don't convert to a canonical representation
+           ;; which renders them EQUAL when all strings are STRING=.
+           ;; This area of the language spec seems to have been a clusterfsck.
+           (equal x y))
+          ;; We would need to enhance COALESCE-TREE-P to detect cycles involving
+          ;; SIMPLE-VECTOR before recursing, otherwise this could exhaust stack.
+          ((unboxed-array (*))
+           (and (sb-xc:typep y '(simple-array * 1))
+                (= (length x) (length y))
+                (equal (sb-xc:array-element-type x) (sb-xc:array-element-type y))
+                (or (typep x '(array nil (*)))
+                    (dotimes (i (length x) t)
+                      (unless (= (aref x i) (aref y i)) (return nil))))))
+          ;; How do SIMPLE-VECTOR and other array types get here?
+          ;; Answer: COALESCE-TREE-P is "weaker than" the the local COALESCE-P function in FIND-CONSTANT,
+          ;; so it may return T on trees that contain atoms that COALESCE-P would have returned NIL on.
+          ;; Therefore DUMP-NON-IMMEDIATE-OBJECT may call SIMILARP on an object for which COALESCE-P
+          ;; would have said NIL.
+          ;; As mentioned at the top of this file, this seems incredibly bad,
+          ;; But users do not tend to have object cycles involving SIMPLE-VECTOR and such, I guess?
+          ;; Anyway, the answer has to be "no" for everything else: un-EQL objects are not similar.
+          (t nil)))))
+;; This hash function is an amalgam of SXHASH and PSHASH with the following properties:
+;;  - numbers must have the same type to be similar (same as SXHASH)
+;;  - instances must be EQ to be similar (same as SXHASH)
+;;  - strings and characters are compared case-sensitively (same as SXHASH)
+;;  - arrays must have the same type to be similar
+;; Unlike EQUAL-HASH, we never call EQ-HASH, because there is generally no reason
+;; to try to look up an object that lacks a content-based hash value.
+(defun similar-hash (x)
+  (named-let recurse ((x x))
+    ;; There is no depth cutoff - X must not be circular,
+    ;; which was already determined as a precondition to calling this,
+    ;; except that as pointed out, we must not descend into simple-vector
+    ;; because there was no circularity checking done for arrays.
+    (typecase x
+      (list (do ((hash 0))
+                ((atom x) (mix (if x (recurse x) #xD00F) hash))
+              ;; mix the hash of the CARs only, without consuming stack
+              ;; proportional to list length.
+              (setf hash (mix (recurse (car x)) hash)
+                    x (cdr x))))
+      (symbol (sxhash x))
+      (number (sb-impl::number-sxhash x))
+      (pathname (sb-impl::pathname-sxhash x))
+      (instance
+       (let ((idmap (fasl-output-instance-id-table sb-c::*compile-object*)))
+         (values (ensure-gethash x idmap
+                                 (let ((c (1+ (hash-table-count idmap))))
+                                   (mix c c))))))
+      ;; Arrays disregard simplicity.
+      ((array nil (*)) #xdead) ; don't access the data in these bastards
+      ((unboxed-array (*))
+       (let* ((simple-array (coerce x '(simple-array * (*))))
+              (widetag (%other-pointer-widetag simple-array))
+              (saetp (find widetag sb-vm:*specialized-array-element-type-properties*
+                           :key #'sb-vm:saetp-typecode))
+              (n-data-words (ceiling (sb-vm::vector-n-data-octets simple-array saetp)
+                                     sb-vm:n-word-bytes))
+              (hash (word-mix (length x) widetag)))
+         (declare (word hash))
+         (dotimes (i n-data-words (logand hash most-positive-fixnum))
+           (setq hash (word-mix hash (%vector-raw-bits x i))))))
+      (character (char-code x))
+      (t 0))))
+(defun make-similarity-table ()
+  (make-hash-table :hash-function #'similar-hash :test #'similarp))
+) ; end PROGN
+
+;;; When cross-compiling, it's good enough to approximate similarity as EQUAL.
+#+sb-xc-host
+(defun make-similarity-table () (make-hash-table :test 'equal))
+
+(defmacro get-similar (key table) `(gethash ,key ,table))
 
 ;;; This structure holds information about a circularity.
 (defstruct (circularity (:copier nil))
@@ -197,13 +316,9 @@
 ;;; otherwise NIL.
 (defun similar-check-table (x fasl-output)
   (declare (type fasl-output fasl-output))
-  (let ((handle
-         (dolist (candidate (gethash x (fasl-output-similar-table fasl-output)))
-           (when (sb-c::similarp (car candidate) x)
-             (return (cdr candidate))))))
-    (cond
-     (handle (dump-push handle fasl-output) t)
-     (t nil))))
+  (awhen (get-similar x (fasl-output-similar-table fasl-output))
+    (dump-push it fasl-output)
+    t))
 
 ;;; These functions are called after dumping an object to save the
 ;;; object in the table. The object (also passed in as X) must already
@@ -216,7 +331,7 @@
 (defun similar-save-object (x fasl-output)
   (declare (type fasl-output fasl-output))
   (let ((handle (dump-to-table fasl-output)))
-    (push (cons x handle) (gethash x (fasl-output-similar-table fasl-output)))
+    (setf (get-similar x (fasl-output-similar-table fasl-output)) handle)
     (setf (gethash x (fasl-output-eq-table fasl-output)) handle))
   (values))
 ;;; Record X in File's CIRCULARITY-TABLE. This is called on objects
@@ -272,8 +387,8 @@
                     compiled from ~S~%  ~
                     using ~A version ~A~%"
                    where
-                   (sb-xc:lisp-implementation-type)
-                   (sb-xc:lisp-implementation-version))))
+                   (lisp-implementation-type)
+                   (lisp-implementation-version))))
        stream)
       (dump-byte +fasl-header-string-stop-char-code+ res)
       ;; Finish the header by outputting fasl file implementation,
@@ -289,7 +404,7 @@
                  (dump-byte (char-code (aref string i)) res))))
         (dump-counted-string (symbol-name +backend-fasl-file-implementation+))
         (dump-word +fasl-file-version+ res)
-        (dump-counted-string (sb-xc:lisp-implementation-version))
+        (dump-counted-string (lisp-implementation-version))
         (dump-counted-string (compute-features-affecting-fasl-format)))
       res)))
 
@@ -333,8 +448,8 @@
                     ((not (similar-check-table x file))
                      (dump-list x file t)
                      (similar-save-object x file))))
-             (layout
-              (dump-layout x file)
+             (wrapper
+              (dump-wrapper x file)
               (eq-save-object x file))
              #+sb-xc-host
              (ctype
@@ -348,8 +463,12 @@
                               ((eq x sb-c::*debug-name-ellipsis*) 2)
                               (t (bug "Bogus debug name marker")))))
              (instance
-              (dump-structure x file)
-              (eq-save-object x file))
+              (let ((c (gethash x (sb-c::eql-constants sb-c::*ir1-namespace*))))
+                (cond ((and c (sb-c::leaf-has-source-name-p c))
+                       (dump-load-time-symbol-global-value c file))
+                      (t
+                       (dump-structure x file)
+                       (eq-save-object x file)))))
              (array
               ;; DUMP-ARRAY (and its callees) are responsible for
               ;; updating the EQ and EQUAL hash tables.
@@ -409,7 +528,14 @@
              (dump-fop 'fop-truth file)
              (dump-non-immediate-object x file)))
         ((fixnump x) (dump-integer x file))
-        ((characterp x) (dump-character x file))
+        ((characterp x)
+         (dump-fop 'fop-character file (char-code x)))
+        ((packagep x)
+         (dump-push (dump-package x file) file))
+        #-sb-xc-host
+        ((system-area-pointer-p x)
+         (dump-fop 'fop-word-pointer file)
+         (dump-integer-as-n-bytes (sap-int x) sb-vm:n-word-bytes file))
         (t
          (dump-non-immediate-object x file))))
 
@@ -449,6 +575,7 @@
 ;;; We peek at the object type so that we only pay the circular
 ;;; detection overhead on types of objects that might be circular.
 (defun dump-object (x file)
+  #+(and metaspace sb-xc-host) (when (cl:typep x 'sb-vm:layout) (error "can't dump sb-vm:layout"))
   (if (compound-object-p x)
       (let ((*circularities-detected* ())
             (circ (fasl-output-circularity-table file)))
@@ -724,9 +851,9 @@
 ;;; tables.
 (defun dump-vector (x file)
   (let ((simple-version (if (array-header-p x)
-                            (sb-xc:coerce x `(simple-array
-                                              ,(array-element-type x)
-                                              (*)))
+                            (coerce x `(simple-array
+                                        ,(array-element-type x)
+                                        (*)))
                             x)))
     (typecase simple-version
       ;; On the host, take all strings to be simple-base-string.
@@ -789,9 +916,11 @@
   #-sb-xc-host (declare (type (simple-unboxed-array (*)) vector))
   (let* ((length (length vector))
          (widetag (%other-pointer-widetag vector))
-         (bits-per-length (aref **saetp-bits-per-length** widetag)))
-    (aver (< bits-per-length 255))
+         (bits-per-elt (sb-vm::simple-array-widetag->bits-per-elt widetag)))
     (unless data-only
+      ;; fop-spec-vector doesn't grok trailing #\null convention.
+      (aver (and (/= widetag sb-vm:simple-base-string-widetag)
+                 (/= widetag sb-vm:simple-vector-widetag)))
       (dump-fop 'fop-spec-vector file length)
       (dump-byte widetag file))
 
@@ -806,22 +935,19 @@
     (sb-impl::buffer-output (fasl-output-stream file)
                             vector
                             0
-                            (ceiling (* length bits-per-length) sb-vm:n-byte-bits)
-                            #+sb-xc-host bits-per-length))))
+                            (ceiling (* length bits-per-elt) sb-vm:n-byte-bits)
+                            #+sb-xc-host bits-per-elt))))
 
-;;; Dump characters and string-ish things.
-
-(defun dump-character (char file)
-  (dump-fop 'fop-character file (sb-xc:char-code char)))
+;;; Dump string-ish things.
 
 ;;; Dump a SIMPLE-STRING.
 (defun dump-chars (s fasl-output base-string-p)
   (declare (type simple-string s))
   (if (or base-string-p #-sb-unicode t) ; if non-unicode, every char is 1 byte
       (dovector (c s)
-        (dump-byte (sb-xc:char-code c) fasl-output))
+        (dump-byte (char-code c) fasl-output))
       (dovector (c s) ; varint (a/k/a LEB128) is better for this than UTF-8.
-        (dump-varint (sb-xc:char-code c) fasl-output))))
+        (dump-varint (char-code c) fasl-output))))
 
 ;;; If we get here, it is assumed that the symbol isn't in the table,
 ;;; but we are responsible for putting it there when appropriate.
@@ -891,7 +1017,8 @@
     :symbol-tls-index
     :foreign :foreign-dataref :code-object
     :layout :immobile-symbol :named-call :static-call
-    :symbol-value)
+    :symbol-value
+    :layout-id)
   #'equalp)
 
 ;;; Pack the aspects of a fixup into an integer.
@@ -931,7 +1058,15 @@
            (operand
             (ecase flavor
               (:code-object (the null name))
-              (:layout (if (symbolp name) name (layout-classoid-name name)))
+              (:layout
+               (if (symbolp name)
+                   name
+                   (wrapper-classoid-name
+                    (cond #+metaspace
+                          ((sb-kernel::layout-p name) (layout-friend name))
+                          (t name)))))
+              (:layout-id
+               (the wrapper name))
               ((:assembly-routine :assembly-routine* :asm-routine-nil-offset
                :symbol-tls-index
                ;; Only #+immobile-space can use the following two flavors.
@@ -941,11 +1076,16 @@
                ;; but its global value must be an immobile object.
                :immobile-symbol :symbol-value)
                (the symbol name))
-              ((:foreign #+linkage-table :foreign-dataref) (the string name))
+              ((:foreign :foreign-dataref) (the string name))
               ((:named-call :static-call) name))))
       (dump-object operand fasl-output)
       (dump-integer info fasl-output))
     (incf n)))
+
+(defun dump-load-time-symbol-global-value (constant fasl-output)
+  (dump-object 'symbol-global-value fasl-output)
+  (dump-object (sb-c::leaf-source-name constant) fasl-output)
+  (dump-fop 'fop-funcall fasl-output 1))
 
 ;;; Dump out the constant pool and code-vector for component, push the
 ;;; result in the table, and return the offset.
@@ -975,7 +1115,9 @@
         (let ((entry (aref constants i)))
           (etypecase entry
             (constant
-             (dump-object (sb-c::constant-value entry) fasl-output))
+             (if (sb-c::leaf-has-source-name-p entry)
+                 (dump-load-time-symbol-global-value entry fasl-output)
+                 (dump-object (sb-c::constant-value entry) fasl-output)))
             (cons
              (ecase (car entry)
                (:constant ; anything that has not been wrapped in a #<CONSTANT>
@@ -1087,7 +1229,7 @@
             (dolist (entry entries)
               ;; Process in reverse order of ENTRIES.
               ;; See also MAKE-CORE-COMPONENT which does the same thing.
-              (decf wordindex 4)
+              (decf wordindex sb-vm:code-slots-per-simple-fun)
               (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
                     `(:constant ,(sb-c::entry-info-name entry))
                     (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
@@ -1109,10 +1251,7 @@
         ;; to functions in top-level forms.
         #+sb-xc-host
         (let ((name (sb-c::entry-info-name entry)))
-          ;; At the moment, we rely on the fopcompiler to do linking
-          ;; for DEFUNs that are not block compiled.
-          (when (and (eq (sb-c::block-compile sb-c::*compilation*) t)
-                     (sb-c::legal-fun-name-p name))
+          (when (sb-c::legal-fun-name-p name)
             (dump-object name file)
             (dump-push entry-handle file)
             (dump-fop 'fop-fset file)))
@@ -1167,6 +1306,9 @@
 ;;; which gets multiply expanded exactly as described above.
 
 (defun load-form-is-default-mlfss-p (struct)
+  ;; FIXME? this is called while writing a fasl and so might need
+  ;; to invoke MAKE-LOAD-FORM, long after IR1 conversion has happened.
+  ;; Surely this is not the best design.
   (eq (nth-value 1 (sb-c::%make-load-form struct)) 'fop-struct))
 
 ;; Having done nothing more than load all files in obj/from-host, the
@@ -1183,12 +1325,12 @@
            struct))
   (note-potential-circularity struct file)
   (do* ((length (%instance-length struct))
-        (layout (%instance-layout struct))
-        (bitmap (layout-bitmap layout))
+        (wrapper (%instance-wrapper struct))
+        (bitmap (wrapper-bitmap wrapper))
         (circ (fasl-output-circularity-table file))
         (index sb-vm:instance-data-start (1+ index)))
       ((>= index length)
-       (dump-non-immediate-object layout file)
+       (dump-non-immediate-object wrapper file)
        (dump-fop 'fop-struct file length))
     (let* ((obj (if (logbitp index bitmap)
                     (%instance-ref struct index)
@@ -1205,14 +1347,14 @@
                              (t obj))
                        file))))
 
-(defun dump-layout (obj file)
-  (when (layout-invalid obj)
+(defun dump-wrapper (obj file &aux (flags (wrapper-flags obj)))
+  (when (wrapper-invalid obj)
     (compiler-error "attempt to dump reference to obsolete class: ~S"
-                    (layout-classoid obj)))
+                    (wrapper-classoid obj)))
   ;; STANDARD-OBJECT could in theory be dumpable, but nothing else,
   ;; because all its subclasses can evolve to have new layouts.
-  (aver (not (logtest (layout-flags obj) +pcl-object-layout-flag+)))
-  (let ((name (layout-classoid-name obj)))
+  (aver (not (logtest flags +pcl-object-layout-flag+)))
+  (let ((name (wrapper-classoid-name obj)))
     ;; Q: Shouldn't we aver that NAME is the proper name for its classoid?
     (unless name
       (compiler-error "dumping anonymous layout: ~S" obj))
@@ -1222,11 +1364,11 @@
     #-sb-xc-host
     (let ((fop (known-layout-fop name)))
       (when fop
-        (return-from dump-layout (dump-byte fop file))))
+        (return-from dump-wrapper (dump-byte fop file))))
     (dump-object name file))
-  (sub-dump-object (layout-bitmap obj) file)
-  (sub-dump-object (layout-inherits obj) file)
+  (sub-dump-object (wrapper-bitmap obj) file)
+  (sub-dump-object (wrapper-inherits obj) file)
   (dump-fop 'fop-layout file
-            (1+ (layout-depthoid obj)) ; non-stack args can't be negative
-            (logand (layout-flags obj) sb-kernel::layout-flags-mask)
-            (layout-length obj)))
+            (1+ (wrapper-depthoid obj)) ; non-stack args can't be negative
+            (logand flags sb-kernel::layout-flags-mask)
+            (wrapper-length obj)))

@@ -11,19 +11,21 @@
 
 #-(and x86-64 sb-thread) (sb-ext:exit :code 104) ;; not implemented elsewhere
 
+(defstruct fruitbasket x y z)
 (with-test (:name :aprof-smoketest-struct
+                  :skipped-on :darwin
             ;; reverse-engineering the allocation instructions fails but should not
             :fails-on (not :immobile-space))
   (let ((nbytes
          (sb-aprof:aprof-run
             (checked-compile
              '(sb-int:named-lambda "test" ()
-                (declare (inline sb-thread:make-mutex)
+                (declare (inline make-fruitbasket)
                          (optimize sb-c::instrument-consing))
-                (loop repeat 50 collect (sb-thread:make-mutex))))
+                (loop repeat 50 collect (make-fruitbasket))))
             :stream nil)))
     (assert (= nbytes
-               (* 50 (+ (sb-vm::primitive-object-size (sb-thread:make-mutex))
+               (* 50 (+ (sb-ext:primitive-object-size (make-fruitbasket))
                         (* 2 sb-vm:n-word-bytes))))))) ; cons cells
 
 (with-test (:name :aprof-smoketest-non-constant-size-vector
@@ -49,7 +51,7 @@
                 (declare (optimize sb-c::instrument-consing))
                 (make-array (* 128 16) :element-type 'bit)))
             :stream nil)))
-    (assert (= nbytes (sb-vm::primitive-object-size
+    (assert (= nbytes (sb-ext:primitive-object-size
                        (make-array (* 128 16) :element-type 'bit))))))
 
 (with-test (:name :aprof-smoketest-large-vector
@@ -100,7 +102,7 @@ sb-vm::
 
 #-win32
 (import '(sb-vm::temp-reg-tn sb-vm::thread-base-tn
-          sb-vm::thread-pseudo-atomic-bits-slot sb-vm::thread-alloc-region-slot
+          sb-vm::thread-alloc-region-slot
           sb-vm::rcx-tn sb-vm::rbp-tn sb-vm::r9-tn sb-vm::r10-tn sb-vm::rsi-tn
           sb-vm:cons-size sb-vm:n-word-bytes
           sb-vm::ea sb-vm:nil-value
@@ -114,8 +116,7 @@ sb-vm::
   (values (make-this-struct) (make-that-struct)))
 (compile 'make-structs)
 #-win32
-(with-test (:name :aprof-instance
-            :fails-on (or (not :immobile-space) :sb-safepoint))
+(with-test (:name :aprof-instance :skipped-on (not :immobile-space))
   (let (seen-this seen-that)
     (dolist (line (split-string
                    (with-output-to-string (s)

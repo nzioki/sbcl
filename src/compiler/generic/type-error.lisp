@@ -44,26 +44,7 @@
          (index :scs (unsigned-reg))
          (value :scs (descriptor-reg)))
   (:arg-types simple-array-nil positive-fixnum *)
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 1
-    (error-call vop 'nil-array-accessed-error object)))
-
-(define-vop (data-vector-set/simple-array-nil)
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
-         (value :scs (descriptor-reg)))
-  (:info offset)
-  (:arg-types simple-array-nil positive-fixnum *
-              (:constant (integer 0 0)))
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result offset)
+  (:ignore index value)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
@@ -90,7 +71,7 @@
   (cond ((sc-is thing immediate)
          (let ((obj (tn-value thing)))
            (typecase obj
-             (layout nil)
+             (wrapper nil)
              ;; non-static symbols can be referenced as error-break args
              ;; because they appear in the code constants.
              ;; static symbols can't be referenced as error-break args
@@ -126,7 +107,6 @@
   (def "INVALID-ARG-COUNT"       sb-c::%arg-count-error       nil nargs)
   (def "LOCAL-INVALID-ARG-COUNT" sb-c::%local-arg-count-error nil nargs fname)
   (def "OBJECT-NOT-TYPE"         sb-c::%type-check-error      t   object ptype)
-  (def "LAYOUT-INVALID"          sb-c::%layout-invalid-error  nil object layout)
   (def "ODD-KEY-ARGS"            sb-c::%odd-key-args-error    nil)
   (def "UNKNOWN-KEY-ARG"         sb-c::%unknown-key-arg-error t   key)
   (def "ECASE-FAILURE"           ecase-failure                nil value keys)
@@ -162,7 +142,7 @@
               (make-sc+offset immediate-sc-number (tn-value where)))
              (t
               (make-sc+offset (if (and (sc-is where immediate)
-                                       (typep (tn-value where) '(or symbol layout)))
+                                       (typep (tn-value where) '(or symbol wrapper)))
                                   constant-sc-number
                                   (sc-number (tn-sc where)))
                               (or (tn-offset where) 0))))

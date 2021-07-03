@@ -57,6 +57,26 @@
 
     DONE))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional)
+  ;; "extra" info in conditional vops follows the 2 super-magical info args
+  (:info target not-p test-layout)
+  (:temporary (:sc unsigned-reg) this-id test-id)
+  (:generator 4
+    (let ((label (register-inline-constant :layout-id test-layout))
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (inst lw test-id sb-vm::code-tn label)
+      (inst lw this-id x offset)
+      (inst nop)
+      (inst* (if not-p 'bne 'beq) this-id test-id target)
+      (inst nop))))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -66,8 +86,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -240,3 +260,10 @@
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 4
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))

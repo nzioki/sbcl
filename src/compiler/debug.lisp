@@ -107,7 +107,7 @@
                         (barf "strange CONSTANTS entry: ~S" v))
                       (dolist (n (leaf-refs v))
                         (check-node-reached n)))
-                    (eq-constants ns))
+                    (eql-constants ns))
 
            (maphash (lambda (k v)
                       (declare (ignore k))
@@ -498,6 +498,7 @@
      (dolist (exit (entry-exits node))
        (unless (node-deleted exit)
          (check-node-reached node))))
+    (enclose)
     (exit
      (let ((entry (exit-entry node))
            (value (exit-value node)))
@@ -756,14 +757,8 @@
 (defun check-block-conflicts (component)
   (do-ir2-blocks (block component)
     (do ((conf (ir2-block-global-tns block)
-               (global-conflicts-next-blockwise conf))
-         (prev nil conf))
+               (global-conflicts-next-blockwise conf)))
         ((null conf))
-      (when prev
-        (unless (> (tn-number (global-conflicts-tn conf))
-                   (tn-number (global-conflicts-tn prev)))
-          (barf "~S and ~S out of order in ~S" prev conf block)))
-
       (unless (find-in #'global-conflicts-next-tnwise
                        conf
                        (tn-global-conflicts
@@ -1047,7 +1042,12 @@
                      (cast-type-to-check node)
                      (cast-asserted-type node))))
           (no-op
-           (princ "no-op")))
+           (princ "no-op"))
+          (enclose
+           (write-string "enclose ")
+           (dolist (leaf (enclose-funs node))
+             (print-leaf leaf)
+             (write-char #\space))))
         (pprint-newline :mandatory)))
 
     (awhen (block-info block)
@@ -1084,6 +1084,7 @@
         ((null ref))
       (let ((tn (tn-ref-tn ref))
             (ltn (tn-ref-load-tn ref)))
+        (awhen (tn-ref-memory-access ref) (format t "@~A" it))
         (cond ((not ltn)
                (print-tn-guts tn))
               (t
@@ -1097,7 +1098,7 @@
 ;;; necessary.
 (defun print-vop (vop)
   (pprint-logical-block (*standard-output* nil)
-    (princ (vop-info-name (vop-info vop)))
+    (princ (vop-name vop))
     (princ #\space)
     (pprint-indent :current 0)
     (print-operands (vop-args vop))

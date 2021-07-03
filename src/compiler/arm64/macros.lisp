@@ -102,30 +102,21 @@
          (lip ,lip))
      (aver (sc-is lip interior-reg))
      (inst add lip function
-           (- (ash simple-fun-insts-offset word-shift)
-              fun-pointer-lowtag))
+           (+ (- (ash simple-fun-insts-offset word-shift)
+                 fun-pointer-lowtag)
+              4))
      (inst br lip)))
 
-(defmacro lisp-return (function lip return-style)
+(defmacro lisp-return (lip return-style)
   "Return to RETURN-PC."
-  `(let* ((function ,function)
-          (lip ,lip))
+  `(let* ((lip ,lip))
      (aver (sc-is lip interior-reg))
      ;; Indicate a single-valued return by clearing the Z flag
      ,@(ecase return-style
          (:single-value '((inst cmp null-tn 0)))
          (:multiple-values '((inst cmp zr-tn zr-tn)))
          (:known))
-     (inst sub lip function (- other-pointer-lowtag 8))
      (inst ret lip)))
-
-(defmacro emit-return-pc (label)
-  "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
-  `(progn
-     (emit-alignment n-lowtag-bits)
-     (emit-label ,label)
-     (inst lra-header-word)))
-
 
 ;;;; Stack TN's
 
@@ -156,7 +147,7 @@
   (once-only ((n-reg reg)
               (n-stack reg-or-stack))
     `(sc-case ,n-reg
-       ((any-reg descriptor-reg)
+       ((any-reg descriptor-reg interior-reg)
         (sc-case ,n-stack
           ((any-reg descriptor-reg)
            (move ,n-reg ,n-stack))
@@ -232,7 +223,7 @@
         (inst add result-tn result-tn size)
         (inst cmp result-tn flag-tn)
         (inst b :hi ALLOC)
-        #-sb-thread (inst str result-tn (@ null-tn (- boxed-region nil-value)))
+        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- boxed-region nil-value))))
         #+sb-thread (storew result-tn thread-tn thread-alloc-region-slot)
         ;; alloc_tramp uses tmp-tn for returning the result,
         ;; save on a move when possible
@@ -310,9 +301,9 @@
 ;;; handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((flag-tn &key (sync t)) &body forms)
   (declare (ignorable sync))
-  #+sb-safepoint-strictly
+  #+sb-safepoint
   `(progn ,@forms (emit-safepoint))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   `(progn
      (without-scheduling ()
        #-sb-thread
@@ -341,9 +332,7 @@
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
-         (emit-label not-interrputed))
-       #+sb-safepoint
-       (emit-safepoint))))
+         (emit-label not-interrputed)))))
 
 ;;;; memory accessor vop generators
 
@@ -377,11 +366,9 @@
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg immediate))
-            (value :scs ,scs :target result))
+            (value :scs ,scs))
      (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
-     (:results (result :scs ,scs))
-     (:result-types ,el-type)
      (:generator 2
        (sc-case index
          (immediate
@@ -390,8 +377,7 @@
                                         ,lowtag)))))
          (t
           (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
-          (storew value lip ,offset ,lowtag)))
-       (move result value))))
+          (storew value lip ,offset ,lowtag))))))
 
 (defmacro define-partial-reffer (name type size signed offset lowtag scs
                                  el-type &optional translate)
@@ -443,11 +429,9 @@
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg unsigned-reg immediate))
-            (value :scs ,scs :target result))
+            (value :scs ,scs))
      (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
-     (:results (result :scs ,scs))
-     (:result-types ,el-type)
      (:generator 5
        ,@(multiple-value-bind (op shift)
              (ecase size
@@ -475,8 +459,7 @@
                                              (asr index (- shift))
                                              (lsl index shift)))
                     (inst ,op
-                          ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))
-       (move result value))))
+                          ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))))))))
 
 (defun load-inline-constant (dst value &optional lip)
   (destructuring-bind (size . label) (register-inline-constant value)

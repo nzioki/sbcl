@@ -11,6 +11,29 @@
 
 #-x86-64 (sb-ext:exit :code 104)
 
+(with-test (:name :lowtag-test-elision)
+  ;; This tests a certain behavior that while "undefined" should at least not
+  ;; be fatal. This is important for things like hash-table :TEST where we might
+  ;; call (EQUAL x y) with X being an unbound marker indicating an empty cell.
+  ;; After we started using IR1 type derivation to elide lowtag as a guard condition
+  ;; in some type tests, it became more likely to dereference an unbound marker
+  ;; which does not fit anywhere in the lisp type space.
+  (let ((f (compile nil
+                    '(lambda (x)
+                      (typecase x
+                        ((or character number list sb-kernel:instance function) 1)
+                        ;; After eliminating the preceding cases, the compiler knows
+                        ;; that the only remaining pointer type is OTHER-POINTER,
+                        ;; so it just tries to read the widetag.
+                        ;; If X is the unbound marker, this will read a byte preceding
+                        ;; the start of static space, but it holds a zero.
+                        (simple-vector 2))))))
+    (assert (not (funcall f (sb-kernel:make-unbound-marker)))))
+  (assert (not (equalp (sb-kernel:make-unbound-marker) "")))
+  (let ((a (- (sb-kernel:get-lisp-obj-address (sb-kernel:make-unbound-marker))
+              sb-vm:other-pointer-lowtag)))
+    (assert (> a sb-vm:static-space-start))))
+
 (load "compiler-test-util.lisp")
 (defun disassembly-lines (fun)
   ;; FIXME: I don't remember what this override of the hook is for.
@@ -131,7 +154,9 @@
            #\newline))
          (index
           (position "OBJECT-NOT-TYPE-ERROR" lines :test 'search)))
-    (assert (search "; #<SB-KERNEL:LAYOUT for SB-ASSEM:LABEL" (nth (+ index 2) lines)))))
+    (let ((line (nth (+ index 2) lines)))
+      (assert (search "; #<SB-KERNEL:WRAPPER " line))
+      (assert (search " SB-ASSEM:LABEL" line)))))
 
 #+immobile-code
 (with-test (:name :reference-assembly-tramp)
@@ -199,7 +224,7 @@
         (expect "#<FDEFN G>" lines)
         (expect "#<FUNCTION H>" lines)))))
 
-(with-test (:name :c-call)
+(with-test (:name :c-call :skipped-on (and :win32 :x86-64))
   (let* ((lines (split-string
                  (with-output-to-string (s)
                    (let ((sb-disassem:*disassem-location-column-width* 0))
@@ -323,6 +348,14 @@
                   (and (search "CMP QWORD PTR [" line)
                        (search ":YUP" line))))))
 
+(defun thing-ref-thing-ref (arg1 arg2)
+  (declare (optimize (safety 0)))
+  (let ((answer (typep (thing-x (thing-x arg1)) 'fixnum)))
+    (frobify arg1 arg2)
+    answer))
+(defun frobify (a b) (values a b))
+(compile 'thing-ref-thing-ref)
+
 (with-test (:name :fixnump-thing-ref)
   (flet ((try (access-form true false)
            (let* ((f (compile nil `(lambda (obj) (typep ,access-form 'fixnum))))
@@ -341,7 +374,9 @@
     (try '(thing-x (truly-the thing obj))
          (make-thing :x 1) (make-thing :x "hi"))
     (try '(car obj) '(1) '("hi"))
-    (try '(cdr obj) '("hi" . 1) '("hi"))))
+    (try '(cdr obj) '("hi" . 1) '("hi")))
+  ;; fixnump of memref of memref was eliding one memref by accident
+  (assert (thing-ref-thing-ref (make-thing :x (make-thing :x 3)) 'foo)))
 
 (with-test (:name :huge-code :skipped-on (not :immobile-code))
   (sb-vm::allocate-code-object :immobile 0 4 (* 2 1024 1024)))
@@ -593,7 +628,8 @@ sb-vm::(define-vop (cl-user::test)
    ;; to :dword because zeroing the upper 32 bits is a visible effect.
    (inst mov (reg-in-size rax-tn :qword) (reg-in-size rcx-tn :qword))
    (inst mov rax-tn rcx-tn)))
-(with-test (:name :mov-mov-elim-ignore-resized-reg) ; just don't crash
+(with-test (:name :mov-mov-elim-ignore-resized-reg
+                  :fails-on :sbcl) ; just don't crash
   (checked-compile '(lambda () (sb-sys:%primitive test) 0)))
 
 (defstruct a)
@@ -682,16 +718,17 @@ sb-vm::(define-vop (cl-user::test)
   ;; component.
   (let ((names
           (mapcar (lambda (x)
-                    (sb-kernel:classoid-name (sb-kernel:layout-classoid x)))
-                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:layout))))
+                    (sb-kernel:classoid-name (sb-kernel:wrapper-classoid x)))
+                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:wrapper))))
     (assert (null (set-difference names
                                   '(sb-kernel:ctype
                                     sb-kernel:unknown-type
                                     sb-kernel:fun-designator-type
                                     sb-c::abstract-lexenv
                                     sb-kernel::classoid-cell
-                                    sb-kernel:layout
+                                    sb-kernel:wrapper
                                     sb-kernel:classoid
+                                    sb-kernel:built-in-classoid
                                     #-immobile-space null))))))
 
 ;; lp#1857861
@@ -708,7 +745,7 @@ sb-vm::(define-vop (cl-user::test)
      (loop for line in (split-string (with-output-to-string (string)
                                        (disassemble f :stream string))
                                      #\newline)
-             thereis (and (search "LAYOUT for" line)
+             thereis (and (search "WRAPPER for" line)
                           (search "CMP DWORD PTR" line)))))
 
 (with-test (:name :thread-local-unbound)
@@ -717,13 +754,20 @@ sb-vm::(define-vop (cl-user::test)
 
 #+immobile-code
 (with-test (:name :debug-fun-from-pc-more-robust)
-  (let ((trampoline
-          (sb-di::code-header-from-pc
-           (sb-sys:int-sap (sb-vm::fdefn-raw-addr
-                            (sb-kernel::find-fdefn 'sb-kernel::get-internal-real-time))))))
-    (assert (zerop (sb-kernel:code-n-entries trampoline)))
-    (assert (typep (sb-di::debug-fun-from-pc trampoline 8)
-                   'sb-di::bogus-debug-fun))))
+  ;; This test verifies that debug-fun-from-pc does not croak when the PC points
+  ;; within a trampoline allocated to wrap a closure in a simple-funifying wrapper
+  ;; for installation into a global symbol.
+  (let ((closure (funcall (compile nil '(lambda (x)  (lambda () x))) 0))
+        (symbol (gensym)))
+    (assert (sb-kernel:closurep closure))
+    (setf (fdefinition symbol) closure)
+    (let ((trampoline
+            (sb-di::code-header-from-pc
+             (sb-sys:int-sap (sb-vm::fdefn-raw-addr
+                              (sb-kernel::find-fdefn symbol))))))
+      (assert (zerop (sb-kernel:code-n-entries trampoline)))
+      (assert (typep (sb-di::debug-fun-from-pc trampoline 8)
+                     'sb-di::bogus-debug-fun)))))
 
 (defstruct foo (s 0 :type (or null string)))
 (with-test (:name :reduce-stringp-to-not-null)
@@ -739,3 +783,225 @@ sb-vm::(define-vop (cl-user::test)
     ;; the two variations of the test compile to the identical code
     (dotimes (i 4)
       (assert (string= (nth i f1) (nth i f2))))))
+
+(with-test (:name :make-list-ridiculously-huge)
+  (checked-compile '(lambda () (make-list 3826305079707827596))
+                   :allow-warnings t))
+
+(with-test (:name :with-foo-macro-elides-arg-count-trap)
+  (let ((lines
+          (split-string
+           (with-output-to-string (s)
+             (sb-c:dis '(lambda (x) (with-standard-io-syntax (eval x))) s))
+           #\newline)))
+    ;; The outer lambda checks its arg count, but the lambda
+    ;; passed to call-with-mutex does not.
+    (assert (= (count-if (lambda (line)
+                           (search "Invalid argument count trap" line))
+                         lines)
+               1))))
+
+#+compact-instance-header
+(with-test (:name :gf-self-contained-trampoline)
+  (let ((l (sb-kernel:find-layout 'standard-generic-function)))
+    (assert (/= (sb-kernel:wrapper-bitmap l) sb-kernel:+layout-all-tagged+))))
+
+(with-test (:name :known-array-rank)
+  (flet ((try (type)
+           (let ((lines
+                  (disassembly-lines
+                   `(lambda (x)
+                     #+sb-safepoint (declare (optimize (sb-c::insert-safepoints 0)))
+                     (array-rank (truly-the ,type x))))))
+             ;; (format t "~{~&~A~}" lines)
+             ;; Naturally this is brittle as heck. I wish we had a better way.
+             (assert (<= (length lines) 9)))))
+    (try 'string)
+    (try '(and vector (not simple-array)))
+    (try '(or string bit-vector)) ; not an array type, but known rank
+    (try '(array * (4 5 *)))))
+
+;;; Match the same set of objects that %OTHER-POINTER-P does.
+(deftype other-pointer-object ()
+  '(not (or fixnum single-float function list sb-kernel:instance character)))
+
+;;; Helper to assert something about how many comparisons it takes to test
+;;; for various sets of widetags.
+(defun count-cmp-opcodes (type expect function)
+  (let ((lines (disassembly-lines function)))
+    (let ((actual
+           (loop for line in lines
+                 count (or (search "CMP" line)
+                           (search "TEST" line)))))
+      (unless (eql actual expect)
+        (format t "~{~&~a~}~%" lines)
+        (error "typep: needed ~d test ops but expected ~d for ~a"
+               actual expect type)))))
+
+(defun check-arrayp-cmp-opcodes (expect type)
+  ;; Assume the lowtag test passed already.
+  (count-cmp-opcodes type expect
+          `(lambda (x)
+             (declare (optimize (sb-c::verify-arg-count 0)
+                                #+sb-safepoint (sb-c::insert-safepoints 0)))
+             (typep (truly-the other-pointer-object x) ',type))))
+
+(with-test (:name :arrayp-exactly-one-comparison-etc)
+  (check-arrayp-cmp-opcodes 1 'array)
+
+  (check-arrayp-cmp-opcodes 1 'string)
+  (check-arrayp-cmp-opcodes 1 'base-string) ; widetags differing in one bit
+  #+sb-unicode
+  (check-arrayp-cmp-opcodes 1 'sb-kernel::character-string) ; ditto
+  (check-arrayp-cmp-opcodes 1 'simple-string) ; 2 adjacent widetags
+  (check-arrayp-cmp-opcodes 1 '(and string (not simple-array)))
+  (check-arrayp-cmp-opcodes 1 'simple-base-string)
+  #+sb-unicode
+  (check-arrayp-cmp-opcodes 1 'sb-kernel::simple-character-string)
+  ;; FIXME: (AND STRING (NOT SIMPLE-STRING)) executs 4 tests
+  ;; but it denotes the same set of objects as (AND STRING (NOT SIMPLE-ARRAY)).
+  ;; The problem is with type algebra, not in the backend.
+
+  ;; FIXME: this should be 1 comparison: widetag >= start-of-complex-widetags
+  (check-arrayp-cmp-opcodes 2 '(and array (not simple-array)))
+
+  ;; some other interesting pairs
+  ;; This was passing just by random coincidence.
+  ;; The widetag patterns no longer differ in exactly 1 bit.
+  ;; Is there any real relevance to this test?
+  #+nil
+  (check-arrayp-cmp-opcodes 1 '(or (simple-array (unsigned-byte 8) (*))
+                                    (simple-array (unsigned-byte 16) (*))))
+  ;; FIXME: what's up with SIMPLE-UNBOXED-ARRAY requiring 1 SUB,
+  ;; 3 CMPs, and a MOVZX. Something doesn't feel right.
+  ;; In general, a lot of the array types are source-transforming to
+  ;; (AND (SB-KERNEL:%OTHER-POINTER-P #:OBJECT0)
+  ;;      (EQ (SB-KERNEL:%OTHER-POINTER-WIDETAG #:OBJECT0) something))
+  )
+
+(defun check-integerp-cmp-opcodes (expect type)
+  (count-cmp-opcodes type expect
+          `(lambda (x)
+             (declare (optimize (sb-c::verify-arg-count 0)
+                                #+sb-safepoint (sb-c::insert-safepoints 0)))
+             (typep x ',type))))
+
+(with-test (:name :typep-integer-doubleton)
+  ;; This was taking 3 comparisons because it was a FIXNUMP test
+  ;; and some range-based testing rather than just 2 EQ tests.
+  (check-integerp-cmp-opcodes 2 '(integer 1 2)))
+
+(defun typep-asm-code-length (type)
+  (let* ((lines
+          (disassembly-lines
+           (compile nil
+                    `(lambda (x)
+                       (declare (optimize (sb-c::verify-arg-count 0) (debug 0)))
+                       (typep x ',type)))))
+         (callp
+          (some (lambda (x) (or (search "#<FUNCTION" x)
+                                (search "#<FDEFN" x)))
+                lines)))
+    (values (length lines) callp)))
+
+;;; Counting instructions of assembly is sort of a very rough guess
+;;; as to whether widetags are being tested as efficiently as possible.
+;;; This file is for both human and machine consumption.
+;;; #\! precedes any line where the type test involves a function call.
+;;; It might be just a call. We might consider inlining some of those.
+(defun write-golden-typep-data (input-name output-name)
+  (with-open-file (input input-name)
+    (with-open-file (output output-name :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+      (let ((*package* (find-package "SB-KERNEL"))
+            (*print-pretty* nil))
+        (loop (let ((type (read input nil input)))
+                (when (eq type input) (return))
+                (multiple-value-bind (linecount callp) (typep-asm-code-length type)
+                  (format output "~a ~3d ~s~%"
+                          (if callp "!" " ")
+                          linecount type))))))))
+
+#+nil
+(write-golden-typep-data "../interesting-types.lisp-expr"
+                         "typep-golden-data.txt")
+
+(defun compare-to-golden-typep-data (pathname)
+  (with-open-file (input pathname)
+    (let ((*package* (find-package "SB-KERNEL")))
+      (loop (let ((line (read-line input nil input)))
+              (when (eq line input) (return))
+              (with-input-from-string (stream line :start 2)
+                (let ((expect-n (read stream))
+                      (type (read stream)))
+                  (multiple-value-bind (linecount callp) (typep-asm-code-length type)
+                    (declare (ignore callp))
+                    (when (/= linecount expect-n)
+                      (warn "~S was ~d is ~d" type expect-n linecount))))))))))
+
+(with-test (:name :many-interesting-array-types :skipped-on (:not :sb-unicode))
+  (compare-to-golden-typep-data "typep-golden-data.txt"))
+
+(with-test (:name :integerp->bignump-strength-reduction)
+  (let ((f1 (compile nil '(lambda (x)
+                           (typecase x (fixnum 'a) (integer 'b) (t 'c)))))
+        (f2 (compile nil '(lambda (x)
+                           (typecase x (fixnum 'a) (bignum 'b) (t 'c))))))
+    (assert (= (length (disassembly-lines f1))
+               (length (disassembly-lines f2))))))
+
+(with-test (:name :boundp+symbol-value
+            :skipped-on (not :sb-thread))
+  ;; The vop combiner produces exactly one reference to SB-C::*COMPILATION*.
+  ;; Previously there would have been one from BOUNDP and one from SYMBOL-VALUE.
+  (let ((lines (disassembly-lines
+                '(lambda ()
+                  (if (boundp 'sb-c::*compilation*) sb-c::*compilation*) '(hi)))))
+    (dolist (line lines)
+      (assert (not (search "ERROR" line))))
+    (assert (= (loop for line in lines
+                     count (search "*COMPILATION*" line))
+               1)))
+  ;; Non-constant symbol works too now
+  (let ((lines (disassembly-lines
+                '(lambda (x) (if (boundp (truly-the symbol x)) x '(hi))))))
+    (dolist (line lines)
+      (assert (not (search "ERROR" line))))))
+
+;;; We were missing the fndb info that fill-pointer-error doesn't return
+;;; (not exactly "missing", but in the wrong package)
+(with-test (:name :fill-pointer-no-return-multiple)
+  (let ((lines (disassembly-lines '(lambda (x) (fill-pointer x)))))
+    (dolist (line lines)
+      (assert (not (search "RETURN-MULTIPLE" line))))))
+
+(with-test (:name :elide-zero-fill)
+  (let* ((f (compile nil '(lambda () (make-array 100 :initial-element 0))))
+         (lines (disassembly-lines f)))
+    (dolist (line lines)
+      (assert (not (search "REPE STOSQ" line))))))
+
+;;; Word-sized stores (or larger, like double-float on 32-bit) would cons a new lisp object
+(with-test (:name :sap-set-does-not-cons)
+  (loop for (type accessor telltale) in
+        '((sb-vm:word sb-sys:sap-ref-word "ALLOC-UNSIGNED-BIGNUM")
+          (double-float sb-sys:sap-ref-double "CONS"))
+        do (let* ((positive-test
+                   (compile nil `(lambda (sap) (,accessor sap 0))))
+                  (negative-test
+                   (compile nil `(lambda (sap obj) (setf (,accessor sap 0) obj)))))
+             ;; Positive test ensures we know the right telltale for the type
+             ;; in case the allocation logic changes
+             (assert (loop for line in (disassembly-lines positive-test)
+                           thereis (search telltale line)))
+             (assert (not (loop for line in (disassembly-lines negative-test)
+                                thereis (search telltale line)))))))
+
+(with-test (:name :bash-copiers-byte-or-larger)
+  (dolist (f '(sb-kernel::ub8-bash-copy
+               sb-kernel::ub16-bash-copy
+               sb-kernel::ub32-bash-copy
+               sb-kernel::ub64-bash-copy))
+    ;; Should not call anything
+    (assert (not (ctu:find-code-constants (symbol-function f))))))

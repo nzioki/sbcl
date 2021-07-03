@@ -22,7 +22,7 @@
                   (:predicate nil))
   ;; A list of all the entries (except for CONS entries below) in highest
   ;; to lowest priority.
-  (entries nil :type list)
+  (entries #() :type simple-vector)
   ;; A hash table mapping things to entries for type specifiers of the
   ;; form (CONS (MEMBER <thing>)). If the type specifier is of this form,
   ;; we put it in this hash table instead of the regular entries table.
@@ -33,7 +33,3 @@
   (only-initial-entries nil :type boolean))
 
 (declaim (freeze-type pprint-dispatch-table))
-
-#+sb-xc
-(defmethod print-object ((table pprint-dispatch-table) stream)
-  (print-unreadable-object (table stream :type t :identity t)))

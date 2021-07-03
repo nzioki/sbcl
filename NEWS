@@ -1,8 +1,370 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
-changes relative to sbcl-2.0.5:
+changes relative to sbcl-2.1.6:
+  * minor incompatible change: SB-SPROF:START-PROFILING no longer silently
+    does nothing if the clock is already running. It instead stop and restarts
+    with the newly provided options, and warns.
+
+changes in sbcl-2.1.6 relative to sbcl-2.1.5:
+  * minor incompatible change: COMPILE-FILE does not merge the input file's
+    pathname-directory into the output path if :OUTPUT-FILE was specified
+    and has a directory that is not :UNSPECIFIC.
+  * platform support:
+    ** improvements to unwind code generation on arm64.
+    ** on x86-64, accept three operands for vshufpd.  (reported by Bela
+       Pecsek)
+    ** on x86-64, improvements to use of popcount
+    ** improve exception handling on 64-bit Windows.  (thanks to Luis Borges
+       de Oliveira)
+  * bug fix: allow use of macros with improper argument list.  (lp#1929623,
+    thanks to Sean Maher)
+  * bug fix: COERCE no longer attempts to guess what the user meant if they
+    provide a type specifier of a union of types other than STRING.
+    (lp#1929614)
+  * bug fix: print a single trailing zero after the decimal point for FORMAT
+    ~E if there are no digits remaining to be printed and the width allows it.
+    (lp#883520)
+
+changes in sbcl-2.1.5 relative to sbcl-2.1.4:
+  * minor incompatible change: on x86-64, the backend instruction encoders for
+    movzx and for string opcodes have changed their semantics.
+  * platform support:
+    ** compatibility: support the latest MinGW on x86.  (lp#1923325, thanks to
+       Alexis Rivera)
+    ** bug fix: on x86-64, fix instruction encoding for TEST on RIP-relative
+       addresses.  (lp#1925808, reported by Shinmera on #sbcl, thanks also to
+       3b)
+    ** bug fix: on x86-64, loading all-1s into an AVX2 register no longer
+       causes an error.  (thanks to Marco Heisig)
+    ** bug fix: on arm64, improve disassembly of ADD with constant 0 as MOV
+    ** enhancement: on arm64, support debugger commands RETURN-FROM-FRAME and
+       RESTART-FRAME more efficiently.
+    ** enhancement: on x86-64, add support for vshuf* AVX2 instructions.
+       (reported by Bela Pecsek)
+    ** optimization: faster function calls on arm64.
+    ** optimization: (SETF SBIT) is faster on x86-64.
+  * bug fix: INTEGER-DECODE-FLOAT was computing the wrong answer for denormal
+    double floats.  (lp#1926383, reported by Stavros Macrakis)
+  * bug fix: RANDOM on a floating point argument now does not cons.  (reported
+    by Tito Latini)
+  * bug fix: fix a compiler crash in type derivation of LOGTEST.  (lp#1928243)
+  * bug fix: fix a compiler failure when a declared function type contains a
+    literal structure with a valid MAKE-LOAD-FORM method.  (lp#1929160, thanks
+    to Yurii Hryhorenko)
+  * optimization: FBOUNDP on a constant symbol is now faster.
+  * optimization: file compilation now produces smaller fasls for files which
+    reference package literals.
+  * optimization: derive the type of calls to FLOAT-SIGN.
+
+changes in sbcl-2.1.4 relative to sbcl-2.1.3:
+  * platform support:
+    ** work around address-space randomization causing instability on new
+       versions of MinGW.  (lp#1921141)
+  * bug fix: RANDOM on floats returns values strictly less than the float
+    argument.
+  * bug fix: compiler error on x86-64 resulting from attempting to zero a
+    memory location with xor.  (reported by Eric Marsden)
+  * optimization: extended loops updating iteration variables with THEN can
+    perform specialized arithmetic for those updates.
+  * optimization: in some cases, the jump table resulting from a compilation
+    of TYPECASE is simpler.
+  * optimization: on x86-64, IF BOUNDP followed by SYMBOL-VALUE can elide some
+    memory loads and tests.
+
+changes in sbcl-2.1.3 relative to sbcl-2.1.2:
+  * minor incompatible change: support for the :SB-SAFEPOINT-STRICTLY,
+    :SB-THRUPTION, and :SB-WTIMER build features has been removed
+  * platform support:
+    ** support for :SB-CORE-COMPRESSION on Darwin/ARM64
+    ** support ARM v8.1 atomic and compare-and-swap instructions
+    ** x86, x86-64: microoptimizations in multiple type-checking routines
+  * bug fix: structures and conditions are now TYPEP all classes in the class
+    precedence list of their class.  (reported by Luis Oliveira)
+  * bug fix: derivation of the result type from subtraction sometimes
+    erroneously excluded zero.  (lp#1916895)
+  * bug fix: reduce the number of places where the system permissively accepts
+    the symbol * as a type specifier where it should not be accepted.
+    (lp#1860919)
+  * bug fix: the code-walker used by the system's implementation of CLOS can
+    handle defuns declared inline.  (reported by Don Cohen)
+  * optimization: EQUALP on specialized vectors and arrays is faster.
+  * optimization: support routines for EQUALP hash tables generate less garbage.
+
+changes in sbcl-2.1.2 relative to sbcl-2.1.1:
+  * platform support:
+    ** support for ARM64 macOS;
+    ** improvement in coverage mark implementation on non-x86oid backends,
+       approaching the existing x86oid support;
+    ** more empirically-robust retrieval of the program counter from illegal
+       instruction traps on SPARC;
+    ** retain fewer dead objects when saving cores with precise collectors.
+  * incompatible change: MAP-ALL-SAMPLES and MAP-TRACE-SAMPLES
+    are no longer present in the SB-SPROF contrib module.
+  * minor incompatible change: SB-SPROF:WITH-PROFILING defaults to all
+    threads. SB-SPROF:START-PROFILING no longer accepts a :SAMPLING keyword.
+  * enhancement: the sb-introspect contrib now supports finding the lambda
+    lists of method combinations.  (thanks to Didier Verna)
+  * enhancement: short-form DEFSETF now stores a source-location.
+  * bug fix: canonical unions of CONS types were being incorrectly computed.
+    (lp#1912863, reported by James Kalenius)
+  * bug fix: better understanding of array simplicity (or otherwise) in the
+    type system.  (lp#1903241)
+  * bug fix: unions of rational and integer types now have a single canonical
+    form, allowing more correct reasoning about them in the type system.
+  * bug fix: less likely to overclaim certainty about type equality of union
+    types.  (lp#1916040)
+  * bug fix: HANDLER-BIND evaluates the forms producing handler functions only
+    once.  (lp#1916302, reported by Christophe Junke)
+  * optimization: FIND on constant sequences can be compiled into a jump
+    table, in a similar manner to POSITION
+  * optimization: the compiler's awareness of numeric contagion rules for
+    operations on pairs of floating point numbers is improved.  (lp#1914094,
+    thanks to Andrew Berkley)
+
+changes in sbcl-2.1.1 relative to sbcl-2.1.0:
+  * platform support:
+    ** restore non-threaded NetBSD builds;
+    ** adjust how the finalizer thread is started; (lp#1906571, lp#1907872)
+    ** fix the encoding of PEXTR on x86-64;
+  * minor incompatible change: emit warnings for list iteration forms when the
+    object being iterated over is known not to be a list.  (lp#1908819,
+    reported by Michael Fiano)
+  * bug fix: detect 2 or 1 as an invalid number of arguments passed to
+    optimized slot reading or writing effective method respectively.
+    (lp#1909659, reported by Michal Herda)
+  * bug fix: division by zero errors were in some cases not being signalled.
+    (lp#1910098, reported by il71)
+  * bug fix: erroneous coercions in the type system could lose precision.
+    (lp#1910294)
+  * bug fix: literal (read-time evaluated) NaNs in source code no longer cause
+    compiler crashes.  (lp#1909881, reported by Michal Herda)
+  * bug fix: detect more erroneous syntax in method bodies.  (lp#1912362,
+    reported by Paul M. Rodriguez)
+  * optimization: the compiler's understanding of EXPT is improved, reducing
+    the introduction of COMPLEX types.  (lp#1908830, reported by Michael Fiano)
+  * optimization: the compiler is better at computing numeric contagion when
+    (COMPLEX FLOAT) types are involved.
+  * micro-optimizations:
+    ** moving from slightly-bigger-than-fixnum ranges is more efficient on x86-64;
+    ** encode character comparisons with smaller operands on x86-64;
+    ** truncating (and related operations) on floats can be inlined in more
+       cases on 64-bit platforms;
+    ** rounding can use specialized instructions on ARM64 and on x86-64 when
+       SSE4 is available;
+
+changes in sbcl-2.1.0 relative to sbcl-2.0.11:
+  * minor incompatible change: the MAKE-EA internal function, used in the
+    assembler, has been removed (affecting some libraries defining their own
+    Virtual Operations)
+  * new feature: SB-EXT:PRIMITIVE-OBJECT-SIZE can be used to interrogate the
+    low-level size in memory of objects.  (lp#1636910, reported by anquegi)
+  * platform support:
+    ** pass required -std argument to the compiler on Solaris (lp#1885751,
+       thanks to Jesse Off)
+    ** better treatment of non-ASCII program arguments on Windows (lp#1907970,
+       reported by Timofei Shatrov)
+    ** implement the improved TYPEP with structure types on all other
+       supported platforms (32-bit PowerPC, ARM, ARM64, MIPS, SPARC, RISC-V)
+  * enhancement: stream dispatch (to vanilla ANSI / Gray / Simple variants) has
+    been rewritten and optimized, fixing a number of bugs including:
+    ** performance of WRITE-SEQUENCE on composite streams (lp#309136)
+    ** handling of CLOSE on SYNONYM-STREAM (lp#1904257, reported by Richard M
+       Kreuter)
+    ** handling of CLOSE on BROADCAST-STREAM with no components (lp#1904722,
+       reported by Richard M Kreuter)
+    ** loading SB-SIMPLE-STREAMS breaks functionality of other stream classes
+       (lp#1908132)
+    ** some excessive consing in READ-LINE
+  * enhancements related to RUN-PROGRAM:
+    ** improved the documentation related to the ARGS argument (lp#806733,
+       reported by mon_key)
+    ** added a PRESERVE-FDS argument
+  * bug fix: ensure that TYPE-OF returns something even on internal instances,
+    which may become visible in the debugger.  (lp#1908261, reported by
+    Philipp Marek)
+  * bug fix: iteration variables established by standard forms should always
+    be considered used by the compiler.  (lp#719585, reported by Roman
+    Marynchak)
+  * bug fix: don't allow compiler transformations to weaken the requirement
+    against extended (list-form) function names in FUNCALL and related
+    operators.  (lp#310069)
+  * bug fix: improve automated version number generation in branches.
+    (lp#897867, thanks to Martin Cracauer)
+  * bug fix: add possibly-spurious futex wakes when unwinding from a call to
+    futex-wait, to avoid deadlocks from interrupted waits.  (lp#1038034)
+  * bug fixes in the compiler:
+    ** error on malformed DESTRUCTURING-BIND (lp#1738638)
+    ** error on malformed SPECIAL declaration (lp#1740756)
+    ** error from use of VALUES type in COERCE (lp#1887712)
+    ** enforcement of FTYPE types involving &OPTIONAL (lp#1903932)
+    ** checking for proper-list-ness before applying transforms (lp#1905512)
+    ** compilation of LAMBDA form including a malformed DEFUN (lp#1906056)
+    ** memory fault from VALUES-related handling in high DEBUG code
+       (lp#1906563)
+    ** transforms handle explicit NIL arguments in :END arguments to SEARCH
+       (lp#1907924)
+  * bug fix: return COMPILED-FUNCTION for TYPE-OF on compiled functions.
+    (lp#1906583)
+  * some bugs were also closed in this release cycle as obsolete, having been
+    fixed by the passage of time or other change in the environment:
+    ** floating point error reporting on OS X (lp#309454)
+    ** load-shared-library not working from non-main threads on OS X (lp#592425)
+  * optimization: CONSTANTLY on constant arguments returns a more efficient
+    function.  (lp#1852585)
+  * optimization: perform fewer Lisp/Alien representation conversions in
+    callbacks.
+  * optimization: perform fewer redundant widetag tests when doing type tests
+    of complicated union types.
+  * optimization: signed-integer division on machine-word sized operands is
+    now implemented using multiplication, affecting TRUNCATE, FLOOR, CEILING,
+    MOD and REM.  (This optimization was already performed on unsigned-integer
+    division)
+
+changes in sbcl-2.0.11 relative to sbcl-2.0.10:
+  * minor incompatible change: (ARRAY NIL (*)) is not a subtype of STRING,
+    as is consistent with a majority of maintained CL implementations.
+  * minor incompatible change: ARRAY-RANK-LIMIT is decreased from 65529 to 256
+  * optimization: TYPEP on structure types is faster and more compact on
+    x86[-64] and ppc64.
+  * optimization: LOGCOUNT is faster on arm64.
+  * optimization: SIGNUM can be inlined if its argument type is known.
+    (lp#1903533)
+  * bug fix: compiler crash in tail call handling.  (lp#1903938)
+  * bug fix: crash in traceroot.  (lp#1903419, reported by Michal Herda)
+  * bug fix: DESCRIBE called with a string as second argument no longer mutates
+    that string.  (lp#1903901, reported by Michal Herda)
+  * bug fix: stack clobbering by 256-bit SIMD packs on x86-64.  (lp#1901685,
+    reported by Marco Heisig)
+
+changes in sbcl-2.0.10 relative to sbcl-2.0.9:
+  * minor incompatible change: the funarg given to SB-SPROF:MAP-TRACES
+    does not receive a wallclock time with each trace.
+  * minor incompatible change: INTERNAL-TIME-UNITS-PER-SECOND has been
+    increased to 10^6 on 64-bit architectures.
+  * minor incompatible change: SIGPIPE is ignored by default again. (lp#1897624)
+  * minor incompatible change: the system code compiled under the
+    :LINKAGE-TABLE feature is now unconditionally compiled in, and the
+    corresponding entry in *FEATURES* has been removed.
+  * enhancement: style-warnings are issued for variables which have an
+    assignment but no "for-value reference" (per CLHS glossary entry)
+  * bug fix: SB-CLTL2:MACROEXPAND-ALL did not expand MULTIPLE-VALUE-BIND
+    and MULTIPLE-VALUE-SETQ
+  * bug fix: CPUID-based feature detection had an index/mask confusion
+    (lp#1899239)
+  * bug fix: fix a deadlock on Windows (lp#1896802)
+  * bug fix: eliminate type errors when wall clocks go back (lp#1028026,
+    lp#1032111)
+  * bug fix: fix EOF handling in read-char-no-hang on concatenenated streams
+    (lp#690408, reported by Willem Broekema)
+  * bug fix: fix MAP-INTO on extended sequences (lp#1855375, thanks to James
+    Kalenius)
+  * bug fix: SB-GMP can now raise -1, 0 and 1 to the power of a bignum.
+    (thanks to Aaron Chen)
+  * bug fixes in tests:
+    ** add a C function declaration (lp#1897627, thanks to Bob Felts)
+    ** parse vmmap output more liberally (lp#1897722, reported by Bob Felts)
+
+changes in sbcl-2.0.9 relative to sbcl-2.0.8:
+  * incompatible change: HPPA and DEC Alpha architecture
+    support has been removed.
+  * minor incompatible change: the compiler signals a warning at
+    compile-time when an initform of T, NIL or 0 does not match a
+    STANDARD-CLASS slot's declared type.
+  * minor incompatible change: the runtime no longer uses SIGPIPE internally,
+    so the signal is deliverable to user code as is customary. Ignoring the
+    signal - in lieu of the OS default of process termination - is obtainable
+    via (SB-SYS:ENABLE-INTERRUPT SB-UNIX:SIGPIPE :IGNORE).
+  * platform support:
+    ** a number of obsolete portability layers (particularly on the Windows
+       platform) have been removed in favour of direct calling of the native
+       interfaces.
+    ** RUN-PROGRAM now accepts a :WINDOW argument to control whether a
+       subprocess window should be displayed.  (Thanks to Luis Borges de
+       Oliveira)
+    ** the use of futexes implied by :SB-FUTEX is now implemented on FreeBSD.
+  * bug fix: SB-SPROF can distinguish between SBCL-internal assembly routines.
+  * bug fix: SB-SPROF has better output in its reports for anonymous
+    functions.
+  * optimization: CALL-NEXT-METHOD with supplied arguments in required
+    positions is now faster if the supplied arguments are EQL to the original
+    arguments.
+
+changes in sbcl-2.0.8 relative to sbcl-2.0.7:
+  * platform support:
+    ** added support for NetBSD/ARM64;
+    ** threads on Linux now have OS-visible names;
+    ** removed unnecessary emulation of pthread functions on Windows;
+    ** work around a sigwait() bug on Mac OS X;
+    ** allow safepoint build on Mac OS X, though it probably doesn't
+       work very well (reported by Chris Wagner, lp#1382811)
+    ** removed stub support for HPUX.
+  * optimization: SB-THREAD:MAKE-THREAD is faster on most platforms.
+  * optimization: faster RATIONAL when the result is a RATIO.
+  * optimization: improved cross-type comparisons (float/ratio/bignum).
+  * bug fix: EQUALP on pathnames was wrong
+  * bug fixes: fix compiler issues in:
+    ** COUNT (lp#1889391)
+    ** VECTOR-LENGTH (lp#1888919)
+    ** constant-folding (lp#1888384)
+    ** FIND and POSITION (lp#1887316)
+
+changes in sbcl-2.0.7 relative to sbcl-2.0.6:
+  * minor incompatible change: SB-THREAD:THREAD-OS-TID returns NIL for
+    a thread which has exited.
+  * minor incompatible change: OPEN no longer calls TRUENAME implicitly
+    on a string filespec prior to issuing an open() system call.
+  * minor incompatible change: PATHNAME is no longer a STRUCTURE-OBJECT.
+  * documentation: HASH-FUNCTION is a function designator.  (lp#1888028,
+    reported by Jacek Zlydach)
+  * bug fix: eliminated a potential garbage-collector deadlock
+    when linking with TCMalloc.
+  * bug fix: foreign threads (those not made by SB-THREAD:MAKE-THREAD)
+    can not crash with a "GC_PENDING, but why?" error when returning
+    back from Lisp into the foreign caller.
+  * bug fix: sb-fasteval crashed trying to install a JIT-compiled
+    DEFSTRUCT accessor in a locked package.
+  * bug fix: removed misuse of putwc() which caused stdio streams
+    to drop characters.
+  * bug fix: the "maximum interrupt nesting depth exceeded" error
+    generated in the C runtime is significantly less likely to occur.
+  * bug fix: sb-sprof should no longer segfault from calling pthread_kill()
+    on a nonexistent thread.
+  * bug fix:  a portability issue arising from various build hosts
+    (lp#1886255, reported by Pierre Neidhardt)
+  * bug fix: spurious compiler warnings from REDUCE with :INITIAL-VALUE.
+    (lp#1885515, reported by Michael South)
+  * bug fix: an inconsistency between class hierarchies and the type system
+    under some circumstances involving redefinition.  (lp#1886397, reported by
+    Atilla Lendvai)
+  * bug fix: the USE-VALUE restart for OPEN on non-existent files is more
+    likely to function as expected.  (lp#1886587)
+  * bug fix: various invalid inputs to ROTATE-BYTE no longer cause compiler
+    errors.  (lp#1887164, lp#1888152)
+  * optimization: PPC64 on linux uses the __thread annotation on C variables
+    in preference to pthread_setspecific() and pthread_getspecific().
+
+changes in sbcl-2.0.6 relative to sbcl-2.0.5:
+  * planned incompatible change: the defined symbols in the Metaobject
+    Protocol, currently accessible from both SB-MOP and SB-PCL packages, will
+    in a later release be no longer exported from SB-PCL.
+  * platform support:
+    ** better support for dynamic-extent on the SPARC architecture.
+    ** bug fix for loading very large core files.
+    ** bug fix for logior and logxor on PPC64.
   * enhancement: EQUALP on structure instances uses code specialized
     to each structure type, inlining comparison of non-pointer slots.
+  * enhancement: some standard operators, such as WITH-OUTPUT-TO-STRING and
+    CHANGE-CLASS, have been adapted to use dynamic-extent temporary objects,
+    and so cons less garbage on the heap.
+  * enhancement: read tables are more space- and speed efficient
+  * bug fix: stream conditions with dynamic-extent streams have the stream
+    replaced by a stub.  (reported by Matt Kaufmann)
+  * bug fix: garbage collections triggered from foreign callbacks crashed.
+    (lp#1884403, reported by Andrew Kent)
+  * bug fix: compiler failure in compiling MAKE-LIST.  (lp#1881349)
+  * bug fix: using the debugger from frames with calls to functions with
+    unsupplied optional arguments is less likely to cause heap corruption.
+    (lp#1883745)
 
 changes in sbcl-2.0.5 relative to sbcl-2.0.4:
   * platform support:

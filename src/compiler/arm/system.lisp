@@ -59,6 +59,30 @@
     ;; And, finally, pick out the widetag from the header.
     (inst ldrb :ne result (@ object (- result)))))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional :eq)
+  (:info test-layout)
+  (:temporary (:sc unsigned-reg) this-id)
+  (:generator 4
+    (let ((test-id (layout-id test-layout))
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (inst ldr this-id (@ x offset))
+      ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
+      (cond ((typep test-id '(and (unsigned-byte 8) (not (eql 0))))
+             (inst cmp this-id test-id))
+            (t
+             (inst .layout-id test-layout)
+             ;; The fixupper will rewrite these three instructions.
+             (inst eor this-id this-id (ash 255 16))
+             (inst eor this-id this-id (ash 255 8))
+             (inst cmp this-id 255))))))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -68,8 +92,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -247,3 +271,11 @@
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+(define-vop (sb-c::mark-covered)
+ (:info x)
+ (:temporary (:sc unsigned-reg) tmp)
+ (:generator 4
+   ;; Can't compute code-tn-relative index until the boxed header length
+   ;; is known. Some vops emit new boxed words via EMIT-CONSTANT.
+   (inst store-coverage-mark x tmp)))

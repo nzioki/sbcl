@@ -469,7 +469,9 @@ Form: (FOO A)   Context: EVAL
 Form: 'GLOBAL-FOO   Context: EVAL
 \(EVAL-WHEN (:EXECUTE :COMPILE-TOPLEVEL :LOAD-TOPLEVEL) A (FOO A))")))
 
-(test-util:with-test (:name (:walk multiple-value-bind))
+;; This test doesn't understand that gensyms appear in the expansion
+;; (We either need "string=-modulo-tabspace-and-gensyms" or a sexpr-based comparison)
+(test-util:with-test (:name (:walk multiple-value-bind) :fails-on :sbcl)
   (assert (string=-modulo-tabspace
            (with-output-to-string (*standard-output*)
              (take-it-out-for-a-test-walk (multiple-value-bind (a b)
@@ -482,7 +484,8 @@ Form: A   Context: EVAL; lexically bound
 Form: B   Context: EVAL; lexically bound
 \(MULTIPLE-VALUE-BIND (A B) (FOO A B) (LIST A B))")))
 
-(test-util:with-test (:name (:walk multiple-value-bind special))
+;; This test doesn't understand that gensyms appear in the expansion
+(test-util:with-test (:name (:walk multiple-value-bind special) :fails-on :sbcl)
   (assert (string=-modulo-tabspace
            (with-output-to-string (*standard-output*)
              (take-it-out-for-a-test-walk (multiple-value-bind (a b)
@@ -1071,4 +1074,13 @@ Form: C   Context: EVAL; lexically bound
 ;;; Old PCL hung up on this.
 (defmethod #:foo ()
   (defun #:bar ()))
-
+
+;; lp#1912362
+(defmethod zook (x) (let ((typep x 'vector)) typep))
+(test-util:with-test (:name :let-syntax-error)
+  (assertoid:assert-error (zook 1)))
+
+(declaim (inline inlined-fun))
+
+(test-util:with-test (:name :inlined-defun)
+  (eval '(defmethod inlined-defun () (defun inlined-fun ()))))

@@ -26,7 +26,14 @@
                                   0 :type ,(if (= i 64) 'sb-ext:word t))))))
   (defbiggy))
 
-(assert (typep (sb-kernel:layout-bitmap
+(macrolet ((def-100slots ()
+             `(defstruct 100slots
+               ,@(loop for i from 0 repeat 100
+                    collect `(,(sb-int:symbolicate "SLOT" (write-to-string i))
+                              ,(format nil "This is ~D" i))))))
+  (def-100slots))
+
+(assert (typep (sb-kernel:wrapper-bitmap
                 (sb-kernel::find-layout 'biggy)) 'bignum))
 
 (defvar *x* nil)
@@ -53,50 +60,28 @@
 ;; Run it twice to make sure things really worked.
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:layout-bitmap
+      (*x* (sb-kernel:wrapper-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-1) (terpri)
 (force-output)
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:layout-bitmap
+      (*x* (sb-kernel:wrapper-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-2) (terpri)
 (force-output)
 
-;; Test the C bignum bit extractor.
-;; Surprisingly, there was a bug in it, unrelated to forwarding
-;; pointers that remained dormant until the randomized
-;; HUGE-MANYRAW test in 'defstruct.impure.lisp' found it.
-(defun c-bignum-logbitp (index bignum)
-  (assert (typep bignum 'bignum))
-  (sb-sys:with-pinned-objects (bignum)
-    (alien-funcall (extern-alien "positive_bignum_logbitp"
-                                 (function boolean int system-area-pointer))
-                   index
-                   (sb-sys:int-sap
-                    (- (sb-kernel:get-lisp-obj-address bignum)
-                       sb-vm:other-pointer-lowtag)))))
+(defun collect-slot-values (struct &aux result)
+  (sb-kernel:do-instance-tagged-slot (i struct)
+    (push (sb-kernel:%instance-ref struct i) result))
+  (nreverse result))
 
-(with-test (:name :c-bignum-logbitp)
-  ;; walking 1 bit
-  (dotimes (i 256)
-    (let ((num (ash 1 i)))
-      (when (typep num 'bignum)
-        (dotimes (j 257)
-          (assert (eq (c-bignum-logbitp j num)
-                     (logbitp j num)))))))
-  ;; random bits
-  (let ((max (ash 1 768)))
-    (dotimes (i 100)
-      (let ((num (random max)))
-        (when (typep num 'bignum)
-          (dotimes (j (* (sb-bignum:%bignum-length num)
-                         sb-vm:n-word-bits))
-            (assert (eq (c-bignum-logbitp j num)
-                       (logbitp j num)))))))))
+(with-test (:name :sign-extended-bitmap)
+  ;; could have 100 or 101 physical payload slots depending on
+  ;; presence of a padding word
+  (assert (>= (length (collect-slot-values (make-100slots))) 100)))
 
 ;; for testing the comparator
 (defstruct foo1
@@ -114,7 +99,7 @@
   (c 'cee))                                      ;    13       9
 
 (defvar *afoo* (make-foo1))
-(assert (= (sb-kernel:layout-length (sb-kernel:layout-of *afoo*))
+(assert (= (sb-kernel:wrapper-length (sb-kernel:wrapper-of *afoo*))
            (sb-kernel:%instance-length *afoo*)))
 (with-test (:name :tagged-slot-iterator-macro)
   ;; on 32-bit, the logical length is 14, which means 15 words (with header),

@@ -89,9 +89,11 @@
 
 (defun xset-member-p (elt xset)
   (let ((data (xset-data xset)))
-    (if (listp data)
-        (member elt data :test #'eql)
-        (gethash elt data))))
+    (if (if (listp data)
+            (member elt data :test #'eql)
+            (gethash elt data))
+        t
+        nil)))
 
 (defun xset-members (xset)
   (let ((data (xset-data xset)))
@@ -135,6 +137,6 @@
        xset1))
     t))
 
-#-sb-fluid (declaim (inline xset-empty-p))
+(declaim (inline xset-empty-p))
 (defun xset-empty-p (xset)
   (not (xset-data xset)))

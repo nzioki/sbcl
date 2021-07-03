@@ -15,6 +15,7 @@
 #ifndef _GC_PRIVATE_H_
 #define _GC_PRIVATE_H_
 
+#include "genesis/instance.h"
 #include "genesis/weak-pointer.h"
 #include "immobile-space.h"
 #include "code.h"
@@ -46,7 +47,7 @@ extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
 #define note_transported_object(old, new) /* do nothing */
 
 static inline lispobj
-gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
+gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
 {
     CHECK_COPY_PRECONDITIONS(object, nwords);
 
@@ -97,7 +98,7 @@ extern boolean scan_weak_hashtable(struct hash_table *hash_table,
                                    void (*)(lispobj*));
 extern int (*weak_ht_alivep_funs[4])(lispobj,lispobj);
 extern void gc_scav_pair(lispobj where[2]);
-extern void weakobj_init();
+extern void gc_common_init();
 extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
 
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
@@ -234,23 +235,54 @@ static inline void add_to_weak_pointer_chain(struct weak_pointer *wp) {
      * In cheneygc, chaining is performed in 'trans_weak_pointer'
      * which works just as well, since an object is transported
      * at most once per GC cycle */
-    wp->next = (struct weak_pointer *)LOW_WORD(weak_pointer_chain);
+    wp->next = weak_pointer_chain;
     weak_pointer_chain = wp;
 }
 
-/// Same as Lisp LOGBITP, except no negative bignums allowed.
-static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
+#include "genesis/layout.h"
+struct bitmap { sword_t *bits; unsigned int nwords; };
+static inline struct bitmap get_layout_bitmap(struct layout* layout)
 {
-    if (fixnump(bitmap))
-      return (index < (N_WORD_BITS - N_FIXNUM_TAG_BITS))
-          ? (bitmap >> (index+N_FIXNUM_TAG_BITS)) & 1
-          : (sword_t)bitmap < 0;
-    return positive_bignum_logbitp(index, (struct bignum*)native_pointer(bitmap));
+    struct bitmap bitmap;
+    const int layout_id_vector_fixed_capacity = 7;
+#ifdef LISP_FEATURE_64_BIT
+    sword_t depthoid = layout->flags;
+    // Depthoid is stored in the upper 4 bytes of the header, as a fixnum.
+    depthoid >>= (32 + N_FIXNUM_TAG_BITS);
+    int extra_id_words =
+      (depthoid > layout_id_vector_fixed_capacity) ?
+      ALIGN_UP(depthoid - layout_id_vector_fixed_capacity, 2) / 2 : 0;
+#else
+    sword_t depthoid = layout->depthoid;
+    depthoid >>= N_FIXNUM_TAG_BITS;
+    int extra_id_words = (depthoid > layout_id_vector_fixed_capacity) ?
+      depthoid - layout_id_vector_fixed_capacity : 0;
+#endif
+    // The 2 bits for stable address-based hashing can't ever bet set.
+    const int baseline_payload_words = (sizeof (struct layout) / N_WORD_BYTES) - 1;
+    int payload_words = ((unsigned int)layout->header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF;
+    bitmap.bits = (sword_t*)((char*)layout + sizeof (struct layout)) + extra_id_words;
+    bitmap.nwords = payload_words - baseline_payload_words - extra_id_words;
+    return bitmap;
+}
+
+/* Return true if the INDEXth bit is set in BITMAP.
+ * Index 0 corresponds to the word just after the instance header.
+ * So index 0 may be the layout pointer if #-compact-instance-header,
+ * or a user data slot if #+compact-instance-header
+ */
+static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
+{
+    unsigned int word_index = index / N_WORD_BITS;
+    unsigned int bit_index  = index % N_WORD_BITS;
+    if (word_index >= bitmap.nwords) return bitmap.bits[bitmap.nwords-1] < 0;
+    return (bitmap.bits[word_index] >> bit_index) & 1;
 }
 
 /* Keep in sync with 'target-hash-table.lisp' */
+#define hashtable_kind(ht) ((ht->flags >> (4+N_FIXNUM_TAG_BITS)) & 3)
 #define hashtable_weakp(ht) (ht->flags & (8<<N_FIXNUM_TAG_BITS))
-#define hashtable_weakness(ht) (ht->flags >> (4+N_FIXNUM_TAG_BITS))
+#define hashtable_weakness(ht) (ht->flags >> (6+N_FIXNUM_TAG_BITS))
 
 #if defined(LISP_FEATURE_GENCGC)
 
@@ -287,10 +319,18 @@ static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
          operation; \
          protect_page(page_address(page_index), page_index); }}
 
+#ifdef LISP_FEATURE_DARWIN_JIT
+#define OS_VM_PROT_JIT_READ OS_VM_PROT_READ
+#define OS_VM_PROT_JIT_ALL OS_VM_PROT_READ | OS_VM_PROT_WRITE
+#else
+#define OS_VM_PROT_JIT_READ OS_VM_PROT_READ | OS_VM_PROT_EXECUTE
+#define OS_VM_PROT_JIT_ALL OS_VM_PROT_ALL
+#endif
+
 /* This is used bu the fault handler, and potentially during GC */
 static inline void unprotect_page_index(page_index_t page_index)
 {
-    os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_ALL);
+    os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_JIT_ALL);
     unsigned char *pflagbits = (unsigned char*)&page_table[page_index].gen - 1;
     __sync_fetch_and_or(pflagbits, WP_CLEARED_FLAG);
     __sync_fetch_and_and(pflagbits, ~WRITE_PROTECTED_FLAG);
@@ -298,9 +338,12 @@ static inline void unprotect_page_index(page_index_t page_index)
 
 static inline void protect_page(void* page_addr, page_index_t page_index)
 {
-    os_protect((void *)page_addr,
-               GENCGC_CARD_BYTES,
-               OS_VM_PROT_READ|OS_VM_PROT_EXECUTE);
+#ifdef LISP_FEATURE_DARWIN_JIT
+    if ((page_table[page_index].type & PAGE_TYPE_MASK) == CODE_PAGE_TYPE) {
+      return;
+    }
+#endif
+    os_protect((void *)page_addr, GENCGC_CARD_BYTES, OS_VM_PROT_JIT_READ);
 
     /* Note: we never touch the write_protected_cleared bit when protecting
      * a page. Consider two random threads that reach their SIGSEGV handlers
@@ -333,27 +376,110 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 #define KV_PAIRS_HIGH_WATER_MARK(kvv) fixnum_value(kvv[0])
 #define KV_PAIRS_REHASH(kvv) kvv[1]
 
-#include "genesis/layout.h"
-// Generalize over INSTANCEish things. (Not general like SB-KERNEL:LAYOUT-OF)
-static inline lispobj layout_of(lispobj* instance) { // native ptr
-    // Smart C compilers eliminate the ternary operator if exprs are the same
-    return widetag_of(instance) == FUNCALLABLE_INSTANCE_WIDETAG
-      ? funinstance_layout(instance) : instance_layout(instance);
+/* This is NOT the same value that lisp's %INSTANCE-LENGTH returns.
+ * Lisp always uses the logical length (as originally allocated),
+ * except when heap-walking which requires exact physical sizes */
+static inline int instance_length(lispobj header)
+{
+    // * Byte 3 of an instance header word holds the immobile gen# and visited bit,
+    //   so those have to be masked off.
+    // * fullcgc uses bit index 31 as a mark bit, so that has to
+    //   be cleared. Lisp does not have to clear bit 31 because fullcgc does not
+    //   operate concurrently.
+    // * If the object is in hashed-and-moved state and the original instance payload
+    //   length was odd (total object length was even), then add 1.
+    //   This can be detected by ANDing some bits, bit 10 being the least-significant
+    //   bit of the original size, and bit 9 being the 'hashed+moved' bit.
+    // * 64-bit machines do not need 'long' right-shifts, so truncate to int.
+
+    int extra = ((unsigned int)header >> 10) & ((unsigned int)header >> 9) & 1;
+    return (((unsigned int)header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF) + extra;
 }
 
-extern lispobj layout_of_layout;
+/// instance_layout() and layout_of() macros takes a lispobj* and are lvalues
+#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+
+# ifdef LISP_FEATURE_LITTLE_ENDIAN
+#  define instance_layout(native_ptr) ((uint32_t*)(native_ptr))[1]
+# else
+#  error "No instance_layout() defined"
+# endif
+# define funinstance_layout(native_ptr) instance_layout(native_ptr)
+// generalize over either metatype, but not as general as SB-KERNEL:LAYOUT-OF
+# define layout_of(native_ptr) instance_layout(native_ptr)
+
+#else
+
+// first 2 words of ordinary instance are: header, layout
+# define instance_layout(native_ptr) ((lispobj*)native_ptr)[1]
+// first 4 words of funcallable instance are: header, trampoline, layout, fin-fun
+# define funinstance_layout(native_ptr) ((lispobj*)native_ptr)[2]
+# define layout_of(native_ptr) \
+  ((lispobj*)native_ptr)[1+((widetag_of(native_ptr)>>LAYOUT_SELECTOR_BIT)&1)]
+
+#endif
+
+static inline int layout_depth2_id(struct layout* layout) {
+    int32_t* vector = (int32_t*)&layout->id_word0;
+    return vector[0];
+}
+// Keep in sync with hardwired IDs in src/compiler/generic/genesis.lisp
+#define WRAPPER_LAYOUT_ID 2
+#define LAYOUT_LAYOUT_ID 3
+#define LFLIST_NODE_LAYOUT_ID 4
+
 /// Return true if 'thing' is a layout.
+/// This predicate is careful, as is it used to verify heap invariants.
 static inline boolean layoutp(lispobj thing)
 {
-    lispobj base_ptr = thing - INSTANCE_POINTER_LOWTAG;
     lispobj layout;
-    if ((base_ptr & LOWTAG_MASK) || !(layout = layout_of((lispobj*)base_ptr)))
-        return 0;
-    return layout == layout_of_layout;
+    if (lowtag_of(thing) != INSTANCE_POINTER_LOWTAG) return 0;
+    if ((layout = instance_layout(INSTANCE(thing))) == 0) return 0;
+    return layout_depth2_id(LAYOUT(layout)) == LAYOUT_LAYOUT_ID;
+}
+#ifdef LISP_FEATURE_METASPACE
+static inline boolean wrapperp(lispobj thing)
+{
+    lispobj layout;
+    if (lowtag_of(thing) != INSTANCE_POINTER_LOWTAG) return 0;
+    if ((layout = instance_layout(INSTANCE(thing))) == 0) return 0;
+    return layout_depth2_id(LAYOUT(layout)) == WRAPPER_LAYOUT_ID;
+}
+static inline int wrapper_id(lispobj wrapper)
+{
+    struct layout* layout = LAYOUT(WRAPPER(wrapper)->friend);
+    return layout_depth2_id(layout);
+}
+#endif
+/// Return true if 'thing' is the layout of any subtype of sb-lockless::list-node.
+static inline boolean lockfree_list_node_layout_p(struct layout* layout) {
+    return layout_depth2_id(layout) == LFLIST_NODE_LAYOUT_ID;
 }
 
-static inline int lockfree_list_node_layout_p(struct layout* layout) {
-    return layout->flags & flag_LockfreeListNode;
-}
+#ifdef LISP_FEATURE_METASPACE
+#define METASPACE_START (READ_ONLY_SPACE_START+32768) /* KLUDGE */
+// Keep in sync with the macro definitions in src/compiler/generic/early-vm.lisp
+struct slab_header {
+    short sizeclass;
+    short capacity;
+    short chunksize;
+    short count;
+    void* freelist;
+    struct slab_header *next;
+    struct slab_header *prev;
+};
+#endif
+
+/* Check whether 'pointee' was forwarded. If it has been, update the contents
+ * of 'cell' to point to it. Otherwise, set 'cell' to 'broken'.
+ * Note that this macro has no braces around the body because one of the uses
+ * of it needs to stick on another 'else' or two */
+#define TEST_WEAK_CELL(cell, pointee, broken) \
+    lispobj *native = native_pointer(pointee); \
+    if (from_space_p(pointee)) \
+        cell = forwarding_pointer_p(native) ? forwarding_pointer_value(native) : broken; \
+    else if (immobile_space_p(pointee)) { \
+        if (immobile_obj_gen_bits(base_pointer(pointee)) == from_space) cell = broken; \
+    }
 
 #endif /* _GC_PRIVATE_H_ */

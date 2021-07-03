@@ -955,7 +955,7 @@
 
 ;;;; MUFFLE-CONDITIONS test (corresponds to the test in the manual)
 ; FIXME: make a better test!
-(with-test (:name muffle-conditions :skipped-on (or :alpha :ppc64 :x86-64))
+(with-test (:name muffle-conditions :skipped-on (or :ppc64 :x86-64))
   (multiple-value-bind (fun failure-p warnings style-warnings notes)
       (checked-compile
        '(lambda (x)
@@ -1082,7 +1082,16 @@
              (assert (eq 'number (type-error-expected-type e)))
              :error))))))
 
-(with-test (:name :compiled-debug-funs-leak)
+;;; This tested something which is no longer a thing. There was a hash-table
+;;; named *COMPILED-DEBUG-FUNS* which held on to an arbitrary number of code blobs,
+;;; and it was made weak in git rev 9abfd1a2b2 and then removed in rev a2aa5eceb5
+;;; (except for cheneygc - and I'm not entirely sure that there isn't a way to
+;;; remove it from cheneygc as well, but it wasn't interesting).
+;;; So really it's testing nothing, except that maybe it is.
+;;; But the test doesn't pass with parallel-exec because profiling the code causes
+;;; potentially any and every lambda to be retained when a stack sample is taken.
+;;; So I'm not sure whether to delete or disable this. I guess disable.
+(with-test (:name :compiled-debug-funs-leak :fails-on :parallel-test-runner)
   (sb-ext:gc :full t)
   (let ((usage-before (sb-kernel::dynamic-usage)))
     (dotimes (x 10000)
@@ -2260,6 +2269,8 @@
 ;;; check that non-trivial constants are EQ across different files: this is
 ;;; not something ANSI either guarantees or requires, but we want to do it
 ;;; anyways.
+(when (find-symbol "SORT-INLINE-CONSTANTS" "SB-VM")
+  (push :inline-constants *features*))
 (defconstant +share-me-1+ #-inline-constants 123.456d0 #+inline-constants nil)
 (defconstant +share-me-2+ "a string to share")
 (defconstant +share-me-3+ (vector 1 2 3))
@@ -2778,6 +2789,19 @@
        ((function (function *))       "(FUNCTION (FUNCTION *))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
 
+(with-test (:name (:compiler-messages function :lambda-list))
+  ;; Previously, function lambda lists were sometimes printed
+  ;; confusingly, e.g.:
+  ;;
+  ;;   (function collection) => #'COLLECTION
+  ;;   ((function t))        => (#'T)
+  ;;
+  (handler-case
+      (sb-c::parse-lambda-list '((function t) . a) :context 'defmethod)
+    (error (condition)
+      (assert (search "illegal dotted lambda list: ((FUNCTION T) . A)"
+                      (princ-to-string condition))))))
+
 (with-test (:name :boxed-ref-setf-special
             :skipped-on :interpreter)
   (let* ((var (gensym))
@@ -3005,7 +3029,7 @@
     (assert (eql (foo1 10 1) 3628800))
     (let ((code (sb-kernel::fun-code-header #'foo1)))
       (assert (= (sb-kernel::code-n-entries code) 1))
-      (assert (eq (aref (sb-kernel::code-entry-points code) 0)
+      (assert (eq (sb-kernel:%code-entry-point code 0)
                   #'foo1)))))
 
 (with-test (:name (:block-compile :inline))
@@ -3066,3 +3090,25 @@
 (with-test (:name :fopcompile-specials)
   (ctu:file-compile
    "(locally (declare (special foo)) (print foo))"))
+
+(with-test (:name :local-call-context)
+  (ctu:file-compile
+   "(lambda (&optional b) (declare (type integer b)) b)"
+   :load t))
+
+(defstruct entry-info-type-struct)
+
+(defvar *entry-info-type-struct* (make-entry-info-type-struct))
+
+(defmethod make-load-form ((struct entry-info-type-struct) &optional env)
+  (declare (ignore env))
+  '*entry-info-type-struct*)
+
+(declaim (ftype (function () (member #.*entry-info-type-struct*)) entry-info-type-func))
+
+
+(with-test (:name :dump-entry-info-type)
+  (ctu:file-compile
+   "(lambda () (entry-info-type-func))"
+   :load t))
+

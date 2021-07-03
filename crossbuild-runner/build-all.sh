@@ -9,7 +9,7 @@ set -e
 # or a host machine on which to run its native compiler.
 
 if [ -z "$*" ]; then
-    targets="alpha arm arm64 hppa mips ppc ppc64 riscv sparc x86 x86-64"
+    targets="arm arm64 mips ppc ppc64 riscv sparc x86 x86-64"
 else
     targets="$@"
 fi
@@ -24,16 +24,14 @@ do
   # Assume that dlopen() is provided so that we don't try to read sbcl.nm though.
   echo '(lambda (features) (union features (list :crossbuild-test :os-provides-dlopen ' > $ltf
   echo ":$arch" >> $ltf
-  # x86-64 is tested as if #+win32
-  if [ $arch != "x86-64" ]; then
-    echo ':unix :linux :elf :sb-futex' >> $ltf
+  # x86 and x86-64 are tested as if #+win32. Unix is otherwise plenty tested.
+  if [ $arch = x86 -o $arch = x86-64 ]; then
+    echo ':win32 :sb-thread :sb-safepoint' >> $ltf
+  else
+    echo ':unix :linux :elf' >> $ltf
   fi
   cat crossbuild-runner/backends/$arch/features >> $ltf
   cat crossbuild-runner/backends/$arch/local-target-features >> $ltf
-  case "$arch" in
-    alpha | hppa)  ;;
-    *) echo ':linkage-table' >> $ltf
-  esac
   echo ')))' >> $ltf
 
   cp -fv crossbuild-runner/backends/$arch/stuff-groveled-from-headers.lisp \

@@ -37,7 +37,7 @@
   (foldable flushable))
 
 ;;; These can be affected by type definitions, so they're not FOLDABLE.
-(defknown (sb-xc:upgraded-complex-part-type sb-xc:upgraded-array-element-type)
+(defknown (upgraded-complex-part-type upgraded-array-element-type)
     (type-specifier &optional lexenv-designator) (or list symbol)
     (unsafely-flushable))
 
@@ -98,9 +98,11 @@
 (defknown find-classoid (name-for-class &optional t)
   (or classoid null) ())
 (defknown classoid-of (t) classoid (flushable))
-(defknown layout-of (t) layout (flushable))
-#+64-bit (defknown layout-depthoid (layout) fixnum (flushable always-translatable))
-(defknown layout-depthoid-gt (layout integer) boolean (flushable))
+(defknown wrapper-of (t) wrapper (flushable))
+(defknown wrapper-depthoid (wrapper) layout-depthoid (flushable))
+#+64-bit (defknown layout-depthoid (sb-vm:layout) layout-depthoid (flushable always-translatable))
+#+(or x86 x86-64) (defknown (layout-depthoid-ge) (sb-vm:layout integer) boolean (flushable))
+(defknown %structure-is-a (instance t) boolean (foldable flushable))
 (defknown copy-structure (structure-object) structure-object
   (flushable)
   :derive-type #'result-type-first-arg)
@@ -122,7 +124,7 @@
 (defknown (symbol-function) (symbol) function ())
 
 (defknown boundp (symbol) boolean (flushable))
-(defknown fboundp ((or symbol cons)) boolean (unsafely-flushable))
+(defknown fboundp ((or symbol cons)) (or null function) (unsafely-flushable))
 (defknown special-operator-p (symbol) t
   ;; The set of special operators never changes.
   (movable foldable flushable))
@@ -279,7 +281,7 @@
 
 (defknown gcd (&rest integer) unsigned-byte
   (movable foldable flushable))
-(defknown sb-kernel::fixnum-gcd (fixnum fixnum) (integer 0 #.(1+ sb-xc:most-positive-fixnum))
+(defknown sb-kernel::fixnum-gcd (fixnum fixnum) (integer 0 #.(1+ most-positive-fixnum))
     (movable foldable flushable))
 
 (defknown lcm (&rest integer) unsigned-byte
@@ -341,8 +343,11 @@
 (defknown %multiply-high (word word) word
     (movable foldable flushable))
 
+(defknown %signed-multiply-high (sb-vm:signed-word sb-vm:signed-word) sb-vm:signed-word
+    (movable foldable flushable))
+
 (defknown (mod rem) (real real) real
-  (movable foldable flushable))
+    (movable foldable flushable))
 
 (defknown (ffloor fceiling fround ftruncate)
   (real &optional real) (values float real)
@@ -362,7 +367,18 @@
 ;;; e.g. the behavior if the first arg is a NaN is well-defined as we have it,
 ;;; but what about the second arg? We need some test cases around this.
 (defknown float-sign (float &optional float) float
-  (movable foldable unsafely-flushable))
+  (movable foldable unsafely-flushable)
+  :derive-type (lambda (call &aux (args (combination-args call))
+                                  (type (unless (cdr args) (lvar-type (first args)))))
+                 (cond ((and type (csubtypep type (specifier-type 'single-float)))
+                        (specifier-type '(member $1f0 $-1f0)))
+                       ((and type (csubtypep type (specifier-type 'double-float)))
+                        (specifier-type '(member $1d0 $-1d0)))
+                       (type
+                        (specifier-type '(member $1f0 $-1f0 $1d0 $-1d0)))
+                       (t
+                        (specifier-type 'float)))))
+
 (defknown (float-digits float-precision) (float) float-digits
   (movable foldable unsafely-flushable))
 (defknown integer-decode-float (float)
@@ -562,7 +578,7 @@
 (defknown (every notany notevery) (function-designator proper-sequence &rest proper-sequence) boolean
   (foldable unsafely-flushable call))
 
-(defknown reduce ((function-designator ((nth-arg 1 :sequence t :key :key)
+(defknown reduce ((function-designator ((nth-arg 1 :sequence t :key :key :value :initial-value)
                                         (nth-arg 1 :sequence t :key :key)))
                   proper-sequence &rest t &key (:from-end t)
                   (:start (inhibit-flushing index 0))
@@ -575,6 +591,19 @@
 (defknown fill ((modifying sequence) t &rest t &key
                 (:start index) (:end sequence-end)) sequence
     ()
+  :derive-type #'result-type-first-arg
+  :result-arg 0)
+;;; Like FILL but with no keyword argument parsing
+(defknown quickfill ((modifying (simple-array * 1)) t) (simple-array * 1) ()
+  :derive-type #'result-type-first-arg
+  :result-arg 0)
+;;; Special case of FILL that takes either a machine word with which to fill,
+;;; or a keyword indicating a certain behavior to compute the word.
+;;; In either case the supplied count is lispwords, not elements.
+;;; This might be a no-op depending on whether memory is prezeroized.
+(defknown sb-vm::splat ((modifying (simple-array * 1)) index (or symbol sb-vm:word))
+    (simple-array * 1)
+  (always-translatable)
   :derive-type #'result-type-first-arg
   :result-arg 0)
 
@@ -726,7 +755,7 @@
     (:end (inhibit-flushing sequence-end nil))
     (:from-end t)
     (:key (function-designator ((nth-arg 1 :sequence t)))))
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable call))
 
 (defknown (position-if position-if-not)
@@ -735,21 +764,21 @@
    (:start (inhibit-flushing index 0))
     (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable call))
 
 (defknown (%bit-position/0 %bit-position/1) (simple-bit-vector t index index)
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable))
 (defknown (%bit-pos-fwd/0 %bit-pos-fwd/1 %bit-pos-rev/0 %bit-pos-rev/1)
   (simple-bit-vector index index)
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable))
 (defknown %bit-position (t simple-bit-vector t index index)
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable))
 (defknown (%bit-pos-fwd %bit-pos-rev) (t simple-bit-vector index index)
-  (or (mod #.(1- sb-xc:array-dimension-limit)) null)
+  (or (mod #.(1- array-dimension-limit)) null)
   (foldable flushable))
 
 (defknown count
@@ -873,14 +902,22 @@
 
 (defknown list (&rest t) list (movable flushable))
 (defknown list* (t &rest t) t (movable flushable))
-(defknown make-list (index &key (:initial-element t)) list
+;;; The length constraint on MAKE-LIST is such that:
+;;; - not every byte of addressable memory can be used up.
+;;; - the number of bytes to allocate should be a fixnum
+;;; - type-checking can use use efficient bit-masking approach
+;;;   to combine the fixnum + range test into one instruction
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant make-list-limit
+    (ash most-positive-fixnum (- (+ sb-vm:word-shift 1)))))
+(defknown make-list ((integer 0 #.make-list-limit) &key (:initial-element t)) list
   (movable flushable))
-(defknown %make-list (index t) list (movable flushable))
+(defknown %make-list ((integer 0 #.make-list-limit) t) list (movable flushable))
 
-(defknown sb-impl::|List| (&rest t) list (movable flushable foldable))
-(defknown sb-impl::|List*| (t &rest t) t (movable flushable foldable))
-(defknown sb-impl::|Append| (&rest t) t (flushable foldable))
-(defknown sb-impl::|Vector| (&rest t) simple-vector (flushable foldable))
+(defknown sb-impl::|List| (&rest t) list (movable flushable))
+(defknown sb-impl::|List*| (t &rest t) t (movable flushable))
+(defknown sb-impl::|Append| (&rest t) t (movable flushable))
+(defknown sb-impl::|Vector| (&rest t) simple-vector (movable flushable))
 
 ;;; All but last must be of type LIST, but there seems to be no way to
 ;;; express that in this syntax.
@@ -1022,6 +1059,7 @@
         (:synchronized t))
   hash-table
   (flushable))
+(defknown sb-impl::make-hash-table-using-defaults (integer) hash-table (flushable))
 (defknown hash-table-p (t) boolean (movable foldable flushable))
 (defknown gethash (t hash-table &optional t) (values t boolean)
   (flushable)) ; not FOLDABLE, since hash table contents can change
@@ -1041,6 +1079,7 @@
 (defknown hash-table-test (hash-table) symbol (foldable flushable))
 (defknown (sxhash psxhash) (t) hash-code (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
+(defknown sb-impl::install-hash-table-lock (hash-table) sb-thread:mutex ())
 ;; To avoid emitting code to test for nil-function-returned
 (defknown (sb-impl::signal-corrupt-hash-table
            sb-impl::signal-corrupt-hash-table-bucket)
@@ -1143,7 +1182,10 @@
   (movable foldable flushable))
 (defknown fill-pointer (complex-vector) index
     (unsafely-flushable))
-(defknown sb-impl::fill-pointer-error (t &optional t) nil)
+;;; We could cut 1 instruction off the call sequence by not loading the arg count
+;;; register for error-handler helpers that take fixed args.
+;;; Perhaps they should all be trap instead though?
+(defknown sb-vm::fill-pointer-error (t) nil)
 
 (defknown vector-push (t (modifying complex-vector)) (or index null) ())
 (defknown vector-push-extend (t (modifying complex-vector) &optional (and index (integer 1))) index
@@ -1664,7 +1706,7 @@
                        &key (:stream stream) (:use-labels t))
   null)
 
-(defknown describe (t &optional (or stream (member t nil))) (values))
+(defknown describe (t &optional stream-designator) (values))
 (defknown function-lambda-expression (function) (values t boolean t))
 (defknown inspect (t) (values))
 (defknown room (&optional (member t nil :default)) (values))
@@ -1752,7 +1794,7 @@
 ;;; We can't fold this in general because of SATISFIES. There is a
 ;;; special optimizer anyway.
 (defknown %typep (t (or type-specifier ctype)) boolean (movable flushable))
-(defknown %instance-typep (t (or type-specifier ctype layout)) boolean
+(defknown %instance-typep (t (or type-specifier ctype wrapper)) boolean
   (movable flushable always-translatable))
 ;;; We should never emit a call to %typep-wrapper
 (defknown %typep-wrapper (t t (or type-specifier ctype)) t
@@ -1793,11 +1835,10 @@
 (defknown %pop-values (t) t)
 (defknown %nip-values (t t &rest t) (values))
 (defknown %dummy-dx-alloc (t t) t)
-(defknown %allocate-closures (t) *)
 (defknown %type-check-error (t t t) nil)
 (defknown %type-check-error/c (t t t) nil)
 
-;; FIXME: This function does not return, but due to the implementation
+;; %compile-time-type-error does not return, but due to the implementation
 ;; of FILTER-LVAR we cannot write it here.
 (defknown (%compile-time-type-error %compile-time-type-style-warn) (t t t t t t) *)
 (defknown (etypecase-failure ecase-failure) (t t) nil)
@@ -1817,9 +1858,10 @@
   (foldable unsafely-flushable always-translatable))
 (defknown data-nil-vector-ref (simple-array index) nil
   (always-translatable))
-(defknown data-vector-set (array index t) t
-  (always-translatable))
-(defknown data-vector-set-with-offset (array fixnum fixnum t) t
+;;; The lowest-level vector SET operators should not return a value.
+;;; Functions built upon them may return the input value.
+(defknown data-vector-set (array index t) (values) (always-translatable))
+(defknown data-vector-set-with-offset (array fixnum fixnum t) (values)
   (always-translatable))
 (defknown hairy-data-vector-ref (array index) t (foldable))
 (defknown hairy-data-vector-set (array index t) t ())
@@ -1952,7 +1994,6 @@
 (defknown sb-vm::touch-object (t) (values)
   (always-translatable))
 
-#+linkage-table
 (defknown foreign-symbol-dataref-sap (simple-string)
   system-area-pointer
   (movable flushable))
@@ -1991,7 +2032,7 @@
 ;;; Unfortunately it prints that noise at each call site.
 ;;; Using DEFKNOWN we can make the proclamation effective when
 ;;; running the cross-compiler but not when building it.
-;;; Alternatively we could use SB-XC:PROCLAIM, except that that
+;;; Alternatively we could use PROCLAIM, except that that
 ;;; doesn't exist soon enough, and would need conditionals guarding
 ;;; it, which is sort of the very thing this is trying to avoid.
 (defknown missing-arg () nil)
@@ -2046,7 +2087,7 @@
 ;;; Avoid a ton of FBOUNDP checks in the string stream constructors etc,
 ;;; by wiring in the needed functions instead of dereferencing their fdefns.
 (defknown (ill-in ill-bin ill-out ill-bout
-           sb-impl::string-inch sb-impl::string-in-misc
+           sb-impl::string-in-misc
            sb-impl::string-sout
            sb-impl::finite-base-string-ouch sb-impl::finite-base-string-out-misc
            sb-impl::fill-pointer-ouch sb-impl::fill-pointer-sout
@@ -2075,10 +2116,31 @@
 (defknown class-name (class) symbol (flushable))
 
 (defknown finalize
-    (t (function-designator () * :no-function-conversion t) &key (:dont-save t))
+    (t (function-designator () *) &key (:dont-save t))
     *)
 
+(defknown (sb-impl::%with-standard-io-syntax
+           sb-impl::%with-rebound-io-syntax
+           sb-impl::call-with-sane-io-syntax)
+    (function) *)
+(defknown sb-debug::funcall-with-debug-io-syntax (function &rest t) *)
+(defknown sb-impl::%print-unreadable-object (t t t &optional function) null)
+
 #+sb-thread
-(defknown sb-thread::call-with-recursive-lock (function t t t) *)
-#+sb-thread
-(defknown sb-thread::call-with-mutex (function t t t t) *)
+(progn
+(defknown (sb-thread::call-with-mutex sb-thread::call-with-recursive-lock)
+    (function t t t) *)
+(defknown (sb-thread::call-with-system-mutex
+           sb-thread::call-with-system-mutex/allow-with-interrupts
+           sb-thread::call-with-system-mutex/without-gcing
+           sb-thread::call-with-recursive-system-lock)
+    (function t) *))
+
+#+round-float
+(progn
+  (defknown round-double (double-float #1=(member :round :floor :ceiling :truncate))
+      double-float
+      (foldable flushable movable always-translatable))
+
+  (defknown round-single (single-float #1#) single-float
+      (foldable flushable movable always-translatable)))

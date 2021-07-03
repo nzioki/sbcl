@@ -11,6 +11,8 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
 ;;; The number of bytes reserved above the number stack pointer.  These
@@ -263,7 +265,7 @@
      zero-sc-number)
     (null
      null-sc-number)
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol

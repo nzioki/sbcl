@@ -15,7 +15,9 @@
 #ifndef _SBCL_RUNTIME_H_
 #define _SBCL_RUNTIME_H_
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#include "lispobj.h"
+
+#ifdef LISP_FEATURE_WIN32
 # include "pthreads_win32.h"
 #else
 # include <signal.h>
@@ -28,22 +30,26 @@
 #include <inttypes.h>
 
 #if defined(LISP_FEATURE_SB_THREAD)
-#define thread_self() pthread_self()
-#define thread_equal(a,b) pthread_equal(a,b)
-#define thread_kill pthread_kill
 
 #ifdef LISP_FEATURE_WIN32
-#define thread_sigmask _sbcl_pthread_sigmask
+#define thread_sigmask sb_pthread_sigmask
+// wrap CriticalSection operators in a function returning 0 to satisfy assertions
+static inline int cs_mutex_lock(void* l) { EnterCriticalSection(l); return 0; }
+static inline int cs_mutex_unlock(void* l) { LeaveCriticalSection(l); return 0; }
+#define thread_mutex_lock(l) cs_mutex_lock(l)
+#define thread_mutex_unlock(l) cs_mutex_unlock(l)
 #else
+#define thread_self() pthread_self()
+#define thread_equal(a,b) pthread_equal(a,b)
 #define thread_sigmask pthread_sigmask
-#endif
-
 #define thread_mutex_lock(l) pthread_mutex_lock(l)
 #define thread_mutex_unlock(l) pthread_mutex_unlock(l)
+#endif
+
 #else
+// not SB_THREAD
 #define thread_self() 0
 #define thread_equal(a,b) ((a)==(b))
-#define thread_kill kill_safely
 #define thread_sigmask sigprocmask
 #define thread_mutex_lock(l) 0
 #define thread_mutex_unlock(l) 0
@@ -79,13 +85,6 @@ void gc_state_unlock();
  * The next few defines serve as configuration -- edit them inline if
  * you are a developer and want to affect FSHOW behaviour.
  */
-
-/* Block blockable interrupts for each SHOW, if not 0.
- * (On Windows, this setting has no effect.)
- *
- * In principle, this is a "configuration option", but I am not aware of
- * any reason why or when it would be advantageous to disable it. */
-#define QSHOW_SIGNAL_SAFE 1
 
 /* Enable extra-verbose low-level debugging output for signals? (You
  * probably don't want this unless you're trying to debug very early
@@ -165,19 +164,6 @@ extern int gencgc_verbose;
 
 void dyndebug_init(void);
 
-#if QSHOW_SIGNAL_SAFE == 1 && !defined(LISP_FEATURE_WIN32)
-
-extern sigset_t blockable_sigset;
-
-#define QSHOW_BLOCK                                             \
-        sigset_t oldset;                                        \
-        thread_sigmask(SIG_BLOCK, &blockable_sigset, &oldset)
-#define QSHOW_UNBLOCK thread_sigmask(SIG_SETMASK,&oldset,0)
-#else
-#define QSHOW_BLOCK
-#define QSHOW_UNBLOCK
-#endif
-
 /* The following macros duplicate the expansion of odxprint, because the
  * extra level of parentheses around `args' prevents us from
  * implementing FSHOW in terms of odxprint directly.  (They also differ
@@ -200,24 +186,6 @@ extern sigset_t blockable_sigset;
 # define FSHOW_SIGNAL(args)
 #endif
 
-/* KLUDGE: These are in theory machine-dependent and OS-dependent, but
- * in practice the "foo int" definitions work for all the machines
- * that SBCL runs on as of 0.6.7. If we port to the Alpha or some
- * other non-32-bit machine we'll probably need real machine-dependent
- * and OS-dependent definitions again. */
-/* even on alpha, int happens to be 4 bytes.  long is longer. */
-/* FIXME: these names really shouldn't reflect their length and this
-   is not quite right for some of the FFI stuff */
-#if defined(LISP_FEATURE_WIN32)&&defined(LISP_FEATURE_X86_64)
-typedef unsigned long long u64;
-typedef signed long long s64;
-#else
-typedef unsigned long u64;
-typedef signed long s64;
-#endif
-typedef unsigned int u32;
-typedef signed int s32;
-
 #ifdef _WIN64
 #define AMD64_SYSV_ABI __attribute__((sysv_abi))
 #else
@@ -226,33 +194,7 @@ typedef signed int s32;
 
 #include <sys/types.h>
 
-#if defined(LISP_FEATURE_SB_THREAD)
-typedef pthread_t os_thread_t;
-#else
-typedef pid_t os_thread_t;
-#endif
-
-#ifndef LISP_FEATURE_ALPHA
-typedef uintptr_t uword_t;
-typedef intptr_t  sword_t;
-#else
-/* The alpha32 port uses non-intptr-sized words */
-typedef u32 uword_t;
-typedef s32 sword_t;
-#endif
-
-/* FIXME: we do things this way because of the alpha32 port.  once
-   alpha64 has arrived, all this nastiness can go away */
-#if 64 == N_WORD_BITS
-#define LOW_WORD(c) ((uintptr_t)c)
 #define OBJ_FMTX PRIxPTR
-typedef uintptr_t lispobj;
-#else
-#define OBJ_FMTX "x"
-#define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
-/* fake it on alpha32 */
-typedef unsigned int lispobj;
-#endif
 
 static inline int
 lowtag_of(lispobj obj)
@@ -290,40 +232,13 @@ static inline int instancep(lispobj obj) {
 static inline int functionp(lispobj obj) {
     return lowtag_of(obj) == FUN_POINTER_LOWTAG;
 }
+static inline int other_pointer_p(lispobj obj) {
+    return lowtag_of(obj) == OTHER_POINTER_LOWTAG;
+}
 static inline int simple_vector_p(lispobj obj) {
-    return lowtag_of(obj) == OTHER_POINTER_LOWTAG &&
+    return other_pointer_p(obj) &&
            widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
 }
-
-/* This is NOT the same value that lisp's %INSTANCE-LENGTH returns.
- * Lisp always uses the logical length (as originally allocated),
- * except when heap-walking which requires exact physical sizes */
-static inline int instance_length(lispobj header)
-{
-    // * Byte 3 of an instance header word holds the immobile gen# and visited bit,
-    //   so those have to be masked off.
-    // * fullcgc uses bit index 31 as a mark bit, so that has to
-    //   be cleared. Lisp does not have to clear bit 31 because fullcgc does not
-    //   operate concurrently.
-    // * If the object is in hashed-and-moved state and the original instance payload
-    //   length was odd (total object length was even), then add 1.
-    //   This can be detected by ANDing some bits, bit 10 being the least-significant
-    //   bit of the original size, and bit 9 being the 'hashed+moved' bit.
-    // * 64-bit machines do not need 'long' right-shifts, so truncate to int.
-
-    int extra = ((unsigned int)header >> 10) & ((unsigned int)header >> 9) & 1;
-    return (((unsigned int)header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF) + extra;
-}
-
-/// instance_layout() macro takes a lispobj* and is an lvalue
-#ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-# define instance_layout(instance_ptr) ((lispobj*)instance_ptr)[1]
-#elif defined(LISP_FEATURE_64_BIT) && defined(LISP_FEATURE_LITTLE_ENDIAN)
-  // so that this stays an lvalue, it can't be cast to lispobj
-# define instance_layout(instance_ptr) ((uint32_t*)(instance_ptr))[1]
-#else
-# error "No instance_layout() defined"
-#endif
 
 /* Is the Lisp object obj something with pointer nature (as opposed to
  * e.g. a fixnum or character or unbound marker)? */
@@ -378,15 +293,10 @@ native_pointer(lispobj obj)
 static inline lispobj
 make_lispobj(void *o, int low_tag)
 {
-    return LOW_WORD(o) | low_tag;
+    return (lispobj)o | low_tag;
 }
 
-#define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
-static inline lispobj
-make_fixnum(uword_t n) // '<<' on negatives is _technically_ undefined behavior
-{
-    return MAKE_FIXNUM(n);
-}
+#define make_fixnum(n) ((uword_t)(n) << N_FIXNUM_TAG_BITS)
 
 static inline sword_t
 fixnum_value(lispobj n)

@@ -14,7 +14,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(conditional-opcode emit-word
+  (import '(conditional-opcode negate-condition emit-word
             composite-immediate-instruction encodable-immediate
             lsl lsr asr ror cpsr @) "SB-VM")
   ;; Imports from SB-VM into this package
@@ -40,7 +40,7 @@
     (:le . 13)
     (:al . 14))
   #'equal)
-(defconstant-eqx sb-vm::+condition-name-vec+
+(defconstant-eqx +condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
@@ -49,6 +49,9 @@
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
+(defun negate-condition (name)
+  (let ((code (logxor 1 (conditional-opcode name))))
+    (aref +condition-name-vec+ code)))
 
 ;;;; disassembler field definitions
 
@@ -716,6 +719,31 @@
 (define-data-processing-instruction movs #x1b t nil)
 (define-data-processing-instruction mvn  #x1e t nil)
 (define-data-processing-instruction mvns #x1f t nil)
+
+(define-instruction-format (movw-format 32
+                            :default-printer '(:name :tab rd ", #" immediate))
+  (cond :field (byte 4 28) :type 'condition-code)
+  (opcode-8 :field (byte 8 20))
+  (immediate :fields (list (byte 4 16) (byte 12 0))
+             :prefilter (lambda (dstate high low)
+                          (declare (ignore dstate))
+                          (logior (ash high 12) low)))
+  (rd :field (byte 4 12) :type 'reg))
+
+(macrolet ((mov-imm-16 (segment rd imm half)
+             `(emit-dp-instruction ,segment 14 #b00 #b1
+                                   ,(ecase half
+                                      (:low  #b10000)
+                                      (:high #b10100))
+                                   (ldb (byte 4 12) ,imm)
+                                   (tn-offset ,rd)
+                                   (ldb (byte 12 0) ,imm))))
+(define-instruction movw (segment rd imm) ; move wide (zero-extend)
+  (:printer movw-format ((opcode-8 #b00110000)))
+  (:emitter (mov-imm-16 segment rd imm :low)))
+(define-instruction movt (segment rd imm) ; move top bits (and keep bottom)
+  (:printer movw-format ((opcode-8 #b00110100)))
+  (:emitter (mov-imm-16 segment rd imm :high))))
 
 ;;;; Exception-generating instructions
 
@@ -1283,6 +1311,9 @@
 (define-instruction load-from-label (segment &rest args)
   (:vop-var vop)
   (:emitter
+   ;; ISTM this use of an interior-pointer is unnecessary. Since we know the
+   ;; displacement of the label from the base of the CODE, we could load
+   ;; either from [code+X] or [PC+X] where X is in an unsigned-reg.
    (with-condition-defaulted (args (condition dest lip label))
      ;; We can load the word addressed by a label in a single
      ;; instruction if the overall offset puts it to within a 12-bit
@@ -1734,3 +1765,45 @@
 (define-two-reg-transfer-fp-instruction fmrrs :single :to-arm)
 (define-two-reg-transfer-fp-instruction fmdrr :double :from-arm)
 (define-two-reg-transfer-fp-instruction fmrrd :double :to-arm)
+
+(sb-assem::%def-inst-encoder
+ '.layout-id
+ (lambda (segment layout)
+   (sb-c:note-fixup segment :layout-id (sb-c:make-fixup layout :layout-id))))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset) (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  (let ((sap (code-instructions code)))
+    (ecase kind
+      (:layout-id
+       (aver (typep value '(unsigned-byte 24)))
+       (setf (sap-ref-word sap offset)
+             (dpb (ldb (byte 8 16) value) (byte 8 0) (sap-ref-word sap offset))
+             (sap-ref-word sap (+ offset 4))
+             (dpb (ldb (byte 8  8) value) (byte 8 0) (sap-ref-word sap (+ offset 4)))
+             (sap-ref-word sap (+ offset 8))
+             (dpb (ldb (byte 8  0) value) (byte 8 0) (sap-ref-word sap (+ offset 8)))))
+      (:absolute
+       (setf (sap-ref-32 sap offset) value))))
+  nil)
+
+(define-instruction store-coverage-mark (segment path-index temp)
+  (:emitter
+   ;; No backpatch is needed to compute the offset into the code header
+   ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   (let* ((offset (+ (component-header-length)
+                     n-word-bytes ; skip over jump table word
+                     path-index
+                     (- other-pointer-lowtag)))
+          (addr
+           (@ sb-vm::code-tn
+              (etypecase offset
+                ((integer 0 4095) offset)
+                ((unsigned-byte 31)
+                 (inst* segment 'movw temp (logand offset #xffff))
+                 (when (ldb-test (byte 16 16) offset)
+                   (inst* segment 'movt temp (ldb (byte 16 16) offset)))
+                 temp)))))
+     (inst* segment 'strb sb-vm::null-tn addr))))

@@ -160,8 +160,8 @@ static lispobj
 ptrans_instance(lispobj thing, lispobj header, boolean /* ignored */ constant)
 {
     constant = 0;
-    lispobj info = LAYOUT(instance_layout(native_pointer(thing)))->info;
-    if (info != NIL) {
+    lispobj info = LAYOUT(instance_layout(native_pointer(thing)))->_info;
+    if (instancep(info)) {
         lispobj pure = ((struct defstruct_description*)native_pointer(info))->pure;
         if (pure != NIL && pure != T) {
             gc_abort();
@@ -259,7 +259,7 @@ ptrans_code(lispobj thing)
 #endif
     /* Put in forwarding pointers for all the functions. */
     for_each_simple_fun(i, newfunc, new, 1, {
-        lispobj* old = (lispobj*)LOW_WORD((char*)newfunc - displacement);
+        lispobj* old = (lispobj*)((char*)newfunc - displacement);
         *old = make_lispobj(newfunc, FUN_POINTER_LOWTAG);
         pscav(&newfunc->self, 1, 1); // and fix the self-pointer now
     });
@@ -410,7 +410,6 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
     case COMPLEX_CHARACTER_STRING_WIDETAG:
 #endif
       case COMPLEX_BIT_VECTOR_WIDETAG:
-      case COMPLEX_VECTOR_NIL_WIDETAG:
       case COMPLEX_VECTOR_WIDETAG:
       case COMPLEX_ARRAY_WIDETAG:
         return ptrans_boxed(thing, header, constant);
@@ -529,7 +528,7 @@ pscav(lispobj *addr, long nwords, boolean constant)
                 //     [1] : vector length
                 //     [2] : element[0] = high-water mark
                 //     [3] : element[1] = rehash bit
-                if (is_vector_subtype(thing, VectorAddrHashing))
+                if (vector_flagp(thing, VectorAddrHashing))
                     addr[3] = make_fixnum(1); // just flag it for rehash
                 count = 2;
                 break;
@@ -560,23 +559,14 @@ pscav(lispobj *addr, long nwords, boolean constant)
 
               case INSTANCE_WIDETAG:
                 {
-                    lispobj lbitmap = LAYOUT(instance_layout(addr))->bitmap;
-                    lispobj* slots = addr + 1;
-                    long nslots = instance_length(*addr) | 1;
-                    int index;
-                    if (fixnump(lbitmap)) {
-                      sword_t bitmap = fixnum_value(lbitmap);
-                      for (index = 0; index < nslots ; index++, bitmap >>= 1)
-                        if (bitmap & 1)
-                          pscav(slots + index, 1, constant);
-                    } else {
-                      struct bignum * bitmap;
-                      bitmap = (struct bignum*)native_pointer(lbitmap);
-                      for (index = 0; index < nslots ; index++)
-                        if (positive_bignum_logbitp(index, bitmap))
-                          pscav(slots + index, 1, constant);
-                    }
-                    count = 1 + nslots;
+                struct bitmap bitmap = get_layout_bitmap(LAYOUT(instance_layout(addr)));
+                long nslots = instance_length(*addr);
+                int index;
+                for (index = 0; index < nslots ; index++)
+                    // logically treat index 0 (layout) as a tagged slot
+                    if (index == 0 || bitmap_logbitp(index, bitmap))
+                        pscav((addr+1) + index, 1, constant);
+                count = 1 + (nslots | 1);
                 }
                 break;
 
@@ -667,9 +657,7 @@ purify(lispobj static_roots, lispobj read_only_roots)
     printf(" handlers");
     fflush(stdout);
 #endif
-    pscav((lispobj *) interrupt_handlers,
-          sizeof(interrupt_handlers) / sizeof(lispobj),
-          0);
+    pscav(lisp_sig_handlers, NSIG, 0);
 
 #ifdef PRINTNOISE
     printf(" stack");
@@ -734,9 +722,6 @@ purify(lispobj static_roots, lispobj read_only_roots)
 #ifdef PRINTNOISE
     printf(" cleanup");
     fflush(stdout);
-#endif
-#ifdef LISP_FEATURE_HPUX
-    clear_auto_gc_trigger(); /* restore mmap as it was given by os */
 #endif
 
     os_zero((os_vm_address_t) current_dynamic_space, dynamic_space_size);

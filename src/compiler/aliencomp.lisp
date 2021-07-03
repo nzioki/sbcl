@@ -219,7 +219,7 @@
            (give-up-ir1-transform "Element alignment is unknown."))
          (if (null dims)
              (values nil 0 element-type)
-             (let* ((arg (gensym))
+             (let* ((arg (sb-xc:gensym))
                     (args (list arg))
                     (offsetexpr arg))
                (dolist (dim (cdr dims))
@@ -598,11 +598,10 @@
   (unless (and (constant-lvar-p type)
                (alien-fun-type-p (lvar-value type)))
     (error "Something is broken."))
-  (let ((type (lvar-value type)))
-    (values-specifier-type
-     (compute-alien-rep-type
-      (alien-fun-type-result-type type)
-      :result))))
+  (let ((spec (compute-alien-rep-type
+               (alien-fun-type-result-type (lvar-value type))
+               :result)))
+    (if (eq spec '*) *wild-type* (values-specifier-type spec))))
 
 (defoptimizer (%alien-funcall ltn-annotate)
               ((function type &rest args) node ltn-policy)
@@ -710,7 +709,7 @@
               (reference-tn-list (remove-if-not #'tn-p (flatten-list arg-tns)) nil))
              (result-operands
               (reference-tn-list (remove-if-not #'tn-p result-tns) t)))
-        (cond #+(vop-named sb-vm::call-out-named)
+        (cond #+#.(cl:if (sb-c::vop-existsp :named sb-vm::call-out-named) '(and) '(or))
               ((and (constant-lvar-p function) (stringp (lvar-value function)))
                (vop* call-out-named call block (arg-operands) (result-operands)
                      (lvar-value function)

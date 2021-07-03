@@ -6,7 +6,7 @@
 # ones as dependencies.
 
 UNAME:=$(shell uname -s)
-DEST=$(SBCL_PWD)/obj/sbcl-home/contrib/
+DEST=$(SBCL_TOP)/obj/sbcl-home/contrib/
 FASL=$(DEST)/$(SYSTEM).fasl
 ASD=$(DEST)/$(SYSTEM).asd
 
@@ -30,6 +30,7 @@ all: $(FASL) $(ASD)
 
 $(FASL)::
 	$(SBCL) --eval '(setf (sb-ext:readtable-base-char-preference *readtable*) :both)' \
+		--eval '(declaim (muffle-conditions (and compiler-note (not sb-c::unknown-typep-note))))' \
 		--load ../asdf-stub.lisp \
 		--eval '(asdf::build-asdf-contrib "$(SYSTEM)")'
 

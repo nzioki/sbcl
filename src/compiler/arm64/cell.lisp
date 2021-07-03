@@ -44,17 +44,22 @@
   (:temporary (:sc interior-reg) lip)
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   (:generator 5
-    (inst dsb)
     (inst add-sub lip object (- (* offset n-word-bytes) lowtag))
-    LOOP
-    (inst ldxr result lip)
-    (inst cmp result old)
-    (inst b :ne EXIT)
-    (inst stlxr tmp-tn new lip)
-    (inst cbnz tmp-tn LOOP)
-    EXIT
-    (inst clrex)
-    (inst dmb)))
+    (cond ((member :arm-v8.1 *backend-subfeatures*)
+           (move result old)
+           (inst casal result new lip))
+          (t
+           (assemble ()
+             (inst dsb)
+             LOOP
+             (inst ldxr result lip)
+             (inst cmp result old)
+             (inst b :ne EXIT)
+             (inst stlxr tmp-tn new lip)
+             (inst cbnz tmp-tn LOOP)
+             EXIT
+             (inst clrex)
+             (inst dmb))))))
 
 ;;;; Symbol hacking VOPs:
 
@@ -228,6 +233,40 @@
     (inst dmb)
     (inst cmp result unbound-marker-widetag)
     (inst b :eq (generate-error-code vop 'unbound-symbol-error symbol))))
+
+(define-vop (%compare-and-swap-symbol-value-v8.1)
+  (:translate %compare-and-swap-symbol-value)
+  (:args (symbol :scs (descriptor-reg))
+         (old :scs (descriptor-reg any-reg))
+         (new :scs (descriptor-reg any-reg)))
+  (:results (result :scs (descriptor-reg any-reg) :from :load))
+  #+sb-thread
+  (:temporary (:sc any-reg) tls-index)
+  (:temporary (:sc interior-reg) lip)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:guard (member :arm-v8.1 *backend-subfeatures*))
+  (:generator 14
+    #+sb-thread
+    (assemble ()
+      (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
+      ;; Thread-local area, no synchronization needed.
+      (inst ldr result (@ thread-tn tls-index))
+      (inst cmp result old)
+      (inst b :ne DONT-STORE-TLS)
+      (inst str new (@ thread-tn tls-index))
+      DONT-STORE-TLS
+
+      (inst cmp result no-tls-value-marker-widetag)
+      (inst b :ne CHECK-UNBOUND))
+    (inst add-sub lip symbol (- (* symbol-value-slot n-word-bytes)
+                                other-pointer-lowtag))
+    (move result old)
+    (inst casal result new lip)
+    CHECK-UNBOUND
+    (inst cmp result unbound-marker-widetag)
+    (inst b :eq (generate-error-code vop 'unbound-symbol-error symbol))))
+
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -466,12 +505,23 @@
   (:translate %instance-cas)
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types instance tagged-num * *))
+(define-vop (%raw-instance-cas/word %instance-cas)
+  (:args (object)
+         (index)
+         (old-value :scs (unsigned-reg))
+         (new-value :scs (unsigned-reg)))
+  (:arg-types * tagged-num unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types unsigned-num)
+  (:translate %raw-instance-cas/word))
+
 
 ;;;; Code object frobbing.
 
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (descriptor-reg any-reg) * code-header-ref)
 
+#-darwin-jit
 (define-full-setter code-header-set * 0 other-pointer-lowtag
   (descriptor-reg any-reg) * code-header-set)
 
@@ -497,11 +547,9 @@
                        (inst ,instruction value (@ object offset))))
                     ,@(when move-result
                         `((,move-macro result value))))))
-         (let ((ref-vop (symbolicate "RAW-INSTANCE-REF/" name))
-               (set-vop (symbolicate "RAW-INSTANCE-SET/" name)))
            `(progn
-              (define-vop (,ref-vop)
-                (:translate ,(symbolicate "%" ref-vop))
+              (define-vop ()
+                (:translate ,(symbolicate "%RAW-INSTANCE-REF/" name))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
                        (index :scs (any-reg immediate)))
@@ -510,17 +558,15 @@
                 (:result-types ,value-primtype)
                 (:temporary (:scs (non-descriptor-reg)) offset)
                 (:generator 5 ,@(emit-generator 'ldr nil)))
-              (define-vop (,set-vop)
-                (:translate ,(symbolicate "%" set-vop))
+              (define-vop ()
+                (:translate ,(symbolicate "%RAW-INSTANCE-SET/" name))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
                        (index :scs (any-reg immediate))
-                       (value :scs (,value-sc) :target result))
+                       (value :scs (,value-sc)))
                 (:arg-types * positive-fixnum ,value-primtype)
-                (:results (result :scs (,value-sc)))
-                (:result-types ,value-primtype)
                 (:temporary (:scs (non-descriptor-reg)) offset)
-                (:generator 5 ,@(emit-generator 'str t))))))))
+                (:generator 5 ,@(emit-generator 'str nil)))))))
   (define-raw-slot-vops word unsigned-num unsigned-reg)
   (define-raw-slot-vops signed-word signed-num signed-reg)
   (define-raw-slot-vops single single-float single-reg
@@ -556,3 +602,22 @@
     (inst stlxr tmp-tn sum lip)
     (inst cbnz tmp-tn LOOP)
     (inst dmb)))
+
+(define-vop (raw-instance-atomic-incf/word-v8.1)
+  (:translate %raw-instance-atomic-incf/word)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (diff :scs (unsigned-reg)))
+  (:arg-types * positive-fixnum unsigned-num)
+  (:temporary (:sc interior-reg) lip)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types unsigned-num)
+  (:guard (member :arm-v8.1 *backend-subfeatures*))
+  (:generator 3
+    (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
+    (inst add lip lip (- (* instance-slots-offset
+                            n-word-bytes)
+                         instance-pointer-lowtag))
+
+    (inst ldaddal diff result lip)))

@@ -321,6 +321,8 @@
   (data-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
+  (data-origin-label (gen-label "data start") :read-only t)
+  (text-origin-label (gen-label "text start") :read-only t)
   (elsewhere-label (gen-label "elsewhere start") :read-only t)
   (inter-function-padding :normal :type (member :normal :nop))
   ;; for collecting unique "unboxed constants" prior to placing them
@@ -331,6 +333,9 @@
   ;; can print "in the {x} section" whenever it changes.
   (tracing-state (list nil nil) :read-only t)) ; segment and vop
 (declaim (freeze-type asmstream))
+;;; FIXME: suboptimal since *asmstream* was declaimed earlier because reasons.
+;;; (so we're missing uses of the known type even though the special var is known)
+(declaim (type asmstream *asmstream*))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)
@@ -1346,10 +1351,21 @@
 
 ;;;; interface to the rest of the compiler
 
+;;; Map of opcode symbol to function that emits it into the byte stream
+;;; (or with the schedulding assembler, into the queue)
+;;; Key is a symbol. Value is either #<function> or (#<function>),
+;;; the latter if function wants to receive prefix arguments.
+(defglobal *inst-encoder* (make-hash-table)) ; keys are symbols
+
 ;;; Return T only if STATEMENT has a label which is potentially a branch
 ;;; target, and not merely labeled to store a location of interest.
 (defun labeled-statement-p (statement &aux (labels (stmt-labels statement)))
   (if (listp labels) (some #'label-usedp labels) (label-usedp labels)))
+
+#-x86-64
+(progn
+  (defun extract-prefix-keywords (x) x)
+  (defun decode-prefix (args) args))
 
 (defun dump-symbolic-asm (section stream &aux last-vop all-labels (n 0))
   (format stream "~2&Assembler input:~%")
@@ -1359,7 +1375,7 @@
     (incf n)
     (binding* ((vop (stmt-vop statement) :exit-if-null))
       (unless (eq vop last-vop)
-        (format stream "## ~A~%" (sb-c::vop-info-name (sb-c::vop-info vop))))
+        (format stream "## ~A~%" (sb-c::vop-name vop)))
       (setq last-vop vop))
     (let ((op (stmt-mnemonic statement))
           (eol-comment ""))
@@ -1376,7 +1392,11 @@
       (if (functionp op)
           (format stream "# postit ~S~A~%" op eol-comment)
           (format stream "    ~:@(~A~) ~{~A~^, ~}~A~%"
-                  op (stmt-operands statement) eol-comment))))
+                  op
+                  (if (consp (gethash op *inst-encoder*))
+                      (decode-prefix (stmt-operands statement))
+                      (stmt-operands statement))
+                  eol-comment))))
   (let ((*print-length* nil)
         (*print-pretty* t)
         (*print-right-margin* 80))
@@ -1399,10 +1419,6 @@
             (section-tail second) head))
     (setf (section-tail first) last-stmt))
   first)
-
-;;; Map of opcode symbol to function that emits it into the byte stream
-;;; (or with the schedulding assembler, into the queue)
-(defglobal *inst-encoder* (make-hash-table :test 'eq))
 
 ;;; Combine INPUTS into one assembly stream and assemble into SEGMENT
 (defun %assemble (segment section)
@@ -1454,9 +1470,10 @@
                ((nil)) ; ignore
                (t
                 (let ((encoder (gethash mnemonic *inst-encoder*)))
-                  (cond ((functionp encoder)
+                  (cond (encoder
                          (instruction-hooks segment)
-                         (apply encoder segment
+                         (apply (the function (if (listp encoder) (car encoder) encoder))
+                                segment
                                 (perform-operand-lowering operands)))
                         (t
                          (bug "No encoder for ~S" mnemonic))))))))))
@@ -1588,21 +1605,34 @@
 ;;; As such, we must detect that we are emitting directly to machine code.
 ;;;
 (defun inst* (mnemonic &rest operands)
-  (declare (symbol mnemonic))
-  (let ((action (gethash mnemonic *inst-encoder*))
-        (dest *current-destination*))
+  (let ((dest
+         (etypecase mnemonic
+           (symbol
+            ;; If called by a vop, the first argument is a mnemonic.
+            *current-destination*)
+           (segment
+            ;; If called by an instruction encoder to encode other instructions,
+            ;; the first argument is a SEGMENT. This facilitates a different kind of
+            ;; macro-instruction, one which decides only at encoding time what other
+            ;; instructions to emit. Similar results could be achievedy by factoring
+            ;; out other emitters into callable functions, though the INST macro
+            ;; tends to be a more convenient interface.
+            (prog1 mnemonic (setq mnemonic (the symbol (pop operands)))))))
+        (action (gethash mnemonic *inst-encoder*)))
     (unless action ; try canonicalizing again
       (setq mnemonic (find-symbol (string mnemonic)
                                   *backend-instruction-set-package*)
             action (gethash mnemonic *inst-encoder*))
       (aver action))
+    (when (listp action) (setq operands (extract-prefix-keywords operands)))
     (typecase dest
       (cons ; streaming in to the assembler
        (trace-inst dest mnemonic operands)
        (emit dest (cons mnemonic operands)))
       (segment ; streaming out of the assembler
        (instruction-hooks dest)
-       (apply action dest (perform-operand-lowering operands))))))
+       (apply (the function (if (listp action) (car action) action))
+              dest (perform-operand-lowering operands))))))
 
 (defun emit-label (label)
   "Emit LABEL at this location in the current section."
@@ -1765,9 +1795,16 @@
                (:little-endian (nreverse forms))
                (:big-endian forms)))))))
 
-(defun %def-inst-encoder (symbol &optional thing)
-  (setf (gethash symbol *inst-encoder*)
-        (or thing (gethash symbol *inst-encoder*))))
+(defun %def-inst-encoder (symbol thing &optional accept-prefixes)
+  (let ((function
+         (or thing ; load-time effect passes the definition
+             ;; (where compile-time doesn't).
+             ;; Otherwise, take what we already had so that a compile-time
+             ;; effect doesn't clobber an already-working hash-table entry
+             ;; if re-evaluating a define-instruction form.
+             (car (ensure-list (gethash symbol *inst-encoder*))))))
+    (setf (gethash symbol *inst-encoder*)
+          (if accept-prefixes (cons function t) function))))
 
 (defmacro define-instruction (name lambda-list &rest options)
   (binding* ((fun-name (intern (symbol-name name) *backend-instruction-set-package*))
@@ -1865,13 +1902,18 @@
        (setf (get ',fun-name 'sb-disassem::instruction-flavors)
              (list ,@pdefs))
        ,@(when emitter
-           `((eval-when (:compile-toplevel) (%def-inst-encoder ',fun-name))
-             (%def-inst-encoder
-              ',fun-name
-              (named-lambda ,(string fun-name) (,segment-name ,@(cdr lambda-list))
-                (declare ,@decls)
-                (let ,(and vop-name `((,vop-name **current-vop**)))
-                  (block ,fun-name ,@emitter))))))
+           (let* ((operands (cdr lambda-list))
+                  (accept-prefixes (eq (car operands) '&prefix)))
+             (when accept-prefixes (setf operands (cdr operands)))
+             `((eval-when (:compile-toplevel)
+                 (%def-inst-encoder ',fun-name nil ',accept-prefixes))
+               (%def-inst-encoder
+                ',fun-name
+                (named-lambda ,(string fun-name) (,segment-name ,@operands)
+                  (declare ,@decls)
+                  (let ,(and vop-name `((,vop-name **current-vop**)))
+                    (block ,fun-name ,@emitter)))
+                ',accept-prefixes))))
        ',fun-name)))
 
 (defun instruction-hooks (segment)

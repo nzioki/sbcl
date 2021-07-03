@@ -295,7 +295,7 @@
                             t)
 
 
-  (let ((min sb-xc:most-positive-fixnum)
+  (let ((min most-positive-fixnum)
         (min-scn nil)
         (unique nil))
     (dolist (scn scs)
@@ -577,8 +577,7 @@
                                             pass-tn vop))
                (after
                 (cond ((eq how :local-call)
-                       (aver (eq (vop-info-name (vop-info prev))
-                                 'allocate-frame))
+                       (aver (eq (vop-name prev) 'allocate-frame))
                        prev)
                       (prev (vop-next prev))
                       (t
@@ -594,13 +593,15 @@
     (let ((type (tn-ref-type x-tn-ref)))
       (cond ((not type)
              nil)
+            ((csubtypep type (specifier-type 'fixnum))
+             (template-or-lose 'sb-vm::move-from-word/fixnum))
             ((csubtypep type
-                        (specifier-type `(integer ,sb-xc:most-negative-fixnum
-                                                  ,(1+ sb-xc:most-positive-fixnum))))
+                        (specifier-type `(integer ,most-negative-fixnum
+                                                  ,(1+ most-positive-fixnum))))
              (template-or-lose 'sb-vm::move-from-fixnum+1))
             ((csubtypep type
-                        (specifier-type `(integer ,(1- sb-xc:most-negative-fixnum)
-                                                  ,sb-xc:most-positive-fixnum)))
+                        (specifier-type `(integer ,(1- most-negative-fixnum)
+                                                  ,most-positive-fixnum)))
              (template-or-lose 'sb-vm::move-from-fixnum-1))))))
 
 (defun coerce-from-constant (x-tn-ref y)
@@ -738,7 +739,7 @@
 ;;; If TN is in a number stack SC, make all the right annotations.
 ;;; Note that this should be called after TN has been referenced,
 ;;; since it must iterate over the referencing environments.
-#-sb-fluid (declaim (inline note-if-number-stack))
+(declaim (inline note-if-number-stack))
 (defun note-if-number-stack (tn 2comp restricted)
   (declare (type tn tn) (type ir2-component 2comp))
   (when (if restricted

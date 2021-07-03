@@ -38,7 +38,7 @@
            has already been partially loaded. This may not work, you may~%~
            need to get a fresh lisp (reboot) and then load PCL."))
 
-#-sb-fluid (declaim (inline gdefinition))
+(declaim (inline gdefinition))
 (defun gdefinition (spec)
   ;; This is null layer right now, but once FDEFINITION stops bypasssing
   ;; fwrappers/encapsulations we can do that here.
@@ -122,7 +122,7 @@
     ((not and or) `(,(car type) ,@(mapcar #'convert-to-system-type
                                           (cdr type))))
     ((class class-eq) ; class-eq is impossible to do right
-     (layout-classoid (class-wrapper (cadr type))))
+     (wrapper-classoid (class-wrapper (cadr type))))
     (eql type)
     (t (if (null (cdr type))
            (car type)
@@ -177,7 +177,7 @@
 
 ;;;; built-in classes
 
-;;; Grovel over SB-KERNEL::+!BUILT-IN-CLASSES+ in order to set
+;;; Grovel over SB-KERNEL::*BUILTIN-CLASSOIDS* in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
 (define-load-time-global *built-in-classes*
@@ -185,8 +185,7 @@
              (/noshow "entering DIRECT-SUPERS" (classoid-name class))
              (if (typep class 'built-in-classoid)
                  (built-in-classoid-direct-superclasses class)
-                 (let ((inherits (layout-inherits
-                                  (classoid-layout class))))
+                 (let ((inherits (wrapper-inherits (classoid-wrapper class))))
                    (/noshow inherits)
                    (list (svref inherits (1- (length inherits)))))))
            (direct-subs (class)
@@ -195,8 +194,8 @@
                (let ((subs (classoid-subclasses class)))
                  (/noshow subs)
                  (when subs
-                   (dohash ((sub v) subs)
-                     (declare (ignore v))
+                   (sb-kernel::do-subclassoids ((sub wrapper) class)
+                     (declare (ignore wrapper))
                      (/noshow sub)
                      (when (member class (direct-supers sub) :test #'eq)
                        (res sub)))))
@@ -209,9 +208,8 @@
                 `(,name
                   ,(mapcar #'classoid-name (direct-supers class))
                   ,(mapcar #'classoid-name (direct-subs class))
-                  ,(map 'list
-                        (lambda (x) (classoid-name (layout-classoid x)))
-                        (reverse (layout-inherits (classoid-layout class))))
+                  ,(map 'list #'wrapper-classoid-name
+                        (reverse (wrapper-inherits (classoid-wrapper class))))
                   ,(eval (getf (cdr kernel-bic-entry) :prototype-form)))))
             (remove-if (lambda (kernel-bic-entry)
                          (member (first kernel-bic-entry)
@@ -219,8 +217,9 @@
                                  ;; SYSTEM-CLASSes) from the
                                  ;; BUILT-IN-CLASS list
                                  '(t function stream sequence
-                                     file-stream string-stream)))
-                       sb-kernel::+!built-in-classes+))))
+                                   file-stream string-stream
+                                   slot-object)))
+                       sb-kernel::*builtin-classoids*))))
 (/noshow "done setting up SB-PCL::*BUILT-IN-CLASSES*")
 
 ;;;; the classes that define the kernel of the metabraid
@@ -330,6 +329,7 @@
    (lambda-list :initform () :initarg :lambda-list :reader method-lambda-list)
    (%function :initform nil :initarg :function :reader method-function)
    (%documentation :initform nil :initarg :documentation)
+   (%cache :initform nil :accessor method-em-cache)
    ;; True IFF method is known to have no CALL-NEXT-METHOD in it, or
    ;; just a plain (CALL-NEXT-METHOD).
    (simple-next-method-call
@@ -568,14 +568,12 @@
 ;; gethash on a live key should get the identical specializer, but since
 ;; nothing referenced the old specializer, consing a new one is fine.
 (defglobal *eql-specializer-table*
-  (make-hash-table :test 'eql :weakness :value))
+  (sb-impl::make-system-hash-table :test 'eql :weakness :value :synchronized nil))
 
 (defun intern-eql-specializer (object)
   ;; Avoid style-warning about compiler-macro being unavailable.
   (declare (notinline make-instance))
-  ;; Need to lock, so that two threads don't get non-EQ specializers
-  ;; for an EQL object.
-  (with-locked-system-table (*eql-specializer-table*)
+  (with-system-mutex ((hash-table-lock *eql-specializer-table*))
     (ensure-gethash object *eql-specializer-table*
                     (make-instance 'eql-specializer :object object))))
 

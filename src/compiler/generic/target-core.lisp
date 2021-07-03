@@ -37,7 +37,7 @@
   (defun sb-vm::function-raw-address (name &aux (fun (fdefinition name)))
     (cond ((not (immobile-space-obj-p fun))
            (error "Can't statically link to ~S: code is movable" name))
-          ((neq (fun-subtype fun) sb-vm:simple-fun-widetag)
+          ((neq (%fun-pointer-widetag fun) sb-vm:simple-fun-widetag)
            (error "Can't statically link to ~S: non-simple function" name))
           (t
            (let ((addr (get-lisp-obj-address fun)))
@@ -57,15 +57,21 @@
 ;;; FUN must be pinned when calling this.
 (declaim (inline assign-simple-fun-self))
 (defun assign-simple-fun-self (fun)
-  (setf (%simple-fun-self fun)
-        ;; x86 backends store the address of the entrypoint in 'self'
-        #+(or x86 x86-64)
-        (%make-lisp-obj
-         (truly-the word (+ (get-lisp-obj-address fun)
-                            (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift)
-                            (- sb-vm:fun-pointer-lowtag))))
-        ;; non-x86 backends store the function itself (what else?) in 'self'
-        #-(or x86 x86-64) fun))
+  (let ((self ;; x86 backends store the address of the entrypoint in 'self'
+          #+(or x86 x86-64)
+          (%make-lisp-obj
+           (truly-the word (+ (get-lisp-obj-address fun)
+                              (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift)
+                              (- sb-vm:fun-pointer-lowtag))))
+          ;; non-x86 backends store the function itself (what else?) in 'self'
+          #-(or x86 x86-64) fun))
+    #-darwin-jit
+    (setf (sb-vm::%simple-fun-self fun) self)
+    #+darwin-jit
+    (sb-vm::jit-patch (+ (get-lisp-obj-address fun)
+                  (- sb-vm:fun-pointer-lowtag)
+                  (* sb-vm:simple-fun-self-slot sb-vm:n-word-bytes))
+               (get-lisp-obj-address self))))
 
 (flet ((fixup (code-obj offset sym kind flavor preserved-lists statically-link-p)
          (declare (ignorable statically-link-p))
@@ -87,7 +93,8 @@
                    (:code-object (get-lisp-obj-address code-obj))
                    #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index sym))
                    (:layout (get-lisp-obj-address
-                             (if (symbolp sym) (find-layout sym) sym)))
+                             (wrapper-friend (if (symbolp sym) (find-layout sym) sym))))
+                   (:layout-id (layout-id sym))
                    (:immobile-symbol (get-lisp-obj-address sym))
                    (:symbol-value (get-lisp-obj-address (symbol-global-value sym)))
                    #+immobile-code
@@ -108,13 +115,6 @@
 
        (finish-fixups (code-obj preserved-lists)
          (declare (ignorable code-obj preserved-lists))
-         ;; clip to 18 significant bits for serialno regardless of machine word size
-         (let* ((serialno (ldb (byte 18 0) (atomic-incf sb-fasl::*code-serialno*)))
-                (insts (code-instructions code-obj))
-                (jumptable-word (sap-ref-word insts 0)))
-           (aver (zerop (ash jumptable-word -14)))
-           ;; insert serialno
-           (setf (sap-ref-word insts 0) (logior (ash serialno 14) jumptable-word)))
          #+(or x86 x86-64)
          (let ((rel-fixups (elt preserved-lists 1))
                (abs-fixups (elt preserved-lists 2))
@@ -135,7 +135,7 @@
              (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
                                (- 4 sb-vm:fun-pointer-lowtag))
                    (truly-the (unsigned-byte 32)
-                     (get-lisp-obj-address #.(find-layout 'function))))))
+                     (get-lisp-obj-address (wrapper-friend #.(find-layout 'function)))))))
          ;; And finally, make the memory range executable
          #-(or x86 x86-64) (sb-vm:sanctify-for-execution code-obj)
          ;; Return fixups amenable to static linking
@@ -180,7 +180,10 @@
          (copy (allocate-code-object
                 :dynamic (code-n-named-calls code) boxed unboxed)))
     (with-pinned-objects (code copy)
+      #-darwin-jit
       (%byte-blt (code-instructions code) 0 (code-instructions copy) 0 unboxed)
+      #+darwin-jit
+      (sb-vm::jit-memcpy (code-instructions copy) (code-instructions code) unboxed)
       ;; copy boxed constants so that the fixup step (if needed) sees the 'fixups'
       ;; slot from the new object.
       (loop for i from 2 below boxed
@@ -245,6 +248,16 @@
 ;;; are 0, so the jump table count is 0.
 ;;; Similar considerations pertain to x86[-64] fixups within the machine code.
 
+(defun assign-code-serialno (code-obj)
+  (let* ((serialno (ldb (byte (byte-size sb-vm::code-serialno-byte) 0)
+                        (atomic-incf *code-serialno*)))
+         (insts (code-instructions code-obj))
+         (jumptable-word (sap-ref-word insts 0)))
+    (aver (zerop (ash jumptable-word -14)))
+    (setf (sb-vm::sap-ref-word-jit insts 0) ; insert serialno
+          (logior (ash serialno (byte-position sb-vm::code-serialno-byte))
+                  jumptable-word))))
+
 (defun make-core-component (component segment length fixup-notes object)
   (declare (type component component)
            (type segment segment)
@@ -276,7 +289,15 @@
              ;; is GC-safe because we no longer need to know where simple-funs are embedded
              ;; within the object to trace pointers. We *do* need to know where the funs
              ;; are when transporting the object, but it's currently pinned.
-             (%byte-blt bytes 0 (code-instructions code-obj) 0 (length bytes)))
+             #-darwin-jit
+             (%byte-blt bytes 0 (code-instructions code-obj) 0 (length bytes))
+             #+darwin-jit
+             (with-pinned-objects (bytes)
+               (sb-vm::jit-memcpy (code-instructions code-obj) (vector-sap bytes) (length bytes)))
+
+             ;; Serial# shares a word with the jump-table word count,
+             ;; so we can't assign serial# until after all raw bytes are copied in.
+             (assign-code-serialno code-obj))
            ;; Enforce that the final unboxed data word is published to memory
            ;; before the debug-info is set.
            (sb-thread:barrier (:write))
@@ -286,8 +307,8 @@
            ;; That is, C code can't deal with an interior code pointer until the fun-table
            ;; is valid. This store must occur prior to calling %CODE-ENTRY-POINT, and
            ;; applying fixups calls %CODE-ENTRY-POINT, so we have to do this before that.
-           (setf (%code-debug-info code-obj) debug-info)
-           (apply-core-fixups fixup-notes code-obj))))
+            (setf (%code-debug-info code-obj) debug-info)
+            (apply-core-fixups fixup-notes code-obj))))
 
       ;; Don't need code pinned now
       ;; (It will implicitly be pinned on the conservatively scavenged backends)
@@ -297,6 +318,7 @@
         (let ((fun (%code-entry-point code-obj (decf fun-index)))
               (w (+ sb-vm:code-constants-offset
                     (* sb-vm:code-slots-per-simple-fun fun-index))))
+          (aver (functionp fun)) ; in case %CODE-ENTRY-POINT returns NIL
           (setf (code-header-ref code-obj (+ w sb-vm:simple-fun-name-slot))
                 (entry-info-name entry-info)
                 (code-header-ref code-obj (+ w sb-vm:simple-fun-arglist-slot))
@@ -334,6 +356,9 @@
                  (setf (code-header-ref code-obj index) referent)))))))
     (when named-call-fixups
       (sb-vm::statically-link-code-obj code-obj named-call-fixups))
+    (when sb-fasl::*show-new-code*
+      (let ((*print-pretty* nil))
+        (format t "~&~X New code(core): ~A~%" (get-lisp-obj-address code-obj) code-obj)))
     code-obj))
 
 (defun set-code-fdefn (code index fdefn)
