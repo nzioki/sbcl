@@ -268,8 +268,8 @@
 #+gencgc
 (defun ensure-code/data-separation ()
   (let* ((n-bits (+ sb-vm:next-free-page 10))
-         (code-bits (make-array n-bits :element-type 'bit))
-         (data-bits (make-array n-bits :element-type 'bit))
+         (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
+         (data-bits (make-array n-bits :element-type 'bit :initial-element 0))
          (total-code-size 0))
     (sb-vm:map-allocated-objects
      (lambda (obj type size)
@@ -466,17 +466,6 @@
     (sb-thread:join-thread worker-thread)
     (setq working nil)
     (sb-thread:join-thread gc-thread)))
-
-(with-test (:name :no-conses-on-large-object-pages)
-  (let* ((fun (checked-compile '(lambda (&rest params) params)))
-         (list (make-list #+gencgc (/ sb-vm:large-object-size
-                                      (sb-ext:primitive-object-size '(1))
-                                      1/2)
-                          #-gencgc 16384))
-         (rest (apply fun list)))
-    (sb-sys:with-pinned-objects (rest)
-      (sb-ext:gc :full t)
-      (assert (and (equal list rest) t)))))
 
 (defun use-up-thread-region ()
   ;; cons until the thread-local allocation buffer uses up a page

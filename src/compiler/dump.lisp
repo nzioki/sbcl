@@ -190,6 +190,9 @@
               (hash (word-mix (length x) widetag)))
          (declare (word hash))
          (dotimes (i n-data-words (logand hash most-positive-fixnum))
+           ;; FIXME: the last word of {1,2,4}-bit-per-element vectors
+           ;; needs to be masked. At worst, this fails to coalesce
+           ;; similar vectors, so it's not fatal.
            (setq hash (word-mix hash (%vector-raw-bits x i))))))
       (character (char-code x))
       (t 0))))
@@ -1115,7 +1118,13 @@
         (let ((entry (aref constants i)))
           (etypecase entry
             (constant
-             (if (sb-c::leaf-has-source-name-p entry)
+             (if (and (sb-c::leaf-has-source-name-p entry)
+                      ;; We can't really reference constants defined
+                      ;; by name at load time in the same block
+                      ;; compilation unit, so dump it anonymously when
+                      ;; such a situation arises.
+                      (not (member (sb-c::leaf-source-name entry)
+                                   sb-c::*hairy-defconstants*)))
                  (dump-load-time-symbol-global-value entry fasl-output)
                  (dump-object (sb-c::constant-value entry) fasl-output)))
             (cons

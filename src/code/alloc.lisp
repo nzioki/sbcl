@@ -21,7 +21,7 @@
   (addr system-area-pointer)
   (bytes unsigned))
 
-(!define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
+(define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
 
 (defun allocate-static-vector (widetag length words)
   (declare (type (unsigned-byte #.n-widetag-bits) widetag)
@@ -100,7 +100,7 @@
 ;;; A better structure would be just a sorted array of sizes
 ;;; with each entry pointing to the holes which are threaded through
 ;;; some bytes in the storage itself rather than through cons cells.
-(!define-load-time-global *immobile-freelist* nil)
+(define-load-time-global *immobile-freelist* nil)
 
 ;;; Return the zero-based index within the varyobj subspace of immobile space.
 (defun varyobj-page-index (address)

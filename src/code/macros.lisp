@@ -201,7 +201,6 @@ tree structure resulting from the evaluation of EXPRESSION."
 (declaim (ftype (sfunction (symbol t &optional t t) null)
                 about-to-modify-symbol-value))
 ;;; the guts of DEFCONSTANT
-
 (defun %defconstant (name value source-location &optional (doc nil docp))
   #+sb-xc-host (declare (ignore doc docp))
   (unless (symbolp name)
@@ -259,6 +258,11 @@ tree structure resulting from the evaluation of EXPRESSION."
     (when docp
       (setf (documentation name 'variable) doc))
     (%set-symbol-value name value))
+  ;; Record the names of hairy defconstants when block compiling.
+  (when (and sb-c::*compile-time-eval*
+             (eq (sb-c::block-compile sb-c::*compilation*) t))
+    (unless (sb-xc:typep value '(or fixnum character symbol))
+      (push name sb-c::*hairy-defconstants*)))
   ;; Define the constant in the cross-compilation host, since the
   ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
   ;; which reference the constant.
@@ -661,6 +665,8 @@ invoked. In that case it will store into PLACE and start over."
   (let ((def (make-macro-lambda (sb-c::debug-name 'compiler-macro name)
                                 lambda-list body 'define-compiler-macro name
                                 :accessor 'sb-c::compiler-macro-args)))
+    ;; FIXME: Shouldn't compiler macros also get source locations?
+    ;; Plain DEFMACRO supplies source location information.
     `(progn
        (eval-when (:compile-toplevel)
          (sb-c::%compiler-defmacro :compiler-macro-function ',name))
@@ -1443,23 +1449,18 @@ symbol-case giving up: case=((V U) (F))
                       errorp proceedp expected-type)
   (when proceedp ; CCASE or CTYPECASE
     (return-from case-body-aux
-      (let ((block (gensym))
-            (again (gensym)))
-        `(let ((,keyform-value ,keyform))
-           (block ,block
-             (tagbody
-                ,again
-                (return-from
-                 ,block
-                  (cond ,@(nreverse clauses)
-                        (t
-                         (setf ,keyform-value
-                               (setf ,keyform
-                                     (case-body-error
-                                      ',name ',keyform ,keyform-value
-                                      ',expected-type ',keys)))
-                         (go ,again))))))))))
-
+      ;; It is not a requirement to evaluate subforms of KEYFORM once only, but it often
+      ;; reduces code size to do so, as the update form will take advantage of typechecks
+      ;; already performed. (Nor is it _required_ to re-evaluate subforms)
+      (binding* ((switch (make-symbol "SWITCH"))
+                 (retry
+                  ;; TODO: consider using the union type simplifier algorithm here
+                  `(case-body-error ',name ',keyform ,keyform-value ',expected-type ',keys))
+                 ((vars vals stores writer reader) (get-setf-expansion keyform)))
+        `(let* ,(mapcar #'list vars vals)
+           (named-let ,switch ((,keyform-value ,reader))
+             (cond ,@(nreverse clauses)
+                   (t (multiple-value-bind ,stores ,retry (,switch ,writer)))))))))
   (let ((implement-as name)
         (original-keys keys))
     (when (member name '(typecase etypecase))
@@ -1869,9 +1870,8 @@ symbol-case giving up: case=((V U) (F))
 ;;;;
 ;;;; SB-EXT:COMPARE-AND-SWAP is the public API for now.
 ;;;;
-;;;; Internally our interface has CAS, GET-CAS-EXPANSION, DEFINE-CAS-EXPANDER,
-;;;; DEFCAS, and #'(CAS ...) functions -- making things mostly isomorphic with
-;;;; SETF.
+;;;; Internally our interface has CAS, GET-CAS-EXPANSION,
+;;;; DEFCAS, and #'(CAS ...) functions.
 
 (defun expand-structure-slot-cas (info name place)
   (let* ((dd (car info))
@@ -1907,6 +1907,7 @@ symbol-case giving up: case=((V U) (F))
                                      (the ,type ,new)))
                 `(,op ,instance))))))
 
+;;; FIXME: remove (it's EXPERIMENTAL, so doesn't need to go through deprecation)
 (defun get-cas-expansion (place &optional environment)
   "Analogous to GET-SETF-EXPANSION. Returns the following six values:
 
@@ -2008,62 +2009,20 @@ atomicity for CAS functions, nor can it verify that they are atomic: it is up
 to the implementor of a CAS function to ensure its atomicity.
 
 EXPERIMENTAL: Interface subject to change."
+  ;; It's not necessary that GET-CAS-EXPANSION work on defined alien vars.
+  ;; They're not generalized places in the sense that they could hold any object,
+  ;; so there's very little point to being more general.
+  ;; In particular, allowing ATOMIC-PUSH or ATOMIC-POP on them is wrong.
+  (awhen (and (symbolp place)
+              (eq (info :variable :kind place) :alien)
+              (sb-alien::cas-alien place old new))
+    (return-from cas it))
   (multiple-value-bind (temps place-args old-temp new-temp cas-form)
       (get-cas-expansion place env)
     `(let* (,@(mapcar #'list temps place-args)
             (,old-temp ,old)
             (,new-temp ,new))
        ,cas-form)))
-
-(sb-xc:defmacro define-cas-expander (accessor lambda-list &body body)
-  "Analogous to DEFINE-SETF-EXPANDER. Defines a CAS-expansion for ACCESSOR.
-BODY must return six values as specified in GET-CAS-EXPANSION.
-
-Note that the system provides no automatic atomicity for CAS expansion, nor
-can it verify that they are atomic: it is up to the implementor of a CAS
-expansion to ensure its atomicity.
-
-EXPERIMENTAL: Interface subject to change."
-  `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (setf (info :cas :expander ',accessor)
-           ,(make-macro-lambda `(cas-expand ,accessor) lambda-list body
-                               'define-cas-expander accessor))))
-
-;; FIXME: this interface is bogus - short-form DEFSETF/CAS does not
-;; want a lambda-list. You just blindly substitute
-;;  (CAS (PLACE arg1 ... argN) old new) -> (F arg1 ... argN old new).
-;; What role can this lambda-list have when there is no user-provided
-;; code to read the variables?
-;; And as mentioned no sbcl-devel, &REST is beyond bogus, it's broken.
-;;
-(sb-xc:defmacro defcas (accessor lambda-list function &optional docstring)
-  "Analogous to short-form DEFSETF. Defines FUNCTION as responsible
-for compare-and-swap on places accessed using ACCESSOR. LAMBDA-LIST
-must correspond to the lambda-list of the accessor.
-
-Note that the system provides no automatic atomicity for CAS expansions
-resulting from DEFCAS, nor can it verify that they are atomic: it is up to the
-user of DEFCAS to ensure that the function specified is atomic.
-
-EXPERIMENTAL: Interface subject to change."
-  (multiple-value-bind (llks reqs opts rest)
-      (parse-lambda-list lambda-list
-                         :accept (lambda-list-keyword-mask '(&optional &rest))
-                         :context "a DEFCAS lambda-list")
-    (declare (ignore llks))
-    `(define-cas-expander ,accessor ,lambda-list
-       ,@(when docstring (list docstring))
-       ;; FIXME: if a &REST arg is present, this is really weird.
-       (let ((temps (mapcar #'gensymify ',(append reqs opts rest)))
-             (args (list ,@(append reqs opts rest)))
-             (old (gensym "OLD"))
-             (new (gensym "NEW")))
-         (values temps
-                 args
-                 old
-                 new
-                 `(,',function ,@temps ,old ,new)
-                 `(,',accessor ,@temps))))))
 
 (sb-xc:defmacro compare-and-swap (place old new)
   "Atomically stores NEW in PLACE if OLD matches the current value of PLACE.
@@ -2088,8 +2047,7 @@ unspecified if there is an applicable method on either
 SB-MOP:SLOT-VALUE-USING-CLASS, (SETF SB-MOP:SLOT-VALUE-USING-CLASS), or
 SB-MOP:SLOT-BOUNDP-USING-CLASS.
 
-Additionally, the PLACE can be a anything for which a CAS-expansion has been
-specified using DEFCAS, DEFINE-CAS-EXPANDER, or for which a CAS-function has
+Additionally, the PLACE can be a anything for which a CAS-function has
 been defined. (See SB-EXT:CAS for more information.)
 "
   `(cas ,place ,old ,new))

@@ -828,26 +828,35 @@ core and return a descriptor to it."
 
 ;;; Write the bits of INT to core as if a bignum, i.e. words are ordered from
 ;;; least to most significant regardless of machine endianness.
-(defun integer-bits-to-core (descriptor int nwords &optional (offset 0))
+(defun integer-bits-to-core (int descriptor start nwords)
   (declare (fixnum nwords))
-  (do ((index 1 (1+ index))
+  (do ((index 0 (1+ index))
        (remainder int (ash remainder (- sb-vm:n-word-bits))))
-      ((> index nwords)
+      ((>= index nwords)
        (unless (zerop (integer-length remainder))
          (error "Nonzero remainder after writing ~D using ~D words" int nwords)))
     (write-wordindexed/raw descriptor
-                           (+ index offset)
+                           (+ start index)
                            (logand remainder sb-ext:most-positive-word))))
 
 (defun bignum-to-core (n)
   "Copy a bignum to the cold core."
   (let* ((words (ceiling (1+ (integer-length n)) sb-vm:n-word-bits))
-         (handle (allocate-otherptr *dynamic* (1+ words) sb-vm:bignum-widetag)))
-    (integer-bits-to-core handle n words)
+         (handle
+          #-bignum-assertions (allocate-otherptr *dynamic* (1+ words) sb-vm:bignum-widetag)
+          #+bignum-assertions
+          (let* ((aligned-words (1+ (logior words 1))) ; round to odd, slap on a header
+                 (physical-words (* aligned-words 2))
+                 (handle (allocate-otherptr *dynamic* physical-words sb-vm:bignum-widetag)))
+            ;; rewrite the header to indicate the logical size
+            (write-wordindexed/raw handle 0 (logior (ash words 8) sb-vm:bignum-widetag))
+            handle)))
+    (integer-bits-to-core n handle sb-vm:bignum-digits-offset words)
+    (assert (= (bignum-from-core handle) n))
     handle))
 
 (defun bignum-from-core (descriptor)
-  (let ((n-words (get-header-data descriptor))
+  (let ((n-words (logand (get-header-data descriptor) #x7fffff))
         (val 0))
     (dotimes (i n-words val)
       (let ((bits (read-bits-wordindexed descriptor
@@ -1100,8 +1109,6 @@ core and return a descriptor to it."
 ;;; to the host's COLD-LAYOUT proxy for that layout.
 (defvar *cold-layout-by-addr*)
 
-(defvar *known-structure-classoids*)
-
 ;;; Trivial methods [sic] require that we sort possible methods by the depthoid.
 ;;; Most of the objects printed in cold-init are ordered hierarchically in our
 ;;; type lattice; the major exceptions are ARRAY and VECTOR at depthoid -1.
@@ -1305,7 +1312,7 @@ core and return a descriptor to it."
                    (incf byte-offset 4)))
         (setf (bvref-s32 (descriptor-mem result) byte-offset) this-id)))
 
-    (integer-bits-to-core result bitmap bitmap-words fixed-words)
+    (integer-bits-to-core bitmap result (1+ fixed-words) bitmap-words)
 
     result))
 
@@ -2498,20 +2505,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
     (multiple-value-bind (fun args) (pop-args n (fasl-input))
       (if args
           (case fun
-           (fdefinition
-            ;; Special form #'F fopcompiles into `(FDEFINITION ,f)
-            (aver (and (singleton-p args) (symbolp (car args))))
-            (cold-symbol-function (car args)))
            (symbol-global-value (cold-symbol-value (first args)))
            (values-specifier-type
             (let* ((des (first args))
                    (spec (if (descriptor-p des) (host-object-from-core des) des)))
               (ctype-to-core spec (funcall fun spec))))
-           (sb-thread:make-mutex
-            (aver (eq (car args) :name))
-            (write-slots (allocate-struct-of-type 'sb-thread:mutex)
-                         :name (cadr args)
-                         :%owner *nil-descriptor*))
            (t (error "Can't FOP-FUNCALL with function ~S in cold load." fun)))
           (let ((counter *load-time-value-counter*))
             (push (cold-list (cold-intern :load-time-value) fun
@@ -2525,21 +2523,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
           (push fun *!cold-toplevels*)
           (case fun
             (sb-pcl::!trivial-defmethod (apply #'cold-defmethod args))
-            (sb-kernel::%defstruct
-             (push args *known-structure-classoids*)
-             (push (apply #'cold-list (cold-intern 'defstruct) args)
-                   *!cold-toplevels*))
-            ((sb-impl::%defconstant sb-impl::%defparameter)
+            ((sb-impl::%defconstant)
              (destructuring-bind (name val . rest) args
                (cold-set name (if (symbolp val) (cold-intern val) val))
                (push (apply #'cold-list (cold-intern fun) (cold-intern name) rest)
                      *!cold-defsymbols*)))
-            (set
-             (aver (= (length args) 2))
-             (cold-set (first args)
-                       (let ((val (second args)))
-                         (if (symbolp val) (cold-intern val) val))))
-            (%svset (apply 'cold-svset args))
             (t
              (error "Can't FOP-FUNCALL-FOR-EFFECT with function ~S in cold load" fun)))))))
 
@@ -3167,13 +3155,6 @@ Legal values for OFFSET are -4, -8, -12, ..."
          (lowtag (or (symbol-value (sb-vm:primitive-object-lowtag obj)) 0)))
   ;; writing primitive object layouts
     (flet ((output-c ()
-             (when (eq name 'sb-vm::thread)
-               (format t "#define THREAD_HEADER_SLOTS ~d~%" sb-vm::thread-header-slots)
-               (dolist (x sb-vm::*thread-header-slot-names*)
-                 (let ((s (package-symbolicate "SB-VM" "THREAD-" x "-SLOT")))
-                   (format t "#define ~a ~d~%"
-                           (c-name (string s)) (symbol-value s))))
-               (terpri))
              (when (eq name 'sb-vm::code)
                (format t "#define CODE_SLOTS_PER_SIMPLE_FUN ~d~2%"
                        sb-vm:code-slots-per-simple-fun))
@@ -3208,6 +3189,12 @@ Legal values for OFFSET are -4, -8, -12, ..."
                        (- (* (sb-vm:slot-offset slot) sb-vm:n-word-bytes) lowtag)))
              (format t "#define ~A_SIZE ~d~%"
                      (string-upcase c-name) (sb-vm:primitive-object-length obj))))
+      (when (eq name 'sb-vm::thread)
+        (format t "#define THREAD_HEADER_SLOTS ~d~%" sb-vm::thread-header-slots)
+        (dolist (x sb-vm::*thread-header-slot-names*)
+          (let ((s (package-symbolicate "SB-VM" "THREAD-" x "-SLOT")))
+            (format t "#define ~a ~d~%" (c-name (string s)) (symbol-value s))))
+        (terpri))
       (format t "#ifdef __ASSEMBLER__~2%")
       (output-asm)
       (format t "~%#else /* __ASSEMBLER__ */~2%")
@@ -3718,7 +3705,6 @@ III. initially undefined function references (alphabetically):
            (*nil-descriptor*)
            (*simple-vector-0-descriptor*)
            (*c-callable-fdefn-vector*)
-           (*known-structure-classoids* nil)
            (*classoid-cells* (make-hash-table :test 'eq))
            (*ctype-cache* (make-hash-table :test 'equal))
            (*cold-layouts* (make-hash-table :test 'eq)) ; symbol -> cold-layout
@@ -3791,19 +3777,11 @@ III. initially undefined function references (alphabetically):
 
       (sb-cold::check-no-new-cl-symbols)
 
-      (when *known-structure-classoids*
-        ;; Fill in LAYOUT-%INFO with each corresponding DEFSTRUCT-DESCRIPTION
-        ;; (Couldn't this be done sooner?)
-        (dolist (defstruct-args *known-structure-classoids*)
-          (let* ((dd (first defstruct-args))
-                 (layout (gethash (warm-symbol (read-slot dd :name)) *cold-layouts*)))
-            (write-slots (->wrapper (cold-layout-descriptor layout)) :%info dd)))
-        (when verbose
-          (format t "~&; SB-Loader: (~D~@{+~D~}) structs/vars/methods/other~%"
-                  (length *known-structure-classoids*)
-                  (length *!cold-defsymbols*)
-                  (reduce #'+ *cold-methods* :key (lambda (x) (length (cdr x))))
-                  (length *!cold-toplevels*))))
+      (when (and verbose core-file-name)
+        (format t "~&; SB-Loader: (~D~@{+~D~}) vars/methods/other~%"
+                (length *!cold-defsymbols*)
+                (reduce #'+ *cold-methods* :key (lambda (x) (length (cdr x))))
+                (length *!cold-toplevels*)))
 
       (dolist (symbol '(*!cold-defsymbols* *!cold-toplevels*))
         (cold-set symbol (list-to-core (nreverse (symbol-value symbol))))

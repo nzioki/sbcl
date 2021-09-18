@@ -40,7 +40,7 @@
   `(sb-vm::%%make-symbol (logior-header-bits ,string ,sb-vm:+vector-shareable+)))
 
 ;;; We don't want to clutter the bignum code.
-#+(or x86 x86-64)
+#+(and (or x86 x86-64) (not bignum-assertions))
 (define-source-transform sb-bignum:%bignum-ref (bignum index)
   ;; KLUDGE: We use TRULY-THE here because even though the bignum code
   ;; is (currently) compiled with (SAFETY 0), the compiler insists on
@@ -768,3 +768,19 @@
 ;; because %PRIMITIVE is not generally fopcompilable.
 (sb-c:define-source-transform make-unbound-marker ()
   `(sb-sys:%primitive make-unbound-marker))
+
+(deftransform (cas symbol-value) ((old new symbol))
+  (let ((cname (and (constant-lvar-p symbol) (lvar-value symbol))))
+    (case (and cname (info :variable :kind cname))
+      ((:special :global)
+       (let ((type (info :variable :type cname)))
+         `(truly-the ,type
+                     (%compare-and-swap-symbol-value ',cname old (the ,type new)))))
+      (t
+       `(progn
+          (about-to-modify-symbol-value symbol 'compare-and-swap new)
+          (%compare-and-swap-symbol-value symbol old new))))))
+
+(deftransform (cas svref) ((old new vector index))
+  '(let ((v (the simple-vector vector)))
+    (%compare-and-swap-svref v (check-bound v (length v) index) old new)))

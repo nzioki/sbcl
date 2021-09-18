@@ -41,7 +41,7 @@
 
 ;;; a list of toplevel things set by GENESIS
 (defvar *!cold-toplevels*)
-(defvar *!cold-defsymbols*)  ; "easy" DEFCONSTANTs and DEFPARAMETERs
+(defvar *!cold-defsymbols*)  ; "easy" DEFCONSTANTs
 
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
@@ -56,18 +56,55 @@
 
 (defun !c-runtime-noinform-p () (/= (extern-alien "lisp_startup_options" char) 0))
 
+(defun !format-cold-init ()
+  (sb-format::!late-format-init)
+  (sb-format::!format-directives-init))
+
+;;; Allows the SIGNAL function to be called early.
+(defun !signal-function-cold-init ()
+  #+sb-devel
+  (progn
+    (setq *break-on-signals* nil)
+    (setq sb-kernel::*current-error-depth* 0))
+  (setq *stack-top-hint* nil))
+
+(defun !printer-control-init ()
+  (setq *print-readably* nil
+        *print-escape* t
+        *print-pretty* nil
+        *print-base* 10
+        *print-radix* nil
+        *print-vector-length* nil
+        *print-circle* nil
+        *print-case* :upcase
+        *print-array* t
+        *print-gensym* t
+        *print-lines* nil
+        *print-right-margin* nil
+        *print-miser-width* nil
+        *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table #() nil nil)
+        *suppress-print-errors* nil
+        *current-level-in-print* 0))
+
 ;;; called when a cold system starts up
 (defun !cold-init (&aux (real-choose-symbol-out-fun #'choose-symbol-out-fun)
                         (real-failed-aver-fun #'%failed-aver))
   "Give the world a shove and hope it spins."
 
   (/show0 "entering !COLD-INIT")
-  (!readtable-cold-init)
-  (setq *print-length* 6 *print-level* 3)
-  (setq *error-output* (!make-cold-stderr-stream)
-                      *standard-output* *error-output*
-                      *trace-output* *error-output*)
+  #+sb-show (setq */show* t)
+  (/show0 "cold-initializing streams")
+  (sb-impl::!cold-stream-init)
+  (show-and-call !signal-function-cold-init)
+  (show-and-call !printer-control-init) ; needed before first instance of FORMAT or WRITE-STRING
+  (setq *unparse-fun-type-simplify* nil) ; needed by TLFs in target-error.lisp
+  (setq sb-unix::*unblock-deferrables-on-enabling-interrupts-p* nil) ; needed by LOAD-LAYOUT called by CLASSES-INIT
+  (setq *print-length* 6
+        *print-level* 3)
   (/show "testing '/SHOW" *print-length* *print-level*) ; show anything
+  ;; This allows FORMAT to work, and can go as early needed for
+  ;; debugging.
+  (show-and-call !format-cold-init)
   (unless (!c-runtime-noinform-p)
     ;; I'd like FORMAT to remain working in cold-init, where it does work,
     ;; hence the conditional.
@@ -86,8 +123,7 @@
 
   (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
 
-  (!cold-init-hash-table-methods)
-  ;; And now *CURRENT-THREAD* and *HANDLER-CLUSTERS*
+  ;; And now *CURRENT-THREAD*
   (sb-thread::init-main-thread)
 
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
@@ -96,12 +132,16 @@
   (locally (declare (notinline fboundp)) (fboundp '(setf !zzzzzz)))
 
   ;; Printing of symbols requires that packages be filled in, because
-  ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility.
+  ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility. Also
+  ;; allows IN-PACKAGE to work.
   (show-and-call !package-cold-init)
-  (setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table #() nil nil))
-  ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
-  (setf (symbol-function 'choose-symbol-out-fun)
-        (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol))
+  ;; debug machinery needed for printing symbols
+  #+sb-devel
+  (progn
+    (!readtable-cold-init)
+    ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
+    (setf (symbol-function 'choose-symbol-out-fun)
+          (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol)))
 
   ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
@@ -130,26 +170,24 @@
   ;; to the subclasses of STRUCTURE-OBJECT.
   (show-and-call sb-kernel::!set-up-structure-object-class)
 
-  ;; Genesis is able to perform some of the work of DEFCONSTANT and
-  ;; DEFPARAMETER, but not all of it. It assigns symbol values, but can not
-  ;; manipulate globaldb. Therefore, a subtlety of these macros for bootstrap
-  ;; is that we see each DEFthing twice: once during cold-load and again here.
-  ;; Now it being the case that DEFPARAMETER implies variable assignment
-  ;; unconditionally, you may think it should assign. No! This was logically
-  ;; ONE use of the defining macro, but split into pieces as a consequence
-  ;; of the implementation.
+  ;; Genesis is able to perform some of the work of DEFCONSTANT, but
+  ;; not all of it. It assigns symbol values, but can not manipulate
+  ;; globaldb. Therefore, a subtlety of these macros for bootstrap is
+  ;; that we see each DEFthing twice: once during cold-load and again
+  ;; here.
+  (setq sb-pcl::*!docstrings* nil) ; needed by %DEFCONSTANT
   (dolist (x *!cold-defsymbols*)
     (destructuring-bind (fun name source-loc . docstring) x
       (aver (boundp name)) ; it's a bug if genesis didn't initialize
       (ecase fun
         (%defconstant
-         (apply #'%defconstant name (symbol-value name) source-loc docstring))
-        (%defparameter ; use %DEFVAR which will not clobber
-         (apply #'%defvar name source-loc nil docstring)))))
+         (apply #'%defconstant name (symbol-value name) source-loc docstring)))))
 
   (unless (!c-runtime-noinform-p)
     #+(or x86 x86-64) (format t "[Length(TLFs)=~D]" (length *!cold-toplevels*))
     #-(or x86 x86-64) (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
+
+  (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
 
   (loop with *package* = *package* ; rebind to self, as if by LOAD
         for index-in-cold-toplevels from 0
@@ -170,8 +208,6 @@
            (aver (typep object 'code-component))
            (aver (unbound-marker-p (code-header-ref object index)))
            (setf (code-header-ref object index) (svref *!load-time-values* value))))
-        ((cons (eql defstruct))
-         (apply 'sb-kernel::%defstruct (cdr toplevel-thing)))
         ((cons (eql :begin-file))
          (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
         (t
@@ -341,8 +377,8 @@ process to continue normally."
   ;; re-disable ldb again.
   (when (eq *invoke-debugger-hook* 'sb-debug::debugger-disabled-hook)
     (sb-debug::disable-debugger))
-  #+sb-thread (finalizer-thread-start)
-  (call-hooks "initialization" *init-hooks*))
+  (call-hooks "initialization" *init-hooks*)
+  #+sb-thread (finalizer-thread-start))
 
 ;;;; some support for any hapless wretches who end up debugging cold
 ;;;; init code

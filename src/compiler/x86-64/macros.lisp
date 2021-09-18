@@ -36,7 +36,7 @@
        (aver (xmm-tn-p src))
        (inst movaps dst src))
       #+sb-simd-pack-256
-      ((int-avx2-reg avx2-reg)
+      ((ymm-reg int-avx2-reg)
        (aver (xmm-tn-p src))
        (inst vmovdqa dst src))
       #+sb-simd-pack-256
@@ -103,7 +103,8 @@
 ;;; assert that alloc-region->free_pointer and ->end_addr can be accessed
 ;;; using a single byte displacement from thread-base-tn
 (eval-when (:compile-toplevel)
-  (aver (<= (1+ thread-alloc-region-slot) 15)))
+  (aver (<= (1+ thread-boxed-tlab-slot) 15))
+  (aver (<= (1+ thread-unboxed-tlab-slot) 15)))
 
 (defun thread-slot-ea (slot-index)
   (ea (ash slot-index word-shift) thread-base-tn))
@@ -252,6 +253,22 @@
                new-value)
          (move value rax)))))
 
+(defun bignum-index-check (bignum index addend vop)
+  (declare (ignore bignum index addend vop))
+  ;; Conditionally compile this in to sanity-check the bignum logic
+  #+nil
+  (let ((ok (gen-label)))
+    (cond ((and (tn-p index) (not (constant-tn-p index)))
+           (aver (sc-is index any-reg))
+           (inst lea :dword temp-reg-tn (ea (fixnumize addend) index))
+           (inst shr :dword temp-reg-tn n-fixnum-tag-bits))
+          (t
+           (inst mov temp-reg-tn (+ (if (tn-p index) (tn-value index) index) addend))))
+    (inst cmp :dword temp-reg-tn (ea (- 1 other-pointer-lowtag) bignum))
+    (inst jmp :b ok)
+    (inst break halt-trap)
+    (emit-label ok)))
+
 (defmacro define-full-reffer (name type offset lowtag scs el-type &optional translate)
   `(progn
      (define-vop (,name)
@@ -263,7 +280,10 @@
        (:arg-types ,type tagged-num)
        (:results (value :scs ,scs))
        (:result-types ,el-type)
+       (:vop-var vop)
        (:generator 3                    ; pw was 5
+         ,@(when (eq translate 'sb-bignum:%bignum-ref)
+             '((bignum-index-check object index 0 vop)))
          (inst mov value (ea (- (* ,offset n-word-bytes) ,lowtag)
                              object index (ash 1 (- word-shift n-fixnum-tag-bits))))))
      (define-vop (,(symbolicate name "-C"))
@@ -277,7 +297,10 @@
                                                 ,(eval offset))))
        (:results (value :scs ,scs))
        (:result-types ,el-type)
+       (:vop-var vop)
        (:generator 2                    ; pw was 5
+         ,@(when (eq translate 'sb-bignum:%bignum-ref)
+             '((bignum-index-check object index 0 vop)))
          (inst mov value (ea (- (* (+ ,offset index) n-word-bytes) ,lowtag)
                              object))))))
 
@@ -312,6 +335,8 @@
        (:result-types ,el-type)
        (:vop-var vop)
        (:generator 3
+         ,@(when (eq translate 'sb-bignum:%bignum-ref-with-offset)
+             '((bignum-index-check object index addend vop)))
          (let ((ea (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
                        object index (ash 1 (- word-shift n-fixnum-tag-bits)))))
            ,@(trap 'index)
@@ -332,6 +357,8 @@
        (:result-types ,el-type)
        (:vop-var vop)
        (:generator 2
+         ,@(when (eq translate 'sb-bignum:%bignum-ref-with-offset)
+             '((bignum-index-check object index addend vop)))
          (let ((ea (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag) object)))
            ,@(trap '(emit-constant (+ index addend)))
            (inst mov value ea)))))))
@@ -348,6 +375,8 @@
        (:arg-types ,type tagged-num ,el-type)
        (:vop-var vop)
        (:generator 4
+         ,@(when (eq translate 'sb-bignum:%bignum-set)
+             '((bignum-index-check object index 0 vop)))
          (let ((ea (if (sc-is index immediate)
                        (ea (- (* (+ ,offset (tn-value index)) n-word-bytes) ,lowtag)
                            object)

@@ -184,23 +184,10 @@
             (let ((function (car form)))
               ;; Certain known functions have a special way of checking
               ;; their fopcompilability in the cross-compiler.
-              (or (member function '(sb-pcl::!trivial-defmethod
-                                     sb-kernel::%defstruct
-                                     sb-thread:make-mutex))
-                  ;; allow DEF{CONSTANT,PARAMETER} only if the value form is ok
-                  (and (member function '(sb-impl::%defconstant sb-impl::%defparameter))
-                       (fopcompilable-p (third form)))
-                  (and (eq function 'setf)
-                       (fopcompilable-p (%macroexpand form *lexenv*)))
-                  (and (eq function 'sb-kernel:%svset)
-                       (destructuring-bind (thing index value) (cdr form)
-                         (and (symbolp thing)
-                              (integerp index)
-                              (eq (info :variable :kind thing) :global)
-                              (typep value
-                                     '(cons (member lambda function named-lambda))))))
-                  (and (eq function 'setq)
-                       (setq-fopcompilable-p (cdr form))))))))
+              (or (member function '(sb-pcl::!trivial-defmethod))
+                  ;; allow DEFCONSTANT only if the value form is ok
+                  (and (member function '(sb-impl::%defconstant))
+                       (fopcompilable-p (third form))))))))
 ) ; end FLET
 
 (defun let-fopcompilable-p (operator args)

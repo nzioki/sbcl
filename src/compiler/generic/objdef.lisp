@@ -32,9 +32,7 @@
 
 ;;;; the primitive objects themselves
 
-(define-primitive-object (cons :type cons
-                               :lowtag list-pointer-lowtag
-                               :alloc-trans cons)
+(define-primitive-object (cons :type cons :lowtag list-pointer-lowtag)
   (car :ref-trans car :set-trans %rplaca :init :arg
        :cas-trans %compare-and-swap-car)
   (cdr :ref-trans cdr :set-trans %rplacd :init :arg
@@ -512,15 +510,16 @@ during backtrace.
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   (stepping)
+  ;; Deterministic consing profile recording area.
+  (profile-data :c-type "uword_t *" :pointer t)
+  ;; Thread-local allocation buffers
+  #+gencgc (boxed-tlab :c-type "struct alloc_region" :length 4)
+  #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
+  ;; END of slots to keep near the beginning.
+
   (dynspace-addr)
   (dynspace-card-count)
   (dynspace-pte-base)
-  ;; Deterministic consing profile recording area.
-  (profile-data :c-type "uword_t *" :pointer t)
-  ;; Lisp needs only the first two fields of the alloc_region, so it's OK if the
-  ;; final 2 fields have offsets >= 128 from the base of the thread structure.
-  #+gencgc (alloc-region :c-type "struct alloc_region" :length 4)
-  ;; END of slots to keep near the beginning.
 
   ;; This is the original address at which the memory was allocated,
   ;; which may have different alignment then what we prefer to use.
@@ -566,6 +565,16 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
+
+  ;; allocation instrumenting
+  (tot-bytes-alloc-boxed)
+  (tot-bytes-alloc-unboxed)
+  (slow-path-allocs)
+  (et-allocator-mutex-acq) ; elapsed times
+  (et-find-freeish-page)
+  (et-bzeroing)
+  (obj-size-histo :c-type "size_histogram" :length #.sb-vm:n-word-bits)
+
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
   (lisp-thread :pointer t :special sb-thread:*current-thread*))

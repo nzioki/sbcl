@@ -134,6 +134,14 @@
                     (tokenize-control-string string))))
           (interpret-directive-list stream tokens orig-args args)))))
 
+
+(!begin-collecting-cold-init-forms)
+(define-load-time-global *format-directive-interpreters* nil)
+(!cold-init-forms
+ (setq *format-directive-interpreters* (make-array 128 :initial-element nil)))
+(declaim (type (simple-vector 128)
+               *format-directive-interpreters*))
+
 (defun interpret-directive-list (stream directives orig-args args)
   (loop
    (unless directives
@@ -178,21 +186,19 @@
                             char)))
         (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (sb-xc:gensym "DIRECTIVES"))))
-    `(setf
-      (svref *format-directive-interpreters*
-             ;; Using the host's char-upcase should be fine here.
-             ;; (Do we even need to use it? Why not just spell the source code as desired?)
-             ,(char-code (char-upcase char)))
-      (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
-        (declare (ignorable stream orig-args args))
-        ,@(if lambda-list
-              `((let ,(mapcar (lambda (var)
-                                `(,var
-                                  (,(symbolicate "DIRECTIVE-" var) ,directive)))
-                              (butlast lambda-list))
-                  (values (progn ,@body) args)))
-              `((declare (ignore ,directive ,directives))
-                ,@body))))))
+    `(!cold-init-forms
+      (setf
+       (aref *format-directive-interpreters* ,(char-code (char-upcase char)))
+       (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
+         (declare (ignorable stream orig-args args))
+         ,@(if lambda-list
+               `((let ,(mapcar (lambda (var)
+                                 `(,var
+                                   (,(symbolicate "DIRECTIVE-" var) ,directive)))
+                               (butlast lambda-list))
+                   (values (progn ,@body) args)))
+               `((declare (ignore ,directive ,directives))
+                 ,@body)))))))
 
 (defmacro def-format-interpreter (char lambda-list &body body)
   (let ((directives (sb-xc:gensym "DIRECTIVES")))
@@ -1234,6 +1240,8 @@
             (:remaining (args (length args)))
             (t (args param)))))
       (apply symbol stream (next-arg) colonp atsignp (args)))))
+
+(!defun-from-collected-cold-init-forms !format-directives-init)
 
 (push '("SB-FORMAT"
         def-format-directive def-complex-format-directive

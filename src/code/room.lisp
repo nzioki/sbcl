@@ -215,35 +215,36 @@
          ;; This should pick off the most frequently-occurring things first.
          ;; CONS and INSTANCE of course top the list.
          (typecase object
-           (cons 2)
+           (list (if object 2 sizeof-nil-in-words))
            (instance (1+ (instance-length object)))
            (function
             (when (= (%fun-pointer-widetag object) simple-fun-widetag)
               (return-from primitive-object-size
                 (code-object-size (fun-code-header (truly-the simple-fun object)))))
             (1+ (get-closure-length object)))
+           ;; Must be an OTHER pointer now
            (code-component
             (return-from primitive-object-size (code-object-size object)))
-           ;; Most everything else is an OTHER pointer, except for NIL.
-           ;; Arrays (especially strings and simple-vector) and symbols tend to be the
-           ;; next-most-common heap object, for which we need the ROOM-INFO.
+           (fdefn 4) ; constant length not stored in the header
+           ((satisfies array-header-p)
+            (+ array-dimensions-offset (array-rank object)))
+           ((simple-array nil (*)) 2) ; no payload
+           (bignum
+            #+bignum-assertions
+            (+ (* (sb-bignum:%bignum-length object) 2) 2)
+            #-bignum-assertions
+            ;; 64-bit machines might want to store the bignum length in the upper 4
+            ;; bytes of the header which would simplify %bignum-set-length.
+            (1+ (sb-bignum:%bignum-length object)))
            (t
             (let ((room-info (aref *room-info* (%other-pointer-widetag object))))
-              (cond ((typep room-info 'specialized-array-element-type-properties)
-                     (let ((n-data-octets (vector-n-data-octets object room-info)))
-                       (+ (ceiling n-data-octets n-word-bytes) ; N data words
-                          vector-data-offset)))
-                    (t
-                     (typecase object
-                       (fdefn 4) ; constant length not stored in the header
-                       ((satisfies array-header-p)
-                        (+ array-dimensions-offset (array-rank object)))
-                       ((simple-array nil (*)) 2) ; no payload
-                       (null sizeof-nil-in-words)
-                       (t
-                        ;; GET-HEADER-DATA works for everything that's left
-                        (1+ (logand (get-header-data object)
-                                    (room-info-mask room-info))))))))))))
+              (if (typep room-info 'specialized-array-element-type-properties)
+                  (let ((n-data-octets (vector-n-data-octets object room-info)))
+                    (+ (ceiling n-data-octets n-word-bytes) ; N data words
+                       vector-data-offset))
+                  ;; GET-HEADER-DATA works for everything that's left
+                  (1+ (logand (get-header-data object)
+                              (room-info-mask room-info)))))))))
         (* (align-up words 2) n-word-bytes)))
 
 ;;; Macros not needed after this file (and avoids a redefinition warning this way)
@@ -564,7 +565,7 @@ We could try a few things to mitigate this:
   #+gencgc
   (let ((region-struct
           #+sb-thread (sap+ (sb-thread::current-thread-sap)
-                            (ash thread-alloc-region-slot word-shift))
+                            (ash thread-boxed-tlab-slot word-shift))
           ;; If no threads, the alloc_region struct is in static space.
           #-sb-thread (int-sap boxed-region)))
     ;; The 'start_addr' field is at word index 3 of the structure (see gencgc-alloc-region.h).
@@ -1274,7 +1275,8 @@ We could try a few things to mitigate this:
                                 &aux (n-code-bytes 0)
                                      (total-pages next-free-page)
                                      (pages
-                                      (make-array total-pages :element-type 'bit)))
+                                      (make-array total-pages :element-type 'bit
+                                                  :initial-element 0)))
   (flet ((dump-page (page-num)
            (format stream "~&Page ~D~%" page-num)
            (let ((where (+ dynamic-space-start (* page-num gencgc-card-bytes)))
@@ -1363,8 +1365,8 @@ We could try a few things to mitigate this:
 (defun !ensure-genesis-code/data-separation ()
   #+gencgc
   (let* ((n-bits (+ next-free-page 10))
-         (code-bits (make-array n-bits :element-type 'bit))
-         (data-bits (make-array n-bits :element-type 'bit))
+         (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
+         (data-bits (make-array n-bits :element-type 'bit :initial-element 0))
          (total-code-size 0))
     (map-allocated-objects
      (lambda (obj type size)

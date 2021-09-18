@@ -32,14 +32,13 @@
     (set-header-data vector (dpb flags (byte 8 0) (get-header-data vector)))
     (values))
   (defun logior-header-bits (vector bits)
-    (set-header-data vector (logior (get-header-data vector) bits)))
+    (set-header-data vector (logior (get-header-data vector) bits))
+    vector)
   (defun reset-header-bits (vector bits)
     (set-header-data vector (logand (get-header-data vector) (lognot bits)))
     (values)))
 
-;;; from bignum.lisp
 (in-package "SB-IMPL")
-(defsetf %bignum-ref %bignum-set)
 
 (declaim (inline (setf %funcallable-instance-info)))
 (defun (setf %funcallable-instance-info) (value instance index)

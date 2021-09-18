@@ -25,7 +25,7 @@
 (declaim (ftype (function ((or symbol cons) keyword) (values))
                 note-name-defined))
 (defun note-name-defined (name kind)
-  #-sb-xc-host (atomic-incf *type-cache-nonce*)
+  #-sb-xc-host (atomic-incf sb-kernel::*type-cache-nonce*)
   ;; We do this BOUNDP check because this function can be called when
   ;; not in a compilation unit (as when loading top level forms).
   (when (boundp '*undefined-warnings*)
@@ -105,7 +105,12 @@
 
       (let ((kind (info :function :kind name)))
         ;; scrubbing old data I: possible collision with a macro
-        (when (and (fboundp name) (eq :macro kind))
+        ;; There's a silly little problem with fun names that are not ANSI-legal names,
+        ;; e.g. (CAS mumble). We can't ask the host whether that is FBOUNDP,
+        ;; because it would rightly complain. So, just assume that it is not FBOUNDP.
+        (when (and #+sb-xc-host (symbolp name)
+                   (fboundp name)
+                   (eq :macro kind))
           (assert-it)
           (compiler-style-warn "~S was previously defined as a macro." name)
           (setf (info :function :where-from name) :assumed)
@@ -269,11 +274,7 @@
       (enable-package-locks
        (set-difference old names :test #'equal)))))
 
-;;; This variable really wants to be a DEFVAR, but the "if (boundp)" expression
-;;; is too tricky for genesis. Let's ensure proper behavior by not clobbering
-;;; it in the host, but doing the only thing that genesis can do in the target.
-(#+sb-xc-host defvar #-sb-xc-host defparameter
- *queued-proclaims* nil) ; should this be !*QUEUED-PROCLAIMS* ?
+(defvar *queued-proclaims* nil)
 
 (defun process-variable-declaration (name kind info-value)
   (unless (symbolp name)
@@ -282,7 +283,9 @@
   (when (and (eq kind 'always-bound) (eq info-value :always-bound)
              (not (boundp name))
              ;; Allow it to be unbound at compile-time.
-             (not *compile-time-eval*))
+             (not *compile-time-eval*)
+             ;; Check if we are still bootstrapping.
+             (not (boundp '*queued-proclaims*)))
     (error "Cannot proclaim an unbound symbol as ~A: ~S" kind name))
 
   (multiple-value-bind (allowed test)

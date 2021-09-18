@@ -143,14 +143,6 @@
 (defconstant-eqx p-a-flag `(ea ,(ash sb-vm::thread-pseudo-atomic-bits-slot sb-vm:word-shift)
                                ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
   #'equal)
-(defconstant-eqx region-ptr
-    `(ea ,(ash sb-vm::thread-alloc-region-slot sb-vm:word-shift)
-         ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
-  #'equal)
-(defconstant-eqx region-end
-    `(ea ,(ash (1+ sb-vm::thread-alloc-region-slot) sb-vm:word-shift)
-         ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
-  #'equal)
 
 (defun header-word-store-p (inst bindings)
   ;; a byte-sized or word-sized store at displacement 8 through 10 is OK
@@ -176,9 +168,9 @@
 (setq *allocation-templates*
       `((array ;; also array-header
                (xadd ?free ?size)
-               (cmp :qword ?free ,region-end)
+               (cmp :qword ?free :tlab-limit)
                (jmp :nbe ?_)
-               (mov :qword ,region-ptr ?free)
+               (mov :qword :tlab-freeptr ?free)
                (mov ?_ (ea 0 ?size) ?header); after XADD, size is the old free ptr
                (:optional (mov ?_ (ea 8 ?size) ?vector-len))
                (:or (or ?size ,sb-vm:other-pointer-lowtag)
@@ -188,21 +180,32 @@
                   ;; LEA with scale=1 can have base and index swapped
                   (lea :qword ?end (ea 0 ?nbytes-var ?free))
                   (add ?end ?free)) ; ?end originally holds the size in bytes
-             (cmp :qword ?end ,region-end)
+             (cmp :qword ?end :tlab-limit)
              (jmp :nbe ?_)
-             (mov :qword ,region-ptr ?end)
+             (mov :qword :tlab-freeptr ?end)
              (mov ?_ (ea 0 ?free) ?header)
              (:optional (:if header-word-store-p (mov ?_ (ea ?_ ?free) ?vector-len)))
              (:or (or ?free ?lowtag)
                   (lea :qword ?result (ea ?lowtag ?free))))
 
+        ;; LISTIFY-REST-ARG computes a tagged pointer to the _last_ cons in the memory block,
+        ;; not the first cons.
+        (list (lea :qword ?end (ea 0 ?nbytes ?free))
+              (cmp :qword ?end :tlab-limit)
+              (jmp :nbe ?_)
+              (mov :qword :tlab-freeptr ?end)
+              (lea :qword ?free (ea ,(- sb-vm:list-pointer-lowtag
+                                        (* sb-vm:cons-size sb-vm:n-word-bytes))
+                                    ?free ?nbytes))
+              (shr ?nbytes 4))
+
         ;; either non-headered object (cons) or unknown header or unknown nbytes
         (unknown-header (:or (lea :qword ?end (ea ?nbytes ?free ?nbytes-var))
                              (lea :qword ?end (ea 0 ?nbytes-var ?free))
                              (add ?end ?free))
-                        (cmp :qword ?end ,region-end)
+                        (cmp :qword ?end :tlab-limit)
                         (jmp :nbe ?_)
-                        (mov :qword ,region-ptr ?end)
+                        (mov :qword :tlab-freeptr ?end)
                         (:repeat (:or (mov . ignore) (lea . ignore)))
                         (:or (or ?free ?lowtag)
                              (lea :qword ?result (ea ?lowtag ?free))))))
@@ -234,9 +237,24 @@
           ;; FIXME: this drops any LOCK prefix, but that seems to be ok
           (do ((tail (cdr inst) (cdr tail)))
               ((null tail))
+            ;; This takes an instruction expressed thusly:
+            ;;   (MOV (#S(MACHINE-EA :DISP n :BASE n) . :QWORD) RDX)
+            ;; and turns it into:
+            ;;   (MOV :QWORD #S(MACHINE-EA :DISP n :BASE n) RDX)
             (when (typep (car tail) '(cons machine-ea))
-              (setf inst (list* (car inst) (cdar tail) (cdr inst))
-                    (car tail) (caar tail))
+              (let ((ea (caar tail)))
+                (setf inst (list* (car inst) (cdar tail) (cdr inst))) ; insert the :size)
+                (when (eq (machine-ea-base ea) (sb-c:tn-offset sb-vm::thread-base-tn))
+                  ;; Figure out if we're looking at an allocation buffer
+                  (let ((disp (ash (machine-ea-disp ea) (- sb-vm:word-shift))))
+                    (awhen (case disp
+                            ((#.sb-vm::thread-boxed-tlab-slot
+                              #.sb-vm::thread-unboxed-tlab-slot) :tlab-freeptr)
+                            ((#.(1+ sb-vm::thread-boxed-tlab-slot)
+                              #.(1+ sb-vm::thread-unboxed-tlab-slot)) :tlab-limit))
+                      (setq ea it))))
+                (setf (car tail) ea)) ; change the EA
+              ;; There can be at most one EA per instruction, so we're done
               (return)))
           (vector-push-extend inst vector)
           inst))))
@@ -415,13 +433,7 @@
 
     (let* ((type)
            (bindings
-            (matchp iterator
-                    ;; compiler bug? If expressed with "`" then the compiler tries to
-                    ;; refer to the undumpable constant REGION-PTR by its value, not by its
-                    ;; name, then complaining that it can't be dumped.
-                    ;; Why is ",P-A-FLAG" acceptable but this not?
-                    (load-time-value (list (list 'mov :qword '?free region-ptr)) t)
-                    nil))
+            (matchp iterator `((mov :qword ?free :tlab-freeptr)) nil))
            (templates
             (cond (template-name
                    (list (find template-name *allocation-templates* :key 'car)))
@@ -455,6 +467,8 @@
                    (setq type (aref *tag-to-type* (logand header #xFF)))
                    (when (eq type 'instance)
                      (setq type (deduce-layout iterator bindings))))
+                  ((eq type 'list) ; listify-rest-arg
+                   (setq nbytes nil))
                   ((member type '(any unknown-header))
                    (setq type (case lowtag
                                 (#.sb-vm:list-pointer-lowtag 'list)
@@ -636,16 +650,19 @@
 ;;; cons profiling.
 ;;; STREAM is where to report, defaulting to *standard-output*.
 ;;; The convention is that of map-segment-instructions, meaning NIL is a sink.
-(defun aprof-run (fun &key (stream *standard-output*))
+(defun aprof-run (fun &key (stream *standard-output*) arguments)
   (aprof-reset)
   (patch-fixups)
-  (let (nbytes)
-    (unwind-protect
-         (progn (aprof-start) (funcall fun))
-      (aprof-stop)
-      (setq nbytes (aprof-show :stream stream))
-      (when stream (terpri stream)))
-    nbytes))
+  (dx-let ((arglist (cons arguments nil))) ; so no consing in here
+    (when (listp arguments)
+      (setq arglist (car arglist))) ; was already a list
+    (let (nbytes)
+      (unwind-protect
+           (progn (aprof-start) (apply fun arglist))
+        (aprof-stop)
+        (setq nbytes (aprof-show :stream stream))
+        (when stream (terpri stream)))
+      nbytes)))
 
 ;;;;
 

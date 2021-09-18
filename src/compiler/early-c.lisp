@@ -109,7 +109,7 @@
 ;;; Bind this to a stream to capture various internal debugging output.
 (defvar *compiler-trace-output* nil)
 ;;; These are the default, but the list can also include
-;;; :pre-ir2-optimize and :symbolic-asm.
+;;; :pre-ir2-optimize, :symbolic-asm, and :sb-graph.
 (defvar *compile-trace-targets* '(:ir1 :ir2 :vop :symbolic-asm :disassemble))
 (defvar *constraint-universe*)
 (defvar *current-path*)
@@ -144,28 +144,17 @@ the stack without triggering overflow protection.")
 (declaim (type (member nil t :specified)
                *block-compile-default* *block-compile-argument*))
 
-;;; This lock is seized in the compiler, and related areas -- like the
-;;; classoid/layout/class system.
-#-sb-xc-host
-(!define-load-time-global **world-lock** (sb-thread:make-mutex :name "World Lock"))
+;; Names seen which are defined to be hairy (i.e. non-EQ comparable)
+;; constants.
+(defvar *hairy-defconstants* '())
+(declaim (type list *hairy-defconstants*))
 
 #-sb-xc-host
 (define-load-time-global *static-linker-lock*
     (sb-thread:make-mutex :name "static linker"))
 
-(defmacro with-world-lock (() &body body)
-  #+sb-xc-host `(progn ,@body)
-  #-sb-xc-host `(sb-thread:with-recursive-lock (**world-lock**) ,@body))
 
 ;;;; miscellaneous utilities
-
-;;; This is for "observers" who want to know if type names have been added.
-;;; Rather than registering listeners, they can detect changes by comparing
-;;; their stored nonce to the current nonce. Additionally the observers
-;;; can detect whether function definitions have occurred.
-#-sb-xc-host
-(progn (declaim (fixnum *type-cache-nonce*))
-       (!define-load-time-global *type-cache-nonce* 0))
 
 (defstruct (debug-name-marker (:print-function print-debug-name-marker)
                               (:copier nil)))

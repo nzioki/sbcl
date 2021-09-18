@@ -177,9 +177,7 @@
                                  collect (1+ (random 4000))))
            (test-list (sort (delete-duplicates random-numbers) #'<))
            (packed-int (sb-c::pack-code-fixup-locs test-list nil))
-           (result (make-array 1 :element-type 'sb-ext:word)))
-      ;; The packer intrinsically self-checks the packing
-      ;; so we don't need to assert anything about that.
+           (result (make-array 1 :element-type '(unsigned-byte 32))))
       (sb-sys:with-pinned-objects (packed-int result)
         ;; Now exercise the C unpacker.
         ;; This hack of allocating 4 longs is terrible, but whatever.
@@ -2872,7 +2870,12 @@
            (checked-compile
             `(lambda ()
                (values-list (cons 1 nil)))))
-          '(function () (values (integer 1 1) &optional)))))
+          '(function () (values (integer 1 1) &optional))))
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            `(lambda (x) (values-list (list* x 1 x nil)))))
+          '(function (t) (values t (integer 1 1) t &optional)))))
 
 (with-test (:name :xeps-and-inlining)
   (checked-compile-and-assert
@@ -3227,3 +3230,74 @@
   (let ((x (nth-value 1 (ignore-errors (logcount (opaque-identity #\a)))))
         (y (nth-value 1 (ignore-errors (oddp (opaque-identity #\a))))))
     (assert (string= (princ-to-string x) (princ-to-string y)))))
+
+(with-test (:name :set-exclusive-or-inlined)
+  (checked-compile-and-assert
+   ()
+   `(lambda (set1 set2)
+      (declare (inline set-exclusive-or))
+      (set-exclusive-or set1 set2))))
+
+(declaim (inline inline-deletion-note))
+(defun inline-deletion-note (x y)
+  (if y
+      10
+      x))
+
+(with-test (:name :inline-deletion-note)
+  (checked-compile-and-assert
+   (:allow-notes nil)
+   `(lambda (x)
+      (inline-deletion-note x t))
+   ((t) 10)))
+
+(with-test (:name :cast-type-preservation)
+  (assert
+   (equal (caddr
+           (sb-kernel:%simple-fun-type
+            (checked-compile
+             `(lambda (b)
+                (declare ((integer 1 1000) b))
+                (declare (optimize (space 0)))
+                (gcd 2 b)))))
+          '(values (integer 1 2) &optional))))
+
+(with-test (:name :lvar-substituting-non-deletable-casts)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b)
+      (the integer
+           (let (*)
+             (rem 2
+                  (let ((m
+                          (flet ((f ()
+                                   (truncate (the (integer -10 0) b) -4)))
+                            (f))))
+                    (if (> m 1)
+                        1
+                        m)))))
+      10)
+   ((-10) 10)))
+
+(with-test (:name :convert-mv-bind-to-let-no-casts)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare (type (integer 7693489 168349189459797431) a))
+      (max
+       (floor a
+              (min -14
+                   (loop for lv3 below 3
+                         sum (mod 77196223293181
+                                  (max 75 (mod a (min -57 lv3)))))))))
+   ((8000000) -571429)))
+
+(with-test (:name :values-length-mismatch)
+  (checked-compile-and-assert
+   (:allow-style-warnings t :optimize :default)
+   `(lambda (a)
+      (declare (values t &optional))
+      (when a
+        (values 1 2)))
+   ((nil) nil)
+   ((t) (condition 'type-error))))

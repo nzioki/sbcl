@@ -252,7 +252,9 @@
   (sb-int:named-let chain ((index (sb-impl::hash-table-next-free-kv tbl)))
     (when (plusp index)
       (nconc (list index)
-             (chain (aref (sb-impl::hash-table-next-vector tbl) index))))))
+             (if (< index
+                    (sb-impl::kv-vector-high-water-mark (sb-impl::hash-table-pairs tbl)))
+                 (chain (aref (sb-impl::hash-table-next-vector tbl) index)))))))
 
 (defvar *tbl* (make-hash-table :weakness :key))
 
@@ -401,3 +403,10 @@
 (with-test (:name :array-psxhash-non-consing :skipped-on :interpreter)
    (let ((a (make-array 1000 :element-type 'double-float)))
      (ctu:assert-no-consing (sb-int:psxhash a))))
+
+(with-test (:name :array-psxhash)
+  (let ((table (make-hash-table :test 'equalp)))
+    (let ((x (vector 1.0d0 1.0d0))
+          (y (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 1.0d0))))
+      (setf (gethash x table) t)
+      (assert (gethash y table)))))

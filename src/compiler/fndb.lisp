@@ -1193,15 +1193,15 @@
 (defknown vector-pop ((modifying complex-vector)) t ())
 
 ;;; FIXME: complicated MODIFYING
-;;; Also, an important-result warning could be provided if the array
-;;; is known to be not expressly adjustable.
 (defknown adjust-array
   (array (or index list) &key (:element-type type-specifier)
          (:initial-element t) (:initial-contents t)
          (:fill-pointer (or index boolean))
          (:displaced-to (or array null))
          (:displaced-index-offset index))
-  array ())
+  ;; This is a special case in CHECK-IMPORTANT-RESULT because it is not
+  ;; necessary to use the result if the array is adjustable.
+  array (important-result))
 ;  :derive-type 'result-type-arg1) Not even close...
 
 ;;;; from the "Strings" chapter:
@@ -1677,20 +1677,28 @@
    &key
 
    ;; ANSI options
-   (:output-file (or pathname-designator
-                     null
-                     ;; FIXME: This last case is a non-ANSI hack.
-                     (member t)))
+   (:output-file pathname-designator)
    (:verbose t)
    (:print t)
    (:external-format external-format-designator)
-   (:progress t)
 
    ;; extensions
+   (:progress t)
    (:trace-file t)
    (:block-compile t)
    (:entry-points list)
    (:emit-cfasl t))
+  (values (or pathname null) boolean boolean))
+(defknown sb-c::compile-files
+    (cons &key (:output-file pathname-designator)
+               (:verbose t)
+               (:print t)
+               (:external-format external-format-designator)
+               (:progress t)
+               (:trace-file t)
+               (:block-compile t)
+               (:entry-points list)
+               (:emit-cfasl t))
   (values (or pathname null) boolean boolean))
 
 (defknown (compile-file-pathname)
@@ -1812,7 +1820,8 @@
 (defknown %special-unbind (&rest symbol) t)
 (defknown %listify-rest-args (t index) list (flushable))
 (defknown %more-arg-context (t t) (values t index) (flushable))
-(defknown %more-arg (t index) t)
+(defknown %more-arg (t index) t (flushable))
+(defknown %more-keyword-pair (t fixnum) (values t t) (flushable))
 #+stack-grows-downward-not-upward
 ;;; FIXME: The second argument here should really be NEGATIVE-INDEX, but doing that
 ;;; breaks the build, and I cannot seem to figure out why. --NS 2006-06-29
@@ -2069,6 +2078,10 @@
 (defknown sb-kernel::gc-safepoint () (values) ())
 
 ;;;; atomic ops
+;;; the CAS functions are transformed to something else rather than "translated".
+;;; either way, they should not be called.
+(defknown (cas svref) (t t simple-vector index) t (always-translatable))
+(defknown (cas symbol-value) (t t symbol) t (always-translatable))
 (defknown %compare-and-swap-svref (simple-vector index t t) t
     ())
 (defknown (%compare-and-swap-symbol-value

@@ -130,24 +130,19 @@
 (define-source-transform ninth (x) `(nth 8 ,x))
 (define-source-transform tenth (x) `(nth 9 ,x))
 
-;;; LIST with one arg is an extremely common operation (at least inside
-;;; SBCL itself); translate it to CONS to take advantage of common
-;;; allocation routines.
+;;; Pick off special cases of LIST and LIST*.
 (define-source-transform list (&rest args)
-  (case (length args)
-    (1 `(cons ,(first args) nil))
-    (t (values nil t))))
+  (if args (values nil t) (values nil nil)))
+(define-source-transform list* (arg &rest others)
+  (if others (values nil t) (values arg nil)))
+;;; Use LIST* in lieu of CONS so that there are only 2 low-level allocators
+;;; instead of 3. Strictly speaking, LIST is redundant as well.
+(define-source-transform cons (x y) `(list* ,x ,y))
 
 (defoptimizer (list derive-type) ((&rest args))
   (if args
       (specifier-type 'cons)
       (specifier-type 'null)))
-
-;;; And similarly for LIST*.
-(define-source-transform list* (arg &rest others)
-  (cond ((not others) arg)
-        ((not (cdr others)) `(cons ,arg ,(car others)))
-        (t (values nil t))))
 
 (defoptimizer (list* derive-type) ((arg &rest args))
   (if args
@@ -4555,8 +4550,7 @@
 
 (defoptimizer (format derive-type) ((dest control &rest args))
   (declare (ignore control args))
-  (when (and (constant-lvar-p dest)
-             (null (lvar-value dest)))
+  (when (lvar-value-is-nil dest)
     (specifier-type 'simple-string)))
 
 ;;; We disable this transform in the cross-compiler to save memory in
@@ -5068,8 +5062,7 @@
     (when (fun-type-p type)
       (let ((null-p (not (and (constant-lvar-p waitp)
                               (lvar-value waitp)
-                              (constant-lvar-p timeout)
-                              (null (lvar-value timeout))))))
+                              (lvar-value-is-nil timeout)))))
         (if null-p
             (values-type-union (fun-type-returns type)
                                (values-specifier-type '(values null &optional)))

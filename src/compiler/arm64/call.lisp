@@ -368,8 +368,6 @@
                                   :sc (sc-or-lose 'any-reg)
                                   :offset nfp-offset))
           (delta (- (sb-allocated-size 'control-stack) fixed)))
-      ;; And we use ASSEMBLE here so that we get "implcit labels"
-      ;; rather than having to use GEN-LABEL and EMIT-LABEL.
       (assemble ()
         ;; Compute the end of the fixed stack frame (start of the MORE
         ;; arg area) into RESULT.
@@ -429,17 +427,20 @@
         DO-REGS
         (when (< fixed register-arg-count)
           ;; Now we have to deposit any more args that showed up in registers.
-          (inst subs count nargs-tn (fixnumize fixed))
-          (do ((i fixed (1+ i)))
-              ((>= i register-arg-count))
-            ;; Don't deposit any more than there are.
-            (inst b :eq DONE)
-            (inst subs count count (fixnumize 1))
-            ;; Store it into the space reserved to it, by displacement
-            ;; from the frame pointer.
-            (storew (nth i *register-arg-tns*)
-                    cfp-tn (+ (sb-allocated-size 'control-stack)
-                              (- i fixed)))))
+          (loop with i = fixed
+                for offset = (+ delta i)
+                do
+                (cond ((and (< (1+ i) register-arg-count)
+                            (ldp-stp-offset-p (* offset n-word-bytes) n-word-bits))
+                       (inst stp
+                             (nth i *register-arg-tns*)
+                             (nth (1+ i) *register-arg-tns*)
+                             (@ cfp-tn (* offset n-word-bytes)))
+                       (incf i 2))
+                      (t
+                       (storew (nth i *register-arg-tns*) cfp-tn offset)
+                       (incf i)))
+                while (< i register-arg-count)))
         DONE
 
         ;; Now that we're done with the &MORE args, we can set up the
@@ -471,6 +472,20 @@
       (t
        (inst add temp context (lsl index (- word-shift n-fixnum-tag-bits)))
        (loadw value temp)))))
+
+(define-vop ()
+  (:translate sb-c::%more-keyword-pair)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (keyword :scs (descriptor-reg any-reg))
+            (value :scs (descriptor-reg any-reg)))
+  (:result-types * *)
+  (:generator 5
+    (inst add temp context (lsl index (- word-shift n-fixnum-tag-bits)))
+    (inst ldp keyword value (@ temp))))
 
 (define-vop (more-arg-or-nil)
   (:policy :fast-safe)
@@ -515,40 +530,39 @@
     (move result null-tn)
     (inst cbz count DONE)
 
-    ;; We need to do this atomically.
-    (pseudo-atomic (pa-flag :sync nil)
-      ;; Allocate a cons (2 words) for each item.
-      (let* ((dx-p (node-stack-allocate-p node))
-             (size (cond (dx-p
-                          (lsl count (1+ (- word-shift n-fixnum-tag-bits))))
-                         (t
-                          (inst lsl temp count (1+ (- word-shift n-fixnum-tag-bits)))
-                          temp))))
-        (allocation 'list size list-pointer-lowtag dst
-                    :flag-tn pa-flag
-                    :stack-allocate-p dx-p
-                    :lip lip))
-      (move result dst)
+    (let ((dx-p (node-stack-allocate-p node)))
+      (pseudo-atomic (pa-flag :sync nil :elide-if dx-p)
+        ;; Allocate a cons (2 words) for each item.
+        (let ((size (cond (dx-p
+                           (lsl count (1+ (- word-shift n-fixnum-tag-bits))))
+                          (t
+                           (inst lsl temp count (1+ (- word-shift n-fixnum-tag-bits)))
+                           temp))))
+          (allocation 'list size list-pointer-lowtag dst
+                      :flag-tn pa-flag
+                      :stack-allocate-p dx-p
+                      :lip lip))
+        (move result dst)
 
-      (inst b ENTER)
+        (inst b ENTER)
 
-      ;; Compute the next cons and store it in the current one.
-      LOOP
-      (inst add dst dst (* 2 n-word-bytes))
-      (storew dst dst -1 list-pointer-lowtag)
+        ;; Compute the next cons and store it in the current one.
+        LOOP
+        (inst add dst dst (* 2 n-word-bytes))
+        (storew dst dst -1 list-pointer-lowtag)
 
-      ;; Grab one value.
-      ENTER
-      (inst ldr temp (@ context n-word-bytes :post-index))
+        ;; Grab one value.
+        ENTER
+        (inst ldr temp (@ context n-word-bytes :post-index))
 
-      ;; Dec count, and if != zero, go back for more.
-      (inst subs count count (fixnumize 1))
-      ;; Store the value into the car of the current cons.
-      (storew temp dst 0 list-pointer-lowtag)
-      (inst b :gt LOOP)
+        ;; Dec count, and if != zero, go back for more.
+        (inst subs count count (fixnumize 1))
+        ;; Store the value into the car of the current cons.
+        (storew temp dst 0 list-pointer-lowtag)
+        (inst b :gt LOOP)
 
-      ;; NIL out the last cons.
-      (storew null-tn dst 1 list-pointer-lowtag))
+        ;; NIL out the last cons.
+        (storew null-tn dst 1 list-pointer-lowtag)))
     DONE))
 
 ;;; Return the location and size of the more arg glob created by

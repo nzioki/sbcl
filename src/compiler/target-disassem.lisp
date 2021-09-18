@@ -1722,7 +1722,8 @@
                           (offset (sb-c:sc+offset-offset sc+offset)))
                      (when (>= offset length)
                        (setf locations (adjust-array locations
-                                                     (max (* 2 length) (1+ offset)))
+                                                     (max (* 2 length) (1+ offset))
+                                                     :initial-element nil)
                              (location-group-locations group) locations))
                      (let ((already-there (aref locations offset)))
                        (cond ((null already-there)
@@ -2189,7 +2190,7 @@
       (when (code-component-p object)
         (let* ((base (- (get-lisp-obj-address object) sb-vm:other-pointer-lowtag))
                (insts (code-instructions object)))
-        (format t "~&; Base: ~x Data: ~x~%" base (sap-int insts))))
+        (format stream "~&; Base: ~x Data: ~x~%" base (sap-int insts))))
       (disassemble-code-component thing :stream stream)))))
 
 ;;;; code to disassemble assembler segments
@@ -2637,21 +2638,22 @@
            (type (or null stream) stream)
            (type disassem-state dstate))
   (multiple-value-bind (errnum adjust sc+offsets lengths error-byte)
-       (funcall error-parse-fun
-                (dstate-segment-sap dstate)
-                (dstate-next-offs dstate)
-                trap-number
-                (null stream))
+      (funcall error-parse-fun
+               (dstate-segment-sap dstate)
+               (dstate-next-offs dstate)
+               trap-number
+               (null stream))
     (when stream
        (setf (dstate-cur-offs dstate)
              (dstate-next-offs dstate))
        (flet ((emit-err-arg ()
                 (let ((num (pop lengths)))
-                  (print-notes-and-newline stream dstate)
-                  (print-current-address stream dstate)
-                  (print-inst num stream dstate)
-                  (print-bytes num stream dstate)
-                  (incf (dstate-cur-offs dstate) num)))
+                  (unless (zerop num)
+                    (print-notes-and-newline stream dstate)
+                    (print-current-address stream dstate)
+                    (print-inst num stream dstate)
+                    (print-bytes num stream dstate)
+                    (incf (dstate-cur-offs dstate) num))))
               (emit-note (note)
                 (when note
                   (note (string note) dstate))))
@@ -2669,11 +2671,10 @@
 ;;; so can't easily share this code.
 ;;; But probably we should just add the conditionalization in here.
 #-arm64
-(defun snarf-error-junk (sap offset trap-number &optional length-only (compact-error-trap t))
+(defun snarf-error-junk (sap offset trap-number &optional length-only)
   (let* ((index offset)
          (error-byte t)
-         (error-number (cond ((and compact-error-trap
-                                   (>= trap-number sb-vm:error-trap))
+         (error-number (cond ((>= trap-number sb-vm:error-trap)
                               (setf error-byte nil)
                               (- trap-number sb-vm:error-trap))
                              (t

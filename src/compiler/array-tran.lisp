@@ -131,14 +131,6 @@
        :aref)))
   (lvar-type new-value))
 
-;;; Return true if ARG is NIL, or is a constant-lvar whose
-;;; value is NIL, false otherwise.
-(defun unsupplied-or-nil (arg)
-  (declare (type (or lvar null) arg))
-  (or (not arg)
-      (and (constant-lvar-p arg)
-           (not (lvar-value arg)))))
-
 (defun supplied-and-true (arg)
   (and arg
        (constant-lvar-p arg)
@@ -917,8 +909,7 @@
                                (t
                                 ;; otherwise, reading an element can't cause an invalid bit pattern
                                 ;; to be observed, but the bits could be random.
-                                ;; KLUDGE: backward-compatibile 0-fill
-                                `(sb-vm::splat ,data-alloc-form nwords 0)))))))
+                                data-alloc-form))))))
 
             ;; Case (3) - constant :INITIAL-CONTENTS and LENGTH
             ((and c-length
@@ -1114,29 +1105,29 @@
                           *
                           :node call)
   (block make-array
-    ;; If lvar-use of DIMS is a call to LIST, then it must mean that LIST
-    ;; was declared notinline - because if it weren't, then it would have been
-    ;; source-transformed into CONS - which gives us reason NOT to optimize
-    ;; this call to MAKE-ARRAY. So look for CONS instead of LIST,
-    ;; which means that LIST was *not* declared notinline.
-    (when (and (lvar-matches dims :fun-names '(cons) :arg-count 2)
-               (let ((cdr (second (combination-args (lvar-uses dims)))))
-                 (and (constant-lvar-p cdr) (null (lvar-value cdr)))))
-      (let* ((args (splice-fun-args dims :any 2)) ; the args to CONS
-             (dummy (cadr args)))
-        (flush-dest dummy)
+    ;; Recognize vector construction where the length is spelled as (LIST n)
+    ;; or (LIST* n nil). Don't care if FUN-LEXICALLY-NOTINLINE-P on those because
+    ;; you can't portably observe whether they're called (tracing them isn't allowed).
+    ;; XXX: minor OAOO problem, see similar logic in (VALUES-LIST OPTIMIZER).
+    (awhen (cond ((and (lvar-matches dims :fun-names '(list) :arg-count 1))
+                  (car (splice-fun-args dims :any 1)))
+                 ((and (lvar-matches dims :fun-names '(list*) :arg-count 2)
+                       (lvar-value-is-nil (second (combination-args (lvar-uses dims)))))
+                  (let* ((args (splice-fun-args dims :any 2)) ; the args to LIST*
+                         (dummy (cadr args)))
+                    (flush-dest dummy)
+                    (setf (combination-args call) (delete dummy (combination-args call)))
+                    (car args))))
         ;; Don't want (list (list x)) to become a valid dimension specifier.
-        (assert-lvar-type (car args) (specifier-type 'index)
-                          (%coerce-to-policy call))
-        (setf (combination-args call) (delete dummy (combination-args call)))
+        (assert-lvar-type it (specifier-type 'index) (%coerce-to-policy call))
         (return-from make-array
-          (transform-make-array-vector (car args)
+          (transform-make-array-vector it
                                        element-type
                                        initial-element
                                        initial-contents
                                        call
                                        :adjustable adjustable
-                                       :fill-pointer fill-pointer))))
+                                       :fill-pointer fill-pointer)))
     (unless (constant-lvar-p dims)
       (give-up-ir1-transform
        "The dimension list is not constant; cannot open code array creation."))
@@ -1155,10 +1146,7 @@
                                           initial-element initial-contents call
                                           :adjustable adjustable
                                           :fill-pointer fill-pointer))
-            ((and fill-pointer
-                  (not (and
-                        (constant-lvar-p fill-pointer)
-                        (null (lvar-value fill-pointer)))))
+            ((and fill-pointer (not (lvar-value-is-nil fill-pointer)))
              (give-up-ir1-transform))
             (t
              (let* ((total-size (reduce #'* dims))
@@ -1747,43 +1735,13 @@
                 (define-source-transform ,setter (a i v)
                   `(setf (aref (the ,',type ,a) ,i) ,v)))))
   (define-frob schar %scharset simple-string)
-  (define-frob char %charset string))
+  (define-frob char %charset string)
+  (define-frob svref %svset simple-vector))
 
 (defun the-unwild (type expr)
   (if (or (null type) (eq type *wild-type*)) expr `(the ,type ,expr)))
 (defun truly-the-unwild (type expr)
   (if (or (null type) (eq type *wild-type*)) expr `(truly-the ,type ,expr)))
-
-;;; We transform SVREF and %SVSET directly into DATA-VECTOR-REF/SET: this is
-;;; around 100 times faster than going through the general-purpose AREF
-;;; transform which ends up doing a lot of work -- and introducing many
-;;; intermediate lambdas, each meaning a new trip through the compiler -- to
-;;; get the same result.
-;;;
-;;; FIXME: [S]CHAR, and [S]BIT above would almost certainly benefit from a similar
-;;; treatment.
-(define-source-transform svref (vector index)
-  (let ((elt-type (let ((var (and (symbolp vector) (lexenv-find vector vars))))
-                    (when (lambda-var-p var)
-                      (declared-array-element-type (lambda-var-type var))))))
-    (with-unique-names (n-vector)
-      `(let ((,n-vector ,vector))
-         ,(the-unwild elt-type `(data-vector-ref
-                         (the simple-vector ,n-vector)
-                         (check-bound ,n-vector (length ,n-vector) ,index)))))))
-
-(define-source-transform %svset (vector index value)
-  (let ((elt-type (let ((var (and (symbolp vector) (lexenv-find vector vars))))
-                    (when (lambda-var-p var)
-                      (declared-array-element-type (lambda-var-type var))))))
-    `(let* ((%sv (the simple-vector
-                      (with-annotations
-                          (,(make-lvar-modified-annotation :caller '(setf svref)))
-                        ,vector)))
-            (%indx (check-bound %sv (length %sv) ,index))
-            (%val ,(the-unwild elt-type value)))
-       (data-vector-set %sv %indx %val)
-       %val)))
 
 (macrolet (;; This is a handy macro for computing the row-major index
            ;; given a set of indices. We wrap each index with a call

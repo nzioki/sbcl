@@ -79,6 +79,15 @@
             (error "~S used on non-constant LVAR ~S" 'lvar-value lvar))
           value))))
 
+(defun lvar-value-is-nil (lvar)
+  (and (constant-lvar-p lvar) (null (lvar-value lvar))))
+
+;;; Return true if ARG is NIL, or is a constant-lvar whose
+;;; value is NIL, false otherwise.
+(defun unsupplied-or-nil (arg)
+  (declare (type (or lvar null) arg))
+  (or (not arg) (lvar-value-is-nil arg)))
+
 (defun lvar-uses-values (lvar)
   (declare (type lvar lvar))
   (let ((uses (principal-lvar-use lvar)))
@@ -974,6 +983,13 @@
   (when (and (null (node-lvar node))
              (ir1-attributep (fun-info-attributes info) important-result)
              (neq (combination-info node) :important-result-discarded))
+    (when (lvar-fun-is (combination-fun node) '(adjust-array))
+      (let ((type (lvar-type (car (combination-args node)))))
+        ;; - if the array is simple, then result is important
+        ;; - if non-simple, then result is not important
+        ;; - if not enough information, then don't warn
+        (when (or (not (array-type-p type)) (array-type-complexp type)) ; T or :MAYBE
+          (return-from check-important-result))))
     (let ((*compiler-error-context* node))
       (setf (combination-info node) :important-result-discarded)
       (compiler-style-warn
@@ -2104,22 +2120,13 @@
            (eq (node-home-lambda ref)
                (lambda-home (lambda-var-home var))))
       (let ((ref-type (single-value-type (node-derived-type ref))))
-        (cond ((csubtypep (single-value-type (lvar-type arg)) ref-type)
-               (substitute-lvar-uses lvar arg
-                                     ;; Really it is (EQ (LVAR-USES LVAR) REF):
-                                     t)
-               (delete-lvar-use ref))
-              (t
-               (let* ((value (make-lvar))
-                      (cast (insert-cast-before ref value ref-type
-                                                ;; KLUDGE: it should be (TYPE-CHECK 0)
-                                                *policy*)))
-                 (setf (cast-type-to-check cast) *wild-type*)
-                 (substitute-lvar-uses value arg
-                                       ;; FIXME
-                                       t)
-                 (%delete-lvar-use ref)
-                 (add-lvar-use cast lvar)))))
+        (unless (csubtypep (single-value-type (lvar-type arg)) ref-type)
+          (do-uses (node arg)
+            (derive-node-type node ref-type)))
+        (substitute-lvar-uses lvar arg
+                              ;; Really it is (EQ (LVAR-USES LVAR) REF):
+                              t)
+        (delete-lvar-use ref))
       (delete-ref ref)
       (unlink-node ref)
       (when (return-p dest)
@@ -2532,14 +2539,14 @@
                                   (let ((arg (pop args))
                                         (new-lvar (pop lvars))
                                         (type (pop types)))
-                                    (if (and type
-                                             (not (type-asserted-p arg type)))
-                                        ;; Propagate derived types from the VALUES call to its args:
-                                        ;; transforms can leave the VALUES call with a better type
-                                        ;; than its args have, so make sure not to throw that away.
-                                        (use-lvar (insert-cast-before use arg type **zero-typecheck-policy**)
-                                                  new-lvar)
-                                        (substitute-lvar-uses new-lvar arg nil))))
+                                    (when (and type
+                                               (not (type-asserted-p arg type)))
+                                      ;; Propagate derived types from the VALUES call to its args:
+                                      ;; transforms can leave the VALUES call with a better type
+                                      ;; than its args have, so make sure not to throw that away.
+                                      (do-uses (node arg)
+                                        (derive-node-type node type)))
+                                    (substitute-lvar-uses new-lvar arg nil)))
                             ;; Discard unused arguments
                             (loop for arg in args
                                   do (flush-dest arg))
@@ -2579,14 +2586,18 @@
     (when (combination-p use)
       (let ((name (lvar-fun-name (combination-fun use)))
             (args (combination-args use)))
+        ;; Recognizing LIST* seems completely ad-hoc, however, once upon a time
+        ;; (LIST x) was translated to (CONS x NIL), so in order for this optimizer to
+        ;; pick off (VALUES-LIST (LIST x)), it had to instead look for (CONS x NIL).
+        ;; Realistically nobody should hand-write (VALUES-LIST ({CONS | LIST*} x NIL))
+        ;; so it seems very questionable in utility to preserve both spellings.
         (when (or (eq name 'list)
-                  (and (eq name 'cons)
-                       (let ((cdr (second args)))
-                        (and (constant-lvar-p cdr)
-                             (null (lvar-value cdr))
+                  (and (eq name 'list*)
+                       (let ((cdr (car (last args))))
+                        (and (lvar-value-is-nil cdr)
                              (progn
                                (flush-dest cdr)
-                               (setf (cdr args) nil)
+                               (setf args (butlast args))
                                t)))))
 
           ;; FIXME: VALUES might not satisfy an assertion on NODE-LVAR.
@@ -2629,6 +2640,13 @@
                (not (node-deleted (bound-cast-check cast))))
       (flush-combination (bound-cast-check cast))
       (setf (bound-cast-check cast) nil))
+    (unless (array-index-cast-p cast)
+      ;; Normally the types are the same, as the cast gets its derived
+      ;; type from the lvar, but it may get a different type when an
+      ;; inlined function with a derived type is let-converted.
+      (let ((type (node-derived-type cast)))
+        (do-uses (node value)
+          (derive-node-type node type))))
     (delete-filter cast lvar value)
     (when lvar
       (reoptimize-lvar lvar)
@@ -2734,7 +2752,10 @@
                     (context (if (local-call-context-p context)
                                  (local-call-context-var context)
                                  context)))
-               (unless (cast-silent-conflict cast)
+               (when (or (not (cast-silent-conflict cast))
+                         (and (eq (cast-silent-conflict cast) :style-warning)
+                              (not (cast-single-value-p cast))
+                              (setf context :multiple-values)))
                  (filter-lvar
                   value
                   (if (cast-single-value-p cast)
