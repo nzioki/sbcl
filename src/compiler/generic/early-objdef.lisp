@@ -252,6 +252,9 @@
   #-64-bit unused09-widetag                 ;  7E       7E
 
   simple-array-widetag                      ;  82   81  82   81
+  ;; NIL element type is not in the contiguous range of widetags
+  ;; corresponding to SIMPLE-UNBOXED-ARRAY
+  simple-array-nil-widetag
   simple-vector-widetag                     ;
   simple-bit-vector-widetag                 ;
   simple-array-unsigned-byte-2-widetag      ;
@@ -285,9 +288,6 @@
   simple-array-complex-single-float-widetag ;
   simple-array-complex-double-float-widetag ;
 
-  ;; Not a string type
-  simple-array-nil-widetag                  ;
-
   simple-base-string-widetag                ;  D6   E1  D6   E1       \
   #+sb-unicode                              ;                          |
   simple-character-string-widetag           ;  DA   E5                 | Strings
@@ -310,10 +310,17 @@
 
 ;;; Byte index:           3           2           1           0
 ;;;                 +-----------------------------------+-----------+
-;;;                 |  unused   |   rank    |   flags   |  widetag  |
+;;;                 |  unused   |   rank   <|>   flags  |  widetag  |
 ;;;                 +-----------+-----------+-----------+-----------+
 ;;;                 |<---------- HEADER DATA ---------->|
 
+;;; Having contiguous rank and widetag allows
+;;; SIMPLE-ARRAY-HEADER-OF-RANK-P to be done with just one comparison.
+;;; Other backends may not be ready to switch the order yet.
+(defconstant array-rank-position  #-arm64 16 #+arm64 8)
+(defconstant array-flags-position #-arm64 8  #+arm64 16)
+
+(defconstant array-flags-data-position (- array-flags-position n-widetag-bits))
 (defconstant +array-fill-pointer-p+    #x80)
 
 (defconstant +vector-dynamic-extent+   #x40)

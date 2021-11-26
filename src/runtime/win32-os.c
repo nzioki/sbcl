@@ -560,6 +560,7 @@ void* os_dlsym_default(char* name)
 {
     unsigned int i;
     void* result = 0;
+    buildTimeImages[0] = (void*)runtime_module_handle;
     if (buildTimeImageCount == 0) {
         buildTimeImageCount =
             1 + os_get_build_time_shared_libraries(15u,
@@ -840,8 +841,7 @@ set_up_win64_seh_thunk(size_t page_size)
 static LARGE_INTEGER lisp_init_time;
 static double qpcMultiplier;
 
-void os_init(char __attribute__((__unused__)) *argv[],
-             char __attribute__((__unused__)) *envp[])
+void os_init()
 {
 #ifdef LISP_FEATURE_64_BIT
     LARGE_INTEGER qpcFrequency;
@@ -1132,7 +1132,7 @@ handle_access_violation(os_context_t *ctx,
 
     /* dynamic space */
     page_index_t page = find_page_index(fault_address);
-    if (page != -1 && !page_table[page].write_protected) {
+    if (page != -1 && !PAGE_WRITEPROTECTED_P(page)) {
         os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
                          os_vm_page_size);
         return 0;
@@ -1480,11 +1480,11 @@ char *dirname(char *path)
 
 // 0 - not a socket or other error, 1 - has input, 2 - has no input
 int
-socket_input_available(HANDLE socket)
+socket_input_available(HANDLE socket, long time, long utime)
 {
     int count = 0;
     int wsaErrno = GetLastError();
-    TIMEVAL timeout = {0, 0};
+    TIMEVAL timeout = {time, utime};
     fd_set readfds, errfds;
 
     FD_ZERO(&readfds);

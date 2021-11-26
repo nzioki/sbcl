@@ -150,6 +150,13 @@
   (unless (null args)
     (bug "Leftover args: ~S" args)))
 
+(defun unbound-marker-tn-p (tn)
+  (let ((writes (tn-writes tn)))
+    (and writes
+         (not (tn-ref-next writes)) ; is never changed
+         (let ((vop (tn-ref-vop writes)))
+           (and vop (eq (vop-name vop) 'make-unbound-marker))))))
+
 (defun emit-fixed-alloc (node block name words type lowtag result lvar)
   (let ((stack-allocate-p (and lvar (lvar-dynamic-extent lvar))))
     (when stack-allocate-p
@@ -466,10 +473,3 @@
                     (primitive-object-slots (primitive-object 'array)))
                '(fill-pointer elements data
                  displacement displaced-p displaced-from dimensions)))
-
-(defun emit-code-page-write-barrier-p (fun-name)
-  (and (listp fun-name)
-       (eq (car fun-name) 'setf)
-       (member (cadr fun-name)
-               '(%code-debug-info %code-fixups))
-       t))

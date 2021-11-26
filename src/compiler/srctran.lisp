@@ -405,22 +405,6 @@
 ;;;; have to create these new interval structures even though
 ;;;; numeric-type has everything we want to know. Reason 2 wins for
 ;;;; now.
-
-;;; Support operations that mimic real arithmetic comparison
-;;; operators, but imposing a total order on the floating points such
-;;; that negative zeros are strictly less than positive zeros.
-(macrolet ((def (name op)
-             `(defun ,name (x y)
-                (declare (type real x y))
-                (if (and (floatp x) (floatp y) (zerop x) (zerop y))
-                    (,op (float-sign x) (float-sign y))
-                    (,op x y)))))
-  (def signed-zero->= sb-xc:>=)
-  (def signed-zero-> sb-xc:>)
-  (def signed-zero-= sb-xc:=)
-  (def signed-zero-< sb-xc:<)
-  (def signed-zero-<= sb-xc:<=))
-
 (defun make-interval (&key low high)
   (labels ((normalize-bound (val)
              (cond ((and (floatp val)
@@ -456,9 +440,18 @@
            ;; With these traps masked, we might get things like infinity
            ;; or negative infinity returned. Check for this and return
            ;; NIL to indicate unbounded.
+           #+sb-xc-host
+           (when (and (eql f #'log)
+                      (zerop x))
+             (return-from bound-func))
            (let ((y (funcall f (type-bound-number x))))
-             (if (and (floatp y)
-                      (float-infinity-p y))
+             (if (or (and (floatp y)
+                          (float-infinity-p y))
+                     (and (typep y 'complex)
+                          (or (and (floatp (imagpart y))
+                                   (float-infinity-p (imagpart y)))
+                              (and (floatp (realpart y))
+                                   (float-infinity-p (realpart y))))))
                  nil
                  (set-bound y (and strict (consp x))))))
          ;; Some numerical operations will signal an ERROR, e.g. in
@@ -678,9 +671,9 @@
   (declare (type interval x))
   (let ((lo (interval-low x))
         (hi (interval-high x)))
-    (cond ((and lo (signed-zero->= (type-bound-number lo) point))
+    (cond ((and lo (sb-xc:>= (type-bound-number lo) point))
            '+)
-          ((and hi (signed-zero->= point (type-bound-number hi)))
+          ((and hi (sb-xc:>= point (type-bound-number hi)))
            '-)
           (t
            nil))))
@@ -689,9 +682,9 @@
   (declare (type interval x))
   (let ((lo (interval-low x))
         (hi (interval-high x)))
-    (cond ((and lo (signed-zero->= (type-bound-number lo) point))
+    (cond ((and lo (sb-xc:>= (type-bound-number lo) point))
            '+)
-          ((and hi (signed-zero-> point (type-bound-number hi)))
+          ((and hi (sb-xc:> point (type-bound-number hi)))
            '-))))
 
 ;;; Test to see whether the interval X is bounded. HOW determines the
@@ -717,26 +710,26 @@
         (hi (interval-high x)))
     (cond ((and lo hi)
            ;; The interval is bounded
-           (if (and (signed-zero-<= (type-bound-number lo) p)
-                    (signed-zero-<= p (type-bound-number hi)))
+           (if (and (sb-xc:<= (type-bound-number lo) p)
+                    (sb-xc:<= p (type-bound-number hi)))
                ;; P is definitely in the closure of the interval.
                ;; We just need to check the end points now.
-               (cond ((signed-zero-= p (type-bound-number lo))
+               (cond ((sb-xc:= p (type-bound-number lo))
                       (numberp lo))
-                     ((signed-zero-= p (type-bound-number hi))
+                     ((sb-xc:= p (type-bound-number hi))
                       (numberp hi))
                      (t t))
                nil))
           (hi
            ;; Interval with upper bound
-           (if (signed-zero-< p (type-bound-number hi))
+           (if (sb-xc:< p (type-bound-number hi))
                t
-               (and (numberp hi) (signed-zero-= p hi))))
+               (and (numberp hi) (sb-xc:= p hi))))
           (lo
            ;; Interval with lower bound
-           (if (signed-zero-> p (type-bound-number lo))
+           (if (sb-xc:> p (type-bound-number lo))
                t
-               (and (numberp lo) (signed-zero-= p lo))))
+               (and (numberp lo) (sb-xc:= p lo))))
           (t
            ;; Interval with no bounds
            t))))
@@ -1443,6 +1436,23 @@
 (defoptimizer (* derive-type) ((x y))
   (two-arg-derive-type x y #'*-derive-type-aux #'sb-xc:*))
 
+(defoptimizer (%signed-multiply-high derive-type) ((x y))
+  (two-arg-derive-type x y
+                       (lambda (x y same-arg)
+                         (let* ((type (*-derive-type-aux x y same-arg))
+                                (low (numeric-type-low type))
+                                (high (numeric-type-high type)))
+                           (when (and low high)
+                             (make-numeric-type :class 'integer
+                                                :low
+                                                (ash low (- sb-vm:n-word-bits))
+                                                :high (ash high (- sb-vm:n-word-bits))))))
+                       #'sb-xc:*))
+
+(defoptimizer (%multiply-high derive-type) ((x y) node)
+  (declare (ignore x y))
+  (%signed-multiply-high-derive-type-optimizer node))
+
 (defun /-derive-type-aux (x y same-arg)
   (if (and (numeric-type-real-p x)
            (numeric-type-real-p y))
@@ -1521,7 +1531,7 @@
                                        (numeric-type-format type))))))
 
 (defoptimizer (lognot derive-type) ((int))
-  (lognot-derive-type-aux (lvar-type int)))
+  (one-arg-derive-type int #'lognot-derive-type-aux #'lognot))
 
 (defoptimizer (%negate derive-type) ((num))
   (flet ((negate-bound (b)
@@ -3037,7 +3047,7 @@
 ;;; Flush calls to various arith functions that convert to the
 ;;; identity function or a constant.
 (macrolet ((def (name identity result)
-             `(deftransform ,name ((x y) (* (constant-arg (member ,identity))) *)
+             `(deftransform ,name ((x y) (t (constant-arg (member ,identity))) *)
                 "fold identity operations"
                 ',result)))
   (def ash 0 x)
@@ -3052,7 +3062,7 @@
   (and (/= x -1)
        (1- (integer-length (logxor x (1+ x))))))
 
-(deftransform logand ((x y) (* (constant-arg integer)) *)
+(deftransform logand ((x y) (t (constant-arg integer)) *)
   "fold identity operation"
   (let* ((y (lvar-value y))
          (width (or (least-zero-bit y) '*)))
@@ -3062,7 +3072,7 @@
       (give-up-ir1-transform))
     'x))
 
-(deftransform mask-signed-field ((size x) ((constant-arg t) *) *)
+(deftransform mask-signed-field ((size x) ((constant-arg t) t) *)
   "fold identity operation"
   (let ((size (lvar-value size)))
     (cond ((= size 0) 0)
@@ -3071,7 +3081,7 @@
           (t
            (give-up-ir1-transform)))))
 
-(deftransform logior ((x y) (* (constant-arg integer)) *)
+(deftransform logior ((x y) (t (constant-arg integer)) *)
   "fold identity operation"
   (let* ((y (lvar-value y))
          (width (or (least-zero-bit (lognot y))
@@ -3116,7 +3126,7 @@
   (def + :type rational :folded (+ -))
   (def * :type rational :folded (* /)))
 
-(deftransform mask-signed-field ((width x) ((constant-arg unsigned-byte) *))
+(deftransform mask-signed-field ((width x) ((constant-arg unsigned-byte) t))
   "Fold mask-signed-field/mask-signed-field of constant width"
   (binding* ((node  (if (lvar-has-single-use-p x)
                         (lvar-use x)
@@ -3310,7 +3320,7 @@
                (,op ,a ,reverse)))
         `(,op ,a ,char))))
 
-(deftransform two-arg-char-equal ((a b) (* (constant-arg character)) *
+(deftransform two-arg-char-equal ((a b) (t (constant-arg character)) *
                                   :node node)
   (transform-constant-char-equal 'a b))
 
@@ -4888,13 +4898,13 @@
            (%sort-vector (or ,key #'identity))))))
 
 (deftransform sort ((list predicate &key key)
-                    (list * &rest t) *)
+                    (list t &rest t) *)
   `(sb-impl::stable-sort-list list
                               (%coerce-callable-to-fun predicate)
                               (if key (%coerce-callable-to-fun key) #'identity)))
 
 (deftransform stable-sort ((sequence predicate &key key)
-                           ((or vector list) *))
+                           ((or vector list) t))
   (let ((sequence-type (lvar-type sequence)))
     (cond ((csubtypep sequence-type (specifier-type 'list))
            `(sb-impl::stable-sort-list sequence
@@ -5043,9 +5053,9 @@
            (if (or (eq kind match-kind) (memq kind '(:constant :global))) ; as above
                `(setq ,symbol value)
                (give-up-ir1-transform)))))
-  (deftransform set-symbol-global-value ((symbol value) ((constant-arg symbol) *))
+  (deftransform set-symbol-global-value ((symbol value) ((constant-arg symbol) t))
     (xform symbol :global))
-  (deftransform set ((symbol value) ((constant-arg symbol) *))
+  (deftransform set ((symbol value) ((constant-arg symbol) t))
     (xform symbol :special)))
 
 (deftransforms (prin1-to-string princ-to-string) ((object) (number) * :important nil)

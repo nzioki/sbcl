@@ -180,7 +180,7 @@ during backtrace.
 ;;; hidden dependencies on primitive object sizes for the most part,
 ;;; 'ppc-assem.S' contains a literal constant that relies on knowing
 ;;; the precise size of a code object. Yes, there is a FIXME there :-)
-;;; So, if you touch this, then fix that.
+;;; So, if you touch this, then fix that. REALLY REALLY.
 (define-primitive-object (code :type code-component
                                 :lowtag other-pointer-lowtag
                                 :widetag code-header-widetag)
@@ -196,21 +196,15 @@ during backtrace.
   ;; for the assembler code component, a cons holding a hash-table.
   ;; (the cons points from read-only to static space, but the hash-table
   ;; wants to be in dynamic space)
+  ;; The corresponding SETF function is defined using code-header-set
+  ;; on the slot index; and there's a special variant if #+darwin-jit.
   (debug-info :type t
               :ref-known (flushable)
-              :ref-trans %%code-debug-info
-              :set-known ()
-              :set-trans (setf #-darwin-jit %code-debug-info
-                               #+darwin-jit %%code-debug-info))
-  ;; Define this slot if the architecture might ever use fixups.
-  ;; x86-64 doesn't necessarily use them, depending on the feature set,
-  ;; but this keeps things consistent.
-  #+(or x86 x86-64)
-  (fixups :type t
-          :ref-known (flushable)
-          :ref-trans %code-fixups
-          :set-known ()
-          :set-trans (setf %code-fixups))
+              :ref-trans %%code-debug-info)
+  ;; Not all architectures use fixups. The slot is always present for consistency.
+  ;; The corresponding SETF function is defined using code-header-set
+  ;; on the slot index.
+  (fixups :type t :ref-known (flushable) :ref-trans %code-fixups)
   (constants :rest-p t))
 
 (define-primitive-object (fdefn :type fdefn
@@ -380,11 +374,20 @@ during backtrace.
          :set-trans %set-symbol-global-value
          :set-known ())
 
-  (info :ref-trans symbol-info :ref-known (flushable)
-        :set-trans (setf symbol-info)
+  ;; The private accessor for INFO reads the slot verbatim.
+  ;; In contrast, the SYMBOL-INFO function always returns a PACKED-INFO
+  ;; instance (see info-vector.lisp) or NIL. The slot itself may hold a cons
+  ;; of the user's PLIST and a PACKED-INFO or just a PACKED-INFO.
+  ;; It can't hold a PLIST alone without wrapping in an extra cons cell.
+  (info :ref-trans symbol-%info :ref-known (flushable)
+        :set-trans (setf symbol-%info)
         :set-known ()
-        :cas-trans %compare-and-swap-symbol-info
-        :type (or simple-vector list)
+        ;; IR2-CONVERT-CASSER only knows the arg order as (OBJECT OLD NEW),
+        ;; so as much as I'd like to name this (CAS SYMBOL-%INFO),
+        ;; it can't be that, because it'd need args of (OLD NEW OBJECT).
+        ;; This is a pretty close approximation of the desired name.
+        :cas-trans sb-impl::cas-symbol-%info
+        :type (or instance list)
         :init :null)
   (name :ref-trans symbol-name :init :arg)
   (package :ref-trans sb-xc:symbol-package
@@ -469,6 +472,9 @@ during backtrace.
                             *thread-header-slot-names*)))))
   (assign-header-slot-indices))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defconstant histogram-small-bins 32)) ; for consing size histogram
+
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
@@ -517,10 +523,6 @@ during backtrace.
   #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
   ;; END of slots to keep near the beginning.
 
-  (dynspace-addr)
-  (dynspace-card-count)
-  (dynspace-pte-base)
-
   ;; This is the original address at which the memory was allocated,
   ;; which may have different alignment then what we prefer to use.
   ;; Kept here so that when the thread dies we can release the whole
@@ -553,7 +555,7 @@ during backtrace.
   ;; handling, we need to know if the machine context is in Lisp code
   ;; or not.  On non-threaded targets, this is a global variable in
   ;; the runtime, but it's clearly a per-thread value.
-  #+sb-thread
+  #+(and sb-thread (not arm64))
   (foreign-function-call-active :c-type "boolean")
   ;; Same as above for the location of the current control stack frame.
   #+(and sb-thread (not (or x86 x86-64)))
@@ -565,6 +567,7 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
+  #+ppc64 (card-table)
 
   ;; allocation instrumenting
   (tot-bytes-alloc-boxed)
@@ -573,7 +576,8 @@ during backtrace.
   (et-allocator-mutex-acq) ; elapsed times
   (et-find-freeish-page)
   (et-bzeroing)
-  (obj-size-histo :c-type "size_histogram" :length #.sb-vm:n-word-bits)
+  (obj-size-histo :c-type "size_histogram"
+                  :length #.(+ histogram-small-bins sb-vm:n-word-bits))
 
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.

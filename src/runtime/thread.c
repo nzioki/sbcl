@@ -233,6 +233,12 @@ struct thread *alloc_thread_struct(void*,lispobj);
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), \
                     GetCurrentProcess(), (LPHANDLE)&thread->os_thread, 0, TRUE, \
                     DUPLICATE_SAME_ACCESS)
+#elif defined LISP_FEATURE_GS_SEG
+#include <asm/prctl.h>
+#include <sys/prctl.h>
+extern int arch_prctl(int code, unsigned long *addr);
+#define ASSOCIATE_OS_THREAD(thread) arch_prctl(ARCH_SET_GS, (uword_t*)thread), \
+      thread->os_thread = thread_self()
 #else
 #define ASSOCIATE_OS_THREAD(thread) thread->os_thread = thread_self()
 #endif
@@ -341,6 +347,14 @@ void create_main_lisp_thread(lispobj function) {
 #else
     funcall0(function);
 #endif
+    // If we end up returning, clean up the initial thread.
+#ifdef LISP_FEATURE_SB_THREAD
+    unlink_thread(th);
+#else
+    all_threads = NULL;
+#endif
+    arch_os_thread_cleanup(th);
+    ASSIGN_CURRENT_THREAD(NULL);
 }
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -905,16 +919,11 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
 #ifdef LAYOUT_OF_FUNCTION
     tls[THREAD_FUNCTION_LAYOUT_SLOT] = LAYOUT_OF_FUNCTION << 32;
 #endif
-#ifdef LISP_FEATURE_GENCGC
 #ifdef THREAD_VARYOBJ_CARD_MARKS_SLOT
     extern unsigned int* varyobj_page_touched_bits;
     tls[THREAD_VARYOBJ_SPACE_ADDR_SLOT] = VARYOBJ_SPACE_START;
     tls[THREAD_VARYOBJ_CARD_COUNT_SLOT] = varyobj_space_size / IMMOBILE_CARD_BYTES;
     tls[THREAD_VARYOBJ_CARD_MARKS_SLOT] = (lispobj)varyobj_page_touched_bits;
-#endif
-    th->dynspace_addr       = DYNAMIC_SPACE_START;
-    th->dynspace_card_count = page_table_pages;
-    th->dynspace_pte_base   = (lispobj)page_table;
 #endif
 
     th->os_address = spaces;
@@ -1006,7 +1015,7 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
      * all. */
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     th->foreign_function_call_active = 0;
-#else
+#elif !defined(LISP_FEATURE_ARM64) // uses control_stack_start
     th->foreign_function_call_active = 1;
 #endif
 #endif
@@ -1034,6 +1043,14 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
     thread_interrupt_data(th).gc_blocked_deferrables = 0;
 #if GENCGC_IS_PRECISE
     thread_interrupt_data(th).allocation_trap_context = 0;
+#endif
+#if defined LISP_FEATURE_PPC64
+    /* Storing a 0 into code coverage mark bytes or GC card mark bytes
+     * can be done from the low byte of the thread base register.
+     * The thread alignment is BACKEND_PAGE_BYTES (from thread.h), but seeing as this is
+     * a similar-but-different requirement, it pays to double-check */
+    if ((lispobj)th & 0xFF) lose("Thread struct not at least 256-byte-aligned");
+    th->card_table = (lispobj)gc_card_mark;
 #endif
 
 #ifdef LISP_FEATURE_SB_THREAD

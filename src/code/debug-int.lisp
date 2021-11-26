@@ -939,7 +939,7 @@
                           (make-bogus-debug-fun
                            "bogus stack frame"))
                          (t
-                          (debug-fun-from-pc code pc-offset)))))
+                          (debug-fun-from-pc code pc-offset escaped)))))
             (make-compiled-frame caller up-frame d-fun
                                  (code-location-from-pc d-fun pc-offset
                                                         escaped)
@@ -2571,9 +2571,10 @@ register."
          (sap-ref-sap nfp (number-stack-offset))))
       (#.constant-sc-number
        (if escaped
-           (code-header-ref
-            (code-header-from-pc (sb-vm:context-pc escaped))
-            (sb-c:sc+offset-offset sc+offset))
+           (let ((code (code-header-from-pc (sb-vm:context-pc escaped))))
+             (if code
+                 (code-header-ref code (sb-c:sc+offset-offset sc+offset))
+                 :invalid-code-object-at-pc))
            :invalid-value-for-unescaped-register-storage))
       (#.immediate-sc-number
        (sb-c:sc+offset-offset sc+offset)))))

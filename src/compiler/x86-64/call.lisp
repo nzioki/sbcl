@@ -14,28 +14,8 @@
 (defconstant arg-count-sc (make-sc+offset any-reg-sc-number rcx-offset))
 (defconstant closure-sc (make-sc+offset any-reg-sc-number rax-offset))
 
-;;; Make a passing location TN for a local call return PC.
-;;;
-;;; Always wire the return PC location to the stack in its standard
-;;; location.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
-                 sap-stack-sc-number return-pc-save-offset))
-
 (defconstant return-pc-passing-offset
   (make-sc+offset sap-stack-sc-number return-pc-save-offset))
-
-;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
-;;; location to pass OLD-FP in.
-;;;
-;;; This is wired in both the standard and the local-call conventions,
-;;; because we want to be able to assume it's always there. Besides,
-;;; the x86 doesn't have enough registers to really make it profitable
-;;; to pass it in a register.
-(defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
-                 ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset control-stack-sc-number ocfp-save-offset))
@@ -46,16 +26,17 @@
 ;;;
 ;;; Without using a save-tn - which does not make much sense if it is
 ;;; wired to the stack?
-(defun make-old-fp-save-location (physenv)
-  (physenv-debug-live-tn (make-wired-tn *fixnum-primitive-type*
-                                        control-stack-sc-number
-                                        ocfp-save-offset)
-                         physenv))
-(defun make-return-pc-save-location (physenv)
-  (physenv-debug-live-tn
-   (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
-                  sap-stack-sc-number return-pc-save-offset)
-   physenv))
+(defun make-old-fp-save-location ()
+  (let ((tn (make-wired-tn *fixnum-primitive-type*
+                           control-stack-sc-number
+                           ocfp-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
+(defun make-return-pc-save-location ()
+  (let ((tn (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
+                           sap-stack-sc-number return-pc-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
 
 ;;; Make a TN for the standard argument count passing location. We only
 ;;; need to make the standard location, since a count is never passed when we
@@ -258,7 +239,7 @@
 ;;;     there are stack values.
 ;;;  -- Reset SP. This must be done whenever other than 1 value is
 ;;;     returned, regardless of the number of values desired.
-(defun default-unknown-values (vop values nvals node)
+(defun default-unknown-values (vop values nvals node rbx move-temp)
   (declare (type (or tn-ref null) values)
            (type unsigned-byte nvals))
   (let ((type (sb-c::basic-combination-derived-type node)))
@@ -275,9 +256,9 @@
             ;; dangling. Let's emit a NOP.
             (inst nop)))
          ((not (sb-kernel:values-type-may-be-single-value-p type))
-          (inst mov rsp-tn rbx-tn))
+          (inst mov rsp-tn rbx))
          (t
-          (inst cmov :c rsp-tn rbx-tn))))
+          (inst cmov :c rsp-tn rbx))))
       ((<= nvals register-arg-count)
        (note-this-location vop :unknown-return)
        (when (sb-kernel:values-type-may-be-single-value-p type)
@@ -298,11 +279,11 @@
                  do
                  (inst mov :dword (tn-ref-tn tn-ref)
                        (if 2nd-tn-live 2nd-tn nil-value)))))
-           (inst mov rbx-tn rsp-tn)
+           (inst mov rbx rsp-tn)
            (emit-label regs-defaulted)))
        (when (< register-arg-count
                 (sb-kernel:values-type-max-value-count type))
-         (inst mov rsp-tn rbx-tn)))
+         (inst mov rsp-tn rbx)))
       (t
        (collect ((defaults))
          (let ((default-stack-slots (gen-label))
@@ -327,7 +308,7 @@
                    (loop for null = nil-value then (car used-registers)
                          for reg in used-registers
                          do (inst mov :dword reg null))
-                   (move rbx-tn rsp-tn)
+                   (move rbx rsp-tn)
                    (inst jmp defaulting-done)))
             REGS-DEFAULTED
             (do ((i register-arg-count (1+ i))
@@ -343,12 +324,12 @@
                     (inst jmp :be default-lab)
                     (sc-case tn
                       (control-stack
-                       (loadw r11-tn rbx-tn (frame-word-offset (+ sp->fp-offset i)))
-                       (inst mov tn r11-tn))
+                       (loadw move-temp rbx (frame-word-offset (+ sp->fp-offset i)))
+                       (inst mov tn move-temp))
                       (t
-                       (loadw tn rbx-tn (frame-word-offset (+ sp->fp-offset i)))))))))
+                       (loadw tn rbx (frame-word-offset (+ sp->fp-offset i)))))))))
             DEFAULTING-DONE
-            (move rsp-tn rbx-tn)
+            (move rsp-tn rbx)
             (let ((defaults (defaults)))
               (when defaults
                 (assemble (:elsewhere)
@@ -356,7 +337,7 @@
                   (loop for null = nil-value then (car used-registers)
                         for reg in used-registers
                         do (inst mov :dword reg null))
-                  (move rbx-tn rsp-tn)
+                  (move rbx rsp-tn)
                   (dolist (default defaults)
                     (emit-label (car default))
                     (inst mov (cdr default) nil-value))
@@ -506,11 +487,12 @@
   (:vop-var vop)
   (:ignore nfp arg-locs args callee)
   (:node-var node)
+  (:temporary (:sc any-reg) move-temp)
   (:generator 5
     (move rbp-tn fp)
     (note-this-location vop :call-site)
     (inst call target)
-    (default-unknown-values vop values nvals node)))
+    (default-unknown-values vop values nvals node rbx-tn move-temp)))
 
 ;;; Non-TR local call for a variable number of return values passed according
 ;;; to the unknown values convention. The results are the start of the values
@@ -660,8 +642,7 @@
 
                (:ignore
                ,@(unless (or variable (eq return :tail)) '(arg-locs))
-               ,@(unless variable '(args))
-               ,@(and (eq return :fixed) '(rbx)))
+               ,@(unless variable '(args)))
 
                ;; We pass either the fdefn object (for named call) or
                ;; the actual function object (for unnamed call) in
@@ -682,7 +663,8 @@
                ,@(when (eq return :fixed)
                    ;; Save it for DEFAULT-UNKNOWN-VALUES to work
                    `((:temporary (:sc unsigned-reg :offset rbx-offset
-                                  :from :result) rbx)))
+                                  :from :result) rbx)
+                     (:temporary (:sc any-reg) move-temp)))
 
                ;; With variable call, we have to load the
                ;; register-args out of the (new) stack frame before
@@ -851,7 +833,7 @@
                        `(call-unnamed rax fun-type vop)))
                ,@(ecase return
                    (:fixed
-                    '((default-unknown-values vop values nvals node)))
+                    '((default-unknown-values vop values nvals node rbx move-temp)))
                    (:unknown
                     '((note-this-location vop :unknown-return)
                       (receive-unknown-values values-start nvals start count
@@ -1297,6 +1279,7 @@
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) rcx)
   ;; Note that DST conflicts with RESULT because we use both as temps
   (:temporary (:sc unsigned-reg) value dst)
+  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 20
@@ -1311,10 +1294,13 @@
       ;; Setup for the CDR of the last cons (or the entire result) being NIL.
       (inst mov result nil-value)
       (inst jrcxz DONE)
-      (unless stack-allocate-p (instrument-alloc 'list rcx node))
-      (pseudo-atomic (:elide-if stack-allocate-p)
+      (unless stack-allocate-p
+        (instrument-alloc 'list rcx node (list value dst) thread-tn))
+      (pseudo-atomic (:elide-if stack-allocate-p :thread-tn thread-tn)
        ;; Produce an untagged pointer into DST
-       (allocation 'list rcx 0 node stack-allocate-p dst)
+       (if stack-allocate-p
+           (stack-allocation rcx 0 dst)
+           (allocation 'list rcx 0 dst node value thread-tn))
        ;; Recalculate DST as a tagged pointer to the last cons
        (inst lea dst (ea (- list-pointer-lowtag (* cons-size n-word-bytes)) dst rcx))
        (inst shr :dword rcx (1+ word-shift)) ; convert bytes to number of cells

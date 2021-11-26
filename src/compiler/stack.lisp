@@ -247,7 +247,7 @@
       (setq start (merge-uvl-live-sets start (ir2-block-popped 2block)))
 
       ;; We cannot delete unused UVLs during NLX, so all UVLs live at
-      ;; ENTRY will be actually live at NLE.
+      ;; ENTRY which are not popped will be actually live at NLE.
       ;;
       ;; BUT, UNWIND-PROTECTor is called in the environment, which has
       ;; nothing in common with the environment of its entry. So we
@@ -262,7 +262,9 @@
                (cleanup (nlx-info-cleanup nlx-info)))
           (unless (eq (cleanup-kind cleanup) :unwind-protect)
             (let* ((entry-block (node-block (cleanup-mess-up cleanup)))
-                   (entry-stack (ir2-block-start-stack (block-info entry-block))))
+                   (entry-stack (set-difference
+                                 (ir2-block-start-stack (block-info entry-block))
+                                 (ir2-block-popped (block-info entry-block)))))
               (setq start (merge-uvl-live-sets start entry-stack))))))
 
       (when *check-consistency*
@@ -509,6 +511,8 @@
         (when (and (block-start succ)
                    (not (eq (ir2-block-start-stack (block-info succ))
                             top)))
-          (insert-stack-cleanups block succ)))))
+          ;; Return resets the stack, so no need to clean anything.
+          (unless (return-p (block-last succ))
+            (insert-stack-cleanups block succ))))))
 
   (values))

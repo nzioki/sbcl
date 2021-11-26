@@ -324,6 +324,8 @@
          ("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
          ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
+         ("(and (not sb-thread) (or arm64 ppc64))"
+          "The selected architecture requires :SB-THREAD")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
          ("(and cheneygc (not (or arm mips ppc riscv sparc)))"
@@ -543,8 +545,8 @@
          ;; Compile-for-effect happens simultaneously with a forked compile,
          ;; so we need the for-effect output not to stomp on the real output.
          (tmp-obj
-          (concatenate 'string obj
-                       (if *compile-for-effect-only* "-scratch" "-tmp")))
+           (concatenate 'string obj
+                        (if *compile-for-effect-only* "-scratch" "-tmp")))
          (compile-file (ecase mode
                          (:host-compile
                           #+abcl ; ABCL complains about its own deficiency and then returns T
@@ -625,26 +627,27 @@
        retry-compile-file
          (multiple-value-bind (output-truename warnings-p failure-p)
              (restart-case
-                 (apply compile-file src :output-file tmp-obj
-                          :block-compile (and ;; Block compilation was
-                                              ;; completely broken
-                                              ;; from the beginning of
-                                              ;; SBCL history until
-                                              ;; version 2.0.2.
-                                              #+sbcl
-                                              (or (eq mode :target-compile)
-                                                  (and (find-symbol "SPLIT-VERSION-STRING" "SB-C")
-                                                       (funcall (find-symbol "VERSION>=" "SB-C")
-                                                                (funcall (find-symbol "SPLIT-VERSION-STRING" "SB-C")
-                                                                         (lisp-implementation-version))
-                                                                '(2 0 2))))
-                                              block-compile)
-                          :allow-other-keys t
-                          ;; If tracing, also print, but don't specify :PRINT unless specifying
-                          ;; :TRACE-FILE so that whatever the default is for *COMPILE-PRINT*
-                          ;; prevails, insensitively to whether it's the SB-XC: or CL: symbol.
-                          (when trace-file
-                            '(:trace-file t :print t)))
+                 (apply compile-file src
+                        :output-file tmp-obj
+                        :block-compile (and
+                                        ;; Block compilation was
+                                        ;; completely broken from the
+                                        ;; beginning of SBCL history
+                                        ;; until version 2.0.2.
+                                        #+sbcl
+                                        (or (eq mode :target-compile)
+                                            (and (find-symbol "SPLIT-VERSION-STRING" "HOST-SB-C")
+                                                 (funcall (find-symbol "VERSION>=" "HOST-SB-C")
+                                                          (funcall (find-symbol "SPLIT-VERSION-STRING" "HOST-SB-C")
+                                                                   (lisp-implementation-version))
+                                                          '(2 0 2))))
+                                        block-compile)
+                        :allow-other-keys t
+                        ;; If tracing, also print, but don't specify :PRINT unless specifying
+                        ;; :TRACE-FILE so that whatever the default is for *COMPILE-PRINT*
+                        ;; prevails, insensitively to whether it's the SB-XC: or CL: symbol.
+                        (when trace-file
+                          '(:trace-file t :print t)))
                (recompile ()
                  :report report-recompile-restart
                  (go retry-compile-file)))
@@ -653,19 +656,19 @@
                   (error "couldn't compile ~S" src))
                  (failure-p
                   (unwind-protect
-                           (restart-case
-                               (error "FAILURE-P was set when creating ~S."
-                                      obj)
-                             (recompile ()
-                               :report report-recompile-restart
-                               (go retry-compile-file))
-                             (continue ()
-                               :report report-continue-restart
-                               (setf failure-p nil)))
-                        ;; Don't leave failed object files lying around.
-                        (when (and failure-p (probe-file tmp-obj))
-                          (delete-file tmp-obj)
-                          (format t "~&deleted ~S~%" tmp-obj))))
+                       (restart-case
+                           (error "FAILURE-P was set when creating ~S."
+                                  obj)
+                         (recompile ()
+                           :report report-recompile-restart
+                           (go retry-compile-file))
+                         (continue ()
+                           :report report-continue-restart
+                           (setf failure-p nil)))
+                    ;; Don't leave failed object files lying around.
+                    (when (and failure-p (probe-file tmp-obj))
+                      (delete-file tmp-obj)
+                      (format t "~&deleted ~S~%" tmp-obj))))
                  ;; Otherwise: success, just fall through.
                  (t nil)))))
 
@@ -674,16 +677,14 @@
     (cond ((not *compile-for-effect-only*)
            (rename-file-a-la-unix tmp-obj obj))
           ((probe-file tmp-obj)
-           (delete-file tmp-obj))) ; clean up the trash
+           (delete-file tmp-obj)))      ; clean up the trash
 
     ;; nice friendly traditional return value
     (pathname obj)))
 (compile 'compile-stem)
 
 (defparameter *host-quirks*
-  (or #+cmu  '(:host-quirks-cmu)
-      #+ecl  '(:host-quirks-ecl)
-      #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
+  (or #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
 
 ;;; Execute function FN in an environment appropriate for compiling the
 ;;; cross-compiler's source code in the cross-compilation host.

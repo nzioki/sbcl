@@ -453,24 +453,6 @@
        (node-ends-block (ctran-use ctran)))))
   (values))
 
-;;; CTRAN must be the last ctran in an incomplete block; finish the
-;;; block and start a new one if necessary.
-(defun start-block (ctran)
-  (declare (type ctran ctran))
-  (aver (not (ctran-next ctran)))
-  (ecase (ctran-kind ctran)
-    (:inside-block
-     (let ((block (ctran-block ctran))
-           (node (ctran-use ctran)))
-       (aver (not (block-last block)))
-       (aver node)
-       (setf (block-last block) node)
-       (setf (node-next node) nil)
-       (setf (ctran-use ctran) nil)
-       (setf (ctran-kind ctran) :unused)
-       (setf (ctran-block ctran) nil)
-       (link-blocks block (ctran-starts-block ctran))))
-    (:block-start)))
 
 ;;;;
 
@@ -567,6 +549,7 @@
 ;;; the LEXENV-LAMBDA may be deleted, we must chain up the
 ;;; LAMBDA-CALL-LEXENV thread until we find a CLAMBDA that isn't
 ;;; deleted, and then return its home.
+(declaim (maybe-inline node-home-lambda))
 (defun node-home-lambda (node)
   (declare (type node node))
   (do ((fun (lexenv-lambda (node-lexenv node))
@@ -579,12 +562,14 @@
 (defun lambda-parent (lambda)
   (lexenv-lambda (lambda-lexenv lambda)))
 
-(declaim (ftype (sfunction (node) component) node-component))
 (defun node-component (node)
-  (block-component (node-block node)))
-(declaim (ftype (sfunction (node) physenv) node-physenv))
-(defun node-physenv (node)
-  (lambda-physenv (node-home-lambda node)))
+  (declare (type node node))
+  (the component (block-component (node-block node))))
+
+(declaim (maybe-inline node-environment))
+(defun node-environment (node)
+  (declare (type node node) #-sb-xc-host (inline node-home-lambda))
+  (the environment (lambda-environment (node-home-lambda node))))
 
 (declaim (inline node-stack-allocate-p))
 (defun node-stack-allocate-p (node)
@@ -666,6 +651,7 @@
 ;;; actually correspond to code which will be written anywhere.
 (declaim (ftype (sfunction (cblock) (or clambda null)) block-home-lambda-or-null))
 (defun block-home-lambda-or-null (block)
+  #-sb-xc-host (declare (inline node-home-lambda))
   (if (node-p (block-last block))
       ;; This is the old CMU CL way of doing it.
       (node-home-lambda (block-last block))
@@ -695,14 +681,14 @@
             nil))))
 
 ;;; Return the non-LET LAMBDA that holds BLOCK's code.
-(declaim (ftype (sfunction (cblock) clambda) block-home-lambda))
 (defun block-home-lambda (block)
-  (block-home-lambda-or-null block))
+  (declare (type cblock block))
+  (the clambda (block-home-lambda-or-null block)))
 
-;;; Return the IR1 physical environment for BLOCK.
-(declaim (ftype (sfunction (cblock) physenv) block-physenv))
-(defun block-physenv (block)
-  (lambda-physenv (block-home-lambda block)))
+;;; Return the IR1 environment for BLOCK.
+(defun block-environment (block)
+  (declare (type cblock block))
+  (lambda-environment (block-home-lambda block)))
 
 ;;;; DYNAMIC-EXTENT related
 
@@ -760,35 +746,28 @@
               (compiler-notify "~@<could~2:I not stack allocate: ~S~:@>"
                                (find-original-source (node-source-path use)))))))))
 
-(defun use-good-for-dx-p (use dx &optional component)
-  ;; FIXME: Can casts point to LVARs in other components?
-  ;; RECHECK-DYNAMIC-EXTENT-LVARS assumes that they can't -- that is, that the
-  ;; PRINCIPAL-LVAR is always in the same component as the original one. It
-  ;; would be either good to have an explanation of why casts don't point
-  ;; across components, or an explanation of when they do it. ...in the
-  ;; meanwhile AVER that our assumption holds true.
-  (aver (or (not component) (eq component (node-component use))))
+(defun use-good-for-dx-p (use dx)
   (and (not (node-to-be-deleted-p use))
        (or (dx-combination-p use dx)
            (and (cast-p use)
                 (not (cast-type-check use))
-                (lvar-good-for-dx-p (cast-value use) dx component))
+                (lvar-good-for-dx-p (cast-value use) dx))
            (and (trivial-lambda-var-ref-p use)
                 (let ((uses (lvar-uses (trivial-lambda-var-ref-lvar use))))
                   (or (eq use uses)
-                      (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx component)))))))
+                      (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx)))))))
 
-(defun lvar-good-for-dx-p (lvar dx &optional component)
+(defun lvar-good-for-dx-p (lvar dx)
   (let ((uses (lvar-uses lvar)))
     (cond
       ((null uses)
        nil)
       ((consp uses)
        (every (lambda (use)
-                (use-good-for-dx-p use dx component))
+                (use-good-for-dx-p use dx))
               uses))
       (t
-       (use-good-for-dx-p uses dx component)))))
+       (use-good-for-dx-p uses dx)))))
 
 (defun known-dx-combination-p (use dx)
   (and (eq (combination-kind use) :known)
@@ -922,7 +901,7 @@
                 return arg))))))
 
 ;;; This needs to play nice with LVAR-GOOD-FOR-DX-P and friends.
-(defun handle-nested-dynamic-extent-lvars (dx lvar &optional recheck-component)
+(defun handle-nested-dynamic-extent-lvars (dx lvar)
   (let ((uses (lvar-uses lvar)))
     ;; DX value generators must end their blocks: see UPDATE-UVL-LIVE-SETS.
     ;; Uses of mupltiple-use LVARs already end their blocks, so we just need
@@ -937,25 +916,25 @@
              (etypecase use
                (cast
                 (handle-nested-dynamic-extent-lvars
-                 dx (cast-value use) recheck-component))
+                 dx (cast-value use)))
                (combination
                 (loop for arg in (combination-args use)
                       ;; deleted args show up as NIL here
                       when (and arg
-                                (lvar-good-for-dx-p arg dx recheck-component))
+                                (lvar-good-for-dx-p arg dx))
                       append (handle-nested-dynamic-extent-lvars
-                              dx arg recheck-component)))
+                              dx arg)))
                (ref
                 (let* ((other (trivial-lambda-var-ref-lvar use)))
                   (unless (eq other lvar)
                     (handle-nested-dynamic-extent-lvars
-                     dx other recheck-component)))))))
+                     dx other)))))))
       (cons (cons dx lvar)
             (if (listp uses)
                 (loop for use in uses
-                      when (use-good-for-dx-p use dx recheck-component)
+                      when (use-good-for-dx-p use dx)
                       nconc (recurse use))
-                (when (use-good-for-dx-p uses dx recheck-component)
+                (when (use-good-for-dx-p uses dx)
                   (recurse uses)))))))
 
 ;;; Return the Top Level Form number of PATH, i.e. the ordinal number
@@ -1076,7 +1055,9 @@
 (defun %lvar-single-value-p (lvar)
   (let ((dest (lvar-dest lvar)))
     (typecase dest
-      ((or creturn exit)
+      (exit
+       (lvar-single-value-p (node-lvar dest)))
+      (creturn
        nil)
       (mv-combination
        (eq (basic-combination-fun dest) lvar))
@@ -1095,11 +1076,12 @@
 (defun principal-lvar-single-valuify (lvar)
   (loop for prev = lvar then (node-lvar dest)
         for dest = (and prev (lvar-dest prev))
-        while (cast-p dest)
+        while (or (cast-p dest)
+                  (exit-p dest))
         do (setf (node-derived-type dest)
                  (make-short-values-type (list (single-value-type
                                                 (node-derived-type dest)))))
-        (reoptimize-lvar prev)))
+           (reoptimize-lvar prev)))
 
 ;;; Return a new LEXENV just like DEFAULT except for the specified
 ;;; slot values. Values for the alist slots are APPENDed to the
@@ -1246,9 +1228,8 @@
 ;;; otherwise false.
 (defun join-successor-if-possible (block)
   (declare (type cblock block))
-  (let* ((next (first (block-succ block)))
-         (start (block-start next)))
-    (when start  ; NEXT is not an END-OF-COMPONENT marker
+  (let ((next (first (block-succ block))))
+    (when (block-start next)  ; NEXT is not an END-OF-COMPONENT marker
       (cond ( ;; We cannot combine with a successor block if:
              (or
               ;; the successor has more than one predecessor;
@@ -1264,28 +1245,20 @@
               ;; thus the control transfer is a non-local exit.
               (not (eq (block-home-lambda block)
                        (block-home-lambda next)))
-              ;; Stack analysis phase wants ENTRY to start a block...
-              (entry-p (block-start-node next))
+              ;; Stack analysis phase wants DX ENTRYs to start their
+              ;; blocks...
+              (let ((entry (block-start-node next)))
+                (and (entry-p entry)
+                     (eq (cleanup-kind (entry-cleanup entry))
+                         :dynamic-extent)))
               (let ((last (block-last block)))
                 (and (valued-node-p last)
                      (awhen (node-lvar last)
-                       (or
-                        ;; ... and a DX-allocator to end a block.
-                        (lvar-dynamic-extent it)
-                        ;; ... and for there to be no chance of there
-                        ;; being two successive USEs of the same
-                        ;; multi-valued LVAR in the same block (since
-                        ;; we can only insert cleanup code at block
-                        ;; boundaries, but need to discard
-                        ;; multi-valued LVAR contents before they are
-                        ;; overwritten).
-                        (and (consp (lvar-uses it))
-                             (not (lvar-single-value-p it)))))))
+                       ;; ...and DX-allocators to end
+                       ;; their blocks.
+                       (lvar-dynamic-extent it))))
               (neq (block-type-check block)
-                   (block-type-check next))
-              ;; This ctran is a destination of an EXIT,
-              ;; a later inlined function may want to use it.
-              (ctran-entries start))
+                   (block-type-check next)))
              nil)
             (t
              (join-blocks block next)
@@ -1536,7 +1509,6 @@
 
 ;;;; deleting stuff
 
-#-sb-devel
 (declaim (start-block delete-ref delete-functional flush-node flush-dest
                       delete-lvar delete-block delete-block-lazily delete-lambda
                       mark-for-deletion))
@@ -1899,8 +1871,7 @@
                (delete node (basic-var-sets var)))))
       (cast
        (flush-dest (cast-value node)))
-      (enclose)
-      (no-op)))
+      (enclose)))
 
   (remove-from-dfo block)
   (values))
@@ -1910,14 +1881,13 @@
 ;;; Do stuff to indicate that the return node NODE is being deleted.
 (defun delete-return (node)
   (declare (type creturn node))
-  (let ((fun (return-lambda node)))
-    (when fun ;; could become replaced by MOVE-RETURN-STUFF
-      (let ((tail-set (lambda-tail-set fun)))
-        (aver (lambda-return fun))
-        (setf (lambda-return fun) nil)
-        (when (and tail-set (not (find-if #'lambda-return
-                                          (tail-set-funs tail-set))))
-          (setf (tail-set-type tail-set) *empty-type*)))))
+  (let* ((fun (return-lambda node))
+         (tail-set (lambda-tail-set fun)))
+    (aver (lambda-return fun))
+    (setf (lambda-return fun) nil)
+    (when (and tail-set (not (find-if #'lambda-return
+                                      (tail-set-funs tail-set))))
+      (setf (tail-set-type tail-set) *empty-type*)))
   (values))
 
 ;;; If any of the VARS in FUN was never referenced and was not
@@ -2008,20 +1978,9 @@
     (unless (eq (functional-kind home) :deleted)
       (do-nodes (node nil block)
         (let* ((path (node-source-path node))
-               (first (first path)))
-          (when (and (not (return-p node))
-                     ;; CASTs are just value filters and do not
-                     ;; represent code and they can be moved around
-                     ;; making CASTs from the original source code
-                     ;; appear in code inserted by the compiler, generating
-                     ;; false deletion notes.
-                     ;; And if a block with the original source gets
-                     ;; deleted the node that produces the value for
-                     ;; the CAST will get a note, no need to note
-                     ;; twice.
-                     (not (cast-p node))
-                     ;; Nothing interesting in BIND nodes
-                     (not (bind-p node))
+               (ctran-path (ctran-source-path (node-prev node))))
+          (flet ((visible-p (path)
+                   (let ((first (first path)))
                      (or (eq first 'original-source-start)
                          (and (atom first)
                               (or (not (symbolp first))
@@ -2034,14 +1993,63 @@
                                        (present-in-form first x 0))
                                      (source-path-forms path))
                               (present-in-form first (find-original-source path)
-                                               0))))
-            (let ((*compiler-error-context* node))
-              (compiler-notify 'code-deletion-note
-                               :format-control "deleting unreachable code"
-                               :format-arguments nil))
-            (return))))))
+                                               0))))))
+            (cond ((and ctran-path
+                        (visible-p ctran-path))
+                   (push (cons ctran-path (node-lexenv node))
+                         (deleted-source-paths *compilation*))
+                   (return))
+                  ((and (not (return-p node))
+                        ;; CASTs are just value filters and do not
+                        ;; represent code and they can be moved around
+                        ;; making CASTs from the original source code
+                        ;; appear in code inserted by the compiler, generating
+                        ;; false deletion notes.
+                        ;; And if a block with the original source gets
+                        ;; deleted the node that produces the value for
+                        ;; the CAST will get a note, no need to note
+                        ;; twice.
+                        (not (cast-p node))
+                        ;; Nothing interesting in BIND nodes
+                        (not (bind-p node))
+                        ;; Try to get the outer deleted node.
+                        (not (and (valued-node-p node)
+                                  (let ((dest (node-dest node)))
+                                    (and dest
+                                         (node-to-be-deleted-p dest)
+                                         (node-source-inside-p node dest)))))
+                        (visible-p path))
+                   (push (cons path (node-lexenv node))
+                         (deleted-source-paths *compilation*))
+                   (return))))))))
   (values))
 
+(defun node-source-inside-p (inner-node outer-node)
+  (tailp (source-path-original-source (node-source-path outer-node))
+         (source-path-original-source (node-source-path inner-node))))
+
+(defun report-code-deletion ()
+  (let ((forms (make-hash-table :test #'equal))
+        (reversed-path))
+    ;; Report only the outermost form
+    (loop for pair in (shiftf (deleted-source-paths *compilation*) nil)
+          for (path) = pair
+          do
+          (when (eq (car path) 'original-source-start)
+            (setf (gethash (source-path-original-source path) forms) path))
+          (push pair reversed-path))
+    (loop for (path . lexenv) in reversed-path
+          for original = (source-path-original-source path)
+          when (loop for outer on (if (eq (car path) 'original-source-start)
+                                      (cdr original)
+                                      original)
+                     never (gethash outer forms))
+          do
+          (let ((*current-path* path)
+                (*lexenv* lexenv))
+            (compiler-notify 'code-deletion-note
+                             :format-control "deleting unreachable code"
+                             :format-arguments nil)))))
 ;;; Delete a node from a block, deleting the block if there are no
 ;;; nodes left. We remove the node from the uses of its LVAR.
 ;;;
@@ -2056,7 +2064,6 @@
   (declare (type node node))
   (when (valued-node-p node)
     (delete-lvar-use node))
-
   (let* ((ctran (node-next node))
          (next (and ctran (ctran-next ctran)))
          (prev (node-prev node))
@@ -2072,7 +2079,9 @@
                  (t
                   (setf (ctran-next prev) next)
                   (setf (node-prev next) prev)
-                  (when (if-p next) ; AOP wanted
+                  (unless (ctran-source-path prev)
+                    (setf (ctran-source-path prev) (ctran-source-path ctran)))
+                  (when (if-p next)
                     (reoptimize-lvar (if-test next)))))
            (setf (node-prev node) nil)
            nil)
@@ -2080,15 +2089,8 @@
            (aver (eq prev-kind :block-start))
            (aver (eq node last))
            (let* ((succ (block-succ block))
-                  (next (first succ))
-                  (next-ctran (block-start next)))
+                  (next (first succ)))
              (aver (singleton-p succ))
-             ;; Update the ctran used by EXITs from BLOCKs.
-             (when next-ctran
-               (loop for entry in (ctran-entries prev)
-                     do (setf (second entry) next-ctran))
-               (setf (ctran-entries next-ctran)
-                     (ctran-entries prev)))
              (cond
                ((eq block (first succ))
                 (with-ir1-environment-from-node node
@@ -2515,7 +2517,7 @@ is :ANY, the function name is not checked."
   (let* ((entry (exit-entry exit))
          (cleanup (entry-cleanup entry))
         (block (first (block-succ (node-block exit)))))
-    (dolist (nlx (physenv-nlx-info (node-physenv entry)) nil)
+    (dolist (nlx (environment-nlx-info (node-environment entry)) nil)
       (when (and (eq (nlx-info-block nlx) block)
                  (eq (nlx-info-cleanup nlx) cleanup))
         (return nlx)))))
@@ -2917,6 +2919,7 @@ is :ANY, the function name is not checked."
 ;;; from system lambdas.
 (defun preserve-single-use-debug-var-p (call var)
   (and (policy call (eql preserve-single-use-debug-variables 3))
+       (not (lambda-var-specvar var))
        (or (not (lambda-var-p var))
            (not (lambda-system-lambda-p (lambda-var-home var))))))
 

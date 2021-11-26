@@ -157,7 +157,7 @@
                 ;; index. The returned value is a physical index.
                 (named-let recurse ((start 0) (end (ash (length v) -1)))
                   (declare (type (unsigned-byte 9) start end)
-                           (optimize (sb-c::insert-array-bounds-checks 0)))
+                           (optimize (sb-c:insert-array-bounds-checks 0)))
                   (when (< start end)
                     (let* ((i (ash (+ start end) -1))
                            (elt (keyfn (aref v (ash i 1)))))
@@ -1001,6 +1001,8 @@ The default value of USE is implementation-dependent, and in this
 implementation it is ~S." *!default-package-use-list*)
   (prog ((name (stringify-string-designator name))
          (nicks (stringify-string-designators nicknames))
+         (package (%make-package (make-package-hashtable internal-symbols)
+                                 (make-package-hashtable external-symbols)))
          clobber)
    :restart
      (when (find-package name)
@@ -1017,19 +1019,13 @@ implementation it is ~S." *!default-package-use-list*)
        points. Consider moving the package creation form outside the ~
        scope of a block compilation."))
      (with-package-graph ()
-       ;; Check for race, signal the error outside the lock.
-       (when (and (not clobber) (find-package name))
-         (go :restart))
-       (let ((package
-               (%make-package
-                name
-                (make-package-hashtable internal-symbols)
-                (make-package-hashtable external-symbols))))
-
+         ;; Check for race, signal the error outside the lock.
+         (when (and (not clobber) (find-package name))
+           (go :restart))
+         (setf (package-%name package) name)
          ;; Do a USE-PACKAGE for each thing in the USE list so that checking for
          ;; conflicting exports among used packages is done.
          (use-package use package)
-
          ;; FIXME: ENTER-NEW-NICKNAMES can fail (ERROR) if nicknames are illegal,
          ;; which would leave us with possibly-bad side effects from the earlier
          ;; USE-PACKAGE (e.g. this package on the used-by lists of other packages,
@@ -1046,7 +1042,7 @@ implementation it is ~S." *!default-package-use-list*)
          (with-package-names (table)
            (%register-package table name package))
          (atomic-incf *package-names-cookie*)
-         (return package)))
+         (return package))
      (bug "never")))
 
 (flet ((remove-names (package name-table keep-primary-name)
@@ -1174,11 +1170,12 @@ implementation it is ~S." *!default-package-use-list*)
                   (dolist (used (package-use-list package))
                     (unuse-package used package))
                   (setf (package-%local-nicknames package) nil)
-                  ;; FIXME: lacking a way to advise UNINTERN that this package
-                  ;; is pending deletion, a large package conses successively
-                  ;; many smaller tables for no good reason.
-                  (do-symbols (sym package)
-                    (unintern sym package))
+                  (flet ((nullify-home (symbols)
+                           (dovector (x (package-hashtable-cells symbols))
+                             (when (and (symbolp x) (eq (symbol-package x) package))
+                               (%set-symbol-package x nil)))))
+                    (nullify-home (package-internal-symbols package))
+                    (nullify-home (package-external-symbols package)))
                   (with-package-names (table)
                     (remove-names package table nil)
                     (setf (package-%name package) nil
@@ -1982,7 +1979,7 @@ PACKAGE."
                                                (logand start-state 3))))))
                      (when (zerop index)
                        (return (advance start-state))))))
-          (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
           (if (logtest start-state +package-iter-check-shadows+)
               (let ((shadows (package-%shadowing-symbols (this-package))))
                 (scan (not (member sym shadows :test #'string=))))

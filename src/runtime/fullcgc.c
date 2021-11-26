@@ -75,7 +75,7 @@ static page_index_t free_page;
 
 /* The whole-page allocator works backwards from the end of dynamic space.
  * If it collides with 'next_free_page', then you lose.
- * TOOD: It would be reasonably simple to have this request more memory from
+ * TODO: It would be reasonably simple to have this request more memory from
  * the OS instead of failing on overflow */
 static void* get_free_page() {
     --free_page;
@@ -634,12 +634,15 @@ void execute_full_sweep_phase()
     if (sweeplog)
         fflush(sweeplog);
 
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+    free_page = next_free_page;
+#else
     page_index_t first_page, last_page;
     for (first_page = 0; first_page < next_free_page; ++first_page)
-        if (page_table[first_page].write_protected
+        if (PAGE_WRITEPROTECTED_P(first_page)
             && protection_mode(first_page) == PHYSICAL) {
             last_page = first_page;
-            while (page_table[last_page+1].write_protected
+            while (PAGE_WRITEPROTECTED_P(last_page+1)
                    && protection_mode(last_page+1) == PHYSICAL)
                 ++last_page;
             os_protect(page_address(first_page),
@@ -647,6 +650,7 @@ void execute_full_sweep_phase()
                        OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
             first_page = last_page;
         }
+#endif
     while (free_page < page_table_pages) {
         page_table[free_page++].type = FREE_PAGE_FLAG;
     }

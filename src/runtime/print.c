@@ -421,7 +421,7 @@ char * simple_base_stringize(struct vector * string)
 
 static void brief_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     extern struct vector * instance_classoid_name(lispobj*);
     struct vector * classoid_name;
     classoid_name = instance_classoid_name((lispobj*)instance);
@@ -464,7 +464,7 @@ static boolean tagged_slot_p(struct layout *layout, int slot_index)
 
 static void print_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     short int i;
     char buffer[16];
     lispobj layout = instance_layout(native_pointer(obj));
@@ -573,19 +573,18 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 
 lispobj symbol_function(lispobj* symbol)
 {
-    lispobj info = ((struct symbol*)symbol)->info;
-    if (listp(info))
-        info = CONS(info)->cdr;
-    if (lowtag_of(info) == OTHER_POINTER_LOWTAG) {
-        struct vector* v = VECTOR(info);
-        int len = vector_len(v);
-        if (len != 0) {
-            lispobj elt = v->data[0];  // Just like INFO-VECTOR-FDEFN
-            if (fixnump(elt) && (fixnum_value(elt) & 07777) >= 07701) {
-                lispobj fdefn = v->data[len-1];
-                if (lowtag_of(fdefn) == OTHER_POINTER_LOWTAG)
-                    return FDEFN(fdefn)->fun;
-            }
+    lispobj info_holder = ((struct symbol*)symbol)->info;
+    if (listp(info_holder))
+        info_holder = CONS(info_holder)->cdr;
+    if (lowtag_of(info_holder) == INSTANCE_POINTER_LOWTAG) {
+        struct instance* info = INSTANCE(info_holder);
+        // Do the same thing as PACKED-INFO-FDEFN
+        lispobj elt = info->slots[INSTANCE_DATA_START];
+        if (fixnump(elt) && (fixnum_value(elt) & 07777) >= 07701) {
+            int len = (info->header >> INSTANCE_LENGTH_SHIFT) & INSTANCE_LENGTH_MASK;
+            lispobj fdefn = info->slots[len-1];
+            if (lowtag_of(fdefn) == OTHER_POINTER_LOWTAG)
+                return FDEFN(fdefn)->fun;
         }
     }
     return NIL;

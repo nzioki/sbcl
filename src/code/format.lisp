@@ -33,8 +33,9 @@
                  t)))
     (if (logtest (get-header-data string)
                  ;; shareable = readonly
-                 (logior sb-vm:+vector-shareable+
-                         sb-vm:+vector-shareable-nonstd+))
+                 (ash (logior sb-vm:+vector-shareable+
+                              sb-vm:+vector-shareable-nonstd+)
+                      sb-vm:array-flags-data-position))
         (memoize (compute-it))
         (compute-it))))
 
@@ -361,7 +362,7 @@
     (let ((*orig-args-available* t)
           (*only-simple-args* nil))
       `(named-lambda ,lambda-name (stream &rest orig-args)
-         (declare (ignorable stream))
+         (declare (ignorable stream) (muffle-conditions compiler-note))
          (let ((args orig-args))
            ,(expand-control-string control-string)
            ,(and need-retval 'args))))))

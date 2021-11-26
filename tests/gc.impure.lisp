@@ -35,7 +35,7 @@
     (assert (= (aref a 4) 18))
     ;; broken cells are the cons, string, bignum, hash-table, plus one NIL
     ;; cell that was never assigned into
-    (assert (= (count nil *weak-vect*) 5))))
+    *weak-vect*))
 
 ;;; Make sure MAP-REFERENCING-OBJECTS doesn't spuriously treat raw bits as
 ;;; potential pointers. Also make sure it sees the SYMBOL-INFO slot.
@@ -44,7 +44,7 @@
 (with-test (:name :map-referencing-objs)
   (sb-vm::map-referencing-objects (lambda (x) (assert (not (typep x 'afoo))))
                                   :dynamic '*posix-argv*)
-  (let ((v (sb-kernel:symbol-info 'satisfies)) referers)
+  (let ((v (sb-kernel:symbol-%info 'satisfies)) referers)
     (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
                                     #+gencgc :dynamic #-gencgc :static v)
     #+immobile-space
@@ -152,7 +152,8 @@
                 (sb-kernel:get-lisp-obj-address string-one)
                 (sb-kernel:get-lisp-obj-address string-two)))))
 #+gencgc
-(with-test (:name :pin-all-code-with-gc-enabled)
+(with-test (:name :pin-all-code-with-gc-enabled
+                  :skipped-on :interpreter)
   #+sb-thread (sb-thread:join-thread (sb-thread:make-thread #'make-some-objects))
   #-sb-thread (progn (make-some-objects) (sb-sys:scrub-control-stack))
   (sb-sys:with-code-pages-pinned (:dynamic) (gc))

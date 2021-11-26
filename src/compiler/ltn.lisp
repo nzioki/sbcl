@@ -475,7 +475,9 @@
   (setf (node-tail-p node) nil)
   (let ((value (exit-value node)))
     (when value
-      (annotate-unknown-values-lvar value)))
+      (if (lvar-single-value-p (node-lvar node))
+          (annotate-fixed-values-lvar value (list *backend-t-primitive-type*))
+          (annotate-unknown-values-lvar value))))
   (values))
 
 (defun ltn-analyze-enclose (node)
@@ -913,7 +915,7 @@
       ;; transforms or VOPs or whatever.
       (unless template
         (ltn-default-call call)
-        (when (let ((funleaf (physenv-lambda (node-physenv call)))
+        (when (let ((funleaf (environment-lambda (node-environment call)))
                     (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
                      (eq name (leaf-source-name funleaf))

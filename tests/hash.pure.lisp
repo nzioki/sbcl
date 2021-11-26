@@ -52,7 +52,7 @@
         (unsafely-set-bit
          (compile nil
                   '(lambda (bv i val)
-                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+                     (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                      (setf (bit bv i) val)))))
     (replace bv '(1 0 1 1 1))
     (let ((hash (sxhash bv)))
@@ -223,7 +223,8 @@
 
 (with-test (:name (hash-table :custom-hashfun-with-standard-test))
   (flet ((kv-flag-bits (ht)
-           (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))))
+           (ash (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))
+                (- sb-vm:array-flags-data-position))))
     ;; verify that EQ hashing on symbols is address-sensitive
     (let ((h (make-hash-table :test 'eq)))
       (setf (gethash 'foo h) 1)

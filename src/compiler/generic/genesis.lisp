@@ -426,14 +426,12 @@
                (or (aref (gspace-page-table gspace) index)
                    (setf (aref (gspace-page-table gspace) index) (make-page))))
              (assign-page-types (page-type start-word-index count)
-               ;; CMUCL incorrectly warns that the result of ADJUST-ARRAY
-               ;; must not be discarded.
-               #+host-quirks-cmu (declare (notinline adjust-array))
                (let ((start-page (page-index start-word-index))
                      (end-page (page-index (+ start-word-index (1- count)))))
                  (unless (> (length (gspace-page-table gspace)) end-page)
-                   (adjust-array (gspace-page-table gspace) (1+ end-page)
-                                 :initial-element nil))
+                   (setf (gspace-page-table gspace)
+                         (adjust-array (gspace-page-table gspace) (1+ end-page)
+                                       :initial-element nil)))
                  (loop for page-index from start-page to end-page
                        for pte = (pte page-index)
                        do (if (null (page-type pte))
@@ -1012,6 +1010,7 @@ core and return a descriptor to it."
 
 ;;;; symbol magic
 
+(defvar *tls-index-to-symbol*)
 #+sb-thread
 (progn
   ;; Simulate *FREE-TLS-INDEX*. This is a word count, not a displacement.
@@ -1020,6 +1019,7 @@ core and return a descriptor to it."
   ;; This is a backend support routine, but the style within this file
   ;; is to conditionalize by the target features.
   (defun cold-assign-tls-index (symbol index)
+    (push (list index (warm-symbol symbol)) *tls-index-to-symbol*)
     #+64-bit
     (write-wordindexed/raw
      symbol 0 (logior (ash index 32) (read-bits-wordindexed symbol 0)))
@@ -1030,11 +1030,8 @@ core and return a descriptor to it."
   ;; choosing a new index if it doesn't have one yet.
   (defun ensure-symbol-tls-index (symbol)
     (let* ((cold-sym (cold-intern symbol))
-           (tls-index
-            #+64-bit
-            (ldb (byte 32 32) (read-bits-wordindexed cold-sym 0))
-            #-64-bit
-            (read-bits-wordindexed cold-sym sb-vm:symbol-tls-index-slot)))
+           (tls-index #+64-bit (ldb (byte 32 32) (read-bits-wordindexed cold-sym 0))
+                      #-64-bit (read-bits-wordindexed cold-sym sb-vm:symbol-tls-index-slot)))
       (unless (plusp tls-index)
         (let ((next (prog1 *genesis-tls-counter* (incf *genesis-tls-counter*))))
           (setq tls-index (ash next sb-vm:word-shift))
@@ -1480,7 +1477,7 @@ core and return a descriptor to it."
 (defun set-readonly (vector)
   (write-wordindexed/raw vector 0 (logior (read-bits-wordindexed vector 0)
                                           (ash sb-vm:+vector-shareable+
-                                               sb-vm:n-widetag-bits)))
+                                               sb-vm:array-flags-position)))
   vector)
 
 (defun initialize-packages ()
@@ -1932,7 +1929,7 @@ core and return a descriptor to it."
      (sort (%hash-table-alist *cold-package-symbols*)
            #'string< :key #'car)))) ; Sort by package-name
 
-  (dump-symbol-info-vectors
+  (dump-symbol-infos
    (attach-fdefinitions-to-symbols
     (attach-classoid-cells-to-symbols (make-hash-table :test #'eq))))
 
@@ -2104,7 +2101,7 @@ core and return a descriptor to it."
 ;;
 (defun attach-fdefinitions-to-symbols (hashtable)
     ;; Collect fdefinitions that go with one symbol, e.g. CAR and (SETF CAR),
-    ;; using the host's code for manipulating a packed info-vector.
+    ;; using the host's code for manipulating a packed-info.
     (maphash (lambda (warm-name cold-fdefn)
                (with-globaldb-name (key1 key2) warm-name
                  :hairy (error "Hairy fdefn name in genesis: ~S" warm-name)
@@ -2116,24 +2113,33 @@ core and return a descriptor to it."
               *cold-fdefn-objects*)
     hashtable)
 
-(defun dump-symbol-info-vectors (hashtable)
-    ;; Emit in the same order symbols reside in core to avoid
-    ;; sensitivity to the iteration order of host's maphash.
-    (loop for (warm-sym . info)
+(defun dump-packed-info (list)
+  ;; Payload length is the element count + LAYOUT slot if necessary.
+  ;; Header word is added automatically by ALLOCATE-STRUCT
+  (let ((s (allocate-struct (+ sb-vm:instance-data-start (length list))
+                            (cold-layout-descriptor (gethash 'packed-info *cold-layouts*)))))
+    (loop for i from (+ sb-vm:instance-slots-offset sb-vm:instance-data-start)
+          for elt in list do (write-wordindexed s i elt))
+    s))
+(defun dump-symbol-infos (hashtable)
+  (cold-set 'sb-impl::+nil-packed-infos+
+            (dump-packed-info (list (make-fixnum-descriptor 0))))
+  ;; Emit in the same order symbols reside in core to avoid
+  ;; sensitivity to the iteration order of host's maphash.
+  (loop for (warm-sym . info)
           in (sort (%hash-table-alist hashtable) #'<
                    :key (lambda (x) (descriptor-bits (cold-intern (car x)))))
           do (write-wordindexed
               (cold-intern warm-sym) sb-vm:symbol-info-slot
-              ;; Each vector will have one fixnum, possibly the symbol SETF,
+              (dump-packed-info
+              ;; Each packed-info will have one fixnum, possibly the symbol SETF,
               ;; and one or two #<fdefn> objects in it, and/or a classoid-cell.
-              (vector-in-core
                      (map 'list (lambda (elt)
                                   (etypecase elt
                                     (symbol (cold-intern elt))
-                                    (fixnum (make-fixnum-descriptor elt))
+                                    (sb-xc:fixnum (make-fixnum-descriptor elt))
                                     (descriptor elt)))
-                          info)))))
-
+                          (sb-impl::packed-info-cells info))))))
 
 ;;;; fixups and related stuff
 
@@ -2209,7 +2215,6 @@ Legal values for OFFSET are -4, -8, -12, ..."
 ;;; In case we need to store code fixups in code objects.
 ;;; At present only the x86 backends use this
 (defvar *code-fixup-notes*)
-(defvar *allocation-point-fixup-notes*)
 
 (defun code-jump-table-words (code)
   (ldb (byte 14 0) (read-bits-wordindexed code (code-header-words code))))
@@ -2220,9 +2225,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
                            descriptor)
                 cold-fixup))
 (defun cold-fixup (code-object after-header value kind flavor)
-  (when (sb-vm:fixup-code-object code-object after-header value kind flavor)
-    (push (cons kind after-header)
-          (gethash (descriptor-bits code-object) *code-fixup-notes*)))
+  (let ((classification
+         (sb-vm:fixup-code-object code-object after-header value kind flavor)))
+    (when classification
+      (push (cons classification after-header)
+            (gethash (descriptor-bits code-object) *code-fixup-notes*))))
   code-object)
 
 (defun resolve-static-call-fixups ()
@@ -2232,16 +2239,17 @@ Legal values for OFFSET are -4, -8, -12, ..."
                   (cold-fun-entry-addr (cold-symbol-function name))
                   kind :static-call))))
 
-;;; Save packed lists of absolute and relative fixups.
+;;; Save packed lists of fixups.
 ;;; (cf. FINISH-FIXUPS in generic/target-core.)
 (defun repack-fixups (list)
-  (collect ((relative) (absolute))
+  (collect ((immediate) (relative) (absolute))
     (dolist (item list)
       (ecase (car item)
         ;; There should be no absolute64 fixups to preserve
+        (:immediate (immediate (cdr item)))
         (:relative (relative (cdr item)))
         (:absolute (absolute (cdr item)))))
-    (number-to-core (sb-c:pack-code-fixup-locs (absolute) (relative)))))
+    (number-to-core (sb-c:pack-code-fixup-locs (absolute) (relative) (immediate)))))
 
 (defun linkage-table-note-symbol (symbol-name datap)
   "Register a symbol and return its address in proto-linkage-table."
@@ -2595,7 +2603,8 @@ Legal values for OFFSET are -4, -8, -12, ..."
   #-untagged-fdefns (write-wordindexed code index fdefn))
 
 (define-cold-fop (fop-load-code (header code-size n-fixups))
-  (let* ((n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
+  (let* ((n-entries (read-unsigned-byte-32-arg (fasl-input-stream)))
+         (n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
          (immobile (oddp header)) ; decode the representation used by dump
          ;; The number of constants is rounded up to even (if required)
          ;; to ensure that the code vector will be properly aligned.
@@ -2616,6 +2625,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
            (end (+ start code-size)))
       (read-bigvec-as-sequence-or-die (descriptor-mem des) (fasl-input-stream)
                                       :start start :end end)
+      (aver (= (code-n-entries des) n-entries))
       (let ((jumptable-word (read-bits-wordindexed des aligned-n-boxed-words)))
         (aver (zerop (ash jumptable-word -14)))
         ;; assign serialno
@@ -2733,6 +2743,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
 
 ;;; Target variant of this is defined in 'target-load'
 (defun apply-fixups (fop-stack code-obj n-fixups)
+  (let ((alloc-points (pop-fop-stack fop-stack)))
+    (when alloc-points
+      (cold-set 'sb-c::*!cold-allocation-patch-point*
+                (cold-cons (cold-cons code-obj alloc-points)
+                           (cold-symbol-value 'sb-c::*!cold-allocation-patch-point*)))))
   (dotimes (i n-fixups code-obj)
     (binding* ((info (descriptor-fixnum (pop-fop-stack fop-stack)))
                (sym (pop-fop-stack fop-stack))
@@ -2757,6 +2772,8 @@ Legal values for OFFSET are -4, -8, -12, ..."
              (:layout-id ; SYM is a #<WRAPPER>
               (cold-layout-id (gethash (descriptor-bits (->layout sym))
                                        *cold-layout-by-addr*)))
+             ;; The machine-dependent code decides how to patch in 'nbits'
+             #+gencgc (:gc-barrier sb-vm::gencgc-card-table-index-nbits)
              (:immobile-symbol
               ;; an interned symbol is represented by its host symbol,
               ;; but an uninterned symbol is a descriptor.
@@ -2766,13 +2783,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
              (:named-call
               (+ (descriptor-bits (cold-fdefinition-object sym))
                  (- 2 sb-vm:other-pointer-lowtag))))
-           kind flavor))
-      (when (and (member sym '(sb-vm::enable-alloc-counter
-                               sb-vm::enable-sized-alloc-counter))
-                 ;; Ignore symbol fixups naming these assembly routines!
-                 (member flavor '(:assembly-routine :assembly-routine*)))
-        (push (cold-cons code-obj (make-fixnum-descriptor offset))
-              *allocation-point-fixup-notes*)))))
+           kind flavor)))))
 
 ;;;; sanity checking space layouts
 
@@ -2937,8 +2948,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
                  sb-vm:n-lowtag-bits sb-vm:lowtag-mask
                  sb-vm:n-widetag-bits sb-vm:widetag-mask
                  sb-vm:n-fixnum-tag-bits sb-vm:fixnum-tag-mask
+                 sb-vm:instance-length-mask
                  sb-vm:dsd-raw-type-mask
-                 sb-vm:short-header-max-words))
+                 sb-vm:short-header-max-words
+                 sb-vm:array-flags-position
+                 sb-vm:array-rank-position))
       (push (list (c-symbol-name c)
                   -1                    ; invent a new priority
                   (symbol-value c)
@@ -3333,11 +3347,13 @@ Legal values for OFFSET are -4, -8, -12, ..."
                       "layouts"
                       "type specifiers"
                       "symbols"
-                      "linkage table")))
+                      "linkage table"
+                      #+sb-thread "TLS map")))
       (dotimes (i (length sections))
         (format t "~4<~@R~>. ~A~%" (1+ i) (nth i sections))))
     (format t "=================~2%")
-    (format t "I. assembler routines defined in core image:~2%")
+    (format t "I. assembler routines defined in core image: (base=~x)~2%"
+            (descriptor-bits *cold-assembler-obj*))
     (dolist (routine *cold-assembler-routines*)
       (let ((name (car routine)))
         (format t "~8,'0X: ~S~%" (lookup-assembler-reference name) name)))
@@ -3404,7 +3420,7 @@ III. initially undefined function references (alphabetically):
       (dolist (classoid dumped-classoids)
         (let ((nwords (logand (ash (read-bits-wordindexed classoid 0)
                                    (- sb-vm:instance-length-shift))
-                              sb-vm::instance-length-mask)))
+                              sb-vm:instance-length-mask)))
           (format t "Classoid @ ~x, ~d words:~%" (descriptor-bits classoid) (1+ nwords))
           (dotimes (i (1+ nwords)) ; include the header word in output
             (format t "~2d: ~10x~%" i (read-bits-wordindexed classoid i)))
@@ -3450,6 +3466,10 @@ III. initially undefined function references (alphabetically):
                 (listp name)
                 (sb-vm::linkage-table-entry-address (cdr entry))
                 (car (ensure-list name))))))
+
+  #+sb-thread
+  (format t "~%~|~%IV. TLS map:~2%~:{~4x ~s~%~}"
+          (sort *tls-index-to-symbol* #'< :key #'car))
 
   (values))
 
@@ -3543,8 +3563,10 @@ III. initially undefined function references (alphabetically):
       (write-bigvec-as-sequence ptes core-file :end pte-bytes)
       (force-output core-file)
       (file-position core-file posn))
-    (mapc write-word ; 5 = number of words in this core header entry
-          `(,page-table-core-entry-type-code 5 ,n-ptes ,pte-bytes ,data-page))))
+    (mapc write-word
+          `(,page-table-core-entry-type-code
+            6 ; = number of words in this core header entry
+            ,sb-vm::gencgc-card-table-index-nbits ,n-ptes ,pte-bytes ,data-page))))
 
 ;;; Create a core file created from the cold loaded image. (This is
 ;;; the "initial core file" because core files could be created later
@@ -3710,6 +3732,7 @@ III. initially undefined function references (alphabetically):
            (*cold-layouts* (make-hash-table :test 'eq)) ; symbol -> cold-layout
            (*cold-layout-by-addr* (make-hash-table :test 'eql)) ; addr -> cold-layout
            (*!cold-defsymbols* nil)
+           (*tls-index-to-symbol* nil)
            ;; '*COLD-METHODS* is never seen in the target, so does not need
            ;; to adhere to the #\! convention for automatic uninterning.
            (*cold-methods* nil)
@@ -3719,7 +3742,6 @@ III. initially undefined function references (alphabetically):
            *cold-assembler-obj*
            *deferred-undefined-tramp-refs*
            (*code-fixup-notes* (make-hash-table))
-           (*allocation-point-fixup-notes* nil)
            (*deferred-known-fun-refs* nil))
 
       (setf *nil-descriptor* (make-nil-descriptor)
@@ -3732,6 +3754,7 @@ III. initially undefined function references (alphabetically):
       (when core-file-name
         (initialize-packages))
       (initialize-static-space tls-init)
+      (cold-set 'sb-c::*!cold-allocation-patch-point* *nil-descriptor*)
 
       ;; Load all assembler code
       (flet ((assembler-file-p (name) (tailwise-equal (namestring name) ".assem-obj")))
@@ -3822,12 +3845,9 @@ III. initially undefined function references (alphabetically):
       (resolve-deferred-known-funs)
       (resolve-static-call-fixups)
       (foreign-symbols-to-core)
-      #+(or x86 immobile-space)
       (dolist (pair (sort (%hash-table-alist *code-fixup-notes*) #'< :key #'car))
         (write-wordindexed (make-random-descriptor (car pair))
                            sb-vm::code-fixups-slot (repack-fixups (cdr pair))))
-      (cold-set 'sb-c::*!cold-allocation-point-fixups*
-                (vector-in-core *allocation-point-fixup-notes*))
       (when core-file-name
         (finish-symbols))
       (finalize-load-time-value-noise)

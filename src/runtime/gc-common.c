@@ -196,8 +196,9 @@ void heap_scavenge(lispobj *start, lispobj *end)
     }
     // This assertion is usually the one that fails when something
     // is subtly wrong with the heap, so definitely always do it.
-    gc_assert_verbose(object_ptr == end, "Final object pointer %p, start %p, end %p\n",
-                      object_ptr, start, end);
+    if (object_ptr != end)
+        lose("heap_scavenge failure: Final object pointer %p, start %p, end %p",
+             object_ptr, start, end);
 }
 
 // Scavenge a block of memory from 'start' extending for 'n_words'
@@ -441,11 +442,38 @@ trans_fun_header(lispobj object)
  * instances
  */
 
+int n_unboxed_instances;
 static inline lispobj copy_instance(lispobj object)
 {
     // Object is an un-forwarded object in from_space
     lispobj header = *(lispobj*)(object - INSTANCE_POINTER_LOWTAG);
     int original_length = instance_length(header);
+
+    int page_type = BOXED_PAGE_FLAG;
+#ifdef LISP_FEATURE_GENCGC
+    lispobj layout = instance_layout(INSTANCE(object));
+    if (layout) {
+        generation_index_t gen = 0;
+        // If the layout is pseudo-static and the bitmap is 0 then this instance can go
+        // on an unboxed page to avoid further pointer tracing.
+        // And it could never be a valid argument to CHANGE-CLASS.
+    #ifdef LISP_FEATURE_IMMOBILE_SPACE
+        if (find_fixedobj_page_index((void*)layout))
+            gen = immobile_obj_generation((lispobj*)LAYOUT(layout));
+    #else
+        page_index_t p = find_page_index((void*)layout);
+        if (p >= 0) gen = page_table[p].gen;
+    #endif
+        if (gen == PSEUDO_STATIC_GENERATION) {
+            struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+            if (bitmap.nwords == 1 && !bitmap.bits[0]) {
+                page_type = UNBOXED_PAGE_FLAG;
+                // ++n_unboxed_instances; // for metrics gathering
+            }
+        }
+    }
+#endif
+
     lispobj copy;
     // KLUDGE: reading both flags at once doesn't really work
     // unless either we know what the opaque values are:
@@ -458,7 +486,8 @@ static inline lispobj copy_instance(lispobj object)
          * adding 1 for the header will effectively add 2 words.
          * Otherwise, don't add anything because a padding slot exists */
         int new_length = original_length + (original_length & 1);
-        copy = gc_copy_object_resizing(object, 1 + (new_length|1), BOXED_PAGE_FLAG,
+        copy = gc_copy_object_resizing(object, 1 + (new_length|1),
+                                       page_type,
                                        1 + (original_length|1));
         lispobj *base = native_pointer(copy);
         /* store the old address as the hash value */
@@ -480,7 +509,7 @@ static inline lispobj copy_instance(lispobj object)
                instance_length(*base));
 #endif
     } else {
-        copy = copy_object(object, 1 + (original_length|1));
+        copy = gc_general_copy_object(object, 1 + (original_length|1), page_type);
     }
     set_forwarding_pointer(native_pointer(object), copy);
     return copy;
@@ -493,7 +522,7 @@ scav_instance_pointer(lispobj *where, lispobj object)
     lispobj copy = copy_instance(object);
     *where = copy;
 
-    struct instance* node = (struct instance*)(copy - INSTANCE_POINTER_LOWTAG);
+    struct instance* node = INSTANCE(copy);
     lispobj layout = instance_layout((lispobj*)node);
     if (layout) {
         if (forwarding_pointer_p((lispobj*)LAYOUT(layout)))
@@ -507,7 +536,7 @@ scav_instance_pointer(lispobj *where, lispobj object)
                    && !forwarding_pointer_p(native_pointer(object))) {
                 copy = copy_instance(object);
                 node->slots[INSTANCE_DATA_START] = copy;
-                node = (struct instance*)(copy - INSTANCE_POINTER_LOWTAG);
+                node = INSTANCE(copy);
                 // We don't have to stop upon seeing an instance with a different layout.
                 // The only other object in the 'next' chain could be *TAIL-ATOM* if we reach
                 // the end. It's possible that all of the tests in the 'while' loop are met
@@ -667,7 +696,7 @@ DEF_SCAV_BOXED(short_boxed, SHORT_BOXED_NWORDS)
 DEF_SCAV_BOXED(tiny_boxed, TINY_BOXED_NWORDS)
 
 static inline int array_header_nwords(lispobj header) {
-    unsigned char rank = (header >> 16);
+    unsigned char rank = (header >> ARRAY_RANK_POSITION);
     ++rank; // wraparound from 255 to 0
     int nwords = sizeof (struct array)/N_WORD_BYTES + (rank-1);
     return ALIGN_UP(nwords, 2);
@@ -1050,6 +1079,7 @@ void smash_weak_pointers(void)
     while (vectors) {
         struct vector* vector = (struct vector*)vectors->car;
         vectors = (struct cons*)vectors->cdr;
+        ensure_non_ptr_word_writable(&vector->header);
         UNSET_WEAK_VECTOR_VISITED(vector);
         sword_t len = vector_len(vector);
         sword_t i;
@@ -1134,7 +1164,7 @@ void add_to_weak_vector_list(lispobj* vector, lispobj header)
     if (!vector_flagp(header, VectorWeakVisited)) {
         weak_vectors = (struct cons*)gc_private_cons((uword_t)vector,
                                                      (uword_t)weak_vectors);
-        *vector |= flag_VectorWeakVisited << N_WIDETAG_BITS;
+        *vector |= flag_VectorWeakVisited << ARRAY_FLAGS_POSITION;
     }
 }
 
@@ -1506,7 +1536,24 @@ scav_vector_t(lispobj *where, lispobj header)
 
 /* Walk through the chain whose first element is *FIRST and remove
  * dead weak entries.
- * Return the new value for 'should rehash' */
+ * Return the new value for 'should rehash'.
+ *
+ * This operation might have to touch a hash-table that is currently
+ * on a write-protected page, as follows:
+ *    hash-table in gen5 (WRITE-PROTECTED) -> pair vector in gen5 (NOT WRITE-PROTECTED)
+ *    -> younger k/v in gen1 that are deemed not-alive.
+ * That's all fine, but now we have to store into the table for two reasons:
+ *  1. to adjust the count
+ *  2. to store the list of reusable cells
+ * The former store is a non-pointer, but the latter may create an old->young pointer,
+ * because the list of cells for reuse is freshly consed (and therefore young).
+ * Moreover, when updating 'smashed_cells', that slot might not even be on the same
+ * hardware page as the table header (if a page-spanning object) so it might be
+ * unwritable even if words 0 through <something> are writable.
+ * Employing the NON_FAULTING_STORE macro might make sense for the non-pointer slot,
+ * except that it's potentially a lot more unprotects and reprotects.
+ * Better to just get it done once.
+ */
 static inline boolean
 cull_weak_hash_table_bucket(struct hash_table *hash_table,
                             uint32_t bucket, uint32_t index,
@@ -1544,12 +1591,14 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table,
                 cons->cdr = hash_table->culled_values;
                 cons->car = val;
                 lispobj list = make_lispobj(cons, LIST_POINTER_LOWTAG);
+                ensure_ptr_word_writable(&hash_table->culled_values);
                 hash_table->culled_values = list;
                 // ensure this cons doesn't get smashed into (0 . 0) by full gc
                 if (!compacting_p()) gc_mark_obj(list);
             }
             kv_vector[2 * index] = empty_symbol;
             kv_vector[2 * index + 1] = empty_symbol;
+            ensure_non_ptr_word_writable(&hash_table->_count);
             hash_table->_count -= make_fixnum(1);
 
             // Push (index . bucket) onto the table's GC culled cell list.
@@ -1573,6 +1622,7 @@ cull_weak_hash_table_bucket(struct hash_table *hash_table,
             cons->cdr = hash_table->smashed_cells;
             // Lisp code must atomically pop the list whereas this C code
             // always wins and does not need compare-and-swap.
+            ensure_ptr_word_writable(&hash_table->smashed_cells);
             hash_table->smashed_cells = make_lispobj(cons, LIST_POINTER_LOWTAG);
             // ensure this cons doesn't get smashed into (0 . 0) by full gc
             if (!compacting_p()) gc_mark_obj(hash_table->smashed_cells);
@@ -2428,54 +2478,6 @@ scavenge_interrupt_contexts(struct thread *th)
 }
 #endif /* x86oid targets */
 
-void varint_unpacker_init(struct varint_unpacker* unpacker, lispobj integer)
-{
-  if (fixnump(integer)) {
-      unpacker->word  = fixnum_value(integer);
-      unpacker->limit = N_WORD_BYTES;
-      unpacker->data  = (char*)&unpacker->word;
-  } else {
-      struct bignum* bignum = (struct bignum*)(integer - OTHER_POINTER_LOWTAG);
-      unpacker->word  = 0;
-      unpacker->limit = HeaderValue(bignum->header) * N_WORD_BYTES;
-      unpacker->data  = (char*)bignum->digits;
-  }
-  unpacker->index = 0;
-}
-
-// Fetch the next varint from 'unpacker' into 'result'.
-// Because there is no length prefix on the number of varints encoded,
-// spurious trailing zeros might be observed. The data consumer can
-// circumvent that by storing a count as the first value in the series.
-// Return 1 for success, 0 for EOF.
-int varint_unpack(struct varint_unpacker* unpacker, int* result)
-{
-    if (unpacker->index >= unpacker->limit) return 0;
-    int accumulator = 0;
-    int shift = 0;
-    while (1) {
-#ifdef LISP_FEATURE_LITTLE_ENDIAN
-        int byte = unpacker->data[unpacker->index];
-#else
-        // bignums are little-endian in word order,
-        // but machine-native within each word.
-        // We could pack bytes MSB-to-LSB in the bigdigits,
-        // but that seems less intuitive on the Lisp side.
-        int word_index = unpacker->index / N_WORD_BYTES;
-        int byte_index = unpacker->index % N_WORD_BYTES;
-        int byte = (((unsigned int*)unpacker->data)[word_index]
-                    >> (byte_index * 8)) & 0xFF;
-#endif
-        ++unpacker->index;
-        accumulator |= (byte & 0x7F) << shift;
-        if (!(byte & 0x80)) break;
-        gc_assert(unpacker->index < unpacker->limit);
-        shift += 7;
-    }
-    *result = accumulator;
-    return 1;
-}
-
 /* Our own implementation of heapsort, because some C libraries have a qsort()
  * that calls malloc() apparently, which we MUST NOT do. */
 
@@ -2519,6 +2521,7 @@ void gc_heapsort_uwords(heap array, int length)
 }
 
 /// External function for calling from Lisp.
-page_index_t ext_lispobj_size(lispobj *addr) {
+uword_t primitive_object_size(lispobj ptr) {
+    lispobj* addr = native_pointer(ptr);
     return OBJECT_SIZE(*addr,addr) * N_WORD_BYTES;
 }

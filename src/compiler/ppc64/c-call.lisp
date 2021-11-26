@@ -172,10 +172,9 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
-    (inst lr addr (make-fixup foreign-symbol :foreign-dataref))
-    (loadw res addr)))
+    (inst lr res (make-fixup foreign-symbol :foreign-dataref))
+    (loadw res res)))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg) :target cfunc)
@@ -413,9 +412,7 @@
               ;; And make the call.
               (load-address-into
                r0
-               (foreign-symbol-address
-                #-sb-thread "funcall3"
-                #+sb-thread "callback_wrapper_trampoline"))
+               (foreign-symbol-address "callback_wrapper_trampoline"))
               (inst mtlr r0)
               (inst blrl)
 

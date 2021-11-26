@@ -812,7 +812,7 @@
                             ;; for the the header word.
                             (header-bits
                               (logior (if (eq has-fill-pointer t) ; (i.e. can't handle :maybe)
-                                          (ash sb-vm:+array-fill-pointer-p+ sb-vm:n-widetag-bits)
+                                          (ash sb-vm:+array-fill-pointer-p+ sb-vm:array-flags-position)
                                           0)
                                       (or (sb-vm:saetp-complex-typecode saetp)
                                           sb-vm:complex-vector-widetag)))
@@ -832,7 +832,7 @@
                        (if (eq has-fill-pointer :maybe)
                            `(let ((%array ,array-header))
                               (when fill-pointer
-                                (logior-header-bits %array sb-vm:+array-fill-pointer-p+))
+                                (logior-array-flags %array sb-vm:+array-fill-pointer-p+))
                               %array)
                            array-header))))))
       (cond ;; Case (1) - :INITIAL-ELEMENT
@@ -982,7 +982,7 @@
                                      adjustable fill-pointer
                                      displaced-to
                                      displaced-index-offset)
-                          (t &rest *) *
+                          (t &rest t) *
                           :node node)
   (delay-ir1-transform node :constraint)
   (when (and initial-contents initial-element)
@@ -1516,10 +1516,12 @@
              ;; chances to run.
              (delay-ir1-transform node :ir1-phases))
            (if (vop-existsp :named test-header-bit)
-               `(test-header-bit array sb-vm:+array-fill-pointer-p+)
-               `(logtest (get-header-data array) sb-vm:+array-fill-pointer-p+))))))
+               `(test-header-bit array
+                                 (ash sb-vm:+array-fill-pointer-p+ sb-vm:array-flags-data-position))
+               `(logtest (get-header-data array)
+                         (ash sb-vm:+array-fill-pointer-p+ sb-vm:array-flags-data-position)))))))
 
-(deftransform %check-bound ((array dimension index) ((simple-array * (*)) * *))
+(deftransform %check-bound ((array dimension index) ((simple-array * (*)) t t))
   (let ((array-ref (lvar-uses array))
         (index-ref (lvar-uses index)))
     (unless (and

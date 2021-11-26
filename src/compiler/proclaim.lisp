@@ -17,7 +17,8 @@
 ;;; A list of UNDEFINED-WARNING structures representing references to unknown
 ;;; stuff which came up in a compilation unit.
 (defvar *undefined-warnings*)
-(declaim (list *undefined-warnings*))
+(defvar *argument-mismatch-warnings*)
+(declaim (list *undefined-warnings* *argument-mismatch-warnings*))
 
 ;;; Delete any undefined warnings for NAME and KIND. This is for the
 ;;; benefit of the compiler, but it's sometimes called from stuff like
@@ -508,10 +509,11 @@
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
              (push raw-form *queued-proclaims*)))
-        #-sb-fluid
         (freeze-type
+         #-sb-fluid
          (map-args #'process-freeze-type-declaration))
         ((start-block end-block)
+         #-(and sb-devel sb-xc-host)
          (when (and *compile-time-eval* (boundp '*compilation*))
            (if (eq *block-compile-argument* :specified)
                (process-block-compile-declaration args kind)
