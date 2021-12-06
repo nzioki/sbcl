@@ -20,14 +20,6 @@
   (%primitive print "too early in cold init to recover from errors")
   (%halt))
 
-(defun !cold-failed-aver (expr)
-  ;; output the message and invoke ldb monitor
-  (terpri)
-  (write-line "failed AVER:")
-  (write expr)
-  (terpri)
-  (%halt))
-
 ;;; last-ditch error reporting for things which should never happen
 ;;; and which, if they do happen, are sufficiently likely to torpedo
 ;;; the normal error-handling system that we want to bypass it
@@ -46,13 +38,13 @@
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
 
-  ;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
-  ;; and use it for most of the cold-init functions. (Just be careful
-  ;; not to use it for the COLD-INIT-OR-REINIT functions.)
+;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
+;; and use it for most of the cold-init functions. (Just be careful
+;; not to use it for the COLD-INIT-OR-REINIT functions.)
 (defmacro show-and-call (name)
-    `(progn
-       (/show "Calling" ,(symbol-name name))
-       (,name)))
+  `(progn
+     (/show "Calling" ,(symbol-name name))
+     (,name)))
 
 (defun !c-runtime-noinform-p () (/= (extern-alien "lisp_startup_options" char) 0))
 
@@ -87,14 +79,15 @@
         *current-level-in-print* 0))
 
 ;;; called when a cold system starts up
-(defun !cold-init (&aux (real-choose-symbol-out-fun #'choose-symbol-out-fun)
-                        (real-failed-aver-fun #'%failed-aver))
+(defun !cold-init ()
   "Give the world a shove and hope it spins."
 
   (/show0 "entering !COLD-INIT")
   #+sb-show (setq */show* t)
-  (/show0 "cold-initializing streams")
-  (sb-impl::!cold-stream-init)
+  (let ((stream (!make-cold-stderr-stream)))
+    (setq *error-output* stream
+          *standard-output* stream
+          *trace-output* stream))
   (show-and-call !signal-function-cold-init)
   (show-and-call !printer-control-init) ; needed before first instance of FORMAT or WRITE-STRING
   (setq *unparse-fun-type-simplify* nil) ; needed by TLFs in target-error.lisp
@@ -121,8 +114,6 @@
   (show-and-call !globaldb-cold-init)
   (show-and-call !function-names-init)
 
-  (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
-
   ;; And now *CURRENT-THREAD*
   (sb-thread::init-main-thread)
 
@@ -135,13 +126,11 @@
   ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility. Also
   ;; allows IN-PACKAGE to work.
   (show-and-call !package-cold-init)
-  ;; debug machinery needed for printing symbols
+
+  ;; The readtable needs to be initialized for printing symbols early,
+  ;; which is useful for debugging.
   #+sb-devel
-  (progn
-    (!readtable-cold-init)
-    ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
-    (setf (symbol-function 'choose-symbol-out-fun)
-          (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol)))
+  (!readtable-cold-init)
 
   ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
@@ -220,9 +209,6 @@
   ;; Setting them to NIL helps a little bit.
   (setq *!cold-defsymbols* nil *!cold-toplevels* nil)
 
-  ;; Now that L-T-V forms have executed, the symbol output chooser works.
-  (setf (symbol-function 'choose-symbol-out-fun) real-choose-symbol-out-fun)
-
   #+win32 (show-and-call reinit-internal-real-time)
 
   ;; Set sane values again, so that the user sees sane values instead
@@ -273,7 +259,6 @@
   (setf sb-kernel:*maximum-error-depth* 10)
   (/show0 "enabling internal errors")
   (setf (extern-alien "internal_errors_enabled" int) 1)
-  (setf (symbol-function '%failed-aver) real-failed-aver-fun)
 
   (show-and-call sb-disassem::!compile-inst-printers)
 

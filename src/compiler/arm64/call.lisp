@@ -312,22 +312,28 @@
 ;;; results Start and Count (also, it's nice to be able to target them).
 (defun receive-unknown-values (args nargs start count)
   (declare (type tn args nargs start count))
-  (assemble ()
-    (inst b :eq MULTIPLE)
-    (move start csp-tn)
-    (inst str (first *register-arg-tns*) (@ csp-tn n-word-bytes :post-index))
-    (inst mov count (fixnumize 1))
-    (inst b DONE)
-    MULTIPLE
-    #.(assert (evenp register-arg-count))
-    (do ((arg *register-arg-tns* (cddr arg))
-         (i 0 (+ i 2)))
-        ((null arg))
-      (inst stp (first arg) (second arg)
-            (@ args (* i n-word-bytes))))
-    (move start args)
-    (move count nargs)
-    DONE))
+  (let ((unused-count-p (eq (tn-kind count) :unused))
+        (unused-start-p (eq (tn-kind start) :unused)))
+    (assemble ()
+      (inst b :eq MULTIPLE)
+      (unless unused-start-p
+        (move start csp-tn))
+      (inst str (first *register-arg-tns*) (@ csp-tn n-word-bytes :post-index))
+      (unless unused-count-p
+        (inst mov count (fixnumize 1)))
+      (inst b DONE)
+      MULTIPLE
+      #.(assert (evenp register-arg-count))
+      (do ((arg *register-arg-tns* (cddr arg))
+           (i 0 (+ i 2)))
+          ((null arg))
+        (inst stp (first arg) (second arg)
+              (@ args (* i n-word-bytes))))
+      (unless unused-start-p
+        (move start args))
+      (unless unused-count-p
+        (move count nargs))
+      DONE)))
 
 ;;; VOP that can be inherited by unknown values receivers.  The main
 ;;; thing this handles is allocation of the result temporaries.
@@ -938,15 +944,7 @@
                               (ecase what
                                 (:load-nargs
                                  ,@(if variable
-                                       `((move nargs-pass csp-tn)
-                                         ;; The variable args are on the stack
-                                         ;; and become the frame, but there may
-                                         ;; be <4 args and 2 stack slots are
-                                         ;; assumed allocate on the call. So
-                                         ;; need to ensure there are at least 2
-                                         ;; slots. This just adds 2 more.
-                                         (inst add csp-tn nargs-pass (* 2 n-word-bytes))
-                                         (inst sub nargs-pass nargs-pass new-fp)
+                                       `((inst sub nargs-pass csp-tn new-fp)
                                          (inst asr nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits))
                                          ,@(do ((arg *register-arg-names* (cddr arg))
                                                 (i 0 (+ i 2))
