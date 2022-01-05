@@ -209,8 +209,8 @@
            (inst pop alloc-tn)))
     (let* ((NOT-INLINE (gen-label))
            (DONE (gen-label))
-           (free-pointer #+sb-thread (thread-slot-ea thread-boxed-tlab-slot #+gs-seg thread-temp)
-                         #-sb-thread (ea boxed-region))
+           (free-pointer #+sb-thread (thread-slot-ea thread-mixed-tlab-slot #+gs-seg thread-temp)
+                         #-sb-thread (ea mixed-region))
            (end-addr (ea (sb-x86-64-asm::ea-segment free-pointer)
                          (+ n-word-bytes (ea-disp free-pointer))
                          (ea-base free-pointer))))
@@ -884,21 +884,23 @@
       (if stack-allocate-p
           (stack-allocation bytes (if type 0 lowtag) result)
           (allocation nil bytes (if type 0 lowtag) result node alloc-temp thread-tn))
-      (when type
-        (let* ((widetag (if instancep instance-widetag type))
-               (header (compute-object-header words widetag)))
-          (if (or #+compact-instance-header
-                  (and (eq name '%make-structure-instance) stack-allocate-p))
+      (let* ((widetag (if instancep instance-widetag type))
+             (header (compute-object-header words widetag)))
+        (cond #+compact-instance-header
+              ((and (eq name '%make-structure-instance) stack-allocate-p)
               ;; Write a :DWORD, not a :QWORD, because the high half will be
               ;; filled in when the layout is stored. Can't use STOREW* though,
               ;; because it tries to store as few bytes as possible,
               ;; where this instruction must write exactly 4 bytes.
-              (inst mov :dword (ea 0 result) header)
-              (storew* header result 0 0 (not stack-allocate-p)))
-          (inst or :byte result lowtag))))
-    (when instancep ; store its layout
-      (inst mov :dword (ea (+ 4 (- lowtag)) result)
-            (make-fixup type :layout))))))
+               (inst mov :dword (ea 0 result) header))
+              (t
+               (storew* header result 0 0 (not stack-allocate-p)))))
+      ;; GC can make the best choice about placement if it has a layout.
+      ;; Of course with conservative GC the object will be pinned anyway,
+      ;; but still, always having a layout is a good thing.
+      (when instancep ; store its layout, while still in pseudo-atomic
+        (inst mov :dword (ea 4 result) (make-fixup type :layout)))
+      (inst or :byte result lowtag)))))
 
 ;;; Allocate a non-vector variable-length object.
 ;;; Exactly 4 allocators are rendered via this vop:
@@ -971,20 +973,5 @@
    (pseudo-atomic ()
      (c-call "alloc_immobile_fixedobj")
      (move result rax))))
-
-(define-vop (alloc-dynamic-space-code)
-  (:args (total-words :scs (signed-reg) :target c-arg1))
-  (:temporary (:sc unsigned-reg :from (:argument 0) :to :eval :offset rdi-offset) c-arg1)
-  (:temporary (:sc unsigned-reg :from :eval :to (:result 0) :offset rax-offset) rax)
-  (:results (result :scs (descriptor-reg)))
-  (:node-var node)
-  (:generator 50
-   (inst mov c-arg1 total-words)
-   ;; RSP needn't be restored because the allocators all return immediately
-   ;; which has that effect
-   (inst and rsp-tn -16)
-   (pseudo-atomic () (c-call "alloc_code_object"))
-   ;; RESULT is a tagged ptr. MOV doesn't need to be inside the PSEUDO-ATOMIC.
-   (inst mov result rax)))
 
 ) ; end MACROLET

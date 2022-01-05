@@ -50,7 +50,6 @@
           (setf (functional-kind fun) nil)
           (delete-functional fun)))))
 
-  (setf (component-nlx-info-generated-p component) t)
   (values))
 
 ;;; If FUN has an environment, return it, otherwise assign an empty
@@ -308,7 +307,7 @@
     (setf (nlx-info-target info) new-block)
     (setf (nlx-info-safe-p info) (exit-should-check-tag-p exit))
     (push info (environment-nlx-info env))
-    (push info (cleanup-info cleanup))
+    (push info (cleanup-nlx-info cleanup))
     (when (member (cleanup-kind cleanup) '(:catch :unwind-protect))
       (setf (node-lexenv (block-last new-block))
             (node-lexenv entry))))
@@ -382,26 +381,29 @@
   (declare (type component component))
   (let (*dx-combination-p-check-local*) ;; catch unconverted combinations
     (dolist (lambda (component-lambdas component))
-      ;; If this LAMBDA is marked dynamic extent and also a closure,
-      ;; mark its ENCLOSE as DX by making it use an LVAR if it doesn't
-      ;; have one already.
-      (when (leaf-dynamic-extent lambda)
-        (let ((xep (functional-entry-fun lambda)))
-          (when (and xep (environment-closure (get-lambda-environment xep)))
-            (let ((enclose (lambda-enclose lambda)))
-              (when (and enclose (not (node-lvar enclose)))
-                (let ((lvar (make-lvar)))
-                  (use-lvar enclose lvar)
-                  (let ((cleanup (node-enclosing-cleanup (ctran-next (node-next enclose)))))
-                    (aver (eq (cleanup-mess-up cleanup) enclose))
-                    (setf (lvar-dynamic-extent lvar) cleanup)
-                    (setf (cleanup-info cleanup) (list lvar)))
-                  (push lvar (component-dx-lvars component))))))))
+      ;; If this FUNCTIONAL is marked dynamic extent and also a
+      ;; closure, mark its ENCLOSE as DX by making it use an LVAR if
+      ;; it doesn't have one already.
+      (let ((fun (if (eq (lambda-kind lambda) :optional)
+                     (lambda-optional-dispatch lambda)
+                     lambda)))
+        (when (leaf-dynamic-extent fun)
+          (let ((xep (functional-entry-fun fun)))
+            (when (and xep (environment-closure (get-lambda-environment xep)))
+              (let ((enclose (functional-enclose fun)))
+                (when (and enclose (not (node-lvar enclose)))
+                  (let ((lvar (make-lvar)))
+                    (use-lvar enclose lvar)
+                    (let ((cleanup (node-enclosing-cleanup (ctran-next (node-next enclose)))))
+                      (aver (eq (cleanup-mess-up cleanup) enclose))
+                      (setf (lvar-dynamic-extent lvar) cleanup)
+                      (setf (cleanup-nlx-info cleanup) (list lvar)))
+                    (push lvar (component-dx-lvars component)))))))))
       (dolist (entry (lambda-entries lambda))
         (let ((cleanup (entry-cleanup entry)))
           (when (eq (cleanup-kind cleanup) :dynamic-extent)
             (let ((real-dx-lvars '()))
-              (dolist (what (cleanup-info cleanup))
+              (dolist (what (cleanup-nlx-info cleanup))
                 (declare (type cons what))
                 (let ((dx (car what))
                       (lvar (cdr what)))
@@ -417,7 +419,7 @@
                         (t
                          (note-no-stack-allocation lvar)
                          (setf (lvar-dynamic-extent lvar) nil)))))
-              (setf (cleanup-info cleanup) real-dx-lvars)
+              (setf (cleanup-nlx-info cleanup) real-dx-lvars)
               (setf (component-dx-lvars component)
                     (append real-dx-lvars (component-dx-lvars component)))))))))
   (values))
@@ -454,18 +456,18 @@
             (:special-bind
              (code `(%special-unbind ',(lvar-value (car args)))))
             (:catch
-             (code `(%catch-breakup ,(opaquely-quote (car (cleanup-info cleanup))))))
+             (code `(%catch-breakup ,(opaquely-quote (car (cleanup-nlx-info cleanup))))))
             (:unwind-protect
-             (code `(%unwind-protect-breakup ,(opaquely-quote (car (cleanup-info cleanup)))))
+             (code `(%unwind-protect-breakup ,(opaquely-quote (car (cleanup-nlx-info cleanup)))))
              (let ((fun (ref-leaf (lvar-uses (second args)))))
                 (when (functional-p fun)
                   (reanalyze-funs fun)
                   (code `(%funcall ,fun)))))
             ((:block :tagbody)
-             (dolist (nlx (cleanup-info cleanup))
+             (dolist (nlx (cleanup-nlx-info cleanup))
                (code `(%lexical-exit-breakup ,(opaquely-quote nlx)))))
             (:dynamic-extent
-             (when (cleanup-info cleanup)
+             (when (cleanup-nlx-info cleanup)
                (code `(%cleanup-point))))
             (:restore-nsp
              (code `(%primitive set-nsp ,(ref-leaf node))))))))

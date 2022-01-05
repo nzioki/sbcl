@@ -261,9 +261,9 @@
                   ;; Figure out if we're looking at an allocation buffer
                   (let ((disp (ash (machine-ea-disp ea) (- sb-vm:word-shift))))
                     (awhen (case disp
-                            ((#.sb-vm::thread-boxed-tlab-slot
+                            ((#.sb-vm::thread-mixed-tlab-slot
                               #.sb-vm::thread-unboxed-tlab-slot) :tlab-freeptr)
-                            ((#.(1+ sb-vm::thread-boxed-tlab-slot)
+                            ((#.(1+ sb-vm::thread-mixed-tlab-slot)
                               #.(1+ sb-vm::thread-unboxed-tlab-slot)) :tlab-limit))
                       (setq ea it))))
                 (setf (car tail) ea)) ; change the EA
@@ -381,26 +381,17 @@
 (defun deduce-layout (iterator bindings)
   (unless (assq '?result bindings)
     (push `(?result . ,(cdr (assq '?free bindings))) bindings))
-  (let ((bindings
-         (matchp iterator
-                 ;; instance allocation completes the pseudoatomic part after storing widetag
-                 ;; and length, before storing the layout; so we look for either pending-interrupt
-                 ;; or safepoint trap in between some stores.
-                 (load-time-value
-                  #+sb-safepoint
-                  `((test :byte ,(get-gpr :byte sb-vm::rax-offset)
-                          (ea ,(- sb-vm:static-space-start sb-vm:gc-safepoint-trap-offset) nil))
-                    (mov :dword (ea 1 ?result) ?layout))
-                  #-sb-safepoint
-                  `((xor :qword ,p-a-flag ,(get-gpr :qword thread-reg))
-                    (jmp :eq ?_)
-                    #+linux (icebp) #-linux (break . ignore)
-                    (mov :dword (ea 1 ?result) ?layout))
-                  t)
-                 bindings)))
-    (if (eq bindings :fail)
-        'instance
-        (layout-name (cdr (assq '?layout bindings))))))
+  (when (eql (cdr (assq '?lowtag bindings)) sb-vm:instance-pointer-lowtag)
+    (destructuring-bind (pos vector . dstate) iterator
+      (let ((inst (aref vector (1- pos))))
+        (aver (eq (car inst) 'or))
+        (let* ((iterator (list* (- pos 2) vector dstate))
+               (bindings (matchp iterator
+                                 (load-time-value `((mov :dword (ea 4 ?result) ?layout)) t)
+                                 bindings)))
+          (if (eq bindings :fail)
+              'instance
+              (layout-name (cdr (assq '?layout bindings)))))))))
 
 (defun deduce-fun-subtype (iterator bindings)
   (declare (ignorable iterator bindings))

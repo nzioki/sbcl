@@ -966,10 +966,9 @@
              (let ((lambda-list `(length ,@(eliminate-keywords))))
                `(lambda ,lambda-list
                   (declare (ignorable ,@lambda-list))
-                  (unless (= (length initial-contents) ,(or c-length 'length))
-                    (error "~S has ~D elements, vector length is ~D."
-                           :initial-contents (length initial-contents)
-                           ,(or c-length 'length)))
+                  (let ((content-length (length initial-contents)))
+                   (unless (= content-length ,(or c-length 'length))
+                     (initial-contents-error content-length  ,(or c-length 'length))))
                   ,(wrap `(replace ,data-alloc-form initial-contents)))))))))
 
 ;;; IMPORTANT: The order of these three MAKE-ARRAY forms matters: the least
@@ -1515,8 +1514,8 @@
              ;; the CONSTRAINT-PROPAGATE-IF optimizer have the most
              ;; chances to run.
              (delay-ir1-transform node :ir1-phases))
-           (if (vop-existsp :named test-header-bit)
-               `(test-header-bit array
+           (if (vop-existsp :named test-header-data-bit)
+               `(test-header-data-bit array
                                  (ash sb-vm:+array-fill-pointer-p+ sb-vm:array-flags-data-position))
                `(logtest (get-header-data array)
                          (ash sb-vm:+array-fill-pointer-p+ sb-vm:array-flags-data-position)))))))

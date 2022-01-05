@@ -1102,6 +1102,121 @@
                        :node node)
   (transform-replace nil node)))
 
+(defoptimizer (replace ir2-hook) ((seq1 seq2 &key &allow-other-keys) node block)
+  (declare (ignore block))
+  (flet ((element-type (lvar)
+           (let ((type (lvar-type lvar)))
+             (when (csubtypep type (specifier-type 'array))
+               (multiple-value-bind (upgraded other)
+                   (array-type-upgraded-element-type type)
+                 (or other upgraded))))))
+    (let ((type1 (element-type seq1))
+          (type2 (element-type seq2)))
+      (when (and type1
+                 (neq type1 *wild-type*))
+        (if type2
+            (unless (or (eq type2 *wild-type*)
+                        (types-equal-or-intersect type1 type2))
+              (let ((*compiler-error-context* node))
+                (compiler-warn "Incompatible array element types: ~a and ~a"
+                               (type-specifier type1)
+                               (type-specifier type2))))
+            (when (constant-lvar-p seq2)
+              (map nil (lambda (x)
+                         (unless (ctypep x type1)
+                           (let ((*compiler-error-context* node))
+                             (compiler-warn "The source sequence has an element ~s incompatible with the target array element type ~a."
+                                            x
+                                            (type-specifier type1)))
+                           (return-from replace-ir2-hook-optimizer))
+                         x)
+                   (lvar-value seq2))))))))
+
+(defoptimizer (%make-array ir2-hook) ((dimensions widetag n-bits &key initial-contents &allow-other-keys)
+                                      node block)
+  (declare (ignore dimensions n-bits block))
+  (when (and (constant-lvar-p widetag)
+             initial-contents)
+    (let* ((saetp (find (lvar-value widetag) sb-vm:*specialized-array-element-type-properties*
+                        :key #'sb-vm:saetp-typecode))
+           (element-type (sb-vm:saetp-ctype saetp))
+           (initial-contents-type (lvar-type initial-contents))
+           (initial-contents-element-type
+             (if (csubtypep initial-contents-type (specifier-type 'array))
+                 (multiple-value-bind (upgraded other)
+                     (array-type-upgraded-element-type initial-contents-type)
+                   (or other upgraded))
+                 *wild-type*)))
+      (cond ((not (or (eq initial-contents-element-type *wild-type*)
+                      (types-equal-or-intersect element-type initial-contents-element-type)))
+             (let ((*compiler-error-context* node))
+               (compiler-warn "Incompatible :initial-contents ~s for :element-type ~a."
+                              (type-specifier initial-contents-type)
+                              (sb-vm:saetp-specifier saetp))))
+            ((constant-lvar-p initial-contents)
+             (map nil (lambda (x)
+                        (unless (ctypep x element-type)
+                          (let ((*compiler-error-context* node))
+                            (compiler-warn ":initial-contents has an element ~s incompatible with :element-type ~a."
+                                           x
+                                           (type-specifier element-type)))
+                          (return-from %make-array-ir2-hook-optimizer))
+                        x)
+                  (lvar-value initial-contents)))))))
+
+(defun check-sequence-item (item seq node format-string)
+  (let ((seq-type (lvar-type seq))
+        (item-type (lvar-type item)))
+    (when (and (neq item-type *wild-type*)
+               (csubtypep seq-type (specifier-type 'array)))
+      (let ((element-type (multiple-value-bind (upgraded other)
+                              (array-type-upgraded-element-type seq-type)
+                            (or other upgraded))))
+        (unless (or (eq element-type *wild-type*)
+                    (types-equal-or-intersect item-type element-type))
+          (let ((*compiler-error-context* node))
+            (compiler-warn format-string
+                           (type-specifier item-type)
+                           (type-specifier seq-type))))))))
+
+(defun check-substitute-args (new seq node)
+  (check-sequence-item new seq node "Can't substitute ~a into ~a"))
+
+(defoptimizer (substitute ir2-hook) ((new old seq &key &allow-other-keys) node block)
+  (declare (ignore old block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (substitute-if ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (substitute-if-not ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute ir2-hook) ((new old seq &key &allow-other-keys) node block)
+  (declare (ignore old block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute-if ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute-if-not ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (vector-fill* ir2-hook) ((seq item &key &allow-other-keys) node block)
+  (declare (ignore block))
+  (check-sequence-item item seq node "Can't fill ~a into ~a"))
+
+(defoptimizer (vector-push ir2-hook) ((item vector) node block)
+  (declare (ignore block))
+  (check-sequence-item item vector node "Can't push ~a into ~a"))
+
+(defoptimizer (vector-push-extend ir2-hook) ((item vector &optional min-extension) node block)
+  (declare (ignore block min-extension))
+  (check-sequence-item item vector node "Can't push ~a into ~a"))
 
 ;;; Expand simple cases of UB<SIZE>-BASH-COPY inline.  "simple" is
 ;;; defined as those cases where we are doing word-aligned copies from
@@ -1120,32 +1235,32 @@
   (binding* ((n-elems-per-word (truncate sb-vm:n-word-bits n-bits-per-elem))
              ((src-word src-elt) (truncate (lvar-value src-offset) n-elems-per-word))
              ((dst-word dst-elt) (truncate (lvar-value dst-offset) n-elems-per-word)))
-        ;; Avoid non-word aligned copies.
-        (unless (and (zerop src-elt) (zerop dst-elt))
-          (give-up-ir1-transform))
-        ;; Avoid copies where we would have to insert code for
-        ;; determining the direction of copying.
-        (unless (= src-word dst-word)
-          (give-up-ir1-transform))
-        `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word)))
-               (extra (mod length ,n-elems-per-word)))
-           (declare (type index end))
-           ;; Handle any bits at the end.
-           (unless (zerop extra)
-             ;; MASK selects just the bits that we want from the ending word of
-             ;; the source array. The number of bits to shift out is
-             ;;   (- n-word-bits (* extra n-bits-per-elem))
-             ;; which is equal mod n-word-bits to the expression below.
-             (let ((mask (shift-towards-start
-                          most-positive-word (* extra ,(- n-bits-per-elem)))))
-               (%set-vector-raw-bits
-                dst end (logior (logand (%vector-raw-bits src end) mask)
-                                (logandc2 (%vector-raw-bits dst end) mask)))))
-           ;; Copy from the end to save a register.
-           (do ((i (1- end) (1- i)))
-               ((< i ,src-word))
-             (%set-vector-raw-bits dst i (%vector-raw-bits src i)))
-           (values))))
+    ;; Avoid non-word aligned copies.
+    (unless (and (zerop src-elt) (zerop dst-elt))
+      (give-up-ir1-transform))
+    ;; Avoid copies where we would have to insert code for
+    ;; determining the direction of copying.
+    (unless (= src-word dst-word)
+      (give-up-ir1-transform))
+    `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word)))
+           (extra (mod length ,n-elems-per-word)))
+       (declare (type index end))
+       ;; Handle any bits at the end.
+       (unless (zerop extra)
+         ;; MASK selects just the bits that we want from the ending word of
+         ;; the source array. The number of bits to shift out is
+         ;;   (- n-word-bits (* extra n-bits-per-elem))
+         ;; which is equal mod n-word-bits to the expression below.
+         (let ((mask (shift-towards-start
+                      most-positive-word (* extra ,(- n-bits-per-elem)))))
+           (%set-vector-raw-bits
+            dst end (logior (logand (%vector-raw-bits src end) mask)
+                            (logandc2 (%vector-raw-bits dst end) mask)))))
+       ;; Copy from the end to save a register.
+       (do ((i (1- end) (1- i)))
+           ((< i ,src-word))
+         (%set-vector-raw-bits dst i (%vector-raw-bits src i)))
+       (values))))
 
 ;;; Detect misuse with sb-devel. "Misuse" means mismatched array element types
 #-sb-devel

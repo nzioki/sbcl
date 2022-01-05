@@ -96,27 +96,27 @@
   ;; VECTOR -- see SHRINK-VECTOR.
   (fill-pointer :type index
                 :ref-trans %array-fill-pointer
-                :ref-known (flushable foldable)
+                :ref-known (flushable)
                 :set-trans (setf %array-fill-pointer)
                 :set-known ())
   (elements :type index
             :ref-trans %array-available-elements
-            :ref-known (flushable foldable)
+            :ref-known (flushable)
             :set-trans (setf %array-available-elements)
             :set-known ())
   (data :type array
         :ref-trans %array-data ; might be a vector, might not be
-        :ref-known (flushable foldable)
+        :ref-known (flushable)
         :set-trans (setf %array-data)
         :set-known ())
   (displacement :type index
                 :ref-trans %array-displacement
-                :ref-known (flushable foldable)
+                :ref-known (flushable)
                 :set-trans (setf %array-displacement)
                 :set-known ())
   (displaced-p :type t
                :ref-trans %array-displaced-p
-               :ref-known (flushable foldable)
+               :ref-known (flushable)
                :set-trans (setf %array-displaced-p)
                :set-known ())
   (displaced-from :type list
@@ -387,7 +387,17 @@ during backtrace.
         :cas-trans sb-impl::cas-symbol-%info
         :type (or instance list)
         :init :null)
-  (name :ref-trans symbol-name :init :arg)
+  (name :init :arg #-compact-symbol :ref-trans #-compact-symbol symbol-name)
+  ;; This slot holds an FDEFN. It's almost unnecessary to have FDEFNs at all
+  ;; for symbols. If we ensured that any function bound to a symbol had a
+  ;; call convention rendering it callable in the manner of a SIMPLE-FUN,
+  ;; then we would only need to store that function's raw entry address here,
+  ;; thereby removing the FDEFN for any global symbol. Any closure assigned
+  ;; to a symbol would need a tiny trampoline, which is already the case
+  ;; for #+immobile-code.
+  (fdefn :ref-trans %symbol-fdefn :ref-known ()
+         :cas-trans cas-symbol-fdefn)
+  #-compact-symbol
   (package :ref-trans sb-xc:symbol-package
            :set-trans %set-symbol-package
            :init :null)
@@ -517,7 +527,7 @@ during backtrace.
   ;; Deterministic consing profile recording area.
   (profile-data :c-type "uword_t *" :pointer t)
   ;; Thread-local allocation buffers
-  #+gencgc (boxed-tlab :c-type "struct alloc_region" :length 4)
+  #+gencgc (mixed-tlab :c-type "struct alloc_region" :length 4)
   #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
   ;; END of slots to keep near the beginning.
 
@@ -627,3 +637,77 @@ during backtrace.
           (ldb code-serialno-byte (sap-ref-word (code-instructions code) 0)))))
 
 ) ; end PROGN
+
+;;; The definitions below want to use ALIGN-UP, which is not defined
+;;; in time to put these in early-objdef, but it turns out that we don't
+;;; need them there.
+(defconstant nil-value
+    (+ static-space-start
+       ;; mixed_region precedes NIL
+       ;; 8 is the number of words to reserve at the beginning of static space
+       ;; prior to the words of NIL.
+       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
+       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
+       #+64-bit #x100
+       ;; magic padding because of NIL's symbol/cons-like duality
+       (* 2 n-word-bytes)
+       list-pointer-lowtag))
+
+;;; MIXED-REGION is address in static space at which a 'struct alloc_region'
+;;; is overlaid on a lisp vector with element type WORD.
+#-sb-thread
+(defconstant mixed-region
+  (+ static-space-start
+     (* 2 n-word-bytes))) ; skip the array header
+
+;;; Start of static objects:
+;;;
+;;;   32-bit w/threads     |   32-bit no threads     |      64-bit
+;;;  --------------------  | --------------------    | ---------------------
+;;;       padding          |      padding            |      padding
+;;;  NIL: header (#x07__)  | NIL: header (#x06__)    | NIL: header (#x05__)
+;;;       hash             |      hash               |      hash
+;;;       value            |      value              |      value
+;;;       info             |      info               |      info
+;;;       name             |      name               |      name
+;;;       fdefn            |      fdefn              |      fdefn
+;;;       package          |      package            |      (unused)
+;;;       tls_index        |   T: header             |   T: header
+;;;       (unused)         |                         |
+;;;    T: header           |                         |
+;;;  -------------------   | --------------------    | ---------------------
+;;;    SYMBOL_SIZE=8       |   SYMBOL_SIZE=7         |   SYMBOL_SIZE=6
+;;;    NIL is 10 words     |   NIL is 8 words        |   NIL is 8 words
+
+;;; This constant is the address at which to scan NIL as a root.
+;;; To ensure that scav_symbol is invoked, we have to see the widetag
+;;; in the 0th word, which is at 1 word prior to the word containing the CAR of
+;;; nil-as-a-list. So subtract the lowtag and then go back one more word.
+;;; This address is NOT double-lispword-aligned, but the scavenge method
+;;; does not assert that.
+(defconstant nil-symbol-slots-start
+  (- nil-value list-pointer-lowtag n-word-bytes))
+
+;;; NIL as a symbol contains the usual number of words for a symbol,
+;;; aligned to a double-lispword. This will NOT end at a double-lispword boundary.
+;;; In all 3 scenarios depicted above, the number of slots that the 'scav' function
+;;; returns suggests that it would examine the header word of the *next* symbol.
+;;; But it does not, because it confines itself to looking only at the number of
+;;; words indicated in the symbol header of NIL. But we have to pass in the aligned
+;;; count because of the assertion in heap_scavenge that the scan ends as expected,
+;;; and scavenge methods must return an even number because nothing can be smaller
+;;; than 1 cons cell or not a multiple thereof.
+(defconstant nil-symbol-slots-end
+  (+ nil-symbol-slots-start (ash (align-up symbol-size 2) word-shift)))
+
+;;; This constant is the number of words to report that NIL consumes
+;;; when Lisp asks for its primitive-object-size. So we say that it consumes
+;;; all words from the start of static-space objects up to the next object.
+(defconstant sizeof-nil-in-words (+ 2 (sb-int:align-up (1- sb-vm:symbol-size) 2)))
+
+;;; Address at which to start scanning static symbols when heap-walking.
+;;; Basically skip over MIXED-REGION (if it's in static space) and NIL.
+;;; Or: go to NIL's header word, subtract 1 word, and add in the physical
+;;; size of NIL in bytes that we report for primitive-object-size.
+(defconstant static-space-objects-start
+  (+ nil-symbol-slots-start (ash (1- sizeof-nil-in-words) word-shift)))

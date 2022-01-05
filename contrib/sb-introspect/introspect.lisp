@@ -354,6 +354,7 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c:fun-info-ltn-annotate . sb-c:ltn-annotate)
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
+                            (sb-c::fun-info-ir2-hook . sb-c::ir2-hook)
                             (sb-c::fun-info-stack-allocate-result
                              . sb-c::stack-allocate-result)
                             (sb-c::fun-info-constraint-propagate
@@ -615,7 +616,18 @@ or a method combination name."
                 ;; entry.
                 (setf (definition-source-form-number source-location)
                       xref-form-number)
-                (push (cons name source-location) result))))
+                (let ((name (cond ((sb-c::transform-p name)
+                                   (append (%fun-name fun)
+                                           (let* ((type (sb-c::transform-type name))
+                                                  (type-spec (type-specifier type)))
+                                             (and (sb-kernel:fun-type-p type)
+                                                  (list (second type-spec))))))
+                                  ((sb-c::vop-info-p name)
+                                   (list 'sb-c:define-vop
+                                         (sb-c::vop-info-name name)))
+                                  (t
+                                   name))))
+                  (push (cons name source-location) result)))))
           xrefs))))
     result))
 

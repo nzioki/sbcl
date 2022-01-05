@@ -75,21 +75,21 @@
          #+(and sb-thread win32) (scratch-tn (pop scratch-tns))
          #+(and sb-thread win32) (swap-tn (pop scratch-tns))
          (free-pointer
-           ;; thread->boxed_tlab.free_pointer
+           ;; thread->mixed_tlab.free_pointer
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes thread-boxed-tlab-slot)
-                    #-sb-thread boxed-region))
+                    #+sb-thread (* n-word-bytes thread-mixed-tlab-slot)
+                    #-sb-thread mixed-region))
          (end-addr
-            ;; thread->boxed_tlab.end_addr
+            ;; thread->mixed_tlab.end_addr
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes (1+ thread-boxed-tlab-slot))
-                    #-sb-thread (+ boxed-region n-word-bytes))))
+                    #+sb-thread (* n-word-bytes (1+ thread-mixed-tlab-slot))
+                    #-sb-thread (+ mixed-region n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -240,7 +240,10 @@
    (flet ((store-widetag (value ptr slot lowtag)
              (inst mov (object-slot-ea
                         ptr slot lowtag
-                        (if (typep value '(and integer (not (unsigned-byte 8)))) :word :byte))
+                        (typecase value
+                          ((unsigned-byte 8) :byte)
+                          ((unsigned-byte 16) :word)
+                          (t :dword)))
                    value)))
     (let ((size (sc-case words
                   (immediate
@@ -259,7 +262,6 @@
        (allocation nil size other-pointer-lowtag node nil result)
        (sc-case type
          (immediate
-          (aver (typep (tn-value type) '(unsigned-byte 9)))
           (store-widetag (tn-value type) result 0 other-pointer-lowtag))
          (t
           (storew type result 0 other-pointer-lowtag)))
@@ -370,41 +372,16 @@
     (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
-  (:args)
   (:info name words type lowtag stack-allocate-p)
   (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
-    ;; We special case the allocation of conses, because they're
-    ;; extremely common and because the pseudo-atomic sequence on x86
-    ;; is relatively heavyweight.  However, if the user asks for top
-    ;; speed, we accomodate him.  The primary reason that we don't
-    ;; also check for (< SPEED SPACE) is because we want the space
-    ;; savings that these out-of-line allocation routines bring whilst
-    ;; compiling SBCL itself.  --njf, 2006-07-08
-    (if (and (not stack-allocate-p)
-             (= lowtag list-pointer-lowtag) (policy node (< speed 3)))
-        (let ((dst
-               ;; FIXME: out-of-line dx-allocation
-               #.(loop for offset in *dword-regs*
-                    collect `(,offset
-                              ',(intern (format nil "ALLOCATE-CONS-TO-~A"
-                                                (svref +dword-register-names+
-                                                       offset)))) into cases
-                    finally (return `(case (tn-offset result)
-                                       ,@cases)))))
-          (aver (null type))
-          (inst call (make-fixup dst :assembly-routine)))
-        (pseudo-atomic (:elide-if stack-allocate-p)
-         (let ((nbytes (* (pad-data-block words)
-                          #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
-           (allocation nil nbytes lowtag node stack-allocate-p result))
-         (when type
-           (storew (compute-object-header words type)
-                   result
-                   0
-                   lowtag))))))
+    (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((nbytes (* (pad-data-block words)
+                       #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
+        (allocation nil nbytes lowtag node stack-allocate-p result))
+      (storew (compute-object-header words type) result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))

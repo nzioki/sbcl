@@ -22,17 +22,35 @@
 
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h"
+/* TODO: The following objects should be allocated to BOXED pages instead of MIXED pages:
+ * - CONS, VALUE-CELL, (COMPLEX INTEGER), RATIO, ARRAY headers
+ * - simple-vector that is neither weak nor hashing
+ * - wholly-boxed instances
+ * These pointer-containing objects MUST NOT be allocated to BOXED pages:
+ * - weak-pointer (requires deferred scavenge)
+ * - hash-table vector and weak vector (complicated)
+ * - closure and funcallable-instance (contains untagged pointer)
+ * - symbol (contains encoded pointer)
+ * - fdefn (contains untagged pointer)
+ *
+ * Each BOXED page can be linearly scanned without calling type-specific methods
+ * when processing the root set
+ */
 static inline void *
-gc_general_alloc(sword_t nbytes, int page_type_flag)
+gc_general_alloc(sword_t nbytes, int page_type)
 {
     void *gc_alloc_with_region(struct alloc_region*,sword_t,int);
-    if (1 <= page_type_flag && page_type_flag <= 3)
-        return gc_alloc_with_region(&gc_alloc_region[page_type_flag-1],
-                                    nbytes, page_type_flag);
-    lose("bad page type flag: %d", page_type_flag);
+    struct alloc_region* r = 0;
+    switch (page_type) {
+    case PAGE_TYPE_MIXED: r = &mixed_region; break;
+    case PAGE_TYPE_CODE: r = &code_region; break;
+    case PAGE_TYPE_UNBOXED: r = &unboxed_region; break;
+    }
+    if (r) return gc_alloc_with_region(r, nbytes, page_type);
+    lose("bad page type: %d", page_type);
 }
 #else
-extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
+extern void *gc_general_alloc(sword_t nbytes,int page_type);
 #endif
 
 #define CHECK_COPY_PRECONDITIONS(object, nwords) \
@@ -46,15 +64,17 @@ extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
 
 #define note_transported_object(old, new) /* do nothing */
 
+extern uword_t gc_copied_nwords;
 static inline lispobj
-gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
+gc_general_copy_object(lispobj object, size_t nwords, int page_type)
 {
     CHECK_COPY_PRECONDITIONS(object, nwords);
 
     /* Allocate space. */
-    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type);
 
     /* Copy the object. */
+    gc_copied_nwords += nwords;
     memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
 
     note_transported_object(object, new);
@@ -65,11 +85,12 @@ gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
 // Like above but copy potentially fewer words than are allocated.
 // ('old_nwords' can be, but does not have to be, smaller than 'nwords')
 static inline lispobj
-gc_copy_object_resizing(lispobj object, long nwords, int page_type_flag,
+gc_copy_object_resizing(lispobj object, long nwords, int page_type,
                         int old_nwords)
 {
     CHECK_COPY_PRECONDITIONS(object, nwords);
-    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type);
+    gc_copied_nwords += old_nwords;
     memcpy(new, native_pointer(object), old_nwords*N_WORD_BYTES);
     note_transported_object(object, new);
     return make_lispobj(new, lowtag_of(object));
@@ -103,7 +124,7 @@ extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
 
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
 lispobj  copy_object(lispobj object, sword_t nwords);
-lispobj  copy_large_object(lispobj object, sword_t nwords, int page_type_flag);
+lispobj  copy_possibly_large_object(lispobj object, sword_t nwords, int page_type);
 
 lispobj *search_read_only_space(void *pointer);
 lispobj *search_static_space(void *pointer);
@@ -243,7 +264,7 @@ static inline struct bitmap get_layout_bitmap(struct layout* layout)
     const int layout_id_vector_fixed_capacity = 7;
 #ifdef LISP_FEATURE_64_BIT
     sword_t depthoid = layout->flags;
-    // Depthoid is stored in the upper 4 bytes of the header, as a fixnum.
+    // Depthoid is stored in the upper 4 bytes of 'flags', as a fixnum.
     depthoid >>= (32 + N_FIXNUM_TAG_BITS);
     int extra_id_words =
       (depthoid > layout_id_vector_fixed_capacity) ?
@@ -295,7 +316,7 @@ static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
  * It has to do with the way the sanitizer intercepts calls
  * to sigaction() - it mucks with your sa_mask :-(.
  *
- * This macro take an aribtrary expression as the 'operation' rather than
+ * This macro take an arbitrary expression as the 'operation' rather than
  * an address and value to assign, for two reasons:
  * 1. there may be more than one store operation that has to be
  *    within the scope of the lifted write barrier,

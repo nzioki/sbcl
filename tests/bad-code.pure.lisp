@@ -621,4 +621,75 @@
   (assert (nth-value 2
                      (checked-compile
                       `(lambda (x) (find-if 'and x))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x) (funcall 'if x))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x) (mapcar 'and x))
                       :allow-warnings 'warning))))
+
+(with-test (:name :replace-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x y)
+                         (declare (bit-vector x)
+                                  (string y))
+                         (replace x y :start1 10))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :substitute-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (substitute 10 #\a x))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :make-array-initial-contents-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n c)
+                         (make-array n :element-type 'bit :initial-contents (the string c)))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :make-array-initial-contents-constant-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n)
+                         (make-array n :element-type 'bit :initial-contents '(a b c)))
+                      :allow-warnings 'warning))))
+
+
+(with-test (:name :replace-constant-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (replace x '(1 2 3)))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :fill-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (fill x 1))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :vector-push-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (vector-push 1 x))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (vector-push-extend 1 x))
+                      :allow-warnings 'warning))))
+

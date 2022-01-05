@@ -254,13 +254,18 @@ void unwind_binding_stack()
     write_TLS(CURRENT_UNWIND_PROTECT_BLOCK, 0, th);
     unsigned int hint = 0;
     char symbol_name[] = "*SAVE-LISP-CLOBBERED-GLOBALS*";
-    lispobj* sym = find_symbol(symbol_name, sb_kernel_package(), &hint);
+    lispobj* sym = find_symbol(symbol_name,
+                               VECTOR(lisp_package_vector)->data[PACKAGE_ID_KERNEL],
+                               &hint);
     lispobj value;
     int i;
     if (!sym || !simple_vector_p(value = ((struct symbol*)sym)->value))
         fprintf(stderr, "warning: bad value in %s\n", symbol_name);
     else for(i=vector_len(VECTOR(value))-1; i>=0; --i)
         SYMBOL(VECTOR(value)->data[i])->value = UNBOUND_MARKER_WIDETAG;
+    // these lisp pointers in C variables are like weak-pointers
+    lisp_package_vector = 0;
+    alloc_profile_data = 0;
     if (verbose) printf("done]\n");
 }
 

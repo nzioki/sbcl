@@ -230,39 +230,20 @@
 (define-assembly-routine (call-symbol
                           (:return-style :none))
     ((:temp fun (any-reg descriptor-reg) rax-offset) ; FUN = the symbol
-     (:temp length (any-reg descriptor-reg) rax-offset)
-     (:temp info (any-reg descriptor-reg) rbx-offset)) ; for the packed symbol-info
-  (%lea-for-lowtag-test info fun other-pointer-lowtag)
-  (inst test :byte info lowtag-mask)
+     (:temp fdefn (any-reg descriptor-reg) rbx-offset))
+  (%lea-for-lowtag-test fdefn fun other-pointer-lowtag)
+  (inst test :byte fdefn lowtag-mask)
   (inst jmp :nz not-callable)
   (inst cmp :byte (ea (- other-pointer-lowtag) fun) symbol-widetag)
   (inst jmp :ne not-callable)
-  (load-symbol-dbinfo info fun)
-  ;; reimplement by hand PACKED-INFO-FDEFN, q.v.
 
-  ;; This only has to compare the low byte of INFO,
-  ;; because INSTANCE-POINTER-LOWTAG won't match NIL in the low 8 bits.
-  (inst cmp :byte info (logand nil-value #xff))
-  (inst jmp :e undefined)
-
-  ;; XXX - WHAT IS R10? ARBITRARY? COMMENT NEEDED
-  (inst mov :dword r10-tn (ea (- (ash (+ instance-slots-offset instance-data-start) word-shift)
-                                 instance-pointer-lowtag) info))
-  (inst and :dword r10-tn (fixnumize (1- (ash 1 (* info-number-bits 2)))))
-  (inst cmp :dword r10-tn (fixnumize (1+ (ash +fdefn-info-num+ info-number-bits))))
-  (inst jmp :b undefined)
-
-  ;; Read the logical instance length, i.e. excluding a stable hash slot if present,
-  ;; but including a LAYOUT slot if #-compact-instance-header.
-  ;; There's a optimization possibility here to eliminate one SHR, which would use
-  ;; a 4-byte unaligned load at byte index 1 of the header, which would put the length
-  ;; in byte index 0 of the register, but over by 2 bits; mask that, adjust the EA SCALE
-  ;; to get the indexing right. That's too abstraction-violating for my taste.
-  (load-instance-length length info nil)
-  ;; After this MOV, the FUN register will hold the FDEFN.
-  (inst mov fun (ea (- instance-pointer-lowtag) info length n-word-bytes))
-
-  (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fun))
+  (loadw fdefn fun symbol-fdefn-slot other-pointer-lowtag)
+  (inst test :dword fdefn fdefn)
+  (inst jmp :z UNDEFINED)
+  ;; I think we need this MOV because the undefined-function trap examines RAX
+  ;; to see what FDEFN you tried to call through.
+  (inst mov fun fdefn)
+  (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fdefn))
   UNDEFINED
   (inst jmp (make-fixup 'undefined-tramp :assembly-routine))
   NOT-CALLABLE
@@ -453,3 +434,39 @@
       ;; store newval into object
       (inst mov (ea (- other-pointer-lowtag) rdi rdx n-word-bytes) rax))))
   (inst ret 24)) ; remove 3 stack args
+
+;;; These are trampolines, but they benefit from not being in the 'tramps' file
+;;; because they'll automatically get a vop and an assembly routine this way,
+;;; where tramps only get the assembly routine.
+(define-assembly-routine (update-object-layout
+                          (:policy :fast-safe)
+                          (:translate update-object-layout)
+                          (:return-style :raw))
+    ((:arg x (descriptor-reg) rdx-offset)
+     (:res r (descriptor-reg) rdx-offset))
+  (progn x r)
+  (with-registers-preserved (lisp :except rdx-tn)
+    (call-static-fun 'update-object-layout 1)))
+
+(define-assembly-routine (sb-impl::install-hash-table-lock
+                          (:policy :fast-safe)
+                          (:translate sb-impl::install-hash-table-lock)
+                          (:return-style :raw))
+    ((:arg x (descriptor-reg) rdx-offset)
+     (:res r (descriptor-reg) rdx-offset))
+  (progn x r)
+  (with-registers-preserved (lisp :except rdx-tn)
+    (call-static-fun 'sb-impl::install-hash-table-lock 1)))
+
+;;; From a perspective of reducing code bloat, this asm routine does not merit
+;;; being one at all. A vop would suffice, because it's a single-use vop.
+;;; However the WITH-REGISTERS-PRESERVED macro seems to think that it is utilized
+;;; only by asm code in *ASSEMBLER-ROUTINES*. I had trouble with it otherwise.
+(define-assembly-routine (alloc-code (:return-style :raw))
+    ((:arg arg (signed-reg) rdx-offset)
+     (:res res (descriptor-reg) rdx-offset))
+  (with-registers-preserved (c :except rdx-tn)
+    (inst mov rdi-tn arg)
+    (pseudo-atomic ()
+      (inst call (make-fixup "alloc_code_object" :foreign)))
+    (move res rax-tn)))

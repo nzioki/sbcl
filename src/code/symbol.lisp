@@ -144,10 +144,15 @@ distinct from the global value. Can also be SETF."
 ;;; the stub automatically somehow.
 ;;; Furthermore it's annoying that you can't name the CAS function (CAS fn).
 #-compare-and-swap-vops
+(progn
 (defun cas-symbol-%info (symbol old new)
   (%primitive sb-vm::set-slot symbol new
               '(setf symbol-%info) sb-vm:symbol-info-slot sb-vm:other-pointer-lowtag)
   old)
+(defun sb-vm::cas-symbol-fdefn (symbol old new)
+  (%primitive sb-vm::set-slot symbol new
+              '(setf symbol-fdefn) sb-vm:symbol-fdefn-slot sb-vm:other-pointer-lowtag)
+  old))
 
 ;;; Accessors for the dual-purpose info/plist slot
 
@@ -284,14 +289,52 @@ distinct from the global value. Can also be SETF."
   "Return SYMBOL's name as a string."
   (symbol-name symbol))
 
+;; FIXME: I think it would almost certainly be _less_ confusing
+;; if this were strictly a C variable, and not in both Lisp and C.
+;; C can't do without it for backtraces, and we could always use an alien var
+;; from lisp, whereas the other way (only a Lisp symbol) has a chicken-and-egg
+;; problem: C can't find a Lisp symbol unless it can find the package.
+(define-load-time-global *id->package* #())
+(declaim (simple-vector *id->package*))
+
 (defun sb-xc:symbol-package (symbol)
-  "Return the package SYMBOL was interned in, or NIL if none."
+  "Return SYMBOL's home package, or NIL if none."
+  #+compact-symbol
+  (let ((id (symbol-package-id symbol)))
+    (truly-the (or null package)
+               (if (= id +package-id-overflow+)
+                   (values (info :symbol :package symbol))
+                   (aref *id->package* id))))
+  #-compact-symbol
   (sb-xc:symbol-package symbol))
 
 (defun %set-symbol-package (symbol package)
   (declare (type symbol symbol))
+  #+compact-symbol
+  (let* ((new-id (cond ((not package) +package-id-none+)
+                       ((package-id package))
+                       (t +package-id-overflow+)))
+         (old-id (symbol-package-id symbol))
+         (name (symbol-name symbol)))
+    (with-pinned-objects (name)
+      (let ((name-bits (logior (ash new-id (- sb-vm:n-word-bits package-id-bits))
+                               (get-lisp-obj-address name))))
+        (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
+          (setf (info :symbol :package symbol) package))
+        (with-pinned-objects (symbol)
+          (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
+                              (- (ash sb-vm:symbol-name-slot sb-vm:word-shift)
+                                 sb-vm:other-pointer-lowtag))
+                name-bits))))
+    ;; CLEAR-INFO is inefficient, so try not to call it.
+    (when (and (= old-id +package-id-overflow+) (/= new-id +package-id-overflow+))
+      (clear-info :symbol :package symbol))
+    package)
+  #-compact-symbol ; vop translates
   (%set-symbol-package symbol package))
 
+;;; MAKE-SYMBOL is the external API, %MAKE-SYMBOL is the internal function receiving
+;;; a known simple-string, and %%MAKE-SYMBOL is the primitive constructor.
 (defun make-symbol (string)
   "Make and return a new symbol with the STRING as its print name."
   (declare (type string string))
@@ -318,19 +361,23 @@ distinct from the global value. Can also be SETF."
 ;;; It's kinda useless to do that, though not technically forbidden.
 ;;; (It can produce a not-necessarily-self-evaluating keyword)
 
-#+immobile-space
 (defun %make-symbol (kind name)
   (declare (ignorable kind) (type simple-string name))
   (logior-array-flags name sb-vm:+vector-shareable+) ; Set "logically read-only" bit
-  (if #-immobile-symbols
-      (or (eql kind 1) ; keyword
-          (and (eql kind 2) ; random interned symbol
-               (plusp (length name))
-               (char= (char name 0) #\*)
-               (char= (char name (1- (length name))) #\*)))
-      #+immobile-symbols t ; always place them there
-      (truly-the (values symbol) (sb-vm::make-immobile-symbol name))
-      (sb-vm::%%make-symbol name)))
+  (let ((symbol
+         (truly-the symbol
+          #+immobile-symbols (sb-vm::make-immobile-symbol name)
+          #-immobile-space (sb-vm::%%make-symbol name)
+          #+(and immobile-space (not immobile-symbols))
+          (if (or (eql kind 1) ; keyword
+                  (and (eql kind 2) ; random interned symbol
+                       (plusp (length name))
+                       (char= (char name 0) #\*)
+                       (char= (char name (1- (length name))) #\*)))
+              (sb-vm::make-immobile-symbol name)
+              (sb-vm::%%make-symbol name)))))
+    #+compact-symbol (%set-symbol-package symbol nil)
+    symbol))
 
 (defun get (symbol indicator &optional (default nil))
   "Look on the property list of SYMBOL for the specified INDICATOR. If this
@@ -439,6 +486,8 @@ distinct from the global value. Can also be SETF."
 
 (defun keywordp (object)
   "Return true if Object is a symbol in the \"KEYWORD\" package."
+  #+compact-symbol (keywordp object) ; transformed
+  #-compact-symbol
   (and (symbolp object)
        (eq (sb-xc:symbol-package object) *keyword-package*)))
 

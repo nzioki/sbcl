@@ -221,15 +221,7 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
                                            (write-to-string c :escape nil)))
                           (cerror "Finish warm compile ignoring the problem" c)))))
         (with-compilation-unit ()
-          (do-srcs group)
-          ;; I do not know why #+sb-show gets several "undefined-type CLASS" warnings
-          ;; that #-sb-show doesn't. And CLASS is a reserved name not defined as yet,
-          ;; so we have to pretend that didn't happen, otherwise the warning about
-          ;; not being able to define CLASS as a type name breaks the build.
-          #+sb-show
-          (setq sb-c::*undefined-warnings*
-                (delete 'class sb-c::*undefined-warnings*
-                        :key #'sb-c::undefined-warning-name))))))))
+          (do-srcs group)))))))
 
 (sb-c::dump/restore-interesting-types 'write)
 (when (hash-table-p sb-c::*static-vop-usage-counts*)
@@ -241,3 +233,12 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
         (push (cons (gethash name sb-c::*static-vop-usage-counts* 0) name) list))
       (dolist (cell (sort list #'> :key #'car))
         (format output "~7d ~s~%" (car cell) (cdr cell))))))
+
+(when (sb-sys:find-dynamic-foreign-symbol-address "tot_gc_nsec")
+  (let* ((run-sec (/ (get-internal-real-time) internal-time-units-per-second))
+         (gc-nsec (extern-alien "tot_gc_nsec" unsigned))
+         (gc-msec (/ (float gc-nsec) 1000000)))
+    (format t "~&Done with warm.lisp. INTERNAL-REAL-TIME=~Fs~@[, GC=~Fms (~,1,2f%)~]~%"
+            run-sec
+            (if (plusp gc-msec) gc-msec) ; timing wasn't enabled if this is 0
+            (/ gc-msec (* 1000 run-sec)))))

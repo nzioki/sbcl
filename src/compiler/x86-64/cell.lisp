@@ -397,17 +397,6 @@
     GOOD
     (inst and res (lognot fixnum-tag-mask)))) ; redundant (but ok) if asm routine used
 
-(define-vop ()
-  (:policy :fast-safe)
-  (:translate sb-impl::install-hash-table-lock)
-  (:args (arg :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:vop-var vop)
-  (:generator 5
-    (inst push arg)
-    (invoke-asm-routine 'call 'sb-impl::install-hash-table-lock vop)
-    (inst pop res)))
-
 (eval-when (:compile-toplevel)
   ;; assumption: any object can be read 1 word past its base pointer
   (assert (= sb-vm:symbol-hash-slot 1)))
@@ -442,6 +431,24 @@
     (inst and base-ptr (lognot lowtag-mask))
     (inst mov res (ea n-word-bytes base-ptr)) ; 1 word beyond the header
     (inst and res (lognot fixnum-tag-mask))))
+
+(define-vop ()
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:translate sb-impl::symbol-package-id)
+  (:policy :fast-safe)
+  (:generator 2 ; ASSUMPTION: symbol-package-bits = 16
+   (inst mov :word result (object-slot-ea symbol symbol-name-slot (- other-pointer-lowtag 6)))
+   (inst movzx '(:word :dword) result result)))
+(define-vop ()
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (result :scs (descriptor-reg) :from :load))
+  (:translate symbol-name)
+  (:policy :fast-safe)
+  (:generator 2
+   (inst mov result (1- (ash 1 sb-impl::symbol-name-bits)))
+   (inst and result (object-slot-ea symbol symbol-name-slot other-pointer-lowtag))))
 
 ;;;; fdefinition (FDEFN) objects
 

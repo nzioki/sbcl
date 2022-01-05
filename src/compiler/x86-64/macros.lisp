@@ -107,7 +107,7 @@
 ;;; assert that alloc-region->free_pointer and ->end_addr can be accessed
 ;;; using a single byte displacement from thread-tn
 (eval-when (:compile-toplevel)
-  (aver (<= (1+ thread-boxed-tlab-slot) 15))
+  (aver (<= (1+ thread-mixed-tlab-slot) 15))
   (aver (<= (1+ thread-unboxed-tlab-slot) 15)))
 
 ;;; Access a thread slot at a fixed index. If GPR-TN is provided,
@@ -233,8 +233,8 @@
          (inst jmp :z ,label)
          ;; if PAI was set, interrupts were disabled at the same time
          ;; using the process signal mask.
-         #+linux (inst icebp)
-         #-linux (inst break pending-interrupt-trap)
+         #+int1-breakpoints (inst icebp)
+         #-int1-breakpoints (inst break pending-interrupt-trap)
          (emit-label ,label))))))
 
 ;;;; indexed references

@@ -264,7 +264,8 @@ void* read_current_thread() {
 extern pthread_key_t foreign_thread_ever_lispified;
 #endif
 
-#if defined LISP_FEATURE_LINUX && defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_64_BIT
+#if !defined COLLECT_GC_STATS && \
+  defined LISP_FEATURE_LINUX && defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_64_BIT
 #define COLLECT_GC_STATS
 #endif
 #ifdef COLLECT_GC_STATS
@@ -308,7 +309,7 @@ void create_main_lisp_thread(lispobj function) {
     pthread_key_create(&foreign_thread_ever_lispified, 0);
 #endif
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-    lispobj *args = NULL;
+    __attribute__((unused)) lispobj *args = NULL;
 #endif
     ASSOCIATE_OS_THREAD(th);
     ASSIGN_CURRENT_THREAD(th);
@@ -424,8 +425,8 @@ unregister_thread(struct thread *th,
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 
     block_blockable_signals(0);
-    ensure_region_closed(&th->boxed_tlab, BOXED_PAGE_FLAG);
-    ensure_region_closed(&th->unboxed_tlab, UNBOXED_PAGE_FLAG);
+    ensure_region_closed(&th->mixed_tlab, PAGE_TYPE_MIXED);
+    ensure_region_closed(&th->unboxed_tlab, PAGE_TYPE_UNBOXED);
     pop_gcing_safety(&scribble->safety);
     lock_ret = thread_mutex_lock(&all_threads_lock);
     gc_assert(lock_ret == 0);
@@ -451,8 +452,8 @@ unregister_thread(struct thread *th,
     /* FIXME: this nests the free_pages_lock inside the all_threads_lock.
      * There's no reason for that, so closing of regions should be done
      * sooner to eliminate an ordering constraint. */
-    ensure_region_closed(&th->boxed_tlab, BOXED_PAGE_FLAG);
-    ensure_region_closed(&th->unboxed_tlab, UNBOXED_PAGE_FLAG);
+    ensure_region_closed(&th->mixed_tlab, PAGE_TYPE_MIXED);
+    ensure_region_closed(&th->unboxed_tlab, PAGE_TYPE_UNBOXED);
     unlink_thread(th);
     thread_mutex_unlock(&all_threads_lock);
     gc_assert(lock_ret == 0);
@@ -461,7 +462,7 @@ unregister_thread(struct thread *th,
 
     arch_os_thread_cleanup(th);
 
-    struct extra_thread_data *semaphores = thread_extra_data(th);
+    __attribute__((unused)) struct extra_thread_data *semaphores = thread_extra_data(th);
 #ifdef LISP_FEATURE_UNIX
     os_sem_destroy(&semaphores->sprof_sem);
 #endif
@@ -1006,7 +1007,7 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
 #endif
 
 #ifdef LISP_FEATURE_GENCGC
-    gc_init_region(&th->boxed_tlab);
+    gc_init_region(&th->mixed_tlab);
     gc_init_region(&th->unboxed_tlab);
 #endif
 #ifdef LISP_FEATURE_SB_THREAD
@@ -1228,7 +1229,7 @@ void gc_start_the_world()
                       + (gc_end_time.tv_nsec - gc_start_time.tv_nsec);
     if (stw_elapsed < 0 || gc_elapsed < 0) {
         char errmsg[] = "GC: Negative times?\n";
-        write(2, errmsg, sizeof errmsg-1);
+        ignore_value(write(2, errmsg, sizeof errmsg-1));
     } else {
         stw_sum_duration += stw_elapsed;
         if (stw_elapsed < stw_min_duration) stw_min_duration = stw_elapsed;

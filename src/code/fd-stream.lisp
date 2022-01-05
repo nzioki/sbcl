@@ -51,7 +51,7 @@
 (define-load-time-global *available-buffers* ()
   "List of available buffers.")
 
-(defconstant +bytes-per-buffer+ (* 4 1024)
+(defconstant +bytes-per-buffer+ (* 8 1024)
   "Default number of bytes per buffer.")
 
 (defun alloc-buffer (&optional (size +bytes-per-buffer+))
@@ -251,10 +251,17 @@
          ;; something, or be even full.
          (let* ((obuf (fd-stream-obuf stream))
                 (tail (buffer-tail obuf))
-                (space (- (buffer-length obuf) tail)))
-           (when (plusp space)
-             (copy-to-buffer obuf tail (min space (- end start)))
-             (go :more-output-p)))
+                (buffer-length (buffer-length obuf))
+                (space (- buffer-length tail))
+                (length (- end start)))
+           (cond ((and (not (fd-stream-serve-events stream))
+                       (>= length buffer-length))
+                  (flush-output-buffer stream)
+                  (finish-writing-sequence thing stream start end)
+                  (return-from buffer-output))
+                 ((plusp space)
+                  (copy-to-buffer obuf tail (min space length))
+                  (go :more-output-p))))
        :flush-and-fill
          ;; Later copies should always have an empty buffer, since
          ;; they are freshly flushed, but if another thread is
@@ -326,6 +333,34 @@
                               (t
                                (simple-stream-perror +write-failed+
                                                      stream errno)))))))))))))
+
+(defun finish-writing-sequence (sequence stream start end)
+  (synchronize-stream-output stream)
+  (loop
+   (let ((length (- end start)))
+     (multiple-value-bind (count errno)
+         (sb-unix:unix-write (fd-stream-fd stream) sequence start length)
+       (flet ((wait ()
+                (or (wait-until-fd-usable (fd-stream-fd stream) :output
+                                          (fd-stream-timeout stream)
+                                          nil)
+                    (signal-timeout 'io-timeout
+                                    :stream stream
+                                    :direction :output
+                                    :seconds (fd-stream-timeout stream)))))
+         (cond ((eql count length)
+                (return t))
+               (count
+                (incf start count)
+                (wait))
+               #-win32
+               ((eql errno sb-unix:ewouldblock)
+                (wait))
+               ;; if interrupted on win32, just try again
+               #+win32 ((eql errno sb-unix:eintr))
+               (t
+                (simple-stream-perror +write-failed+
+                                      stream errno))))))))
 
 ;;; Helper for FLUSH-OUTPUT-BUFFER -- returns the new buffer.
 (defun %queue-and-replace-output-buffer (stream)
@@ -433,8 +468,7 @@
 ;;; this is not something we want to export. Nikodemus thinks the
 ;;; right thing is to support a low-level non-stream like IO layer,
 ;;; akin to java.nio.
-(declaim (inline output-raw-bytes))
-(define-deprecated-function :late "1.0.8.16" output-raw-bytes write-sequence
+(define-deprecated-function :final "1.0.8.16" output-raw-bytes write-sequence
     (stream thing &optional start end)
   (write-or-buffer-output stream thing (or start 0) (or end (length thing))))
 

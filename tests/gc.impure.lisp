@@ -37,21 +37,6 @@
     ;; cell that was never assigned into
     *weak-vect*))
 
-;;; Make sure MAP-REFERENCING-OBJECTS doesn't spuriously treat raw bits as
-;;; potential pointers. Also make sure it sees the SYMBOL-INFO slot.
-(defstruct afoo (slot nil :type sb-ext:word))
-(defvar *afoo* (make-afoo :slot (sb-kernel:get-lisp-obj-address '*posix-argv*)))
-(with-test (:name :map-referencing-objs)
-  (sb-vm::map-referencing-objects (lambda (x) (assert (not (typep x 'afoo))))
-                                  :dynamic '*posix-argv*)
-  (let ((v (sb-kernel:symbol-%info 'satisfies)) referers)
-    (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
-                                    #+gencgc :dynamic #-gencgc :static v)
-    #+immobile-space
-    (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
-                                    :immobile v)
-    (assert (member 'satisfies referers))))
-
 ;; Assert something about *CURRENT-THREAD* seeing objects that it just consed.
 (with-test (:name :m-a-o-threadlocally-precise
                   :skipped-on (:or (:not (:and :gencgc :sb-thread))
@@ -361,33 +346,28 @@
            (setf (aref a serial) 1))))
      :all)))
 
-(defvar *foo*)
-#+gencgc
-(with-test (:name (sb-ext:search-roots :simple-fun)
-            :broken-on (and :darwin :arm64))
-  ;; Tracing a path to a simple fun wasn't working at some point
-  ;; because of failure to employ fun_code_header in the right place.
-  (setq *foo* (compile nil '(lambda () 42)))
-  (let ((wp (sb-ext:make-weak-pointer *foo*)))
-    (assert (sb-ext:search-roots wp :criterion :oldest :print nil))))
-
-#+gencgc
-(with-test (:name (sb-ext:search-roots :ignore-immediate))
-  (sb-ext:search-roots (make-weak-pointer 48) :gc t :print nil))
-
 #+sb-thread
 (with-test (:name :concurrently-alloc-code)
-  (let ((gc-thread
+  ;; this debug setting may or may not find a problem, but it can't hurt to try
+  (setf (extern-alien "pre_verify_gen_0" int) 1)
+  (let ((worker-th
          (sb-thread:make-thread
           (let ((stop (+ (get-internal-real-time)
-                         internal-time-units-per-second)))
-            (lambda ()
+                         (* 3 internal-time-units-per-second))))
+            (lambda (&aux (n 0))
               (loop while (<= (get-internal-real-time) stop)
-                    do (gc) (sleep 0)))))))
-    (loop (compile nil `(lambda () (print 20)))
-          (unless (sb-thread:thread-alive-p gc-thread)
-            (return)))
-    (sb-thread:join-thread gc-thread)))
+                    do (compile nil `(lambda () (print 20)))
+                       (incf n))
+              n)))))
+    (let ((gcs 0))
+      (loop (gc) (incf gcs)
+            (unless (sb-thread:thread-alive-p worker-th)
+              (return))
+            (sb-unix:nanosleep 0 (random 100000)))
+      (let ((compiles (sb-thread:join-thread worker-th)))
+        (format t "~&Compiled ~D times, GC'ed ~D times~%"
+                compiles gcs))))
+  (setf (extern-alien "pre_verify_gen_0" int) 0))
 
 (defun parse-address-range (line)
   ;; I hope nothing preceding the match of "-" could be a false positive.

@@ -103,24 +103,6 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(defconstant nil-value
-    (+ static-space-start
-       ;; boxed_region precedes NIL
-       ;; 8 is the number of words to reserve at the beginning of static space
-       ;; prior to the words of NIL.
-       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
-       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
-       #+64-bit #x100
-       (* 2 n-word-bytes)
-       list-pointer-lowtag))
-
-;;; BOXED-REGION is address in static space at which a 'struct alloc_region'
-;;; is overlaid on a lisp vector with element type WORD.
-#-sb-thread
-(defconstant boxed-region
-  (+ static-space-start
-     (* 2 n-word-bytes))) ; skip the array header
-
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
         (do-external-symbols (sym "SB-VM")
@@ -255,6 +237,11 @@
   ;; NIL element type is not in the contiguous range of widetags
   ;; corresponding to SIMPLE-UNBOXED-ARRAY
   simple-array-nil-widetag
+
+  ;; IF YOU CHANGE THIS ORDER, THEN MANUALLY VERIFY CORRECTNESS OF:
+  ;; - leaf_obj_widetag_p()
+  ;; - conservative_root_p()
+  ;; - anything else I forgot to mention
   simple-vector-widetag                     ;
   simple-bit-vector-widetag                 ;
   simple-array-unsigned-byte-2-widetag      ;
@@ -288,6 +275,9 @@
   simple-array-complex-single-float-widetag ;
   simple-array-complex-double-float-widetag ;
 
+  ;; WARNING: If you change the order of anything here,
+  ;; be sure to examine COMPUTE-OBJECT-HEADER to see that it works
+  ;; properly for all non-simple array headers.
   simple-base-string-widetag                ;  D6   E1  D6   E1       \
   #+sb-unicode                              ;                          |
   simple-character-string-widetag           ;  DA   E5                 | Strings
@@ -310,20 +300,45 @@
 
 ;;; Byte index:           3           2           1           0
 ;;;                 +-----------------------------------+-----------+
-;;;                 |  unused   |   rank   <|>   flags  |  widetag  |
+;;;                 |  extra    |   flags   |    rank   |  widetag  |
 ;;;                 +-----------+-----------+-----------+-----------+
 ;;;                 |<---------- HEADER DATA ---------->|
 
-;;; Having contiguous rank and widetag allows
-;;; SIMPLE-ARRAY-HEADER-OF-RANK-P to be done with just one comparison.
-;;; Other backends may not be ready to switch the order yet.
-(defconstant array-rank-position  #-arm64 16 #+arm64 8)
-(defconstant array-flags-position #-arm64 8  #+arm64 16)
+;;; "extra" contain the following fields:
+;;;  - generation number for immobile space (4 low bits of extra)
+;;;  - fullcgc mark bit (header bit index 31), not used by Lisp
+;;;  - VISITED bit (header bit index 30) for weak vectors, not used by Lisp
+;;;  - ALLOC-DYNAMIC-EXTENT (bit index 29), not used by lisp
+;;;  - ALLOC-MIXED-REGION (bit index 28), not used by Lisp
+
+;; When I finish implementing "highly unsafe" dynamic-extent allocation, allowing
+;; uninitialized SIMPLE-VECTORs on the stack, _correct_ Lisp code won't be affected
+;; (it's an error to read before writing an element), nor will conservative GC.
+;; But in order to make printing (Lisp and/or ldb) not crashy, we may need to act
+;; as though *PRINT-ARRAY* were NIL on those.
+;; (I don't know what to do if such a vector insists on being printed readably)
+(defconstant +vector-alloc-dynamic-extent-bit+ (ash 1 29))
+
+;; A vector with ALLOC-MIXED-REGION can never be moved to a purely boxed page,
+;; and vectors not so marked could be. This would allow small simple-vectors
+;; to benefit from the same GC optimization as large ones, wherein we scan
+;; only their marked cards without regard to object base address.
+;; A hash-table vector must not move to a pure boxed page, but we can't indicate
+;; a vector as hashing until after it has been properly initialized.
+;; The table algorithms expects to see certain values in the first and last elements,
+;; and shoving all the initialization into pseudo-atomic would be nontrivial.
+;; So we need a different flag bit that can be set immediately on creation,
+;; just in case GC occurs before a hash table vector is flagged as hashing.
+;; Note: ALLOCATE-VECTOR on 32-bit wants its first argument to be POSITIVE-FIXNUM.
+;; so this is the highest bit index that can be used satisfying that restriction.
+;; Once set, this bit can never be cleared.
+(defconstant +vector-alloc-mixed-region-bit+ (ash 1 28))
+
+;;; Rank and widetag adjacent lets SIMPLE-ARRAY-HEADER-OF-RANK-P be just one comparison.
+(defconstant array-rank-position    8)
+(defconstant array-flags-position  16)
 
 (defconstant array-flags-data-position (- array-flags-position n-widetag-bits))
-(defconstant +array-fill-pointer-p+    #x80)
-
-(defconstant +vector-dynamic-extent+   #x40)
 
 ;; A vector tagged as +VECTOR-SHAREABLE+ is logically readonly,
 ;; and permitted to be shared with another vector per the CLHS standard
@@ -342,10 +357,8 @@
 ;; nonetheless, opportunities for sharing abound.
 (defconstant +vector-shareable-nonstd+ #x10)
 
-;; Weak vectors that are not hash-table backing vectors use this bit to track
-;; whether we've already recorded the vector for deferred scavenging.
-;; Hash-tables use an entirely different mechanism. Flag bit used only in C.
-(defconstant vector-weak-visited-flag  #x08)
+;; All arrays have a fill-pointer bit, but only vectors can have a 1 here.
+(defconstant +array-fill-pointer-p+    #x80)
 ;; All hash-table backing vectors are marked with this bit.
 ;; Essentially it informs GC that the vector has a high-water mark.
 (defconstant vector-hashing-flag       #x04)

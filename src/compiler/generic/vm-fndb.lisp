@@ -123,7 +123,10 @@
 (defknown %set-symbol-hash (symbol hash-code)
   t ())
 
-;;; TODOD: I'd like to eliminate the (OR NULL) from this return type.
+;;; SYMBOL-PACKAGE-ID demands a vop so as to avoid placing a raw bit value
+;;; in a descriptor register on precise GC. (The SLOT vop returns a descriptor)
+(defknown sb-impl::symbol-package-id (symbol) (unsigned-byte 16))
+;;; TODO: I'd like to eliminate the (OR NULL) from this return type.
 ;;; For that to happen, I probably need +nil-packed-infos+ to become
 ;;; placed in static space because assembly routines may need it.
 ;;; On the other hand, they may not, because there is no special case
@@ -175,7 +178,8 @@
 (defknown (assign-vector-flags reset-header-bits)
   (t (unsigned-byte 16)) (values)
   (#+x86-64 always-translatable))
-(defknown (test-header-bit)
+;;; test bits of "HeaderData" which start 8 bits over from the lsb
+(defknown (test-header-data-bit)
   (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (boolean)
   (flushable))
 
@@ -268,8 +272,7 @@
 ;;; Allocate an unboxed, non-fancy vector with type code TYPE, length LENGTH,
 ;;; and WORDS words long. Note: it is your responsibility to ensure that the
 ;;; relation between LENGTH and WORDS is correct.
-;;; The extra bit beyond N_WIDETAG_BITS is for the vector weakness flag.
-;;; Note that in almost all situations the first argument is a constant.
+;;; Note that in almost all situations the first argument (TYPE) is a constant.
 ;;; There are only 3 places that it can be non-constant, and not at all
 ;;; after self-build is complete. The three non-constant places are from:
 ;;;  - ALLOCATE-VECTOR-WITH-WIDETAG in src/code/array
@@ -335,10 +338,10 @@
   (defknown %make-simd-pack-ub32 ((unsigned-byte 32) (unsigned-byte 32)
                                   (unsigned-byte 32) (unsigned-byte 32))
       (simd-pack integer)
-      (flushable movable foldable))
+      (flushable movable #-sb-xc-host foldable))
   (defknown %make-simd-pack-ub64 ((unsigned-byte 64) (unsigned-byte 64))
       (simd-pack integer)
-      (flushable movable foldable))
+      (flushable movable #-sb-xc-host foldable))
   (defknown (%simd-pack-low %simd-pack-high) (simd-pack)
       (unsigned-byte 64)
       (flushable movable foldable))
@@ -629,6 +632,9 @@
 
 (defknown %single-float (real) single-float (movable foldable))
 (defknown %double-float (real) double-float (movable foldable))
+
+(defknown bignum-to-float (bignum symbol) float (movable foldable))
+(defknown sb-kernel::float-ratio (ratio symbol) float (movable foldable))
 
 (defknown make-single-float ((signed-byte 32)) single-float
   (movable flushable))

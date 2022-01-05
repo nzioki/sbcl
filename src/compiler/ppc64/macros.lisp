@@ -177,7 +177,7 @@
   (declare (ignore stack-p node))
   (binding* ((imm-size (typep size '(unsigned-byte 15)))
              ((region-base-tn field-offset)
-              (values thread-base-tn (* thread-boxed-tlab-slot n-word-bytes))))
+              (values thread-base-tn (* thread-mixed-tlab-slot n-word-bytes))))
 
     (unless imm-size ; Make temp-tn be the size
       (if (numberp size)
@@ -262,9 +262,8 @@
          (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                      :temp-tn ,temp-tn
                      :flag-tn ,flag-tn))
-       (when ,type-code
-         (inst lr ,temp-tn (compute-object-header ,size ,type-code))
-         (storew ,temp-tn ,result-tn 0 ,lowtag))
+       (inst lr ,temp-tn (compute-object-header ,size ,type-code))
+       (storew ,temp-tn ,result-tn 0 ,lowtag)
        ,@body)))
 
 (defun align-csp (temp)

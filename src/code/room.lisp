@@ -362,10 +362,10 @@ We could try a few things to mitigate this:
              (multiple-value-bind (start end) (%space-bounds space)
                (declare (ignore start))
                (funcall fun nil symbol-widetag (* sizeof-nil-in-words n-word-bytes))
-               (let ((start (+ (logandc2 sb-vm:nil-value sb-vm:lowtag-mask)
-                               (ash (- sizeof-nil-in-words 2) sb-vm:word-shift))))
+               (let ((start (+ (logandc2 nil-value lowtag-mask)
+                               (ash (- sizeof-nil-in-words 2) word-shift))))
                  (map-objects-in-range fun
-                                       (ash start (- sb-vm:n-fixnum-tag-bits))
+                                       (ash start (- n-fixnum-tag-bits))
                                        end))))
 
             ((:read-only #-gencgc :dynamic)
@@ -430,7 +430,7 @@ We could try a few things to mitigate this:
        ;; prove to be an issue with concurrent systems, or with
        ;; spectacularly poor timing for closing an allocation region
        ;; in a single-threaded system.
-  (close-current-gc-region)
+  (close-thread-alloc-region)
   (do ((initial-next-free-page next-free-page)
        (base (int-sap (current-dynamic-space-start)))
        (start-page 0)
@@ -450,10 +450,10 @@ We could try a few things to mitigate this:
                     (= (slot (deref page-table (1+ end-page)) 'start) 0))
             (return))
           (incf end-page))
-    (let ((start (sap+ base (truly-the sb-vm:signed-word
+    (let ((start (sap+ base (truly-the signed-word
                                        (logand (* start-page gencgc-card-bytes)
                                                most-positive-word))))
-          (end (sap+ base (truly-the sb-vm:signed-word
+          (end (sap+ base (truly-the signed-word
                                      (logand (+ (* end-page gencgc-card-bytes)
                                                 end-page-bytes-used)
                                              most-positive-word)))))
@@ -475,27 +475,15 @@ We could try a few things to mitigate this:
                                   (< start-page initial-next-free-page))))))
     (setq start-page (1+ end-page))))
 
-;; Start with a Lisp rendition of ensure_region_closed() on the active
-;; thread's region, since users are often surprised to learn that a
-;; just-consed object can't necessarily be seen by MAP-ALLOCATED-OBJECTS.
+;; Users are often surprised to learn that a just-consed object can't
+;; necessarily be seen by MAP-ALLOCATED-OBJECTS, so close the region
+;; to update the page table.
 ;; Since we're in WITHOUT-GCING, there can be no interrupts.
-;; This is probably better than calling MAP-OBJECTS-IN-RANGE on the
-;; thread's region, because then we might visit some page twice
-;; by doing that.
-;; (And seeing small consing by other threads is hopeless either way)
-(defun close-current-gc-region ()
-  #+gencgc
-  (let ((region-struct
-          #+sb-thread (sap+ (sb-thread::current-thread-sap)
-                            (ash thread-boxed-tlab-slot word-shift))
-          ;; If no threads, the alloc_region struct is in static space.
-          #-sb-thread (int-sap boxed-region)))
-    ;; The 'start_addr' field is at word index 3 of the structure (see gencgc-alloc-region.h).
-    (unless (eql (sap-ref-word region-struct (ash 3 word-shift)) 0)
-      (alien-funcall (extern-alien "gc_close_region" (function void system-area-pointer int))
-                     region-struct
-                     1)) ; ASSUMPTION: BOXED_PAGE_FLAG = 1
-    nil))
+;; Moreover it's probably not safe in the least to walk any thread's
+;; allocation region, unless the observer and observed aren't consing.
+(defun close-thread-alloc-region ()
+  #+gencgc (alien-funcall (extern-alien "close_thread_region" (function void)))
+  nil)
 
 ;;;; MEMORY-USAGE
 
@@ -842,19 +830,6 @@ We could try a few things to mitigate this:
 
 ;;;; LIST-ALLOCATED-OBJECTS, LIST-REFERENCING-OBJECTS
 
-(defvar *ignore-after* nil)
-
-(defun valid-obj (space x)
-  (or (not (eq space :dynamic))
-      ;; this test looks bogus if the allocator doesn't work linearly,
-      ;; which I suspect is the case for GENCGC.  -- CSR, 2004-06-29
-      (< (get-lisp-obj-address x) (get-lisp-obj-address *ignore-after*))))
-
-(defun maybe-cons (space x stuff)
-  (if (valid-obj space x)
-      (cons x stuff)
-      stuff))
-
 (defun list-allocated-objects (space &key type larger smaller count
                                      test)
   (declare (type (or (eql :all) spaces) space)
@@ -1112,16 +1087,16 @@ We could try a few things to mitigate this:
 (defun map-referencing-objects (fun space object)
   (declare (type (or (eql :all) spaces) space))
   (declare (dynamic-extent fun))
-  (unless *ignore-after*
-    (setq *ignore-after* (cons 1 2)))
-  (let ((fun (%coerce-callable-to-fun fun)))
+  (let (list)
     (map-allocated-objects
      (lambda (referer widetag size)
        (declare (ignore widetag size))
-       (when (and (valid-obj space referer) ; semi-bogus!
+       ;; Don't count a self-reference as a reference
+       (when (and (neq referer object)
                   (references-p referer object))
-         (funcall fun referer)))
-     space)))
+         (push referer list)))
+     space)
+    (mapc (%coerce-callable-to-fun fun) list)))
 
 (defun list-referencing-objects (space object)
   (collect ((res))
@@ -1289,7 +1264,7 @@ We could try a few things to mitigate this:
   #+gencgc
   (let* ((n-bits
           (progn
-            (sb-vm::close-current-gc-region)
+            (close-thread-alloc-region)
             (+ next-free-page 50)))
          (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
          (data-bits (make-array n-bits :element-type 'bit :initial-element 0))
@@ -1349,31 +1324,38 @@ We could try a few things to mitigate this:
     (with-pinned-objects (obj)
       (dotimes (i count)
         (let ((word (sap-ref-word (int-sap addr) (ash i word-shift))))
-          (multiple-value-bind (lispobj ok)
+          (multiple-value-bind (lispobj ok fmt)
               (cond ((and (typep thing 'code-component)
                           (< 1 i (code-header-words thing)))
                      (values (code-header-ref thing i) t))
+                    #+compact-symbol
+                    ((and (typep thing '(and symbol (not null)))
+                          (= i symbol-name-slot))
+                     (values (list (sb-impl::symbol-package-id thing)
+                                   (symbol-name thing))
+                             t
+                             "{~{~A,~S~}}"))
                     (decode
                      (make-lisp-obj word nil)))
             (let ((*print-lines* 1)
                   (*print-pretty* t))
-              (format t "~x: ~v,'0x~:[~; = ~S~]~%"
+              (format t "~x: ~v,'0x~:[~; = ~@?~]~%"
                       (+ addr (ash i word-shift))
                       (* 2 n-word-bytes)
-                      word ok lispobj))))))))
+                      word ok (or fmt "~S") lispobj))))))))
 #+sb-thread
 (defun show-tls-map ()
   (let ((list
-         (sort (sb-vm::list-allocated-objects
+         (sort (list-allocated-objects
                 :all
-                :type sb-vm:symbol-widetag
+                :type symbol-widetag
                 :test (lambda (x) (plusp (sb-kernel:symbol-tls-index x))))
                #'<
                :key #'sb-kernel:symbol-tls-index))
         (prev 0))
     (dolist (x list)
-      (let ((n  (ash (sb-kernel:symbol-tls-index x) (- sb-vm:word-shift))))
-        (when (and (> n sb-vm::primitive-thread-object-length)
+      (let ((n  (ash (sb-kernel:symbol-tls-index x) (- word-shift))))
+        (when (and (> n primitive-thread-object-length)
                    (> n (1+ prev)))
           (format t "(unused)~%"))
         (format t "~5d = ~s~%" n x)
@@ -1385,25 +1367,25 @@ We could try a few things to mitigate this:
          (let ((*print-level* 2) (*print-lines* 1))
            (format t "~x ~s~%" (get-lisp-obj-address obj) obj))))
 (defun print-all-code ()
-  (walk-dynamic-space #'print-it #x7f #b11 #b11))
+  (walk-dynamic-space #'print-it #x7f #b01111 #b00111))
 (defun print-large-code ()
-  (walk-dynamic-space #'print-it #x7f #b10011 #b10011))
+  (walk-dynamic-space #'print-it #x7f #b11111 #b10111))
 (defun print-large-unboxed ()
-  (walk-dynamic-space #'print-it #x7f #b10011 #b10010))
+  (walk-dynamic-space #'print-it #x7f #b11111 #b10010))
 ;;; Use this only if you know what you're doing. It can fail because a page
 ;;; that needs to continue onto the next page will cause the "overrun" check
 ;;; to fail.
 (defun print-page-contents (page)
   (let* ((start
-          (+ (current-dynamic-space-start) (* sb-vm:gencgc-card-bytes page)))
+          (+ (current-dynamic-space-start) (* gencgc-card-bytes page)))
          (end
-          (+ start sb-vm:gencgc-card-bytes)))
+          (+ start gencgc-card-bytes)))
     (map-objects-in-range #'print-it (%make-lisp-obj start) (%make-lisp-obj end)))))
 
 (defun map-code-objects (fun)
   (dx-flet ((filter (obj type size)
               (declare (ignore size))
-              (when (= type sb-vm:code-header-widetag)
+              (when (= type code-header-widetag)
                 (funcall fun obj)))
             (nofilter (obj type size)
               (declare (ignore type size))
@@ -1418,7 +1400,7 @@ We could try a few things to mitigate this:
       (alien-funcall (extern-alien "close_code_region" (function void)))
       (walk-dynamic-space #'nofilter
                           #b1111111 ; all generations
-                          3 3))))
+                          #b111 #b111)))) ; type mask and constraint
 
 (export 'code-from-serialno)
 (defun code-from-serialno (serial)
@@ -1428,7 +1410,7 @@ We could try a few things to mitigate this:
     (map-code-objects #'visit)))
 
 (defun show-all-layouts ()
-  (let ((l (sb-vm::list-allocated-objects :all :test #'sb-kernel::wrapper-p))
+  (let ((l (list-allocated-objects :all :test #'sb-kernel::wrapper-p))
         zero trailing-raw trailing-tagged vanilla)
     (dolist (x l)
       (let ((m (wrapper-bitmap x)))
@@ -1463,7 +1445,7 @@ We could try a few things to mitigate this:
 
 #+ubsan
 (defun find-poisoned-vectors (&aux result)
-  (dolist (v (sb-vm:list-allocated-objects :all :type sb-vm:simple-vector-widetag)
+  (dolist (v (list-allocated-objects :all :type simple-vector-widetag)
              result)
     (when (dotimes (i (length v))
             (declare (optimize (sb-c::aref-trapping 0)))

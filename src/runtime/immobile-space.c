@@ -767,9 +767,8 @@ fixedobj_points_to_younger_p(lispobj* obj, int n_words,
 
   switch (widetag_of(obj)) {
   case FDEFN_WIDETAG:
-    return younger_p(fdefn_callee_lispobj((struct fdefn*)obj),
-                     gen, keep_gen, new_gen)
-        || range_points_to_younger_p(obj+1, obj+3, gen, keep_gen, new_gen);
+    if (younger_p(fdefn_callee_lispobj((struct fdefn*)obj), gen, keep_gen, new_gen)) return 1;
+    break; // proceed to other slots as usual (harmlessly revisiting 'raw_addr')
   case CODE_HEADER_WIDETAG:
     // This is a simplifying trampoline around a closure or FIN.
     // The only pointerish slot is debug_info (the called function).
@@ -1176,7 +1175,11 @@ void immobile_space_coreparse(uword_t fixedobj_len, uword_t varyobj_len)
             if (!filler_obj_p(where)) assign_generation(where, gen);
             where += OBJECT_SIZE(*where, where);
         }
-        fprintf(stderr, "WARNING: demoted immobile objects to gen%d\n", gen);
+        // If the regression suite is run with core pages in gen0 (to more aggressively
+        // test code page transporting), we don't want to cause failures in 'script.test.sh'
+        // and some other things that look for an exact match on textual output.
+        if (gencgc_verbose)
+            fprintf(stderr, "WARNING: demoted immobile objects to gen%d\n", gen);
     }
 
     n_pages = fixedobj_len / IMMOBILE_CARD_BYTES;
@@ -1650,7 +1653,14 @@ static void fixup_space(lispobj* where, size_t n_words)
           adjust_words(where+1, 2);
           adjust_fdefn_raw_addr((struct fdefn*)where);
           break;
-
+        case SYMBOL_WIDETAG:
+          // - info, name, package can not point to an immobile object
+          // - symbol value, fdefn, and augmented symbol's extra slot can
+          adjust_words(&((struct symbol*)where)->value, 1);
+          adjust_words(&((struct symbol*)where)->fdefn, 1);
+          if (size > ALIGN_UP(SYMBOL_SIZE,2)) // augmented symbol
+              adjust_words(1 + &((struct symbol*)where)->fdefn, 1);
+          break;
         // Special case because we might need to mark hashtables
         // as needing rehash.
         case SIMPLE_VECTOR_WIDETAG:
@@ -1687,7 +1697,6 @@ static void fixup_space(lispobj* where, size_t n_words)
         case COMPLEX_VECTOR_WIDETAG:
         case COMPLEX_ARRAY_WIDETAG:
         // And the other entirely boxed objects.
-        case SYMBOL_WIDETAG:
         case VALUE_CELL_WIDETAG:
         case WEAK_POINTER_WIDETAG:
         case RATIO_WIDETAG:
@@ -1723,22 +1732,17 @@ static lispobj* get_load_address(lispobj* old)
 //  3=special var, 4=other
 static int classify_symbol(lispobj* obj)
 {
-  struct symbol* symbol = (struct symbol*)obj;
-  if (symbol->package == NIL) return 0;
-  struct vector* package_name = (struct vector*)
-    native_pointer(((struct package*)native_pointer(symbol->package))->_name);
-  if (widetag_of(&package_name->header) == SIMPLE_BASE_STRING_WIDETAG
-      && !strcmp((char*)package_name->data, "KEYWORD"))
-      return 1;
-  // Same criterion as SYMBOL-EXTRA-SLOT-P in src/code/room.
-  if ((HeaderValue(*obj) & 0xFF) > (SYMBOL_SIZE-1))
-      return 2;
-  struct vector* symbol_name = VECTOR(symbol->name);
-  if (vector_len(symbol_name) >= 2 &&
-      schar(symbol_name, 0) == '*' &&
-      schar(symbol_name, vector_len(symbol_name)-1) == '*')
-      return 3;
-  return 4;
+    struct symbol* symbol = (struct symbol*)obj;
+    if (symbol_package_id(symbol) == PACKAGE_ID_NONE) return 0;
+    if (symbol_package_id(symbol) == PACKAGE_ID_KEYWORD) return 1;
+    // Same criterion as SYMBOL-EXTRA-SLOT-P in src/code/room.
+    if ((HeaderValue(*obj) & 0xFF) > (SYMBOL_SIZE-1)) return 2;
+    struct vector* symbol_name = VECTOR(decode_symbol_name(symbol->name));
+    if (vector_len(symbol_name) >= 2 &&
+        schar(symbol_name, 0) == '*' &&
+        schar(symbol_name, vector_len(symbol_name)-1) == '*')
+        return 3;
+    return 4;
 }
 
 static inline char* compute_defrag_start_address()

@@ -81,7 +81,7 @@ static void* get_free_page() {
     --free_page;
     if (free_page < next_free_page)
         lose("Needed more space to GC");
-    page_table[free_page].type = UNBOXED_PAGE_FLAG;
+    page_table[free_page].type = PAGE_TYPE_UNBOXED;
     char* mem = page_address(free_page);
     zero_dirty_pages(free_page, free_page, 0);
     return mem;
@@ -358,6 +358,19 @@ static void trace_object(lispobj* where)
         return;
 #endif
         break;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+    case SYMBOL_WIDETAG:
+        {
+        struct symbol* s = (void*)where;
+        gc_mark_obj(decode_symbol_name(s->name));
+        gc_mark_obj(s->value);
+        gc_mark_obj(s->info);
+        gc_mark_obj(s->fdefn);
+        // process the unnamed slot of augmented symbols
+        if ((s->header & 0xFF00) == (SYMBOL_SIZE<<8)) gc_mark_obj(*(1+&s->fdefn));
+        }
+        return;
+#endif
     case FDEFN_WIDETAG:
         gc_mark_obj(fdefn_callee_lispobj((struct fdefn*)where));
         scan_to = 3;
@@ -402,6 +415,7 @@ void execute_full_mark_phase()
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
+    trace_object((lispobj*)NIL_SYMBOL_SLOTS_START);
     lispobj* where = (lispobj*)STATIC_SPACE_OBJECTS_START;
     lispobj* end = static_space_free_pointer;
     while (where < end) {
@@ -418,6 +432,8 @@ void execute_full_mark_phase()
         where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
 #endif
+    // In case this is not the same as (symbol-value '*id->package*)
+    gc_mark_obj(lisp_package_vector);
     do {
         lispobj ptr = gc_dequeue();
         gc_dcheck(ptr != 0);

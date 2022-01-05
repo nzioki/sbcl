@@ -21,6 +21,10 @@
 ;;; and running the cross-compiler to produce target FASL files).
 (defpackage "SB-COLD" (:use "CL"))
 
+;;; #+sbcl ; use at your own risk!
+;;; (when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
+;;;   (setf (extern-alien "show_gc_generation_throughput" int) 1))
+
 (in-package "SB-COLD")
 
 (defun parse-make-host-parallelism (str)
@@ -277,6 +281,8 @@
         ;; Win32 conditionally adds :sb-futex in grovel-features.sh
         (when (target-featurep '(:and :sb-thread (:or :linux :freebsd)))
           (pushnew :sb-futex sb-xc:*features*))
+        (when (target-featurep '(:or :x86-64 :ppc64 :arm64 (:and :riscv :64-bit)))
+          (push :compact-symbol sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread (:not :win32)))
           (push :pauseless-threadstart sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread (:or :darwin :openbsd)))
@@ -328,6 +334,7 @@
           "The selected architecture requires :SB-THREAD")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
+         ;; I srlsy doubt that any of these are tested with cheneygc any more
          ("(and cheneygc (not (or arm mips ppc riscv sparc)))"
           ":CHENEYGC not supported on selected architecture")
          ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64 riscv)))"
@@ -339,9 +346,9 @@
          ("(not (or elf mach-o win32))"
           "No execute object file format feature defined")
          ("(and cons-profiling (not sb-thread))" ":CONS-PROFILING requires :SB-THREAD")
-         ("(and sb-linkable-runtime (not (or x86 x86-64)))"
+         ("(and sb-linkable-runtime (not (or arm arm64 x86 x86-64)))"
           ":SB-LINKABLE-RUNTIME not supported on selected architecture")
-         ("(and sb-linkable-runtime (not (or darwin linux win32)))"
+         ("(and sb-linkable-runtime (not (or darwin freebsd linux win32)))"
           ":SB-LINKABLE-RUNTIME not supported on selected operating system")
          ("(and sb-eval sb-fasteval)"
           ;; It sorta kinda works to have both, but there should be no need,

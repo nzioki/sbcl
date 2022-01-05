@@ -77,15 +77,14 @@
                         (make-entry)))
                (cleanup (make-cleanup :kind :dynamic-extent
                                       :mess-up entry
-                                      :info dx-lvars)))
+                                      :nlx-info dx-lvars)))
           (setf (entry-cleanup entry) cleanup)
           (insert-node-before call entry)
           (setf (node-lexenv call)
                 (make-lexenv :default (node-lexenv call)
                              :cleanup cleanup))
           ;; Make CALL end its block, so that we have a place to
-          ;; insert cleanup code and MAP-BLOCK-NLXES during stack
-          ;; analysis sees the cleanup we insert here.
+          ;; insert cleanup code.
           (node-ends-block call)
           (push entry (lambda-entries (node-home-lambda entry)))
           (dolist (cell dx-lvars)

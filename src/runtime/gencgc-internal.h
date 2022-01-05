@@ -97,9 +97,10 @@ struct page {
         /*
          * The low 4 bits of 'type' are interpreted as:
          *  0000 free
-         *  ?001 boxed data
-         *  ?010 unboxed data
-         *  ?011 code
+         *  ?001 strictly boxed data (pointers, immediates, object headers)
+         *  ?010 strictly unboxed data
+         *  ?011 mixed boxed/unboxed non-code objects
+         *  ?111 code
          *  1??? open region
          * The high bit indicates that the page holds part of or the entirety
          * of a single object and no other objects.
@@ -150,7 +151,7 @@ extern struct page *page_table;
  *       7      F200        2
  */
 extern char * gc_card_mark;
-extern int gc_card_table_mask;
+extern long gc_card_table_mask;
 #define addr_to_card_index(addr) ((((uword_t)addr)>>GENCGC_CARD_SHIFT) & gc_card_table_mask)
 #define page_to_card_index(n) addr_to_card_index(page_address(n))
 #define PAGE_WRITEPROTECTED_P(n) (gc_card_mark[page_to_card_index(n)] & 1)
@@ -170,12 +171,12 @@ extern page_index_t page_table_pages;
 /* forward declarations */
 
 void update_dynamic_space_free_pointer(void);
-void gc_close_region(struct alloc_region *alloc_region, int page_type_flag);
+void gc_close_region(struct alloc_region *alloc_region, int page_type);
 static inline void ensure_region_closed(struct alloc_region *alloc_region,
-                                        int page_type_flag)
+                                        int page_type)
 {
     if (alloc_region->start_addr)
-        gc_close_region(alloc_region, page_type_flag);
+        gc_close_region(alloc_region, page_type);
 }
 
 static inline void gc_set_region_empty(struct alloc_region *region)
@@ -219,30 +220,22 @@ find_page_index(void *addr)
 #define SINGLE_OBJECT_FLAG (1<<4)
 #define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
 
-#define page_has_smallobj_pins(page) \
-  (page_table[page].pinned && !page_single_obj_p(page))
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
-    // FIXME: this gets called if !compacting_p,
-    // but most people don't run with extra debug assertions,
-    // and if you enable them, you'll pretty quickly crash here.
-    // gc_dcheck(compacting_p());
-#if !GENCGC_IS_PRECISE
-    return page_has_smallobj_pins(page)
-        && hopscotch_containsp(&pinned_objects, obj);
-#else
-    /* There is almost never anything in the hashtable on precise platforms */
-    if (!pinned_objects.count || !page_has_smallobj_pins(page))
-        return 0;
-# ifdef RETURN_PC_WIDETAG
-    /* Conceivably there could be a precise GC without RETURN-PC objects */
+    // Single-object pages can be pinned, but the object doesn't go
+    // in the hashtable. I'm a little surprised that the return value
+    // should be 0 in such case, but I think this never gets called
+    // on large objects because they've all been "moved" to newspace
+    // by adjusting the page table. Perhaps this should do:
+    //   gc_assert(!page_single_obj_p(page))
+    if (!page_table[page].pinned || page_single_obj_p(page)) return 0;
+#ifdef RETURN_PC_WIDETAG
     if (widetag_of(native_pointer(obj)) == RETURN_PC_WIDETAG)
         obj = make_lispobj(fun_code_header(native_pointer(obj)),
                            OTHER_POINTER_LOWTAG);
-# endif
-    return hopscotch_containsp(&pinned_objects, obj);
 #endif
+    return hopscotch_containsp(&pinned_objects, obj);
 }
 
 // Return true only if 'obj' must be *physically* transported to survive gc.
