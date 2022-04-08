@@ -958,17 +958,23 @@
         (t
          (give-up-ir1-transform))))
 
-(macrolet ((def (name test index)
-             `(deftransform ,name ((string1 string2 start1 end1 start2 end2)
-                                   (simple-string simple-string t t t t) *)
-                `(multiple-value-bind (index diff)
-                     (%sp-string-compare string1 start1 end1 string2 start2 end2)
-                   (declare (ignorable index))
-                   (if (,',test diff 0)
-                       ,,(if index ''index t)
-                       nil)))))
-  (def string=* = nil) ; FIXME: this xform looks counterproductive.
-  (def string/=* /= t))
+(deftransform string=*
+    ((string1 string2 start1 end1 start2 end2) (simple-base-string simple-base-string t t t t) *)
+  `(simple-base-string= string1 string2 start1 end1 start2 end2))
+
+#+sb-unicode
+(deftransform string=*
+    ((string1 string2 start1 end1 start2 end2) (simple-character-string simple-character-string t t t t) *)
+  `(simple-character-string= string1 string2 start1 end1 start2 end2))
+
+(deftransform string/=*
+    ((string1 string2 start1 end1 start2 end2) (simple-string simple-string t t t t) *)
+  `(multiple-value-bind (index diff)
+       (%sp-string-compare string1 start1 end1 string2 start2 end2)
+     (declare (ignorable index))
+     (if (,'/= diff 0)
+         ,'index
+         nil)))
 
 (deftransform string/=* ((str1 str2 start1 end1 start2 end2) * * :node node
                          :important nil)
@@ -2554,24 +2560,40 @@
   (define-trimmer-transform string-trim t t))
 
 
-;;; (partially) constant-fold backq-* functions, or convert to their
-;;; plain CL equivalent (now that they're not needed for pprinting).
+;;; We use this structure to facilitate named constant reference dumping inside
+;;; constant folded backquoted structures.
+#-sb-xc-host
+(defstruct (named-constant-reference
+             (:constructor make-named-constant-reference (name)))
+  (name (missing-arg) :type symbol :read-only t))
 
-;;; There's too much ambiguity around semantics of backquoted expressions
-;;; as pertains to constant-ness, and on top of that, how "folding" affects
-;;; whether any of the elements need a load-time-value of a global
-;;; defconstant that is not trivially dumpable.
-;;; Refer to the test case in backq-const-fold.impure-cload.
+#-sb-xc-host
+(defmethod make-load-form ((object named-constant-reference) &optional environment)
+  (declare (ignore environment))
+  (named-constant-reference-name object))
 
-;; Pop constant values from the end, list/list* them if any, and link
-;; the remainder with list* at runtime.
+;;; Wrap the value of lvar-value if it comes from a named
+;;; reference. For bootstrap reasons we don't do this during
+;;; cross-compile.
+(defun maybe-wrapped-lvar-value (lvar)
+  #+sb-xc-host
+  (lvar-value lvar)
+  #-sb-xc-host
+  (multiple-value-bind (value leaf)
+      (lvar-value lvar)
+    (if (leaf-has-source-name-p leaf)
+        (make-named-constant-reference (leaf-source-name leaf))
+        value)))
+
+;;; Pop constant values from the end, list/list* them if any, and link
+;;; the remainder with list* at runtime.
 (defun transform-backq-list-or-list* (function values)
   (let ((gensyms (make-gensym-list (length values)))
         (reverse (reverse values))
         (constants '()))
     (loop while (and reverse
                      (constant-lvar-p (car reverse)))
-          do (push (lvar-value (pop reverse))
+          do (push (maybe-wrapped-lvar-value (pop reverse))
                    constants))
     (if (null constants)
         `(lambda ,gensyms
@@ -2604,7 +2626,7 @@
     ;; though I doubt it would provide benefit to many real-world scenarios.
     (dolist (elt elts)
       (cond ((constant-lvar-p elt)
-             (push (lvar-value elt) constants))
+             (push (maybe-wrapped-lvar-value elt) constants))
             (t
              (setq constants :fail)
              (return))))

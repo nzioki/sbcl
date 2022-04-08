@@ -45,11 +45,11 @@
                 (defconstant register-arg-count ,(length args)))))
                      ; ABI register mnemonic
   (defreg zero 0)    ; zero
-  (defreg lip 1)     ; ra
+  (defreg ra 1)      ; ra
   (defreg nsp 2)     ; sp
   (defreg global 3)  ; gp
   (defreg tp 4)      ; tp
-  (defreg lra 5)     ; t0, alternate link register
+  (defreg lip 5)     ; t0, alternate link register
   (defreg cfp 6)     ; t1
   (defreg ocfp 7)    ; t2
   (defreg nfp 8)     ; s0, callee-saved
@@ -79,19 +79,19 @@
   (defreg code 30)   ; t5
   (defreg nargs 31)  ; t6
 
-  (defregset non-descriptor-regs nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nargs nfp cfunc)
-  (defregset descriptor-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 ocfp lra lexenv)
+  (defregset non-descriptor-regs nl0 nl1 nl2 ra nl3 nl4 nl5 nl6 nl7 nargs nfp cfunc)
+  (defregset descriptor-regs a0 a1 a2 a3 a4 a5 l0 l1 #-sb-thread l2 ocfp lexenv)
   (defregset reserve-descriptor-regs lexenv)
   (defregset reserve-non-descriptor-regs cfunc)
   (defregset boxed-regs a0 a1 a2 a3 a4 a5 l0 l1
     #-sb-thread l2 #+sb-thread thread
-    ocfp lra lexenv code)
+    ocfp lexenv code)
 
   (define-argument-register-set a0 a1 a2 a3 a4 a5))
 
 (!define-storage-bases
  (define-storage-base registers :finite :size 32)
- (define-storage-base control-stack :unbounded :size 8)
+ (define-storage-base control-stack :unbounded :size 0)
  (define-storage-base non-descriptor-stack :unbounded :size 0)
 
  (define-storage-base float-registers :finite :size 32)
@@ -101,7 +101,12 @@
  )
 
 (!define-storage-classes
+
+ ;; Non-immediate constants in the constant pool
  (constant constant)
+
+ ;; Immediate constant.
+ (zero immediate-constant)
  (immediate immediate-constant)
 
  (control-stack control-stack)
@@ -110,7 +115,7 @@
           :reserve-locations #.(append reserve-non-descriptor-regs
                                        reserve-descriptor-regs)
           :alternate-scs (control-stack)
-          :constant-scs (immediate constant)
+          :constant-scs (immediate zero constant)
           :save-p t)
 
  ;; Pointer descriptor objects.  Must be seen by GC.
@@ -149,7 +154,7 @@
              :locations #.non-descriptor-regs
              :reserve-locations #.reserve-non-descriptor-regs
              :alternate-scs (signed-stack)
-             :constant-scs (immediate)
+             :constant-scs (zero immediate)
              :save-p t)
  (unsigned-stack non-descriptor-stack)
  (unsigned-reg registers
@@ -200,25 +205,28 @@
                     :sc (sc-or-lose ',sc)
                     :offset ,offset-sym)))))
   (defregtn zero any-reg)
-  (defregtn nargs any-reg)
-
-  (defregtn nfp any-reg)
-  (defregtn ocfp any-reg)
-
+  (defregtn lip interior-reg)
+  (defregtn code descriptor-reg)
   (defregtn null descriptor-reg)
+
+  (defregtn nargs any-reg)
   (defregtn lexenv descriptor-reg)
 
-  (defregtn cfp any-reg)
   (defregtn csp any-reg)
-  (defregtn nsp any-reg)
+  (defregtn cfp any-reg)
 
-  (defregtn code descriptor-reg)
-  (defregtn lip interior-reg))
+  (defregtn nsp any-reg)
+  (defregtn ocfp any-reg)
+  (defregtn nfp any-reg)
+
+  (defregtn ra any-reg))
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
   (typecase value
+    ((integer 0 0)
+     zero-sc-number)
     (null
      (values descriptor-reg-sc-number null-offset))
     ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
@@ -230,7 +238,8 @@
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (eql sc immediate-sc-number))
+  (or (eql sc zero-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; Function Call Parameters
 
@@ -241,7 +250,7 @@
 
 ;;; Offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
-(defconstant lra-save-offset 1)
+(defconstant ra-save-offset 1)
 (defconstant nfp-save-offset 2)
 
 (defparameter *register-arg-tns*

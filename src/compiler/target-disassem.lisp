@@ -318,16 +318,6 @@
               (seg-virtual-location seg)
               (seg-code seg)))))
 
-;;;; function ops
-
-;;; the offset of FUNCTION from the start of its code-component's
-;;; instruction area
-(defun fun-insts-offset (simple-fun) ; FUNCTION *must* be pinned
-  (declare (type simple-fun simple-fun))
-  (- (get-lisp-obj-address simple-fun)
-     sb-vm:fun-pointer-lowtag
-     (sap-int (code-instructions (fun-code-header simple-fun)))))
-
 ;;;; operations on code-components (which hold the instructions for
 ;;;; one or more functions)
 
@@ -365,7 +355,7 @@
            (type alignment size))
   (zerop (logand (1- size) address)))
 
-#-(or x86 x86-64 arm64)
+#-(or x86 x86-64 arm64 riscv)
 (progn
 (defconstant lra-size (words-to-bytes 1))
 (defun lra-hook (chunk stream dstate)
@@ -608,24 +598,11 @@
         (prefix-len 0) ; sum of lengths of any prefix instruction(s)
         (prefix-print-names nil)) ; reverse list of prefixes seen
 
-   ;; To minimize the extent of disabled GC, the obligatory disabling for
-   ;; cheneygc occurs inside the per-instruction loop rather than around it.
-   ;; Otherwise, operating on huge memory regions could exhaust the heap.
-   ;; gencgc can do better though: pin SEG-OBJECT once only outside the loop.
-   (macrolet ((with-pinned-segment (&body body)
-                #-gencgc `(without-gcing
-                            (setf (dstate-segment-sap dstate)
-                                  (funcall (seg-sap-maker segment)))
-                            ,@body)
-                #+gencgc `(progn ,@body)))
-
     (rewind-current-segment dstate segment)
 
-    ;; Do not pin anything yet if using cheneygc, as that would inhibit GC
-    ;; with a larger scope than strictly necessary.
-    (with-pinned-objects (#+gencgc (seg-object (dstate-segment dstate))
-                          #+gencgc dstate) ; for SAP access to SCRATCH-BUF
-     #+gencgc (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
+    (with-pinned-objects ((seg-object (dstate-segment dstate))
+                          dstate) ; for SAP access to SCRATCH-BUF
+     (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
 
      ;; Now commence disssembly of instructions
      (loop
@@ -646,7 +623,6 @@
       (call-offs-hooks nil stream dstate)
 
       (unless (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
-        (with-pinned-segment
          (let* ((bytes-remaining (- (seg-length (dstate-segment dstate))
                                     (dstate-cur-offs dstate)))
                 (raw-chunk (get-dchunk dstate))
@@ -703,7 +679,7 @@
                           (funcall function chunk inst)
 
                           (awhen (inst-control inst)
-                            (funcall it chunk inst stream dstate))))))))))
+                            (funcall it chunk inst stream dstate)))))))))
 
       (setf (dstate-cur-offs dstate) (dstate-next-offs dstate))
 
@@ -718,7 +694,7 @@
               (nconc (dstate-filtered-arg-pool-free dstate)
                      (dstate-filtered-arg-pool-in-use dstate)))
         (setf (dstate-filtered-arg-pool-in-use dstate) nil)
-        (setf (dstate-inst-properties dstate) 0)))))))
+        (setf (dstate-inst-properties dstate) 0))))))
 
 
 (defun collect-labelish-operands (args cache)
@@ -752,15 +728,6 @@
   ;; add labels at the beginning with a label-number of nil; we'll notice
   ;; later and fill them in (and sort them)
   (declare (type disassem-state dstate))
-  ;; Holy cow, is this flaky. The problem is that labels are computed as absolute
-  ;; addresses, yet GC is (in theory) able to relocate the code while disassembling.
-  ;; The labels wouldn't make sense if that happens.
-  ;; I'm disinclined to revise all of the backends to compute labels relative to
-  ;; code-instructions. Probably we shouldn't try to support code movement while
-  ;; disassembling, it's just not worth the headache.
-  ;; However, a potential fix might be to pin the code while scanning it for
-  ;; labels, then relativize all labels to the segment base.
-  ;; When disassembling arbitrary memory, relativization would be skipped.
   (let ((labels (dstate-labels dstate)))
     (map-segment-instructions
      (lambda (chunk inst)
@@ -802,17 +769,14 @@
      dstate)
     ;; erase any notes that got there by accident
     (setf (dstate-notes dstate) nil)
-    ;; add labels from code header jump tables. As noted above,
-    ;; this is buggy if code moves, but no worse than anything else.
+    ;; add labels from code header jump tables.
     ;; CODE-JUMP-TABLE-WORDS = 0 if the architecture doesn't have jump tables.
     (binding* ((code (seg-code segment) :exit-if-null))
       (with-pinned-objects (code)
         (loop with insts = (code-instructions code)
               for i from 1 below (code-jump-table-words code)
               do (pushnew (cons (sap-ref-word insts (ash i sb-vm:word-shift)) nil)
-                          labels :key #'car
-                          ;; FIXME: compiler uses EQ instead of EQL unless forced
-                          :test #'=))))
+                          labels :key #'car :test #'=))))
     ;; Return the new list
     (setf (dstate-labels dstate) labels)))
 
@@ -1404,7 +1368,7 @@
       (format stream "#X~2,'0x" (sap-ref-8 sap (+ offs start-offs))))))
 
 (defvar *default-dstate-hooks*
-  (list* #-(or x86 x86-64 arm64) #'lra-hook nil))
+  (list* #-(or x86 x86-64 arm64 riscv) #'lra-hook nil))
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
@@ -1515,6 +1479,13 @@
 ;;; objects).
 ;;; INITIAL-OFFSET is the displacement into the instruction bytes
 ;;; of CODE (if supplied) that the segment begins at.
+;;;
+;;; Technically we need to pin OBJECT around all of calls of MAKE-SEGMENT
+;;; with that same object. Otherwise, the VIRTUAL-LOCATION slots could come
+;;; out inconsistently across them. It's unlikely to happen, but if it did,
+;;; that would tend to lead to buggy disassemblies due to subtlety of
+;;; absolute addressing in MAP-SEGMENT-INSTRUCTIONS that supposedly hides
+;;; the movability of the underlying object.
 (defun make-segment (object sap-maker length
                      &key
                      code (initial-offset 0) virtual-location
@@ -1846,62 +1817,39 @@
   (let* ((function (%fun-fun function))
          (code (fun-code-header function))
          (fun-map (code-fun-map code))
-         (fname (%simple-fun-name function))
          (sfcache (make-source-form-cache))
-         (first-block-seen-p nil)
-         (nil-block-seen-p nil)
-         (last-offset 0)
-         (last-debug-fun nil)
-         (segments nil))
-    (flet ((add-seg (offs len df)
-             (when (> len 0)
-               (push (make-code-segment code offs len
-                                        :debug-fun df
-                                        :source-form-cache sfcache)
-                     segments))))
-      (loop for fmap-entry = fun-map then next
-            for offset = (sb-c::compiled-debug-fun-offset fmap-entry)
-            for next = (sb-c::compiled-debug-fun-next fmap-entry)
-            do
-            (when first-block-seen-p
-              (add-seg last-offset
-                       (- offset last-offset)
-                       last-debug-fun)
-              (setf last-debug-fun nil))
-            (setf last-offset offset)
-            (let ((name (sb-c::compiled-debug-fun-name fmap-entry))
-                  (kind (sb-c::compiled-debug-fun-kind fmap-entry)))
-              #+nil
-              (format t ";;; SAW ~S ~S ~S,~S ~W,~W~%"
-                      name kind first-block-seen-p nil-block-seen-p
-                      last-offset
-                      (sb-c::compiled-debug-fun-start-pc fmap-entry))
-              (cond (#+nil (eq last-offset fun-offset)
-                     (and (equal name fname)
-                          (null kind)
-                          (not first-block-seen-p))
-                     (setf first-block-seen-p t))
-                    ((eq kind :external)
-                     (when first-block-seen-p
-                       (return)))
-                    ((eq kind nil)
-                     (when nil-block-seen-p
-                       (return))
-                     (when first-block-seen-p
-                       (setf nil-block-seen-p t))))
-              (setf last-debug-fun
-                    (sb-di::make-compiled-debug-fun fmap-entry code)))
-            while next)
-      (let ((max-offset (%code-text-size code)))
-        (when (and first-block-seen-p last-debug-fun)
-          (add-seg last-offset
-                   (- max-offset last-offset)
-                   last-debug-fun))
-        (if (null segments) ; FIXME: when does this happen? Comment PLEASE
-            (let ((offs (fun-insts-offset function)))
-              (list
-               (make-code-segment code offs (- max-offset offs))))
-            (nreverse segments))))))
+         (fun-start (sb-di::function-start-pc-offset function))
+         (max-offset (%code-text-size code)))
+    (loop for cdf = fun-map then next
+          for offset = (sb-c::compiled-debug-fun-offset cdf)
+          for next = (sb-c::compiled-debug-fun-next cdf)
+          when (and (not (sb-c::compiled-debug-fun-kind cdf))
+                    (>= offset fun-start))
+          do (let* ((len (-
+                          (if next
+                              (sb-c::compiled-debug-fun-offset next)
+                              max-offset)
+                          offset))
+                    (elsewhere (sb-c::compiled-debug-fun-elsewhere-pc cdf))
+                    (elsewhere-len (and next
+                                        (- (sb-c::compiled-debug-fun-elsewhere-pc next)
+                                           elsewhere))))
+               (when (plusp len)
+                 (let ((df (sb-di::make-compiled-debug-fun cdf code)))
+                   (return (list* (make-code-segment code offset len
+                                                     :debug-fun df
+                                                     :source-form-cache sfcache)
+                                  (and next ;; otherwise the above segment will already contain elsewhere
+                                       (plusp elsewhere-len)
+                                       (list (make-code-segment code elsewhere elsewhere-len
+                                                                :debug-fun df
+                                                                :source-form-cache sfcache))))))))
+          while next
+          finally
+          ;; FIXME: when does this happen? Comment PLEASE
+          (return
+            (list
+             (make-code-segment code fun-start (- max-offset fun-start)))))))
 
 ;;; Return a list of the segments of memory containing machine code
 ;;; instructions for the code-component CODE. If START-OFFSET and/or
@@ -2219,8 +2167,7 @@
 (define-load-time-global *grokked-symbol-slots*
   (sort (copy-list `((,sb-vm:symbol-value-slot . symbol-value)
                      (,sb-vm:symbol-info-slot . symbol-info)
-                     (,sb-vm:symbol-name-slot . symbol-name)
-                     #-compact-symbol (,sb-vm:symbol-package-slot . symbol-package)))
+                     (,sb-vm:symbol-name-slot . symbol-name)))
         #'<
         :key #'car))
 
@@ -2519,12 +2466,15 @@
     (when name
       (when (eql offs 0)
         (setq offs nil))
-      (note (cond (note-address-p
-                   (format nil "#x~8,'0x: ~a~@[ +~d~]" address name offs))
-                  (offs
-                   (format nil "~a +~d" name offs))
-                  (t
-                   (string name)))
+      (note (lambda (stream)
+              (cond (note-address-p
+                     (format stream "#x~8,'0x: ~a~@[ +~d~]" address name offs))
+                    (offs
+                     (format stream "~a +~d" name offs))
+                    ((stringp name)
+                     (princ name stream))
+                    (t
+                     (prin1 name stream))))
             dstate))
     name))
 

@@ -250,7 +250,7 @@ bootstrapping.
 
 (defmacro defgeneric (fun-name lambda-list &body options)
   (declare (type list lambda-list))
-  (check-designator fun-name defgeneric)
+  (check-designator fun-name 'defgeneric #'legal-fun-name-p "function name")
   (with-current-source-form (lambda-list)
     (check-gf-lambda-list lambda-list))
   (let ((initargs ())
@@ -433,7 +433,7 @@ bootstrapping.
 ;;; which means that checking of callers' arglists can only occur after called
 ;;; methods are actually loaded.
 (defmacro defmethod (name &rest args)
-  (check-designator name defmethod)
+  (check-designator name 'defmethod #'legal-fun-name-p "function name")
   (multiple-value-bind (qualifiers lambda-list body)
       (parse-defmethod args)
     `(progn
@@ -1789,11 +1789,9 @@ bootstrapping.
                                  (slot-value #'optimize-slot-value)
                                  (set-slot-value #'optimize-set-slot-value)
                                  (slot-boundp #'optimize-slot-boundp))))
-                      `(sb-c::with-source-form ,form
-                        ,(funcall fun form slots required-parameters env)))
+                      (funcall fun form slots required-parameters env))
                     form))
                (t form))))
-
       (let* ((sb-walker::*walk-form-preserve-source* t)
              (walked-lambda (walk-form method-lambda env #'walk-function)))
         ;;; FIXME: the walker's rewriting of the source code causes
@@ -1840,18 +1838,29 @@ bootstrapping.
 (defun load-defmethod-internal
     (method-class gf-spec qualifiers specializers lambda-list
                   initargs source-location)
-  (when (and (eq **boot-state** 'complete)
-             (fboundp gf-spec))
-    (let* ((gf (fdefinition gf-spec))
-           (method (and (generic-function-p gf)
-                        (generic-function-methods gf)
-                        (find-method gf qualifiers specializers nil))))
-      (when method
-        (warn 'sb-kernel:redefinition-with-defmethod
-              :name gf-spec
-              :new-location source-location
-              :old-method method
-              :qualifiers qualifiers :specializers specializers))))
+  (block nil
+    (when (and (eq **boot-state** 'complete)
+               (fboundp gf-spec))
+      (restart-bind
+          ((continue (lambda ()
+                       (fmakunbound gf-spec)
+                       (return))
+                     :report-function
+                     (lambda (stream)
+                       (format stream "Unbind the generic function"))
+                     :test-function
+                     (lambda (c)
+                       (typep c 'find-method-length-mismatch))))
+        (let* ((gf (fdefinition gf-spec))
+               (method (and (generic-function-p gf)
+                            (generic-function-methods gf)
+                            (find-method gf qualifiers specializers nil))))
+          (when method
+            (warn 'sb-kernel:redefinition-with-defmethod
+                  :name gf-spec
+                  :new-location source-location
+                  :old-method method
+                  :qualifiers qualifiers :specializers specializers))))))
   (let ((method (apply #'add-named-method
                        gf-spec qualifiers specializers lambda-list
                        'source source-location
@@ -2855,19 +2864,6 @@ bootstrapping.
 
   (/show "leaving !FIX-EARLY-GENERIC-FUNCTIONS"))
 
-;;; PARSE-DEFMETHOD is used by DEFMETHOD to parse the &REST argument
-;;; into the 'real' arguments. This is where the syntax of DEFMETHOD
-;;; is really implemented.
-(defun parse-defmethod (cdr-of-form)
-  (declare (list cdr-of-form))
-  (let ((qualifiers ())
-        (spec-ll ()))
-    (loop (if (and (car cdr-of-form) (atom (car cdr-of-form)))
-              (push (pop cdr-of-form) qualifiers)
-              (return (setq qualifiers (nreverse qualifiers)))))
-    (setq spec-ll (pop cdr-of-form))
-    (values qualifiers spec-ll cdr-of-form)))
-
 (defun parse-specializers (generic-function specializers)
   (declare (list specializers))
   (flet ((parse (spec)
@@ -2888,46 +2884,6 @@ bootstrapping.
   (def 1 extract-lambda-list)
   (def 2 extract-specializer-names))
 
-(define-condition specialized-lambda-list-error
-    (reference-condition simple-program-error)
-  ()
-  (:default-initargs :references '((:ansi-cl :section (3 4 3)))))
-
-(defun specialized-lambda-list-error (format-control &rest format-arguments)
-  (error 'specialized-lambda-list-error
-         :format-control format-control
-         :format-arguments format-arguments))
-
-;; Return 3 values:
-;; - the bound variables, without defaults, supplied-p vars, or &AUX vars.
-;; - the lambda list without specializers.
-;; - just the specializers
-(defun parse-specialized-lambda-list (arglist)
-  (binding* (((llks specialized optional rest key aux)
-              (parse-lambda-list
-               arglist
-               :context 'defmethod
-               :accept (lambda-list-keyword-mask
-                        '(&optional &rest &key &allow-other-keys &aux))
-               :silent t         ; never signal &OPTIONAL + &KEY style-warning
-               :condition-class 'specialized-lambda-list-error))
-             (required (mapcar (lambda (x) (if (listp x) (car x) x)) specialized))
-             (specializers (mapcar (lambda (x) (if (listp x) (cadr x) t)) specialized)))
-    (check-lambda-list-names
-     llks required optional rest key aux nil nil
-     :context "a method lambda list" :signal-via #'specialized-lambda-list-error)
-    (values (append required
-                    (mapcar #'parse-optional-arg-spec optional)
-                    rest
-                    ;; Preserve keyword-names when given as (:KEYWORD var)
-                    (mapcar (lambda (x)
-                              (if (typep x '(cons cons))
-                                  (car x)
-                                  (parse-key-arg-spec x)))
-                            key))
-            (make-lambda-list llks nil required optional rest key aux)
-            specializers)))
-
 (setq **boot-state** 'early)
 
 ;;; FIXME: In here there was a #-CMU definition of SYMBOL-MACROLET

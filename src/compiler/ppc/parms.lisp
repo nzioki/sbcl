@@ -34,7 +34,7 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -50,10 +50,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-;;; flags for the generational garbage collector
-(defconstant pseudo-atomic-interrupted-flag 1)
-(defconstant pseudo-atomic-flag 4)
 
 (defconstant float-inexact-trap-bit (ash 1 0))
 (defconstant float-divide-by-zero-trap-bit (ash 1 1))
@@ -107,8 +103,7 @@
                      :dynamic-space-start
                      #+linux   #x4f000000
                      #+netbsd  #x4f000000
-                     #+openbsd #x4f000000
-                     #+darwin  #x10000000)
+                     #+openbsd #x4f000000)
 
 (defconstant linkage-table-growth-direction :up)
 (defconstant linkage-table-entry-size 16)
@@ -140,13 +135,6 @@
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x5cfff000)))
-
-#+darwin
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x10000000)
-    (defparameter dynamic-0-space-end   #x3ffff000)))
 
 (defenum (:start 8)
   halt-trap

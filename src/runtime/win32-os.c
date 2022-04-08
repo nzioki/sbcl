@@ -61,6 +61,7 @@
 #include "unaligned.h"
 
 #include "gc.h"
+#include "gc-private.h"
 #include "gencgc-internal.h"
 #include <wincrypt.h>
 #include <stdarg.h>
@@ -1041,17 +1042,17 @@ static int
 handle_breakpoint_trap(os_context_t *ctx, struct thread* self)
 {
 #ifdef LISP_FEATURE_UD2_BREAKPOINTS
-    if (((unsigned short *)*os_context_pc_addr(ctx))[0] != 0x0b0f)
+    if (((unsigned short *)OS_CONTEXT_PC(ctx))[0] != 0x0b0f)
         return -1;
 #endif
 
     /* Unlike some other operating systems, Win32 leaves EIP
      * pointing to the breakpoint instruction. */
-    (*os_context_pc_addr(ctx)) += TRAP_CODE_WIDTH;
+    OS_CONTEXT_PC(ctx) += TRAP_CODE_WIDTH;
 
     /* Now EIP points just after the INT3 byte and aims at the
      * 'kind' value (eg trap_Cerror). */
-    unsigned trap = *(unsigned char *)(*os_context_pc_addr(ctx));
+    unsigned trap = *(unsigned char *)OS_CONTEXT_PC(ctx);
 
 #ifdef LISP_FEATURE_SB_THREAD
     /* Before any other trap handler: gc_safepoint ensures that
@@ -1546,10 +1547,10 @@ io_end_interruptible(HANDLE handle)
 {
     if (!ptr_CancelIoEx)
         return;
-    thread_mutex_lock(&interrupt_io_lock);
+    EnterCriticalSection(&interrupt_io_lock);
     __sync_bool_compare_and_swap(&thread_extra_data(get_sb_vm_thread())->synchronous_io_handle_and_flag,
                                  handle, 0);
-    thread_mutex_unlock(&interrupt_io_lock);
+    LeaveCriticalSection(&interrupt_io_lock);
 }
 #define WITH_INTERRUPTIBLE_IO(handle)      \
     if (!io_begin_interruptible(handle)) { \
@@ -1629,7 +1630,7 @@ int console_handle_p(HANDLE handle)
 
 static __stdcall unsigned int tty_read_line_server(LPVOID arg)
 {
-    thread_mutex_lock(&ttyinput.lock);
+    EnterCriticalSection(&ttyinput.lock);
     while (ttyinput.handle) {
         DWORD nchars;
         BOOL ok;
@@ -1637,7 +1638,7 @@ static __stdcall unsigned int tty_read_line_server(LPVOID arg)
         while (!ttyinput.in_progress)
           SleepConditionVariableCS(&ttyinput.cond_has_client,&ttyinput.lock,INFINITE);
 
-        thread_mutex_unlock(&ttyinput.lock);
+        LeaveCriticalSection(&ttyinput.lock);
 #ifdef LISP_FEATURE_SB_UNICODE
         ok = ReadConsoleW(ttyinput.handle,
                           &ttyinput.buffer[ttyinput.tail],
@@ -1650,7 +1651,7 @@ static __stdcall unsigned int tty_read_line_server(LPVOID arg)
                          &nchars,NULL);
 #endif
 
-        thread_mutex_lock(&ttyinput.lock);
+        EnterCriticalSection(&ttyinput.lock);
 
         if (ok) {
             ttyinput.tail += nchars;
@@ -1658,7 +1659,7 @@ static __stdcall unsigned int tty_read_line_server(LPVOID arg)
         }
         ttyinput.in_progress = 0;
     }
-    thread_mutex_unlock(&ttyinput.lock);
+    LeaveCriticalSection(&ttyinput.lock);
     return 0;
 }
 
@@ -1689,7 +1690,7 @@ win32_tty_listen(HANDLE handle)
     boolean result = 0;
     INPUT_RECORD ir;
     DWORD nevents;
-    thread_mutex_lock(&ttyinput.lock);
+    EnterCriticalSection(&ttyinput.lock);
     if (!tty_maybe_initialize_unlocked(handle))
         result = 0;
 
@@ -1705,7 +1706,7 @@ win32_tty_listen(HANDLE handle)
             }
         }
     }
-    thread_mutex_unlock(&ttyinput.lock);
+    LeaveCriticalSection(&ttyinput.lock);
     return result;
 }
 
@@ -1721,7 +1722,7 @@ static int win32_read_console(HANDLE handle, void* buf, int count)
 
     count = nchars*sizeof(console_char);
 
-    thread_mutex_lock(&ttyinput.lock);
+    EnterCriticalSection(&ttyinput.lock);
 
     if (!tty_maybe_initialize_unlocked(handle)) {
         result = -1;
@@ -1778,7 +1779,7 @@ static int win32_read_console(HANDLE handle, void* buf, int count)
         }
     }
 unlock:
-    thread_mutex_unlock(&ttyinput.lock);
+    LeaveCriticalSection(&ttyinput.lock);
     return result;
 }
 
@@ -1794,7 +1795,7 @@ win32_maybe_interrupt_io(void* thread)
 #endif
 
     if (ptr_CancelIoEx) {
-        thread_mutex_lock(&interrupt_io_lock);
+        EnterCriticalSection(&interrupt_io_lock);
         HANDLE h = (HANDLE)
             InterlockedExchangePointer((volatile LPVOID *)
                                        &thread_extra_data(th)->synchronous_io_handle_and_flag,
@@ -1802,9 +1803,9 @@ win32_maybe_interrupt_io(void* thread)
 
         if (h && (h!=INVALID_HANDLE_VALUE)) {
             if (console_handle_p(h)) {
-                thread_mutex_lock(&ttyinput.lock);
+                EnterCriticalSection(&ttyinput.lock);
                 WakeAllConditionVariable(&ttyinput.cond_has_data);
-                thread_mutex_unlock(&ttyinput.lock);
+                LeaveCriticalSection(&ttyinput.lock);
                 done = 1;
                 goto unlock;
             }
@@ -1814,7 +1815,7 @@ win32_maybe_interrupt_io(void* thread)
             done |= !!ptr_CancelIoEx(h,NULL);
         }
     unlock:
-        thread_mutex_unlock(&interrupt_io_lock);
+        LeaveCriticalSection(&interrupt_io_lock);
     }
     return done;
 }

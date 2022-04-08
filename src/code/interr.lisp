@@ -221,10 +221,12 @@
                    (info :variable :type symbol)
                  (if (and defined
                           (not (ctypep value type)))
-                     (still-bad (sb-format:tokens
-                                 "Type mismatch when restarting unbound symbol error:~@
-                                 ~s is not of type ~/sb-impl:print-type/")
-                                value type)
+                     (try (make-condition 'type-error
+                                          :datum value
+                                          :expected-type (type-specifier type)
+                                          :context
+                                          (format nil "while restarting unbound variable ~a."
+                                                  symbol)))
                      value)))
              (set-value (value &optional set-symbol)
                (sb-di::sub-set-debug-var-slot
@@ -238,12 +240,7 @@
              (retry-evaluation ()
                (if (boundp symbol)
                    (set-value (symbol-value symbol))
-                   (still-bad "~s is still unbound" symbol)))
-             (still-bad (format-control &rest format-arguments)
-               (try (make-condition 'retry-unbound-variable
-                                    :name symbol
-                                    :format-control format-control
-                                    :format-arguments format-arguments)))
+                   (try condition)))
              (try (condition)
                (restart-case (error condition)
                  (continue ()
@@ -314,32 +311,66 @@
          :operation '/
          :operands (list this that)))
 
+(defun restart-type-error (type condition pc-offset)
+  (let ((tn-offset (car *current-internal-error-args*)))
+    (labels ((retry-value (value)
+               (if (typep value type)
+                   value
+                   (try (make-condition 'type-error
+                                        :expected-type type
+                                        :datum value
+                                        :context "while restarting a type error."))))
+             (set-value (value)
+               (sb-di::sub-set-debug-var-slot
+                nil tn-offset (retry-value value)
+                *current-internal-error-context*)
+               (sb-vm::incf-context-pc *current-internal-error-context*
+                                       pc-offset)
+               (return-from restart-type-error))
+             (try (condition)
+               (restart-case (error condition)
+                 (use-value (value)
+                   :report (lambda (stream)
+                             (format stream "Use specified value."))
+                   :interactive read-evaluated-form
+                   (set-value value)))))
+      (try condition))))
+
+(defun object-not-type-error (object type &optional (context nil context-p))
+  (if (invalid-array-p object)
+      (invalid-array-error object)
+      (let* ((context (if context-p
+                          context
+                          (sb-di:error-context)))
+             (condition
+               (make-condition (if (and (%instancep object)
+                                        (wrapper-invalid (%instance-wrapper object)))
+                                   ;; Signaling LAYOUT-INVALID is dubious, but I guess it provides slightly
+                                   ;; more information in that it says that the object may have at some point
+                                   ;; been TYPE. Anyway, it's not wrong - it's a subtype of TYPE-ERROR.
+                                   'layout-invalid
+                                   'type-error)
+                               :datum object
+                               :expected-type (typecase type
+                                                (classoid-cell
+                                                 (classoid-cell-name type))
+                                                (wrapper
+                                                 (wrapper-proper-name type))
+                                                (t
+                                                 type))
+                               :context (and (not (integerp context))
+                                             context))))
+        (if (integerp context)
+            (restart-type-error type condition context)
+            (error condition)))))
+
 (macrolet ((def (errname fun-name)
              `(setf (svref **internal-error-handlers**
                            ,(error-number-or-lose errname))
                     (fdefinition ',fun-name))))
   (def etypecase-failure-error etypecase-failure)
-  (def ecase-failure-error ecase-failure))
-
-(deferr object-not-type-error (object type)
-  (if (invalid-array-p object)
-      (invalid-array-error object)
-      (error (if (and (%instancep object)
-                      (wrapper-invalid (%instance-wrapper object)))
-                 ;; Signaling LAYOUT-INVALID is dubious, but I guess it provides slightly
-                 ;; more information in that it says that the object may have at some point
-                 ;; been TYPE. Anyway, it's not wrong - it's a subtype of TYPE-ERROR.
-                 'layout-invalid
-                 'type-error)
-             :datum object
-             :expected-type (typecase type
-                              (classoid-cell
-                               (classoid-cell-name type))
-                              (wrapper
-                               (wrapper-proper-name type))
-                              (t
-                               type))
-             :context (sb-di:error-context))))
+  (def ecase-failure-error ecase-failure)
+  (def object-not-type-error object-not-type-error))
 
 (deferr odd-key-args-error ()
   (%program-error "odd number of &KEY arguments"))
@@ -401,6 +432,55 @@
   (bug "~@<failed AVER: ~2I~_~S~:>" form))
 (deferr unreachable-error ()
   (bug "Unreachable code reached"))
+
+(deferr mul-overflow-error (low high)
+  (destructuring-bind (raw-low raw-high) *current-internal-error-args*
+    (declare (ignorable raw-low raw-high))
+    (let ((type (or (sb-di:error-context)
+                    'fixnum)))
+      (object-not-type-error #+x86-64
+                             (* low high)
+                             #-x86-64
+                             (if (memq (sb-c:sc+offset-scn raw-low) `(,sb-vm:any-reg-sc-number
+                                                                      ,sb-vm:descriptor-reg-sc-number))
+                                 (ash (logior
+                                       (ash high sb-vm:n-word-bits)
+                                       (ldb (byte sb-vm:n-word-bits 0) (ash low sb-vm:n-fixnum-tag-bits)))
+                                      (- sb-vm:n-fixnum-tag-bits))
+                                 (logior
+                                  (ash high sb-vm:n-word-bits)
+                                  (ldb (byte sb-vm:n-word-bits 0) low)))
+                             type
+                             nil))))
+
+(sb-c::when-vop-existsp (:translate sb-c::unsigned+)
+  (flet ((err (x of cf)
+           (let* ((raw-x (car *current-internal-error-args*))
+                  (signed (= (sb-c:sc+offset-scn raw-x) sb-vm:signed-reg-sc-number)))
+             (let ((type (or (sb-di:error-context)
+                             'fixnum))
+                   (x (if signed
+                          (cond ((and of cf)
+                                 (dpb x (byte sb-vm:n-word-bits 0) -1))
+                                (of
+                                 (ldb (byte sb-vm:n-word-bits 0) x))
+                                (t
+                                 (bug "flags")))
+                          (cond (cf
+                                 (dpb 1 (byte 1 sb-vm:n-word-bits) x))
+                                (of
+                                 (sb-c::mask-signed-field sb-vm:n-word-bits x))
+                                (t
+                                 (dpb x (byte sb-vm:n-word-bits 0) -1))))))
+               (object-not-type-error x type nil)))))
+    (deferr add-sub-overflow-error (x)
+      (multiple-value-bind (of cf) (sb-vm::context-overflow-carry-flags *current-internal-error-context*)
+        (err x of cf)))
+
+   #+x86-64
+    (deferr sub-overflow-error (x)
+      (multiple-value-bind (of cf) (sb-vm::context-overflow-carry-flags *current-internal-error-context*)
+        (err x of (not cf))))))
 
 ;;;; INTERNAL-ERROR signal handler
 
@@ -450,13 +530,10 @@
                                   :format-arguments (list slot-name struct-name)
                                   :datum (make-unbound-marker)
                                   :expected-type (if dsd (dsd-type dsd) 't))))
-                       (error 'type-error
-                              :datum (sb-di::sub-access-debug-var-slot
-                                      fp (first arguments) alien-context)
-                              :expected-type
-                              (car (svref sb-c:+backend-internal-errors+
-                                          error-number))
-                              :context context)))
+                       (object-not-type-error (sb-di::sub-access-debug-var-slot
+                                               fp (first arguments) alien-context)
+                                              (car (svref sb-c:+backend-internal-errors+
+                                                          error-number)))))
                  (let ((handler
                          (and (typep error-number `(mod ,n-internal-error-handlers))
                               (svref **internal-error-handlers** error-number))))

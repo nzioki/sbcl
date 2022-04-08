@@ -296,7 +296,7 @@
     (inst li temp (make-fixup "gc_card_table_mask" :foreign-dataref)) ; linkage entry
     (inst ld temp temp) ; address of gc_card_table_mask
     (inst ld temp temp) ; value of gc_card_table_mask
-    (pseudo-atomic ()
+    (pseudo-atomic (temp)
       ;; Compute card mark index
       (inst srl card object gencgc-card-shift)
       (inst and card card temp)
@@ -305,7 +305,7 @@
       (inst ld temp temp) ; address of gc_card_mark
       (inst ld temp temp) ; value of gc_card_mark
       ;; Touch the card mark byte.
-      (inst stb zero-tn temp card)
+      (inst stb null-tn temp card)
       ;; set 'written' flag in the code header
       ;; If two threads get here at the same time, they'll write the same byte.
       (let ((byte #+big-endian (- other-pointer-lowtag) #+little-endian (bug "Wat")))

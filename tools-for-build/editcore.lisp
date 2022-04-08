@@ -333,6 +333,8 @@
   ;; but no more so than everything else in this file)
   (let ((locs (sb-c::compiled-debug-fun-encoded-locs
                (truly-the sb-c::compiled-debug-fun compiled-debug-fun))))
+    (when (consp locs)
+      (setq locs (cdr (translate locs spaces))))
     (sb-c::compiled-debug-fun-offset
      (sb-c::make-compiled-debug-fun
       :name nil
@@ -1024,12 +1026,14 @@
                        (car (translate (sb-vm::%%code-debug-info code-component) spaces))
                        spaces))
               #'< :key #'cadr)))
-        ;; Possibly a padding word
+        ;; Possibly unboxed words and/or padding
         (let ((here (ash jump-table-count sb-vm:word-shift))
               (first-entry-point (cadar name->addr)))
           (when (> first-entry-point here)
-            (assert (= first-entry-point (+ here 8)))
-            (format output " .quad 0~%")))
+            (format output " .quad ~{0x~x~^,~}~%"
+                    (loop for offs = here then (+ offs 8)
+                          while (< offs first-entry-point)
+                          collect (sap-ref-word (code-instructions code-component) offs)))))
         ;; Loop over the embedded routines
         (let ((list name->addr)
               (obj-size (code-object-size code-component)))
@@ -1764,7 +1768,7 @@
                (aver (= data-page original-total-npages))
                (aver (= (ceiling (space-nwords
                                   (find dynamic-core-space-id spaces :key #'space-id))
-                                 (/ sb-vm:gencgc-card-bytes n-word-bytes))
+                                 (/ sb-vm:gencgc-page-bytes n-word-bytes))
                         n-ptes))
                (when verbose
                  (format t "PTE: page=~5x~40tbytes=~8x~%" data-page nbytes))

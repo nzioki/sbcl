@@ -168,10 +168,10 @@
     (:nle . 15) (:g . 15))
   #'equal)
 (defconstant-eqx +condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
 (define-arg-type condition-code :printer +condition-name-vec+)
@@ -2449,14 +2449,29 @@
          (aver (not (sb-vm::self-referential-code-fixup-p value code)))
          :relative)))))
 
+;;; Coverage support
+
+(define-instruction store-coverage-mark (segment mark-index)
+  (:emitter
+   (let ((offset (+ (component-header-length)
+                    ;; skip over jump table word and entries
+                    (* (1+ (component-n-jump-table-entries))
+                       n-word-bytes)
+                    mark-index
+                    (- other-pointer-lowtag))))
+     (assemble (segment)
+       (inst mov (make-ea :byte :disp (make-fixup nil :code-object offset)) 1)))))
+
 ;;; Perform exhaustive analysis here because of the extreme degree
 ;;; of confusion I have about what is allowed to reach the instruction
 ;;; emitter as a raw fixup, a fixup wrapped in an EA, a label wrapped
 ;;; in a fixup wrapped in an EA etc.
+;;; (The x86-64 assembler is more understandable - we need to kill this one)
 (defun sb-assem::%mark-used-labels (operand)
   (named-let recurse ((operand operand))
     (etypecase operand
       ((or integer tn keyword null))
+      #+sb-xc-host ((cons (eql sb-assem::entry)))
       (ea
        (let ((disp (ea-disp operand)))
          (etypecase disp
@@ -2469,16 +2484,3 @@
                 (setf (label-usedp offset) t))
                ((consp offset)
                 (setf (label-usedp (car offset)) t))))))))
-
-(defun sb-c::branch-opcode-p (mnemonic)
-  (case mnemonic
-    ((call ret jmp jecxz break int iret
-      loop loopz loopnz syscall
-      byte word dword) ; unexplained phenomena
-     t)))
-
-;;; Replace the STATEMENT with an instruction to store a coverage mark
-;;; in the OFFSETth byte beyond LABEL.
-(defun sb-c::replace-coverage-instruction (statement label offset)
-  (setf (stmt-mnemonic statement) 'mov
-        (stmt-operands statement) `(,(make-ea :byte :disp `(+ ,label ,offset)) 1)))

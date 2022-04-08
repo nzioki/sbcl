@@ -322,13 +322,13 @@ of :INHERITED :EXTERNAL :INTERNAL."
 (defun make-package-hashtable (size)
   (flet ((actual-package-hashtable-size (size)
            (loop for n of-type fixnum
-              from (logior (ceiling size +package-rehash-threshold+) 1)
+              from (logior (ceiling size #.+package-rehash-threshold+) 1)
               by 2
               when (positive-primep n) return n)))
     (let* ((n (actual-package-hashtable-size size))
            ;; SIZE is how many symbols we'd like to be able to store,
            ;; but the number of physical cells is N, chosen for its primality.
-           (size (truncate (* n +package-rehash-threshold+)))
+           (size (truncate (* n #.+package-rehash-threshold+)))
            (table (make-array n :initial-element 0)))
       (%make-package-hashtable table size))))
 
@@ -842,9 +842,7 @@ Experimental: interface subject to change."
                (floor (info-storage-capacity (info-env-storage table)) 4))
         ;; Otherwise, when >1/4th of the table consists of tombstones,
         ;; then rebuild the table.
-        (%rebuild-package-names table)
-        (when (eq oldval :deleted)
-          (setq oldval nil))))
+        (%rebuild-package-names table)))
     (setf (info-gethash name table) object)
     (when (eq oldval :deleted)
       (decf (info-env-tombstones table)))))
@@ -1048,12 +1046,9 @@ implementation it is ~S." *!default-package-use-list*)
                       (new-length (min (+ current-length 10) +package-id-overflow+))
                       (new-vector (make-array new-length :initial-element nil)))
                  (replace new-vector vector)
-                 (with-pinned-objects (vector)
-                   (setf (extern-alien "lisp_package_vector" unsigned)
-                         (get-lisp-obj-address new-vector)))
+                 (setf *id->package* new-vector)
                  (setf new-id current-length
-                       vector new-vector
-                       *id->package* vector)))
+                       vector new-vector)))
              (when new-id
                (setf (package-id package) new-id
                      (aref vector new-id) package)))
@@ -1887,10 +1882,7 @@ PACKAGE."
       (let ((id (package-id pkg)))
         (when id (setq max-id (max id max-id)))))
     (let ((a (make-array (1+ max-id) :initial-element nil)))
-      (setq *id->package* a)
-      (with-pinned-objects (a)
-        (setf (extern-alien "lisp_package_vector" unsigned)
-              (get-lisp-obj-address a)))
+      (setf *id->package* a)
       (do-packages (pkg)
         (let ((id (package-id pkg)))
           (when id

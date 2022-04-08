@@ -117,8 +117,12 @@
        (load-immediate-word y (fixnumize val)))
       (character
        (let* ((codepoint (char-code val))
-              (encoded-character (dpb codepoint (byte 24 8) character-widetag)))
-         (load-immediate-word y encoded-character)))
+              (tagged (dpb codepoint (byte 24 8) character-widetag)))
+         (load-immediate-word y tagged)))
+      (single-float
+       (let* ((bits (single-float-bits val))
+              (tagged (dpb bits (byte 32 32) single-float-widetag)))
+         (load-immediate-word y tagged)))
       (symbol
        (load-symbol y val)))))
 
@@ -404,16 +408,18 @@
 ;;; ARG is a fixnum or bignum; figure out which and load if necessary.
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg)))
+  (:results-var results)
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "integer to untagged word coercion")
   (:generator 4
     #.(assert (= fixnum-tag-mask 1))
-    (sc-case y
-      (signed-reg
-       (inst asr y x n-fixnum-tag-bits))
-      (unsigned-reg
-       (inst lsr y x n-fixnum-tag-bits)))
-    (inst tbz x 0 DONE)
+    (when (types-equal-or-intersect (tn-ref-type results) (specifier-type 'fixnum))
+      (sc-case y
+        (signed-reg
+         (inst asr y x n-fixnum-tag-bits))
+        (unsigned-reg
+         (inst lsr y x n-fixnum-tag-bits)))
+      (inst tbz x 0 DONE))
     (loadw y x bignum-digits-offset other-pointer-lowtag)
     DONE))
 
@@ -502,7 +508,7 @@
       ;; value we're boxing is CLEAR, we need to shrink the bignum by
       ;; one word, hence the following:
       (inst tbnz x (1- n-word-bits) STORE)
-      (load-immediate-word pa-flag (compute-object-header (+ 1 bignum-digits-offset) bignum-widetag))
+      (load-immediate-word pa-flag (bignum-header-for-length 1))
       STORE
       ;; See the comment in move-from-signed
       (storew-pair pa-flag 0 x bignum-digits-offset tmp-tn))
@@ -546,3 +552,13 @@
 ;;; descriptor passing location.
 (define-move-vop move-arg :move-arg
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
+
+(define-vop (move-conditional-result)
+  (:results (res :scs (descriptor-reg)))
+  (:info true)
+  (:generator 1
+    (move res null-tn)
+    (inst b done)
+    (emit-label true)
+    (load-symbol res t)
+    done))

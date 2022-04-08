@@ -23,7 +23,7 @@
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg)))
+         (value :scs (descriptor-reg any-reg zero)))
   (:info name offset lowtag)
   (:ignore name)
   (:results)
@@ -47,7 +47,7 @@
     (inst sc temp new lip :aq :rl)
     (inst bne temp zero-tn LOOP)
     EXIT))
-
+
 ;;;; Symbol hacking VOPs:
 (define-vop (%compare-and-swap-symbol-value)
   (:translate %compare-and-swap-symbol-value)
@@ -290,7 +290,7 @@
 ;;; symbol.
 #+sb-thread
 (define-vop (dynbind)
-  (:args (value :scs (any-reg descriptor-reg))
+  (:args (value :scs (any-reg descriptor-reg zero))
          (symbol :scs (descriptor-reg) :target alloc-tls-symbol))
   ;; These have a dual personality in the assembly routine. We are
   ;; trying to pack as tightly as possible.
@@ -303,7 +303,7 @@
      (load-tls-index tls-index symbol)
      (inst bne tls-index zero-tn TLS-VALID)
      (move alloc-tls-symbol symbol)
-     (invoke-asm-routine 'alloc-tls-index)
+     (inst jal lip (make-fixup 'alloc-tls-index :assembly-routine))
      TLS-VALID
      (inst add lip thread-base-tn tls-index)
      (loadw value-temp lip)
@@ -316,7 +316,7 @@
 
 #-sb-thread
 (define-vop (dynbind)
-  (:args (value :scs (any-reg descriptor-reg))
+  (:args (value :scs (any-reg descriptor-reg zero))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (any-reg)) bsp-temp)
@@ -399,7 +399,7 @@
 
 (define-full-setter %closure-index-set *
   closure-info-offset fun-pointer-lowtag
-  (descriptor-reg any-reg) * %closure-index-set)
+  (descriptor-reg any-reg zero) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -448,7 +448,7 @@
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-ref)
 
 (define-full-setter instance-index-set * instance-slots-offset
-  instance-pointer-lowtag (descriptor-reg any-reg) * %instance-set)
+  instance-pointer-lowtag (descriptor-reg any-reg zero) * %instance-set)
 
 (define-full-casser instance-index-cas * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-cas)
@@ -464,7 +464,7 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg))
-         (value :scs (any-reg descriptor-reg)))
+         (value :scs (any-reg descriptor-reg zero)))
   (:arg-types * tagged-num *)
   (:temporary (:scs (non-descriptor-reg)) temp card)
   (:temporary (:sc non-descriptor-reg) pa-flag)
@@ -482,7 +482,7 @@
       (loadw temp temp) ; value of gc_card_mark (pointer)
       ;; Touch the card mark byte.
       (inst add temp temp card)
-      (inst sb zero-tn temp 0)
+      (inst sb null-tn temp 0)
       ;; set 'written' flag in the code header
       ;; If two threads get here at the same time, they'll write the same byte.
       (let ((byte (- 3 other-pointer-lowtag)))

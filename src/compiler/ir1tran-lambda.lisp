@@ -26,8 +26,8 @@
 
 ;;; Return a VAR structure for NAME, filling in info if it is globally
 ;;; special. If it is losing, we punt with a COMPILER-ERROR.
-(declaim (ftype (sfunction (symbol) lambda-var) varify-lambda-arg))
-(defun varify-lambda-arg (name)
+(declaim (ftype (sfunction (symbol &optional t) lambda-var) varify-lambda-arg))
+(defun varify-lambda-arg (name &optional source-form)
   (case (info :variable :kind name)
     (:special
      (let ((variable (find-free-var name)))
@@ -36,7 +36,8 @@
                         :where-from (leaf-where-from variable)
                         :specvar variable)))
     (t
-     (make-lambda-var :%source-name name))))
+     (make-lambda-var :%source-name name
+                      :source-form source-form))))
 
 ;;; Parse a lambda list into a list of VAR structures, stripping off
 ;;; any &AUX bindings. Each arg name is checked for legality, and
@@ -164,7 +165,7 @@
           (bind-ctran (make-ctran))
           (cleanup-ctran (make-ctran)))
       (ir1-convert start bind-ctran nil
-                   `(%special-bind ',(leaf-source-name (lambda-var-specvar var)) ,var))
+                   `(%special-bind ',(lambda-var-specvar var) ,var))
       (setf (cleanup-mess-up cleanup) (ctran-use bind-ctran))
       (let ((*lexenv* (make-lexenv :cleanup cleanup)))
         (ir1-convert bind-ctran cleanup-ctran nil '(%cleanup-point))
@@ -575,7 +576,7 @@
                     (case ,n-key ,@(tests))))))
 
             (unless allowp
-              (let ((location (opaquely-quote (make-restart-location))))
+              (let ((location (make-restart-location)))
                 (body `(if (and (not (unbound-marker-p ,n-lose))
                                 (not ,n-allowp))
                            (%unknown-key-arg-error ,n-lose ,location)

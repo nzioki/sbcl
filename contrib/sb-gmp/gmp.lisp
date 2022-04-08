@@ -834,13 +834,9 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 
 ;;;; SBCL interface and integration installation
 (macrolet ((def (name original)
-             (let ((special (intern (format nil "*~A-FUNCTION*" name))))
-               `(progn
-                  (declaim (type function ,special)
-                           (inline ,name))
-                  (defvar ,special (symbol-function ',original))
-                  (defun ,name (&rest args)
-                    (apply (load-time-value ,special t) args))))))
+             `(progn
+                (declaim (ftype function ,name))
+                (setf (fdefinition ',name) (fdefinition ',original)))))
   (def orig-mul multiply-bignums)
   (def orig-truncate bignum-truncate)
   (def orig-gcd bignum-gcd)
@@ -876,7 +872,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (mpz-tdiv a b)))
 
 (defun gmp-lcm (a b)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (type integer a b)
            (inline mpz-lcm))
   (if (or (and (typep a 'fixnum)
@@ -896,7 +892,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 
 ;;; rationals
 (defun gmp-two-arg-+ (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-add))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -907,7 +903,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-+ x y)))
 
 (defun gmp-two-arg-- (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-sub))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -918,7 +914,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-- x y)))
 
 (defun gmp-two-arg-* (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-mul))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -929,7 +925,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-* x y)))
 
 (defun gmp-two-arg-/ (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-div))
   (if (and (rationalp x)
            (rationalp y)
@@ -980,8 +976,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 (defun uninstall-gmp-funs ()
   (sb-ext:without-package-locks
       (macrolet ((def (destination source)
-                   `(setf (fdefinition ',destination)
-                          ,(intern (format nil "*~A-FUNCTION*" source)))))
+                   `(setf (fdefinition ',destination) (fdefinition ',source))))
         (def multiply-bignums orig-mul)
         (def bignum-truncate orig-truncate)
         (def bignum-gcd orig-gcd)

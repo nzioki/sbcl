@@ -461,7 +461,7 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
       (bug "%PRIMITIVE was used with an unknown values template."))
 
     (ir1-convert start next result
-                 `(%%primitive ',name
+                 `(%%primitive ',template
                                ',(eval-info-args
                                   (subseq args required min))
                                ,@(subseq args 0 required)
@@ -513,6 +513,7 @@ Return VALUE without evaluating it."
 ;;; un-merged pathnames. I'm not daring enough to change it for everyone.
 ;;; It defaults to what it should, and is changed before saving the image.
 ;;;
+;;; FIXME: can't we just get rid of this and _never_ use TRUENAME?
 (declaim (type (member pathname truename) *name-context-file-path-selector*))
 (defglobal *name-context-file-path-selector* 'pathname)
 
@@ -747,7 +748,7 @@ be a lambda expression."
              name :context context :allow-symbol-macro nil)
             (unless (eq context 'let*)
               (funcall names name))
-            (vars (varify-lambda-arg name))
+            (vars (varify-lambda-arg name spec))
             (vals value)))))
     (values (vars) (vals))))
 
@@ -1043,7 +1044,8 @@ care."
                                        derive-type-only
                                        truly
                                        source-form
-                                       use-annotations)
+                                       use-annotations
+                                       restart)
                            form)
                           start next result)
   (let ((value-type (if (ctype-p value-type)
@@ -1051,7 +1053,12 @@ care."
                         (values-specifier-type value-type)))
         (*current-path* (if source-form
                             (ensure-source-path source-form)
-                            *current-path*)))
+                            *current-path*))
+        (context (cond (restart
+                        ;; For now, these share the same place in the debug info
+                        (aver (not context))
+                        :restart)
+                       (context))))
     (cond (derive-type-only
            ;; For something where we really know the type and need no mismatch checking,
            ;; e.g. structure accessors

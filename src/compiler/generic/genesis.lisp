@@ -188,8 +188,8 @@
                                     #+darwin-jit 1))
 
 (defstruct page
-  (type nil :type (member nil :code :mixed))
-  (bytes-used 0)
+  (type nil :type (member nil :code :list :mixed))
+  (words-used 0)
   scan-start) ; byte offset from base of the space
 
 ;;; a GENESIS-time representation of a memory space (e.g. read-only
@@ -204,6 +204,7 @@
   ;; the gspace contents as a BIGVEC
   (data (make-bigvec) :type bigvec :read-only t)
   (page-table nil) ; for dynamic space
+  (cons-region) ; (word-index . limit)
   ;; lists of holes created by the allocator to segregate code from data.
   ;; Doesn't matter for cheneygc; does for gencgc.
   ;; Each free-range is (START . LENGTH) in words.
@@ -409,93 +410,106 @@
     (setf (gspace-free-word-index gspace) new-free-word-index)
     old-free-word-index))
 
-;; Special case for dynamic space code/data segregation
+(defconstant min-usable-hole-size 10) ; semi-arbitrary constant to speed up the allocator
+;; Place conses and code on their respective page type.
 #+gencgc
-(defun dynamic-space-claim-n-words (gspace n-words page-type)
-  (let* ((words-per-page (/ sb-vm:gencgc-card-bytes sb-vm:n-word-bytes))
-         (holder (ecase page-type
-                   (:code (gspace-code-free-ranges gspace))
-                   (:mixed (gspace-non-code-free-ranges gspace))))
-         (found (find-if (lambda (x) (>= (cdr x) n-words))
-                         (cdr holder)))) ; dummy cons cell simplifies writeback
-    (labels ((alignedp (word-index) ; T if WORD-INDEX aligns to a GC page boundary
-               (not (logtest (* word-index sb-vm:n-word-bytes)
-                             (1- sb-vm:gencgc-card-bytes))))
-             (page-index (word-index)
-               (values (floor word-index words-per-page)))
-             (pte (index) ; create on demand
-               (or (aref (gspace-page-table gspace) index)
-                   (setf (aref (gspace-page-table gspace) index) (make-page))))
-             (assign-page-types (page-type start-word-index count)
-               (let ((start-page (page-index start-word-index))
-                     (end-page (page-index (+ start-word-index (1- count)))))
-                 (unless (> (length (gspace-page-table gspace)) end-page)
-                   (setf (gspace-page-table gspace)
-                         (adjust-array (gspace-page-table gspace) (1+ end-page)
-                                       :initial-element nil)))
-                 (loop for page-index from start-page to end-page
-                       for pte = (pte page-index)
-                       do (if (null (page-type pte))
-                              (setf (page-type pte) page-type)
-                              (assert (eq (page-type pte) page-type))))))
-             (note-it (start-word-index)
-               (let* ((start-page (page-index start-word-index))
-                      (end-word-index (+ start-word-index n-words))
-                      (end-page (page-index (1- end-word-index))))
-                 ;; pages from start to end (exclusive) must be full
-                 (loop for index from start-page below end-page
-                       do (setf (page-bytes-used (pte index)) sb-vm:gencgc-card-bytes))
-                 ;; Compute the difference between the word-index at the start of
-                 ;; end-page and the end-word.
-                 (setf (page-bytes-used (pte end-page))
-                       (* sb-vm:n-word-bytes
-                          (- end-word-index (* end-page words-per-page))))
-                 ;; update the scan start of any page without it set
-                 (loop for index from start-page to end-page
-                       do (let ((pte (pte index)))
-                            (unless (page-scan-start pte)
-                              (setf (page-scan-start pte) start-word-index)))))
-               start-word-index)
-             (get-frontier-page-type ()
-               (page-type (pte (page-index (1- (gspace-free-word-index gspace)))))))
-      (when found ; Case 1: always try to backfill first if possible
+(defun dynamic-space-claim-n-words (gspace n-words page-type
+                                    &aux (words-per-page
+                                          (/ sb-vm:gencgc-page-bytes sb-vm:n-word-bytes)))
+  (labels ((alignedp (word-index) ; T if WORD-INDEX aligns to a GC page boundary
+             (not (logtest (* word-index sb-vm:n-word-bytes)
+                           (1- sb-vm:gencgc-page-bytes))))
+           (page-index (word-index)
+             (values (floor word-index words-per-page)))
+           (pte (index) ; create on demand
+             (or (aref (gspace-page-table gspace) index)
+                 (setf (aref (gspace-page-table gspace) index) (make-page))))
+           (assign-page-type (page-type start-word-index count)
+             ;; CMUCL incorrectly warns that the result of ADJUST-ARRAY
+             ;; must not be discarded.
+             #+host-quirks-cmu (declare (notinline adjust-array))
+             (let ((start-page (page-index start-word-index))
+                   (end-page (page-index (+ start-word-index (1- count)))))
+               (unless (> (length (gspace-page-table gspace)) end-page)
+                 (adjust-array (gspace-page-table gspace) (1+ end-page)
+                               :initial-element nil))
+               (loop for page-index from start-page to end-page
+                     for pte = (pte page-index)
+                     do (if (null (page-type pte))
+                            (setf (page-type pte) page-type)
+                            (assert (eq (page-type pte) page-type))))))
+           (note-words-used (start-word-index)
+             (let* ((start-page (page-index start-word-index))
+                    (end-word-index (+ start-word-index n-words))
+                    (end-page (page-index (1- end-word-index))))
+               ;; pages from start to end (exclusive) must be full
+               (loop for index from start-page below end-page
+                     do (setf (page-words-used (pte index)) words-per-page))
+               ;; Compute the difference between the word-index at the start of
+               ;; end-page and the end-word.
+               (setf (page-words-used (pte end-page))
+                     (- end-word-index (* end-page words-per-page)))
+               ;; update the scan start of any page without it set
+               (loop for index from start-page to end-page
+                     do (let ((pte (pte index)))
+                          (unless (page-scan-start pte)
+                            (setf (page-scan-start pte) start-word-index)))))
+             start-word-index)
+           (get-frontier-page-type ()
+             (page-type (pte (page-index (1- (gspace-free-word-index gspace))))))
+           (realign-frontier ()
+             ;; Align the frontier to a page, putting the empty space onto a free list
+             (let* ((free-ptr (gspace-free-word-index gspace))
+                    (avail (- (align-up free-ptr words-per-page) free-ptr))
+                    (other-type (get-frontier-page-type)) ; before extending frontier
+                    (word-index (gspace-claim-n-words gspace avail)))
+               ;; the space we got should be exactly what we thought it should be
+               (aver (= word-index free-ptr))
+               (aver (alignedp (gspace-free-word-index gspace)))
+               (aver (= (gspace-free-word-index gspace) (+ free-ptr avail)))
+               (when (>= avail min-usable-hole-size)
+                 ;; allocator is first-fit; space goes to the tail of the other freelist.
+                 (nconc (ecase other-type
+                          (:code  (gspace-code-free-ranges gspace))
+                          (:mixed (gspace-non-code-free-ranges gspace)))
+                        (list (cons word-index avail)))))))
+    (when (eq page-type :list) ; Claim whole pages at a time
+      (let* ((region
+              (or (gspace-cons-region gspace)
+                  (progn
+                    (unless (alignedp (gspace-free-word-index gspace))
+                      (realign-frontier))
+                    (let ((word-index (gspace-claim-n-words gspace words-per-page)))
+                      (assign-page-type page-type word-index sb-vm:cons-size)
+                      (let ((pte (pte (page-index word-index))))
+                        (setf (page-scan-start pte) word-index))
+                      (setf (gspace-cons-region gspace)
+                            (cons word-index
+                                  (+ word-index (* (1- sb-vm::max-conses-per-page)
+                                                   sb-vm:cons-size))))))))
+             (result (car region)))
+        (incf (page-words-used (pte (page-index result))) sb-vm:cons-size)
+        (when (= (incf (car region) sb-vm:cons-size) (cdr region))
+          (setf (gspace-cons-region gspace) nil))
+        (return-from dynamic-space-claim-n-words result)))
+    (let* ((holder (ecase page-type
+                     (:code (gspace-code-free-ranges gspace))
+                     (:mixed (gspace-non-code-free-ranges gspace))))
+           (found (find-if (lambda (x) (>= (cdr x) n-words))
+                           (cdr holder)))) ; dummy cons cell simplifies writeback
+      (when found ; always try to backfill holes first if possible
         (let ((word-index (car found)))
-          (if (zerop (decf (cdr found) n-words))
-              (rplacd holder (delete found (cdr holder) :count 1))
+          (if (< (decf (cdr found) n-words) min-usable-hole-size) ; discard this hole now?
+              (rplacd holder (delete found (cdr holder) :count 1)) ; yup
               (incf (car found) n-words))
-          (return-from dynamic-space-claim-n-words (note-it word-index))))
-      (when (or (alignedp (gspace-free-word-index gspace))
-                (eq (get-frontier-page-type) page-type))
-        ;; Case 2: extend the frontier
-        (let ((word-index (gspace-claim-n-words gspace n-words)))
-          ;; could optimize this out if we don't go onto a new page
-          (assign-page-types page-type word-index n-words)
-          (return-from dynamic-space-claim-n-words (note-it word-index))))
-      ;; Align the frontier to a page, add some more pages for good measure,
-      ;; and stuff that empty space onto a free list. Then start a new new page.
-      (let* ((free-ptr (gspace-free-word-index gspace))
-             ;; avoid waste by always giving some more slack to the other
-             ;; type of page before starting a new page
-             (reserve-extra-pages 4) ; a random heuristic
-             (reserve (+ (- (align-up free-ptr words-per-page) free-ptr)
-                         (* words-per-page reserve-extra-pages)))
-             (other-type (get-frontier-page-type)) ; before extending frontier
-             (word-index (gspace-claim-n-words gspace reserve)))
-        ;; the space we got should be exactly what we thought it should be
-        (aver (= word-index free-ptr))
-        (aver (alignedp (gspace-free-word-index gspace)))
-        (aver (= (gspace-free-word-index gspace) (+ free-ptr reserve)))
-        ;; those pages all have the other type (the one we don't want)
-        (assign-page-types other-type word-index reserve)
-        ;; allocator is first-fit; space goes to the tail of the other freelist.
-        (nconc (ecase other-type
-                 (:code  (gspace-code-free-ranges gspace))
-                 (:mixed (gspace-non-code-free-ranges gspace)))
-               (list (cons word-index reserve))))
-      ;; Reduced to case 2 now
+          (return-from dynamic-space-claim-n-words (note-words-used word-index))))
+      ;; Avoid switching between :CODE and :MIXED on a page
+      (unless (or (alignedp (gspace-free-word-index gspace))
+                  (eq (get-frontier-page-type) page-type))
+        (realign-frontier))
       (let ((word-index (gspace-claim-n-words gspace n-words)))
-        (assign-page-types page-type word-index n-words)
-        (note-it word-index)))))
+        (assign-page-type page-type word-index n-words)
+        (note-words-used word-index)))))
 
 (defun gspace-claim-n-bytes (gspace specified-n-bytes &optional (page-type :mixed))
   (declare (ignorable page-type))
@@ -614,7 +628,7 @@
 ;;;
 ;;; Each TOPLEVEL-THING can be a function to be executed or a fixup or
 ;;; loadtime value, represented by (CONS KEYWORD ..).
-(declaim (special *!cold-toplevels* *!cold-defsymbols* *cold-methods*))
+(declaim (special *!cold-toplevels* *cold-methods*))
 
 
 ;;;; miscellaneous stuff to read and write the core memory
@@ -794,13 +808,18 @@
 
 ;;;; copying simple objects into the cold core
 
+(defun cold-simple-vector-p (obj)
+  (and (= (descriptor-lowtag obj) sb-vm:other-pointer-lowtag)
+       (= (logand (read-bits-wordindexed obj 0) sb-vm:widetag-mask)
+          sb-vm:simple-vector-widetag)))
+
 (declaim (inline cold-vector-len))
 (defun cold-vector-len (vector)
   #+ubsan (ash (read-bits-wordindexed vector 0) (- -32 sb-vm:n-fixnum-tag-bits))
   #-ubsan (descriptor-fixnum (read-wordindexed vector sb-vm:vector-length-slot)))
 
-(macrolet ((string-data (string-descriptor)
-             `(+ (descriptor-byte-offset ,string-descriptor)
+(macrolet ((vector-data (vector-descriptor)
+             `(+ (descriptor-byte-offset ,vector-descriptor)
                  (* sb-vm:vector-data-offset sb-vm:n-word-bytes))))
 (defun base-string-to-core (string &optional (gspace *dynamic*))
   "Copy STRING (which must only contain STANDARD-CHARs) into the cold
@@ -813,17 +832,33 @@ core and return a descriptor to it."
                                length (ceiling (1+ length) sb-vm:n-word-bytes)
                                gspace))
          (mem (descriptor-mem des))
-         (byte-base (string-data des)))
+         (byte-base (vector-data des)))
     (dotimes (i length des) ; was prezeroed, so automatically null-terminated
       (setf (bvref mem (+ byte-base i)) (char-code (aref string i))))))
 
 (defun base-string-from-core (descriptor)
   (let* ((mem (descriptor-mem descriptor))
-         (byte-base (string-data descriptor))
+         (byte-base (vector-data descriptor))
          (len (cold-vector-len descriptor))
          (str (make-string len)))
     (dotimes (i len str)
-      (setf (aref str i) (code-char (bvref mem (+ byte-base i))))))))
+      (setf (aref str i) (code-char (bvref mem (+ byte-base i)))))))
+
+(defun bit-vector-to-core (bit-vector &optional (gspace *dynamic*))
+  (let* ((length (length bit-vector))
+         (nwords (ceiling length sb-vm:n-word-bits))
+         (des (allocate-vector sb-vm:simple-bit-vector-widetag length nwords gspace))
+         (mem (descriptor-mem des))
+         (base (vector-data des)))
+    (let ((byte 0))
+      (dotimes (i length)
+        (let ((byte-bit (rem i 8)))
+          (setf (ldb (byte 1 byte-bit) byte) (bit bit-vector i))
+          (when (= byte-bit 7)
+            (setf (bvref mem (+ base (floor i 8))) byte))))
+      (when (/= 0 (rem length 8))
+        (setf (bvref mem (+ base (floor length 8))) byte))
+      des))))
 
 ;;; Write the bits of INT to core as if a bignum, i.e. words are ordered from
 ;;; least to most significant regardless of machine endianness.
@@ -950,14 +985,15 @@ core and return a descriptor to it."
 
 ;;; Allocate a cons cell in GSPACE and fill it in with CAR and CDR.
 (defun cold-cons (car cdr &optional (gspace *dynamic*))
-  (let ((dest (allocate-object gspace 2 sb-vm:list-pointer-lowtag)))
+  (let ((cons (allocate-cold-descriptor gspace (ash 2 sb-vm:word-shift)
+                                        sb-vm:list-pointer-lowtag :list)))
     (let* ((objs (gspace-objects gspace))
            (n (1- (length objs))))
       (when objs
         (setf (aref objs n) (list (aref objs n)))))
-    (write-wordindexed dest sb-vm:cons-car-slot car)
-    (write-wordindexed dest sb-vm:cons-cdr-slot cdr)
-    dest))
+    (write-wordindexed cons sb-vm:cons-car-slot car)
+    (write-wordindexed cons sb-vm:cons-cdr-slot cdr)
+    cons))
 (defun list-to-core (list)
   (let ((head *nil-descriptor*)
         (tail nil))
@@ -1049,6 +1085,9 @@ core and return a descriptor to it."
   (let ((symbol (allocate-otherptr gspace size sb-vm:symbol-widetag)))
     (when core-file-name
       (let* ((cold-name (set-readonly (base-string-to-core name *dynamic*)))
+             (pkg-id (if cold-package
+                         (descriptor-fixnum (read-slot cold-package :id))
+                         sb-impl::+package-id-none+))
              (hash (make-fixnum-descriptor
                     (if core-file-name (sb-c::symbol-name-hash name) 0))))
         (write-wordindexed symbol sb-vm:symbol-value-slot *unbound-marker*)
@@ -1056,13 +1095,10 @@ core and return a descriptor to it."
         (write-wordindexed symbol sb-vm:symbol-info-slot *nil-descriptor*)
         #+compact-symbol
         (write-wordindexed/raw symbol sb-vm:symbol-name-slot
-                               (encode-symbol-name
-                                (if cold-package
-                                    (descriptor-fixnum (read-slot cold-package :id))
-                                    sb-impl::+package-id-none+)
-                                cold-name))
+                               (encode-symbol-name pkg-id cold-name))
         #-compact-symbol
-        (progn (write-wordindexed symbol sb-vm:symbol-package-slot cold-package)
+        (progn (write-wordindexed symbol sb-vm:symbol-package-id-slot
+                                  (make-fixnum-descriptor pkg-id))
                (write-wordindexed symbol sb-vm:symbol-name-slot cold-name))))
     symbol))
 
@@ -1078,33 +1114,11 @@ core and return a descriptor to it."
 (defun cold-symbol-value (symbol)
   (let ((val (read-wordindexed (cold-intern symbol) sb-vm:symbol-value-slot)))
     (if (= (descriptor-bits val) sb-vm:unbound-marker-widetag)
-        (unbound-cold-symbol-handler symbol)
+        (error "Symbol value of ~a is unbound." symbol)
         val)))
 (defun cold-fdefn-fun (cold-fdefn)
   (read-wordindexed cold-fdefn sb-vm:fdefn-fun-slot))
 
-(defun unbound-cold-symbol-handler (symbol)
-  (awhen (and (eq (sb-xc:symbol-package symbol) *cl-package*)
-              (find-symbol (string symbol) "SB-XC"))
-    (setq symbol it))
-  (let ((host-val (and (boundp symbol) (symbol-value symbol))))
-    (etypecase host-val
-      (number
-       ;; This case is intended to handle
-       ;; (DEFCONSTANT LEAST-POSITIVE-NORMALIZED-SHORT-FLOAT
-       ;;              LEAST-POSITIVE-NORMALIZED-SINGLE-FLOAT) ; etc
-       ;; Several uses of MOST-POSITIVE-FIXNUM come through here as well
-       ;; due to (DEFCONSTANT mumble-LIMIT most-positive-fixnum).
-       ;; That seems weird but doesn't seem to be a problem.
-       ;; (i.e. why don't we just dump the fixnum?)
-       (number-to-core host-val))
-      (named-type
-       (let ((target-val (ctype-to-core (named-type-name host-val) host-val)))
-          ;; Though it looks complicated to assign cold symbols on demand,
-          ;; it avoids writing code to build the layout of NAMED-TYPE in the
-          ;; way we build other primordial stuff such as layout-of-layout.
-          (cold-set symbol target-val)
-          target-val)))))
 
 ;;;; layouts and type system pre-initialization
 
@@ -1120,7 +1134,7 @@ core and return a descriptor to it."
 ;;; to the host's COLD-LAYOUT proxy for that layout.
 (defvar *cold-layout-by-addr*)
 
-;;; Trivial methods [sic] require that we sort possible methods by the depthoid.
+;;; Initial methods require that we sort possible methods by the depthoid.
 ;;; Most of the objects printed in cold-init are ordered hierarchically in our
 ;;; type lattice; the major exceptions are ARRAY and VECTOR at depthoid -1.
 ;;; Of course we need to print VECTORs because a STRING is a vector,
@@ -1246,6 +1260,7 @@ core and return a descriptor to it."
   ;; types in the IS-A vector. They may vary in length due to the bitmap word count.
   ;; But we can at least assert that there is one less thing to worry about.
   (aver (<= depthoid sb-kernel::layout-id-vector-fixed-capacity))
+  (aver (cold-simple-vector-p inherits))
   (let* ((fixed-words (sb-kernel::type-dd-length sb-vm:layout))
          (bitmap-words (ceiling (1+ (integer-length bitmap)) sb-vm:n-word-bits))
          (result (allocate-struct (+ fixed-words bitmap-words)
@@ -1619,6 +1634,7 @@ core and return a descriptor to it."
                           (get-uninterned-symbol (string value))))
               (number (number-to-core value))
               (string (base-string-to-core value))
+              (simple-bit-vector (bit-vector-to-core value))
               (cons (cold-cons (target-representation (car value))
                                (target-representation (cdr value))))
               (simple-vector
@@ -1707,12 +1723,10 @@ core and return a descriptor to it."
 ;;; It might be nice to put NIL on a readonly page by itself to prevent unsafe
 ;;; code from destroying the world with (RPLACx nil 'kablooey)
 (defun make-nil-descriptor ()
-  ;; 8 words are placed prior to NIL to contain the 'struct alloc_region'.
+  ;; 8 words prior to NIL is an array of two 'struct alloc_region'.
+  ;; The lisp objects begin at STATIC_SPACE_OBJECTS_START.
   ;; See also (DEFCONSTANT NIL-VALUE) in early-objdef.
-  #+(and gencgc (not sb-thread))
-  (allocate-vector #-64-bit sb-vm:simple-array-signed-byte-32-widetag
-                   #+64-bit sb-vm:simple-array-signed-byte-64-widetag
-                   6 6 *static*)
+  #+(and gencgc (not sb-thread)) (gspace-claim-n-words *static* 8)
   #+64-bit (setf (gspace-free-word-index *static*) (/ 256 sb-vm:n-word-bytes))
   (let* ((des (allocate-otherptr *static* (1+ sb-vm:symbol-size) 0))
          (nil-val (make-descriptor (+ (descriptor-bits des)
@@ -1778,8 +1792,8 @@ core and return a descriptor to it."
   (let ((target-cl-pkg-info (gethash "COMMON-LISP" *cold-package-symbols*)))
     ;; -1 is magic having to do with nil-as-cons vs. nil-as-symbol
     #-compact-symbol
-    (write-wordindexed *nil-descriptor* (- sb-vm:symbol-package-slot 1)
-                       (cdr target-cl-pkg-info))
+    (write-wordindexed *nil-descriptor* (- sb-vm:symbol-package-id-slot 1)
+                       (make-fixnum-descriptor sb-impl::+package-id-lisp+))
     (when core-file-name
       (record-accessibility :external target-cl-pkg-info *nil-descriptor*)))
   ;; Intern the others.
@@ -1973,6 +1987,21 @@ core and return a descriptor to it."
    (attach-fdefinitions-to-symbols
     (attach-classoid-cells-to-symbols (make-hash-table :test #'eq))))
 
+  #+x86-64 ; Dump a popular constant
+  (let ((array
+         ;; Embed the constant in an unboxed array. This shouldn't be necessary,
+         ;; because the start of the scanned space is STATIC_SPACE_OBJECTS_START,
+         ;; but not all uses strictly follow that rule. (They should though)
+         ;; This does not conflict with the 2 alloc regions at the start of the space,
+         ;; because the constant is in word index 10, and the array header is in
+         ;; word index 8, and the two regions are in indices 0 through 7.
+         (make-random-descriptor (logior (- sb-vm::non-negative-fixnum-mask-constant-wired-address
+                                            (* 2 sb-vm:n-word-bytes))
+                                         sb-vm:other-pointer-lowtag))))
+    (write-wordindexed/raw array 0 sb-vm:simple-array-unsigned-byte-64-widetag)
+    (write-wordindexed array 1 (make-fixnum-descriptor 1))
+    (write-wordindexed/raw array 2 sb-vm::non-negative-fixnum-mask-constant))
+
   #+x86
   (progn
     (cold-set 'sb-vm::*fp-constant-0d0* (number-to-core $0d0))
@@ -2092,15 +2121,6 @@ core and return a descriptor to it."
          (+ (logandc2 (descriptor-bits defn) sb-vm:lowtag-mask)
             (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift))))
     fdefn))
-
-;;; Handle a DEFMETHOD in cold-load. "Very easily done". Right.
-(defun cold-defmethod (method-class name &rest stuff)
-  (declare (ignore method-class))
-  (let ((gf (assoc name *cold-methods*)))
-    (unless gf
-      (setq gf (cons name nil))
-      (push gf *cold-methods*))
-    (push stuff (cdr gf))))
 
 (defun attach-classoid-cells-to-symbols (hashtable)
   (when (plusp (hash-table-count *classoid-cells*))
@@ -2565,42 +2585,41 @@ Legal values for OFFSET are -4, -8, -12, ..."
     (multiple-value-bind (fun args) (pop-args n (fasl-input))
       (if args
           (case fun
-           (symbol-global-value (cold-symbol-value (first args)))
            (values-specifier-type
             (let* ((des (first args))
                    (spec (if (descriptor-p des) (host-object-from-core des) des)))
-              (ctype-to-core spec (funcall fun spec))))
+              (ctype-to-core spec (if (eq spec '*)
+                                      *wild-type*
+                                      (funcall fun spec)))))
            (t (error "Can't FOP-FUNCALL with function ~S in cold load." fun)))
           (let ((counter *load-time-value-counter*))
             (push (cold-list (cold-intern :load-time-value) fun
                              (number-to-core counter)) *!cold-toplevels*)
             (setf *load-time-value-counter* (1+ counter))
-            (make-ltv-patch counter)))))
-
-  (define-cold-fop (fop-funcall-for-effect (n))
-    (multiple-value-bind (fun args) (pop-args n (fasl-input))
-      (if (not args)
-          (push fun *!cold-toplevels*)
-          (case fun
-            (sb-pcl::!trivial-defmethod (apply #'cold-defmethod args))
-            ((sb-impl::%defconstant)
-             (destructuring-bind (name val . rest) args
-               (cold-set name (if (symbolp val) (cold-intern val) val))
-               (push (apply #'cold-list (cold-intern fun) (cold-intern name) rest)
-                     *!cold-defsymbols*)))
-            (t
-             (error "Can't FOP-FUNCALL-FOR-EFFECT with function ~S in cold load" fun)))))))
-
-;;; Needed for certain L-T-V lambdas that use the -NO-SKIP variant of funcall.
-#-c-headers-only
-(setf (svref **fop-funs** (get 'fop-funcall-no-skip 'opcode))
-      (svref **fop-funs** (get 'fop-funcall 'opcode)))
+            (make-ltv-patch counter))))))
 
 (defun finalize-load-time-value-noise ()
   (cold-set '*!load-time-values*
             (allocate-vector sb-vm:simple-vector-widetag
                              *load-time-value-counter*
                              *load-time-value-counter*)))
+
+(define-cold-fop (fop-funcall-for-effect (n))
+  (if (= n 0)
+      (push (pop-stack) *!cold-toplevels*)
+      (error "Can't FOP-FUNCALL-FOR-EFFECT random stuff in cold load")))
+
+;;; Needed for certain L-T-V lambdas that use the -NO-SKIP variant of funcall.
+#-c-headers-only
+(setf (svref **fop-funs** (get 'fop-funcall-no-skip 'opcode))
+      (svref **fop-funs** (get 'fop-funcall 'opcode)))
+
+(define-cold-fop (fop-named-constant-set (index))
+  (push (cold-list (cold-intern :named-constant)
+                   (pop-stack)
+                   (number-to-core index)
+                   (pop-stack))
+        *!cold-toplevels*))
 
 
 ;;;; cold fops for fixing up circularities
@@ -2635,6 +2654,51 @@ Legal values for OFFSET are -4, -8, -12, ..."
   (let ((fn (pop-stack))
         (name (pop-stack)))
     (cold-fset name fn)))
+
+(define-cold-fop (fop-mset)
+  (let ((fn (pop-stack))
+        (specializers (pop-stack))
+        (qualifiers (pop-stack))
+        (name (pop-stack)))
+    ;; Methods that are qualified or are specialized on more than
+    ;; one argument do not work on start-up, since our start-up
+    ;; implementation of method dispatch is single dispatch only.
+    (when (and (null qualifiers)
+               (= 1 (count-if-not (lambda (x) (eq x t)) (host-object-from-core specializers))))
+      (push (list (cold-car specializers) fn)
+            (cdr (or (assoc name *cold-methods*)
+                     (car (push (list name) *cold-methods*))))))))
+
+;;; Order all initial methods so that the first one whose guard
+;;; returns T is the most specific method. LAYOUT-DEPTHOID is a valid
+;;; sort key for this because we don't have multiple inheritance in
+;;; the system object type lattice.
+(defun sort-initial-methods ()
+  (cold-set
+   'sb-pcl::*!initial-methods*
+   (list-to-core
+    (loop for (gf-name . methods) in *cold-methods*
+          collect
+          (cold-cons
+           (cold-intern gf-name)
+           (vector-in-core
+            (loop for (class fun)
+                    ;; Methods must be sorted because we invoke
+                    ;; only the first applicable one.
+                    in (stable-sort methods #'> ; highest depthoid first
+                                    :key (lambda (method)
+                                           (class-depthoid (warm-symbol (car method)))))
+                  collect
+                  (vector-in-core
+                   (let ((class-symbol (warm-symbol class)))
+                     (list (cold-intern
+                            (predicate-for-specializer class-symbol))
+                           (acond ((gethash class-symbol *cold-layouts*)
+                                   (->wrapper (cold-layout-descriptor it)))
+                                  (t
+                                   (aver (predicate-for-specializer class-symbol))
+                                   class))
+                           fun))))))))))
 
 (define-cold-fop (fop-fdefn)
   (ensure-cold-fdefn (pop-stack)))
@@ -2707,12 +2771,12 @@ Legal values for OFFSET are -4, -8, -12, ..."
           #+compact-instance-header
           (write-wordindexed/raw fn 0 (logior (ash (cold-layout-descriptor-bits 'function) 32)
                                               (read-bits-wordindexed fn 0)))
-          #+(or x86 x86-64) ; store a machine-native pointer to the function entry
+          #+(or x86 x86-64 arm64) ; store a machine-native pointer to the function entry
           ;; note that the bit pattern looks like fixnum due to alignment
           (write-wordindexed/raw fn sb-vm:simple-fun-self-slot
                                  (+ (- (descriptor-bits fn) sb-vm:fun-pointer-lowtag)
                                     (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift)))
-          #-(or x86 x86-64) ; store a pointer back to the function itself in 'self'
+          #-(or x86 x86-64 arm64) ; store a pointer back to the function itself in 'self'
           (write-wordindexed fn sb-vm:simple-fun-self-slot fn))
         (dotimes (i sb-vm:code-slots-per-simple-fun)
           (write-wordindexed des header-index (svref stack stack-index))
@@ -2999,6 +3063,10 @@ Legal values for OFFSET are -4, -8, -12, ..."
         (record (c-symbol-name c) -1 c ""))
       ;; More symbols that doesn't fit into the pattern above.
       (dolist (c '(sb-impl::+magic-hash-vector-value+
+                   ;; These next two flags bits use different naming conventions unfortunately,
+                   ;; but one's a vector header bit, the other a layout flag bit.
+                   sb-vm::+vector-alloc-mixed-region-bit+
+                   sb-kernel::+strictly-boxed-flag+
                    sb-vm::nil-symbol-slots-start
                    sb-vm::nil-symbol-slots-end
                    sb-vm::static-space-objects-start))
@@ -3024,10 +3092,15 @@ Legal values for OFFSET are -4, -8, -12, ..."
           (format t "#define ~A ~A~A /* 0x~X */~%" name value suffix value))))
     (terpri))
 
+  ;; backend-page-bytes doesn't really mean much any more.
+  ;; It's the granularity at which we can map the core file pages.
   (format t "#define BACKEND_PAGE_BYTES ~D~%" sb-c:+backend-page-bytes+)
-  #+gencgc ; value never needed in Lisp, so therefore not a defconstant
-  (format t "#define GENCGC_CARD_SHIFT ~D~%"
-            (1- (integer-length sb-vm:gencgc-card-bytes)))
+  #+gencgc ; values never needed in Lisp, so therefore not a defconstant
+  (progn
+  (format t "#define MAX_CONSES_PER_PAGE ~D~%" sb-vm::max-conses-per-page)
+  (format t "#define CARDS_PER_PAGE ~D~%#define GENCGC_CARD_SHIFT ~D~%"
+          sb-vm::cards-per-page ; this is the "GC" page, not "backend" page
+          sb-vm::gencgc-card-shift))
 
   (let ((size #+cheneygc (- sb-vm:dynamic-0-space-end sb-vm:dynamic-0-space-start)
               #+gencgc sb-vm::default-dynamic-space-size))
@@ -3084,12 +3157,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
             (sb-xc:byte-position (symbol-value symbol)))
     (format t "#define ~A_MASK 0x~X /* ~:*~A */~%"
             (c-symbol-name symbol)
-            (sb-xc:mask-field (symbol-value symbol) -1)))
-  ;; find a 1 bit in funcallable-instance-widetag not in instance-widetag
-  (format t "#define LAYOUT_SELECTOR_BIT ~d~%"
-          (let ((mask (logandc2 sb-vm:funcallable-instance-widetag sb-vm:instance-widetag)))
-            (aver (plusp mask))
-            (1- (integer-length mask)))))
+            (sb-xc:mask-field (symbol-value symbol) -1))))
 
 (defun write-regnames-h (stream)
   (declare (ignorable stream))
@@ -3194,15 +3262,15 @@ lispobj symbol_function(struct symbol* symbol);
 #include \"genesis/vector.h\"
 struct vector *symbol_name(struct symbol*);~%
 lispobj symbol_package(struct symbol*);~%")
+    (format stream "static inline int symbol_package_id(struct symbol* s) { return ~A; }~%"
+            #+compact-symbol (format nil "s->name >> ~D" sb-impl::symbol-name-bits)
+            #-compact-symbol "fixnum_value(s->package_id)")
     #+compact-symbol
     (progn (format stream "#define decode_symbol_name(ptr) (ptr & (uword_t)0x~X)~%"
                    (mask-field (byte sb-impl::symbol-name-bits 0) -1))
            (format stream "static inline void set_symbol_name(struct symbol*s, lispobj name) {
   s->name = (s->name & (uword_t)0x~X) | name;~%}~%"
-                   (mask-field (byte sb-impl::package-id-bits sb-impl::symbol-name-bits) -1))
-           (format stream
-                   "static inline int symbol_package_id(struct symbol* s) { return s->name >> ~D; }~%"
-                   sb-impl::symbol-name-bits))
+                   (mask-field (byte sb-impl::package-id-bits sb-impl::symbol-name-bits) -1)))
     #-compact-symbol
     (progn (format stream "#define decode_symbol_name(ptr) ptr~%")
            (format stream "static inline void set_symbol_name(struct symbol*s, lispobj name) {
@@ -3227,6 +3295,11 @@ lispobj symbol_package(struct symbol*);~%")
              (when (eq name 'sb-vm::code)
                (format t "#define CODE_SLOTS_PER_SIMPLE_FUN ~d~2%"
                        sb-vm:code-slots-per-simple-fun))
+             (when (and (eq name 'sb-vm::thread)
+                        (find 'sb-vm::pseudo-atomic-bits slots :key #'sb-vm:slot-name))
+               (format t "#define HAVE_THREAD_PSEUDO_ATOMIC_BITS_SLOT 1~2%")
+               #+(or sparc ppc ppc64) (format t "typedef char pa_bits_t[~d];~2%" sb-vm:n-word-bytes)
+               #-(or sparc ppc ppc64) (format t "typedef lispobj pa_bits_t;~2%"))
              (format t "struct ~A {~%" c-name)
              (when (sb-vm:primitive-object-widetag obj)
                (format t "    lispobj header;~%"))
@@ -3502,7 +3575,15 @@ III. initially undefined function references (alphabetically):
               (descriptor-fixnum (read-slot pkg :id)))))
 
   (format t "~%~|~%VII. symbols (numerically):~2%")
-  (mapc (lambda (cell) (format t "~X: ~S~%" (car cell) (cdr cell)))
+  (mapc (lambda (cell)
+          (let* ((addr (car cell))
+                 (host-sym (cdr cell))
+                 (val
+                  (unless (or (keywordp host-sym) (null host-sym))
+                    (read-bits-wordindexed (cold-intern host-sym)
+                                           sb-vm:symbol-value-slot))))
+            (format t "~X: ~S~@[ = ~X~]~%" addr host-sym
+                    (unless (eql val sb-vm:unbound-marker-widetag) val))))
         (sort (%hash-table-alist *cold-symbols*) #'< :key #'car))
 
   (format t "~%~|~%VIII. parsed type specifiers:~2%")
@@ -3580,28 +3661,30 @@ III. initially undefined function references (alphabetically):
 #+gencgc
 (defun output-page-table (gspace data-page core-file write-word verbose)
   ;; Write as many PTEs as there are pages used.
-  ;; A corefile PTE is { uword_t scan_start_offset; page_bytes_t bytes_used; }
+  ;; A corefile PTE is { uword_t scan_start_offset; page_words_t words_used; }
   (let* ((data-bytes (* (gspace-free-word-index gspace) sb-vm:n-word-bytes))
-         (n-ptes (ceiling data-bytes sb-vm:gencgc-card-bytes))
+         (n-ptes (ceiling data-bytes sb-vm:gencgc-page-bytes))
          (sizeof-usage ; see similar expression in 'src/code/room'
-          (if (typep sb-vm:gencgc-card-bytes '(unsigned-byte 16)) 2 4))
+          (if (typep sb-vm::gencgc-page-words '(unsigned-byte 16)) 2 4))
          (sizeof-corefile-pte (+ sb-vm:n-word-bytes sizeof-usage))
          (pte-bytes (round-up (* sizeof-corefile-pte n-ptes) sb-vm:n-word-bytes))
          (n-code 0)
+         (n-cons 0)
          (n-mixed 0)
          (ptes (make-bigvec)))
     (expand-bigvec ptes pte-bytes)
     (dotimes (page-index n-ptes)
       (let* ((pte-offset (* page-index sizeof-corefile-pte))
              (pte (aref (gspace-page-table gspace) page-index))
-             (usage (page-bytes-used pte))
+             (usage (page-words-used pte))
              (sso (if (plusp usage)
-                      (- (* page-index sb-vm:gencgc-card-bytes)
+                      (- (* page-index sb-vm:gencgc-page-bytes)
                          (* (page-scan-start pte) sb-vm:n-word-bytes))
                       0))
              (type-bits (if (plusp usage)
                             (ecase (page-type pte)
                               (:code  (incf n-code)  #b111)
+                              (:list  (incf n-cons)  #b101)
                               (:mixed (incf n-mixed) #b011))
                             0)))
         (setf (bvref-word ptes pte-offset) (logior sso type-bits))
@@ -3609,12 +3692,13 @@ III. initially undefined function references (alphabetically):
                      ;; KLUDGE to avoid compiler note about one or the other
                      ;; branch of this IF being unreachable.
                      (declare (notinline typep))
-                     (if (typep sb-vm:gencgc-card-bytes '(unsigned-byte 16))
+                     (if (typep sb-vm::gencgc-page-words '(unsigned-byte 16))
                          '#'(setf bvref-16)
                          '#'(setf bvref-32))))
           (funcall (setter) usage ptes (+ pte-offset sb-vm:n-word-bytes)))))
     (when verbose
-      (format t "movable dynamic space: ~d boxed pages, ~d code pages~%" n-mixed n-code))
+      (format t "movable dynamic space: ~d + ~d + ~d cons/code/mixed pages~%"
+              n-cons n-code n-mixed))
     (force-output core-file)
     (let ((posn (file-position core-file)))
       (file-position core-file (* sb-c:+backend-page-bytes+ (1+ data-page)))
@@ -3789,7 +3873,6 @@ III. initially undefined function references (alphabetically):
            (*ctype-cache* (make-hash-table :test 'equal))
            (*cold-layouts* (make-hash-table :test 'eq)) ; symbol -> cold-layout
            (*cold-layout-by-addr* (make-hash-table :test 'eql)) ; addr -> cold-layout
-           (*!cold-defsymbols* nil)
            (*tls-index-to-symbol* nil)
            ;; '*COLD-METHODS* is never seen in the target, so does not need
            ;; to adhere to the #\! convention for automatic uninterning.
@@ -3859,47 +3942,15 @@ III. initially undefined function references (alphabetically):
       (sb-cold::check-no-new-cl-symbols)
 
       (when (and verbose core-file-name)
-        (format t "~&; SB-Loader: (~D~@{+~D~}) vars/methods/other~%"
-                (length *!cold-defsymbols*)
+        (format t "~&; SB-Loader: (~D~@{+~D~}) methods/other~%"
                 (reduce #'+ *cold-methods* :key (lambda (x) (length (cdr x))))
                 (length *!cold-toplevels*)))
 
-      (dolist (symbol '(*!cold-defsymbols* *!cold-toplevels*))
-        (cold-set symbol (list-to-core (nreverse (symbol-value symbol))))
-        (makunbound symbol)) ; so no further PUSHes can be done
-
-      ;;; Order all trivial methods so that the first one whose guard
-      ;;; returns T is the most specific method. LAYOUT-DEPTHOID is a valid
-      ;;; sort key for this because we don't have multiple inheritance in
-      ;;; the system object type lattice.
-      (cold-set
-       'sb-pcl::*!trivial-methods*
-       (list-to-core
-        (loop for (gf-name . methods) in *cold-methods*
-              collect
-              (cold-cons
-               (cold-intern gf-name)
-               (vector-in-core
-                (loop for (class qual lambda-list fun source-loc)
-                      ;; Methods must be sorted because we invoke
-                      ;; only the first applicable one.
-                      in (stable-sort methods #'> ; highest depthoid first
-                                      :key (lambda (method)
-                                             (class-depthoid (car method))))
-                      collect
-                      (vector-in-core
-                       (list (cold-intern
-                              (and (null qual) (predicate-for-specializer class)))
-                             (cold-intern qual)
-                             (acond ((gethash class *cold-layouts*)
-                                     (->wrapper (cold-layout-descriptor it)))
-                                    (t
-                                     (aver (predicate-for-specializer class))
-                                     (cold-intern class)))
-                             fun
-                             lambda-list source-loc))))))))
+      (cold-set '*!cold-toplevels* (list-to-core (nreverse *!cold-toplevels*)))
+      (makunbound '*!cold-toplevels*) ; so no further PUSHes can be done
 
       ;; Tidy up loose ends left by cold loading. ("Postpare from cold load?")
+      (sort-initial-methods)
       (resolve-deferred-known-funs)
       (resolve-static-call-fixups)
       (foreign-symbols-to-core)
@@ -3945,6 +3996,42 @@ III. initially undefined function references (alphabetically):
           (write-makefile-features stream)))
       (write-c-headers c-header-dir-name))))
 
+#+gencgc
+(defun write-mark-array-operators (stream &optional (ncards sb-vm::cards-per-page))
+  #-soft-card-marks
+  (progn
+    (aver (= ncards 1))
+    (format stream "static inline int cardseq_all_marked_nonsticky(long card) {
+    return gc_card_mark[card] == CARD_MARKED;~%}~%")
+    (format stream "static inline int cardseq_any_marked(long card) {
+    return gc_card_mark[card] != CARD_UNMARKED;~%}~%")
+    (format stream "static inline int cardseq_any_sticky_mark(long card) {
+    return gc_card_mark[card] == STICKY_MARK;~%}~%"))
+  #+soft-card-marks
+  ;; In general we have to be wary of wraparound of the card index bits
+  ;; - see example in comment above the definition of addr_to_card_index() -
+  ;; but it's OK to treat marks as linearly addressable within a page.
+  ;; The 'card' argument as supplied to these predicates will be
+  ;; a page-aligned card, i.e. the first card for its page.
+  (let* ((n-markwords
+          ;; This is how many words (of N_WORD_BYTES) of marks there are for the
+          ;; cards on a page.
+          (cond ((and (= sb-vm:n-word-bytes 8) (= ncards 32)) 4)
+                ((and (= sb-vm:n-word-bytes 8) (= ncards 16)) 2)
+                ((and (= sb-vm:n-word-bytes 8) (= ncards 8)) 1)
+                ((and (= sb-vm:n-word-bytes 4) (= ncards 8)) 2)
+                (t (error "bad cards-per-page"))))
+         (indices (loop for i below n-markwords collect i)))
+    (format stream "static inline int cardseq_all_marked_nonsticky(long card) {
+    uword_t* mark = (uword_t*)&gc_card_mark[card];
+    return (~{mark[~d]~^ | ~}) == 0;~%}~%" indices)
+    (format stream "static inline int cardseq_any_marked(long card) {
+    uword_t* mark = (uword_t*)&gc_card_mark[card];
+    return (~{mark[~d]~^ & ~}) != (uword_t)-1;~%}~%" indices)
+    (format stream "static inline int cardseq_any_sticky_mark(long card) {
+    uword_t* mark = (uword_t*)&gc_card_mark[card];
+    return ~{word_has_stickymark(mark[~d])~^ || ~};~%}~%" indices)))
+
 (defun write-c-headers (c-header-dir-name)
   (macrolet ((out-to (name &body body) ; write boilerplate and inclusion guard
                `(actually-out-to ,name (lambda (stream) ,@body))))
@@ -3982,6 +4069,8 @@ III. initially undefined function references (alphabetically):
         (out-to "regnames" (write-regnames-h stream))
         (out-to "errnames" (write-errnames-h stream))
         (out-to "gc-tables" (sb-vm::write-gc-tables stream))
+        #+soft-card-marks
+        (out-to "cardmarks" (write-mark-array-operators stream))
         (out-to "tagnames" (write-tagnames-h stream))
         (out-to "print.inc" (write-c-print-dispatch stream))
         (let ((structs (sort (copy-list sb-vm:*primitive-objects*) #'string<
@@ -4003,9 +4092,14 @@ III. initially undefined function references (alphabetically):
             (write-structure-object (wrapper-info (find-layout 'wrapper)) stream)
             (write-cast-operator 'wrapper "wrapper" sb-vm:instance-pointer-lowtag stream))
           (write-cast-operator 'layout "layout" sb-vm:instance-pointer-lowtag stream))
+        ;; For purposes of the C code, cast all hash tables as general_hash_table
+        ;; even if they lack the slots for weak tables.
+        (out-to "hash-table"
+          (write-structure-object (wrapper-info (find-layout 'sb-impl::general-hash-table))
+                                  stream "hash_table"))
         (dolist (class '(defstruct-description defstruct-slot-description
                          classoid
-                         hash-table package
+                         package
                          sb-thread::avlnode sb-thread::mutex
                          sb-c::compiled-debug-info sb-c::compiled-debug-fun))
           (out-to (string-downcase class)

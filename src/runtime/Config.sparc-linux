@@ -22,12 +22,4 @@ ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
 
-ifdef LISP_FEATURE_GENCGC
-  GC_SRC = fullcgc.c gencgc.c traceroot.c
-else
-  GC_SRC = cheneygc.c
-endif
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:
+GC_SRC = fullcgc.c gencgc.c traceroot.c

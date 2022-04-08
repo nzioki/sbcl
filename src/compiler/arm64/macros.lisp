@@ -90,21 +90,10 @@
                          #+big-endian `(+ ,n-offset (1- n-word-bytes))))
       `(inst ldrb ,n-target (@ ,n-source ,target-offset)))))
 
-;;; Macros to handle the fact that our stack pointer isn't actually in
-;;; a register (or won't be, by the time we're done).
-
-;;; Macros to handle the fact that we cannot use the machine native call and
-;;; return instructions.
-
-(defmacro lisp-jump (function lip)
-  "Jump to the lisp lip LIP."
-  `(let ((function ,function)
-         (lip ,lip))
+(defmacro lisp-jump (lip)
+  `(let ((lip ,lip))
      (aver (sc-is lip interior-reg))
-     (inst add lip function
-           (+ (- (ash simple-fun-insts-offset word-shift)
-                 fun-pointer-lowtag)
-              4))
+     (inst add lip lip 4)
      (inst br lip)))
 
 (defmacro lisp-return (lip return-style)
@@ -186,7 +175,8 @@
 (defun allocation (type size lowtag result-tn
                    &key flag-tn
                         stack-allocate-p
-                        (lip (if stack-allocate-p nil (missing-arg))))
+                        (lip (if stack-allocate-p nil (missing-arg)))
+                        overflow)
   (declare (ignorable type lip))
   ;; Normal allocation to the heap.
   (if stack-allocate-p
@@ -195,37 +185,35 @@
         (inst and tmp-tn tmp-tn (lognot lowtag-mask))
         (inst add csp-tn tmp-tn (add-sub-immediate size result-tn))
         (inst add result-tn tmp-tn lowtag))
-      #-gencgc
-      (progn
-        (load-symbol-value flag-tn *allocation-pointer*)
-        (inst add result-tn flag-tn lowtag)
-        (inst add flag-tn flag-tn (add-sub-immediate size))
-        (store-symbol-value flag-tn *allocation-pointer*))
-      #+gencgc
-      (let ((alloc (gen-label)) (back-from-alloc (gen-label)))
+      (let ((alloc (gen-label))
+            #+sb-thread (tlab (if (eq type 'list) thread-cons-tlab-slot thread-mixed-tlab-slot))
+            #-sb-thread (region (if (eq type 'list) cons-region mixed-region))
+            (back-from-alloc (gen-label)))
         #-sb-thread
         (progn
           ;; load-pair can't base off null-tn because the displacement
           ;; has to be a multiple of 8
-          (load-immediate-word flag-tn mixed-region)
+          (load-immediate-word flag-tn region)
           (inst ldp result-tn flag-tn (@ flag-tn 0)))
         #+sb-thread
-        (inst ldp tmp-tn flag-tn (@ thread-tn (* n-word-bytes thread-mixed-tlab-slot)))
+        (inst ldp tmp-tn flag-tn (@ thread-tn (* n-word-bytes tlab)))
         (inst add result-tn tmp-tn (add-sub-immediate size result-tn))
         (inst cmp result-tn flag-tn)
         (inst b :hi ALLOC)
-        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- mixed-region nil-value))))
-        #+sb-thread (storew result-tn thread-tn thread-mixed-tlab-slot)
+        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- region nil-value))))
+        #+sb-thread (storew result-tn thread-tn tlab)
 
         (emit-label BACK-FROM-ALLOC)
         (inst add result-tn tmp-tn lowtag)
         (assemble (:elsewhere)
           (emit-label ALLOC)
-          (allocation-tramp type
-                            result-tn
-                            size
-                            BACK-FROM-ALLOC
-                            lip)))))
+          (if overflow
+              (funcall overflow)
+              (allocation-tramp type
+                                result-tn
+                                size
+                                BACK-FROM-ALLOC
+                                lip))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -248,9 +236,10 @@
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
-       (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
-       ,@(and store-type-code
-              `((storew ,flag-tn ,result-tn 0 ,lowtag)))
+       (when ,type-code
+         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
+         ,@(and store-type-code
+                `((storew ,flag-tn ,result-tn 0 ,lowtag))))
        ,@body)))
 
 ;;;; Error Code
@@ -274,9 +263,14 @@
           (t
            (let ((first-value (car values)))
              (inst brk (dpb (cond ((and (tn-p first-value)
-                                        (sc-is first-value descriptor-reg any-reg))
+                                        (sc-is first-value descriptor-reg any-reg unsigned-reg signed-reg))
                                    (pop values)
-                                   (tn-offset first-value))
+                                   (dpb (sc-case first-value
+                                          (unsigned-reg 1)
+                                          (signed-reg 2)
+                                          (t 0))
+                                        (byte 2 5)
+                                        (tn-offset first-value)))
                                   (t
                                    zr-offset))
                             (byte 8 8)

@@ -33,11 +33,13 @@
 ;;; don't change allocation granularity
 (assert (= gencgc-alloc-granularity 0))
 ;;; cards are not larger than pages
-(assert (<= gencgc-card-bytes +backend-page-bytes+))
+(assert (<= gencgc-page-bytes +backend-page-bytes+))
 ;;; largeness does not depend on the hardware page size
-(defconstant large-object-size (* 4 gencgc-card-bytes)))
+(defconstant large-object-size (* 4 gencgc-page-bytes)))
 
 ;;; Keep this (mostly) lined up with 'early-objdef' for sanity's sake!
+;;; The "transport" function is used only if the object is an OTHER-POINTER
+;;; (which goes through the dispatch table).
 #+sb-xc-host
 (defparameter *scav/trans/size*
  (mapcar
@@ -52,32 +54,30 @@
     (complex-single-float "unboxed")
     (complex-double-float "unboxed")
 
-    (code-header "code_header")
-    ;; For all 3 function subtypes, the transporter is "lose"
-    ;; because functions are not OTHER pointer objects.
-    ;; The scavenge function for fun-header is basically "lose",
-    ;; but it's only defined on non-x86 platforms for some reason.
-    ;; The sizer is "lose" because it's an error if a function is encountered
-    ;; in a heap scan.
-    (simple-fun ,(or #+(or x86 x86-64) "lose" "fun_header") "lose" "lose")
+    (code-header "code_blob")
+    ;; For simple-fun, all three methods are "lose": "scav" is because you can't
+    ;; encounter a simple-fun in heap scanning; "trans" is because it's not an OTHER pointer,
+    ;; and "size" is because you can't take the size of a simple-fun by itself.
+    (simple-fun "lose")
     ;; The closure scavenge function needs to know if the "self" slot
     ;; has pointer nature though it be fixnum tagged, as on x86.
     ;; The sizer is short_boxed.
-    (closure ,(or #+(or x86 x86-64) "closure" "short_boxed") "lose" "short_boxed")
+    (closure ,(or #+(or x86 x86-64 arm64) "closure" "short_boxed") "lose" "short_boxed")
     ;; Like closure, but these can also have a layout pointer in the high header bytes.
     (funcallable-instance "funinstance" "lose" "short_boxed")
     ;; These have a scav and trans function, but no size function.
-    #-(or x86 x86-64 arm64) (return-pc "return_pc_header" "return_pc_header" "lose")
+    #-(or x86 x86-64 arm64 riscv)
+    (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
-    (symbol #-compact-symbol "tiny_boxed" #+compact-symbol "symbol"
-            "tiny_boxed") ; trans and size are always like tiny_boxed
+    (symbol "symbol"
+            "tiny_mixed" "tiny_boxed") ; trans and size respectively
     ;; Can't transport characters as "other" pointer objects.
     ;; It should be a cons cell half which would go through trans_list()
     (character "immediate")
     (sap "unboxed")
     (unbound-marker "immediate")
-    (weak-pointer "weak_pointer" "weak_pointer" "boxed")
+    (weak-pointer "weakptr")
     (instance "instance" "lose" "instance")
     (fdefn "fdefn")
 

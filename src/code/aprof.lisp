@@ -64,7 +64,8 @@
 
 (defpackage #:sb-aprof
   (:use #:cl #:sb-ext #:sb-alien #:sb-sys #:sb-int #:sb-kernel)
-  (:export #:aprof-run #:aprof-show #:aprof-reset)
+  (:export #:aprof-run #:aprof-show #:aprof-reset
+           #:aprof-start #:patch-all-code)
   (:import-from #:sb-di #:valid-lisp-pointer-p)
   (:import-from #:sb-vm #:thread-reg)
   (:import-from #:sb-x86-64-asm
@@ -230,7 +231,11 @@
                (pop ?result)
                (mov ?_ (ea 0 ?result) ?header)
                (mov ?_ (ea ?_ ?result) ?vector-len)
-               (or ?result ?lowtag))))
+               (or ?result ?lowtag))
+        (list (push ?nbytes)
+              (call . ignore)
+              (pop ?result)
+              (or ?result ?lowtag))))
 
 (defun iterator-begin (iterator pc code)
   (let ((segment (sb-disassem:make-code-segment
@@ -262,9 +267,9 @@
                   (let ((disp (ash (machine-ea-disp ea) (- sb-vm:word-shift))))
                     (awhen (case disp
                             ((#.sb-vm::thread-mixed-tlab-slot
-                              #.sb-vm::thread-unboxed-tlab-slot) :tlab-freeptr)
+                              #.sb-vm::thread-cons-tlab-slot) :tlab-freeptr)
                             ((#.(1+ sb-vm::thread-mixed-tlab-slot)
-                              #.(1+ sb-vm::thread-unboxed-tlab-slot)) :tlab-limit))
+                              #.(1+ sb-vm::thread-cons-tlab-slot)) :tlab-limit))
                       (setq ea it))))
                 (setf (car tail) ea)) ; change the EA
               ;; There can be at most one EA per instruction, so we're done
@@ -466,9 +471,6 @@
           (let ((nbytes (cdr (assoc '?nbytes bindings)))
                 (header (cdr (assoc '?header bindings)))
                 (lowtag (cdr (assoc '?lowtag bindings))))
-            ;; The low bit might signify something to the allocator. Clear it.
-            (when (integerp nbytes)
-              (setq nbytes (logandc2 nbytes 1)))
             ;; matchp converts NIL in a machine-ea to 0.  The disassembler uses
             ;; NIL to signify that there was no displacement, which makes sense
             ;; when register indirect mode is used without a SIB byte.
@@ -482,7 +484,8 @@
                    (when (eq type 'instance)
                      (setq type (deduce-layout iterator bindings))))
                   ((eq type 'list) ; listify-rest-arg
-                   (setq nbytes nil))
+                   (unless (integerp nbytes)
+                     (setq nbytes nil)))
                   ((eq type 'acons)
                    (setq type 'list nbytes (* 2 sb-vm:cons-size sb-vm:n-word-bytes)))
                   ((member type '(any unknown-header))

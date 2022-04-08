@@ -429,23 +429,33 @@
   `(error "Can't supply a value for :FILL-POINTER (~S) that is larger ~
            than the~A size of the vector (~S)" ,actual ,adjective ,max))
 
-(declaim (inline %save-displaced-array-backpointer))
+(declaim (inline %save-displaced-array-backpointer
+                 %save-displaced-new-array-backpointer))
 (defun %save-displaced-array-backpointer (array data)
   (flet ((purge (pointers)
            (remove-if (lambda (value)
                         (or (not value) (eq array value)))
                       pointers
                       :key #'weak-pointer-value)))
-    ;; Add backpointer to the new data vector if it has a header.
+    (let ((old-data (%array-data array)))
+      (unless (eq old-data data)
+        ;; Add backpointer to the new data vector if it has a header.
+        (when (array-header-p data)
+          (setf (%array-displaced-from data)
+                (cons (make-weak-pointer array)
+                      (purge (%array-displaced-from data)))))
+        ;; Remove old backpointer, if any.
+        (when (array-header-p old-data)
+          (setf (%array-displaced-from old-data)
+                (purge (%array-displaced-from old-data))))))))
+
+(defun %save-displaced-new-array-backpointer (array data)
+  (flet ((purge (pointers)
+           (remove-if-not #'weak-pointer-value pointers)))
     (when (array-header-p data)
       (setf (%array-displaced-from data)
             (cons (make-weak-pointer array)
-                  (purge (%array-displaced-from data)))))
-    ;; Remove old backpointer, if any.
-    (let ((old-data (%array-data array)))
-      (when (and (neq data old-data) (array-header-p old-data))
-        (setf (%array-displaced-from old-data)
-              (purge (%array-displaced-from old-data)))))))
+                  (purge (%array-displaced-from data)))))))
 
 (defmacro populate-dimensions (header list-or-index rank)
   `(if (listp ,list-or-index)
@@ -465,16 +475,13 @@
                (setq product (* product (the index dim)))
                (incf rank))))))
 
-(defconstant-eqx +widetag->element-type+
-    #.(let ((a (make-array 32 :initial-element 0)))
-        (dovector (saetp *specialized-array-element-type-properties* a)
-          (let ((tag (saetp-typecode saetp)))
-            (setf (aref a (ash (- tag #x80) -2)) (saetp-specifier saetp)))))
-  #'equalp)
-
 (declaim (inline widetag->element-type))
 (defun widetag->element-type (widetag)
-  (svref +widetag->element-type+ (- (ash widetag -2) 32)))
+  (svref #.(let ((a (make-array 32 :initial-element 0)))
+             (dovector (saetp *specialized-array-element-type-properties* a)
+               (let ((tag (saetp-typecode saetp)))
+                 (setf (aref a (ash (- tag #x80) -2)) (saetp-specifier saetp)))))
+         (- (ash widetag -2) 32)))
 
 (defun initial-contents-error (content-length length)
   (error "There are ~W elements in the :INITIAL-CONTENTS, but ~
@@ -556,13 +563,9 @@
              (setf (%array-data array) data)
              (setf (%array-displaced-from array) nil)
              (cond (displaced-to
-                    (let ((offset (or displaced-index-offset 0)))
-                      (when (> (+ offset total-size)
-                               (array-total-size displaced-to))
-                        (error "~S doesn't have enough elements." displaced-to))
-                      (setf (%array-displacement array) offset)
-                      (setf (%array-displaced-p array) t)
-                      (%save-displaced-array-backpointer array data)))
+                    (setf (%array-displacement array) (or displaced-index-offset 0))
+                    (setf (%array-displaced-p array) t)
+                    (%save-displaced-new-array-backpointer array data))
                    (t
                     (setf (%array-displaced-p array) nil)))
              (populate-dimensions array dimensions array-rank)
@@ -736,17 +739,6 @@ of specialized arrays is supported."
                ,@decls
                (tagbody ,@forms))))))))
 
-;;; We need this constant to be dumped in such a way that genesis can directly
-;;; compute the symbol-value in cold load, and not defer the reference until
-;;; *!cold-toplevels* are evaluated. That's because GROW-HASH-TABLE calls REPLACE
-;;; which calls VECTOR-REPLACE which tries to reference the array of functions,
-;;; which had better not be deferred, or all hell breaks loose. It's actually
-;;; tricky to call any function in any file that has its toplevel forms evaluated
-;;; later than the current file, because you don't generally know whether code
-;;; blobs in that other file have had their L-T-V fixups patched in.
-(defconstant-eqx +blt-copier-for-widetag+ #.(make-array 32 :initial-element nil)
-  #'equalp)
-
 (macrolet ((%ref (accessor-getter extra-params)
              `(funcall (,accessor-getter array) array index ,@extra-params))
            (define (accessor-name slow-accessor-name accessor-getter
@@ -858,7 +850,7 @@ of specialized arrays is supported."
                         collect `(setf (svref ,symbol ,widetag)
                                        (,deffer ,saetp ,check-form))))))
   (defun !hairy-data-vector-reffer-init ()
-    (!blt-copiers-cold-init +blt-copier-for-widetag+)
+    (!blt-copiers-cold-init)
     (define-reffers %%data-vector-reffers%% define-reffer
       (progn)
       #'slow-hairy-data-vector-ref)
@@ -1043,24 +1035,17 @@ of specialized arrays is supported."
 
 ;;;; miscellaneous array properties
 
-(macrolet ((widetag->type (accessor)
-             (let ((table
-                    ;; Using unbound-marker for empty elements would be preferable,
-                    ;; but I'd either need a cross-compiler proxy for unbound-marker,
-                    ;; or else wrap a LOAD-TIME-VALUE on the table construction form
-                    ;; which might introduce more order-sensitivity to self-build.
-                    (sb-xc:make-array 32 ;:initial-element (make-unbound-marker)
-                                      :initial-element 0)))
-               (dovector (saetp *specialized-array-element-type-properties*)
-                 (setf (aref table (ash (- (saetp-typecode saetp) 128) -2))
-                       (funcall accessor saetp)))
-               `(aref ,table (- (ash (array-underlying-widetag array) -2) 32)))))
+(define-load-time-global *saetp-widetag-ctype* (make-array 32 :initial-element (make-unbound-marker)))
+
 (defun array-element-ctype (array)
   ;; same as (SPECIFIER-TYPE (ARRAY-ELEMENT-TYPE ARRAY)) but more efficient
-  (widetag->type saetp-ctype))
+  (svref (load-time-value *saetp-widetag-ctype*)
+         (- (ash (array-underlying-widetag array) -2) 32)))
+
 (defun array-element-type (array)
   "Return the type of the elements of the array"
-  (truly-the (or list symbol) (widetag->type saetp-specifier))))
+  (truly-the (or list symbol)
+             (widetag->element-type (array-underlying-widetag array))))
 
 (defun array-rank (array)
   "Return the number of dimensions of ARRAY."
@@ -1178,19 +1163,21 @@ of specialized arrays is supported."
            (setf (%array-fill-pointer array) (1+ fill-pointer))
            fill-pointer))))
 
-(defun !blt-copiers-cold-init (array)
-  (macrolet ((init ()
-               `(progn
-                  ,@(loop for saetp across *specialized-array-element-type-properties*
-                          when (and (not (member (saetp-specifier saetp) '(t nil)))
-                                    (<= (saetp-n-bits saetp) n-word-bits))
-                            collect `(setf (svref array ,(ash (- (saetp-typecode saetp) 128) -2))
-                                           #',(intern (format nil "UB~D-BASH-COPY"
-                                                              (saetp-n-bits saetp))
-                                                      "SB-KERNEL"))))))
-      (init)))
-
-(defmacro blt-copier-for-widetag (x) `(aref +blt-copier-for-widetag+ (ash (- ,x 128) -2)))
+(defun !blt-copiers-cold-init ()
+  (let ((array (make-array 32 :initial-element nil)))
+    (macrolet ((init ()
+                 `(progn
+                    ,@(loop for saetp across *specialized-array-element-type-properties*
+                            when (and (not (member (saetp-specifier saetp) '(t nil)))
+                                      (<= (saetp-n-bits saetp) n-word-bits))
+                              collect `(setf (svref array ,(ash (- (saetp-typecode saetp) 128) -2))
+                                             #',(intern (format nil "UB~D-BASH-COPY"
+                                                                (saetp-n-bits saetp))
+                                                        "SB-KERNEL"))))))
+      (init))
+    (setf (fdefinition 'blt-copier-for-widetag)
+          (lambda (x)
+            (aref array (ash (- x 128) -2))))))
 
 (defun extend-vector (vector min-extension)
   (declare (optimize speed)
@@ -1217,8 +1204,8 @@ of specialized arrays is supported."
                      (truly-the simple-vector old-data)
                      :start2 old-start :end2 old-end)
             (let ((copier (blt-copier-for-widetag widetag)))
-              (if (functionp copier)
-                  (funcall copier old-data old-start new-data 0 old-length)
+              (if copier
+                  (funcall (truly-the function copier) old-data old-start new-data 0 old-length)
                   (replace new-data old-data :start2 old-start :end2 old-end))))
         (setf (%array-data vector) new-data
               (%array-available-elements vector) new-length

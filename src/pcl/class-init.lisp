@@ -44,9 +44,8 @@
 
 
 (defun allocate-standard-instance (wrapper)
-  (let* ((instance (%make-instance (1+ sb-vm:instance-data-start)))
+  (let* ((instance (%new-instance wrapper (1+ sb-vm:instance-data-start)))
          (slots (make-array (wrapper-length wrapper) :initial-element +slot-unbound+)))
-    (setf (%instance-wrapper instance) wrapper)
     (%instance-set instance sb-vm:instance-data-start slots)
     instance))
 
@@ -602,7 +601,7 @@
                                         info
                                         (cdr (find-slot-cell wrapper slot-name))))))
                              (when typecheck
-                               (funcall typecheck new-value)))
+                               (setf new-value (funcall typecheck new-value))))
                            ;; Then call the real writer.
                            (funcall writer-fun new-value instance)))))
     (set-fun-name (if safe-p

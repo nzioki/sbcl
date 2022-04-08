@@ -33,7 +33,6 @@
 
 ;;; a list of toplevel things set by GENESIS
 (defvar *!cold-toplevels*)
-(defvar *!cold-defsymbols*)  ; "easy" DEFCONSTANTs
 
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
@@ -77,6 +76,59 @@
         *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table #() nil nil)
         *suppress-print-errors* nil
         *current-level-in-print* 0))
+
+;;; Create a stream that works early.
+(defun !make-cold-stderr-stream ()
+  (let ((stderr
+          #-win32 2
+          #+win32 (sb-win32::get-std-handle-or-null sb-win32::+std-error-handle+))
+        (buf (make-string 1 :element-type 'base-char :initial-element #\Space)))
+    (%make-fd-stream
+     :out (lambda (stream ch)
+            (declare (ignore stream))
+            (setf (char buf 0) ch)
+            (sb-unix:unix-write stderr buf 0 1))
+     :sout (lambda (stream string start end)
+             (declare (ignore stream))
+             (flet ((out (s start len)
+                      (when (plusp len)
+                        (setf (char buf 0) (char s (+ start len -1))))
+                      (sb-unix:unix-write stderr s start len)))
+               (if (typep string 'simple-base-string)
+                   (out string start (- end start))
+                   (let ((n (- end start)))
+                     ;; will croak if there is any non-BASE-CHAR in the string
+                     (out (replace (make-array n :element-type 'base-char)
+                                   string :start2 start) 0 n)))))
+     :misc (lambda (stream operation arg1)
+             (declare (ignore stream arg1))
+             (stream-misc-case (operation :default nil)
+               (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
+                (if (eql (char buf 0) #\newline) 0 1)))))))
+
+(defun xc-sanity-checks ()
+  ;; Verify on startup that some constants were dumped reflecting the
+  ;; correct action of our vanilla-host-compatible functions.  For
+  ;; now, just SXHASH is checked.
+
+  ;; Parallelized build doesn't get the full set of data because the
+  ;; side effect of data recording when invoking compile-time
+  ;; functions aren't propagated back to process that forked the
+  ;; children doing the grunt work.
+  (let ((sxhash-crosscheck
+          '#.(let (pairs)
+               ;; De-duplicate, which reduces the list from ~8000 entries to ~1000 entries.
+               ;; But make sure that any key which isolated repeated has the same value
+               ;; at each repetition.
+               (dolist (pair sb-c::*sxhash-crosscheck* (coerce pairs 'simple-vector))
+                 (let ((found (assoc (car pair) pairs)))
+                   (if found
+                       (aver (= (cdr found) (cdr pair)))
+                       (push pair pairs)))))))
+    (loop for (object . hash) across sxhash-crosscheck
+          unless (= (sxhash object) hash)
+            do (error "SXHASH computed wrong answer for ~S. Got ~x should be ~x"
+                      object hash (sxhash object)))))
 
 ;;; called when a cold system starts up
 (defun !cold-init ()
@@ -129,8 +181,10 @@
 
   ;; The readtable needs to be initialized for printing symbols early,
   ;; which is useful for debugging.
-  #+sb-devel
   (!readtable-cold-init)
+  (write-string "Checking symbol printer: ")
+  (write 't)
+  (terpri)
 
   ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
@@ -147,10 +201,6 @@
   (show-and-call sb-kernel::!primordial-type-cold-init)
 
   (show-and-call !type-cold-init)
-  ;; FIXME: It would be tidy to make sure that that these cold init
-  ;; functions are called in the same relative order as the toplevel
-  ;; forms of the corresponding source files.
-
   (show-and-call !policy-cold-init-or-resanify)
   (/show0 "back from !POLICY-COLD-INIT-OR-RESANIFY")
 
@@ -159,33 +209,16 @@
   ;; to the subclasses of STRUCTURE-OBJECT.
   (show-and-call sb-kernel::!set-up-structure-object-class)
 
-  ;; Genesis is able to perform some of the work of DEFCONSTANT, but
-  ;; not all of it. It assigns symbol values, but can not manipulate
-  ;; globaldb. Therefore, a subtlety of these macros for bootstrap is
-  ;; that we see each DEFthing twice: once during cold-load and again
-  ;; here.
-  (setq sb-pcl::*!docstrings* nil) ; needed by %DEFCONSTANT
-  (dolist (x *!cold-defsymbols*)
-    (destructuring-bind (fun name source-loc . docstring) x
-      (aver (boundp name)) ; it's a bug if genesis didn't initialize
-      (ecase fun
-        (%defconstant
-         (apply #'%defconstant name (symbol-value name) source-loc docstring)))))
-
   (unless (!c-runtime-noinform-p)
     #+(or x86 x86-64) (format t "[Length(TLFs)=~D]" (length *!cold-toplevels*))
     #-(or x86 x86-64) (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
 
+  (setq sb-pcl::*!docstrings* nil) ; needed before any documentation is set
   (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
 
-  (loop with *package* = *package* ; rebind to self, as if by LOAD
-        for index-in-cold-toplevels from 0
-        for toplevel-thing in (prog1 *!cold-toplevels*
-                                 (makunbound '*!cold-toplevels*))
-        do
-      #+sb-show
-      (when (zerop (mod index-in-cold-toplevels 1000))
-        (/show index-in-cold-toplevels))
+  (/show0 "calling cold toplevel forms and fixups")
+  (let ((*package* *package*)) ; rebind to self, as if by LOAD
+    (dolist (toplevel-thing *!cold-toplevels*)
       (typecase toplevel-thing
         (function
          (funcall toplevel-thing))
@@ -197,17 +230,19 @@
            (aver (typep object 'code-component))
            (aver (unbound-marker-p (code-header-ref object index)))
            (setf (code-header-ref object index) (svref *!load-time-values* value))))
+        ((cons (eql :named-constant))
+         (destructuring-bind (object index name) (cdr toplevel-thing)
+           (aver (typep object 'code-component))
+           (aver (unbound-marker-p (code-header-ref object index)))
+           (sb-fasl::named-constant-set object index name)))
         ((cons (eql :begin-file))
          (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
         (t
-         (!cold-lose "bogus operation in *!COLD-TOPLEVELS*"))))
+         (!cold-lose "bogus operation in *!COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
   (unless (!c-runtime-noinform-p) (terpri))
 
-  ;; Precise GC seems to think these symbols are live during the final GC
-  ;; which in turn enlivens a bunch of other "*!foo*" symbols.
-  ;; Setting them to NIL helps a little bit.
-  (setq *!cold-defsymbols* nil *!cold-toplevels* nil)
+  (makunbound '*!cold-toplevels*) ; so it gets GC'd
 
   #+win32 (show-and-call reinit-internal-real-time)
 
@@ -222,8 +257,12 @@
   ;; now that the type system is definitely initialized, fixup UNKNOWN
   ;; types that have crept in.
   (show-and-call !fixup-type-cold-init)
-  ;; run the PROCLAIMs.
-  (show-and-call !late-proclaim-cold-init)
+
+  ;; We run through queued-up type and ftype proclaims that were made
+  ;; before the type system was initialized, and (since it is now
+  ;; initalized) reproclaim them..
+  (mapcar #'proclaim sb-c::*queued-proclaims*)
+  (makunbound 'sb-c::*queued-proclaims*)
 
   (show-and-call !loader-cold-init)
   (show-and-call os-cold-init-or-reinit)
@@ -269,6 +308,8 @@
       (logically-readonlyize (sb-c::sc-load-costs sc))
       (logically-readonlyize (sb-c::sc-move-vops sc))
       (logically-readonlyize (sb-c::sc-move-costs sc))))
+
+  (show-and-call xc-sanity-checks)
 
   ;; The system is finally ready for GC.
   (/show0 "enabling GC")

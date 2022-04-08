@@ -2200,23 +2200,12 @@
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 
-;; named and unnamed
-(defconstant +born-to-coalesce+ '.born-to-coalesce.)
-(test-util:with-test (:name (compile compile-file :coalescing symbol))
-  (multiple-value-bind (file-fun core-fun)
-      (compile2 '(lambda ()
-                  (let ((x (cons +born-to-coalesce+ nil))
-                        (y (cons '.born-to-coalesce. nil)))
-                    (list x y))))
-    (assert (= 1 (count-code-constants '.born-to-coalesce. file-fun)))
-    (assert (= 1 (count-code-constants '.born-to-coalesce. core-fun)))))
-
 ;; some things must retain identity under COMPILE, but we want to coalesce them under COMPILE-FILE
 (defun assert-coalescing (constant)
-  (let ((value (copy-seq (symbol-value constant))))
+  (let ((value (copy-seq constant)))
     (multiple-value-bind (file-fun core-fun)
         (compile2 `(lambda ()
-                     (let ((x (cons ,constant nil))
+                     (let ((x (cons ',constant nil))
                            (y (cons ',value nil)))
                        (list x y))))
       (assert (= 1 (count-code-constants value file-fun)))
@@ -2234,17 +2223,14 @@
                      (equal a b)
                      (not (eq a b))))))))
 
-(defconstant +born-to-coalesce2+ "maybe coalesce me!")
 (test-util:with-test (:name (compile compile-file :coalescing string))
-  (assert-coalescing '+born-to-coalesce2+))
+  (assert-coalescing "maybe coalesce me!"))
 
-(defconstant +born-to-coalesce3+ #*01101001011101110100011)
 (test-util:with-test (:name (compile compile-file :coalescing bit-vector))
-  (assert-coalescing '+born-to-coalesce3+))
+  (assert-coalescing #*01101001011101110100011))
 
-(defconstant +born-to-coalesce4+ '(foo bar "zot" 123 (nested "quux") #*0101110010))
 (test-util:with-test (:name (compile compile-file :coalescing :mixed))
-  (assert-coalescing '+born-to-coalesce4+))
+  (assert-coalescing '(foo bar "zot" 123 (nested "quux") #*0101110010)))
 
 (defclass some-constant-thing () ())
 
@@ -2294,6 +2280,21 @@
       (test f1 c1)
       (test f1 f2)
       (test f1 c2))))
+
+;;;; backq const folding tests
+(test-util:with-test (:name :backq-const-named-reference-folding)
+  (ctu:file-compile
+   `((defconstant +izero+ 0)
+     (defconstant +fzero+ 0f0)
+     (defconstant +dzero+ 0d0)
+     (defparameter *dzero* 0d0)
+     (defun test-1 () `(,+izero+ ,+fzero+ ,+dzero+))
+     (defun test-2 () `(,+izero+ ,+fzero+ ,+dzero+ ,*dzero*))
+     (defun test-3 () (list +izero+ +fzero+ +dzero+)))
+   :load t)
+  (assert (equal (test-1) '(0 0.0 0.0d0)))
+  (assert (equal (test-2) '(0 0.0 0.0d0 0.0d0)))
+  (assert (equal (test-3) '(0 0.0 0.0d0))))
 
 ;;; user-defined satisfies-types cannot be folded
 (deftype mystery () '(satisfies mysteryp))
@@ -2476,10 +2477,7 @@
     (assert (equal type1 (sb-kernel:%simple-fun-type g)))
     (assert (equal type0 (sb-kernel:%simple-fun-type h)))))
 
-;;; I think *CHECK-CONSISTENCY* is confused in the presence of dynamic-extent.
-;;; A simpler example not involving package iteration also fails in COMPILE-FILE:
-;;;   (let ((l (mapcar #'string *features*))) (defun g () l))
-(test-util:with-test (:name :bug-308921 :fails-on :sbcl)
+(test-util:with-test (:name :bug-308921)
   (let ((*check-consistency* t))
     (ctu:file-compile
      `((let ((exported-symbols-alist
@@ -3071,8 +3069,47 @@
 
 (declaim (ftype (function () (member #.*entry-info-type-struct*)) entry-info-type-func))
 
-
 (with-test (:name :dump-entry-info-type)
   (ctu:file-compile
    "(lambda () (entry-info-type-func))"
    :load t))
+
+(deftype member-abc () '(member #\a #\b #\c))
+(with-test (:name (make-array :initial-element style-warning))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-array len :element-type '(or member-abc condition) :initial-element #\\e))")
+    (assert warnp)
+    (assert (not failp))))
+
+(let ((false #\a)
+      (true #\z))
+  (defun is-probability? (inp)
+    (and (characterp inp) (char<= false inp true)))
+  (deftype probability () '(satisfies is-probability?)))
+(with-test (:name (make-array :initial-element satisfies))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-array len :element-type '(or probability condition) :initial-element #\\e))")
+    (assert (not warnp))
+    (assert (not failp))))
+(with-test (:name (make-sequence :initial-element satisfies))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-sequence '(simple-array (or probability condition) (*)) len :initial-element #\\e))")
+    (assert (not warnp))
+    (assert (not failp))))
+
+;;; Test from git rev 0b39d68b05ef669f812a6bf570126505d931bf96
+;;; I do not understand why, if placed in a '.pure' file, it causes:
+;;;  There is no applicable method for the generic function
+;;;    #<STANDARD-GENERIC-FUNCTION SB-MOP:REMOVE-DIRECT-SUBCLASS (1)>
+;;;  when called with arguments
+;;;    (#<STRUCTURE-CLASS COMMON-LISP:STRUCTURE-OBJECT> NIL).
+;;; when the test runner attempts to purge the classoid namespace
+;;; of test artifacts.
+;;; (It does define structures, but that's supposed to be allowed now)
+(with-test (:name :bug-255)
+  (with-scratch-file (fasl "fasl")
+    (compile-file "bug-255" :output-file fasl))
+  (delete-package :bug255))

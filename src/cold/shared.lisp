@@ -21,9 +21,9 @@
 ;;; and running the cross-compiler to produce target FASL files).
 (defpackage "SB-COLD" (:use "CL"))
 
-;;; #+sbcl ; use at your own risk!
-;;; (when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
-;;;   (setf (extern-alien "show_gc_generation_throughput" int) 1))
+#+nil ; change to #+sbcl if desired, but at your own risk!
+(when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
+  (setf (extern-alien "show_gc_generation_throughput" int) 1))
 
 (in-package "SB-COLD")
 
@@ -281,7 +281,7 @@
         ;; Win32 conditionally adds :sb-futex in grovel-features.sh
         (when (target-featurep '(:and :sb-thread (:or :linux :freebsd)))
           (pushnew :sb-futex sb-xc:*features*))
-        (when (target-featurep '(:or :x86-64 :ppc64 :arm64 (:and :riscv :64-bit)))
+        (when (target-featurep :64-bit)
           (push :compact-symbol sb-xc:*features*))
         (when (target-featurep '(:and :sb-thread (:not :win32)))
           (push :pauseless-threadstart sb-xc:*features*))
@@ -334,11 +334,6 @@
           "The selected architecture requires :SB-THREAD")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
-         ;; I srlsy doubt that any of these are tested with cheneygc any more
-         ("(and cheneygc (not (or arm mips ppc riscv sparc)))"
-          ":CHENEYGC not supported on selected architecture")
-         ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64 riscv)))"
-          ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
          ("(and sb-safepoint (not (and (or arm64 x86 x86-64) (or darwin linux win32))))"
@@ -691,7 +686,10 @@
 (compile 'compile-stem)
 
 (defparameter *host-quirks*
-  (or #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
+  (or #+cmu  '(:host-quirks-cmu)
+      #+ecl  '(:host-quirks-ecl)
+      #+ccl  '(:host-quirks-ccl)
+      #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
 
 ;;; Execute function FN in an environment appropriate for compiling the
 ;;; cross-compiler's source code in the cross-compilation host.

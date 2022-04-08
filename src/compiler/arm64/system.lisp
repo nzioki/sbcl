@@ -159,14 +159,6 @@
 
 ;;;; Allocation
 
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
-
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -223,6 +215,16 @@
     (inst add ndescr offset ndescr)
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
+
+(define-vop (%closure-fun)
+  (:policy :fast-safe)
+  (:translate %closure-fun)
+  (:args (function :scs (descriptor-reg)))
+  (:results (result :scs (descriptor-reg)))
+  (:temporary (:scs (interior-reg)) lip)
+  (:generator 3
+    (loadw lip function closure-fun-slot fun-pointer-lowtag)
+    (inst add-sub result lip (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes)))))
 ;;;
 
 (defun load-symbol-dbinfo (result symbol temp)

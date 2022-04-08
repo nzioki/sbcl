@@ -15,7 +15,7 @@
 #include "os.h"
 #include "lispregs.h"
 #include "signal.h"
-#include "alloc.h"
+#include "pseudo-atomic.h"
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
@@ -40,18 +40,12 @@ os_context_register(os_context_t *context, int offset)
 }
 
 static inline unsigned int
-os_context_pc(os_context_t *context)
-{
-    return (unsigned int)(*os_context_pc_addr(context));
-}
-
-static inline unsigned int
 os_context_insn(os_context_t *context)
 {
     if (os_context_bd_cause(context))
-        return *(unsigned int *)(os_context_pc(context) + INSN_LEN);
+        return *(unsigned int *)((unsigned)OS_CONTEXT_PC(context) + INSN_LEN);
     else
-        return *(unsigned int *)(os_context_pc(context));
+        return *(unsigned int *)((unsigned)OS_CONTEXT_PC(context));
 }
 
 boolean
@@ -118,8 +112,8 @@ next_insn_addr(os_context_t *context, unsigned int inst)
     unsigned int r2 = (inst >> 16) & 0x1f;
     unsigned int r3 = (inst >> 11) & 0x1f;
     unsigned int disp = ((inst&(1<<15)) ? inst | (-1 << 16) : inst&0x7fff) << 2;
-    unsigned int jtgt = (os_context_pc(context) & ~0x0fffffff) | (inst&0x3ffffff) << 2;
-    unsigned int tgt = os_context_pc(context);
+    unsigned int jtgt = ((unsigned)OS_CONTEXT_PC(context) & ~0x0fffffff) | (inst&0x3ffffff) << 2;
+    unsigned int tgt = (unsigned)OS_CONTEXT_PC(context);
 
     switch(opcode) {
     case 0x0: /* jr, jalr */
@@ -130,7 +124,7 @@ next_insn_addr(os_context_t *context, unsigned int inst)
         case 0x09: /* jalr */
             tgt = os_context_register(context, r1);
             *os_context_register_addr(context, r3)
-                = os_context_pc(context) + INSN_LEN;
+                = (unsigned)OS_CONTEXT_PC(context) + INSN_LEN;
             break;
         default:
             tgt += INSN_LEN;
@@ -158,7 +152,7 @@ next_insn_addr(os_context_t *context, unsigned int inst)
             if(os_context_register(context, r1) < 0) {
                 tgt += disp;
                 *os_context_register_addr(context, 31)
-                    = os_context_pc(context) + INSN_LEN;
+                    = (unsigned)OS_CONTEXT_PC(context) + INSN_LEN;
             } else
                 tgt += INSN_LEN;
             break;
@@ -167,7 +161,7 @@ next_insn_addr(os_context_t *context, unsigned int inst)
             if(os_context_register(context, r1) >= 0) {
                 tgt += disp;
                 *os_context_register_addr(context, 31)
-                    = os_context_pc(context) + INSN_LEN;
+                    = (unsigned)OS_CONTEXT_PC(context) + INSN_LEN;
             } else
                 tgt += INSN_LEN;
             break;
@@ -182,7 +176,7 @@ next_insn_addr(os_context_t *context, unsigned int inst)
     case 0x3: /* jal */
         tgt = jtgt;
         *os_context_register_addr(context, 31)
-            = os_context_pc(context) + INSN_LEN;
+            = (unsigned)OS_CONTEXT_PC(context) + INSN_LEN;
         break;
     case 0x4: /* beq */
     case 0x14: /* beql */
@@ -240,37 +234,31 @@ arch_skip_instruction(os_context_t *context)
     /* Skip the offending instruction. Don't use os_context_insn here,
        since in case of a branch we want the branch insn, not the delay
        slot. */
-    *os_context_pc_addr(context)
+    OS_CONTEXT_PC(context)
         = (os_context_register_t)
             next_insn_addr(context,
-                *(unsigned int *)(os_context_pc(context)));
+                *(unsigned int *)((unsigned)OS_CONTEXT_PC(context)));
 }
 
 unsigned char *
 arch_internal_error_arguments(os_context_t *context)
 {
     if (os_context_bd_cause(context))
-        return (unsigned char *)(os_context_pc(context) + (INSN_LEN * 2));
+        return (unsigned char *)((unsigned)OS_CONTEXT_PC(context) + (INSN_LEN * 2));
     else
-        return (unsigned char *)(os_context_pc(context) + INSN_LEN);
+        return (unsigned char *)((unsigned)OS_CONTEXT_PC(context) + INSN_LEN);
 }
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
-{
-    return os_context_register(context, reg_ALLOC) & 1;
+boolean arch_pseudo_atomic_atomic(__attribute((unused)) os_context_t *context) {
+    return get_pseudo_atomic_atomic(get_sb_vm_thread());
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
-{
-    *os_context_register_addr(context, reg_NL4) |= -1LL<<31;
+void arch_set_pseudo_atomic_interrupted(__attribute__((unused)) os_context_t *context) {
+    set_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
-{
-    *os_context_register_addr(context, reg_NL4) &= ~(-1LL<<31);
+void arch_clear_pseudo_atomic_interrupted(__attribute__((unused)) os_context_t *context) {
+    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 unsigned int
@@ -342,7 +330,7 @@ static sigset_t orig_sigmask;
 void
 arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 {
-    unsigned int *pc = (unsigned int *)os_context_pc(context);
+    unsigned int *pc = (unsigned int *)(unsigned)OS_CONTEXT_PC(context);
     unsigned int *next_pc;
 
     orig_sigmask = *os_context_sigmask_addr(context);
@@ -366,7 +354,7 @@ arch_handle_breakpoint(os_context_t *context)
 void
 arch_handle_fun_end_breakpoint(os_context_t *context)
 {
-    *os_context_pc_addr(context)
+    OS_CONTEXT_PC(context)
         = (os_context_register_t)(unsigned int)
         handle_fun_end_breakpoint(context);
 }
@@ -375,7 +363,7 @@ void
 arch_handle_after_breakpoint(os_context_t *context)
 {
     arch_install_breakpoint(skipped_break_addr);
-    arch_remove_breakpoint((unsigned int *)os_context_pc(context),
+    arch_remove_breakpoint((unsigned int *)(unsigned)OS_CONTEXT_PC(context),
                            displaced_after_inst);
     *os_context_sigmask_addr(context) = orig_sigmask;
 }
@@ -383,24 +371,96 @@ arch_handle_after_breakpoint(os_context_t *context)
 void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
-    unsigned int code = *((uint32_t *)(os_context_pc(context)));
+    unsigned int code = *((uint32_t *)((unsigned)OS_CONTEXT_PC(context)));
     int register_offset = code >> 16 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
 
+#include "genesis/cons.h"
+static void
+handle_allocation_trap(os_context_t * context, unsigned int insn)
+{
+    if (foreign_function_call_active)
+      lose("Allocation trap inside foreign code.");
+
+    mcontext_t *mctx = &context->uc_mcontext;
+    // int rs = (insn >> 21) & 0x1f;
+    int rt = (insn >> 16) & 0x1f;
+    int code = (insn >> 6) & 0x3ff;
+    int alloc_tn = code & 0x3f;
+    int consp = code & 0x100;
+    // the number of bytes requested is the difference between region->free_pointer
+    // and the adjusted freepointer in 'rt'
+    struct alloc_region* r = (struct alloc_region*)STATIC_SPACE_START;
+    if (consp) ++r;
+    int request = *os_context_register_addr(context,rt) - (uword_t)r->free_pointer;
+    lispobj* argv = 0; // for listify_rest
+    if (code & 0x200) {
+        // alloc trap never occurs in a branch delay slot, so 'bd-cause' is 0
+        unsigned int* pc = (void*)(int)OS_CONTEXT_PC(context);
+        unsigned int dummy_add = pc[2];
+        int special = (dummy_add >> 26) & 0x3f;
+        int rs = (dummy_add >> 21) & 0x1f;
+        int rt = (dummy_add >> 16) & 0x1f;
+        int rd = (dummy_add >> 11) & 0x1f;
+        // Make sure it looks right
+        if (!(special == 0 && rd == 0 && rs == rt && ((dummy_add & 0x7ff) == 0x21)))
+            lose("Didn't see an ADDU after listify_rest trap");
+        argv = (lispobj*)(uword_t)mctx->gregs[rs];
+    }
+    // I don't undertand this. Just copying it from sparc + ppc
+    fake_foreign_function_call(context);
+    uword_t result;
+    {
+        struct thread* thread = get_sb_vm_thread();
+        struct interrupt_data *data = &thread_interrupt_data(thread);
+        data->allocation_trap_context = context;
+        if (argv) { // listify_rest
+            extern lispobj listify_rest_arg(lispobj*, sword_t);
+            // listify_rest_arg wants the number of bytes in the argv[] array,
+            // not the number of bytes in the result list, so divide by 2.
+            result = listify_rest_arg(argv, request>>1);
+            // Skip over this instruction and 2 more
+            OS_CONTEXT_PC(context) += 12;
+        } else { // anything else
+            extern lispobj *alloc(sword_t), *alloc_list(sword_t);
+            result = (uword_t)(consp ? alloc_list(request) : alloc(request));
+            // Skip over this instruction and the writeback of freeptr
+            OS_CONTEXT_PC(context) += 8;
+        }
+        data->allocation_trap_context = 0;
+    }
+    // store into the alloc_tn (which is encoded in 'code')
+    mctx->gregs[alloc_tn] = result;
+    undo_fake_foreign_function_call(context);
+}
+
 static void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int code = (os_context_insn(context) >> 6) & 0xff;
-    if (code == trap_PendingInterrupt) {
-        /* KLUDGE: is this necessary or will handle_trap do the same? */
-        arch_clear_pseudo_atomic_interrupted(context);
+    unsigned int insn = os_context_insn(context);
+    unsigned int funct = insn & 0x3f; // 6-bit field
+    unsigned int code = (insn >> 6) & 0x3ff;
+    __attribute__((unused)) int rs = (insn >> 21) & 0x1f;
+    __attribute__((unused)) int rt = (insn >> 16) & 0x1f;
+    switch (funct) {
+    case 0x33: // #b110011 = TLTU
+        return handle_allocation_trap(context, insn);
+    case 0x36: // #b110110 = TNE
+        switch (code) {
+        case 0: // FIXME: why is this not trap_PendingInterrupt ?
+          arch_clear_pseudo_atomic_interrupted(context);
+          OS_CONTEXT_PC(context) += 4;
+          return interrupt_handle_pending(context);
+        case trap_InvalidArgCount:
+          return interrupt_internal_error(context, 0);
+        }
     }
     handle_trap(context, code);
 }
 
-static void
+__attribute__((unused)) static void
 sigfpe_handler(int signal, siginfo_t *info, os_context_t *context)
 {
     interrupt_handle_now(signal, info, context);
@@ -439,4 +499,17 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
     char *reloc_addr =
         (char*)LINKAGE_TABLE_SPACE_END - (index + 1) * LINKAGE_TABLE_ENTRY_SIZE;
     *(unsigned int *)reloc_addr = (unsigned int)target_addr;
+}
+
+void gcbarrier_patch_code(void* where, int nbits)
+{
+    // Replicate FIXUP-CODE-OBJECT for fixup kind :SLL-SA.
+    unsigned* pc = where;
+    unsigned inst = pc[0];
+    unsigned next = pc[1];
+    int left_shift = 32 - (GENCGC_CARD_SHIFT + nbits);
+    int right_shift = left_shift + GENCGC_CARD_SHIFT;
+    unsigned preserve_bits = ~(0x1f << 6);
+    pc[0] = (inst & preserve_bits) | (left_shift << 6);
+    pc[1] = (next & preserve_bits) | (right_shift << 6);
 }

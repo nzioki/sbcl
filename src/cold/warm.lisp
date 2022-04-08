@@ -61,7 +61,11 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
   (do-all-symbols (s)
     (let ((dd (sb-kernel:find-defstruct-description s nil)))
       (when (and dd (not (sb-kernel::dd-null-lexenv-p dd)))
-        (push (sb-kernel:dd-name dd) result))))
+        (let ((pkg (symbol-package (sb-kernel:dd-name dd))))
+          (unless (member (package-name pkg)
+                          '("SB-RBTREE.WORD" "SB-RBTREE.MAP")
+                          :test 'string=)
+            (push (sb-kernel:dd-name dd) result))))))
   (assert (equal result '(sb-c::conset))))
 
 ;;; Assert that genesis preserved shadowing symbols.
@@ -201,7 +205,9 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
                               ((sb-kernel:redefinition-with-defgeneric
                                 #'muffle-warning))
                             (let ((sb-c::*source-namestring* fullname))
-                              (load output-truename)))
+                              ;; RISCV is slow, I'd like to see it doing something
+                              ;; rather than appearing to go out to lunch
+                              (load output-truename :verbose (or #+riscv t))))
                     (error "LOAD of ~S failed." output-truename))
                   (sb-int:/show "done loading" output-truename))))))))
 

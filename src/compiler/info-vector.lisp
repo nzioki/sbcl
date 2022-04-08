@@ -90,9 +90,20 @@
 ;;;;; Some stuff moved from 'globaldb.lisp':
 
 ;;; The structure constructor is never called
+;;; Can't freeze theis type because INSTANCE-LENGTH is variable,
+;;; but freezing would make it constant henceforth.
 (sb-xc:defstruct (packed-info (:predicate nil) (:constructor nil) (:copier nil))
   cells)
-;;(declaim (freeze-type packed-info)) ; crashes?
+(eval-when (#-sb-xc-host :compile-toplevel)
+  (sb-xc:defmacro make-packed-info (n)
+    `(%new-instance ,(find-layout 'packed-info) (+ ,n ,sb-vm:instance-data-start)))
+  ;; We can't call COPY-STRUCTURE because during bootstrapping, the DEFSTRUCT-DESCRIPTION
+  ;; is not available in cold-init by the first call to COPY-PACKED-INFO,
+  ;;    but COPY-STRUCTURE needs to know whether there are raw slos.
+  (sb-xc:defmacro copy-packed-info (info)
+    ;; not bothering with ONCE-ONLY here (doesn't matter)
+    `(%copy-instance (%make-instance (%instance-length ,info)) ,info)))
+
 (defconstant info-num-mask (ldb (byte info-number-bits 0) -1)) ; #b111111
 
 ;; Using 6 bits per packed field, 5 infos can be described in a 30-bit fixnum,
@@ -246,8 +257,8 @@
 ;; Iterate over PACKED-INFO, binding DATA-INDEX to the index of each aux-key in turn.
 ;; TOTAL-N-FIELDS is deliberately exposed to invoking code.
 ;;
-(defmacro do-packed-info-aux-key ((packed-info &optional (data-index (gensym)))
-                                          step-form &optional result-form)
+(defmacro do-packed-info-aux-key ((packed-info &optional (data-index (sb-xc:gensym)))
+                                  step-form &optional result-form)
   (with-unique-names (descriptor-idx field-idx info)
      `(let* ((,info ,packed-info)
              (,data-index (packed-info-len ,info))
@@ -569,9 +580,9 @@
             (t (packify-infos new end)))))) ; otherwise repack
 
 ;; We need a few magic constants to be shared between the next two functions.
-(defconstant-eqx !+pcl-reader-name+ '#.(make-symbol "READER") (constantly t))
-(defconstant-eqx !+pcl-writer-name+ '#.(make-symbol "WRITER") (constantly t))
-(defconstant-eqx !+pcl-boundp-name+ '#.(make-symbol "BOUNDP") (constantly t))
+(defconstant-eqx !+pcl-reader-name+ (make-symbol "READER") (constantly t))
+(defconstant-eqx !+pcl-writer-name+ (make-symbol "WRITER") (constantly t))
+(defconstant-eqx !+pcl-boundp-name+ (make-symbol "BOUNDP") (constantly t))
 
 ;; PCL names are physically 4-lists (see "pcl/slot-name")
 ;; that get treated as 2-component names for globaldb's purposes.
@@ -663,7 +674,8 @@ This is interpreted as
   (flet ((check (plist)
            (and (evenp (length plist))
                 (loop for (indicator value) on plist by #'cddr
-                      always (typep indicator 'info-number))))
+                      always (progn #+host-quirks-ccl value ; shut up the host
+                                    (typep indicator 'info-number)))))
          (add-length-prefix (list) ; computers count better than people
            (cons (1+ (length list)) list)))
     (unless (and (check (first lists))

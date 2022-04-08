@@ -121,8 +121,10 @@
             :load-if (sc-case y
                        ((any-reg descriptor-reg))
                        (immediate
-                        (not (and (integerp (tn-value y))
-                                  (abs-add-sub-immediate-p (fixnumize (tn-value y))))))
+                        (not (or
+                              (eql (tn-value y) $0f0)
+                              (and (integerp (tn-value y))
+                                   (abs-add-sub-immediate-p (fixnumize (tn-value y)))))))
                        (t t))))
   (:conditional :eq)
   (:policy :fast-safe)
@@ -130,7 +132,10 @@
   (:generator 6
     (let ((value (sc-case y
                    (immediate
-                    (fixnumize (tn-value y)))
+                    (let ((value (tn-value y)))
+                     (if (eql value $0f0)
+                         single-float-widetag
+                         (fixnumize (tn-value y)))))
                    (t y))))
       (cond ((or (not (integerp value))
                  (add-sub-immediate-p value))
@@ -146,9 +151,7 @@
                 (:variant-cost ,cost))))
   (def fast-if-eq-character fast-char=/character 3)
   (def fast-if-eq-character/c fast-char=/character/c 2)
-  (def fast-if-eq-fixnum fast-eql/fixnum 3)
-  (def fast-if-eq-fixnum/c fast-eql-c/fixnum 2)
+  (def fast-if-eq-fixnum fast-if-eql/fixnum 3)
+  (def fast-if-eq-integer/c fast-if-eql-integer/c 2)
   (def fast-if-eq-signed fast-if-eql/signed 5)
-  (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
-  (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
-  (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))
+  (def fast-if-eq-unsigned fast-if-eql/unsigned 5))

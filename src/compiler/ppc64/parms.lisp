@@ -19,17 +19,14 @@
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 
 (defconstant +backend-fasl-file-implementation+ :ppc)
-  ;; On Linux, the ABI specifies the page size to be 4k-64k, use the
-  ;; maximum of that range. FIXME: it'd be great if somebody would
-  ;; find out whether using exact multiples of the page size actually
-  ;; matters in the few places where that's done, or whether we could
-  ;; just use 4k everywhere.
-(defconstant +backend-page-bytes+ #+linux 65536 #-linux 4096)
+;; Granularity at which memory is mapped
+(defconstant +backend-page-bytes+ 65536)
 
-;;; The size in bytes of GENCGC cards, i.e. the granularity at which
-;;; writes to old generations are logged.  With mprotect-based write
-;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The size in bytes of GENCGC pages, i.e. the granularity at which
+;;; threads claim memory from the global heap.
+(defconstant gencgc-page-bytes +backend-page-bytes+)
+;;; Granularity at which writes to old generations are logged.
+(defconstant cards-per-page 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -45,10 +42,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-;;; flags for the generational garbage collector
-(defconstant pseudo-atomic-interrupted-flag 1)
-(defconstant pseudo-atomic-flag 4)
 
 (defconstant float-inexact-trap-bit (ash 1 0))
 (defconstant float-divide-by-zero-trap-bit (ash 1 1))
@@ -131,13 +124,6 @@
   (progn
     (defparameter dynamic-0-space-start #x4f000000)
     (defparameter dynamic-0-space-end   #x5cfff000)))
-
-#+darwin
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x10000000)
-    (defparameter dynamic-0-space-end   #x3ffff000)))
 
 (defenum (:start 8)
   halt-trap

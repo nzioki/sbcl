@@ -113,7 +113,7 @@ tree structure resulting from the evaluation of EXPRESSION."
               entry-points
               (not (member name entry-points :test #'equal))))))
 
-(flet ((defun-expander (env name lambda-list body snippet)
+(flet ((defun-expander (env name lambda-list body snippet &optional source-form)
   (multiple-value-bind (forms decls doc) (parse-body body t)
     ;; Maybe kill docstring, but only under the cross-compiler.
     #+(and (not sb-doc) sb-xc-host) (setq doc nil)
@@ -147,25 +147,29 @@ tree structure resulting from the evaluation of EXPRESSION."
         (setq inline-thing (list 'quote inline-thing)))
       (when (and extra-info (not (keywordp extra-info)))
         (setq extra-info (list 'quote extra-info)))
-      `(progn
-         (eval-when (:compile-toplevel)
-           (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
-         ,(if (block-compilation-non-entry-point name)
-              `(progn
-                 (sb-c::%refless-defun ,named-lambda)
-                 ',name)
-              `(%defun ',name ,named-lambda
-                       ,@(when (or inline-thing extra-info) `(,inline-thing))
-                       ,@(when extra-info `(,extra-info))))
-         ;; This warning, if produced, comes after the DEFUN happens.
-         ;; When compiling, there's no real difference, but when interpreting,
-         ;; if there is a handler for style-warning that nonlocally exits,
-         ;; it's wrong to have skipped the DEFUN itself, since if there is no
-         ;; function, then the warning ought not to have been issued at all.
-         ,@(when (typep name '(cons (eql setf)))
-             `((eval-when (:compile-toplevel :execute)
-                 (sb-c::warn-if-setf-macro ',name))
-               ',name)))))))
+      (let ((definition
+              (if (block-compilation-non-entry-point name)
+                  `(progn
+                     (sb-c::%refless-defun ,named-lambda)
+                     ',name)
+                  `(%defun ',name ,named-lambda
+                           ,@(when (or inline-thing extra-info) `(,inline-thing))
+                           ,@(when extra-info `(,extra-info))))))
+       `(progn
+          (eval-when (:compile-toplevel)
+            (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
+          ,(if source-form
+               `(sb-c::with-source-form ,source-form ,definition)
+               definition)
+          ;; This warning, if produced, comes after the DEFUN happens.
+          ;; When compiling, there's no real difference, but when interpreting,
+          ;; if there is a handler for style-warning that nonlocally exits,
+          ;; it's wrong to have skipped the DEFUN itself, since if there is no
+          ;; function, then the warning ought not to have been issued at all.
+          ,@(when (typep name '(cons (eql setf)))
+              `((eval-when (:compile-toplevel :execute)
+                  (sb-c::warn-if-setf-macro ',name))
+                ',name))))))))
 
 ;;; This is one of the major places where the semantics of block
 ;;; compilation is handled.  Substitution for global names is totally
@@ -175,15 +179,15 @@ tree structure resulting from the evaluation of EXPRESSION."
 ;;; functions (effectively turning them into local lexical functions.)
   (sb-xc:defmacro defun (&environment env name lambda-list &body body)
     "Define a function at top level."
-    (check-designator name defun)
+    (check-designator name 'defun #'legal-fun-name-p "function name")
     #+sb-xc-host
     (unless (cl:symbol-package (fun-name-block-name name))
       (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
     (defun-expander env name lambda-list body nil))
 
   ;; extended defun as used by defstruct
-  (sb-xc:defmacro sb-c:xdefun (&environment env name snippet lambda-list &body body)
-    (defun-expander env name lambda-list body snippet)))
+  (sb-xc:defmacro sb-c:xdefun (&environment env name snippet source-form lambda-list &body body)
+    (defun-expander env name lambda-list body snippet source-form)))
 
 ;;;; DEFCONSTANT, DEFVAR and DEFPARAMETER
 
@@ -192,7 +196,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   compiled into code. If the variable already has a value, and this is not
   EQL to the new value, the code is not portable (undefined behavior). The
   third argument is an optional documentation string for the variable."
-  (check-designator name defconstant)
+  (check-designator name 'defconstant)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (%defconstant ',name ,value (sb-c:source-location)
                    ,@(and docp `(',doc)))))
@@ -246,6 +250,9 @@ tree structure resulting from the evaluation of EXPRESSION."
         ;; don't warn or error or anything, just fall through.)
         )
        (t (warn "redefining ~(~A~) ~S to be a constant" kind name)))))
+  (dolist (backpatch (info :variable :forward-references name))
+    (funcall backpatch value))
+  (clear-info :variable :forward-references name)
   ;; We ought to be consistent in treating any change of :VARIABLE :KIND
   ;; as a continuable error. The above CASE expression pre-dates the
   ;; existence of symbol-macros (I believe), but at a bare minimum,
@@ -258,11 +265,6 @@ tree structure resulting from the evaluation of EXPRESSION."
     (when docp
       (setf (documentation name 'variable) doc))
     (%set-symbol-value name value))
-  ;; Record the names of hairy defconstants when block compiling.
-  (when (and sb-c::*compile-time-eval*
-             (eq (sb-c::block-compile sb-c::*compilation*) t))
-    (unless (sb-xc:typep value '(or fixnum character symbol))
-      (push name sb-c::*hairy-defconstants*)))
   ;; Define the constant in the cross-compilation host, since the
   ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
   ;; which reference the constant.
@@ -276,7 +278,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   SPECIAL and, optionally, initialize it. If the variable already has a
   value, the old value is not clobbered. The third argument is an optional
   documentation string for the variable."
-  (check-designator var defvar)
+  (check-designator var 'defvar)
   ;; Maybe kill docstring, but only under the cross-compiler.
   #+(and (not sb-doc) sb-xc-host) (setq doc nil)
   `(progn
@@ -300,7 +302,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   variable special and sets its value to VAL, overwriting any
   previous value. The third argument is an optional documentation
   string for the parameter."
-  (check-designator var defparameter)
+  (check-designator var 'defparameter)
   ;; Maybe kill docstring, but only under the cross-compiler.
   #+(and (not sb-doc) sb-xc-host) (setq doc nil)
   `(progn
@@ -309,6 +311,51 @@ tree structure resulting from the evaluation of EXPRESSION."
      (%defparameter ',var ,val (sb-c:source-location)
                     ,@(and docp
                            `(',doc)))))
+
+(defun %compiler-defvar (var)
+  (proclaim `(special ,var)))
+
+
+;;;; DEFGLOBAL and DEFINE-LOAD-TIME-GLOBAL
+
+(sb-xc:defmacro defglobal (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME both at compile- and load-time, but only if NAME is not
+already bound.
+
+Global variables share their values between all threads, and cannot be
+locally bound, declared special, defined as constants, and neither bound
+nor defined as symbol macros.
+
+See also the declarations SB-EXT:GLOBAL and SB-EXT:ALWAYS-BOUND."
+  (check-designator name 'defglobal)
+  (let ((boundp (make-symbol "BOUNDP")))
+    `(progn
+       (eval-when (:compile-toplevel)
+         (let ((,boundp (boundp ',name)))
+           (%compiler-defglobal ',name :always-bound
+                                (not ,boundp) (unless ,boundp ,value))))
+       (%defglobal ',name
+                   (if (%boundp ',name) (make-unbound-marker) ,value)
+                   (sb-c:source-location)
+                   ,@(and docp `(',doc))))))
+
+(sb-xc:defmacro define-load-time-global (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME at load-time, but only if NAME is not already bound.
+
+Attempts to read NAME at compile-time will signal an UNBOUND-VARIABLE error
+unless it has otherwise been assigned a value.
+
+See also DEFGLOBAL which assigns the VALUE at compile-time too."
+  (check-designator name 'define-load-time-global)
+  `(progn
+     (eval-when (:compile-toplevel)
+       (%compiler-defglobal ',name :eventually nil nil))
+     (%defglobal ',name
+                 (if (%boundp ',name) (make-unbound-marker) ,value)
+                 (sb-c:source-location)
+                 ,@(and docp `(',doc)))))
 
 (defun %compiler-defglobal (name always-boundp assign-it-p value)
   (proclaim `(global ,name))
@@ -320,9 +367,6 @@ tree structure resulting from the evaluation of EXPRESSION."
    (if (eq (info :variable :always-bound name) :always-bound)
        :always-bound
        always-boundp)))
-
-(defun %compiler-defvar (var)
-  (proclaim `(special ,var)))
 
 
 ;;;; various conditional constructs
@@ -656,7 +700,8 @@ invoked. In that case it will store into PLACE and start over."
 
 (sb-xc:defmacro define-compiler-macro (name lambda-list &body body)
   "Define a compiler-macro for NAME."
-  (check-designator name define-compiler-macro)
+  (check-designator name 'define-compiler-macro
+      #'legal-fun-name-p "function name")
   (when (and (symbolp name) (special-operator-p name))
     (%program-error "cannot define a compiler-macro for a special operator: ~S"
                     name))

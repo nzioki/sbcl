@@ -29,7 +29,7 @@
 ;;;
 (defmacro define-method-combination (&whole form name . args)
   (declare (ignore args))
-  (check-designator name define-method-combination)
+  (check-designator name 'define-method-combination)
   `(progn
      (with-single-package-locked-error
          (:symbol ',name "defining ~A as a method combination"))
@@ -101,6 +101,17 @@
       ',(and (neq documentation canary)
              documentation)
       (sb-c:source-location))))
+
+(defun random-documentation (name type)
+  (cdr (assoc type (info :random-documentation :stuff name))))
+
+(defun (setf random-documentation) (new-value name type)
+  (let ((pair (assoc type (info :random-documentation :stuff name))))
+    (if pair
+        (setf (cdr pair) new-value)
+        (push (cons type new-value)
+              (info :random-documentation :stuff name))))
+  new-value)
 
 (defun load-short-defcombin (type-name operator ioa doc source-location)
   (let ((info (make-method-combination-info

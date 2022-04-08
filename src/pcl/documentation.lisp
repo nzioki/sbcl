@@ -46,6 +46,49 @@
      (setf (%simple-fun-doc function) new-value)))
   new-value)
 
+(defun real-function-name (name)
+  ;; Resolve the actual name of the function named by NAME
+  ;; e.g. (setf (name-function 'x) #'car)
+  ;; (real-function-name 'x) => CAR
+  (cond ((not (fboundp name))
+         nil)
+        ((and (symbolp name)
+              (macro-function name))
+         (let ((name (%fun-name (macro-function name))))
+           (and (consp name)
+                (eq (car name) 'macro-function)
+                (cadr name))))
+        (t
+         (%fun-name (fdefinition name)))))
+
+;;; It would be nice not to need this at all, but there's too much spaghetti
+;;; and macrology for me to figure out where relying on a method just works.
+(defun %doc-info (x doc-type)
+  (case doc-type
+    (function
+     ;; Unused
+     (error "FUNCTION doc-type is not supported."))
+    (structure
+     (typecase x
+       (symbol (cond
+                 ((eq (info :type :kind x) :instance)
+                  (values (info :type :documentation x)))
+                 ((info :typed-structure :info x)
+                  (values (info :typed-structure :documentation x)))))))
+    (type
+     (typecase x
+       (structure-class (values (info :type :documentation (class-name x))))
+       (t (and (typep x 'symbol) (values (info :type :documentation x))))))
+    ((t)
+     (typecase x
+       (function (fun-doc x))
+       (structure-class (values (info :type :documentation (class-name x))))
+       ((or symbol cons)
+        (random-documentation x doc-type))))
+    (t
+     (when (typep x '(or symbol cons))
+       (random-documentation x doc-type)))))
+
 ;;; (SETF %DOC-INFO) is a thin wrapper on INFO that set or clears
 ;;; a :DOCUMENTATION info value depending on whether STRING is NIL.
 ;;; It, and the corresponding reader, are not for use outside this file.
@@ -83,46 +126,18 @@
            ;; " Documentation is attached as a documentation string to
            ;;   /name/ (as kind function) and to the /function object/."
            (cond ((not (legal-fun-name-p name)))
-                 ((not (equal (sb-c::real-function-name name) name))
+                 ((not (equal (real-function-name name) name))
                   (setf (random-documentation name 'function) string))
                  (t
                   (setf (fun-doc (fdefinition name)) string))))
           ((typep name '(or symbol cons))
            (setf (random-documentation name doc-type) string)))))
 
-;;; It would be nice not to need this at all, but there's too much spaghetti
-;;; and macrology for me to figure out where relying on a method just works.
-(defun %doc-info (x doc-type)
-  (case doc-type
-    (function
-     ;; Unused
-     (error "FUNCTION doc-type is not supported."))
-    (structure
-     (typecase x
-       (symbol (cond
-                 ((eq (info :type :kind x) :instance)
-                  (values (info :type :documentation x)))
-                 ((info :typed-structure :info x)
-                  (values (info :typed-structure :documentation x)))))))
-    (type
-     (typecase x
-       (structure-class (values (info :type :documentation (class-name x))))
-       (t (and (typep x 'symbol) (values (info :type :documentation x))))))
-    ((t)
-     (typecase x
-       (function (fun-doc x))
-       (structure-class (values (info :type :documentation (class-name x))))
-       ((or symbol cons)
-        (random-documentation x doc-type))))
-    (t
-     (when (typep x '(or symbol cons))
-       (random-documentation x doc-type)))))
-
 (defun set-function-name-documentation (name documentation)
   (aver name)
   (cond ((not (legal-fun-name-p name))
          nil)
-        ((not (equal (sb-c::real-function-name name) name))
+        ((not (equal (real-function-name name) name))
          (setf (random-documentation name 'function) documentation))
         (t
          (setf (fun-doc (or (and (symbolp name)
@@ -411,8 +426,8 @@ Value of +SLOT-UNBOUND+ is unspecified, and should not be relied to be
 of any particular type, but it is guaranteed to be suitable for EQ
 comparison.")
 
-#.(prog1 `(progn ,@*!documentation-methods*)
-    (setq *!documentation-methods* nil))
+(!install-cross-compiled-methods 'documentation)
+(!install-cross-compiled-methods '(setf documentation))
 
 (dolist (args (prog1 *!docstrings* (makunbound '*!docstrings*)))
   (apply #'(setf documentation) args))

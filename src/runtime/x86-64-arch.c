@@ -9,6 +9,8 @@
  * files for more information.
  */
 
+#define _GNU_SOURCE /* for REG_RAX etc. from sys/ucontext */
+
 #include <stdio.h>
 
 #include "sbcl.h"
@@ -24,7 +26,7 @@
 #include "interr.h"
 #include "breakpoint.h"
 #include "thread.h"
-#include "getallocptr.h"
+#include "pseudo-atomic.h"
 #include "unaligned.h"
 #include "search.h"
 #include "var-io.h"
@@ -158,7 +160,7 @@ arch_get_bad_addr(int __attribute__((unused)) sig,
  */
 
 os_context_register_t *
-context_eflags_addr(os_context_t *context)
+os_context_flags_addr(os_context_t *context)
 {
 #if defined __linux__
     /* KLUDGE: As of kernel 2.2.14 on Red Hat 6.2, there's code in the
@@ -196,7 +198,7 @@ void arch_skip_instruction(os_context_t *context)
     long code;
 
     /* Get and skip the Lisp interrupt code. */
-    code = *(char*)(*os_context_pc_addr(context))++;
+    code = *(char*)(OS_CONTEXT_PC(context)++);
     switch (code)
         {
         case trap_Error:
@@ -206,7 +208,7 @@ void arch_skip_instruction(os_context_t *context)
         case trap_UninitializedLoad:
             // Skip 1 byte. We can't encode that the internal_error_nargs is 1
             // because it is not an SC+OFFSET that follows the trap code.
-            *os_context_pc_addr(context) += 1;
+            OS_CONTEXT_PC(context) += 1;
             break;
         case trap_Breakpoint:           /* not tested */
         case trap_FunEndBreakpoint: /* not tested */
@@ -230,14 +232,13 @@ void arch_skip_instruction(os_context_t *context)
         }
 
     FSHOW((stderr,
-           "/[arch_skip_inst resuming at %x]\n",
-           *os_context_pc_addr(context)));
+           "/[arch_skip_inst resuming at %x]\n", OS_CONTEXT_PC(context)));
 }
 
 unsigned char *
 arch_internal_error_arguments(os_context_t *context)
 {
-    return 1 + (unsigned char *)(*os_context_pc_addr(context));
+    return 1 + (unsigned char *)OS_CONTEXT_PC(context);
 }
 
 boolean
@@ -296,7 +297,7 @@ unsigned int  single_step_save3;
 void
 arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 {
-    unsigned int *pc = (unsigned int*)(*os_context_pc_addr(context));
+    unsigned int *pc = (unsigned int*)OS_CONTEXT_PC(context);
 
     /* Put the original instruction back. */
     arch_remove_breakpoint(pc, orig_inst);
@@ -311,29 +312,28 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     *(pc-2) = 0x00240c81;
     *(pc-1) = 0x9d000001;
 #else
-    *context_eflags_addr(context) |= 0x100;
+    *os_context_flags_addr(context) |= 0x100;
 #endif
 
     single_stepping = pc;
 
 #ifdef CANNOT_GET_TO_SINGLE_STEP_FLAG
-    *os_context_pc_addr(context) = (os_context_register_t)((char *)pc - 9);
+    OS_CONTEXT_PC(context) = (os_context_register_t)((char *)pc - 9);
 #endif
 }
 
 void
 arch_handle_breakpoint(os_context_t *context)
 {
-    *os_context_pc_addr(context) -= BREAKPOINT_WIDTH;
+    OS_CONTEXT_PC(context) -= BREAKPOINT_WIDTH;
     handle_breakpoint(context);
 }
 
 void
 arch_handle_fun_end_breakpoint(os_context_t *context)
 {
-    *os_context_pc_addr(context) -= BREAKPOINT_WIDTH;
-    *os_context_pc_addr(context) =
-        (uword_t)handle_fun_end_breakpoint(context);
+    OS_CONTEXT_PC(context) -= BREAKPOINT_WIDTH;
+    OS_CONTEXT_PC(context) = (uword_t)handle_fun_end_breakpoint(context);
 }
 
 void
@@ -355,13 +355,11 @@ restore_breakpoint_from_single_step(os_context_t * context)
     *(single_stepping-2) = single_step_save2;
     *(single_stepping-1) = single_step_save3;
 #else
-    *context_eflags_addr(context) &= ~0x100;
+    *os_context_flags_addr(context) &= ~0x100;
 #endif
     /* Re-install the breakpoint if possible. */
-    if (((char *)*os_context_pc_addr(context) >
-         (char *)single_stepping) &&
-        ((char *)*os_context_pc_addr(context) <=
-         (char *)single_stepping + BREAKPOINT_WIDTH)) {
+    if (((char *)OS_CONTEXT_PC(context) > (char *)single_stepping) &&
+        ((char *)OS_CONTEXT_PC(context) <= (char *)single_stepping + BREAKPOINT_WIDTH)) {
         fprintf(stderr, "warning: couldn't reinstall breakpoint\n");
     } else {
         arch_install_breakpoint(single_stepping);
@@ -378,7 +376,7 @@ sigtrap_handler(int __attribute__((unused)) signal,
 {
 #ifdef LISP_FEATURE_INT1_BREAKPOINTS
     // ICEBP instruction = handle-pending-interrupt following pseudo-atomic
-    if (((unsigned char*)*os_context_pc_addr(context))[-1] == 0xF1)
+    if (((unsigned char*)OS_CONTEXT_PC(context))[-1] == 0xF1)
         return interrupt_handle_pending(context);
 #endif
 
@@ -398,16 +396,16 @@ sigtrap_handler(int __attribute__((unused)) signal,
      * 'kind' value (eg trap_Cerror). For error-trap and Cerror-trap a
      * number of bytes will follow, the first is the length of the byte
      * arguments to follow. */
-    trap = *(unsigned char *)(*os_context_pc_addr(context));
+    trap = *(unsigned char *)OS_CONTEXT_PC(context);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     if (trap == trap_UndefinedFunction) {
         // The interrupted PC pins this fdefn. Sigtrap is delivered on the ordinary stack,
         // not the alternate stack.
         // (FIXME: an interior pointer to an fdefn _should_ pin it, but doesn't)
-        lispobj* fdefn = (lispobj*)(*os_context_pc_addr(context) & ~LOWTAG_MASK);
+        lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(context) & ~LOWTAG_MASK);
         if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
             // Return to undefined-tramp
-            *os_context_pc_addr(context) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
+            OS_CONTEXT_PC(context) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
             // with RAX containing the FDEFN
             *os_context_register_addr(context,reg_RAX) =
                 make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
@@ -422,15 +420,15 @@ void
 sigill_handler(int __attribute__((unused)) signal,
                siginfo_t __attribute__((unused)) *siginfo,
                os_context_t *context) {
-    unsigned char* pc = (void*)*os_context_pc_addr(context);
+    unsigned char* pc = (void*)OS_CONTEXT_PC(context);
 #ifndef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     if (*(unsigned short *)pc == UD2_INST) {
-        *os_context_pc_addr(context) += 2;
+        OS_CONTEXT_PC(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
     // Interrupt if overflow (INTO) raises SIGILL in 64-bit mode
     if (*(unsigned char *)pc == INTO_INST) {
-        *os_context_pc_addr(context) += 1;
+        OS_CONTEXT_PC(context) += 1;
         return sigtrap_handler(signal, siginfo, context);
     }
 #endif
@@ -613,18 +611,18 @@ lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
     // This logic is rather nasty, but I don't know what else to do.
     lispobj word;
     if (header_widetag(word = raw_addr[-2]) == SIMPLE_FUN_WIDETAG
-        || (word == 1 &&
+        || (word == FORWARDING_HEADER &&
             widetag_of(native_pointer(forwarding_pointer_value(raw_addr-2)))
             == SIMPLE_FUN_WIDETAG))
         return make_lispobj(raw_addr - 2, FUN_POINTER_LOWTAG);
     int widetag;
     if ((widetag = header_widetag(word = raw_addr[-4])) == CODE_HEADER_WIDETAG
-        || (word == 1 &&
+        || (word == FORWARDING_HEADER &&
             widetag_of(native_pointer(forwarding_pointer_value(raw_addr-4)))
             == CODE_HEADER_WIDETAG))
         return make_lispobj(raw_addr - 4, OTHER_POINTER_LOWTAG);
     if (widetag == FUNCALLABLE_INSTANCE_WIDETAG
-        || (word == 1 &&
+        || (word == FORWARDING_HEADER &&
             widetag_of(native_pointer(forwarding_pointer_value(raw_addr-4)))
             == FUNCALLABLE_INSTANCE_WIDETAG))
         return make_lispobj(raw_addr - 4, FUN_POINTER_LOWTAG);
@@ -662,8 +660,8 @@ static unsigned int claim_index(int qty)
 static boolean NO_SANITIZE_MEMORY
 instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 {
-    int __attribute__((unused)) ret = thread_mutex_lock(&alloc_profiler_lock);
-    gc_assert(ret == 0);
+    int __attribute__((unused)) ret = mutex_acquire(&alloc_profiler_lock);
+    gc_assert(ret);
     uword_t next_pc = *sp;
     // The instrumentation site was 8-byte aligned
     uword_t return_pc = ALIGN_DOWN(next_pc, 8);
@@ -701,11 +699,11 @@ static void record_pc(char* pc, unsigned int index, boolean sizedp)
     }
 #if 0
     if (!code) {
-        int ret = thread_mutex_lock(&free_pages_lock);
-        gc_assert(ret == 0);
+        int ret = mutex_acquire(&free_pages_lock);
+        gc_assert(ret);
         ensure_region_closed(code_region);
-        int ret = thread_mutex_unlock(&free_pages_lock);
-        gc_assert(ret == 0);
+        int ret = mutex_release(&free_pages_lock);
+        gc_assert(ret);
         code = component_ptr_from_pc(pc);
     }
 #endif
@@ -718,12 +716,11 @@ static void record_pc(char* pc, unsigned int index, boolean sizedp)
     // Wasn't the point of code serial# that you don't store
     // code blob pointers into the various profiling buffers? (FIXME?)
     if (code) {
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
-        page_index_t page = find_page_index(&v->data[index]);
-        // technically this only needs to be unprotected if the generation
-        // of the code is younger, but the KISS principle pertains.
-        if (page >= 0) unprotect_page_index(page);
-#endif
+        /* If the first of the two stores is at an even index, then the second
+         * "notice" call is redundant because it will certainly be on the same card.
+         * Doing both calls is future-proof though. */
+        notice_pointer_store(&v->data[index]);
+        notice_pointer_store(&v->data[index+1]);
         v->data[index] = make_lispobj(code, OTHER_POINTER_LOWTAG);
         v->data[index+1] = make_fixnum((lispobj)pc - (lispobj)code);
     } else {
@@ -754,8 +751,8 @@ allocation_tracker_counted(uword_t* sp)
         if (index != 2)
             record_pc((char*)pc, index, 0);
     }
-    int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
-    gc_assert(ret == 0);
+    int __attribute__((unused)) ret = mutex_release(&alloc_profiler_lock);
+    gc_assert(ret);
 }
 
 void AMD64_SYSV_ABI
@@ -787,8 +784,20 @@ allocation_tracker_sized(uword_t* sp)
         if (index != 0) // can't record a PC for the overflow counts
             record_pc((char*)pc, index, 1);
     }
-    int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
-    gc_assert(ret == 0);
+    int __attribute__((unused)) ret = mutex_release(&alloc_profiler_lock);
+    gc_assert(ret);
+}
+
+__attribute__((sysv_abi)) lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs) {
+    extern lispobj call_into_lisp_(lispobj, lispobj *, int, struct thread *)
+        __attribute__((sysv_abi));
+    return call_into_lisp_(fun, args, nargs, get_sb_vm_thread());
+}
+
+lispobj call_into_lisp_first_time(lispobj fun, lispobj *args, int nargs) {
+    extern lispobj call_into_lisp_first_time_(lispobj, lispobj *, int, struct thread *)
+        __attribute__((sysv_abi));
+    return call_into_lisp_first_time_(fun, args, nargs, get_sb_vm_thread());
 }
 
 #include "x86-arch-shared.inc"

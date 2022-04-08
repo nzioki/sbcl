@@ -79,7 +79,7 @@
   (declare (type ref node) (type ir2-block block))
   (let* ((lvar (node-lvar node))
          (leaf (ref-leaf node))
-         (locs (lvar-result-tns lvar (list (leaf-type leaf))))
+         (locs (lvar-result-tns lvar (list (single-value-type (node-derived-type node)))))
          (res (first locs)))
     (etypecase leaf
       (lambda-var
@@ -277,12 +277,12 @@
               (when closure
                 (let* ((entry-info (lambda-info xep))
                        (tn (entry-info-closure-tn entry-info))
-                       #-x86-64
+                       #-(or x86-64 arm64)
                        (entry (make-load-time-constant-tn :entry xep))
                        (env (node-environment node))
                        (leaf-dx-p (and lvar (leaf-dynamic-extent fun))))
                   (aver (entry-info-offset entry-info))
-                  (vop make-closure node ir2-block #-x86-64 entry
+                  (vop make-closure node ir2-block #-(or x86-64 arm64) entry
                                     (entry-info-offset entry-info) (length closure)
                                     leaf-dx-p tn)
                   (loop for what in closure and n from 0 do
@@ -528,23 +528,10 @@
              (unless (eq locs results)
                (move-results-coerced node block results locs))))
           (:unknown
-           (let ((locs (loop for tn in results
-                             collect (cond #+(or x86 x86-64 arm64)
-                                           ((eq (tn-kind tn) :constant)
-                                            tn)
-                                           ((and
-                                             #-(or x86 x86-64 arm64)
-                                             (neq (tn-kind tn) :constant)
-                                             (equal (primitive-type-scs (tn-primitive-type tn))
-                                                    `(,sb-vm:descriptor-reg-sc-number)))
-                                            tn)
-                                           ((let ((new (make-normal-tn *backend-t-primitive-type*)))
-                                              (emit-move node block tn new)
-                                              new))))))
-             (vop* push-values node block
-                   ((reference-tn-list locs nil))
-                   ((reference-tn-list (ir2-lvar-locs 2lvar) t))
-                   (length results))))))))
+           (vop* push-values node block
+                 ((reference-tn-list results nil))
+                 ((reference-tn-list (ir2-lvar-locs 2lvar) t))
+                 (length results)))))))
   (values))
 
 ;;; CAST
@@ -640,11 +627,52 @@
                (register-drop-thru alternative)
                (vop branch node block (block-label alternative))))
           (t
+           (when (equal flags '(:after-sc-selection))
+             ;; To be fixed up by VOP-INFO-AFTER-SC-SELECTION
+             (setf flags (list :after-sc-selection))
+             (setf info-args (append info-args flags)))
            (emit-template node block template args nil info-args)
            (vop branch-if if block (block-label consequent) not-p flags)
            (if (drop-thru-p if alternative)
                (register-drop-thru alternative)
                (vop branch if block (block-label alternative)))))))
+
+(when-vop-existsp (:named sb-vm::move-conditional-result)
+  ;; Use a dedicated VOP instead of wrapping a conditional that needs
+  ;; to return T/NIL in (if x t nil)
+  ;; Produces slightly better code, not emitted when not needed.
+  (defun ir2-convert-conditional-result (node block template args info-args lvar)
+    (declare (type node node) (type ir2-block block)
+             (type template template) (type (or tn-ref null) args)
+             (list info-args))
+    (let* ((res (lvar-result-tns lvar
+                                 (list *universal-type*)
+                                 (list *backend-t-primitive-type*)))
+           (res-refs (reference-tn-list res t))
+           (flags (and (consp (template-result-types template))
+                       (rest (template-result-types template)))))
+      (aver (= (template-info-arg-count template)
+               (+ (length info-args)
+                  (if flags 0 2))))
+      (cond ((not flags)
+             (let ((true (gen-label)))
+               (emit-template node block template args nil
+                              (list* true nil info-args))
+               (emit-template node block (template-or-lose 'sb-vm::move-conditional-result) nil res-refs
+                              (list true))))
+            (t
+             (when (equal flags '(:after-sc-selection))
+               ;; To be fixed up by VOP-INFO-AFTER-SC-SELECTION
+               (setf flags (list :after-sc-selection))
+               (setf info-args (append info-args flags)))
+             (emit-template node block template args nil info-args)
+             (emit-template node block (template-or-lose 'sb-vm::move-if/descriptor)
+                            (reference-tn-list
+                             (list (emit-constant t)
+                                   (emit-constant nil))
+                             nil)
+                            res-refs (list flags))))
+      (move-lvar-result node block res lvar))))
 
 ;;; Convert an IF that isn't the DEST of a conditional template.
 (defun ir2-convert-if (node block)
@@ -711,8 +739,15 @@
         (reference-args call block (combination-args call) template)
       (aver (not (template-more-results-type template)))
       (if (template-conditional-p template)
-          (ir2-convert-conditional call block template args info-args
-                                   (lvar-dest lvar) nil)
+          (let ((dest (lvar-dest lvar)))
+            (cond ((when-vop-existsp (:named sb-vm::move-conditional-result)
+                     (unless (and (if-p dest)
+                                  (immediately-used-p (if-test dest) call))
+                       (ir2-convert-conditional-result call block template args info-args lvar)
+                       t)))
+                  (t
+                   (ir2-convert-conditional call block template args info-args
+                                            dest nil))))
           (let* ((results (make-template-result-tns call lvar rtypes))
                  (r-refs (reference-tn-list results t)))
             (aver (= (length info-args)
@@ -734,7 +769,7 @@
 ;;; arguments.
 (defoptimizer (%%primitive ir2-convert) ((template info &rest args) call block)
   (declare (ignore args))
-  (let* ((template (gethash (lvar-value template) *backend-template-names*))
+  (let* ((template (lvar-value template))
          (info (lvar-value info))
          (lvar (node-lvar call))
          (rtypes (template-result-types template))
@@ -755,7 +790,7 @@
 
 (defoptimizer (%%primitive derive-type) ((template info &rest args))
   (declare (ignore info args))
-  (let* ((template (gethash (lvar-value template) *backend-template-names*))
+  (let* ((template (lvar-value template))
          (type (template-type template)))
     (cond ((zerop (vop-info-num-results template))
            (values-specifier-type '(values &optional)))
@@ -1046,6 +1081,16 @@
         (t
          :symbol)))
 
+(defun pass-nargs-p (combination)
+  (let ((fun-info (combination-fun-info combination)))
+    (not (and (eq (combination-kind combination) :known)
+              fun-info
+              (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)
+              (let ((type (info :function :type (combination-fun-source-name combination))))
+                (and (not (fun-type-keyp type))
+                     (not (fun-type-rest type))
+                     (not (fun-type-optional type))))))))
+
 ;;; Move the arguments into the passing locations and do a (possibly
 ;;; named) tail call.
 (defun ir2-convert-tail-full-call (node block)
@@ -1056,7 +1101,10 @@
          (pass-refs (move-tail-full-call-args node block))
          (old-fp (ir2-environment-old-fp env))
          (return-pc (ir2-environment-return-pc env))
-         (fun-lvar (basic-combination-fun node)))
+         (fun-lvar (basic-combination-fun node))
+         (nargs (if (pass-nargs-p node)
+                    nargs
+                    (list nargs))))
     (multiple-value-bind (fun-tn named)
         (fun-lvar-tn node block fun-lvar)
       (cond ((not named)
@@ -1120,7 +1168,10 @@
                                            (standard-arg-location i))))))
            (loc-refs (reference-tn-list locs t))
            (nvals (length locs))
-           (fun-lvar (basic-combination-fun node)))
+           (fun-lvar (basic-combination-fun node))
+           (nargs (if (pass-nargs-p node)
+                      nargs
+                      (list nargs))))
       (multiple-value-bind (fun-tn named)
           (fun-lvar-tn node block fun-lvar)
         (cond ((not named)
@@ -1138,7 +1189,7 @@
               (t
                (vop* call-named node block
                      (fp #-immobile-code fun-tn args) ; args
-                     (loc-refs)                        ; results
+                     (loc-refs)                       ; results
                      arg-locs nargs #+immobile-code named nvals ; info
                      (emit-step-p node))))
         (move-lvar-result node block locs lvar))))
@@ -1303,8 +1354,11 @@
                        (1- (length (lambda-vars fun))))
                       ((and optional
                             (not (optional-dispatch-more-entry ef)))
-                       (optional-dispatch-max-args ef)))))
-      (unless (and (eql min 0) (not max))
+                       (optional-dispatch-max-args ef))))
+           (fun-info (info :function :info (functional-%source-name ef))))
+      (unless (or (and (eql min 0) (not max))
+                  (and fun-info
+                       (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)))
         (vop verify-arg-count node block
              arg-count-location
              min
@@ -1749,7 +1803,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
 ;;; This is trivial, given our assumption of a shallow-binding
 ;;; implementation.
 (defoptimizer (%special-bind ir2-convert) ((var value) node block)
-  (let ((name (lvar-value var)))
+  (let ((name (leaf-source-name (lvar-value var))))
     ;; Emit either BIND or DYNBIND, preferring BIND if both exist.
     ;; If only one exists, it's DYNBIND.
     ;; Even if the backend supports load-time TLS index assignment,
@@ -2034,47 +2088,17 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 (defoptimizer (list ir2-convert) ((&rest args) node block)
   (let* ((fun (lvar-fun-name (combination-fun node)))
-         (star (ecase fun (list* t) (list nil))))
+         (star (ecase fun (list* t) (list nil)))
+         (num-conses (- (length args) (if star 1 0))))
     ;; LIST needs at least 1 arg, LIST* demands at least 2 args
     (aver (if star (cdr args) args))
-    ;; This used to convert as a full call to LIST or LIST* when n-cons-cell exceeded a threshold
-    ;; which could confuse GC (see the :NO-CONSES-ON-LARGE-OBJECT-PAGES regression test).
-    ;; It's no longer required to special-case that situation.
-    ;; Nonetheless, beyond a certain length, it might make sense to do a full call anyway,
-    ;; because there's little to be gained by inlining all the stores - the generated code size
-    ;; grows at a rate faster than pushing more stack arguments - but because MAKE-LIST avoids
-    ;; allocating as one huge chunk (instead, doing a cons at a time), in theory it can better
-    ;; utilize free memory. But really, if you have a statically written LIST call with so many
-    ;; args that it exhausts the heap, you should probably rethink your coding style.
-    (let* ((allow-const
-            ;; The backend either does or doesn't allow constants in the "more" arg.
-            ;; Determine that once only. Only x86-64 specifies any SCs as yet.
-            (and #.(let ((scs
-                          (operand-parse-scs
-                           (vop-parse-more-args (gethash 'list *backend-parsed-vops*)))))
-                     ;; MAKE-CONSTANT-TN could produce either SC, so ensure both are present.
-                     (and (member 'sb-vm::constant scs)
-                          (member 'sb-vm::immediate scs)
-                          t))
-                 ;; FIXME: this is terribly wrong that in high debug
-                 ;; settings we can't allow constants at the IR2 level.
-                 ;; But two UNWIND-TO-FRAME-AND-CALL tests fail when
-                 ;; constants are allowed. Somehow we're affecting
-                 ;; semantics. It's baffling.
-                 (policy node (< debug 3))))
-           (refs (reference-tn-list
-                  (mapcar (lambda (arg)
-                            (cond ((and allow-const (constant-lvar-p arg))
-                                   (emit-constant (lvar-value arg)))
-                                  (t
-                                   (let ((tn (make-normal-tn *backend-t-primitive-type*)))
-                                     (emit-move node block (lvar-tn node block arg) tn)
-                                     tn))))
-                          args)
-                  nil))
+    (when (> num-conses sb-vm::max-conses-per-page)
+      (return-from list-ir2-convert-optimizer (ir2-convert-full-call node block)))
+    (let* ((refs (reference-tn-list (mapcar (lambda (arg) (lvar-tn node block arg))
+                                            args)
+                                    nil))
            (lvar (node-lvar node))
-           (res (lvar-result-tns lvar (list (specifier-type 'list))))
-           (num-conses (- (length args) (if star 1 0))))
+           (res (lvar-result-tns lvar (list (specifier-type 'list)))))
       (when (and lvar (lvar-dynamic-extent lvar))
         (vop current-stack-pointer node block (ir2-lvar-stack-pointer (lvar-info lvar))))
       ;;; This COND-like expression is unfortunate, but the VOP* macro chokes if the name

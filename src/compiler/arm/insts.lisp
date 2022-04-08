@@ -41,10 +41,10 @@
     (:al . 14))
   #'equal)
 (defconstant-eqx +condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
 (defun conditional-opcode (condition)
@@ -1789,13 +1789,15 @@
        (setf (sap-ref-32 sap offset) value))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index temp)
+(define-instruction store-coverage-mark (segment mark-index temp)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
    (let* ((offset (+ (component-header-length)
-                     n-word-bytes ; skip over jump table word
-                     path-index
+                     ;; skip over jump table word and entries
+                     (* (1+ (component-n-jump-table-entries))
+                        n-word-bytes)
+                     mark-index
                      (- other-pointer-lowtag)))
           (addr
            (@ sb-vm::code-tn

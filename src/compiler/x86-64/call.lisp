@@ -720,9 +720,11 @@
                                for index downfrom -1
                                do (noise `(loadw ,name new-fp ,index)))
                               (noise))
-                   '((if (zerop nargs)
-                         (zeroize rcx)
-                       (inst mov rcx (fixnumize nargs)))))
+                     '((cond ((listp nargs)) ;; no-verify-arg-count
+                             ((zerop nargs)
+                              (zeroize rcx))
+                             (t
+                              (inst mov rcx (fixnumize nargs))))))
                ,@(cond ((eq return :tail)
                         '(;; Python has figured out what frame we should
                           ;; return to so might as well use that clue.
@@ -1285,6 +1287,7 @@
   (:generator 20
     (let ((loop (gen-label))
           (done (gen-label))
+          (leave-pa (gen-label))
           (stack-allocate-p (node-stack-allocate-p node)))
       ;; Compute the number of bytes to allocate
       (let ((shift (- (1+ word-shift) n-fixnum-tag-bits)))
@@ -1295,12 +1298,18 @@
       (inst mov result nil-value)
       (inst jrcxz DONE)
       (unless stack-allocate-p
-        (instrument-alloc 'list rcx node (list value dst) thread-tn))
+        (instrument-alloc +cons-primtype+ rcx node (list value dst) thread-tn))
       (pseudo-atomic (:elide-if stack-allocate-p :thread-tn thread-tn)
        ;; Produce an untagged pointer into DST
        (if stack-allocate-p
            (stack-allocation rcx 0 dst)
-           (allocation 'list rcx 0 dst node value thread-tn))
+           (allocation +cons-primtype+ rcx 0 dst node value thread-tn
+                       :overflow (lambda ()
+                                   (inst push rcx)
+                                   (inst push context)
+                                   (invoke-asm-routine 'call 'listify-&rest node)
+                                   (inst pop result)
+                                   (inst jmp leave-pa))))
        ;; Recalculate DST as a tagged pointer to the last cons
        (inst lea dst (ea (- list-pointer-lowtag (* cons-size n-word-bytes)) dst rcx))
        (inst shr :dword rcx (1+ word-shift)) ; convert bytes to number of cells
@@ -1321,7 +1330,8 @@
        (inst mov result dst) ; preserve the value to put in the CDR of the preceding cons
        (inst sub dst (* cons-size n-word-bytes)) ; get the preceding cons
        (inst inc rcx) ; :QWORD because it's a signed number
-       (inst jmp :nz loop))
+       (inst jmp :nz loop)
+       (emit-label leave-pa))
       (emit-label done))))
 
 ;;; Return the location and size of the &MORE arg glob created by

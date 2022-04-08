@@ -41,22 +41,16 @@
 (defun generate-call-sequence (name style vop options)
   (declare (ignore options))
   (ecase style
-      (:raw
-       (values
-        `((note-this-location ,vop :call-site)
-          (invoke-asm-routine 'call ',name ,vop)
-          (note-this-location ,vop :single-value-return))
-        nil))
-      ((:full-call :full-call-no-return)
-       (values
-        `((note-this-location ,vop :call-site)
-          (invoke-asm-routine 'call ',name ,vop)
-          (note-this-location ,vop :single-value-return))
-        '((:save-p :compute-only))))
-      (:none
-       (values
-        `((invoke-asm-routine 'jmp ',name ,vop))
-        nil))))
+    ((:raw :full-call :full-call-no-return)
+     (values
+      `((note-this-location ,vop :call-site)
+        (invoke-asm-routine 'call ',name ,vop)
+        (note-this-location ,vop :single-value-return))
+      (if (eql style :raw) nil '((:save-p :compute-only)))))
+    (:none
+     (values
+      `((invoke-asm-routine 'jmp ',name ,vop))
+      nil))))
 
 (defun generate-return-sequence (style)
   (ecase style
@@ -71,7 +65,7 @@
   ;: Convention:
   ;;   C    = save GPRs that C call can change
   ;;   Lisp = save GPRs that lisp call can change
-  (let ((fpr-align 32))
+  (let ((fpr-align 64))
     (flet ((gpr-save/restore (operation except)
              (declare (type (member push pop) operation))
              (let ((registers (ecase convention
@@ -91,7 +85,7 @@
        (inst push rbp-tn)
        (inst mov rbp-tn rsp-tn)
        (inst and rsp-tn ,(- fpr-align))
-       (inst sub rsp-tn ,(* 16 fpr-align))
+       (inst sub rsp-tn ,(+ 512 64 256)) ;; XSAVE area
        ;; Using rip-relative call indirect makes shrinkwrapped cores work
        ;; with no modification whatsoever to editcore.
        ;; It wouldn't work straightforwardly using a call indirect

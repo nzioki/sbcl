@@ -27,9 +27,12 @@
          (value :scs (descriptor-reg any-reg null zero)))
   (:info name offset lowtag)
   (:ignore name)
-  (:results)
+  (:temporary (:sc non-descriptor-reg) temp)
+  (:vop-var vop)
   (:generator 1
-    (storew value object offset lowtag)))
+    (without-scheduling ()
+      (emit-gc-store-barrier object nil temp (vop-nth-arg 1 vop) value)
+      (storew value object offset lowtag))))
 
 ;;;; Symbol hacking VOPs:
 
@@ -73,7 +76,6 @@
   (:generator 9
     (inst lb temp object (+ (- (ash symbol-value-slot word-shift) other-pointer-lowtag)
                             #+big-endian 3))
-    (inst nop)
     (inst xor temp temp unbound-marker-widetag)
     (if not-p
         (inst beq temp target)
@@ -137,8 +139,9 @@
   (:temporary (:scs (non-descriptor-reg)) type)
   (:results (result :scs (descriptor-reg)))
   (:generator 38
+      (without-scheduling ()
+        (emit-gc-store-barrier fdefn nil type)) ; type = temp
       (load-type type function (- fun-pointer-lowtag))
-      (inst nop)
       (inst xor type simple-fun-widetag)
       (inst beq type normal-fn)
       (inst addu lip function
@@ -181,20 +184,25 @@
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
+  (:temporary (:scs (non-descriptor-reg)) temp2)
   (:generator 5
     (loadw temp symbol symbol-value-slot other-pointer-lowtag)
     (inst addu bsp-tn bsp-tn (* 2 n-word-bytes))
     (storew temp bsp-tn (- binding-value-slot binding-size))
     (storew symbol bsp-tn (- binding-symbol-slot binding-size))
-    (storew val symbol symbol-value-slot other-pointer-lowtag)))
-
+    (without-scheduling ()
+      (emit-gc-store-barrier symbol nil temp2)
+      (storew val symbol symbol-value-slot other-pointer-lowtag))))
 
 (define-vop (unbind)
   (:temporary (:scs (descriptor-reg)) symbol value)
+  (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
     (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
     (loadw value bsp-tn (- binding-value-slot binding-size))
-    (storew value symbol symbol-value-slot other-pointer-lowtag)
+    (without-scheduling ()
+      (emit-gc-store-barrier symbol nil temp)
+      (storew value symbol symbol-value-slot other-pointer-lowtag))
     (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
     (storew zero-tn bsp-tn (- binding-value-slot binding-size))
     (inst addu bsp-tn bsp-tn (* -2 n-word-bytes))))
@@ -204,6 +212,7 @@
   (:args (arg :scs (descriptor-reg any-reg) :target where))
   (:temporary (:scs (any-reg) :from (:argument 0)) where)
   (:temporary (:scs (descriptor-reg)) symbol value)
+  (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
     (let ((loop (gen-label))
           (skip (gen-label))
@@ -216,7 +225,9 @@
       (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
       (inst beq symbol skip)
       (loadw value bsp-tn (- binding-value-slot binding-size))
-      (storew value symbol symbol-value-slot other-pointer-lowtag)
+      (without-scheduling ()
+        (emit-gc-store-barrier symbol nil temp)
+        (storew value symbol symbol-value-slot other-pointer-lowtag))
       (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
 
       (emit-label skip)
@@ -298,10 +309,40 @@
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (descriptor-reg any-reg) * code-header-ref)
 
-(define-full-setter code-header-set * 0 other-pointer-lowtag
-  (descriptor-reg any-reg null zero) * code-header-set)
-
-
+(define-vop (code-header-set)
+  (:translate code-header-set)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp card)
+  (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:generator 10
+    (inst li temp (make-fixup "gc_card_table_mask" :foreign-dataref))
+    (loadw temp temp) ; address of gc_card_table_mask
+    (inst lw temp temp 0) ; value of gc_card_table_mask (4-byte int)
+    (pseudo-atomic (pa-flag)
+      ;; Compute card mark index
+      (inst srl card object gencgc-card-shift)
+      (inst and card card temp)
+      ;; Load mark table base
+      (inst li temp (make-fixup "gc_card_mark" :foreign-dataref)) ; address of linkage entry
+      (loadw temp temp) ; address of gc_card_mark
+      (loadw temp temp) ; value of gc_card_mark (pointer)
+      ;; Touch the card mark byte.
+      (inst add temp temp card)
+      (inst sb null-tn temp 0)
+      ;; set 'written' flag in the code header
+      ;; If two threads get here at the same time, they'll write the same byte.
+      (let ((byte (- #+little-endian 3 other-pointer-lowtag)))
+        (inst lbu temp object byte)
+        (inst or temp temp #x40)
+        (inst sb temp object byte))
+      ;; No need for LIP register because this is pseudo-atomic
+      (inst sll temp index (- word-shift n-fixnum-tag-bits))
+      (inst add temp object temp)
+      (inst sw value temp (- other-pointer-lowtag)))))
 
 ;;;; raw instance slot accessors
 

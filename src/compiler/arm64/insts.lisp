@@ -48,10 +48,10 @@
   #'equal)
 
 (defconstant-eqx +condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
 (defun conditional-opcode (condition)
@@ -115,6 +115,7 @@
   (define-arg-type sys-reg :printer #'print-sys-reg)
 
   (define-arg-type cond :printer #'print-cond)
+  (define-arg-type negated-cond :printer #'print-negated-cond)
 
   (define-arg-type ldr-str-annotation :printer #'annotate-ldr-str-imm)
   (define-arg-type ldr-str-pair-annotation :printer #'annotate-ldr-str-pair)
@@ -1031,10 +1032,12 @@
 
 (def-cond-select csel 0 0)
 (def-cond-select csinc 0 1
-  (:printer cond-select ((op 0) (op2 1) (rn 31) (rm 31))
+  (:printer cond-select ((op 0) (op2 1) (rn 31) (rm 31)
+                         (cond nil :type 'negated-cond))
             '('cset :tab rd  ", " cond)))
 (def-cond-select csinv 1 0
-  (:printer cond-select ((op 1) (op2 0) (rn 31) (rm 31))
+  (:printer cond-select ((op 1) (op2 0) (rn 31) (rm 31)
+                         (cond nil :type 'negated-cond))
             '('csetm :tab rd  ", " cond)))
 (def-cond-select csneg 1 1)
 
@@ -1057,8 +1060,24 @@
   (0 1 4)
   (nzcv 4 0))
 
+(define-instruction-format
+    (cond-compare 32
+     :default-printer '(:name :tab rn ", " rm ", " nzcv ", " cond))
+    (op :field (byte 1 30))
+    (op2 :field (byte 9 21) :value #b111010010)
+    (rm :field (byte 5 16) :type 'reg)
+    (cond :field (byte 4 12) :type 'cond)
+    (imm-p :field (byte 1 11))
+    (op3 :field (byte 1 10) :value 0)
+    (rn :field (byte 5 5) :type 'reg)
+    (op4 :field (byte 1 4) :value 0)
+    (nzcv :field (byte 4 0) :type 'unsigned-immediate))
+
 (defmacro def-cond-compare (name op)
   `(define-instruction ,name (segment rn rm-imm cond &optional (nzcv 0))
+     (:printer cond-compare ((op ,op) (imm-p 0)))
+     (:printer cond-compare ((op ,op) (imm-p 1)
+                             (rm nil :type 'unsigned-immediate)))
      (:emitter
       (emit-cond-compare segment +64-bit-size+ ,op
                          (if (integerp rm-imm)
@@ -2438,7 +2457,8 @@
   (:printer fp-data-processing-1 ((op #b0)))
   (:emitter
    (cond ((or (sc-is rd complex-double-reg complex-single-reg)
-              (sc-is rn complex-double-reg complex-single-reg)))
+              (sc-is rn complex-double-reg complex-single-reg))
+          (break "Implement"))
          ((and (fp-register-p rd)
                (fp-register-p rn))
           (assert (and (eq (tn-sc rd) (tn-sc rn))) (rd rn)
@@ -2630,6 +2650,47 @@
          (size ,size))
      (inst s-orr rd rn rn size)))
 
+(def-emitter simd-scalar-three-same
+    (#b01 2 30)
+  (u 1 29)
+  (#b11110 5 24)
+  (size 2 22)
+  (#b1 1 21)
+  (rm 5 16)
+  (opc 5 11)
+  (#b1 1 10)
+  (rn 5 5)
+  (rd 5 0))
+
+(define-instruction-format (simd-scalar-three-same 32
+                            :default-printer '(:name :tab rd ", " rn ", " rm))
+  (op3 :field (byte 2 30) :value #b1)
+  (u :field (byte 1 29))
+  (op4 :field (byte 5 24) :value #b11110)
+  (size :field (byte 2 22))
+  (op5 :field (byte 1 21) :value #b1)
+  (rm :fields (list (byte 1 30) (byte 5 16)) :type 'simd-reg)
+  (op :field (byte 5 11))
+  (op6 :field (byte 1 10) :value #b1)
+  (rn :fields (list (byte 1 30) (byte 5 5)) :type 'simd-reg)
+  (rd :fields (list (byte 1 30) (byte 5 0)) :type 'simd-reg))
+
+(define-instruction cmeq (segment rd rn rm &optional size)
+  (:printer simd-three-same ((u #b1)  (op #b10001)))
+  (:emitter
+   (multiple-value-bind (size q)
+       (ecase size
+         (:8b (values 0 0))
+         (:16b (values 0 1)))
+     (emit-simd-three-same segment
+                           q
+                           1
+                           size
+                           (reg-offset rm)
+                           #b10001
+                           (reg-offset rn)
+                           (reg-offset rd)))))
+
 ;;;
 
 (def-emitter simd-extract
@@ -2789,6 +2850,27 @@
       (:s 1)
       (:d 2))
     #b00011
+    (reg-offset rn)
+    (reg-offset rd))))
+
+(define-instruction uminv (segment rd sized rn sizen)
+  (:printer simd-across-lanes  ((u 1) (op #b11010)
+                                      (rd nil :type 'vhsd)))
+  (:emitter
+   (emit-simd-across-lanes
+    segment
+    (ecase sizen
+      (:8b 0)
+      (:16b 1)
+      (:4h 0)
+      (:8h 1)
+      (:4s 1))
+    1
+    (ecase sized
+      (:b 0)
+      (:h 1)
+      (:s #b10))
+    #b11010
     (reg-offset rn)
     (reg-offset rd))))
 
@@ -2954,11 +3036,11 @@
 ;;; code object, having two codepaths is cumbersome and, now that
 ;;; there's no reg-code, STRB needs to load a literal first, which
 ;;; isn't clearly a win compared to using a vector.
-(define-instruction store-coverage-mark (segment path-index temp vector)
+(define-instruction store-coverage-mark (segment mark-index temp vector)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
-   segment path-index temp vector
+   segment mark-index temp vector
    (flet ((encode-index (offset &optional word)
             (cond
               ((if word
@@ -2979,7 +3061,7 @@
                                           (component-info *component-being-compiled*)))
                                  2)))
             (offset (+ (* sb-vm:vector-data-offset n-word-bytes)
-                       path-index
+                       mark-index
                        (- other-pointer-lowtag)))
             (addr
               (@ vector (encode-index offset))))

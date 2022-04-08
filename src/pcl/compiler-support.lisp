@@ -46,25 +46,12 @@
           ((not (types-equal-or-intersect otype standard-object)) nil)
           (t `(%pcl-instance-p object)))))
 
-(declaim (ftype function sb-pcl::parse-specialized-lambda-list))
-(define-source-context defmethod (name &rest stuff)
-  (let ((arg-pos (position-if #'listp stuff)))
-    (if arg-pos
-        `(defmethod ,name ,@(subseq stuff 0 arg-pos)
-           ,(handler-case
-                (nth-value 2 (sb-pcl::parse-specialized-lambda-list
-                              (elt stuff arg-pos)))
-              (error () "<illegal syntax>")))
-        `(defmethod ,name "<illegal syntax>"))))
-
 (define-load-time-global sb-pcl::*internal-pcl-generalized-fun-name-symbols* nil)
 
 (defmacro define-internal-pcl-function-name-syntax (name (var) &body body)
   `(progn
      (define-function-name-syntax ,name (,var) ,@body)
      (pushnew ',name sb-pcl::*internal-pcl-generalized-fun-name-symbols*)))
-
-(pushnew 'sb-pcl::slot-accessor sb-pcl::*internal-pcl-generalized-fun-name-symbols*)
 
 (define-internal-pcl-function-name-syntax sb-pcl::slot-accessor (list)
   (when (= (length list) 4)

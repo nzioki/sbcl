@@ -125,7 +125,7 @@
   (%lock nil #-c-headers-only :type #-c-headers-only (or null sb-thread:mutex))
 
   ;; The 4 standard tests functions don't need these next 2 slots:
-
+  ;; (TODO: possibly don't have them in all hash-tables)
   ;; The function used to compare two keys. Returns T if they are the
   ;; same and NIL if not.
   (test-fun nil :type function :read-only t)
@@ -136,7 +136,7 @@
 
   ;; The type of hash table this is. Part of the exported interface,
   ;; as well as needed for the MAKE-LOAD-FORM and PRINT-OBJECT methods.
-  (test nil :type symbol :read-only t)
+  (test nil :type (or symbol function) :read-only t)
   ;; How much to grow the hash table by when it fills up. If an index,
   ;; then add that amount. If a floating point number, then multiply
   ;; it by that.
@@ -160,13 +160,31 @@
 
   ;; Statistics gathering for new gethash algorithm that doesn't
   ;; disable GC during rehash as a consequence of key movement.
-  (n-rehash+find 0 :type word)
-  (n-lsearch     0 :type word)
+  #+hash-table-metrics (n-rehash+find 0 :type word)
+  #+hash-table-metrics (n-lsearch     0 :type word)
+
   ;; only for debugging system bootstrap when hash-tables are completely
   ;; broken (which seems to be quite often as I optimize them)
-  #+hash-table-simulate (%alist)
+  #+hash-table-simulate (%alist))
 
-  ;;; Supporting slots for weak hash-tables.
+(sb-xc:defstruct (general-hash-table (:copier nil)
+                             (:conc-name hash-table-)
+                             (:include hash-table)
+                             (:constructor %alloc-general-hash-table
+                               (flags
+                                gethash-impl
+                                puthash-impl
+                                remhash-impl
+                                clrhash-impl
+                                test
+                                test-fun
+                                hash-fun
+                                rehash-size
+                                rehash-threshold
+                                pairs
+                                index-vector
+                                next-vector
+                                hash-vector)))
   ;; List of (pair-index . bucket-number) which GC smashed and are almost
   ;; equivalent to free cells, except that they are not yet unlinked from
   ;; their chain. Skipping the removal in GC eliminates a race with REMHASH.

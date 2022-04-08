@@ -106,6 +106,7 @@ interface stability.")
    "VOID-SYSCALL"
    "CLOCK-THREAD-CPUTIME-ID"
    "CLOCK-PROCESS-CPUTIME-ID"
+   "CLOCK-REALTIME"
 
    ;; signals
 
@@ -435,6 +436,7 @@ structure representations")
            "SIMPLE-FUN-SELF-SLOT"
            "SIMPLE-FUN-SOURCE-SLOT"
            "GENCGC-CARD-BYTES"
+           "GENCGC-PAGE-BYTES"
            "GENCGC-ALLOC-GRANULARITY"
            "GENCGC-RELEASE-GRANULARITY"
            #+(or arm64 ppc ppc64 sparc riscv) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
@@ -574,7 +576,7 @@ structure representations")
            "STATIC-SYMBOL-OFFSET" "STATIC-SYMBOL-P"
            "+STATIC-SYMBOLS+"
            "SYMBOL-HASH-SLOT" "SYMBOL-WIDETAG" "SYMBOL-NAME-SLOT"
-           "SYMBOL-PACKAGE-SLOT" "SYMBOL-INFO-SLOT" "SYMBOL-FDEFN-SLOT"
+           "SYMBOL-PACKAGE-ID-SLOT" "SYMBOL-INFO-SLOT" "SYMBOL-FDEFN-SLOT"
            "SYMBOL-SIZE" "SYMBOL-VALUE-SLOT" "SYMBOL-TLS-INDEX-SLOT"
            "AUGMENTED-SYMBOL-SIZE"
            "*BINDING-STACK-START*"
@@ -1209,11 +1211,11 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "FASL-NOTE-HANDLE-FOR-CONSTANT"
            "FASL-OUTPUT" "FASL-OUTPUT-P"
            "FASL-OUTPUT-ENTRY-TABLE" "FASL-OUTPUT-STREAM"
-           "FASL-NOTE-DUMPABLE-INSTANCE"
+           "FASL-VALIDATE-STRUCTURE"
+           "FASL-NOTE-INSTANCE-SAVES-SLOTS"
            "LOAD-FORM-IS-DEFAULT-MLFSS-P"
            "*!LOAD-TIME-VALUES*"
            "OPEN-FASL-OUTPUT"
-           "*!COLD-DEFSYMBOLS*"
            "*!COLD-TOPLEVELS*"
            "COLD-CONS" "COLD-INTERN" "COLD-PUSH"))
 
@@ -1276,8 +1278,9 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
            "COMPILER-NOTIFY"
            "COMPILER-STYLE-WARN" "COMPILER-WARN"
            "COMPONENT" "COMPONENT-HEADER-LENGTH"
-           "COMPONENT-INFO" "COMPONENT-LIVE-TN" "COMPUTE-FUN"
-           "COMPUTE-OLD-NFP" "COPY-MORE-ARG"
+           "COMPONENT-INFO" "COMPONENT-LIVE-TN"
+           "COMPONENT-N-JUMP-TABLE-ENTRIES"
+           "COMPUTE-FUN" "COMPUTE-OLD-NFP" "COPY-MORE-ARG"
            "CURRENT-BINDING-POINTER" "CURRENT-NFP-TN"
            "CURRENT-STACK-POINTER"
            "*ALIEN-STACK-POINTER*"
@@ -1525,7 +1528,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*.")
 (defpackage* "SB-PRETTY"
   (:documentation "private: implementation of pretty-printing")
   (:use "CL" "SB-EXT" "SB-INT" "SB-KERNEL")
-  (:export "PRETTY-STREAM" "PRETTY-STREAM-P"
+  (:export "OUTPUT-PRETTY-OBJECT"
+           "PRETTY-STREAM" "PRETTY-STREAM-P"
            "PPRINT-DISPATCH-TABLE"
            "*PPRINT-QUOTE-WITH-SYNTACTIC-SUGAR*"
            "!PPRINT-COLD-INIT"))
@@ -1599,7 +1603,7 @@ SB-KERNEL) have been undone, but probably more remain.")
    "NLX-PROTECT"
    "OS-EXIT"
    "OS-COLD-INIT-OR-REINIT" "OS-DEINIT"
-   "OS-CONTEXT-T" "OUTPUT-RAW-BYTES"
+   "OS-CONTEXT-T"
    "READ-CYCLE-COUNTER" "ELAPSED-CYCLES"
    "READ-N-BYTES"
    "REMOVE-FD-HANDLER"
@@ -1617,7 +1621,6 @@ SB-KERNEL) have been undone, but probably more remain.")
    "SERVE-EVENT"
    "SIGNED-SAP-REF-16" "SIGNED-SAP-REF-32"
    "SIGNED-SAP-REF-64" "SIGNED-SAP-REF-WORD" "SIGNED-SAP-REF-8"
-   "STRUCTURE!OBJECT"
    "SYSTEM-AREA-POINTER" "SYSTEM-AREA-POINTER-P"
    "SYSTEM-CONDITION" "SYSTEM-CONDITION-ADDRESS"
    "SYSTEM-CONDITION-CONTEXT"
@@ -1884,6 +1887,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "%MEMBER-TEST-NOT"
            "%MULTIPLY-HIGH" "%SIGNED-MULTIPLY-HIGH"
            "%NEGATE" "%POW"
+           "%NEW-INSTANCE"
            "%OTHER-POINTER-WIDETAG"
            "%PCL-INSTANCE-P"
            "%PUTHASH"
@@ -2060,7 +2064,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "GET-CLOSURE-LENGTH" "GET-HEADER-DATA"
            "FUNCTION-HEADER-WORD"
            "INSTANCE-HEADER-WORD"
-           "GET-LISP-OBJ-ADDRESS" "GENERATION-OF"
+           "GET-LISP-OBJ-ADDRESS" "GENERATION-OF" "OBJECT-CARD-MARKS"
            "LOWTAG-OF" "WIDETAG-OF" "WIDETAG="
            "HAIRY-DATA-VECTOR-REF"
            "HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS"  "HAIRY-DATA-VECTOR-SET"
@@ -2233,7 +2237,6 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "POINTERP"
            #+(or x86 x86-64) "*PSEUDO-ATOMIC-BITS*"
            "PUNT-PRINT-IF-TOO-LONG"
-           "RANDOM-DOCUMENTATION"
            "READER-IMPOSSIBLE-NUMBER-ERROR"
            "READER-EOF-ERROR"
            "RESTART-DESIGNATOR"
@@ -2626,7 +2629,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
 
            "STRING>=*" "STRING>*" "STRING=*" "STRING<=*"
            "STRING<*" "STRING/=*" "%SVSET"
-           "%SP-STRING-COMPARE" "%SETNTH" "%SETELT"
+           "SIMPLE-BASE-STRING=" #+sb-unicode "SIMPLE-CHARACTER-STRING="
+           "%SP-STRING-COMPARE" "%SP-STRING="
+           "%SETNTH" "%SETELT"
            "%SET-ROW-MAJOR-AREF" "%SET-FILL-POINTER"
            "%SET-FDEFINITION" "%SCHARSET"
            "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"
@@ -2676,7 +2681,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
            "ASMSTREAM-CONSTANT-VECTOR"
            "APPEND-SECTIONS" "ASSEMBLE-SECTIONS"
            "EMIT" ".ALIGN" ".BYTE" ".LISPWORD" ".SKIP"
-           ".COVERAGE-MARK" ".COMMENT"
+           ".COMMENT"
            "EMIT-ALIGNMENT" "EMIT-BYTE" "EMIT-BACK-PATCH"
            "EMIT-CHOOSER" "DEFINE-BITFIELD-EMITTER"
            "DEFINE-INSTRUCTION" "DEFINE-INSTRUCTION-MACRO"
@@ -2790,6 +2795,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries.")
 (defpackage* "SB-WALKER"
   (:documentation "internal: a code walker used by PCL")
   (:use "CL" "SB-INT" "SB-EXT")
+  (:shadow "RECONS")
   (:export "DEFINE-WALKER-TEMPLATE"
            "WALK-FORM"
            "*WALK-FORM-EXPAND-MACROS-P*"
@@ -2907,6 +2913,7 @@ possibly temporarily, because it might be used internally.")
            "XSET-MEMBERS"
            "XSET-SUBSET-P"
            "XSET-UNION"
+           "XSET="
 
             ;; sparse set implementation backed by a lightweight hashtable
 
@@ -2977,6 +2984,7 @@ possibly temporarily, because it might be used internally.")
             ;; hash mixing operations
 
            "MIX" "MIXF" "WORD-MIX"
+           "GOOD-HASH-WORD->FIXNUM"
 
             ;; Macroexpansion that doesn't touch special forms
 
@@ -3509,9 +3517,17 @@ package is deprecated in favour of SB-MOP.")
 
 (defpackage* "SB-RBTREE"
   (:documentation "internal: red/black tree")
-  (:use "CL" "SB-INT" "SB-EXT")
+  (:use "CL" "SB-INT" "SB-EXT"))
+(defpackage* "SB-RBTREE.WORD"
+  (:documentation nil)
+  (:use "CL")
   (:shadow "DELETE")
-  (:export "INSERT" "DELETE" "FIND=" "FIND<="))
+  (:export "INSERT" "DELETE"))
+(defpackage* "SB-RBTREE.MAP"
+  (:documentation nil)
+  (:use "CL")
+  (:shadow "DELETE")
+  (:export "INSERT" "DELETE"))
 
 (defpackage* "SB-LOCKLESS"
   (:documentation "internal: lockfree lists")

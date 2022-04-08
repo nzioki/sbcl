@@ -460,18 +460,18 @@ If an unsupported TYPE is requested, the function will return NIL.
 (defun find-function-definition-source (function)
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
-         (debug-fun (debug-info-debug-function function debug-info))
-         (tlf (sb-c::compiled-debug-info-tlf-number debug-info)))
-    (make-definition-source
-     :pathname
-     (when (stringp (debug-source-namestring debug-source))
-       (parse-namestring (debug-source-namestring debug-source)))
-     :character-offset
-     (sb-c::compiled-debug-info-char-offset debug-info)
-     :form-path (if tlf (list tlf))
-     :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
-     :file-write-date (debug-source-created debug-source)
-     :plist (sb-c::debug-source-plist debug-source))))
+         (debug-fun (debug-info-debug-function function debug-info)))
+    (multiple-value-bind (tlf character-offset)
+        (sb-di::debug-fun-tlf-and-offset debug-info debug-fun)
+      (make-definition-source
+       :pathname
+       (when (stringp (debug-source-namestring debug-source))
+         (parse-namestring (debug-source-namestring debug-source)))
+       :character-offset character-offset
+       :form-path (if tlf (list tlf))
+       :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
+       :file-write-date (debug-source-created debug-source)
+       :plist (sb-c::debug-source-plist debug-source)))))
 
 (defun translate-source-location (location)
   (if location
@@ -617,11 +617,14 @@ or a method combination name."
                 (setf (definition-source-form-number source-location)
                       xref-form-number)
                 (let ((name (cond ((sb-c::transform-p name)
-                                   (append (%fun-name fun)
-                                           (let* ((type (sb-c::transform-type name))
-                                                  (type-spec (type-specifier type)))
-                                             (and (sb-kernel:fun-type-p type)
-                                                  (list (second type-spec))))))
+                                   (let ((fun-name (%fun-name fun)))
+                                     (append (if (consp fun-name)
+                                                 fun-name
+                                                 (list fun-name))
+                                             (let* ((type (sb-c::transform-type name))
+                                                    (type-spec (type-specifier type)))
+                                               (and (sb-kernel:fun-type-p type)
+                                                    (list (second type-spec)))))))
                                   ((sb-c::vop-info-p name)
                                    (list 'sb-c:define-vop
                                          (sb-c::vop-info-name name)))
@@ -814,30 +817,21 @@ Experimental: interface subject to change."
                          ;; bits are packed in the opposite order. And thankfully,
                          ;; this fix seems not to depend on whether the numbering
                          ;; scheme is MSB 0 or LSB 0, afaict.
-                         (let* ((wp
-                                 (let ((card-index
-                                        (logand
-                                         (ash (get-lisp-obj-address object) ; pinned above
-                                              (- (integer-length (1- sb-vm:gencgc-card-bytes))))
-                                         (sb-alien:extern-alien "gc_card_table_mask" sb-alien:int))))
-                                   (eql 1 (sb-sys:sap-ref-8
-                                           (sb-alien:extern-alien "gc_card_mark"
-                                                                  sb-sys:system-area-pointer)
-                                           card-index))))
+                         (let* ((wp (page-protected-p object))
                                 (index (sb-vm:find-page-index
                                         (get-lisp-obj-address object)))
                                 (flags (sb-alien:slot page 'sb-vm::flags))
                                 .
                                 #+big-endian
-                                ((type      (ldb (byte 5 3) flags))
+                                ((type      (ldb (byte 6 2) flags))
                                  (dontmove  (logbitp 0 flags)))
                                 #+little-endian
-                                ((type      (ldb (byte 5 0) flags))
+                                ((type      (ldb (byte 6 0) flags))
                                  (dontmove  (logbitp 7 flags))))
                            (list :space space
                                  :generation (sb-alien:slot page 'sb-vm::gen)
                                  :write-protected wp
-                                 :boxed (logbitp 0 type)
+                                 :boxed (> (logand type #xf) 1)
                                  :pinned dontmove
                                  :large (logbitp 4 type)
                                  :page index)))
@@ -1039,7 +1033,7 @@ Experimental: interface subject to change."
                                    (= this-bin-size (+ prev-bin-size 2)))
                                this-bin-size))))))))
 
-(defun largest-objects (&key (threshold #+gencgc sb-vm:gencgc-card-bytes
+(defun largest-objects (&key (threshold #+gencgc sb-vm:gencgc-page-bytes
                                         #-gencgc sb-c:+backend-page-bytes+)
                              (sort :size))
   (declare (type (member :address :size) sort))

@@ -637,9 +637,10 @@
           (simd-pack-p ,object)
           (let ((,n-tag (%simd-pack-tag ,object)))
             (or ,@(loop
-                    for type in (simd-pack-type-element-type type)
-                    for index = (position type *simd-pack-element-types*)
-                    collect `(eql ,n-tag ,index))))))))
+                    for bit across (simd-pack-type-element-type type)
+                    for i from 0
+                    if (= bit 1)
+                      collect `(eql ,n-tag ,i))))))))
 
 #+sb-simd-pack-256
 (defun source-transform-simd-pack-256-typep (object type)
@@ -650,9 +651,10 @@
           (simd-pack-256-p ,object)
           (let ((,n-tag (%simd-pack-256-tag ,object)))
             (or ,@(loop
-                    for type in (simd-pack-256-type-element-type type)
-                    for index = (position type *simd-pack-element-types*)
-                    collect `(eql ,n-tag ,index))))))))
+                    for bit across (simd-pack-256-type-element-type type)
+                    for i from 0
+                    if (= bit 1)
+                      collect `(eql ,n-tag ,i))))))))
 
 ;;; Return the predicate and type from the most specific entry in
 ;;; *TYPE-PREDICATES* that is a supertype of TYPE.
@@ -1194,6 +1196,35 @@
                     (error "~a is not a subtype of VECTOR." type)))))
     (simplify type)))
 
+(defun strip-array-dimensions-and-complexity (type)
+  (labels ((process-compound-type (types)
+             (let (array-types)
+               (dolist (type types)
+                 (unless (or (hairy-type-p type)
+                             (sb-kernel::negation-type-p type))
+                   (push (strip type) array-types)))
+               (apply #'type-union array-types)))
+           (strip (type)
+             (cond ((array-type-p type)
+                    (let ((dim (array-type-dimensions type)))
+                      (make-array-type
+                       (if (eq dim '*)
+                           dim
+                           (make-list (length dim)
+                                      :initial-element '*))
+                       :complexp :maybe
+                       :element-type (array-type-element-type type)
+                       :specialized-element-type (array-type-specialized-element-type type))))
+                   ((union-type-p type)
+                    (process-compound-type (union-type-types type)))
+                   ((intersection-type-p type)
+                    (process-compound-type (intersection-type-types type)))
+                   ((member-type-p type)
+                    (process-compound-type
+                     (mapcar #'ctype-of (member-type-members type))))
+                   (t
+                    (error "~a is not a subtype of ARRAY." type)))))
+    (strip type)))
 
 (defun check-coerce (value-type to-type type-specifier node)
   (flet ((fail ()
@@ -1347,7 +1378,7 @@
         tval)))))
 
 (deftransform #+64-bit unsigned-byte-64-p #-64-bit unsigned-byte-32-p
-  ((value) (fixnum) * :important nil)
+  ((value) (sb-vm:signed-word) * :important nil)
   `(>= value 0))
 
 (deftransform %other-pointer-p ((object))

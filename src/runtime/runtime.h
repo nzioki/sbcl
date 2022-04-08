@@ -33,17 +33,18 @@
 
 #ifdef LISP_FEATURE_WIN32
 #define thread_sigmask sb_pthread_sigmask
-// wrap CriticalSection operators in a function returning 0 to satisfy assertions
-static inline int cs_mutex_lock(void* l) { EnterCriticalSection(l); return 0; }
-static inline int cs_mutex_unlock(void* l) { LeaveCriticalSection(l); return 0; }
-#define thread_mutex_lock(l) cs_mutex_lock(l)
-#define thread_mutex_unlock(l) cs_mutex_unlock(l)
+// wrap CriticalSection operators in a function returning 1 to satisfy assertions
+static inline int cs_mutex_lock(void* l) { EnterCriticalSection(l); return 1; }
+static inline int cs_mutex_unlock(void* l) { LeaveCriticalSection(l); return 1; }
+#define mutex_acquire(l) cs_mutex_lock(l)
+#define mutex_release(l) cs_mutex_unlock(l)
 #else
 #define thread_self() pthread_self()
 #define thread_equal(a,b) pthread_equal(a,b)
 #define thread_sigmask pthread_sigmask
-#define thread_mutex_lock(l) pthread_mutex_lock(l)
-#define thread_mutex_unlock(l) pthread_mutex_unlock(l)
+#define mutex_acquire(l) !pthread_mutex_lock(l)
+#define mutex_release(l) !pthread_mutex_unlock(l)
+#define TryEnterCriticalSection(l) !pthread_mutex_trylock(l)
 #endif
 
 #else
@@ -51,8 +52,9 @@ static inline int cs_mutex_unlock(void* l) { LeaveCriticalSection(l); return 0; 
 #define thread_self() 0
 #define thread_equal(a,b) ((a)==(b))
 #define thread_sigmask sigprocmask
-#define thread_mutex_lock(l) 0
-#define thread_mutex_unlock(l) 0
+#define mutex_acquire(l) 1
+#define mutex_release(l) 1
+#define TryEnterCriticalSection(l) 1
 #endif
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
@@ -386,16 +388,7 @@ extern char *copied_string (char *string);
 # define THREADS_USING_GCSIGNAL 1
 #endif
 
-/* Now that SPARC has precise GENCGC, several places that used to be
- * #ifdef PCC need adjustment.  Clearly, "PPC or SPARC" is as unhelpful
- * a test as its reverse, "x86 or x86-64".  However, the feature
- * commonly used to differentiate between those two worlds is
- * C_STACK_IS_CONTROL_STACK, and clearly (or at least in my humble
- * opinion), at some point we'd like to have precise GC on x86 while
- * still sharing the C stack, so stack usage ought not imply GC
- * conservativeness.  So let's have a helper feature that makes the code
- * a bit more future-proof, even if it is itself currently defined in
- * the naive way: */
+/* FIXME: this is the wrong header to make this choice */
 #if defined(LISP_FEATURE_GENCGC) && !defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
 # define GENCGC_IS_PRECISE 1
 #else

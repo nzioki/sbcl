@@ -19,7 +19,8 @@
   make-load-form-saving-slots
   sb-vm:map-allocated-objects
   sb-ext:primitive-object-size
-  sb-vm::remove-static-links)
+  sb-vm::remove-static-links
+  sb-vm::blt-copier-for-widetag)
  ;; CLOS implementation
  (sb-mop:class-finalized-p
   sb-mop:class-prototype
@@ -119,6 +120,9 @@
   sb-sequence:substitute
   sb-sequence:substitute-if
   sb-sequence:substitute-if-not)
+ #+sb-eval
+ (sb-eval:eval-in-environment
+  sb-eval:eval-in-native-environment)
  ;; Fast interpreter
  #+sb-fasteval
  (sb-interpreter:%fun-ftype
@@ -181,7 +185,6 @@
   sb-c::apply-core-fixups
   sb-c::compiled-debug-info-char-offset
   sb-c::compiled-debug-info-tlf-number
-  sb-c::fopcompilable-p
   sb-c::pack-xref-data
   sb-c::prepare-for-compile
   sb-sys:reinit-internal-real-time))

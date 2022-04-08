@@ -53,7 +53,7 @@
 #include "genesis/vector.h"
 #include "genesis/layout.h"
 #include "forwarding-ptr.h"
-#include "getallocptr.h"
+#include "pseudo-atomic.h"
 #include "var-io.h"
 #include "immobile-space.h"
 #include "unaligned.h"
@@ -384,10 +384,13 @@ enliven_immobile_obj(lispobj *ptr, int rescan) // a native pointer
 {
     gc_assert(widetag_of(ptr) != SIMPLE_FUN_WIDETAG); // can't enliven interior pointer
     gc_assert(immobile_obj_gen_bits(ptr) == from_space);
+    // KLUDGE: disregard embedded objects in SB-FASL:*ASSEMBLER-ROUTINES*
+    if (points_to_asm_code_p((uword_t)ptr)
+        && (uword_t)native_pointer((uword_t)ptr) != asm_routines_start) return;
     int pointerish = !leaf_obj_widetag_p(widetag_of(ptr));
     int bits = (pointerish ? 0 : IMMOBILE_OBJ_VISITED_FLAG);
     // enlivening makes the object appear as if written, so that
-    // scav_code_header won't skip it, thus ensuring we transitively
+    // scav_code_blob won't skip it, thus ensuring we transitively
     // scavenge + enliven newspace objects.
     if (widetag_of(ptr) == CODE_HEADER_WIDETAG)
         bits |= OBJ_WRITTEN_FLAG;
@@ -654,7 +657,7 @@ scavenge_immobile_roots(generation_index_t min_gen, generation_index_t max_gen)
             int n_words, gen;
             for ( ; obj < limit ; obj += n_words ) {
                 lispobj header = *obj;
-                // scav_code_header will do nothing if the object isn't
+                // scav_code_blob will do nothing if the object isn't
                 // marked as written.
                 if (genmask >> (gen=immobile_obj_gen_bits(obj)) & 1) {
                     if (gen == new_space) { set_visited(obj); }
@@ -803,7 +806,7 @@ varyobj_points_to_younger_p(lispobj* obj, int gen, int keep_gen, int new_gen,
 {
     lispobj *begin, *end, word = *obj;
     unsigned char widetag = header_widetag(word);
-    if (widetag == CODE_HEADER_WIDETAG) { // usual case. Like scav_code_header()
+    if (widetag == CODE_HEADER_WIDETAG) { // usual case. Like scav_code_blob()
         return header_rememberedp(word);
     } else if (widetag == FDEFN_WIDETAG ||
                widetag == FUNCALLABLE_INSTANCE_WIDETAG) {
@@ -1128,7 +1131,7 @@ sweep_immobile_space(int raise)
   sweep_varyobj_pages(raise);
 }
 
-static void gc_init_immobile()
+void gc_init_immobile()
 {
 #ifdef DEBUG
     logfile = stderr;
@@ -1555,13 +1558,13 @@ static void adjust_fdefn_raw_addr(struct fdefn* fdefn)
   lispobj header;
   int i;
   for (i=1; i<=4; ++i)
-      if ((header = raw_addr[-i]) == 1 || other_immediate_lowtag_p(header)) {
+      if ((header = raw_addr[-i]) == FORWARDING_HEADER || other_immediate_lowtag_p(header)) {
           obj_base = raw_addr-i;
           break;
       }
   gc_assert(obj_base);
   int offset = (char*)raw_addr - (char*)obj_base;
-  if (header == 1) {
+  if (header == FORWARDING_HEADER) {
       char* new = (char*)native_pointer(forwarding_pointer_value(obj_base));
       fdefn->raw_addr = new + offset;
   }
@@ -2240,8 +2243,8 @@ static void defrag_immobile_space(boolean verbose)
 
     // Dynamic space
     // We can safely ignore allocation region boundaries.
-    fixup_space(current_dynamic_space,
-                (lispobj*)get_alloc_pointer() - current_dynamic_space);
+    fixup_space((lispobj*)DYNAMIC_SPACE_START,
+                ((uword_t)dynamic_space_highwatermark() - DYNAMIC_SPACE_START) >> WORD_SHIFT);
 
     // Copy the spaces back where they belong.
 #if DEFRAGMENT_FIXEDOBJ_SUBSPACE

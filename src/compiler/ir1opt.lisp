@@ -73,11 +73,11 @@
         leaf)
     (if (and (ref-p use)
              (constant-p (setf leaf (ref-leaf use))))
-        (constant-value leaf)
+        (values (constant-value leaf) leaf)
         (multiple-value-bind (constantp value) (type-singleton-p type)
           (unless constantp
             (error "~S used on non-constant LVAR ~S" 'lvar-value lvar))
-          value))))
+          (values value (find-constant value))))))
 
 (defun lvar-value-is-nil (lvar)
   (and (constant-lvar-p lvar) (null (lvar-value lvar))))
@@ -500,7 +500,11 @@
                    (= (length args) 2)
                    (constant-lvar-p (first args))
                    (not (constant-lvar-p (second args))))
-              (setf (basic-combination-args node) (nreverse args))))))))
+              (setf (basic-combination-args node) (nreverse args)))))
+      (:full
+       ;; Probably, this can only come from CUT-TO-WIDTH
+       ;; otherwise normal ir1-convert would've called recognize-known-call.
+       (recognize-known-call node nil nil nil)))))
 
 ;;; Loop over the nodes in BLOCK, acting on (and clearing) REOPTIMIZE
 ;;; flags.
@@ -988,7 +992,7 @@
 ;;;; combination IR1 optimization
 
 (declaim (start-block ir1-optimize-combination maybe-terminate-block
-                      validate-call-type))
+                      validate-call-type recognize-known-call))
 
 (defun check-important-result (node info)
   (when (and (null (node-lvar node))
@@ -1331,7 +1335,7 @@
 ;;; We return the leaf referenced (NIL if not a leaf) and the
 ;;; FUN-INFO assigned.
 (defun recognize-known-call (call ir1-converting-not-optimizing-p
-                             &optional unknown-keys)
+                             &optional unknown-keys (inline t))
   (declare (type combination call))
   (let* ((ref (lvar-uses (basic-combination-fun call)))
          (leaf (when (ref-p ref) (ref-leaf ref)))
@@ -1352,7 +1356,8 @@
       ((not (and (global-var-p leaf)
                  (eq (global-var-kind leaf) :global-function)))
        (values leaf nil))
-      ((and (ecase inlinep
+      ((and inline
+            (ecase inlinep
               (inline t)
               (no-chance nil)
               ((nil maybe-inline) (policy call (zerop space))))
@@ -1401,9 +1406,8 @@
        (let ((info (info :function :info (leaf-source-name leaf))))
          (if info
              (values leaf
-                     (progn
-                       (setf (basic-combination-kind call) :known)
-                       (setf (basic-combination-fun-info call) info)))
+                     (setf (basic-combination-kind call) :known
+                           (basic-combination-fun-info call) info))
              (values leaf nil)))))))
 
 ;;; Check whether CALL satisfies TYPE. If so, apply the type to the
@@ -2116,10 +2120,12 @@
              ;; we should not change lifetime of unknown values lvars
              (cast
               (and (type-single-value-p (lvar-derived-type arg))
-                   (multiple-value-bind (pdest pprev)
-                       (principal-lvar-end lvar)
-                     (declare (ignore pdest))
-                     (lvar-single-value-p pprev))
+                   (or
+                    (let-var-immediately-used-p ref var arg)
+                    (multiple-value-bind (pdest pprev)
+                        (principal-lvar-end lvar)
+                      (declare (ignore pdest))
+                      (lvar-single-value-p pprev)))
                    ;; CASTs can disappear, don't substitute if
                    ;; DEST-LVAR has other uses
                    (block nil
@@ -2750,6 +2756,17 @@
                             (cast-asserted-type cast))
            (delete-cast cast)
            t)
+          ((and (fun-type-p (cast-asserted-type cast))
+                (let ((uses (lvar-uses value)))
+                  (when (ref-p uses)
+                    (let ((fun (ref-leaf uses)))
+                      (when (and (functional-p fun)
+                                 (functional-entry-fun fun))
+                        ;; FIXME: is it important to compute this once?
+                        (csubtypep (definition-type (functional-entry-fun fun))
+                                   (cast-asserted-type cast)))))))
+           (delete-cast cast)
+           t)
           ((listp (lvar-uses value))
            ;; Turn (the vector (if x y #())) into
            ;; (if x (the vector y) #())
@@ -2812,9 +2829,6 @@
              (let* ((source-form (node-source-form cast))
                     (detail (lvar-all-sources (cast-value cast)))
                     (context (cast-context cast))
-                    (context (if (opaque-box-p context)
-                                 (opaque-box-value context)
-                                 context))
                     (context (if (local-call-context-p context)
                                  (local-call-context-var context)
                                  context)))

@@ -120,7 +120,7 @@
   (:translate set-header-data)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg))
-         (data :scs (any-reg immediate)))
+         (data :scs (any-reg immediate zero)))
   (:arg-types * positive-fixnum)
   (:temporary (:scs (non-descriptor-reg)) t1 t2)
   (:generator 6
@@ -135,7 +135,8 @@
                 (inst ori t1 t1 val))
                (t
                 (inst li t2 val)
-                (inst or t1 t1 t2))))))
+                (inst or t1 t1 t2)))))
+      (zero))
     (storew t1 x 0 other-pointer-lowtag)))
 
 (define-vop (pointer-hash)
@@ -148,14 +149,6 @@
 
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))

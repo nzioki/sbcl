@@ -20,15 +20,8 @@
 ;;;   * LIST-POINTER-LOWTAG + N-WORD-BYTES = OTHER-POINTER-LOWTAG: NIL
 ;;;     is both a cons and a symbol (at the same address) and depends on this.
 ;;;     See the definition of SYMBOL in objdef.lisp
-;;;   * OTHER-POINTER-LOWTAG > 4: Some code in the SPARC backend,
-;;;     which uses bit 2 of the ALLOC register to indicate that
-;;;     PSEUDO-ATOMIC is on, doesn't strip the low bits of reg_ALLOC
-;;;     before ORing in OTHER-POINTER-LOWTAG within a PSEUDO-ATOMIC
-;;;     section.
 ;;;   * OTHER-IMMEDIATE-0-LOWTAG are spaced 4 apart: various code wants to
-;;;     iterate through these
-;;;   * Allocation code on Alpha wants lowtags for heap-allocated
-;;;     objects to be odd.
+;;;     iterate through these.  (This is not true on PPC64)
 ;;; (These are just the ones we know about as of sbcl-0.7.1.22. There
 ;;; might easily be more, since these values have stayed highly
 ;;; constrained for more than a decade, an inviting target for
@@ -201,23 +194,28 @@
                                             ;                          |
   symbol-widetag                            ;  26   2D  26   2D       /
 
-  code-header-widetag                       ;  2A   31  2A   31
+  #-64-bit instance-widetag                 ;  2A       2A
+  #-64-bit funcallable-instance-widetag     ;  2E       2E
+  #-64-bit simple-fun-widetag               ;  32       32
+  #-64-bit closure-widetag                  ;  36       36
+  #-64-bit code-header-widetag              ;  3A       3A
 
-  simple-fun-widetag                        ;  2E   35  2E   35
-  closure-widetag                           ;  32   39  32   39
-  funcallable-instance-widetag              ;  36   3D  36   3D
+  #+64-bit code-header-widetag              ;       31       31
+  #+64-bit instance-widetag                 ;       35       35
+  #+64-bit simple-fun-widetag               ;       39       39
+  #+64-bit funcallable-instance-widetag     ;       3D       3D
+  #+64-bit closure-widetag                  ;       41       41
 
   ;; x86[-64] does not have objects with this widetag,
-  #-(or x86 x86-64 arm64) return-pc-widetag ;  3A   41  3A   41
-  #+(or x86 x86-64 arm64) lra-widetag-notused
+  #-(or x86 x86-64 arm64 riscv) return-pc-widetag ;  3E   45  3E   45
+  #+(or x86 x86-64 arm64 riscv) lra-widetag-notused
 
-  value-cell-widetag                        ;  3E   45  3E   45
-  character-widetag                         ;  42   49  42   49
-  sap-widetag                               ;  46   4D  46   4D
-  #-64-bit unbound-marker-widetag           ;  4A   51  4A   51
+  value-cell-widetag                        ;  42   49  42   49
+  character-widetag                         ;  46   4D  46   4D
+  sap-widetag                               ;  4A   51  4A   51
+  #-64-bit unbound-marker-widetag           ;  4E   55  4E   55
   #+64-bit unused00-widetag
-  weak-pointer-widetag                      ;  4E   55  4E   55
-  instance-widetag                          ;  52   59  52   59
+  weak-pointer-widetag                      ;  52   59  52   59
   fdefn-widetag                             ;  56   5D  56   5D
 
   no-tls-value-marker-widetag               ;  5A   61  5A   61
@@ -291,6 +289,13 @@
   complex-array-widetag                     ;  EE   F9  E6   F1
   unused-array-widetag                      ;  F2   FD  EA   F5
 ))
+
+;;; Check that INSTANCE and FUNCALLABLE-INSTANCE differ at exactly 1 bit.
+(eval-when (:compile-toplevel)
+  #-64-bit (assert (= (logxor instance-widetag funcallable-instance-widetag)
+                      #b0100))
+  #+64-bit (assert (= (logxor instance-widetag funcallable-instance-widetag)
+                      #b1000)))
 
 (defconstant-eqx +function-widetags+
     '#.(list funcallable-instance-widetag simple-fun-widetag closure-widetag)

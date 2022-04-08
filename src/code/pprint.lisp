@@ -727,7 +727,6 @@ line break."
 
 ;;;; pprint-dispatch tables
 
-(define-load-time-global *standard-pprint-dispatch-table* nil)
 (define-load-time-global *initial-pprint-dispatch-table* nil)
 
 (defstruct (pprint-dispatch-entry
@@ -1502,6 +1501,15 @@ line break."
     ,(or predicate
          `(named-lambda ,(format nil "~A-P" handler) (x)
             ,(sb-c::source-transform-typep 'x specifier)))))
+
+
+;;;; Interface seen by regular (ugly) printer.
+
+;;; OUTPUT-PRETTY-OBJECT is called by OUTPUT-OBJECT when
+;;; *PRINT-PRETTY* is true.
+(defun output-pretty-object (stream fun object)
+  (with-pretty-stream (stream)
+    (funcall fun stream object)))
 
 (defun !pprint-cold-init ()
   (/show0 "entering !PPRINT-COLD-INIT")

@@ -177,6 +177,8 @@
 
 ;;;; user-defined hash table tests
 
+(define-load-time-global *user-hash-table-tests* nil)
+
 (defun register-hash-table-test (name hash-fun)
   (declare (symbol name) (function hash-fun))
   (unless (fboundp name)
@@ -415,9 +417,7 @@ Examples:
     but results are undefined if a thread writes to the hash-table
     concurrently with another reader or writer. If T, all concurrent accesses
     are safe, but note that CLHS 3.6 (Traversal Rules and Side Effects)
-    remains in force. See also: SB-EXT:WITH-LOCKED-HASH-TABLE. This keyword
-    argument is experimental, and may change incompatibly or be removed in the
-    future."
+    remains in force. See also: SB-EXT:WITH-LOCKED-HASH-TABLE."
   (declare (type (or function symbol) test))
   (declare (type unsigned-byte size))
   (multiple-value-bind (kind test test-fun hash-fun)
@@ -442,11 +442,15 @@ Examples:
              (values 3 'equalp #'equalp #'equalp-hash))
             (t
              (dolist (info *user-hash-table-tests*
-                      (if hash-function
-                          (if (functionp test)
-                              (values -1 (%fun-name test) test nil)
-                              (values -1 test (%coerce-callable-to-fun test) nil))
-                          (error "Unknown :TEST for MAKE-HASH-TABLE: ~S" test)))
+                      (flet ((proper-name (fun &aux (name (%fun-name fun)))
+                               (if (and (symbolp name) (fboundp name) (eq (symbol-function name) fun))
+                                   name
+                                   fun)))
+                        (if hash-function
+                            (if (functionp test)
+                                (values -1 (proper-name test) test nil)
+                                (values -1 test (%coerce-callable-to-fun test) nil))
+                            (error "Unknown :TEST for MAKE-HASH-TABLE: ~S" test))))
                (destructuring-bind (test-name test-fun hash-fun) info
                  (when (or (eq test test-name) (eq test test-fun))
                    (return (values -1 test-name test-fun hash-fun)))))))
@@ -466,7 +470,7 @@ Examples:
            ;; FIXME: Original REHASH-THRESHOLD default should be 1.0,
            ;; not 1, to make it easier for the compiler to avoid
            ;; boxing.
-           (rehash-threshold (max +min-hash-table-rehash-threshold+
+           (rehash-threshold (max #.+min-hash-table-rehash-threshold+
                                   (float rehash-threshold $1.0)))) ; always single-float
       (%make-hash-table
        ;; compute flags. The stored KIND bits don't matter for a user-supplied hash
@@ -538,7 +542,8 @@ Examples:
                 (pick-table-methods (logtest flags hash-table-synchronized-flag)
                                     (if userfunp -1 table-kind))))
            (table
-            (%alloc-hash-table flags getter setter remover #'clrhash-impl
+            (funcall (if weakp #'%alloc-general-hash-table #'%alloc-hash-table)
+                               flags getter setter remover #'clrhash-impl
                                test test-fun hash-fun
                                rehash-size rehash-threshold
                                kv-vector index-vector next-vector hash-vector)))
@@ -577,7 +582,7 @@ Examples:
       (%make-hash-table (pack-ht-flags-kind kind)
                         test test-fun hash-fun
                         +min-hash-table-size+
-                        default-rehash-size
+                        #.default-rehash-size
                         $1.0)))) ; rehash threshold
 
 ;;; I guess we might have more than one representation of a table,
@@ -810,7 +815,7 @@ multiple threads accessing the same hash-table without locking."
                               (hash-vector (hash-table-hash-vector table))
                               (rehashing-state (1+ epoch)))
   (declare (hash-table table) (fixnum epoch))
-  (atomic-incf (hash-table-n-rehash+find table))
+  #+hash-table-metrics (atomic-incf (hash-table-n-rehash+find table))
   ;; Verify some invariants prior to disabling array bounds checking
   (aver (>= (length kv-vector) #.(+ (* 2 +min-hash-table-size+)
                                     kv-pairs-overhead-slots)))
@@ -818,7 +823,8 @@ multiple threads accessing the same hash-table without locking."
   (when hash-vector
     (aver (= (length hash-vector) (length next-vector))))
   ;; Empty cells must be in the free chain already, and no smashed cells exist.
-  (aver (null (hash-table-smashed-cells table)))
+  (when (typep table 'general-hash-table)
+    (aver (null (hash-table-smashed-cells table))))
   ;; Must not permit the rehashing state to stick due to a nonlocal exit.
   ;; All further normal use of the table would be prevented.
   (without-interrupts
@@ -1448,7 +1454,7 @@ nnnn 1_    any       linear scan
 (defun hash-table-lsearch (hash-table eq-test key hash default)
   (declare (optimize (sb-c:insert-array-bounds-checks 0)))
   (declare (type (and fixnum unsigned-byte) hash))
-  (atomic-incf (hash-table-n-lsearch hash-table))
+  #+hash-table-metrics (atomic-incf (hash-table-n-lsearch hash-table))
   (let* ((kv-vector (hash-table-pairs hash-table))
          (key-index
           (let ((hash-vector (hash-table-hash-vector hash-table))
@@ -1918,8 +1924,9 @@ table itself."
                     ;; Clear the index-vector.
                     ;; Don't need to clear the hash-vector or the next-vector.
                     (fill (hash-table-index-vector hash-table) 0))
-                  (setf (hash-table-smashed-cells hash-table) nil
-                        (hash-table-next-free-kv hash-table) 1
+                  (when (typep hash-table 'general-hash-table)
+                    (setf (hash-table-smashed-cells hash-table) nil))
+                  (setf (hash-table-next-free-kv hash-table) 1
                         (kv-vector-high-water-mark kv-vector) 0))))
       (if (hash-table-synchronized-p hash-table)
           (sb-thread::call-with-recursive-system-lock #'clear (hash-table-%lock hash-table))

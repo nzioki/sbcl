@@ -284,7 +284,6 @@
              (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 (defvar *!removable-symbols* nil)
-(push '("SB-INT" check-designator) *!removable-symbols*)
 
 (defun %defconstant-eqx-value (symbol expr eqx)
   (declare (type function eqx))
@@ -303,35 +302,15 @@
 ;;;
 #+sb-xc-host
 (defmacro defconstant-eqx (symbol expr eqx &optional doc)
-  ;; CLISP needs the EVAL-WHEN here, or else the symbol defined is unavailable
-  ;; for later uses within the same file. For instance, in x86-64/vm, defining
-  ;; TEMP-REG-TN as R11-TN would get an error that R11-TN is unbound.
-  ;; We don't want that junk in our expansion, especially as our requirement
-  ;; is to separate the compile-time and load-time effect.
+  ;; CLISP needs the EVAL-WHEN here, or else the symbol defined is
+  ;; unavailable for later uses within the same file. For instance, in
+  ;; x86-64/vm, defining TEMP-REG-TN as R11-TN would get an error that
+  ;; R11-TN is unbound.  We don't want that junk in our expansion.
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
        ,@(when doc (list doc)))))
 
-;;; This is the expansion as it should be for us, but notice that this
-;;; recapitulation of the macro is actually not defined at compile-time.
 #-sb-xc-host
-(let ()
-  (defmacro defconstant-eqx (symbol expr eqx &optional doc)
-    `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
-       ,@(when doc (list doc)))))
-
-;;; Special variant at cross-compile-time. Face it: the "croak-if-not-EQx" test
-;;; is irrelevant - there can be no pre-existing value to test against at target load time.
-;;; The extra requirement is that the EXPR must satisfy CONSTANTP so that this
-;;; macroexpander can EVAL it, and then the constant value can be dumped as a literal.
-;;; This in turn allows a LOAD-TIME-VALUE form referencing the constant to work
-;;; in genesis because the target representation of the value will be available.
-;;; It would not be available if the form were computable only by target code.
-#-sb-xc-host
-(eval-when (:compile-toplevel)
-  (sb-xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
-    (unless (constantp expr)
-      (error "DEFCONSTANT-EQX requires a literal constant"))
-    `(eval-when (:compile-toplevel :load-toplevel)
-       (%defconstant ',symbol ',(%defconstant-eqx-value symbol (eval expr) (eval eqx))
-         (sb-c:source-location) ,@(when doc (list doc))))))
+(defmacro defconstant-eqx (symbol expr eqx &optional doc)
+  `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+     ,@(when doc (list doc))))

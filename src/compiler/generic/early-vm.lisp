@@ -162,6 +162,11 @@
 ;;; which can be expressed in 8 bits.
 (defconstant short-header-max-words #x7fff)
 
+#+gencgc
+(defconstant max-conses-per-page
+  (floor (* gencgc-page-bytes n-byte-bits)
+         (1+ (* n-word-bytes 2 n-byte-bits)))) ; 1 extra bit per cons
+
 ;;; Amount to righ-shift an instance header to get the length.
 ;;; Similar consideration as above with regard to use of generation# byte.
 (defconstant instance-length-shift 10)
@@ -287,3 +292,6 @@
   `(setf (slab-sizeclass ,slab) (ash ,sizeclass n-fixnum-tag-bits)
          (slab-capacity ,slab) ,capacity
          (slab-chunk-size ,slab) ,chunksize))
+
+#+gencgc
+(defconstant gencgc-page-words (/ gencgc-page-bytes n-word-bytes))

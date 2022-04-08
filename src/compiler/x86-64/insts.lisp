@@ -339,10 +339,10 @@
     (:nle . 15) (:g . 15))
   #'equal)
 (defconstant-eqx +condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
 ;;; SSE shuffle patterns. The names end in the number of bits of the
@@ -3289,7 +3289,12 @@
 
 (defun sort-inline-constants (constants)
   ;; Each constant is ((size . bits) . label)
-  (stable-sort constants #'> :key (lambda (x) (align-of (car x)))))
+  ;; Jump tables must precede everything else.
+  (let ((jump-tables (remove :jump-table constants :test #'neq :key #'caar))
+        (rest (remove :jump-table constants :key #'caar)))
+    (concatenate 'vector
+                 jump-tables
+                 (stable-sort rest #'> :key (lambda (x) (align-of (car x)))))))
 
 (defun emit-inline-constant (section constant label)
   ;; See comment at CANONICALIZE-INLINE-CONSTANT about how we are
@@ -3373,6 +3378,16 @@
 
 ;;; Coverage support
 
+(define-instruction store-coverage-mark (segment mark-index)
+  (:emitter
+   (assemble (segment)
+     (inst mov :byte (rip-relative-ea (segment-origin segment)
+                                      ;; skip over jump table word and entries
+                                      (+ (* (1+ (component-n-jump-table-entries))
+                                            n-word-bytes)
+                                         mark-index))
+           1))))
+
 (defun sb-assem::%mark-used-labels (operand)
   (when (typep operand 'ea)
     (let ((disp (ea-disp operand)))
@@ -3381,22 +3396,6 @@
         (setf (label-usedp disp) t))
        (label+addend
         (setf (label-usedp (label+addend-label disp)) t))))))
-
-(defun sb-c::branch-opcode-p (mnemonic)
-  (case mnemonic
-    ((call ret jmp jrcxz break int iret
-      loop loopz loopnz syscall
-      byte word dword) ; unexplained phenomena
-     t)))
-
-;;; Replace the STATEMENT with an instruction to store a coverage mark
-;;; in the OFFSETth byte beyond LABEL.
-(defun sb-c::replace-coverage-instruction (statement label offset)
-  ;; This is a bit sucky, but the coverage instruction inserter
-  ;; does not receive the benefit of parsing prefixes as keywords,
-  ;; so it has to use the numeric value.
-  (setf (stmt-mnemonic statement) 'mov
-        (stmt-operands statement) `(,+byte-size-prefix+ ,(rip-relative-ea label offset) 1)))
 
 ;;; Assembly optimizer support
 

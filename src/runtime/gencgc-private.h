@@ -14,19 +14,16 @@
 
 void zero_dirty_pages(page_index_t start, page_index_t end, int page_type);
 
-/// There is some additional cleverness that could potentially be had -
-/// the "need_to_zero" bit (a/k/a "page dirty") is obviously 1 if the page
-/// contains objects. Only for an empty page must we distinguish between pages
-/// not needing be zero-filled before next use and those which must be.
-/// Thus, masking off the dirty bit could be avoided by not storing it for
-/// any in-use page. But since that's not what we do - we set the bit to 1
-/// as soon as a page is used - we do have to mask off the bit.
-#define page_bytes_used(index) (page_table[index].bytes_used_ & ~1)
-#define page_need_to_zero(index) (page_table[index].bytes_used_ & 1)
-#define set_page_bytes_used(index,val) \
-  page_table[index].bytes_used_ = (val) | page_need_to_zero(index)
-#define set_page_need_to_zero(index,val) \
-  page_table[index].bytes_used_ = page_bytes_used(index) | val
+typedef unsigned int page_bytes_t;
+#define page_words_used(index) page_table[index].words_used_
+#define page_bytes_used(index) ((page_bytes_t)page_table[index].words_used_<<WORD_SHIFT)
+#if defined LISP_FEATURE_RISCV && defined LISP_FEATURE_LINUX // KLUDGE
+#define page_need_to_zero(index) (mmap_does_not_zero || page_table[index].need_zerofill)
+#else
+#define page_need_to_zero(index) page_table[index].need_zerofill
+#endif
+#define set_page_bytes_used(index,val) page_table[index].words_used_ = ((val)>>WORD_SHIFT)
+#define set_page_need_to_zero(index,val) page_table[index].need_zerofill = val
 
 #if !CONDENSED_PAGE_TABLE
 
@@ -51,7 +48,7 @@ static void __attribute__((unused))
 set_page_scan_start_offset(page_index_t index, os_vm_size_t offset)
 {
     // If the offset is nonzero and page-aligned
-    unsigned int lsb = offset !=0 && IS_ALIGNED(offset, GENCGC_CARD_BYTES);
+    unsigned int lsb = offset !=0 && IS_ALIGNED(offset, GENCGC_PAGE_BYTES);
     os_vm_size_t scaled = (offset >> (lsb ? GENCGC_CARD_SHIFT-1 : WORD_SHIFT)) | lsb;
     if (scaled > SCAN_START_OFS_MAX) {
         // Assert that if offset exceed the max representable value,
@@ -103,7 +100,4 @@ static inline enum prot_mode protection_mode(page_index_t page) {
 }
 #endif
 
-#ifndef LISP_FEATURE_SB_THREAD
-#define SINGLE_THREAD_MIXED_REGION (struct alloc_region*)(STATIC_SPACE_START + 2*N_WORD_BYTES)
-#endif
 #endif /* _GENCGC_PRIVATE_H_ */

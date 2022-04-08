@@ -11,6 +11,24 @@
 
 (in-package "SB-C")
 
+;;;; DEFTYPEs
+
+;;; An INLINEP value describes how a function is called. The values
+;;; have these meanings:
+;;;     NIL     No declaration seen: do whatever you feel like, but don't
+;;;             dump an inline expansion.
+;;; NOTINLINE  NOTINLINE declaration seen: always do full function call.
+;;;    INLINE  INLINE declaration seen: save expansion, expanding to it
+;;;             if policy favors.
+;;; MAYBE-INLINE
+;;;             Retain expansion, but only use it opportunistically.
+;;;             MAYBE-INLINE is quite different from INLINE. As explained
+;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
+;;;             instantiated once per component, INLINE - for all
+;;;             references (even under #'without FUNCALL)."
+(deftype inlinep () '(member inline maybe-inline notinline nil))
+
+
 ;;;; source-hacking defining forms
 
 ;;; Parse a DEFMACRO-style lambda-list, setting things up so that a
@@ -581,7 +599,7 @@
 ;;; this table, as 42 is EQ to 42 no matter where in the source it
 ;;; appears. GET-SOURCE-PATH and NOTE-SOURCE-PATH functions should be
 ;;; always used to access this table.
-(declaim (hash-table *source-paths*))
+(declaim (type hash-table *source-paths*))
 (defvar *source-paths*)
 
 (defmacro with-source-paths (&body forms)
@@ -621,6 +639,208 @@
                      ,@body)
            (setf (component-last-block ,component)
                  ,old-last-block))))))
+
+
+;;;; DEFPRINTER
+
+;;; These functions are called by the expansion of the DEFPRINTER
+;;; macro to do the actual printing.
+(declaim (ftype (function (symbol t stream) (values))
+                defprinter-prin1 defprinter-princ))
+(defun defprinter-prin1 (name value stream)
+  (defprinter-prinx #'prin1 name value stream))
+(defun defprinter-princ (name value stream)
+  (defprinter-prinx #'princ name value stream))
+(defun defprinter-prinx (prinx name value stream)
+  (declare (type function prinx))
+  (when *print-pretty*
+    (pprint-newline :linear stream))
+  (format stream ":~A " name)
+  (funcall prinx value stream)
+  (values))
+(defun defprinter-print-space (stream)
+  (write-char #\space stream))
+
+(defvar *print-ir-nodes-pretty* nil)
+
+;;; Define some kind of reasonable PRINT-OBJECT method for a
+;;; STRUCTURE-OBJECT class.
+;;;
+;;; NAME is the name of the structure class, and CONC-NAME is the same
+;;; as in DEFSTRUCT.
+;;;
+;;; The SLOT-DESCS describe how each slot should be printed. Each
+;;; SLOT-DESC can be a slot name, indicating that the slot should
+;;; simply be printed. A SLOT-DESC may also be a list of a slot name
+;;; and other stuff. The other stuff is composed of keywords followed
+;;; by expressions. The expressions are evaluated with the variable
+;;; which is the slot name bound to the value of the slot. These
+;;; keywords are defined:
+;;;
+;;; :PRIN1    Print the value of the expression instead of the slot value.
+;;; :PRINC    Like :PRIN1, only PRINC the value
+;;; :TEST     Only print something if the test is true.
+;;;
+;;; If no printing thing is specified then the slot value is printed
+;;; as if by PRIN1.
+;;;
+;;; The structure being printed is bound to STRUCTURE and the stream
+;;; is bound to STREAM.
+;;;
+;;; If PRETTY-IR-PRINTER is supplied, the form is invoked when
+;;; *PRINT-IR-NODES-PRETTY* is true.
+(defmacro defprinter ((name
+                       &key
+                       (conc-name (concatenate 'simple-string
+                                               (symbol-name name)
+                                               "-"))
+                       identity
+                       pretty-ir-printer)
+                      &rest slot-descs)
+  (let ((first? t)
+        maybe-print-space
+        (reversed-prints nil))
+    (flet ((sref (slot-name)
+             `(,(symbolicate conc-name slot-name) structure)))
+      (dolist (slot-desc slot-descs)
+        (if first?
+            (setf maybe-print-space nil
+                  first? nil)
+            (setf maybe-print-space `(defprinter-print-space stream)))
+        (cond ((atom slot-desc)
+               (push maybe-print-space reversed-prints)
+               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) stream)
+                     reversed-prints))
+              (t
+               (let ((sname (first slot-desc))
+                     (test t))
+                 (collect ((stuff))
+                   (do ((option (rest slot-desc) (cddr option)))
+                       ((null option)
+                        (push `(let ((,sname ,(sref sname)))
+                                 (when ,test
+                                   ,maybe-print-space
+                                   ,@(or (stuff)
+                                         `((defprinter-prin1
+                                             ',sname ,sname stream)))))
+                              reversed-prints))
+                     (case (first option)
+                       (:prin1
+                        (stuff `(defprinter-prin1
+                                  ',sname ,(second option) stream)))
+                       (:princ
+                        (stuff `(defprinter-princ
+                                  ',sname ,(second option) stream)))
+                       (:test (setq test (second option)))
+                       (t
+                        (error "bad option: ~S" (first option)))))))))))
+    (let ((normal-printer `(pprint-logical-block (stream nil)
+                             (print-unreadable-object (structure
+                                                       stream
+                                                       :type t
+                                                       :identity ,identity)
+                               ,@(nreverse reversed-prints))) ))
+      `(defmethod print-object ((structure ,name) stream)
+         ,(cond (pretty-ir-printer
+                 `(if *print-ir-nodes-pretty*
+                      ,pretty-ir-printer
+                      ,normal-printer))
+                (t
+                 normal-printer))))))
+
+
+;;;; boolean attribute utilities
+;;;;
+;;;; We need to maintain various sets of boolean attributes for known
+;;;; functions and VOPs. To save space and allow for quick set
+;;;; operations, we represent the attributes as bits in a fixnum.
+
+(deftype attributes () 'fixnum)
+
+;;; Given a list of attribute names and an alist that translates them
+;;; to masks, return the OR of the masks.
+(defun encode-attribute-mask (names universe)
+  (loop for name in names
+        for pos = (position name universe)
+        sum (if pos (ash 1 pos) (error "unknown attribute name: ~S" name))))
+
+(defun decode-attribute-mask (bits universe)
+  (loop for name across universe
+        for mask = 1 then (ash mask 1)
+        when (logtest mask bits) collect name))
+
+;;; Define a new class of boolean attributes, with the attributes
+;;; having the specified ATTRIBUTE-NAMES. NAME is the name of the
+;;; class, which is used to generate some macros to manipulate sets of
+;;; the attributes:
+;;;
+;;;    NAME-attributep attributes attribute-name*
+;;;      Return true if one of the named attributes is present, false
+;;;      otherwise. When set with SETF, updates the place Attributes
+;;;      setting or clearing the specified attributes.
+;;;
+;;;    NAME-attributes attribute-name*
+;;;      Return a set of the named attributes.
+(defmacro !def-boolean-attribute (name &body attribute-names)
+  (let ((vector (coerce attribute-names 'vector))
+        (constructor (symbolicate name "-ATTRIBUTES"))
+        (test-name (symbolicate name "-ATTRIBUTEP")))
+    `(progn
+       (defmacro ,constructor (&rest attribute-names)
+         "Automagically generated boolean attribute creation function.
+  See !DEF-BOOLEAN-ATTRIBUTE."
+         (encode-attribute-mask attribute-names ,vector))
+       (defun ,(symbolicate "DECODE-" name "-ATTRIBUTES") (attributes)
+         (decode-attribute-mask attributes ,vector))
+       (defmacro ,test-name (attributes &rest attribute-names)
+         "Automagically generated boolean attribute test function.
+  See !DEF-BOOLEAN-ATTRIBUTE."
+         `(logtest (the attributes ,attributes)
+                   (,',constructor ,@attribute-names)))
+       (define-setf-expander ,test-name (place &rest attributes
+                                               &environment env)
+         "Automagically generated boolean attribute setter. See
+ !DEF-BOOLEAN-ATTRIBUTE."
+         (multiple-value-bind (temps values stores setter getter)
+             (#+sb-xc-host cl:get-setf-expansion
+              #-sb-xc-host get-setf-expansion place env)
+           (when (cdr stores)
+             (error "multiple store variables for ~S" place))
+           (let ((newval (sb-xc:gensym))
+                 (n-place (sb-xc:gensym))
+                 (mask (encode-attribute-mask attributes ,vector)))
+             (values `(,@temps ,n-place)
+                     `(,@values ,getter)
+                     `(,newval)
+                     `(let ((,(first stores)
+                             (if ,newval
+                                 (logior ,n-place ,mask)
+                                 (logandc2 ,n-place ,mask))))
+                        ,setter
+                        ,newval)
+                     `(,',test-name ,n-place ,@attributes))))))))
+
+;;; And now for some gratuitous pseudo-abstraction...
+;;;
+;;; ATTRIBUTES-UNION
+;;;   Return the union of all the sets of boolean attributes which are its
+;;;   arguments.
+;;; ATTRIBUTES-INTERSECTION
+;;;   Return the intersection of all the sets of boolean attributes which
+;;;   are its arguments.
+;;; ATTRIBUTES=
+;;;   True if the attributes present in ATTR1 are identical to
+;;;   those in ATTR2.
+(defmacro attributes-union (&rest attributes)
+  `(the attributes
+        (logior ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
+(defmacro attributes-intersection (&rest attributes)
+  `(the attributes
+        (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
+(declaim (ftype (function (attributes attributes) boolean) attributes=))
+(declaim (inline attributes=))
+(defun attributes= (attr1 attr2)
+  (eql attr1 attr2))
 
 
 ;;;; the EVENT statistics/trace utility

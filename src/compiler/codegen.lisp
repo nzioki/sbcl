@@ -35,6 +35,9 @@
         (header-length-in-bytes *component-being-compiled*)
         (* sb-vm:n-word-bytes (align-up sb-vm:code-constants-offset 2)))))
 
+(defun component-n-jump-table-entries (&optional (component *component-being-compiled*))
+  (ir2-component-n-jump-table-entries (component-info component)))
+
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
 ;;; frames.
@@ -145,7 +148,7 @@
          (error "EMIT-INLINE-CONSTANT called with ~S" args)))
 ;;; Emit the subset of inline constants which represent jump tables
 ;;; and remove those constants so that they don't get emitted again.
-(defun emit-jump-tables ()
+(defun emit-jump-tables (ir2-component)
   ;; Other backends will probably need relative jump tables instead
   ;; of absolute tables because of the problem of needing to load
   ;; the LIP register prior to loading an arbitrary PC.
@@ -169,6 +172,7 @@
       ;; is a jump table. I don't think that's worth the trouble.
       (emit section `(.lispword ,(1+ nwords)))
       (when (plusp nwords)
+        (setf (ir2-component-n-jump-table-entries ir2-component) nwords)
         (dolist (constant (jump-tables))
           (sb-vm:emit-inline-constant section (car constant) (cdr constant)))
         (let ((nremaining (length (other))))
@@ -276,32 +280,10 @@
          ;; ones can use a NOP which helps the disassembler not lose sync.
          (filler-pattern 0)
          (asmstream (make-asmstream))
-         (coverage-map)
          (*asmstream* asmstream))
 
-    (declare (ignorable coverage-map))
     (emit (asmstream-elsewhere-section asmstream)
           (asmstream-elsewhere-label asmstream))
-
-    #-(or x86 x86-64)
-    (let ((path->index (make-hash-table :test 'equal)))
-      ;; Pre-scan for MARK-COVERED vops and collect the set of
-      ;; distinct source paths that occur. Delay adding the coverage map to
-      ;; the boxed constant vector until all vop generators have run, because
-      ;; they can use EMIT-CONSTANT to add more constants,
-      ;; while the coverage map has to be the very last entry in the vector.
-      (do-ir2-blocks (block component)
-        (do ((vop (ir2-block-start-vop block) (vop-next vop)))
-            ((null vop))
-          (when (eq (vop-name vop) 'mark-covered)
-            (setf (vop-codegen-info vop)
-                  (list (ensure-gethash (car (vop-codegen-info vop))
-                                        path->index
-                                        (hash-table-count path->index)))))))
-      (when (plusp (hash-table-count path->index))
-        (setf coverage-map (make-array (hash-table-count path->index)))
-        (maphash (lambda (path index) (setf (aref coverage-map index) path))
-                 path->index)))
 
     (do-ir2-blocks (block component)
       (let ((1block (ir2-block-block block)))
@@ -363,26 +345,23 @@
           (sb-assem::asmstream-data-origin-label asmstream))
     ;; Jump tables precede the coverage mark bytes to simplify locating
     ;; them in trans_code().
-    (emit-jump-tables)
-    ;; Todo: can we implement the flow-based aspect of coverage mark compression
-    ;; in IR2 instead of waiting until assembly generation?
-    #+(or x86 x86-64) (coverage-mark-lowering-pass component asmstream)
-    ;; The #+(or x86 x86-64) case has _already_ output the mark bytes into
-    ;; the data section in lowering pass, so we don't do that here.
-    #-(or x86 x86-64)
-    (when coverage-map
-      #+arm64
-      (vector-push-extend (make-constant (make-array (length coverage-map)
-                                                     :element-type '(unsigned-byte 8)
-                                                     :initial-element #xFF))
-                          (ir2-component-constants ir2-component))
-      (vector-push-extend (make-constant (cons 'coverage-map coverage-map))
-                          (ir2-component-constants ir2-component))
-      ;; The mark vop can store the low byte from either ZERO-TN or NULLL-TN
-      ;; to avoid loading a constant. Either one won't match #xff.
-      #-arm64
-      (emit (asmstream-data-section asmstream)
-            `(.skip ,(length coverage-map) #xff)))
+    (emit-jump-tables ir2-component)
+    (let ((coverage-map (ir2-component-coverage-map ir2-component)))
+      (unless (zerop (length coverage-map))
+        ;; Nothing depends on the length of the constant vector at this
+        ;; phase (codegen has not made use of component-header-length),
+        ;; so extending can be done with impunity.
+        #+arm64
+        (vector-push-extend (cons :coverage-marks (length coverage-map))
+                            (ir2-component-constants ir2-component))
+        (vector-push-extend
+         (make-constant (cons 'coverage-map
+                              (map-into coverage-map #'car coverage-map)))
+         (ir2-component-constants ir2-component))
+        ;; Allocate space in the data section for coverage marks.
+        #-arm64
+        (emit (asmstream-data-section asmstream)
+              `(.skip ,(length coverage-map) #-(or x86 x86-64) #xff))))
 
     (emit-inline-constants)
 
@@ -415,60 +394,3 @@
         ;; We're interested in what precedes the return, not after
         (< elsewhere label)
         (<= elsewhere label))))
-
-;;; Translate .COVERAGE-MARK pseudo-op into machine assembly language,
-;;; combining any number of consecutive operations with no intervening
-;;; control flow into a single operation.
-;;; FIXME: this pass runs even if no coverage instrumentation was generated.
-(defun coverage-mark-lowering-pass (component asmstream)
-  (declare (ignorable component asmstream))
-  #+(or x86-64 x86)
-  (let ((label (gen-label))
-        ;; vector of lists of original source paths covered
-        (src-paths (make-array 10 :fill-pointer 0))
-        (previous-mark))
-    (do ((statement (stmt-next (section-start (asmstream-code-section asmstream)))
-                    (stmt-next statement)))
-        ((null statement))
-      (dolist (item (ensure-list (stmt-labels statement)))
-        (when (label-usedp item) ; control can transfer to here
-          (setq previous-mark nil)))
-      (let ((mnemonic (stmt-mnemonic statement)))
-        (typecase mnemonic
-         (function ; this can do anything, who knows
-          (setq previous-mark nil))
-         (string) ; a comment can be ignored
-         (t
-          (cond ((branch-opcode-p mnemonic) ; control flow kills mark combining
-                 (setq previous-mark nil))
-                ((eq mnemonic '.coverage-mark)
-                 (let ((path (car (stmt-operands statement))))
-                   (cond ((not previous-mark) ; record a new path
-                          (let ((mark-index
-                                 (vector-push-extend (list path) src-paths)))
-                            ;; have the backend lower it into a real instruction
-                            (replace-coverage-instruction statement label mark-index))
-                            (setq previous-mark statement))
-                           (t ; record that the already-emitted mark pertains
-                            ;; to an additional source path
-                            (push path (elt src-paths (1- (fill-pointer src-paths))))
-                            ;; Clobber this statement. Do not try to remove it and
-                            ;; combine its labels into the previous statement.
-                            ;; Doing that could move a label into an earlier IR2 block
-                            ;; which crashes when dumping locations.
-                            (setf (stmt-mnemonic statement) nil
-                                  (stmt-operands statement) nil))))))))))
-
-    ;; Allocate space in the data section for coverage marks
-    (let ((mark-index (length src-paths)))
-      (when (plusp mark-index)
-        (setf (label-usedp label) t)
-        (let ((v (ir2-component-constants (component-info component))))
-          ;; Nothing depends on the length of the constant vector at this
-          ;; phase (codegen has not made use of component-header-length),
-          ;; so extending can be done with impunity.
-          (vector-push-extend
-           (make-constant (cons 'coverage-map
-                                (coerce src-paths 'simple-vector)))
-           v))
-        (emit (asmstream-data-section asmstream) label `(.skip ,mark-index))))))

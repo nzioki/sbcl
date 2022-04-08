@@ -376,7 +376,8 @@
   (:arg-types (:constant signed-byte))
   (:policy :fast-safe)
   (:generator 1
-    (inst mov sap (thread-slot-ea n))))
+    #-gs-seg (inst mov sap (if (= n thread-this-slot) thread-tn (thread-slot-ea n)))
+    #+gs-seg (inst mov sap (thread-slot-ea n))))
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -557,3 +558,10 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:generator 1
     ;; atomic because the immobile gen# is in the same byte
     (inst and :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f)))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 1
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))

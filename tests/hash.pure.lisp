@@ -31,6 +31,8 @@
   (assert (/= (sxhash #*1010) (sxhash #*0101))))
 
 ;;; This test supposes that no un-accounted-for consing occurs.
+;;; But now that we have to two regions for allocation, it's not necessarily
+;;; the case that any given allocation bumps the mixed-region free pointer.
 (with-test (:name :address-based-hash-counter :skipped-on :interpreter)
   ;; It doesn't particularly matter what ADDRESS-BASED-COUNTER-VAL returns,
   ;; but it's best to verify the assumption that each cons bumps the count
@@ -38,8 +40,9 @@
   ;; hashes.
   (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
-      (declare (notinline cons)) ; it's flushable, but don't flush it
-      (cons 1 2)
+      (declare (notinline cons sb-sys:int-sap)) ; it's flushable, but don't flush it
+      #+use-cons-region (sb-sys:int-sap #xf00fa) ; 2 words in mixed-region
+      #-use-cons-region (cons 1 2)
       (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
@@ -411,3 +414,56 @@
           (y (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 1.0d0))))
       (setf (gethash x table) t)
       (assert (gethash y table)))))
+
+
+#|
+;;; Our SXHASH has kinda bad behavior on 64-bit fixnums.
+;;; I wonder if we should try to hash fixnum better for users.
+;;; Example:
+* (dotimes (i 20)
+    (let ((a (+ sb-vm:dynamic-space-start (* i 32768))))
+      (format t "~4d ~x ~b~%" i a (sxhash a))))
+   0 1000000000 1000010010001101110100101010000110101100010111010111001001010
+   1 1000008000 1000010010001101110100101010000110101100000111110111001001010
+   2 1000010000 1000010010001101110100101010000110101100110110010111001001010
+   3 1000018000 1000010010001101110100101010000110101100100110110111001001010
+   4 1000020000 1000010010001101110100101010000110101101010101010111001001010
+   5 1000028000 1000010010001101110100101010000110101101000101110111001001010
+   6 1000030000 1000010010001101110100101010000110101101110100010111001001010
+   7 1000038000 1000010010001101110100101010000110101101100100110111001001010
+   8 1000040000 1000010010001101110100101010000110101110010011010111001001010
+   9 1000048000 1000010010001101110100101010000110101110000011110111001001010
+  10 1000050000 1000010010001101110100101010000110101110110010010111001001010
+  11 1000058000 1000010010001101110100101010000110101110100010110111001001010
+  12 1000060000 1000010010001101110100101010000110101111010001010111001001010
+  13 1000068000 1000010010001101110100101010000110101111000001110111001001010
+  14 1000070000 1000010010001101110100101010000110101111110000010111001001010
+  15 1000078000 1000010010001101110100101010000110101111100000110111001001010
+  16 1000080000 1000010010001101110100101010000110101000011111010111001001010
+  ...
+|#
+(with-test (:name :fixnum-hash-with-more-entropy)
+  (flet ((try (hasher)
+           (let (hashes)
+             (dotimes (i 20)
+               (let* ((a (+ #+64-bit sb-vm:dynamic-space-start
+                            #-64-bit #xD7C83000
+                            (* i 32768)))
+                      (hash (funcall hasher a)))
+                 ;; (format t "~4d ~x ~v,'0b~%" i a sb-vm:n-word-bits hash)
+                 (push hash hashes)))
+             ;; Try some 4-bit subsequences of the hashes
+             ;; as various positions and make sure that there
+             ;; are none that match for all inputs.
+             ;; For 64-bit machines, SXHASH yields complete overlap
+             ;; of all the test cases at various positions.
+             ;; 32-bit doesn't seem to suffer from this.
+             (dotimes (position (- sb-vm:n-fixnum-bits 4))
+               (let ((field
+                      (mapcar (lambda (x) (ldb (byte 4 position) x))
+                              hashes)))
+                 ;; (print `(,position , (length (delete-duplicates field))))
+                 (when #-64-bit t #+64-bit (not (eq hasher 'sxhash))
+                   (assert (>= (length (remove-duplicates field)) 8))))))))
+    (try 'sxhash)
+    (try 'sb-int:good-hash-word->fixnum)))

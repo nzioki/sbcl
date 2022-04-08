@@ -105,11 +105,11 @@
 (defvar *current-path*)
 
 (defun call-with-current-source-form (thunk &rest forms)
-  (let ((*current-path* (when (and (some #'identity forms)
-                                   (boundp '*source-paths*))
-                          (or (some #'get-source-path forms)
-                              (when (boundp '*current-path*)
-                                *current-path*)))))
+  (let ((*current-path* (or (and (some #'identity forms)
+                                 (boundp '*source-paths*)
+                                 (some #'get-source-path forms))
+                            (and (boundp '*current-path*)
+                                 *current-path*))))
     (funcall thunk)))
 
 (defvar *derive-function-types* nil
@@ -169,53 +169,6 @@
     (eq (or answer (info :function :inlinep name)) 'notinline)))
 
 
-;;;; code coverage
-
-;;; Check the policy for whether we should generate code coverage
-;;; instrumentation. If not, just return the original START
-;;; ctran. Otherwise insert code coverage instrumentation after
-;;; START, and return the new ctran.
-(defun instrument-coverage (start mode form
-                            &aux (metadata (coverage-metadata *compilation*)))
-  ;; We don't actually use FORM for anything, it's just convenient to
-  ;; have around when debugging the instrumentation.
-  (declare (ignore form))
-  (if (and metadata
-           (policy *lexenv* (> store-coverage-data 0))
-           *allow-instrumenting*)
-      (let ((path (source-path-original-source *current-path*)))
-        (when mode
-          (push mode path))
-        (if (member (ctran-block start)
-                    (gethash path (code-coverage-blocks metadata)))
-            ;; If this source path has already been instrumented in
-            ;; this block, don't instrument it again.
-            start
-            (let ((next (make-ctran))
-                  (*allow-instrumenting* nil))
-              (ensure-gethash path (code-coverage-records metadata)
-                              (cons path +code-coverage-unmarked+))
-              (push (ctran-block start)
-                    (gethash path (code-coverage-blocks metadata)))
-              (ir1-convert start next nil `(%primitive mark-covered ',path))
-              next)))
-      start))
-
-;;; In contexts where we don't have a source location for FORM
-;;; e.g. due to it not being a cons, but where we have a source
-;;; location for the enclosing cons, use the latter source location if
-;;; available. This works pretty well in practice, since many PROGNish
-;;; macroexpansions will just directly splice a block of forms into
-;;; some enclosing form with `(progn ,@body), thus retaining the
-;;; EQness of the conses.
-(defun maybe-instrument-progn-like (start forms form)
-  (or (when (and *allow-instrumenting*
-                 (not (get-source-path form)))
-        (let ((*current-path* (get-source-path forms)))
-          (when *current-path*
-            (instrument-coverage start nil form))))
-      start))
-
 (declaim (start-block find-free-fun find-lexically-apparent-fun
                       ;; needed by ir1-translators
                       find-global-fun))
@@ -400,8 +353,6 @@
             (type (info :variable :type name))
             (where-from (info :variable :where-from name))
             (deprecation-state (deprecated-thing-p 'variable name)))
-        (when (and (eq kind :unknown) (not deprecation-state))
-          (note-undefined-reference name :variable))
         ;; For deprecated vars, warn about LET and LAMBDA bindings, SETQ, and ref.
         ;; Don't warn again if the name was already seen by the transform
         ;; of SYMBOL[-GLOBAL]-VALUE.
@@ -430,20 +381,39 @@
                                   :type type
                                   :where-from where-from)))))))
 
+;;; Return T if and only if OBJ's nature as an externalizable thing renders
+;;; it a leaf for dumping purposes. Symbols are leaflike despite havings slots
+;;; containing pointers; similarly (COMPLEX RATIONAL) and RATIO.
+(defun dumpable-leaflike-p (obj)
+  (or (sb-xc:typep obj '(or symbol number character
+                            ;; (ARRAY NIL) is not included in UNBOXED-ARRAY
+                            (or unboxed-array (array nil))
+                            system-area-pointer
+                            #+sb-simd-pack simd-pack
+                            #+sb-simd-pack-256 simd-pack-256))
+      (cl:typep obj 'debug-name-marker)
+      ;; STANDARD-OBJECT layouts use MAKE-LOAD-FORM, but all other layouts
+      ;; have the same status as symbols - composite objects but leaflike.
+      (and (typep obj 'wrapper) (not (layout-for-pcl-obj-p obj)))
+      ;; PACKAGEs are also leaflike.
+      (cl:typep obj 'package)
+      ;; The cross-compiler wants to dump CTYPE instances as leaves,
+      ;; but CLASSOIDs are excluded since they have a MAKE-LOAD-FORM method.
+      #+sb-xc-host (cl:typep obj '(and ctype (not classoid)))))
+
 ;;; Grovel over CONSTANT checking for any sub-parts that need to be
 ;;; processed with MAKE-LOAD-FORM. We have to be careful, because
 ;;; CONSTANT might be circular. We also check that the constant (and
 ;;; any subparts) are dumpable at all.
 (defun maybe-emit-make-load-forms (constant)
   (declare #-sb-xc-host (inline alloc-xset))
-  (dx-let ((xset (alloc-xset)))
+  (dx-let ((things-processed (alloc-xset)))
     (named-let grovel ((value constant))
-      ;; Unless VALUE is an object which which can't contain other objects,
-      ;; or was visited, or is acccessible in a named constant ...
       (unless (or (dumpable-leaflike-p value)
-                  (xset-member-p value xset)
-                  (gethash value (eql-constants *ir1-namespace*)))
-        (add-to-xset value xset)
+                  (xset-member-p value things-processed)
+                  #-sb-xc-host
+                  (unbound-marker-p value))
+        (add-to-xset value things-processed)
         ;; FIXME: shouldn't this be something like SB-XC:TYPECASE ?
         (typecase value
           (cons
@@ -466,11 +436,6 @@
            (dotimes (i (array-total-size value))
              (grovel (row-major-aref value i))))
           (instance
-           ;; In the target SBCL, we can dump any instance, but
-           ;; in the cross-compilation host, %INSTANCE-FOO
-           ;; functions don't work on general instances, only on
-           ;; STRUCTURE!OBJECTs.
-           ;;
            ;; Behold the wonderfully clear sense of this-
            ;;  WHEN (EMIT-MAKE-LOAD-FORM VALUE)
            ;; meaning "when you're _NOT_ using a custom load-form"
@@ -488,25 +453,6 @@
             "Objects of type ~/sb-impl:print-type-specifier/ can't be dumped into fasl files."
             (type-of value)))))))
   (values))
-
-;;; A constant is trivially externalizable if it involves no INSTANCE types
-;;; or any un-dumpable object.
-(defun trivially-externalizable-p (constant)
-  (declare #-sb-xc-host (inline alloc-xset))
-  (dx-let ((xset (alloc-xset)))
-    (named-let ok ((value constant))
-      (if (or (dumpable-leaflike-p value) (xset-member-p value xset))
-          t
-          (progn
-            (add-to-xset value xset)
-            (typecase value
-             (cons (and (ok (car value)) (ok (cdr value))))
-             (vector
-              (dotimes (i (length value) t)
-                (unless (ok (aref value i)) (return nil))))
-             (array
-              (dotimes (i (array-total-size value) t)
-                (unless (ok (row-major-aref value i)) (return nil))))))))))
 
 ;;;; some flow-graph hacking utilities
 
@@ -724,16 +670,20 @@
   (values))
 
 ;;; Generate a reference to a manifest constant, creating a new leaf
-;;; if necessary.
+;;; if necessary. If we are producing a fasl file, make sure that
+;;; MAKE-LOAD-FORM gets used on any parts of the constant that it
+;;; needs to be.
 (defun reference-constant (start next result value)
   (declare (type ctran start next)
            (type (or lvar null) result))
   (ir1-error-bailout (start next result value)
-                     (let* ((leaf (find-constant value))
-                            (res (make-ref leaf)))
-                       (push res (leaf-refs leaf))
-                       (link-node-to-previous-ctran res start)
-                       (use-continuation res next result)))
+    (when (producing-fasl-file)
+      (maybe-emit-make-load-forms value))
+    (let* ((leaf (find-constant value))
+           (res (make-ref leaf)))
+      (push res (leaf-refs leaf))
+      (link-node-to-previous-ctran res start)
+      (use-continuation res next result)))
   (values))
 
 ;;; Add FUNCTIONAL to the COMPONENT-REANALYZE-FUNCTIONALS, unless it's
@@ -810,9 +760,14 @@
         ;; error (bug 412, lp#722734): checking for null RESULT is not enough,
         ;; since variables can become dead due to later optimizations.
         (ir1-convert start next result
-                     (if (eq (global-var-kind var) :global)
-                         `(sym-global-val ',name)
-                         `(symeval ',name)))
+                     (case (global-var-kind var)
+                       (:global `(sym-global-val ',name))
+                       (:unknown
+                        (when (not (deprecated-thing-p 'variable name))
+                          (note-undefined-reference name :variable))
+                        `(symeval ',name))
+                       (t
+                        `(symeval ',name))))
         (etypecase var
           (leaf
            (cond
@@ -1182,13 +1137,15 @@
            (type (or lvar null) result)
            (list form)
            (type global-var var))
-  (let ((info (info :function :info (leaf-source-name var))))
-    (if (and info
-             (ir1-attributep (fun-info-attributes info) predicate)
-             (not (if-p (and result (lvar-dest result)))))
-        (let ((*instrument-if-for-code-coverage* nil))
-          (ir1-convert start next result `(if ,form t nil)))
-        (ir1-convert-combination-checking-type start next result form var))))
+  (if (vop-existsp :named sb-vm::move-conditional-result)
+      (ir1-convert-combination-checking-type start next result form var)
+      (let ((info (info :function :info (leaf-source-name var))))
+        (if (and info
+                 (ir1-attributep (fun-info-attributes info) predicate)
+                 (not (if-p (and result (lvar-dest result)))))
+            (let ((*instrument-if-for-code-coverage* nil))
+              (ir1-convert start next result `(if ,form t nil)))
+            (ir1-convert-combination-checking-type start next result form var)))))
 
 ;;; Actually really convert a global function call that we are allowed
 ;;; to early-bind.

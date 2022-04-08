@@ -75,24 +75,6 @@ char *sbcl_runtime;
  * helper functions for dealing with command line args
  */
 
-void *
-successful_malloc(size_t size)
-{
-    void* result = malloc(size);
-    if (0 == result) {
-        lose("malloc failure");
-    } else {
-        return result;
-    }
-    return (void *) NULL; /* dummy value: return something ... */
-}
-
-char *
-copied_string(char *string)
-{
-    return strcpy(successful_malloc(1+strlen(string)), string);
-}
-
 static char *
 copied_existing_filename_or_null(char *filename)
 {
@@ -541,7 +523,7 @@ parse_argv(struct memsize_options memsize_options,
                 print_version();
                 exit(0);
             } else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages))) {
-                argi += 2;
+                argi += n_consumed;
             } else if (0 == strcmp(arg, "--debug-environment")) {
                 debug_environment_p = 1;
                 ++argi;
@@ -594,7 +576,8 @@ parse_argv(struct memsize_options memsize_options,
             int wargc;
             wchar_t** wargv;
             wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-            sbcl_argv = successful_malloc((2 + wargc - argi) * sizeof(wchar_t *));
+            sbcl_argv = successful_malloc((((argi < wargc) ? (wargc - argi) : 0) + 2)
+                                          * sizeof(wchar_t *));
             sbcl_argv[0] = wargv[0];
             while (argi < wargc) {
                 wchar_t *warg = wargv[argi++];
@@ -681,7 +664,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
      * stack alignment. */
     dynamic_space_size &= ~(sword_t)(BACKEND_PAGE_BYTES-1);
 #ifdef LISP_FEATURE_GENCGC
-    dynamic_space_size &= ~(sword_t)(GENCGC_CARD_BYTES-1);
+    dynamic_space_size &= ~(sword_t)(GENCGC_PAGE_BYTES-1);
 #endif
     thread_control_stack_size &= ~(sword_t)(CONTROL_STACK_ALIGNMENT_BYTES-1);
 

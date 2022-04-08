@@ -51,9 +51,9 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 #define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, insts) - FUN_POINTER_LOWTAG)
 #endif
 
-// For x86[-64], a simple-fun or closure's "self" slot is a fixum
+// For x86[-64], arm64, a simple-fun or closure's "self" slot is a fixum
 // On other backends, it is a lisp ointer.
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
 #define FUN_SELF_FIXNUM_TAGGED 1
 #else
 #define FUN_SELF_FIXNUM_TAGGED 0
@@ -86,12 +86,6 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
  */
 #define vector_flagp(header, val) ((int)header & (flag_##val << ARRAY_FLAGS_POSITION))
 #define vector_flags_zerop(header) ((int)(header) & 0x07 << ARRAY_FLAGS_POSITION) == 0
-// True if flags are zero, also testing the widetag at the same time.
-// Refer to early-objdef for the arrangement of vector header bits.
-static inline int ordinary_simple_vector_p(unsigned int header) {
-    // (flags | encoded rank [8 bits] | widetag [8 bits]) must match
-    return (header & 0x07FFFF) == SIMPLE_VECTOR_WIDETAG;
-}
 // Return true if vector is a weak vector that is not a hash-table <k,v> vector.
 static inline int vector_is_weak_not_hashing_p(unsigned int header) {
     return (header & ((flag_VectorWeak|flag_VectorHashing) << ARRAY_FLAGS_POSITION)) ==
@@ -109,43 +103,6 @@ static inline int vector_is_weak_not_hashing_p(unsigned int header) {
   gc_assert((v->header & (WEAK_VECTOR_VISITED_BIT | 0xff << ARRAY_FLAGS_POSITION | 0xff)) == \
     (WEAK_VECTOR_VISITED_BIT | flag_VectorWeak << ARRAY_FLAGS_POSITION | SIMPLE_VECTOR_WIDETAG)); \
   v->header ^= WEAK_VECTOR_VISITED_BIT
-
-/* values for the *_alloc_* parameters, also see the commentary for
- * struct page in gencgc-internal.h. These constants are used in gc-common,
- * so they can't easily be made gencgc-only */
-#define FREE_PAGE_FLAG        0
-#define PAGE_TYPE_MASK        7 // mask out the 'single-object flag'
-#define BOXED_PAGE_FLAG       1
-/* New objects are allocated to PAGE_TYPE_MIXED.
- * PAGE_TYPE_CONS doesn't get stored in the page table, though I am considering
- * doing that. If conses went on segregated pages, then testing for a valid
- * conservative root on a cons page is as simple as seeing whether the address
- * is correctly aligned and lowtagged.
- * Also, we could reserve bytes at the end of each page to act as a mark bitmap
- * which is useful since conses are headerless objects, and one GC strategy
- * demands mark bitmaps which are currently placed in a side table.
- * That would unfortunately complicate the task of allocating a huge list,
- * because hitting the line of demarcation between conses and the mark bits would
- * require chaining the final cons to another page of conses and so on. */
-
-/* If you change these constants, then possibly also change the following
- * functions in 'room.lisp':
- *  MAP-CODE-OBJECTS
- *  PRINT-ALL-CODE
- *  PRINT-LARGE-CODE
- *  PRINT-LARGE-UNBOXED
- */
-
-//#define PAGE_TYPE_BOXED        1 // #b001
-#define PAGE_TYPE_UNBOXED      2 // #b010
-#define PAGE_TYPE_MIXED        3 // #b011
-#define PAGE_TYPE_CONS         5 // #b101
-#define PAGE_TYPE_CODE         7 // #b111
-#define OPEN_REGION_PAGE_FLAG  8
-
-// Temporarily make cons exactly the same as MIXED
-#undef PAGE_TYPE_CONS
-#define PAGE_TYPE_CONS PAGE_TYPE_MIXED
 
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \
@@ -183,5 +140,6 @@ instance_scan(void (*proc)(lispobj*, sword_t, uword_t),
 extern int simple_fun_index(struct code*, struct simple_fun*);
 
 extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
-
+extern void gc_close_thread_regions(struct thread*);
+extern void gc_close_collector_regions();
 #endif /* _GC_INTERNAL_H_ */

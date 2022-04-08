@@ -45,7 +45,7 @@ include genesis/Makefile.features
 # Config-foo file for setup foo, then arrange for Config to be a
 # symlink to Config-foo.
 # Commonly used variables in Config are: ARCH_SRC, ASSEM_SRC, GC_SRC,
-# OS_SRC, OS_LIBS, OS_CLEAN_FILES
+# OS_SRC, OS_LIBS
 DISABLE_PIE=yes
 include Config
 
@@ -91,6 +91,10 @@ OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o)
 LIBS = ${OS_LIBS} $(LDLIBS) -lm
 
 targets: $(TARGET) $(OBJTARGET) sbcl.mk
+
+LDB_OBJS = $(filter-out main.o runtime.o monitor.o save.o thread.o,$(OBJS))
+ldb: $(LIBSBCL)
+	$(CC) -DSTANDALONE_LDB -I. -o ldb monitor.c thread.c $(LDB_OBJS) $(LIBS)
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
@@ -164,11 +168,12 @@ sbcl.h: $(wildcard genesis/*.h)
 # || true because we don't want the build to break if etags isn't there.
 # ...but it's still nice to have it done by default.
 HEADERS=$(wildcard *.h genesis/*.h)
-TAGS tags: $(SRCS) $(HEADERS)
-	@etags $(SRCS) $(HEADERS) || true
+INC=$(wildcard *.inc)
+TAGS tags: $(SRCS) $(HEADERS) $(INC)
+	@etags --language=c $(SRCS) $(HEADERS) $(INC) || true
 
 clean:
-	-rm -f *.[do] $(TARGET) sbcl.h core *.tmp $(OS_CLEAN_FILES) libsbcl.a shrinkwrap-sbcl* sbcl.mk
+	-rm -f *.[do] $(TARGET) ldb unit-tests sbcl.h core *.tmp libsbcl.a shrinkwrap-sbcl* sbcl.mk
 
 %.d: %.c sbcl.h
 	@$(CC) $(DEPEND_FLAGS) $(CPPFLAGS) $< > $@.tmp; \

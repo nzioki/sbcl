@@ -24,7 +24,6 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
   --noinform --core ../output/sbcl.core \
   --no-userinit --no-sysinit --noprint --disable-debugger $* << EOF
 (pop *posix-argv*)
-(setf (extern-alien "gc_allocate_dirty" char) 1)
 (require :sb-posix)
 (require :sb-sprof)
 (let ((*evaluator-mode* :compile))
@@ -44,8 +43,16 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
                        "timer.impure"
                        "bug-1180102.impure"
                        "gethash-concurrency.impure"
-                       "arith.pure"))
+                       "arith-slow.pure"))
+(defvar *filter* nil)
 (defun choose-order (tests)
+  (when *filter*
+    (let (strings)
+       (with-open-file (file *filter*)
+         (loop (let ((line (read-line file nil)))
+                 (if line (push line strings) (return)))))
+       (setq tests (remove-if (lambda (x) (not (find x strings :test #'string=)))
+                              tests))))
   (sort tests
         (lambda (a b)
           (let ((posn-a (or (position a *slow-tests* :test #'string=)
@@ -67,7 +74,7 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
                (list int1 int2 int3))))
       (dolist (pn (directory "$logdir/*.*"))
         (with-open-file (f pn)
-          (let ((legend "GC: time-to-stw"))
+          (let ((legend "GC: stw_delay"))
             (loop
              (let ((line (read-line f nil)))
                (unless line (return))
@@ -98,7 +105,7 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
   ;; starting them in the batches that filtering places them in.
   (let ((subprocess-count 0)
         (subprocess-list nil)
-        (aggregate-vop-usage (make-hash-table))
+        (aggregate-vop-usage (make-hash-table :test #'equal))
         ;; Start timing only after all the DIRECTORY calls are done (above)
         (start-time (get-internal-real-time))
         (missing-usage)
@@ -187,7 +194,7 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
                        ;; table such that integers don't print normally (and can't be parsed).
                        (let ((*print-pretty* nil))
                          (sb-int:dohash ((name count) sb-c::*static-vop-usage-counts*)
-                           (format output "~7d ~s~%" count name)))))
+                           (format output "~7d \"~s\"~%" count name)))))
                    (sb-sprof:stop-profiling)
                    #+test-aprof (progn (sb-aprof::aprof-stop) (sb-aprof:aprof-show))
                    (when (member :allocator-metrics sb-impl:+internal-features+)
@@ -205,7 +212,7 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
           (let (list)
             (sb-int:dohash ((name vop) sb-c::*backend-template-names*)
               (declare (ignore vop))
-              (push (cons (gethash name aggregate-vop-usage 0) name) list))
+              (push (cons (gethash (prin1-to-string name) aggregate-vop-usage 0) name) list))
             (with-open-file (output (format nil "$logdir/~a" result)
                                             :direction :output
                                             :if-exists :supersede)
@@ -223,6 +230,9 @@ TEST_DIRECTORY=$junkdir SBCL_HOME=../obj/sbcl-home exec ../src/runtime/sbcl \
           (format t "~A~%" filename))
         (format t "==== Logs are in $logdir ====~%")
         (exit :code 1)))))
+(when (string= (car *posix-argv*) "--filter")
+  (setq *filter* (cadr *posix-argv*))
+  (setq *posix-argv* (cddr *posix-argv*)))
 (if (= (length *posix-argv*) 1)
     ;; short form - all files, argument N is the number of parallel tasks
     (let ((jobs (parse-integer (car *posix-argv*))))

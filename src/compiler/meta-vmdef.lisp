@@ -787,6 +787,48 @@
              (assemble ()
                ,@(vop-parse-body parse)))
            ,@(saves))))))
+
+(defun make-after-sc-function (parse)
+  (when (typep (vop-parse-conditional-p parse) '(cons (eql :after-sc-selection)))
+    (let* ((n-vop (vop-parse-vop-var parse))
+           (n-args (vop-parse-args-var parse))
+           (n-results (vop-parse-results-var parse))
+           (n-info (gensym))
+           (n-variant (gensym))
+           (bindings
+             `((,n-args (vop-args ,n-vop))
+               (,n-results (vop-results ,n-vop))
+               ,@(access-operands (vop-parse-args parse)
+                                  (vop-parse-more-args parse)
+                                  n-args)
+               ,@(access-operands (vop-parse-results parse)
+                                  (vop-parse-more-results parse)
+                                  n-results)
+               ,@(when (vop-parse-info-args parse)
+                   `((,n-info (vop-codegen-info ,n-vop))
+                     ,@(mapcar (lambda (x) `(,x (pop ,n-info)))
+                               (vop-parse-info-args parse))))
+               ,@(when (vop-parse-variant-vars parse)
+                   `((,n-variant (vop-info-variant (vop-info ,n-vop)))
+                     ,@(mapcar (lambda (x) `(,x (pop ,n-variant)))
+                               (vop-parse-variant-vars parse))))
+               ,@(loop for op in (vop-parse-operands parse)
+                       when
+                       (ecase (operand-parse-kind op)
+                         ((:argument :result)
+                          `(,(operand-parse-name op)
+                            (tn-ref-tn ,(operand-parse-temp op))))
+                         (:temporary)
+                         ((:more-argument :more-result)))
+                       collect it)))
+           (body (cdr (vop-parse-conditional-p parse))))
+      `(lambda (,n-vop)
+         (let* ,bindings
+           (declare (ignorable ,@(mapcar #'car bindings)))
+           (setf (car (last (vop-codegen-info ,n-vop)))
+                 (progn ,@body))
+           (setf (vop-codegen-info ,n-vop)
+                 (butlast (vop-codegen-info ,n-vop))))))))
 
 (defvar *parse-vop-operand-count*)
 (defun make-operand-parse-temp ()
@@ -1111,11 +1153,11 @@
     (values costs load-scs)))
 
 (defconstant-eqx +no-costs+
-    #.(make-array sb-vm:sc-number-limit :initial-element 0)
+  (make-array sb-vm:sc-number-limit :initial-element 0)
   #'equalp)
 
 (defconstant-eqx +no-loads+
-    #.(make-array sb-vm:sc-number-limit :initial-element t)
+  (make-array sb-vm:sc-number-limit :initial-element t)
   #'equalp)
 
 ;;; Pick off the case of operands with no restrictions.
@@ -1140,25 +1182,26 @@
       (compute-costs-and-restrictions-list (vop-parse-args parse) t)
     (multiple-value-bind (result-costs result-scs)
         (compute-costs-and-restrictions-list (vop-parse-results parse) nil)
-      `(
-        :cost ,(vop-parse-cost parse)
+      (multiple-value-bind (more-arg-costs more-arg-scs)
+          (and (vop-parse-more-args parse)
+               (compute-loading-costs-if-any (vop-parse-more-args parse) t))
+          `(:cost ,(vop-parse-cost parse)
 
-        :arg-costs ',arg-costs
-        :arg-load-scs ',arg-scs
-        :result-costs ',result-costs
-        :result-load-scs ',result-scs
+            :arg-costs ',arg-costs
+            :arg-load-scs ',arg-scs
+            :result-costs ',result-costs
+            :result-load-scs ',result-scs
 
-        :more-arg-costs
-        ',(if (vop-parse-more-args parse)
-              (compute-loading-costs-if-any (vop-parse-more-args parse) t)
-              nil)
+            :more-arg-costs ',more-arg-costs
+            :more-arg-load-scs ',(unless (eq more-arg-costs +no-loads+)
+                                   (substitute-if nil #'listp more-arg-scs))
 
-        :more-result-costs
-        ',(if (vop-parse-more-results parse)
-              (compute-loading-costs-if-any (vop-parse-more-results parse) nil)
-              nil)
-        :optional-results ',(loop for name in (vop-parse-optional-results parse)
-                                collect (position name (vop-parse-results parse) :key #'operand-parse-name))))))
+            :more-result-costs
+            ',(if (vop-parse-more-results parse)
+                  (compute-loading-costs-if-any (vop-parse-more-results parse) nil)
+                  nil)
+            :optional-results ',(loop for name in (vop-parse-optional-results parse)
+                                      collect (position name (vop-parse-results parse) :key #'operand-parse-name)))))))
 
 ;;;; operand checking and stuff
 
@@ -1360,6 +1403,8 @@
       :more-args-type ,(when more-args (make-operand-type more-arg))
       :result-types ,(cond ((eq conditional t)
                             :conditional)
+                           ((eql (car conditional) :after-sc-selection)
+                            ''(:conditional :after-sc-selection))
                            (conditional
                             `'(:conditional . ,conditional))
                            (t
@@ -1422,7 +1467,10 @@
                (equal (vop-parse-body parse) (vop-parse-body iparse)))
           (unless (eq (vop-parse-body parse) :unspecified)
             (make-generator-function parse)))
-      :variant (list ,@variant))))
+      :variant (list ,@variant)
+      :after-sc-selection
+      ;; TODO: inherit it?
+      ,(make-after-sc-function parse))))
 
 ;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
 ;;; If specified, INHERITS is the name of a VOP that we default

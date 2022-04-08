@@ -2612,7 +2612,8 @@
   (let ((c (sb-kernel:fun-code-header #'sb-debug::parse-trace-options)))
     (assert (>= (sb-kernel:code-jump-table-words c) 17))))
 
-(with-test (:name :modular-arith-type-derivers)
+(with-test (:name :modular-arith-type-derivers
+                  :fails-on :ppc64)
   (let ((f (checked-compile
             `(lambda (x)
                (declare ((and fixnum
@@ -3049,23 +3050,6 @@
                  :allow-failure t))))
 
 
-(declaim (maybe-inline inline-recursive))
-(defun inline-recursive (x)
-  (declare (muffle-conditions compiler-note
-                              style-warning))
-  (if (zerop x)
-      x
-      (inline-recursive (1- x))))
-(declaim (inline inline-recursive))
-
-(with-test (:name :reanalyze-functionals-when-inlining)
-  (checked-compile-and-assert
-   ()
-   `(lambda (x)
-      (inline-recursive x)
-      (inline-recursive x))
-    ((5) 0)))
-
 (with-test (:name :split-let-unused-vars)
   (checked-compile-and-assert
       ()
@@ -3348,6 +3332,13 @@
          (1+ (position x (the list y))))
     ((1 '(1)) 1)))
 
+(with-test (:name :lvar-annotation-inline-type-mismatch)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x y)
+         (sb-kernel:the* (float :use-annotations t) (inline-deletion-note x y)))
+    ((1.0 nil) 1.0)))
+
 (with-test (:name :cast-type-preservation)
   (assert
    (equal (caddr
@@ -3562,3 +3553,91 @@
               (apply x 1 2 y)))))
     (assert (equal (funcall f #'list '(3)) '(1 2 3)))
     (assert (not (ctu:find-named-callees f)))))
+
+(with-test (:name :local-fun-type-check-eliminatetion)
+  (let ((fun (checked-compile '(lambda ()
+                                (flet ((f (x)
+                                         (declare (fixnum x))
+                                         (1+ x)))
+                                  (declare (inline f))
+                                  (funcall
+                                   (the (function (&optional fixnum)) #'f)
+                                   10))))))
+    (assert (= (sb-kernel:code-n-entries (sb-kernel:fun-code-header fun))
+               1))))
+
+(with-test (:name :%cleanup-point-transform)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b c)
+      (declare ((integer -14 49702337) a)
+               ((integer -5376440588342 5921272101558) b)
+               ((integer 3395101368955 8345185767296289) c))
+      (if (and (< c b) (> a b))
+          (progv nil
+              (list 288230376151711735 c)
+            (restart-bind nil a))
+          c))
+   ((49702337 5921272101558 8345185767296289) 8345185767296289)))
+
+;;; Test from git rev e47ffa8855d4139f88f5982fe4b82a05c3498ed3.
+;;; I have absolutely zero understanding of what this was doing,
+;;; but the are bunch of "undefined variable" warnings, so it can't
+;;; go at toplevel in a .cload test.
+(with-test (:name :bug-226)
+  (with-scratch-file (lisp "lisp")
+    (with-open-file (f lisp :direction :output)
+      (write '(defun bug226 ()
+  (declare (optimize (speed 0) (safety 3) (debug 3)))
+  (flet ((safe-format (stream string &rest r)
+           (unless (ignore-errors (progn
+                                    (apply #'format stream string r)
+                                    t))
+             (format stream "~&foo ~S" string))))
+    (cond
+      ((eq my-result :ERROR)
+       (cond
+         ((ignore-errors (typep condition result))
+          (safe-format t "~&bar ~S" result))
+         (t
+          (safe-format t "~&baz ~S (~A) ~S" condition condition result)))))))
+             :stream f :readably t))
+    (with-scratch-file (fasl "fasl")
+      (compile-file lisp :output-file fasl))))
+
+;;; I think these tests had to be present in a COMPILE-FILE (as opposed to COMPILE)
+;;; to prove that the bug was fixed.
+;;; Anway it's no longer going to be allowed to have deliberately bad code in '.cload'
+;;; files, because any condition of type warnings or error is considered failure
+;;; of the compile step.
+(with-test (:name :lp-1276282)
+  (with-scratch-file (lisp "lisp")
+    (with-open-file (f lisp :direction :output)
+      ;; from git rev feb31fb6cfc8f89e2d75b5f2cc2ee569ac975033
+      (format f "(lambda () (the string (+ 1 x)))~%")
+      ;; from git rev fbea35e879891723259dfa55589b498228390bb9
+      (format f
+"(lambda ()
+  (macrolet ((x (&rest args)
+               (declare (ignore args))
+               'a))
+    (let (a)
+      (declare (type vector a))
+      (x #.#'list))))~%"))
+    (with-scratch-file (fasl "fasl")
+      (compile-file lisp :output-file fasl))))
+
+(with-test (:name :substitute-single-use-lvar-mv-cast)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((r (random 10))
+               (x (list 1)))
+           (declare (special x)
+                    (dynamic-extent x))
+           (throw 'c (the (integer 0 10) r))))))
+
+(with-test (:name :list-ir2-convert)
+  (checked-compile '(lambda ()
+                     (declare (notinline list +))
+                     (list (loop for i below 2 count t)))))

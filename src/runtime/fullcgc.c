@@ -52,6 +52,15 @@
 #define BIGNUM_MARK_BIT MARK_BIT
 #endif
 
+static inline uword_t boxedobj_widetag_to_markbit(int widetag) {
+    return (widetag == FDEFN_WIDETAG || widetag == WEAK_POINTER_WIDETAG)
+         ? FDEFN_MARK_BIT : MARK_BIT;
+}
+static inline uword_t general_widetag_to_markbit(int widetag) {
+    return (widetag == FDEFN_WIDETAG || widetag == WEAK_POINTER_WIDETAG)
+        ? FDEFN_MARK_BIT : ((widetag == BIGNUM_WIDETAG) ? BIGNUM_MARK_BIT : MARK_BIT);
+}
+
 #define interesting_pointer_p(x) \
   (find_page_index((void*)x) >= 0 || immobile_space_p(x))
 
@@ -92,18 +101,23 @@ static void* get_free_page() {
  * then one GC page can hold 2K cons cells.
  * One byte marks 8 conses (1 bit per cons), 256 bytes mark 2048 conses.
  * 128 blocks of 256 bytes fit on a 32K GC page. */
-char *suballocator_free_ptr, *suballocator_end_ptr;
+static char *suballocator_free_ptr, *suballocator_end_ptr;
 
+#ifndef LISP_FEATURE_USE_CONS_REGION
+static inline uword_t compute_page_key(lispobj cons) {
+    return ALIGN_DOWN(cons, GENCGC_PAGE_BYTES);
+}
 static void* allocate_cons_mark_bits() {
-    int nbytes = GENCGC_CARD_BYTES / (2 * N_WORD_BYTES) / 8;
+    int nbytes = GENCGC_PAGE_BYTES / (2 * N_WORD_BYTES) / 8;
     if (suballocator_free_ptr + nbytes > suballocator_end_ptr) {
         suballocator_free_ptr = get_free_page();
-        suballocator_end_ptr = suballocator_free_ptr + GENCGC_CARD_BYTES;
+        suballocator_end_ptr = suballocator_free_ptr + GENCGC_PAGE_BYTES;
     }
     void* mem = suballocator_free_ptr;
     suballocator_free_ptr += nbytes;
     return mem;
 }
+#endif
 
 static void gc_enqueue(lispobj object)
 {
@@ -152,18 +166,20 @@ static lispobj gc_dequeue()
  * for headerless objects (conses) */
 struct hopscotch_table mark_bits;
 
-static inline uword_t compute_page_key(lispobj cons) {
-    return ALIGN_DOWN(cons, GENCGC_CARD_BYTES);
-}
 static inline int compute_dword_number(lispobj cons) {
-    return (cons & (GENCGC_CARD_BYTES - 1)) >> (1+WORD_SHIFT);
+    return (cons & (GENCGC_PAGE_BYTES - 1)) >> (1+WORD_SHIFT);
 }
 
 static inline int cons_markedp(lispobj pointer) {
+    unsigned int index = compute_dword_number(pointer);
+#ifdef LISP_FEATURE_USE_CONS_REGION /* all conses must be on cons pages */
+    unsigned char* bits = (unsigned char*)ALIGN_DOWN(pointer, GENCGC_PAGE_BYTES)
+                          + CONS_PAGE_USABLE_BYTES;
+#else
     unsigned char* bits = (unsigned char*)
         hopscotch_get(&mark_bits, compute_page_key(pointer), 0);
     if (!bits) return 0;
-    int index = compute_dword_number(pointer);
+#endif
     return (bits[index / 8] >> (index % 8)) & 1;
 }
 
@@ -178,7 +194,8 @@ static inline int pointer_survived_gc_yet(lispobj pointer)
     int widetag = header_widetag(header);
     switch (widetag) {
     case BIGNUM_WIDETAG: return (header & BIGNUM_MARK_BIT) != 0;
-    case FDEFN_WIDETAG : return (header & FDEFN_MARK_BIT) != 0;
+    case WEAK_POINTER_WIDETAG:
+    case FDEFN_WIDETAG: return (header & FDEFN_MARK_BIT) != 0;
     }
     if (embedded_obj_p(widetag))
         header = *fun_code_header(native_pointer(pointer));
@@ -203,7 +220,7 @@ void __mark_obj(lispobj pointer)
                 pointer = make_lispobj(base, OTHER_POINTER_LOWTAG);
                 header = *base;
             }
-            uword_t markbit = (widetag == FDEFN_WIDETAG) ? FDEFN_MARK_BIT : MARK_BIT;
+            uword_t markbit = boxedobj_widetag_to_markbit(widetag);
             if (header & markbit) return; // already marked
             *base |= markbit;
         }
@@ -219,15 +236,23 @@ void __mark_obj(lispobj pointer)
 #endif
         if (leaf_obj_widetag_p(widetag)) return;
     } else {
+        unsigned int index = compute_dword_number(pointer);
+#ifdef LISP_FEATURE_USE_CONS_REGION /* all conses must be on cons pages */
+        unsigned char* bits = (unsigned char*)ALIGN_DOWN(pointer, GENCGC_PAGE_BYTES)
+                              + CONS_PAGE_USABLE_BYTES;
+#else
+        /* Only _some_ conses are on cons pages depending if they got moved there.
+         * We could use a hybrid of storing mark bits on the page if possible,
+         * or the hash-table if not. However, I'd rather not complicate things.
+         * All architectures should be made to allocate directly on cons pages! */
         uword_t key = compute_page_key(pointer);
-        int index = compute_dword_number(pointer);
         unsigned char* bits = (unsigned char*)hopscotch_get(&mark_bits, key, 0);
         if (!bits) {
             bits = allocate_cons_mark_bits();
             hopscotch_insert(&mark_bits, key, (sword_t)bits);
-        } else if (bits[index / 8] & (1 << (index % 8))) {
-            return;
         }
+#endif
+        if (bits[index / 8] & (1 << (index % 8))) return;
         // Mark the cons
         bits[index / 8] |= 1 << (index % 8);
     }
@@ -283,14 +308,9 @@ static void trace_object(lispobj* where)
     lispobj header = *where;
     int widetag = header_widetag(header);
 
-    switch (widetag) {
-    case INSTANCE_WIDETAG:
-        return trace_using_layout(instance_layout(where),
-                                  where, instance_length(header));
-    case FUNCALLABLE_INSTANCE_WIDETAG:
-        return trace_using_layout(funinstance_layout(where),
-                                  where, HeaderValue(header) & SHORT_HEADER_MAX_WORDS);
-    }
+    if (instanceoid_widetag_p(widetag))
+        return trace_using_layout(layout_of(where), where,
+                                  instanceoid_length(header));
     sword_t scan_from = 1;
     sword_t scan_to = sizetab[widetag](where);
     sword_t i;
@@ -332,7 +352,7 @@ static void trace_object(lispobj* where)
             return;
         }
         break;
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined (LISP_FEATURE_ARM64)
     /* on x86[-64], closure->fun is a fixnum-qua-pointer. Convert it to a lisp
      * pointer to mark it, but not on platforms where it's already a descriptor */
     case CLOSURE_WIDETAG:
@@ -389,15 +409,12 @@ static void trace_object(lispobj* where)
 
 void prepare_for_full_mark_phase()
 {
-    // FIXME: Estimate how large to create mark_bits based on dynamic space size.
-    // Guess 8 words per object, and X% of the objects are conses.
-    // The problem is guessing how localized the conses are: guess that N conses
-    // will reside on fraction*N different pages, which guides us as to how many
-    // hash table entries are needed.
+#ifndef LISP_FEATURE_USE_CONS_REGION
     hopscotch_create(&mark_bits, HOPSCOTCH_HASH_FUN_DEFAULT,
                      N_WORD_BYTES, /* table values are machine words */
                      65536, /* initial size */
                      0);
+#endif
 
     free_page = page_table_pages;
     suballocator_free_ptr = suballocator_end_ptr = 0;
@@ -432,7 +449,6 @@ void execute_full_mark_phase()
         where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
 #endif
-    // In case this is not the same as (symbol-value '*id->package*)
     gc_mark_obj(lisp_package_vector);
     do {
         lispobj ptr = gc_dequeue();
@@ -463,8 +479,8 @@ static void local_smash_weak_pointers()
     struct weak_pointer *wp, *next_wp;
     for (wp = weak_pointer_chain; wp != WEAK_POINTER_CHAIN_END; wp = next_wp) {
         gc_assert(widetag_of(&wp->header) == WEAK_POINTER_WIDETAG);
-        next_wp = wp->next;
-        wp->next = NULL;
+        next_wp = get_weak_pointer_next(wp);
+        reset_weak_pointer_next(wp);
         lispobj pointee = wp->value;
         gc_assert(is_lisp_pointer(pointee));
         if (!pointer_survived_gc_yet(pointee))
@@ -529,7 +545,7 @@ static void sweep_fixedobj_pages(long *zeroed)
         lispobj *limit = (lispobj*)((char*)obj + IMMOBILE_CARD_BYTES - obj_spacing);
         for ( ; obj <= limit ; obj = (lispobj*)((char*)obj + obj_spacing) ) {
             lispobj header = *obj;
-            uword_t markbit = (header_widetag(header) == FDEFN_WIDETAG) ? FDEFN_MARK_BIT : MARK_BIT;
+            uword_t markbit = boxedobj_widetag_to_markbit(header_widetag(header));
             if (fixnump(header)) { // is a hole
             } else if (header & markbit) { // live object
                 *obj = header ^ markbit;
@@ -544,7 +560,7 @@ static void sweep_fixedobj_pages(long *zeroed)
     lispobj* limit = fixedobj_page_address(FIXEDOBJ_RESERVED_PAGES);
     while (obj < limit) {
         lispobj header = *obj;
-        uword_t markbit = (header_widetag(header) == FDEFN_WIDETAG) ? FDEFN_MARK_BIT : MARK_BIT;
+        uword_t markbit = boxedobj_widetag_to_markbit(header_widetag(header));
         if (header & markbit) *obj = header ^ markbit;
         obj += sizetab[widetag_of(obj)](obj);
     }
@@ -561,11 +577,7 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
         lispobj word = *where;
         if (is_header(word)) {
             nwords = sizetab[header_widetag(word)](where);
-            lispobj markbit = MARK_BIT;
-            switch (header_widetag(word)) {
-            case BIGNUM_WIDETAG: markbit = BIGNUM_MARK_BIT; break;
-            case FDEFN_WIDETAG : markbit = FDEFN_MARK_BIT; break;
-            }
+            lispobj markbit = general_widetag_to_markbit(header_widetag(word));
             if (word & markbit)
                 *where = word ^ markbit;
             else {
@@ -583,6 +595,9 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                         code->boxed_size = 0;
                         code->header = (nwords << CODE_HEADER_SIZE_SHIFT)
                                      | CODE_HEADER_WIDETAG;
+                        /* This memset() is needed for strictly boxed pages,
+                         * but probably not for other page types. No big deal.
+                         * fullcgc isn't really used much */
                         memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
                     })
                 }
@@ -646,27 +661,23 @@ void execute_full_sweep_phase()
             fprintf(stderr, "%ld%s", words_zeroed[i], i?"+":"");
         fprintf(stderr, " words zeroed]\n");
     }
+#ifdef LISP_FEATURE_USE_CONS_REGION
+    page_index_t page;
+    for (page = 0; page < next_free_page; ++page)
+        if (page_table[page].type == PAGE_TYPE_CONS) {
+            char* base = page_address(page);
+            char* bits = base + CONS_PAGE_USABLE_BYTES;
+            char* end  = base + GENCGC_PAGE_BYTES;
+            memset(bits, 0, end-bits);
+        }
+#else
     hopscotch_destroy(&mark_bits);
+#endif
+
     if (sweeplog)
         fflush(sweeplog);
 
-#ifdef LISP_FEATURE_SOFT_CARD_MARKS
     free_page = next_free_page;
-#else
-    page_index_t first_page, last_page;
-    for (first_page = 0; first_page < next_free_page; ++first_page)
-        if (PAGE_WRITEPROTECTED_P(first_page)
-            && protection_mode(first_page) == PHYSICAL) {
-            last_page = first_page;
-            while (PAGE_WRITEPROTECTED_P(last_page+1)
-                   && protection_mode(last_page+1) == PHYSICAL)
-                ++last_page;
-            os_protect(page_address(first_page),
-                       (last_page - first_page + 1) * GENCGC_CARD_BYTES,
-                       OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
-            first_page = last_page;
-        }
-#endif
     while (free_page < page_table_pages) {
         page_table[free_page++].type = FREE_PAGE_FLAG;
     }

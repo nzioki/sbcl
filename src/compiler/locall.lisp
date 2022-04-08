@@ -26,6 +26,7 @@
             (:copier nil))
   (fun nil :read-only t)
   (var nil :read-only t))
+(!set-load-form-method local-call-context (:xc :target) :ignore-it)
 
 ;;; This function propagates information from the variables in the
 ;;; function FUN to the actual arguments in CALL. This is also called
@@ -46,7 +47,7 @@
         for name = (lambda-var-%source-name var)
         do (assert-lvar-type (car args) (leaf-type var) policy
                              (if (eq (functional-kind fun) :optional)
-                                 (opaquely-quote (make-local-call-context fun name))
+                                 (make-local-call-context fun name)
                                  name))
            (unless (leaf-refs var)
              (flush-dest (car args))
@@ -1046,10 +1047,13 @@
                     (return-result (lambda-return (node-home-lambda call)))
                     (node-lvar call)))
           (call-type (node-derived-type call)))
-      (unless (eq call-type *wild-type*)
-        ;; FIXME: Replace the call with unsafe CAST. -- APD, 2003-01-26
-        (do-uses (use result)
-          (derive-node-type use call-type)))
+      ;; FIXME: Replace the call with unsafe CAST. -- APD, 2003-01-26
+      (do-uses (use result)
+        ;; CRETURN is an unknown value destination, now the
+        ;; destination might be consuming just one value.
+        ;; Reoptimize to help the VALUES transform, for example.
+        (reoptimize-node use)
+        (derive-node-type use call-type))
       (substitute-lvar-uses lvar result
                             (and lvar (eq (lvar-uses lvar) call)))))
 

@@ -2697,18 +2697,97 @@
 ;;;; converting special case multiply/divide to shifts
 
 ;;; If arg is a constant power of two, turn * into a shift.
-(deftransform * ((x y) (integer integer) *)
+(deftransform * ((x y) (integer (constant-arg unsigned-byte)) * :node node)
   "convert x*2^k to shift"
-  (unless (constant-lvar-p y)
-    (give-up-ir1-transform))
-  (let* ((y (lvar-value y))
-         (y-abs (abs y))
-         (len (1- (integer-length y-abs))))
-    (unless (and (> y-abs 0) (= y-abs (ash 1 len)))
+  ;; Delay to make sure the surrounding casts are apparent.
+  (delay-ir1-transform node :optimize)
+  (let* ((type (single-value-type (node-asserted-type node)))
+         (y (lvar-value y))
+         (len (1- (integer-length y))))
+    (unless (or (not (csubtypep (lvar-type x) (specifier-type '(or word sb-vm:signed-word))))
+                (csubtypep type (specifier-type 'word))
+                (csubtypep type (specifier-type 'sb-vm:signed-word))
+                (>= len sb-vm:n-word-bits))
       (give-up-ir1-transform))
-    (if (minusp y)
-        `(- (ash x ,len))
-        `(ash x ,len))))
+    (unless (= y (ash 1 len))
+      (give-up-ir1-transform))
+    `(ash x ,len)))
+
+;;; * deals better with ASH that overflows
+(deftransform ash ((integer amount) ((or word sb-vm:signed-word)
+                                     (constant-arg (integer 1 *))) *
+                   :important nil
+                   :node node)
+  ;; Give modular arithmetic optimizers a chance
+  (delay-ir1-transform node :optimize)
+  (let ((type (single-value-type (node-asserted-type node)))
+        (shift (lvar-value amount)))
+    (when (or (csubtypep type (specifier-type 'word))
+              (csubtypep type (specifier-type 'sb-vm:signed-word))
+              (>= shift sb-vm:n-word-bits))
+      (give-up-ir1-transform))
+    `(* integer ,(ash 1 shift))))
+
+(macrolet ((def (name fun type &optional (types `(,type ,type)))
+             `(when-vop-existsp (:translate ,name)
+                (defun ,name (x y type)
+                  (declare (,type x y))
+                  (let ((r (,fun x y)))
+                    (unless (typep r type)
+                      (error 'type-error :expected-type type :datum r))
+                    r))
+
+                (deftransform ,fun ((x y) ,types * :node node :important nil)
+                  (delay-ir1-transform node :optimize)
+                  (let ((dest (node-dest node))
+                        (target-type (specifier-type ',type))
+                        (type (single-value-type (node-derived-type node)))
+                        type-to-check)
+                    (if (and (cast-p dest)
+                             (cast-type-check dest)
+                             (types-equal-or-intersect target-type type)
+                             (not (csubtypep type target-type))
+                             (not (csubtypep type (specifier-type 'word)))
+                             (not (csubtypep type (specifier-type 'sb-vm:signed-word)))
+                             (csubtypep (setf type-to-check (single-value-type (cast-type-to-check dest))) target-type))
+                        `(,',name x y ',(type-specifier type-to-check))
+                        (give-up-ir1-transform))))
+
+                (deftransform ,name ((x y type-to-check) * * :node node)
+                  (let (type
+                        (type-to-check (lvar-value type-to-check))
+                        (sword (specifier-type ',type)))
+                    (cond ((or (csubtypep (setf type (two-arg-derive-type x y
+                                                                          #',(symbolicate fun '-derive-type-aux)
+                                                                          #',fun))
+                                          sword)
+                               (not (types-equal-or-intersect sword type)))
+                           `(the ,type-to-check (,',fun x y)))
+                          (t
+                           (give-up-ir1-transform))))))))
+
+
+  (def unsigned+signed + word (word sb-vm:signed-word))
+  (def unsigned-signed - word (word sb-vm:signed-word))
+
+  (def signed* * sb-vm:signed-word)
+  (def signed+ + sb-vm:signed-word)
+  (def signed- - sb-vm:signed-word)
+
+  (def unsigned* * word)
+  (def unsigned+ + word)
+  (def unsigned- - word)
+
+  (def fixnum* * fixnum))
+
+(when-vop-existsp (:translate unsigned+signed)
+  (deftransform unsigned+signed
+      ((x y type-to-check) (word word t) * :node node :important nil)
+    `(the ,(lvar-value type-to-check) (+ x y)))
+
+  (deftransform unsigned-signed
+      ((x y type-to-check) (word word t) * :node node :important nil)
+    `(the ,(lvar-value type-to-check) (- x y))))
 
 ;;; These must come before the ones below, so that they are tried
 ;;; first.
@@ -4459,16 +4538,15 @@
                 (lvar-use control)
                 (find-constant
                  (cond ((not symbols) new-string)
-                       ((fasl-output-p *compile-object*)
+                       ((producing-fasl-file)
                         (acond ((assoc string (constant-cache *compilation*) :test 'equal)
                                 (cdr it))
                                (t
-                                (let ((new (if symbols
-                                               (sb-format::make-fmt-control-proxy
-                                                new-string symbols)
-                                               new-string)))
-                                  (push (cons string new) (constant-cache *compilation*))
-                                  new))))
+                                (let ((proxy (sb-format::make-fmt-control-proxy
+                                                         new-string symbols)))
+                                  (maybe-emit-make-load-forms proxy)
+                                  (push (cons string proxy) (constant-cache *compilation*))
+                                  proxy))))
                        #-sb-xc-host ; no such object as a FMT-CONTROL
                        (t
                         (sb-format::make-fmt-control new-string symbols)))))))))
@@ -5096,3 +5174,20 @@
 ;;; is smaller by about the size of an fdefn; and it's faster, so do it.
 (deftransform fboundp ((name) ((constant-arg symbol)))
   `(fdefn-fun (load-time-value (find-or-create-fdefn ',(lvar-value name)) t)))
+
+;;; Remove special bindings with empty bodies
+(deftransform %cleanup-point (() * * :node node)
+  (let ((prev (ctran-use (node-prev (ctran-use (node-prev node))))))
+    (cond ((and (combination-p prev)
+                (eq (combination-fun-source-name prev nil) '%special-bind)
+                (not (node-next node))
+                (let ((succ (car (block-succ (node-block node)))))
+                  (and succ
+                       (block-start succ)
+                       (neq (node-enclosing-cleanup node)
+                            (block-start-cleanup succ)))))
+           (setf (lexenv-cleanup (node-lexenv node)) nil)
+           (flush-combination prev)
+           nil)
+          (t
+           (give-up-ir1-transform)))))

@@ -14,7 +14,6 @@
 #include "genesis/layout.h"
 #include "genesis/package.h"
 #include "genesis/vector.h"
-#include "getallocptr.h" // for get_alloc_pointer()
 #include "search.h"
 #include "genesis/avlnode.h"
 #include "genesis/sap.h"
@@ -464,7 +463,7 @@ static boolean root_p(lispobj ptr, int criterion)
 static lispobj mkcons(lispobj car, lispobj cdr)
 {
     struct cons *cons = (struct cons*)
-        gc_general_alloc(sizeof(struct cons), PAGE_TYPE_CONS);
+        gc_general_alloc(cons_region, sizeof(struct cons), PAGE_TYPE_CONS);
     cons->car = car;
     cons->cdr = cdr;
     return make_lispobj(cons, LIST_POINTER_LOWTAG);
@@ -475,7 +474,7 @@ static lispobj liststar3(lispobj x, lispobj y, lispobj z) {
 static lispobj make_sap(char* value)
 {
     struct sap *sap = (struct sap*)
-        gc_general_alloc(sizeof(struct sap), PAGE_TYPE_UNBOXED);
+        gc_general_alloc(unboxed_region, sizeof(struct sap), PAGE_TYPE_UNBOXED);
     sap->header = (1<<N_WIDETAG_BITS) | SAP_WIDETAG;
     sap->pointer = value;
     return make_lispobj(sap, OTHER_POINTER_LOWTAG);
@@ -983,12 +982,12 @@ static int trace_paths(void (*context_scanner)(),
                                   inverted_heap, &scratchpad,
                                   n_pins, pins, context_scanner, criterion);
             lispobj* elt = VECTOR(paths)->data + i;
-            ensure_ptr_word_writable(elt);
+            notice_pointer_store(elt);
             if ((*elt = path) != 0) ++n_found;
         }
         ++i;
     } while (weak_pointers != NIL);
-    ensure_region_closed(&mixed_region, PAGE_TYPE_MIXED);
+    gc_close_collector_regions();
     os_invalidate(scratchpad.base, scratchpad.end-scratchpad.base);
 #if TRACEROOT_USE_ABSL_HASHMAP
     absl_hashmap_destroy(inverted_heap);

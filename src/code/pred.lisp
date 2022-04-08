@@ -106,7 +106,7 @@
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  #-(or x86 x86-64 arm64) (def-type-predicate-wrapper lra-p)
+  #-(or x86 x86-64 arm64 riscv) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
   (def-type-predicate-wrapper rationalp)
@@ -150,10 +150,10 @@
   (def-type-predicate-wrapper stringp)
   (def-type-predicate-wrapper vectorp))
 
-#+(or x86 x86-64 arm arm64)
-(defun fixnum-mod-p (x limit)
-  (and (fixnump x)
-       (<= 0 x limit)))
+(sb-c::when-vop-existsp (:translate fixnum-mod-p)
+  (defun fixnum-mod-p (x limit)
+    (and (fixnump x)
+         (<= 0 x limit))))
 
 
 ;;; Return the specifier for the type of object. This is not simply

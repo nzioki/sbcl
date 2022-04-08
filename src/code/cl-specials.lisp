@@ -28,7 +28,7 @@
                 cl:*gensym-counter*
                 cl:*load-pathname*
                 cl:*load-print*
-                cl:*load-truename*
+                #+ansi-compliant-load-truename cl:*load-truename*
                 cl:*load-verbose*
                 cl:*macroexpand-hook*
                 cl:*modules*
@@ -77,6 +77,27 @@
          (dolist (symbol ',list)
            (declare (notinline (setf sb-int:info))) ; skirt failure-to-inline warning
            (setf (sb-int:info :variable :wired-tls symbol) t)))))
+
+#-ansi-compliant-load-truename
+(progn
+;; this could almost go in target-load.lisp were it not for the use in ir1-translators
+(defvar sb-fasl::%load-truename nil)
+;; "The consequences are unspecified if an attempt is made to assign or bind [...]"
+;;  http://www.lispworks.com/documentation/HyperSpec/Body/v_ld_pns.htm#STload-truenameST
+;;
+;; But the rationale provided in http://www.lispworks.com/documentation/HyperSpec/Issues/iss218_w.htm
+;; for the existence of the -TRUENAME* variables is dubious:
+;;  "Note that it is not adequate to just have the -PATHNAME* variables
+;;   since TRUENAME on these pathnames might not yield the value of the
+;;   -TRUENAME* variables if the file has been deleted or protected
+;;   since the open occurred (in some implementations)."
+;; because in our ANSI-compliant logic, there is a delay between opening a file
+;; and determining its truename, which means that it might be impossible to determine
+;; the truename even if done ASAP.  Supposing that somebody really were to delete
+;; the very file being acted on, it's not LOAD's job to deal with race conditions.
+(define-symbol-macro *load-truename*
+    (sb-ext:truly-the (values (or pathname null) &optional)
+      (sb-fasl::resolve-load-truename 'sb-fasl::%load-truename *load-pathname*))))
 
 (declaim (type t cl:+ cl:++ cl:+++ cl:- cl:* cl:** cl:***))
 
@@ -135,12 +156,6 @@
 
 (declaim (type pathname cl:*default-pathname-defaults*))
 
-(declaim (type (or pathname null)
-                       cl:*load-pathname*
-                       cl:*load-truename*
-                       cl:*compile-file-pathname*
-                       cl:*compile-file-truename*))
-
 ;;; Some functions for which we should *never* (or almost never) bind eagerly
 ;;; to the functional definition.
 ;;; IR2-CONVERT-GLOBAL-VAR won't use a :KNOWN-FUN constant-tn, but will instead
@@ -149,74 +164,8 @@
 ;;; situations involving (APPLY ...) which rendered encapsulation impossible.
 (declaim (notinline open compile-file load compile))
 
-;;;; DEFGLOBAL and DEFINE-LOAD-TIME-GLOBAL
-;;;; These have alternate definitions (in cross-misc) which rely on
-;;;; the underlying host DEFVAR when building the cross-compiler.
-
 (in-package "SB-IMPL")
 
-;;; Generate a consistent error message for all the standard
-;;; defining macros when given an invalid NAME argument.
-;;; DEFCLASS has its own thing, which is CHECK-CLASS-NAME.
-;;; [This is possibly the wrong place for this, but it's needed
-;;; earlier than anything else, even primordial-extensions.]
-(defmacro check-designator (name macro &optional (arg-reference "NAME"))
-  (multiple-value-bind (predicate explanation)
-      (case macro
-        ((defun defgeneric defmethod define-compiler-macro)
-         (values 'legal-fun-name-p "function name"))
-        (t
-         (values 'symbolp "symbol")))
-    ;; If we decide that the correct behavior is to actually macroexpand
-    ;; and then fail later, well, I suppose we could express all macros
-    ;; such that they perform their LEGAL-FUN-NAME-P/SYMBOLP check as part
-    ;; of the ordinary code, as in:
-    ;;  (DEFPARAMETER "foo" 3) -> (%defparameter (the symbol '"foo") ...)
-    ;; which seems at least slightly preferable to failing in the
-    ;; internal function that would store the globaldb info.
-    `(unless (,predicate ,name)
-       (error ,(format nil "The ~A argument to ~A, ~~S, is not a ~A."
-                       arg-reference macro explanation)
-              ,name))))
-
-(defmacro defglobal (name value &optional (doc nil docp))
-  "Defines NAME as a global variable that is always bound. VALUE is evaluated
-and assigned to NAME both at compile- and load-time, but only if NAME is not
-already bound.
-
-Global variables share their values between all threads, and cannot be
-locally bound, declared special, defined as constants, and neither bound
-nor defined as symbol macros.
-
-See also the declarations SB-EXT:GLOBAL and SB-EXT:ALWAYS-BOUND."
-  (check-designator name defglobal)
-  (let ((boundp (make-symbol "BOUNDP")))
-    `(progn
-       (eval-when (:compile-toplevel)
-         (let ((,boundp (boundp ',name)))
-           (%compiler-defglobal ',name :always-bound
-                                (not ,boundp) (unless ,boundp ,value))))
-       (%defglobal ',name
-                   (if (%boundp ',name) (make-unbound-marker) ,value)
-                   (sb-c:source-location)
-                   ,@(and docp `(',doc))))))
-
-(defmacro define-load-time-global (name value &optional (doc nil docp))
-  "Defines NAME as a global variable that is always bound. VALUE is evaluated
-and assigned to NAME at load-time, but only if NAME is not already bound.
-
-Attempts to read NAME at compile-time will signal an UNBOUND-VARIABLE error
-unless it has otherwise been assigned a value.
-
-See also DEFGLOBAL which assigns the VALUE at compile-time too."
-  (check-designator name define-load-time-global)
-  `(progn
-     (eval-when (:compile-toplevel)
-       (%compiler-defglobal ',name :eventually nil nil))
-     (%defglobal ',name
-                 (if (%boundp ',name) (make-unbound-marker) ,value)
-                 (sb-c:source-location)
-                 ,@(and docp `(',doc)))))
 
 ;;; Ensure some VM symbols get wired TLS.
 (in-package "SB-VM")

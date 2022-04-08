@@ -13,10 +13,10 @@
 
 (define-vop (list)
   (:args (things :more t :scs (descriptor-reg any-reg control-stack constant immediate)))
-  (:temporary (:scs (descriptor-reg)) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
-  (:temporary (:sc non-descriptor-reg) pa-flag temp)
+  (:temporary (:sc non-descriptor-reg) pa-flag)
   (:temporary (:scs (interior-reg)) lip)
   (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
@@ -95,25 +95,22 @@
       (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
-  (:args (function :to :save :scs (descriptor-reg)))
   (:info label length stack-allocate-p)
-  (:ignore label)
   (:temporary (:sc non-descriptor-reg) pa-flag)
   (:temporary (:scs (interior-reg)) lip)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
-      (pseudo-atomic (pa-flag)
+      (pseudo-atomic (pa-flag :elide-if stack-allocate-p)
         (allocation nil alloc-size fun-pointer-lowtag result
                     :flag-tn pa-flag
                     :stack-allocate-p stack-allocate-p
                     :lip lip)
         (load-immediate-word pa-flag
-                             (logior
-                              (ash (1- size) n-widetag-bits)
-                              closure-widetag))
-        (storew-pair pa-flag 0 function closure-fun-slot tmp-tn)))))
+                             (logior (ash (1- size) n-widetag-bits) closure-widetag))
+        (inst adr lip label (ash simple-fun-insts-offset word-shift))
+        (storew-pair pa-flag 0 lip closure-fun-slot tmp-tn)))))
 
 ;;; The compiler likes to be able to directly make value cells.
 ;;;

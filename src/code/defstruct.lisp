@@ -48,6 +48,12 @@
                             (%make-structure-instance-allocator ,dd ,slot-specs))
                       ,@slot-vars)))))
 
+(sb-xc:defmacro %new-instance (layout size)
+  `(let* ((l ,layout)
+          (i (%make-instance ,size)))
+     (setf (%instance-wrapper i) l)
+     i))
+
 (declaim (ftype (sfunction (defstruct-description list) function)
                 %make-structure-instance-allocator))
 (defun %make-structure-instance-allocator (dd slot-specs)
@@ -272,7 +278,8 @@
          (constructor-definitions
           (mapcar (lambda (ctor)
                     `(sb-c:xdefun ,(car ctor)
-                       :constructor
+                         :constructor
+                         nil
                        ,@(structure-ctor-lambda-parts dd (cdr ctor))))
                   (dd-constructors dd)))
          (print-method
@@ -312,10 +319,10 @@
            ,@(when (eq expanding-into-code-for :target)
                `(,@(let ((defuns
                           `(,@(awhen (dd-copier-name dd)
-                                `((sb-c:xdefun ,(dd-copier-name dd) :copier (instance)
+                                `((sb-c:xdefun ,(dd-copier-name dd) :copier nil (instance)
                                     (copy-structure (the ,(dd-name dd) instance)))))
                             ,@(awhen (dd-predicate-name dd)
-                                `((sb-c:xdefun ,(dd-predicate-name dd) :predicate (object)
+                                `((sb-c:xdefun ,(dd-predicate-name dd) :predicate nil (object)
                                     (typep object ',(dd-name dd)))))
                             ,@(accessor-definitions dd))))
                      (if (and delayp (not (compiler-layout-ready-p name)))
@@ -484,6 +491,7 @@
         (let ((name (dsd-accessor-name slot))
               (index (dsd-index slot))
               (new-value '(value))
+              (structure '(structure))
               (slot-type `(and ,(dsd-type slot)
                                ,(dd-element-type defstruct))))
           (let ((inherited (accessor-inherited-data name defstruct)))
@@ -491,14 +499,14 @@
               ((not inherited)
                (stuff `(declaim (inline ,name ,@(unless (dsd-read-only slot)
                                                         `((setf ,name))))))
-               (stuff `(defun ,name (structure)
-                        (declare (type ,ltype structure))
-                        (the ,slot-type (elt structure ,index))))
+               (stuff `(defun ,name ,structure
+                         (declare (type ,ltype . ,structure))
+                         (the ,slot-type (elt ,(car structure) ,index))))
                (unless (dsd-read-only slot)
                  (stuff
-                  `(defun (setf ,name) (,(car new-value) structure)
-                    (declare (type ,ltype structure) (type ,slot-type . ,new-value))
-                    (setf (elt structure ,index) . ,new-value)))))
+                  `(defun (setf ,name) (,(car new-value) . ,structure)
+                     (declare (type ,ltype . ,structure) (type ,slot-type . ,new-value))
+                     (setf (elt ,(car structure) ,index) . ,new-value)))))
               ((not (= (cdr inherited) index))
                (style-warn "~@<Non-overwritten accessor ~S does not access ~
                             slot with name ~S (accessing an inherited slot ~
@@ -946,7 +954,7 @@ unless :NAMED is also specified.")))
                                          always-boundp gc-ignorable
                                          rsd-index)
                           default)))
-      #-sb-xc-host (push (cons dsd spec) *dsd-source-form*)
+      (push (cons dsd spec) *dsd-source-form*)
       (setf (dd-slots defstruct) (nconc (dd-slots defstruct) (list dsd)))
       (let ((comparator
              ;; this is enough specialization for now
@@ -1470,6 +1478,12 @@ or they must be declared locally notinline at each call site.~@:>"
                         :modify old-layout))))
   (values))
 
+(defun dd-custom-gc-method-p (dd)
+  (cond ((eq (dd-name dd) 'sb-lockless::list-node) t)
+        ((dd-include dd)
+         (dd-custom-gc-method-p
+          (wrapper-info (compiler-layout-or-lose (car (dd-include dd))))))))
+
 ;;; Compute DD's bitmap, storing 1 for each tagged word.
 ;;; The GC can parse signed fixnums and bignums, with which we can
 ;;; represent an unlimited number of "&rest" slots all with the same
@@ -1578,11 +1592,7 @@ or they must be declared locally notinline at each call site.~@:>"
     ;; As of now this only pertains to lockfree-singly-linked-list nodes
     ;; and descendant types. (The lockfree list uses one pointer bit
     ;; as a pending-deletion flag. See "src/code/target-lflist.lisp")
-    (when (named-let has-custom-gc-method ((dd dd))
-            (cond ((eq (dd-name dd) 'sb-lockless::list-node) t)
-                  ((dd-include dd)
-                   (has-custom-gc-method
-                    (wrapper-info (compiler-layout-or-lose (car (dd-include dd))))))))
+    (when (dd-custom-gc-method-p dd)
       (aver (eq rest :unspecific))
       (return-from calculate-dd-bitmap minimal-bitmap))
 
@@ -1656,7 +1666,8 @@ or they must be declared locally notinline at each call site.~@:>"
     (unless (dd-alternate-metaclass info)
       (setq flags +structure-layout-flag+))
     (cond ((some #'dsd-rsd-index (dd-slots info))) ; mixed boxed + raw (or wholly raw)
-          ((not (dd-alternate-metaclass info))
+          ((and (not (dd-alternate-metaclass info))
+                (not (dd-custom-gc-method-p info)))
            (setf flags (logior flags +strictly-boxed-flag+))))
     ;; FIXME: explain why this is #-sb-xc-host.
     #-sb-xc-host
@@ -2008,11 +2019,13 @@ or they must be declared locally notinline at each call site.~@:>"
         for accessor-name = (dsd-accessor-name dsd)
         unless (accessor-inherited-data accessor-name dd)
         nconc (dx-let ((key (cons dd dsd)))
-                `(,@(unless (dsd-read-only dsd)
-                     `((sb-c:xdefun (setf ,accessor-name) :accessor (value instance)
-                         ,(slot-access-transform :setf '(instance value) key))))
-                  (sb-c:xdefun ,accessor-name :accessor (instance)
-                    ,(slot-access-transform :read '(instance) key))))))
+                (let ((source-form (and (boundp '*dsd-source-form*)
+                                        (cdr (assq dsd *dsd-source-form*)))))
+                  `(,@(unless (dsd-read-only dsd)
+                        `((sb-c:xdefun (setf ,accessor-name) :accessor ,source-form (value instance)
+                            ,(slot-access-transform :setf '(instance value) key))))
+                    (sb-c:xdefun ,accessor-name :accessor ,source-form (instance)
+                      ,(slot-access-transform :read '(instance) key)))))))
 
 ;;;; instances with ALTERNATE-METACLASS
 ;;;;
@@ -2182,105 +2195,46 @@ or they must be declared locally notinline at each call site.~@:>"
           (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
     (funcall (aref map index) instance)))
 
-;;; It's easier for the compiler to recognize the output of M-L-F-S-S
-;;; without extraneous QUOTE forms, so we define some trivial wrapper macros.
-(defmacro new-instance (type) `(allocate-instance (find-class ',type)))
-(defmacro new-struct (type) `(allocate-struct ',type))
-(defmacro sb-pcl::set-slots (instance name-list &rest values)
-  `(sb-pcl::%set-slots ,instance ',name-list ,@values))
+#+sb-xc-host
+(defun %raw-instance-ref/word (instance index) (%instance-ref instance index))
 
-;;; We require that MAKE-LOAD-FORM-SAVING-SLOTS produce deterministic output
-;;; and that its output take a particular recognizable form so that it can
-;;; be optimized into a sequence of fasl ops.
-;;; The cross-compiler depends critically on optimizing the resulting sexprs
-;;; so that the host can load cold objects, which it could not do
-;;; if constructed by machine code for the target.
-;;; This ends up being a performance win for the target system as well.
 ;;; It is possible to produce instances of structure-object which violate
 ;;; the assumption throughout the compiler that slot readers are safe
 ;;; unless dictated otherwise by the SAFE-P flag in the DSD.
 ;;;  * (defstruct S a (b (error "Must supply me") :type symbol))
 ;;;  * (defmethod make-load-form ((x S) &optional e) (m-l-f-s-s x :slot-names '(a)))
 ;;; After these definitions, a dumped S will have #<unbound> in slot B.
-;;;
 (defun make-load-form-saving-slots (object &key (slot-names nil slot-names-p)
-                                                environment
-                                           &aux (type (type-of object)))
+                                                environment)
   (declare (ignore environment))
-  (flet ((quote-p (thing) (not (self-evaluating-p thing))))
-    (declare (inline quote-p))
-    ;; If TYPE-OF isn't a symbol, the creation form probably can't be compiled
-    ;; unless there is a MAKE-LOAD-FORM on the class without a proper-name.
-    ;; This is better than returning a creation form that produces
-    ;; something completely different.
-    (if (typep object 'structure-object)
-        (values `(new-struct ,(the symbol type)) ; no anonymous defstructs
-                `(setf ,@(mapcan
-                          (lambda (dsd)
-                            (declare (type defstruct-slot-description dsd))
-                            (when (or (not slot-names-p)
-                                      (memq (dsd-name dsd) slot-names))
-                              (let* ((acc (dsd-primitive-accessor dsd))
-                                     (ind (dsd-index dsd))
-                                     (val (funcall acc object ind)))
-                                (list `(,acc ,object ,ind)
-                                      (if (quote-p val) `',val val)))))
-                          (dd-slots (wrapper-dd (%instance-wrapper object))))))
-        #-sb-xc-host
-        (values `(,(if (symbolp type) 'new-instance 'allocate-instance) ,type)
-                (loop for slot in (sb-mop:class-slots (class-of object))
-                      for name = (sb-mop:slot-definition-name slot)
-                      when (if slot-names-p
-                               (memq name slot-names)
-                               (eq (sb-mop:slot-definition-allocation slot) :instance))
-                      collect name into names
-                      and
-                      collect (if (slot-boundp object name)
-                                  (let ((val (slot-value object name)))
-                                    (if (quote-p val) `',val val))
-                                  'sb-pcl:+slot-unbound+) into vals
-                      finally (return `(sb-pcl::set-slots ,object ,names ,@vals)))))))
-
-;;; Call MAKE-LOAD-FORM inside a condition handler in case the method fails,
-;;; returning its two values on success.
-;;; If the resulting CREATION-FORM and INIT-FORM are equivalent to those
-;;; returned from MAKE-LOAD-FORM-SAVING-SLOTS, return NIL and 'SB-FASL::FOP-STRUCT.
-(defun sb-c::%make-load-form (constant)
-  (flet ((canonical-p (inits dsds object &aux reader)
-           ;; Return T if (but not only-if) INITS came from M-L-F-S-S.
-           (dolist (dsd dsds (null inits))
-             (declare (type defstruct-slot-description dsd))
-             (if (and (listp inits)
-                      (let ((place (pop inits)))
-                        (and (listp place)
-                             (eq (setq reader (dsd-primitive-accessor dsd))
-                                 (pop place))
-                             (listp place) (eq object (pop place))
-                             (singleton-p place)
-                             (eql (dsd-index dsd) (car place))))
-                      (let ((init (and (listp inits) (car inits)))
-                            (val (funcall reader object (dsd-index dsd))))
-                        (if (self-evaluating-p val)
-                            (and inits (eql val init))
-                            (and (typep init '(cons (eql quote)))
-                                 (singleton-p (cdr init))
-                                 (eq val (cadr init))))))
-                 (pop inits)
-                 (return nil)))))
-    (multiple-value-bind (creation-form init-form)
-        (handler-case (make-load-form constant (make-null-lexenv))
-          (error (condition) (sb-c:compiler-error condition)))
-      (cond ((and (listp creation-form)
-                  (typep constant 'structure-object)
-                  (typep creation-form '(cons (eql new-struct) (cons symbol null)))
-                  (eq (second creation-form) (type-of constant))
-                  (typep init-form '(cons (eql setf)))
-                  (canonical-p (cdr init-form)
-                               (dd-slots (wrapper-dd (%instance-wrapper constant)))
-                               constant))
-             (values nil 'sb-fasl::fop-struct))
-            (t
-             (values creation-form init-form))))))
+  (if (typep object 'structure-object)
+      (let ((type (type-of object)))
+        (collect ((inits))
+          (dolist (dsd (dd-slots (wrapper-dd (%instance-wrapper object))))
+            (declare (type defstruct-slot-description dsd))
+            (let ((slot-name (dsd-name dsd)))
+              (when (or (memq slot-name slot-names)
+                        (not slot-names-p))
+                (let* ((accessor (dsd-primitive-accessor dsd))
+                       (index (dsd-index dsd))
+                       (value (funcall accessor object index)))
+                  (inits `(setf (,accessor ,object ,index) ',value))))))
+          (values `(allocate-struct ',(the symbol type)) ;; no anonymous defstructs
+                  `(progn ,@(inits)))))
+      #-sb-xc-host
+      (let ((class (class-of object)))
+        (collect ((inits))
+          (dolist (slot (sb-mop:class-slots class))
+            (let ((slot-name (sb-mop:slot-definition-name slot)))
+              (when (or (memq slot-name slot-names)
+                        (and (not slot-names-p)
+                             (eq :instance (sb-mop:slot-definition-allocation slot))))
+                (if (slot-boundp object slot-name)
+                    (let ((value (slot-value object slot-name)))
+                      (inits `(setf (slot-value ,object ',slot-name) ',value)))
+                    (inits `(slot-makunbound ,object ',slot-name))))))
+          (values `(allocate-instance (find-class ',(class-name class)))
+                  `(progn ,@(inits)))))))
 
 ;;; Compute a SAP to the specified slot in INSTANCE.
 ;;; This looks mildly redundant with DEFINE-STRUCTURE-SLOT-ADDRESSOR,
@@ -2290,5 +2244,45 @@ or they must be declared locally notinline at each call site.~@:>"
          (- (ash (+ (get-dsd-index ,type-name ,slot-name) sb-vm:instance-slots-offset)
                  sb-vm:word-shift)
             sb-vm:instance-pointer-lowtag)))
+
+#+sb-xc-host
+(defun write-structure-definitions-as-text (pathname)
+  (with-open-file (output pathname :direction :output :if-exists :supersede)
+    (dolist (root '(structure-object function))
+      (dolist (pair (let ((subclassoids (classoid-subclasses (find-classoid root))))
+                      (if (listp subclassoids)
+                          subclassoids
+                          (flet ((pred (x y)
+                                   (or (string< x y)
+                                       (and (string= x y)
+                                            (let ((xpn (package-name (cl:symbol-package x)))
+                                                  (ypn (package-name (cl:symbol-package y))))
+                                              (string< xpn ypn))))))
+                            (sort (%hash-table-alist subclassoids)
+                                  #'pred
+                                  ;; pair = (#<classoid> . #<layout>)
+                                  :key (lambda (pair) (classoid-name (car pair))))))))
+        (let* ((wrapper (cdr pair))
+               (dd (wrapper-info wrapper)))
+          (cond
+            (dd
+             (let* ((*print-pretty* nil) ; output should be insensitive to host pprint
+                    (*print-readably* t)
+                    (classoid-name (classoid-name (car pair)))
+                    (*package* (cl:symbol-package classoid-name)))
+               (format output "~/sb-ext:print-symbol-with-prefix/ ~S (~%"
+                       classoid-name
+                       (list* (the (unsigned-byte 16) (wrapper-flags wrapper))
+                              (wrapper-depthoid wrapper)
+                              (map 'list #'wrapper-classoid-name
+                                   (wrapper-inherits wrapper))))
+               (dolist (dsd (dd-slots dd) (format output ")~%"))
+                 (format output "  (~d ~S ~S)~%"
+                         (dsd-bits dsd)
+                         (dsd-name dsd)
+                         (dsd-accessor-name dsd)))))
+            (t
+             (error "Missing DD for ~S" pair))))))
+    (format output ";; EOF~%")))
 
 (/show0 "code/defstruct.lisp end of file")

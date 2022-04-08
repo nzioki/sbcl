@@ -24,7 +24,7 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -93,6 +93,7 @@
 ;;; Link these as data entries so that we store only the address of the
 ;;; handwritten assembly code in the linkage able, and not a trampoline
 ;;; to the trampoline. The ALLOCATION macro just wants an address.
+#+gencgc
 (setq *linkage-space-predefined-entries* '(("alloc_tramp" t)
                                            ("list_alloc_tramp" t)))
 
@@ -127,8 +128,6 @@
 ;;;
 (defconstant-eqx +static-symbols+
  `#(,@+common-static-symbols+
-    *allocation-pointer*
-
      *control-stack-pointer*
      *binding-stack-pointer*
      *interrupted-control-stack-pointer*
@@ -154,5 +153,3 @@
 ;;; The number of bits per element in the assemblers code vector.
 ;;;
 (defparameter *assembly-unit-length* 8)
-
-(defvar *allocation-pointer*)

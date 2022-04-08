@@ -1013,7 +1013,12 @@
   (input-stream (missing-arg) :type stream :read-only t)
   (output-stream (missing-arg) :type stream :read-only t))
 
-(defprinter (two-way-stream) input-stream output-stream)
+(defmethod print-object ((x two-way-stream) stream)
+  (print-unreadable-object (x stream :type t :identity t)
+    (format stream
+            ":INPUT-STREAM ~S :OUTPUT-STREAM ~S"
+            (two-way-stream-input-stream x)
+            (two-way-stream-output-stream x))))
 
 (defun make-two-way-stream (input-stream output-stream)
   "Return a bidirectional stream which gets its input from INPUT-STREAM and
@@ -1314,8 +1319,6 @@
 ;;; dx allocation of structures, this'll have to do.
 (defun %init-string-input-stream (stream string &optional (start 0) end)
   (declare (explicit-check string))
-  (setf (%instance-wrapper (truly-the instance stream))
-        #.(find-layout 'string-input-stream))
   (macrolet ((initforms ()
                `(progn
                  ,@(mapcar (lambda (dsd)
@@ -1366,9 +1369,11 @@
 (defun make-string-input-stream (string &optional (start 0) end)
   "Return an input stream which will supply the characters of STRING between
   START and END in order."
-  (macrolet ((nwords () (dd-length (find-defstruct-description 'string-input-stream))))
+  (macrolet ((make () `(%make-structure-instance
+                        ,(find-defstruct-description 'string-input-stream)
+                        nil)))
     ;; kill the secondary value
-    (values (%init-string-input-stream (%make-instance (nwords)) string start end))))
+    (values (%init-string-input-stream (make) string start end))))
 
 ;;;; STRING-OUTPUT-STREAM stuff
 ;;;;
@@ -1381,7 +1386,6 @@
   (declare (optimize speed (sb-c::verify-arg-count 0)))
   (declare (string buffer)
            (ignorable wild-result-type)) ; if #-sb-unicode
-  (setf (%instance-wrapper (truly-the instance stream)) #.(find-layout 'string-output-stream))
   (macrolet ((initforms ()
                `(progn
                   ,@(mapcar (lambda (dsd)
@@ -1880,8 +1884,6 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
   (unless (and (stringp string)
                (array-has-fill-pointer-p string))
     (error "~S is not a string with a fill-pointer" string))
-  (setf (%instance-wrapper (truly-the instance stream))
-        #.(find-layout 'fill-pointer-output-stream))
   (macrolet ((initforms ()
                `(progn ,@(mapcar (lambda (dsd)
                                    `(%instance-set stream ,(dsd-index dsd)

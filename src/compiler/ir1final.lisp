@@ -123,8 +123,7 @@
     (do-nodes-backwards (node lvar block :restart-p t)
       (let ((dest (when lvar (lvar-dest lvar))))
         (cond ((and (cast-p dest)
-                    (not (cast-type-check dest))
-                    (almost-immediately-used-p lvar node))
+                    (not (cast-type-check dest)))
                (let ((dtype (node-derived-type node))
                      (atype (node-derived-type dest)))
                  (when (values-types-equal-or-intersect
@@ -144,7 +143,10 @@
                (delete-filter node lvar (cast-value node))))))))
 
 (defglobal *two-arg-functions*
-    `((* two-arg-* (,(specifier-type 'fixnum) ,(specifier-type 'fixnum)) multiply-fixnums)
+    `((* two-arg-*
+         ,@(sb-c::unless-vop-existsp (:translate sb-c::fixnum*)
+             `((,(specifier-type 'fixnum) ,(specifier-type 'fixnum))
+               multiply-fixnums)))
       (+ two-arg-+)
       (- two-arg--)
       (/ two-arg-/ (,(specifier-type 'integer) ,(specifier-type 'integer)) sb-kernel::integer-/-integer)
@@ -305,6 +307,8 @@
                            for type in types
                            always (csubtypep (lvar-type arg) type)))
             (setf two-arg typed-two-arg))
+          (setf (combination-fun-info combination)
+                (fun-info-or-lose two-arg))
           (change-ref-leaf
            ref
            (find-free-fun two-arg "rewrite-full-call")))))))

@@ -402,7 +402,7 @@
                       (if (label-p old) (cons old new) (nconc old new)))))
           (multiple-value-bind (mnemonic operands)
               (if (consp thing) (values (car thing) (cdr thing)) thing)
-            (unless (member mnemonic '(.align .byte .skip .coverage-mark))
+            (unless (member mnemonic '(.align .byte .skip))
               ;; This automatically gets the .QWORD pseudo-op which we use on x86-64
               ;; to create jump tables, but it's sort of unfortunate that the mnemonic
               ;; is specific to that backend. It should probably be .LISPWORD instead.
@@ -1668,6 +1668,13 @@
     (trace-inst s :align bits)
     (emit s `(.align ,bits ,pattern))))
 
+;; ECL bug workaround: it miscompiles LABEL-POSITION with this decl
+;; This might be unnecessary now that I'm proclaiming an OPTIMIZE policy
+;; that seems to fix everything. It certainly was needed without that.
+;; At least by keeping this we might be able to report some specific bugs
+;; against ECL in the hope it gets fixed. Of course we can't actually ever
+;; remove workarounds.
+#-host-quirks-ecl
 (declaim (ftype (sfunction (label &optional t index) (or null index))
                 label-position))
 (defun label-position (label &optional if-after delta)
@@ -1952,10 +1959,6 @@
 (%def-inst-encoder '.byte
                    (lambda (segment &rest bytes)
                      (dolist (byte bytes) (emit-byte segment byte))))
-(%def-inst-encoder '.coverage-mark
-                   (lambda (segment &rest junk)
-                     (declare (ignore segment junk))
-                     (error "Can't get here")))
 (%def-inst-encoder '.skip
                     (lambda (segment n-bytes &optional (pattern 0))
                       (%emit-skip segment n-bytes pattern)))

@@ -14,16 +14,11 @@
 
 ;;;; type format database
 
-(defstruct (room-info (:constructor make-room-info (mask name kind))
+;;; FIXME: this structure seems to no longer serve a purpose.
+;;; We'd do as well with a simple-vector of (or symbol cons saetp).
+(defstruct (room-info (:constructor make-room-info (name))
                       (:copier nil))
-    ;; the mask applied to HeaderValue to compute object size
-    (mask 0 :type (and fixnum unsigned-byte) :read-only t)
-    ;; the name of this type
-    (name nil :type symbol :read-only t)
-    ;; kind of type (how to reconstitute an object)
-    (kind nil
-          :type (member :other :closure :instance :list :code :fdefn)
-          :read-only t))
+    (name nil :type symbol :read-only t)) ; the name of this type
 (declaim (freeze-type room-info))
 
 (defun room-info-type-name (info)
@@ -33,58 +28,30 @@
 
 (defconstant tiny-boxed-size-mask #xFF)
 (defun compute-room-infos ()
-  (let ((infos (make-array 256 :initial-element nil))
-        (default-size-mask (mask-field (byte 23 0) -1)))
+  (let ((infos (make-array 256 :initial-element nil)))
     (dolist (obj *primitive-objects*)
       (let ((widetag (primitive-object-widetag obj))
             (lowtag (primitive-object-lowtag obj))
             (name (primitive-object-name obj)))
-        (when (and (eq lowtag 'other-pointer-lowtag)
-                   (not (member widetag '(t nil))))
-          (setf (svref infos (symbol-value widetag))
-                (case name
-                 (fdefn  (make-room-info 0 name :fdefn))
-                 (symbol (make-room-info tiny-boxed-size-mask name :other))
-                 (t      (make-room-info default-size-mask name :other)))))))
+        (when (and (member lowtag '(other-pointer-lowtag fun-pointer-lowtag
+                                    instance-pointer-lowtag))
+                   (not (member widetag '(t nil simple-fun-widetag))))
+          (setf (svref infos (symbol-value widetag)) (make-room-info name)))))
 
-    (let ((info (make-room-info tiny-boxed-size-mask 'array-header :other)))
+    (let ((info (make-room-info 'array-header)))
       (dolist (code (list #+sb-unicode complex-character-string-widetag
                           complex-base-string-widetag simple-array-widetag
                           complex-bit-vector-widetag complex-vector-widetag
                           complex-array-widetag))
         (setf (svref infos code) info)))
 
-    (setf (svref infos bignum-widetag)
-          ;; Lose 1 more bit than n-widetag-bits because fullcgc robs 1 bit,
-          ;; not that this is expected to work concurrently with gc.
-          (make-room-info (ash most-positive-word (- (1+ n-widetag-bits)))
-                          'bignum :other))
-    (setf (svref infos filler-widetag)
-          (make-room-info (ash most-positive-word (- (1+ n-widetag-bits)))
-                          'filler :other))
-
-    (setf (svref infos closure-widetag)
-          (make-room-info short-header-max-words 'closure :closure))
+    (setf (svref infos filler-widetag) (make-room-info 'filler))
 
     (dotimes (i (length *specialized-array-element-type-properties*))
       (let ((saetp (aref *specialized-array-element-type-properties* i)))
-        (when (saetp-specifier saetp) ;; SIMPLE-ARRAY-NIL is a special case.
-          (setf (svref infos (saetp-typecode saetp)) saetp))))
+        (setf (svref infos (saetp-typecode saetp)) saetp)))
 
-    ;; This one is here for completeness only- LENGTH does not imply size.
-    (setf (svref infos simple-array-nil-widetag)
-          (make-room-info 0 'simple-array-nil :other))
-
-    (setf (svref infos code-header-widetag)
-          (make-room-info 0 'code :code))
-
-    (setf (svref infos instance-widetag)
-          (make-room-info 0 'instance :instance))
-
-    (setf (svref infos funcallable-instance-widetag)
-          (make-room-info short-header-max-words 'funcallable-instance :closure))
-
-    (let ((cons-info (make-room-info 0 'cons :list)))
+    (let ((cons-info (make-room-info 'cons)))
       ;; A cons consists of two words, both of which may be either a
       ;; pointer or immediate data.  According to the runtime this means
       ;; either a fixnum, a character, an unbound-marker, a single-float
@@ -260,13 +227,12 @@
               (start #+64-bit (unsigned 32) #-64-bit signed)
               ;; On platforms with small enough GC pages, this field
               ;; will be a short. On platforms with larger ones, it'll
-              ;; be an int.
-              ;; Measured in bytes; the low bit has to be masked off.
-              (bytes-used (unsigned
-                           #.(if (typep gencgc-card-bytes '(unsigned-byte 16))
+              ;; be an int. It should probably never be an int.
+              (words-used (unsigned
+                           #.(if (typep gencgc-page-words '(unsigned-byte 16))
                                  16
                                  32)))
-              (flags (unsigned 8))
+              (flags (unsigned 8)) ; in C this is {type, need_zerofill, pinned}
               (gen (signed 8))))
   #+immobile-space
   (progn
@@ -412,7 +378,7 @@ We could try a few things to mitigate this:
        ;; in order to determine what regions contain objects.
 
        ;; We explicitly presume that any pages in an allocation region
-       ;; that are in-use have a BYTES-USED of GENCGC-CARD-BYTES
+       ;; that are in-use have a BYTES-USED of GENCGC-PAGE-BYTES
        ;; (indicating a full page) or an otherwise-valid BYTES-USED.
        ;; We also presume that the pages of an open allocation region
        ;; after the first page, and any pages that are unallocated,
@@ -420,7 +386,7 @@ We could try a few things to mitigate this:
 
        ;; Our procedure is to scan forward through the page table,
        ;; maintaining an "end pointer" until we reach a page where
-       ;; BYTES-USED is not GENCGC-CARD-BYTES or we reach
+       ;; BYTES-USED is not GENCGC-PAGE-BYTES or we reach
        ;; NEXT-FREE-PAGE.  We then MAP-OBJECTS-IN-RANGE if the range
        ;; is not empty, and proceed to the next page (unless we've hit
        ;; NEXT-FREE-PAGE).
@@ -439,28 +405,27 @@ We could try a few things to mitigate this:
       ((> start-page initial-next-free-page))
          ;; The type constraint on page indices is probably too generous,
          ;; but it does its job of producing efficient code.
-    (declare (type (integer 0 (#.(/ (ash 1 n-machine-word-bits) gencgc-card-bytes)))
+    (declare (type (integer 0 (#.(/ (ash 1 n-machine-word-bits) gencgc-page-bytes)))
                    start-page end-page))
     (setq end-page start-page)
     (loop (setq end-page-bytes-used
-                ;; The low bit of bytes-used is the need-to-zero flag.
-                (logandc1 1 (slot (deref page-table end-page) 'bytes-used)))
+                (ash (slot (deref page-table end-page) 'words-used) word-shift))
           ;; See 'page_ends_contiguous_block_p' in gencgc.c
-          (when (or (< end-page-bytes-used gencgc-card-bytes)
+          (when (or (< end-page-bytes-used gencgc-page-bytes)
                     (= (slot (deref page-table (1+ end-page)) 'start) 0))
             (return))
           (incf end-page))
     (let ((start (sap+ base (truly-the signed-word
-                                       (logand (* start-page gencgc-card-bytes)
+                                       (logand (* start-page gencgc-page-bytes)
                                                most-positive-word))))
           (end (sap+ base (truly-the signed-word
-                                     (logand (+ (* end-page gencgc-card-bytes)
+                                     (logand (+ (* end-page gencgc-page-bytes)
                                                 end-page-bytes-used)
                                              most-positive-word)))))
       (when (sap> end start)
-        ;; The bits in the 5-bit flag field have fixed positions,
+        ;; The bits in the 6-bit 'type' field have fixed positions,
         ;; but the position of the field itself depends on endianness.
-        (let ((flags (ldb #+little-endian (byte 5 0) #+big-endian (byte 5 3)
+        (let ((flags (ldb (byte 6 (+ #+big-endian 2))
                           (slot (deref page-table start-page) 'flags))))
           ;; The GEN slot is declared as (SIGNED 8) which does not satisfy the
           ;; type restriction on the first argument to LOGBITP.
@@ -482,7 +447,7 @@ We could try a few things to mitigate this:
 ;; Moreover it's probably not safe in the least to walk any thread's
 ;; allocation region, unless the observer and observed aren't consing.
 (defun close-thread-alloc-region ()
-  #+gencgc (alien-funcall (extern-alien "close_thread_region" (function void)))
+  #+gencgc (alien-funcall (extern-alien "close_current_thread_tlab" (function void)))
   nil)
 
 ;;;; MEMORY-USAGE
@@ -1176,7 +1141,7 @@ We could try a few things to mitigate this:
                                                   :initial-element 0)))
   (flet ((dump-page (page-num)
            (format stream "~&Page ~D~%" page-num)
-           (let ((where (+ dynamic-space-start (* page-num gencgc-card-bytes)))
+           (let ((where (+ dynamic-space-start (* page-num gencgc-page-bytes)))
                  (seen-filler nil))
              (loop
                (let* ((obj (let ((sap (int-sap where)))
@@ -1195,7 +1160,7 @@ We could try a few things to mitigate this:
                  (loop for index from page-num to (find-page-index (1- where))
                        do (setf (sbit pages index) 1)))
                (let ((next-page (find-page-index where)))
-                 (cond ((= (logand where (1- gencgc-card-bytes)) 0)
+                 (cond ((= (logand where (1- gencgc-page-bytes)) 0)
                         (format stream "~&-- END OF PAGE --~%")
                         (return next-page))
                        ((eq next-page page-num))
@@ -1208,7 +1173,7 @@ We could try a few things to mitigate this:
                      (setq i (dump-page i))
                      (incf i)))))
     (let* ((n-pages (count 1 pages))
-           (tot (* n-pages gencgc-card-bytes))
+           (tot (* n-pages gencgc-page-bytes))
            (waste (- tot n-code-bytes)))
       (format t "~&Used-bytes=~D Pages=~D Waste=~D (~F%)~%"
               n-code-bytes n-pages waste
@@ -1283,6 +1248,20 @@ We could try a few things to mitigate this:
                                  data-bits)
                                 (t
                                  code-bits))))
+         ;; If Lisp allocates to cons pages, then this check is always valid.
+         ;; If not, then at first glance we could weaken the check to allow
+         ;; gen0 conses on MIXED pages, but even that is not enough- pinned conses
+         ;; will promote but keep their MIXED page type. So don't bother with this.
+         #+use-cons-region
+         (let* ((flags (slot (deref page-table (find-page-index obj-addr)) 'flags))
+                (type (ldb (byte 6 (+ #+big-endian 2)) flags))
+                (ok (if (consp obj)
+                        (or (= type #b101) ; PAGE_TYPE_CONS
+                            (and (eq (car obj) 0) (eq (cdr obj) 0)))
+                        (/= type #b101))))
+           (unless ok
+             (error "Object @ ~x (gen~D) is on page-type ~b~%"
+                    obj-addr (generation-of obj) type)))
          ;; This is not the most efficient way to update the bit arrays,
          ;; but the simplest and clearest for sure. (The loop could avoided
          ;; if the current page is the same as the previously seen page)
@@ -1293,7 +1272,7 @@ We could try a few things to mitigate this:
                do (cond ((= (sbit other-array index) 1)
                          (format t "~&broken on page index ~d base ~x~%"
                                  index
-                                 (+ dynamic-space-start (* index gencgc-card-bytes)))
+                                 (+ dynamic-space-start (* index gencgc-page-bytes)))
                          (alien-funcall (extern-alien "ldb_monitor" (function void))))
                         (t
                          (setf (sbit array index) 1))))))
@@ -1377,9 +1356,9 @@ We could try a few things to mitigate this:
 ;;; to fail.
 (defun print-page-contents (page)
   (let* ((start
-          (+ (current-dynamic-space-start) (* gencgc-card-bytes page)))
+          (+ (current-dynamic-space-start) (* gencgc-page-bytes page)))
          (end
-          (+ start gencgc-card-bytes)))
+          (+ start gencgc-page-bytes)))
     (map-objects-in-range #'print-it (%make-lisp-obj start) (%make-lisp-obj end)))))
 
 (defun map-code-objects (fun)
@@ -1469,3 +1448,13 @@ We could try a few things to mitigate this:
 (defvar *!cold-allocation-patch-point*)
 (loop for (code . points) in *!cold-allocation-patch-point*
       do (setf (gethash code *allocation-patch-points*) points))
+
+(defun gctablesize (heap-size-gb page-size cards-per-page)
+  (let* ((card-size (/ page-size cards-per-page))
+         (heap-size (* heap-size-gb (expt 1024 3)))
+         (npages (/ heap-size page-size))
+         (ncards (/ heap-size card-size))
+         (pte-nbytes (* 8 npages)))
+    (format t " PTE bytes: ~8D~%" pte-nbytes)
+    (format t "card bytes: ~8D~%" ncards)
+    (format t "     total: ~8D~%" (+ pte-nbytes ncards))))

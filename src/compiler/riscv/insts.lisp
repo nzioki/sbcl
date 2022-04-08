@@ -14,13 +14,28 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from SB-VM into this package
-  (import '(sb-vm::u-and-i-inst-immediate
-            sb-vm::lip-tn
-            sb-vm::zero-tn
-            sb-vm::null-tn
+  (import '(;; SBs, SCs, and TNs
+            sb-vm::immediate-constant
+            sb-vm::registers sb-vm::float-registers
+            sb-vm::zero
+            sb-vm::zero-offset
+            sb-vm::lip-tn sb-vm::zero-tn
+            ;; Types
+            sb-vm::u-and-i-inst-immediate
             sb-vm::short-immediate
             sb-vm::short-immediate-fixnum
             sb-vm::u+i-immediate)))
+
+;;;; Constants, types, conversion functions, some disassembler stuff.
+
+(defun reg-tn-encoding (tn)
+  (declare (type tn tn))
+  (sc-case tn
+    (zero zero-offset)
+    (t
+     (case (sb-name (sc-sb (tn-sc tn)))
+       ((registers float-registers) (tn-offset tn))
+       (t (error "~S isn't a register." tn))))))
 
 
 ;;;; disassembler field definitions
@@ -68,11 +83,11 @@
      (integer
       (emit-machine-word segment word)))))
 
-(defconstant-eqx reg-printer
+(defconstant-eqx r-printer
     '(:name :tab rd ", " rs1 ", " rs2)
-  #'equalp)
+  #'equal)
 
-(define-instruction-format (r 32 :default-printer reg-printer)
+(define-instruction-format (r 32 :default-printer r-printer)
   (funct7 :field (byte 7 25))
   (rs2 :field (byte 5 20) :type 'reg)
   (rs1 :field (byte 5 15) :type 'reg)
@@ -83,11 +98,11 @@
 (define-bitfield-emitter %emit-r-inst 32
   (byte 7 25) (byte 5 20) (byte 5 15) (byte 3 12) (byte 5 7) (byte 7 0))
 (defun emit-r-inst (segment funct7 rs2 rs1 funct3 rd opcode)
-  (%emit-r-inst segment funct7 (tn-offset rs2) (tn-offset rs1) funct3 (tn-offset rd) opcode))
+  (%emit-r-inst segment funct7 (reg-tn-encoding rs2) (reg-tn-encoding rs1) funct3 (reg-tn-encoding rd) opcode))
 
 (defconstant-eqx i-printer
     '(:name :tab rd ", " rs1 ", " imm)
-  #'equalp)
+  #'equal)
 
 (define-instruction-format (i 32 :default-printer i-printer)
   (i-annotation :fields (list (byte 5 15) (byte 12 20)))
@@ -104,14 +119,14 @@
 (defun emit-i-inst (segment imm rs1 funct3 rd opcode)
   (etypecase imm
     (short-immediate
-     (%emit-i-inst segment imm (tn-offset rs1) funct3 (tn-offset rd) opcode))
+     (%emit-i-inst segment imm (reg-tn-encoding rs1) funct3 (reg-tn-encoding rd) opcode))
     (fixup
      (note-fixup segment :i-type imm)
-     (%emit-i-inst segment 0 (tn-offset rs1) funct3 (tn-offset rd) opcode))))
+     (%emit-i-inst segment 0 (reg-tn-encoding rs1) funct3 (reg-tn-encoding rd) opcode))))
 
 (defconstant-eqx s-printer
     '(:name :tab rs2 ", " "(" imm ")" rs1)
-  #'equalp)
+  #'equal)
 
 (define-instruction-format (s 32 :default-printer s-printer)
   (store-annotation :fields (list (byte 5 15) (byte 7 25) (byte 5 7)) :type 'store-annotation)
@@ -126,14 +141,20 @@
 (defun emit-s-inst (segment imm rs2 rs1 funct3 opcode)
   (etypecase imm
     (short-immediate
-     (%emit-s-inst segment (ldb (byte 7 5) imm) (tn-offset rs2) (tn-offset rs1) funct3 (ldb (byte 5 0) imm) opcode))
+     (%emit-s-inst segment (ldb (byte 7 5) imm)
+                   (reg-tn-encoding rs2) (reg-tn-encoding rs1)
+                   funct3 (ldb (byte 5 0) imm)
+                   opcode))
     (fixup
      (note-fixup segment :s-type imm)
-     (%emit-s-inst segment 0 (tn-offset rs2) (tn-offset rs1) funct3 0 opcode))))
+     (%emit-s-inst segment 0
+                   (reg-tn-encoding rs2) (reg-tn-encoding rs1)
+                   funct3 0
+                   opcode))))
 
 (defconstant-eqx cond-branch-printer
   '(:name :tab rs1 ", " rs2 ", " imm)
-  #'equalp)
+  #'equal)
 
 (define-instruction-format (b 32 :default-printer cond-branch-printer)
   (imm :fields (list (byte 1 31) (byte 1 7) (byte 6 25) (byte 4 8)) :type 'relative-b-label)
@@ -147,12 +168,13 @@
 (defun emit-b-inst (segment imm rs2 rs1 funct3 opcode)
   (aver (not (logbitp 0 imm)))
   (%emit-b-inst segment (ldb (byte 1 12) imm) (ldb (byte 6 5) imm)
-                (tn-offset rs2) (tn-offset rs1) funct3 (ldb (byte 4 1) imm)
+                (reg-tn-encoding rs2) (reg-tn-encoding rs1)
+                funct3 (ldb (byte 4 1) imm)
                 (ldb (byte 1 11) imm) opcode))
 
 (defconstant-eqx u-printer
     '(:name :tab rd ", " imm)
-  #'equalp)
+  #'equal)
 
 (define-instruction-format (u 32 :default-printer u-printer)
   (imm :field (byte 20 12) :printer "#x~5,'0X")
@@ -164,14 +186,14 @@
 (defun emit-u-inst (segment imm rd opcode)
   (etypecase imm
     (integer
-     (%emit-u-inst segment imm (tn-offset rd) opcode))
+     (%emit-u-inst segment imm (reg-tn-encoding rd) opcode))
     (fixup
      (note-fixup segment :u-type imm)
-     (%emit-u-inst segment 0 (tn-offset rd) opcode))))
+     (%emit-u-inst segment 0 (reg-tn-encoding rd) opcode))))
 
 (defconstant-eqx j-printer
   '(:name :tab rd ", " imm)
-  #'equalp)
+  #'equal)
 
 (define-instruction-format (j 32 :default-printer j-printer)
   (imm :fields (list (byte 1 31) (byte 8 12) (byte 1 20) (byte 10 21)) :type 'relative-j-label)
@@ -184,7 +206,7 @@
   (aver (not (logbitp 0 imm)))
   (%emit-j-inst segment (ldb (byte 1 20) imm) (ldb (byte 10 1) imm)
                 (ldb (byte 1 11) imm) (ldb (byte 8 12) imm)
-                (tn-offset rd) opcode))
+                (reg-tn-encoding rd) opcode))
 
 (define-instruction lui (segment rd ui)
   (:printer u ((opcode #b0110111)))
@@ -292,38 +314,36 @@
   (define-branch-instruction bltu #b110)
   (define-branch-instruction bgeu #b111))
 
-(macrolet ((define-load-instruction (name funct3 &optional wordp)
+(macrolet ((define-load-instruction (name funct3)
              `(define-instruction ,name (segment rd rs offset)
                 (:printer i
                           ((funct3 ,funct3)
                            (opcode #b0000011)
                            (i-annotation nil :type 'load-annotation))
-                          '(:name :tab rd ", (" imm ")" rs1
-                            ,(when wordp 'i-annotation)))
+                          '(:name :tab rd ", (" imm ")" rs1 i-annotation))
                 (:emitter
                  (emit-i-inst segment offset rs ,funct3 rd #b0000011)))))
   (define-load-instruction lb #b000)
   (define-load-instruction lh #b001)
-  (define-load-instruction lw #b010 #-64-bit t)
+  (define-load-instruction lw #b010)
   #+64-bit
   (progn
-    (define-load-instruction ld #b011 t)
+    (define-load-instruction ld #b011)
     (define-load-instruction lwu #b110))
   (define-load-instruction lbu #b100)
   (define-load-instruction lhu #b101))
 
-(macrolet ((define-store-instruction (name funct3 &optional wordp)
+(macrolet ((define-store-instruction (name funct3)
              `(define-instruction ,name (segment rs2 rs1 offset)
                 (:printer s ((funct3 ,funct3) (opcode #b0100011))
-                          '(:name :tab rs2 ", " "(" imm ")" rs1
-                            ,(when wordp 'store-annotation)))
+                          '(:name :tab rs2 ", " "(" imm ")" rs1 store-annotation))
                 (:emitter
                  (emit-s-inst segment offset rs2 rs1 ,funct3 #b0100011)))))
   (define-store-instruction sb #b000)
   (define-store-instruction sh #b001)
-  (define-store-instruction sw #b010 #-64-bit t)
+  (define-store-instruction sw #b010)
   #+64-bit
-  (define-store-instruction sd #b011 t))
+  (define-store-instruction sd #b011))
 
 (macrolet ((define-immediate-arith-instruction (name funct3 &optional word-name)
              `(progn
@@ -564,10 +584,16 @@
     (:fcsr #x003)))
 
 (defun emit-csr-inst (segment csr funct3 rs rd)
-  (%emit-i-inst segment (csr-encoding csr) (tn-offset rs) funct3 (tn-offset rd) #b1110011))
+  (%emit-i-inst segment
+                (csr-encoding csr) (reg-tn-encoding rs)
+                funct3 (reg-tn-encoding rd)
+                #b1110011))
 
 (defun emit-csr-i-inst (segment csr funct3 zimm rd)
-  (%emit-i-inst segment (csr-encoding csr) zimm funct3 (tn-offset rd) #b1110011))
+  (%emit-i-inst segment
+                (csr-encoding csr) zimm
+                funct3 (reg-tn-encoding rd)
+                #b1110011))
 
 (macrolet ((define-csr-instruction (name funct3)
              `(define-instruction ,name (segment rd csr rs)
@@ -698,23 +724,23 @@
   (rd :field (byte 5 7) :type 'fp-reg)
   (opcode :field (byte 7 0)))
 
-(defun ensure-tn-offset (imm/tn)
+(defun ensure-reg-tn-encoding (imm/tn)
   (etypecase imm/tn
     ((integer 0 31) imm/tn)
-    (tn (tn-offset imm/tn))))
+    (tn (reg-tn-encoding imm/tn))))
 
 (defun emit-r-float-inst (segment rs3/funct5 fmt rs2 rs1 rm rd opcode)
   (%emit-r-inst segment
-                (dpb (ensure-tn-offset rs3/funct5)
+                (dpb (ensure-reg-tn-encoding rs3/funct5)
                      (byte 5 2)
                      (ecase fmt
                        (:single #b00)
                        (:double #b01)
                        (:quad #b10)))
-                (ensure-tn-offset rs2)
-                (tn-offset rs1)
+                (ensure-reg-tn-encoding rs2)
+                (reg-tn-encoding rs1)
                 rm
-                (tn-offset rd)
+                (reg-tn-encoding rd)
                 opcode))
 
 (defun rm-encoding (rm)
@@ -830,11 +856,11 @@
     (:emitter
      (emit-s-inst segment offset rs1 rs2 (fmt-funct3 fmt) #b0100111))))
 
-;;;; Boxed-object computation instructions (for LRA and CODE)
+;;;; Boxed-object computation instructions (for RA and CODE)
 
 ;;; Try to compute DEST from SRC if possible. Otherwise, fall back to
 ;;; using a PC relative calculation as the worst case.
-(defun emit-compute (segment vop dest lip pc-relative-delta src-relative-delta &optional src)
+(defun emit-compute (segment vop dest src lip pc-relative-delta src-relative-delta)
   (labels ((pc-relative-emitter (segment position)
              (multiple-value-bind (u i)
                  (u-and-i-inst-immediate (funcall pc-relative-delta position))
@@ -843,11 +869,11 @@
                  (inst addi dest lip i))))
            (src-relative-emitter (segment position)
              (assemble (segment vop)
-               (inst addi dest src (funcall src-relative-delta position))))
-           (maybe-shrink (segment chooser position magic-value)
+               (inst addi dest src (funcall src-relative-delta position 0))))
+           (maybe-shrink (segment chooser position delta-if-after)
              (declare (ignore chooser))
              (when (and src
-                        (typep (funcall src-relative-delta position magic-value)
+                        (typep (funcall src-relative-delta position delta-if-after)
                                'short-immediate))
                (emit-back-patch segment 4 #'src-relative-emitter)
                t)))
@@ -856,44 +882,48 @@
      #'maybe-shrink
      #'pc-relative-emitter)))
 
-;;; FIXME: Could potentially optimize away an instruction in
-;;; XEP-ALLOCATE-FRAME in some cases when the code can be computed off
-;;; of the register used to call the function, like MIPS. Probably
-;;; requires always using LR as a lip tn though. Also, if the return
-;;; register is fixed, could compute code in one instruction in values
-;;; receiving routines.
-(define-instruction compute-code (segment code lip label &optional src)
+(define-instruction compute-code-from-fn (segment dest src lip label)
   (:vop-var vop)
   (:emitter
-   (emit-compute segment vop code lip
-                 (lambda (position &optional magic-value)
-                   (declare (ignore magic-value))
+   (emit-compute segment vop dest src lip
+                 (lambda (position)
                    (- other-pointer-lowtag
                       position
                       (component-header-length)))
-                 ;; code = lra - other-pointer-tag - header - label-offset + other-pointer-tagged
-                 ;;      = lra - (header + label-offset)
-                 (lambda (position &optional (magic-value 0))
-                   (- (+ (label-position label position magic-value)
-                         (component-header-length))))
-                 src)))
+                 ;; code = fn - fn-ptr-type - header - label-offset + other-pointer-tag
+                 (lambda (position delta-if-after)
+                   (- other-pointer-lowtag
+                      (+ fun-pointer-lowtag
+                         (label-position label position delta-if-after)
+                         (component-header-length)))))))
 
-(define-instruction compute-lra (segment dest lip lra-label &optional src)
+(define-instruction compute-code-from-ra (segment dest src lip label)
   (:vop-var vop)
   (:emitter
-   (emit-compute segment vop dest lip
-                 (lambda (position &optional magic-value)
-                   (- (+ (label-position lra-label
-                                         (when magic-value position)
-                                         magic-value)
-                         other-pointer-lowtag)
-                      position))
-                 ;; lra = code + other-pointer-tag + header + label-offset - other-pointer-tag
-                 ;;     = code + header + label-offset
-                 (lambda (position &optional (magic-value 0))
-                   (+ (label-position lra-label position magic-value)
+   (emit-compute segment vop dest src lip
+                 (lambda (position)
+                   (- other-pointer-lowtag
+                      position
                       (component-header-length)))
-                 src)))
+                 ;; code = ra - header - label-offset + other-pointer-tag
+                 ;;      = ra + other-pointer-tag - (header + label-offset)
+                 (lambda (position delta-if-after)
+                   (- other-pointer-lowtag
+                      (+ (label-position label position delta-if-after)
+                         (component-header-length)))))))
+
+(define-instruction compute-ra-from-code (segment dest src lip label)
+  (:vop-var vop)
+  (:emitter
+   (emit-compute segment vop dest src lip
+                 (lambda (position)
+                   (- (label-position label) position))
+                 ;; ra = code - other-pointer-tag + header + label-offset
+                 ;;    = code + header + label-offset - other-pointer-tag
+                 (lambda (position delta-if-after)
+                   (- (+ (label-position label position delta-if-after)
+                         (component-header-length))
+                      other-pointer-lowtag)))))
 
 (defun emit-header-data (segment type)
   (emit-back-patch
@@ -907,10 +937,6 @@
 (define-instruction simple-fun-header-word (segment)
   (:emitter
    (emit-header-data segment simple-fun-widetag)))
-
-(define-instruction lra-header-word (segment)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
 
 (define-instruction-macro load-layout-id (reg layout)
   `(progn (inst .layout-id-fixup ,layout)
@@ -946,13 +972,455 @@
                (ldb (byte 7 5) i))))))
    nil)
 
-(define-instruction store-coverage-mark (segment path-index)
+(define-instruction store-coverage-mark (segment mark-index)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
    (let ((offset (+ (component-header-length)
-                    n-word-bytes ; skip over jump table word
-                    path-index
+                    ;; skip over jump table word and entries
+                    (* (1+ (component-n-jump-table-entries))
+                       n-word-bytes)
+                    mark-index
                     (- other-pointer-lowtag))))
-     (inst* segment 'sb sb-vm::null-tn sb-vm::code-tn
-            (the (unsigned-byte 15) offset)))))
+     (assemble (segment)
+       (inst sb sb-vm::null-tn sb-vm::code-tn
+             (the (unsigned-byte 11) offset))))))
+
+
+;;;; The RISC-V C extension.
+
+(define-arg-type rvc-reg :printer #'print-rvc-reg)
+(define-arg-type ci-imm :printer #'print-ci-imm)
+(define-arg-type ci-load-32-imm :printer #'print-ci-load-32-imm)
+(define-arg-type ci-load-64-imm :printer #'print-ci-load-64-imm)
+(define-arg-type css-32-imm :printer #'print-css-32-imm)
+(define-arg-type css-64-imm :printer #'print-css-64-imm)
+(define-arg-type ciw-imm :printer #'print-ciw-imm)
+(define-arg-type cl/cs-32-imm :printer #'print-cl/cs-32-imm)
+(define-arg-type cl/cs-64-imm :printer #'print-cl/cs-64-imm)
+(define-arg-type cb-arith-imm :printer #'print-cb-arith-imm)
+(define-arg-type relative-cb-label :use-label #'use-cb-label)
+(define-arg-type relative-cj-label :use-label #'use-cj-label)
+
+(defun rvc-reg-tn-encoding (tn)
+  (declare (type tn tn))
+  (let ((offset (reg-tn-encoding tn)))
+    (aver (<= 8 offset 15))
+    (- offset 8)))
+
+(defconstant-eqx cr-printer
+    '(:name :tab rd/rs1 ", " rs2)
+  #'equal)
+
+(define-instruction-format (cr 16 :default-printer cr-printer)
+  (funct4 :field (byte 4 12))
+  (rd/rs1 :field (byte 5 7) :type 'reg)
+  (rs2 :field (byte 5 2) :type 'reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cr-inst 16
+  (byte 4 12) (byte 5 7) (byte 5 2) (byte 2 0))
+(defun emit-cr-inst (segment funct4 rd/rs1 rs2 opcode)
+  (%emit-cr-inst segment funct4 (reg-tn-encoding rd/rs1) (reg-tn-encoding rs2) opcode))
+
+(defconstant-eqx ci-printer
+    '(:name :tab rd/rs1 ", " imm)
+  #'equal)
+
+(define-instruction-format (ci 16 :default-printer ci-printer)
+  (funct3 :field (byte 3 13))
+  (rd/rs1 :field (byte 5 7) :type 'reg)
+  (imm :fields (list (byte 1 12) (byte 5 2)) :type 'ci-imm)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-ci-inst 16
+  (byte 3 13) (byte 1 12) (byte 5 7) (byte 5 2) (byte 2 0))
+(defun emit-ci-inst (segment funct3 rd/rs1 imm opcode)
+  (%emit-ci-inst segment funct3 (ldb (byte 1 5) imm)
+                 (reg-tn-encoding rd/rs1) (ldb (byte 5 0) imm) opcode))
+
+(defconstant-eqx ci-load-printer
+    '(:name :tab rd ", " imm)
+  #'equal)
+
+(define-instruction-format (ci-load-32 16 :default-printer ci-load-printer)
+  (funct3 :field (byte 3 13))
+  (rd :field (byte 5 7) :type 'reg)
+  (imm :fields (list (byte 1 12) (byte 5 2)) :type 'ci-load-32-imm)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-ci-load-32-inst 16
+  (byte 3 13) (byte 1 12) (byte 5 7) (byte 3 4) (byte 2 2) (byte 2 0))
+
+(defun emit-ci-load-32-inst (segment funct3 rd imm opcode)
+  (aver (zerop (rem imm 4)))
+  (%emit-ci-load-32-inst segment funct3 (ldb (byte 1 5) imm)
+                         (reg-tn-encoding rd) (ldb (byte 3 2) imm)
+                         (ldb (byte 2 6) imm) opcode))
+
+(define-instruction-format (ci-load-64 16 :default-printer ci-load-printer)
+  (funct3 :field (byte 3 13))
+  (rd :field (byte 5 7) :type 'reg)
+  (imm :fields (list (byte 1 12) (byte 5 2)) :type 'ci-load-64-imm)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-ci-load-64-inst 16
+  (byte 3 13) (byte 1 12) (byte 5 7) (byte 2 5) (byte 3 2) (byte 2 0))
+
+(defun emit-ci-load-64-inst (segment funct3 rd imm opcode)
+  (aver (zerop (rem imm 8)))
+  (%emit-ci-load-32-inst segment funct3 (ldb (byte 1 5) imm)
+                         (reg-tn-encoding rd) (ldb (byte 2 3) imm)
+                         (ldb (byte 3 6) imm) opcode))
+
+(defconstant-eqx css-printer
+    '(:name :tab rs2 ", " imm)
+  #'equal)
+
+(define-instruction-format (css-32 16 :default-printer css-printer)
+  ;; TODO: store annotation
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 2 7) (byte 4 9)) :type 'css-32-imm)
+  (rs2 :field (byte 5 2) :type 'reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-css-32-inst 16
+  (byte 3 13) (byte 4 9) (byte 2 7) (byte 5 2) (byte 2 0))
+(defun emit-css-32-inst (segment funct3 imm rs2 opcode)
+  (aver (zerop (rem imm 4)))
+  (%emit-css-32-inst segment (ldb (byte 4 2) imm)
+                     funct3 (ldb (byte 2 6) imm)
+                     (rvc-reg-tn-encoding rs2) opcode))
+
+(define-instruction-format (css-64 16 :default-printer css-printer)
+  ;; TODO: store annotation
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 3 7) (byte 3 10)) :type 'css-64-imm)
+  (rs2 :field (byte 5 2) :type 'reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-css-64-inst 16
+  (byte 3 13) (byte 3 10) (byte 3 7) (byte 5 2) (byte 2 0))
+(defun emit-css-64-inst (segment funct3 imm rs2 opcode)
+  (aver (zerop (rem imm 4)))
+  (%emit-css-64-inst segment (ldb (byte 4 2) imm)
+                     funct3 (ldb (byte 2 6) imm)
+                     (rvc-reg-tn-encoding rs2) opcode))
+
+(defconstant-eqx ciw-printer
+    '(:name :tab rd* ", " imm)
+  #'equal)
+
+(define-instruction-format (ciw 16 :default-printer ciw-printer)
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 4 7) (byte 2 11) (byte 1 5) (byte 1 6)) :type 'ciw-imm)
+  (rd* :field (byte 3 2) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-ciw-inst 16
+  (byte 3 13) (byte 2 11) (byte 4 7) (byte 1 6) (byte 1 5) (byte 3 2) (byte 2 0))
+(defun emit-ciw-inst (segment funct3 imm rd* opcode)
+  (%emit-ciw-inst segment funct3 (ldb (byte 2 4) imm)
+                  (ldb (byte 4 6) imm) (ldb (byte 1 2) imm)
+                  (ldb (byte 1 3) imm) (rvc-reg-tn-encoding rd*)
+                  opcode))
+
+(defconstant-eqx cl/cs-printer
+    '(:name :tab rd*/rs2* ", " "(" imm ")" rs1*)
+  #'equal)
+
+(define-instruction-format (cl/cs-32 16 :default-printer cl/cs-printer)
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 1 6) (byte 3 10) (byte 1 5)) :type 'cl/cs-32-imm)
+  (rs1* :field (byte 3 7) :type 'rvc-reg)
+  (rd*/rs2* :field (byte 3 2) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cl/cs-32-inst 16
+  (byte 3 13) (byte 3 10) (byte 3 7) (byte 1 6) (byte 1 5) (byte 3 2) (byte 2 0))
+
+(defun emit-cl/cs-32-inst (segment funct3 rs1* imm rd*/rs2* opcode)
+  (aver (zerop (rem imm 4)))
+  (%emit-cl/cs-32-inst segment funct3 (ldb (byte 3 3) imm)
+                       (rvc-reg-tn-encoding rs1*) (ldb (byte 1 2) imm)
+                       (ldb (byte 1 6) imm) (rvc-reg-tn-encoding rd*/rs2*)
+                       opcode))
+
+(define-instruction-format (cl/cs-64 16 :default-printer cl/cs-printer)
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 2 5) (byte 3 10)) :type 'cl/cs-64-imm)
+  (rs1* :field (byte 3 7) :type 'rvc-reg)
+  (rd*/rs2* :field (byte 3 2) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cl/cs-64-inst 16
+  (byte 3 13) (byte 3 10) (byte 3 7) (byte 2 5) (byte 3 2) (byte 2 0))
+
+(defun emit-cl/cs-64-inst (segment funct3 rs1* imm rd*/rs2* opcode)
+  (aver (zerop (rem imm 8)))
+  (%emit-cl/cs-64-inst segment funct3 (ldb (byte 3 3) imm)
+                       (rvc-reg-tn-encoding rs1*) (ldb (byte 2 6) imm)
+                       (rvc-reg-tn-encoding rd*/rs2*) opcode))
+
+(defconstant-eqx ca-printer
+    '(:name :tab rd*/rs1* ", " rs2*)
+  #'equal)
+
+(define-instruction-format (ca 16 :default-printer ca-printer)
+  (funct6 :field (byte 6 10))
+  (rd*/rs1* :field (byte 3 7) :type 'rvc-reg)
+  (funct2 :field (byte 2 5))
+  (rs2* :field (byte 3 2) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-ca-inst 16
+  (byte 6 10) (byte 3 7) (byte 2 5) (byte 3 2) (byte 2 0))
+
+(defconstant-eqx cb-arith-printer
+    '(:name :tab rd*/rs1* ", " imm)
+  #'equal)
+
+(define-instruction-format (cb-arith 16 :default-printer cb-arith-printer)
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 1 12) (byte 5 2)) :type 'cb-arith-imm)
+  (funct2 :field (byte 2 10))
+  (rd*/rs1* :field (byte 3 7) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cb-arith-inst 16
+  (byte 3 13) (byte 1 12) (byte 2 10) (byte 3 7) (byte 5 2) (byte 2 0))
+
+(defun emit-cb-arith-inst (segment funct3 funct2 rd*/rs1* imm opcode)
+  (%emit-cb-arith-inst segment funct3 (ldb (byte 1 5) imm)
+                       funct2 (rvc-reg-tn-encoding rd*/rs1*)
+                       (ldb (byte 5 0) imm) opcode))
+
+(defconstant-eqx cb-branch-printer
+    '(:name :tab rs1* ", " offset)
+  #'equal)
+
+(define-instruction-format (cb-branch 16 :default-printer cb-branch-printer)
+  (funct3 :field (byte 3 13))
+  (offset :fields (list (byte 1 12) (byte 2 5) (byte 1 2) (byte 2 10) (byte 2 3))
+          :type 'relative-cb-label)
+  (rs1* :field (byte 3 7) :type 'rvc-reg)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cb-branch-inst 16
+  (byte 3 13) (byte 1 12) (byte 2 10) (byte 3 7)
+  (byte 2 5) (byte 2 3) (byte 1 2) (byte 2 0))
+
+(defun emit-cb-branch-inst (segment funct3 imm rs1* opcode)
+  (aver (not (logbitp 0 imm)))
+  (%emit-cb-branch-inst segment funct3
+                        (ldb (byte 1 8) imm)
+                        (ldb (byte 2 3) imm)
+                        (rvc-reg-tn-encoding rs1*)
+                        (ldb (byte 2 6) imm)
+                        (ldb (byte 2 1) imm)
+                        (ldb (byte 1 5) imm)
+                        opcode))
+
+(defconstant-eqx cj-printer
+    '(:name :tab imm)
+  #'equal)
+
+(define-instruction-format (cj 16 :default-printer cj-printer)
+  (funct3 :field (byte 3 13))
+  (imm :fields (list (byte 1 12) (byte 1 8) (byte 2 9) (byte 1 6)
+                     (byte 1 7) (byte 1 2) (byte 1 8) (byte 3 3))
+       :type 'relative-cj-label)
+  (opcode :field (byte 2 0)))
+
+(define-bitfield-emitter %emit-cj-inst 16
+  (byte 3 13) (byte 1 12) (byte 1 11) (byte 2 9) (byte 1 8)
+  (byte 1 7) (byte 1 6) (byte 3 3) (byte 1 2) (byte 2 0))
+
+(defun emit-cj-inst (segment funct3 imm opcode)
+  (aver (not (logbitp 0 imm)))
+  (%emit-cj-inst segment funct3
+                 (ldb (byte 1 11) imm) (ldb (byte 1 4) imm)
+                 (ldb (byte 2 8) imm) (ldb (byte 1 10) imm)
+                 (ldb (byte 1 6) imm) (ldb (byte 1 7) imm)
+                 (ldb (byte 3 1) imm) (ldb (byte 1 5) imm)
+                 opcode))
+
+(macrolet ((define-rvc-sp-load-instruction (name funct3 emitter)
+             `(define-instruction ,name (segment rd offset)
+                (:printer ci
+                          ((funct3 ,funct3)
+                           (opcode #b10)))
+                (:emitter
+                 (,emitter segment ,funct3 rd offset #b10)))))
+  (define-rvc-sp-load-instruction c.lwsp  #b010 emit-ci-load-32-inst)
+  #+64-bit
+  (define-rvc-sp-load-instruction c.ldsp  #b011 emit-ci-load-64-inst)
+  #-(and 64-bit soft-doubles)
+  (define-rvc-sp-load-instruction c.flwsp #b011 emit-ci-load-32-inst)
+  (define-rvc-sp-load-instruction c.fldsp #b001 emit-ci-load-64-inst))
+
+(macrolet ((define-rvc-sp-store-instruction (name funct3 size)
+             (multiple-value-bind (emitter type)
+                 (ecase size
+                   (32 (values 'emit-css-32-inst 'css-32))
+                   (64 (values 'emit-css-64-inst 'css-64)))
+                 `(define-instruction ,name (segment rs2 offset)
+                    (:printer ,type
+                              ((funct3 ,funct3)
+                               (opcode #b10)))
+                    (:emitter
+                     (,emitter segment ,funct3 rs2 offset #b10))))))
+
+  (define-rvc-sp-store-instruction c.swsp  #b110 32)
+  #+64-bit
+  (define-rvc-sp-store-instruction c.sdsp  #b111 64)
+  #-(and 64-bit soft-doubles)
+  (define-rvc-sp-store-instruction c.fswsp #b111 32)
+  (define-rvc-sp-store-instruction c.fsdsp #b101 64))
+
+(macrolet ((define-rvc-load/store-instruction (name funct3 size arg)
+             (multiple-value-bind (emitter type)
+                 (ecase size
+                   (32 (values 'emit-cl/cs-32-inst 'cl/cs-32))
+                   (64 (values 'emit-cl/cs-64-inst 'cl/cs-64)))
+               `(define-instruction ,name (segment ,arg rs1* offset)
+                  (:printer ,type
+                            ((funct3 ,funct3)
+                             (opcode #b00)))
+                  (:emitter
+                   (,emitter segment ,funct3 ,arg offset rs1* #b00))))))
+  (define-rvc-load/store-instruction c.lw  #b010 32 rd*)
+  #+64-bit
+  (define-rvc-load/store-instruction c.ld  #b011 64 rd*)
+  #-(and 64-bit soft-doubles)
+  (define-rvc-load/store-instruction c.flw #b011 32 rd*)
+  (define-rvc-load/store-instruction c.fld #b001 64 rd*)
+  (define-rvc-load/store-instruction c.sw  #b110 32 rs2*)
+  #+64-bit
+  (define-rvc-load/store-instruction c.sd  #b111 64 rs2*)
+  #-(and 64-bit soft-doubles)
+  (define-rvc-load/store-instruction c.fsw #b111 32 rs2*)
+  (define-rvc-load/store-instruction c.fsd #b101 64 rs2*))
+
+(macrolet ((define-rvc-cj-jump-instruction (name funct3)
+             `(define-instruction ,name (segment offset)
+                (:printer cj
+                          ((funct3 ,funct3)
+                           (opcode #b01)))
+                (:emitter
+                 (emit-cj-inst segment ,funct3 offset #b01)))))
+  (define-rvc-cj-jump-instruction c.j #b101)
+  #-64-bit
+  (define-rvc-cj-jump-instruction c.jal #b001))
+
+(macrolet ((define-rvc-cr-jump-instruction (name funct4)
+             `(define-instruction ,name (segment rs1)
+                (:printer cr
+                          ((funct4 ,funct4)
+                           (opcode #b10)))
+                (:emitter
+                 (%emit-cr-inst segment ,funct4 (reg-tn-encoding rs1) 0 #b10)))))
+  (define-rvc-cr-jump-instruction c.jr #b1000)
+  #-64-bit
+  (define-rvc-cr-jump-instruction c.jalr #b1001))
+
+(macrolet ((define-rvc-branch-instruction (name funct3)
+             `(define-instruction ,name (segment rs1* offset)
+                (:printer cb-branch
+                          ((funct3 ,funct3)
+                           (opcode #b01)))
+                (:emitter
+                 (emit-cb-branch-inst segment ,funct3 rs1* offset #b01)))))
+  (define-rvc-branch-instruction c.beqz #b110)
+  (define-rvc-branch-instruction c.bnez #b111))
+
+(macrolet ((define-rvc-constant-gen-instruction (name funct3)
+             `(define-instruction ,name (segment rd imm)
+                (:printer ci
+                          ((funct3 ,funct3)
+                           (opcode #b01)))
+                (:emitter
+                 (emit-ci-inst segment ,funct3 rd imm #b01)))))
+  (define-rvc-constant-gen-instruction c.li #b010)
+  (define-rvc-constant-gen-instruction c.lui #b011))
+
+(macrolet ((define-rvc-ci-arith-instruction (name funct3 opcode)
+             `(define-instruction ,name (segment rd/rs1 imm)
+                (:printer ci
+                          ((funct3 ,funct3)
+                           (opcode ,opcode)))
+                (:emitter
+                 (emit-ci-inst segment ,funct3 rd/rs1 imm ,opcode)))))
+  (define-rvc-ci-arith-instruction c.addi  #b000 #b01)
+  #+64-bit
+  (define-rvc-ci-arith-instruction c.addiw #b001 #b01)
+  (define-rvc-ci-arith-instruction c.slli  #b001 #b10))
+
+(define-instruction c.addisp16 (segment imm)
+  (:emitter
+   segment imm
+   (error "What a funky instruction.")))
+
+(define-instruction c.addi4spn (segment rd* imm)
+  (:printer ciw
+            ((funct3 #b00)
+             (opcode #b00)))
+  (:emitter
+   (emit-ciw-inst segment #b00 imm rd* #b00)))
+
+(macrolet ((define-rvc-cb-arith-instruction (name funct3 funct2)
+             `(define-instruction ,name (segment rd*/rs1* imm)
+                (:printer cb-arith
+                          ((funct3 ,funct3)
+                           (funct2 ,funct2)
+                           (opcode #b01)))
+                (:emitter
+                 (emit-cb-arith-inst segment ,funct3 ,funct2 rd*/rs1* imm #b01)))))
+  (define-rvc-cb-arith-instruction c.srli #b100 #b00)
+  (define-rvc-cb-arith-instruction c.srai #b100 #b01)
+  (define-rvc-cb-arith-instruction c.andi #b100 #b10))
+
+(macrolet ((define-rvc-cr-arith-instruction (name funct4)
+             `(define-instruction ,name (segment rd/rs1 rs2)
+                (:printer cr
+                          ((funct4 ,funct4)
+                           (opcode #b10)))
+                (:emitter
+                 (%emit-cr-inst segment ,funct4 rd/rs1 rs2 #b10)))))
+  (define-rvc-cr-arith-instruction c.mv  #b1000)
+  (define-rvc-cr-arith-instruction c.add #b1001))
+
+(macrolet ((define-rvc-ca-arith-instruction (name funct6 funct2)
+             `(define-instruction ,name (segment rd*/rs1* rs2*)
+                (:printer ca
+                          ((funct6 ,funct6)
+                           (funct2 ,funct2)
+                           (opcode #b01)))
+                (:emitter
+                 (%emit-ca-inst segment ,funct6 rd*/rs1* ,funct2 rs2* #b01)))))
+  (define-rvc-ca-arith-instruction c.and  #b100011 #b11)
+  (define-rvc-ca-arith-instruction c.or   #b100011 #b10)
+  (define-rvc-ca-arith-instruction c.xor  #b100011 #b01)
+  (define-rvc-ca-arith-instruction c.sub  #b100011 #b00)
+  #+64-bit
+  (define-rvc-ca-arith-instruction c.addw #b100111 #b01)
+  #+64-bit
+  (define-rvc-ca-arith-instruction c.subw #b100111 #b00))
+
+(define-instruction c.nop (segment)
+  (:printer ci
+            ((funct3 #b000)
+             (rd/rs1 0)
+             (imm '(0 0))
+             (opcode #b01)))
+  (:emitter
+   (%emit-ci-inst segment #b000 0 0 0 #b01)))
+
+(define-instruction c.ebreak (segment)
+  (:printer cr
+            ((funct4 #b1001)
+             (rd/rs1 0)
+             (rs2    0)
+             (opcode #b10)))
+  (:emitter
+   (%emit-cr-inst segment #b1001 0 0 #b10)))

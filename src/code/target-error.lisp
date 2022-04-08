@@ -425,7 +425,8 @@ with that condition (or with no condition) will be returned."
                     thereis (stackp (fast-&rest-nth arg-index initargs))))
              (layout (classoid-wrapper classoid))
              (extra (if (and any-dx (type-err-p layout)) 2 0)) ; space for secret initarg
-             (instance (%make-instance (+ sb-vm:instance-data-start
+             (instance (%new-instance layout
+                                        (+ sb-vm:instance-data-start
                                           1 ; ASSIGNED-SLOTS
                                           (length initargs)
                                           extra)))
@@ -433,8 +434,7 @@ with that condition (or with no condition) will be returned."
              (arg-index 0)
              (have-type-error-datum)
              (type-error-datum))
-        (setf (%instance-wrapper instance) layout
-              (condition-assigned-slots instance) nil)
+        (setf (condition-assigned-slots instance) nil)
         (macrolet ((store-pair (key val)
                      `(progn (%instance-set instance data-index ,key)
                              (%instance-set instance (1+ data-index) ,val))))
@@ -664,7 +664,7 @@ with that condition (or with no condition) will be returned."
    Condition types are classes, but (as allowed by ANSI and not as described in
    CLtL2) are neither STANDARD-OBJECTs nor STRUCTURE-OBJECTs. WITH-SLOTS and
    SLOT-VALUE may not be used on condition objects."
-  (check-designator name define-condition)
+  (check-designator name 'define-condition)
   (let* ((parent-types (or parent-types '(condition)))
          (layout (find-condition-layout name parent-types))
          (documentation nil)
@@ -955,9 +955,6 @@ with that condition (or with no condition) will be returned."
                        not available at compile-time.")
                (t
                 ""))))))
-
-(define-condition retry-unbound-variable
-    (simple-condition unbound-variable) ())
 
 (define-condition undefined-function (cell-error)
   ((not-yet-loaded :initform nil :reader not-yet-loaded :initarg :not-yet-loaded))

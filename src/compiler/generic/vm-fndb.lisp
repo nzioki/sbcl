@@ -97,7 +97,11 @@
 (defknown %sp-string-compare
   (simple-string index (or null index) simple-string index (or null index))
   (values index fixnum)
-  (foldable flushable))
+  (foldable flushable no-verify-arg-count))
+(defknown %sp-string=
+  (simple-string index (or null index) simple-string index (or null index))
+  boolean
+  (foldable flushable no-verify-arg-count))
 
 (defknown sb-impl::number-sxhash (number) hash-code (foldable flushable))
 (defknown %sxhash-string (string) hash-code (foldable flushable))
@@ -123,8 +127,8 @@
 (defknown %set-symbol-hash (symbol hash-code)
   t ())
 
-;;; SYMBOL-PACKAGE-ID demands a vop so as to avoid placing a raw bit value
-;;; in a descriptor register on precise GC. (The SLOT vop returns a descriptor)
+;;; SYMBOL-PACKAGE-ID for #+compact-symbol demands a vop which avoids loading
+;;; a raw bit value in a descriptor register (the SLOT vop returns a descriptor)
 (defknown sb-impl::symbol-package-id (symbol) (unsigned-byte 16))
 ;;; TODO: I'd like to eliminate the (OR NULL) from this return type.
 ;;; For that to happen, I probably need +nil-packed-infos+ to become
@@ -139,7 +143,7 @@
   :result-arg 0)
 
 (defknown (vector-fill* vector-fill/t) (t t t t) vector
-  ()
+  (no-verify-arg-count)
   :result-arg 0)
 
 ;;; Return the length of VECTOR.
@@ -198,7 +202,7 @@
   (flushable))
 (defknown sb-kernel::check-array-shape (simple-array list)
   (simple-array)
-  (flushable)
+  (flushable no-verify-arg-count)
   :result-arg 0)
 
 (defknown %make-instance (index) instance
@@ -453,7 +457,7 @@
 (defknown %allocate-bignum (bignum-length) bignum
   (flushable #-bignum-assertions always-translatable))
 
-(defknown %bignum-length (bignum) bignum-length
+(defknown %bignum-length (bignum) (and (integer 1) bignum-length)
   (foldable flushable always-translatable))
 
 ;;; Change the length of bignum to be newlen. Newlen must be the same or
@@ -598,7 +602,7 @@
 
 (defknown %simple-fun-type (function) t (flushable))
 
-#+(or x86 x86-64) (defknown sb-vm::%closure-callee (function) fixnum (flushable))
+#+(or x86 x86-64 arm64) (defknown sb-vm::%closure-callee (function) fixnum (flushable))
 (defknown %closure-fun (function) function (flushable))
 
 (defknown %closure-index-ref (function index) t
@@ -630,11 +634,15 @@
 
 ;;; formerly in 'float-tran'
 
-(defknown %single-float (real) single-float (movable foldable))
-(defknown %double-float (real) double-float (movable foldable))
+(defknown %single-float (real) single-float
+  (movable foldable no-verify-arg-count))
+(defknown %double-float (real) double-float
+  (movable foldable no-verify-arg-count))
 
-(defknown bignum-to-float (bignum symbol) float (movable foldable))
-(defknown sb-kernel::float-ratio (ratio symbol) float (movable foldable))
+(defknown bignum-to-float (bignum symbol) float
+  (movable foldable no-verify-arg-count))
+(defknown sb-kernel::float-ratio (ratio symbol) float
+  (movable foldable no-verify-arg-count))
 
 (defknown make-single-float ((signed-byte 32)) single-float
   (movable flushable))
@@ -715,4 +723,4 @@
   (movable foldable flushable))
 
 (defknown (%unary-truncate %unary-round) (real) integer
-  (movable foldable flushable))
+  (movable foldable flushable no-verify-arg-count))

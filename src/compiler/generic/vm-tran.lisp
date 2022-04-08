@@ -33,12 +33,6 @@
 (deftransform make-symbol ((string) (simple-string))
   `(%make-symbol 0 string))
 
-#+compact-symbol
-(define-source-transform keywordp (x)
-  `(let ((object ,x))
-     (and (symbolp object)
-          (= (sb-impl::symbol-package-id object) ,sb-impl::+package-id-keyword+))))
-
 ;;; We don't want to clutter the bignum code.
 #+(and (or x86 x86-64) (not bignum-assertions))
 (define-source-transform sb-bignum:%bignum-ref (bignum index)
@@ -547,7 +541,8 @@
 (deftransform fill ((sequence item) (simple-base-string t) *
                                     :policy (>= speed space))
   (let ((multiplier (logand #x0101010101010101 most-positive-word)))
-    `(let* ((value ,(if (and (constant-lvar-p item) (typep item 'base-char))
+    `(let* ((value ,(if (and (constant-lvar-p item)
+                             (typep (lvar-value item) 'base-char))
                         (* multiplier (char-code (lvar-value item)))
                         ;; Use multiplication if it's known to be cheap
                         #+(or x86 x86-64)

@@ -43,9 +43,10 @@
 # include <dlfcn.h>
 #endif
 
-static int decode_locs(lispobj packed_integer, int *offset, int *elsewhere)
+int df_decode_locs(lispobj encoded, int *offset, int *elsewhere)
 {
     struct varint_unpacker unpacker;
+    lispobj packed_integer = listp(encoded) ? CONS(encoded)->cdr : encoded;
     varint_unpacker_init(&unpacker, packed_integer);
     return varint_unpack(&unpacker, offset) && varint_unpack(&unpacker, elsewhere);
 }
@@ -67,14 +68,14 @@ debug_function_from_pc (struct code* code, void *pc)
 
     struct compiled_debug_fun *df = (struct compiled_debug_fun*)native_pointer(di->fun_map);
     int begin, end, elsewhere_begin, elsewhere_end;
-    if (!decode_locs(df->encoded_locs, &begin, &elsewhere_begin))
+    if (!df_decode_locs(df->encoded_locs, &begin, &elsewhere_begin))
         return NULL;
     sword_t offset = (char*)pc - code_text_start(code);
     while (df) {
         struct compiled_debug_fun *next;
         if (df->next != NIL) {
             next = (struct compiled_debug_fun*) native_pointer(df->next);
-            if (!decode_locs(next->encoded_locs, &end, &elsewhere_end))
+            if (!df_decode_locs(next->encoded_locs, &end, &elsewhere_end))
                 return NULL;
         } else {
             next = 0;
@@ -123,10 +124,10 @@ lispobj debug_print(lispobj string)
 
 lispobj symbol_package(struct symbol* s)
 {
-#ifdef LISP_FEATURE_COMPACT_SYMBOL
     static int warned;
-    // if using ldb when debugging cold-init, this can be confusing to see all symbols
-    // as if they were uninterned
+    // If using ldb when debugging cold-init, this can be confusing to see all symbols
+    // as if they were uninterned, but package-IDs are always available in the symbol.
+    // End-users should never see this failure.
     if (!lisp_package_vector) {
         if (!warned) {
           fprintf(stderr, "Warning: package vector has not been initialized yet\n");
@@ -136,20 +137,9 @@ lispobj symbol_package(struct symbol* s)
     }
     struct vector* v = VECTOR(lisp_package_vector);
     int id = symbol_package_id(s);
-    if (id < fixnum_value(v->length_)) return v->data[id];
+    if (id < vector_len(v)) return v->data[id];
     lose("can't decode package ID %d", id);
-#else
-    return s->package;
-#endif
 }
-
-#ifndef LISP_FEATURE_COMPACT_SYMBOL
-static int symbol_package_id(struct symbol* s) {
-    lispobj pkg = s->package;
-    if (pkg == NIL) return PACKAGE_ID_NONE;
-    return fixnum_value(((struct package*)native_pointer(pkg))->id);
-}
-#endif
 
 static void
 print_entry_name (lispobj name, FILE *f)
@@ -275,13 +265,17 @@ call_info_from_context(struct call_info *info, os_context_t *context)
         info->frame =
             (struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_OCFP));
+#ifdef reg_LRA
         info->lra = (lispobj)(*os_context_register_addr(context, reg_LRA));
+#else
+        info->lra = (lispobj)(*os_context_register_addr(context, reg_RA));
+#endif
         info->code = code_pointer(info->lra);
         pc = (uword_t)native_pointer(info->lra);
     } else
 #endif
     {
-        pc = *os_context_pc_addr(context);
+        pc = os_context_pc(context);
         info->frame =
             (struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_CFP));
@@ -334,12 +328,14 @@ int lisp_frame_previous(struct thread *thread, struct call_info *info)
         info->code =
 #ifdef reg_CODE
         (struct code*)native_pointer(this_frame->code);
-        info->pc = lra;
 #else
         (struct code *)dynamic_space_code_from_pc((char *)lra);
+#endif
+#ifdef reg_LRA
+        info->pc = lra;
+#else
         info->pc = (char*)native_pointer(lra) - (char*)info->code;
 #endif
-
         info->lra = NIL;
     } else {
         info->code = code_pointer(lra);
@@ -376,13 +372,13 @@ lisp_backtrace(int nframes)
         printf("%4d: ", i);
         // Print spaces to keep the alignment nice
         if (info.interrupted
-#ifdef reg_CODE
+#ifdef reg_LRA
             || info.lra == NIL
 #endif
             ) {
             putchar('[');
             if (info.interrupted) { footnotes |= 1; putchar('I'); }
-#ifdef reg_CODE
+#ifdef reg_LRA
             if (info.lra == NIL) { footnotes |= 2; putchar('*'); }
 #endif
             putchar(']');
@@ -405,6 +401,13 @@ lisp_backtrace(int nframes)
             && info.lra != NIL)
             printf("LRA=%p ", (void*)info.lra);
 
+        int fpvalid = (lispobj*)info.frame >= thread->control_stack_start
+          && (lispobj*)info.frame < thread->control_stack_end;
+
+        // If the FP is invalid, then quite likely we'd crash trying to find a
+        // compiled-debug-fun because info.code is a wild pointer
+        if (!fpvalid) { printf(" BAD FRAME\n"); break; }
+
         if (info.code) {
             struct compiled_debug_fun *df;
             if (absolute_pc &&
@@ -421,7 +424,7 @@ lisp_backtrace(int nframes)
 
     } while (++i <= nframes);
     if (footnotes) printf("Note: [I] = interrupted"
-#ifdef reg_CODE
+#ifdef reg_LRA
                           ", [*] = no LRA"
 #endif
                           "\n");
@@ -585,7 +588,7 @@ void backtrace_from_fp(void *fp, int nframes, int start) {
 
 void backtrace_from_context(os_context_t *context, int nframes) {
     void *fp = (void *)os_context_frame_pointer(context);
-    print_backtrace_frame((void *)*os_context_pc_addr(context), fp, 0, stdout);
+    print_backtrace_frame((void *)os_context_pc(context), fp, 0, stdout);
     backtrace_from_fp(fp, nframes - 1, 1);
 }
 

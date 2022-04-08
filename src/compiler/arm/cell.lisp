@@ -291,10 +291,14 @@
          (index :scs (any-reg))
          (value :scs (any-reg descriptor-reg)))
   (:arg-types * tagged-num *)
-  (:temporary (:scs (non-descriptor-reg)) temp card)
-  (:temporary (:scs (interior-reg)) lip)
-  (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:temporary (:scs (non-descriptor-reg)) temp #+gencgc card)
+  #+gencgc (:temporary (:scs (interior-reg)) lip)
+  #+gencgc (:temporary (:sc non-descriptor-reg) pa-flag)
   (:generator 10
+    #+cheneygc
+    (progn  (inst sub temp index other-pointer-lowtag)
+            (inst str value (@ object temp)))
+    #+gencgc
     (let ((mask-fixup-label (gen-label))
           (table-fixup-label (gen-label)))
       (inst load-from-label temp lip mask-fixup-label)
@@ -309,8 +313,7 @@
         (inst ldr temp (@ temp))
         (inst ldr temp (@ temp))
         ;; Touch the card mark byte.
-        (inst mov lip 0)
-        (inst strb lip (@ temp card))
+        (inst strb null-tn (@ temp card))
         ;; set 'written' flag in the code header
         ;; If two threads get here at the same time, they'll write the same byte.
         (let ((byte (- #+little-endian 3 other-pointer-lowtag)))

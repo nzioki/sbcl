@@ -51,16 +51,17 @@
 
 (/show0 "primtype.lisp 53")
 (!def-primitive-type-alias tagged-num '(:or positive-fixnum fixnum))
-(multiple-value-bind (unsigned signed)
+(multiple-value-bind (unsigned signed untagged)
     (case sb-vm:n-machine-word-bits
       (64 (values '(unsigned-byte-64 unsigned-byte-63 positive-fixnum)
-                  '(signed-byte-64 fixnum unsigned-byte-63 positive-fixnum)))
+                  '(signed-byte-64 fixnum unsigned-byte-63 positive-fixnum)
+                  '(signed-byte-64 unsigned-byte-64 unsigned-byte-63 fixnum positive-fixnum)))
       (32 (values '(unsigned-byte-32 unsigned-byte-31 positive-fixnum)
-                  '(signed-byte-32 fixnum unsigned-byte-31 positive-fixnum))))
+                  '(signed-byte-32 fixnum unsigned-byte-31 positive-fixnum)
+                  '(signed-byte-32 unsigned-byte-32 unsigned-byte-31 fixnum positive-fixnum))))
   (!def-primitive-type-alias unsigned-num `(:or ,@unsigned))
   (!def-primitive-type-alias signed-num `(:or ,@signed))
-  (!def-primitive-type-alias untagged-num
-    `(:or ,@(sort (copy-list (union unsigned signed)) #'string<))))
+  (!def-primitive-type-alias untagged-num `(:or ,@untagged)))
 
 ;;; other primitive immediate types
 (/show0 "primtype.lisp 68")
@@ -389,24 +390,34 @@
              (part-of character)))
         #+sb-simd-pack
         (simd-pack-type
-         (let ((eltypes (simd-pack-type-element-type type)))
-           (cond ((equal '(integer) eltypes)
+         (let* ((eltypes (simd-pack-type-element-type type))
+                (count (count 1 eltypes))
+                (position (position 1 eltypes)))
+           (if (= count 1)
+               (cond
+                 ((eql position (position 'integer *simd-pack-element-types*))
                   (exactly simd-pack-int))
-                 ((equal '(single-float) eltypes)
+                 ((eql position (position 'single-float *simd-pack-element-types*))
                   (exactly simd-pack-single))
-                 ((equal '(double-float) eltypes)
+                 ((eql position (position 'double-float *simd-pack-element-types*))
                   (exactly simd-pack-double))
-                 (t (any)))))
+                 (t (any)))
+               (any))))
         #+sb-simd-pack-256
         (simd-pack-256-type
-         (let ((eltypes (simd-pack-256-type-element-type type)))
-           (cond ((equal '(integer) eltypes)
+         (let* ((eltypes (simd-pack-256-type-element-type type))
+                (count (count 1 eltypes))
+                (position (position 1 eltypes)))
+           (if (= count 1)
+               (cond
+                 ((eql position (position 'integer *simd-pack-element-types*))
                   (exactly simd-pack-256-int))
-                 ((equal '(single-float) eltypes)
+                 ((eql position (position 'single-float *simd-pack-element-types*))
                   (exactly simd-pack-256-single))
-                 ((equal '(double-float) eltypes)
+                 ((eql position (position 'double-float *simd-pack-element-types*))
                   (exactly simd-pack-256-double))
-                 (t (any)))))
+                 (t (any)))
+               (any))))
         (cons-type
          (part-of list))
         (built-in-classoid

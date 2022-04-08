@@ -24,11 +24,6 @@
                    declaration-specifiers))
   `(cl:declaim ,@declaration-specifiers))
 
-;;; The STRUCTURE!OBJECT abstract class is the base of the hierarchy
-;;; of objects that need to be identifiable as SBCL system objects
-;;; in the host Lisp. This type does not exist in the target.
-(defstruct (structure!object (:constructor nil) (:copier nil) (:predicate nil)))
-
 (declaim (declaration truly-dynamic-extent))
 
 ;;; MAYBE-INLINE, FREEZE-TYPE, and block compilation declarations can be safely ignored
@@ -42,13 +37,6 @@
 (declaim (declaration explicit-check always-bound))
 
 (defgeneric sb-xc:make-load-form (obj &optional env))
-
-;;; There's no real reason that the cross-compiler shouldn't get the
-;;; same macro as the target for this, except that the host doesn't
-;;; compile 'cl-specials', and it's kind of unlikely that we'd have
-;;; our own sources not fail in make-host-1 using illegal designators.
-;;; As to make-host-2, well, it's not a user-facing problem.
-(defmacro check-designator (&rest junk) (declare (ignore junk)))
 
 ;;; Restore normalcy of MOD and RATIONAL as type specifiers.
 (deftype mod (n) `(integer 0 ,(1- n)))

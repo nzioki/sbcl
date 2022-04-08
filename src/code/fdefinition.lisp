@@ -14,10 +14,6 @@
 
 (in-package "SB-IMPL")
 
-;; This variable properly belongs in 'target-hash-table',
-;; but it's compiled after this file is.
-(define-load-time-global *user-hash-table-tests* nil)
-
 
 ;;;; fdefinition (fdefn) objects
 
@@ -47,10 +43,9 @@
     ;; or a cons of an FDEFN and list, so 0 is unambiguously "no value"
     (if (eql fdefn 0) nil fdefn)))
 
-;; Return the fdefn object for NAME, or NIL if there is no fdefn.
-;; Signal an error if name isn't valid.
-;; Assume that exists-p implies LEGAL-FUN-NAME-P.
-;;
+;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
+;;; Signal an error if name isn't valid.
+;;; Assume that exists-p implies LEGAL-FUN-NAME-P.
 (declaim (ftype (sfunction ((or symbol list)) (or fdefn null)) find-fdefn))
 (defun find-fdefn (name)
   (declare (explicit-check))
@@ -81,6 +76,37 @@
         (when (eq key1 'setf) ; bypass the legality test
           (return-from find-fdefn nil))))
   (legal-fun-name-or-type-error name))
+
+;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
+;;; special operator. Test for this by seeing whether FUNCTION is the same
+;;; closure as for a known macro.
+(declaim (inline macro/special-guard-fun-p))
+(defun macro/special-guard-fun-p (function)
+  ;; When inlined, this is a few instructions shorter than CLOSUREP
+  ;; if we already know that FUNCTION is a function.
+  ;; It will signal a type error if not, which is the right thing to do anyway.
+  ;; (this isn't quite a true predicate)
+  (and (= (%fun-pointer-widetag function) sb-vm:closure-widetag)
+       ;; This test needs to reference the name of any macro, but in order for
+       ;; cold-init to work, the macro has to be defined first.
+       ;; So pick DX-LET, as it's in primordial-extensions.
+       ;; Prior to cold-init fixing up the load-time-value, this compares
+       ;; %closure-fun to 0, which is ok - it returns NIL.
+       (eq (load-time-value (%closure-fun (symbol-function 'dx-let)) t)
+           (%closure-fun function))))
+
+(defun coerce-symbol-to-fun (symbol)
+  ;; FIXME? I would think to use SYMBOL-FUNCTION here which does not strip off
+  ;; encapsulations. But Stas wrote FDEFINITION so ...
+  ;; [Also note, we won't encapsulate a macro or special-form, so this
+  ;; introspective technique to decide what kind something is works either way]
+  (let ((def (fdefinition symbol)))
+    (if (macro/special-guard-fun-p def)
+        (error (ecase (car (%fun-name def))
+                (:macro "~S names a macro.")
+                (:special "~S names a special operator."))
+               symbol)
+        def)))
 
 (declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
 (defun find-or-create-fdefn (name)
@@ -113,24 +139,6 @@
               (sb-pcl::ensure-accessor name))
             fdefn))))))
 
-;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
-;;; special operator. Test for this by seeing whether FUNCTION is the same
-;;; closure as for a known macro.
-(declaim (inline macro/special-guard-fun-p))
-(defun macro/special-guard-fun-p (function)
-  ;; When inlined, this is a few instructions shorter than CLOSUREP
-  ;; if we already know that FUNCTION is a function.
-  ;; It will signal a type error if not, which is the right thing to do anyway.
-  ;; (this isn't quite a true predicate)
-  (and (= (%fun-pointer-widetag function) sb-vm:closure-widetag)
-       ;; This test needs to reference the name of any macro, but in order for
-       ;; cold-init to work, the macro has to be defined first.
-       ;; So pick DX-LET, as it's in primordial-extensions.
-       ;; Prior to cold-init fixing up the load-time-value, this compares
-       ;; %closure-fun to 0, which is ok - it returns NIL.
-       (eq (load-time-value (%closure-fun (symbol-function 'dx-let)) t)
-           (%closure-fun function))))
-
 ;;; Remove NAME's FTYPE information unless it was explicitly PROCLAIMED.
 ;;; The NEW-FUNCTION argument is presently unused, but could be used
 ;;; for checking compatibility of the NEW-FUNCTION against a proclamation.
@@ -142,29 +150,27 @@
     (unless (eq :declared (info :function :where-from name))
       (clear-info :function :type name))))
 
-;;; Return the fdefn-fun of NAME's fdefinition including any encapsulations.
-;;; LOOKUP-FN, defaulting to FIND-FDEFN, specifies how to lookup the fdefn.
-;;; As a special case it can be given as SYMBOL-FDEFN which is slightly quicker.
-;;; This is the core of the implementation of the standard FDEFINITION function,
-;;; but as we've defined FDEFINITION, that strips encapsulations.
-(defmacro %coerce-name-to-fun (name &optional (lookup-fn 'find-fdefn)
-                                    strictly-functionp)
-  ;; Whoa! We were getting a warning from the *host* here -
-  ;;   "Abbreviated type declaration: (BOOLEAN SB-IMPL::STRICTLY-FUNCTIONP)."
-  ;; I guess it's because we hand it a lambda and it doesn't like our style?
+;;; Return the fdefn-fun of NAME's fdefinition including any
+;;; encapsulations. FDEFN can be provided explicitly. As a special
+;;; case it can be computed with SYMBOL-FDEFN which is slightly
+;;; quicker.  This is the core of the implementation of the standard
+;;; FDEFINITION function, but as we've defined FDEFINITION, that
+;;; strips encapsulations.
+(defun %coerce-name-to-fun (name &optional (fdefn (find-fdefn name))
+                                           strictly-functionp)
   (declare (type boolean strictly-functionp))
-  `(let* ((name ,name) (fdefn (,lookup-fn name)) f)
-     (if (and fdefn
-              (setq f (fdefn-fun (truly-the fdefn fdefn)))
-                ;; If STRICTLY-FUNCTIONP is true, we make sure not to return an error
-                ;; trampoline. This extra check ensures that full calls such as
-                ;; (MAPCAR 'OR '()) signal an error that OR isn't a function.
-                ;; This accords with the non-requirement that macros store strictly
-                ;; a function in the symbol that names them. In many implementations,
-                ;; (FUNCTIONP (SYMBOL-FUNCTION 'OR)) => NIL. We want to pretend that.
-              ,@(if strictly-functionp '((not (macro/special-guard-fun-p f)))))
-         f
-         (retry-%coerce-name-to-fun name ,strictly-functionp))))
+  (let (f)
+    (if (and fdefn
+             (setq f (fdefn-fun fdefn))
+             ;; If STRICTLY-FUNCTIONP is true, we make sure not to return an error
+             ;; trampoline. This extra check ensures that full calls such as
+             ;; (MAPCAR 'OR '()) signal an error that OR isn't a function.
+             ;; This accords with the non-requirement that macros store strictly
+             ;; a function in the symbol that names them. In many implementations,
+             ;; (FUNCTIONP (SYMBOL-FUNCTION 'OR)) => NIL. We want to pretend that.
+             (not (and strictly-functionp (macro/special-guard-fun-p f))))
+        f
+        (retry-%coerce-name-to-fun name strictly-functionp))))
 
 ;;; If %COERCE-NAME-TO-FUN fails, continue here.
 ;;; LOOKUP-FN, being more about speed than semantics, is irrelevant.
@@ -211,14 +217,14 @@
   (declare (explicit-check))
   (etypecase callable
     (function callable)
-    (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+    (symbol (%coerce-name-to-fun callable (symbol-fdefn callable) t))))
 
 ;;; Behaves just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
 (defun %coerce-callable-for-call (callable)
   (declare (explicit-check))
   (etypecase callable
     (function callable)
-    (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+    (symbol (%coerce-name-to-fun callable (symbol-fdefn callable) t))))
 
 
 ;;;; definition encapsulation

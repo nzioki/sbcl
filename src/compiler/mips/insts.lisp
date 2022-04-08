@@ -19,6 +19,8 @@
             sb-vm::immediate-constant
             sb-vm::registers sb-vm::float-registers
             sb-vm::zero
+            sb-vm::null-offset
+            sb-vm::zero-offset
             sb-vm::lip-tn sb-vm::zero-tn)))
 
 ;;;; Constants, types, conversion functions, some disassembler stuff.
@@ -26,8 +28,8 @@
 (defun reg-tn-encoding (tn)
   (declare (type tn tn))
   (sc-case tn
-    (zero sb-vm::zero-offset)
-    (null sb-vm::null-offset)
+    (zero zero-offset)
+    (null null-offset)
     (t
      (if (eq (sb-name (sc-sb (tn-sc tn))) 'registers)
          (tn-offset tn)
@@ -144,7 +146,7 @@
   '(:f :un :eq :ueq :olt :ult :ole :ule :sf :ngle :seq :ngl :lt :nge :le :ngt)
   #'equalp)
 
-(defconstant-eqx compare-kinds-vec #.(apply #'vector compare-kinds)
+(defconstant-eqx compare-kinds-vec (apply #'vector compare-kinds)
   #'equalp)
 
 (deftype compare-kind ()
@@ -246,6 +248,14 @@
   (code :field (byte 10 16) :reader break-code)
   (subcode :field (byte 10 6) :reader break-subcode)
   (funct :field (byte 6 0) :value #b001101))
+
+(define-instruction-format (trap 32 :default-printer
+                                 '(:name :tab rs ", " rt ", " code))
+  (op :field (byte 6 26))
+  (rs :field (byte 5 21) :type 'reg)
+  (rt :field (byte 5 16) :type 'reg)
+  (code :field (byte 10 6))
+  (funct :field (byte 6 0)))
 
 (define-instruction-format (coproc-branch 32
                             :default-printer '(:name :tab offset))
@@ -522,13 +532,18 @@
 
 (define-instruction sll (segment dst src1 &optional src2)
   (:declare (type tn dst)
-            (type (or tn (unsigned-byte 5) null) src1 src2))
+            (type (or tn (unsigned-byte 5) null) src1)
+            ;; use-case for fixup is GC card index calculation (WIP)
+            (type (or tn (unsigned-byte 5) null fixup) src2))
   (:printer register ((op special-op) (rs 0) (shamt nil) (funct #b000000))
             shift-printer)
   (:printer register ((op special-op) (funct #b000100)) shift-printer)
   (:dependencies (reads src1) (if src2 (reads src2) (reads dst)) (writes dst))
   (:delay 0)
   (:emitter
+   (when (and (fixup-p src2) (eq (fixup-flavor src2) :gc-barrier))
+     (note-fixup segment :sll-sa src2) ; shift amount
+     (setq src2 0))
    (emit-shift-inst segment #b00 dst src1 src2)))
 
 (define-instruction sra (segment dst src1 &optional src2)
@@ -761,8 +776,7 @@
 
 (define-instruction bgez (segment reg target)
   (:declare (type label target) (type tn reg))
-  (:printer
-   immediate ((op bcond-op) (rt 1) (immediate nil :type 'relative-label))
+  (:printer immediate ((op bcond-op) (rt 1) (immediate nil :type 'relative-label))
             cond-branch-printer)
   (:attributes branch)
   (:dependencies (reads reg))
@@ -772,8 +786,7 @@
 
 (define-instruction bltzal (segment reg target)
   (:declare (type label target) (type tn reg))
-  (:printer
-   immediate ((op bcond-op) (rt #b01000) (immediate nil :type 'relative-label))
+  (:printer immediate ((op bcond-op) (rt #b10000) (immediate nil :type 'relative-label))
             cond-branch-printer)
   (:attributes branch)
   (:dependencies (reads reg) (writes lip-tn))
@@ -783,8 +796,7 @@
 
 (define-instruction bgezal (segment reg target)
   (:declare (type label target) (type tn reg))
-  (:printer
-   immediate ((op bcond-op) (rt #b01001) (immediate nil :type 'relative-label))
+  (:printer immediate ((op bcond-op) (rt #b10001) (immediate nil :type 'relative-label))
             cond-branch-printer)
   (:attributes branch)
   (:delay 1)
@@ -1035,6 +1047,38 @@
   (:delay 0)
   (:emitter
    (emit-break-inst segment special-op code subcode #b001101)))
+
+(macrolet ((deftrap (name bits)
+             `(define-instruction ,name (segment rs rt &optional (code 0))
+                (:declare (type (unsigned-byte 10) code))
+                (:printer trap ((op special-op) (funct ,bits)))
+                :pinned
+                (:cost 0)
+                (:delay 0)
+                (:emitter
+                 (emit-break-inst segment special-op
+                                  (logior (ash (reg-tn-encoding rs) 5) (reg-tn-encoding rt))
+                                  code ,bits))))
+           (deftrapi (name bits)
+             `(define-instruction ,name (segment rs imm)
+                (:printer immediate ((op #b000001) (rt ,bits)))
+                :pinned
+                (:cost 0)
+                (:delay 0)
+                (:emitter (emit-immediate-inst segment #b000001 (reg-tn-encoding rs) ,bits imm)))))
+  (deftrap teq  #b110100)
+  (deftrap tge  #b110000)
+  (deftrap tgeu #b110001)
+  (deftrap tlt  #b110010)
+  (deftrap tltu #b110011)
+  (deftrap tne  #b110110)
+
+  (deftrapi teqi  #b01100)
+  (deftrapi tgei  #b01000)
+  (deftrapi tgeiu #b01001)
+  (deftrapi tlti  #b01010)
+  (deftrapi tltiu #b01011)
+  (deftrapi tnei  #b01110))
 
 (define-instruction syscall (segment)
   (:printer register ((op special-op) (rd 0) (rt 0) (rs 0) (funct #b001110))
@@ -1391,6 +1435,22 @@
     (ecase kind
       (:absolute
        (setf (sap-ref-32 sap offset) value))
+      (:sll-sa
+       ;; VALUE is the number of bits we'd like to mask the card table index to.
+       ;; But instead of using an AND instruction, we use left-shift + right-shift.
+       ;; So it's the same as right-shift + AND but weird.
+       (let* ((inst (sap-ref-32 sap offset))
+              (next (sap-ref-32 sap (+ offset 4)))
+              (rd (ldb (byte 5 11) inst))
+              (left-shamt (- 32 (+ sb-vm::gencgc-card-shift value)))
+              (right-shamt (+ left-shamt sb-vm::gencgc-card-shift)))
+         ;; the next instruction has to be SRL rd, d, #
+         (aver (and (= (ldb (byte 11 21) next) #b00000000000)
+                    (= (ldb (byte 10 11) next) (logior (ash rd 5) rd))
+                    (= (ldb (byte 6 0) next) #b000010)))
+         (setf (sap-ref-32 sap offset) (dpb left-shamt (byte 5 6) inst))
+         (setf (sap-ref-32 sap (+ offset 4)) (dpb right-shamt (byte 5 6) next))
+         (return-from fixup-code-object :immediate)))
       (:jump
        (aver (zerop (ash value -28)))
        (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
@@ -1403,7 +1463,7 @@
              (ldb (byte 16 0) value)))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index)
+(define-instruction store-coverage-mark (segment mark-index)
   ;; Don't need to annotate the dependence on code-tn, I think?
   (:dependencies (writes :memory))
   (:delay 0)
@@ -1416,8 +1476,10 @@
    ;; for MIPS, I very much suspect that something would go wrong
    ;; by emitting more than 1 CPU instruction from within an emitter.
    (let ((offset (+ (component-header-length)
-                    n-word-bytes ; skip over jump table word
-                    path-index
+                    ;; skip over jump table word and entries
+                    (* (1+ (component-n-jump-table-entries))
+                       n-word-bytes)
+                    mark-index
                     (- other-pointer-lowtag))))
      (inst* segment 'sb sb-vm::null-tn sb-vm::code-tn
             (the (unsigned-byte 15) offset)))))

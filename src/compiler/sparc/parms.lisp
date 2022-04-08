@@ -19,7 +19,7 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -38,12 +38,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-;;; flags for the generational garbage collector
-(defconstant pseudo-atomic-interrupted-flag 1)
-(defconstant pseudo-atomic-flag
-    ;; Must be (ash 1 (1- sb-vm:n-lowtag-bits)) for cheneygc ALLOCATION.
-    4)
 
 ;;; CMUCL COMMENT:
 ;;;   X These values are for the x86 80 bit format and are no doubt
@@ -87,51 +81,7 @@
 
 ;;;; Description of the target address space.
 
-#+gencgc ; sensibly small read-only and static spaces
 (!gencgc-space-setup #x0f800000 :dynamic-space-start #x30000000)
-
-;;; Where to put the different spaces.  Must match the C code!
-#+(and linux cheneygc)
-(progn
-  (defconstant linkage-table-space-start #x0f800000)
-  (defconstant linkage-table-space-end   #x10000000)
-
-  (defconstant read-only-space-start     #x11000000)
-  (defconstant read-only-space-end       #x15000000)
-
-  (defconstant static-space-start        #x28000000)
-  (defconstant static-space-end          #x2c000000)
-
-  (defparameter dynamic-0-space-start #x30000000)
-  (defparameter dynamic-0-space-end   #x38000000))
-
-#+(and sunos cheneygc) ; might as well start by trying the same numbers
-(progn
-  (defconstant linkage-table-space-start #x0f800000)
-  (defconstant linkage-table-space-end   #x10000000)
-
-  (defconstant read-only-space-start     #x11000000)
-  (defconstant read-only-space-end       #x15000000)
-
-  (defconstant static-space-start        #x28000000)
-  (defconstant static-space-end          #x2c000000)
-
-  (defparameter dynamic-0-space-start    #x30000000)
-  (defparameter dynamic-0-space-end      #x38000000))
-
-#+(and netbsd cheneygc) ; Need a gap at 0x4000000 for shared libraries
-(progn
-  (defconstant linkage-table-space-start #x0f800000)
-  (defconstant linkage-table-space-end   #x10000000)
-
-  (defconstant read-only-space-start     #x11000000)
-  (defconstant read-only-space-end       #x15000000)
-
-  (defconstant static-space-start        #x18000000)
-  (defconstant static-space-end          #x1c000000)
-
-  (defparameter dynamic-0-space-start    #x48000000)
-  (defparameter dynamic-0-space-end      #x5ffff000))
 
 ;; Size of one linkage-table entry in bytes. See comment in
 ;; src/runtime/sparc-arch.c
@@ -148,7 +98,7 @@
   after-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  #+gencgc allocation-trap
+  allocation-trap
   error-trap)
 
 ;;;; static symbols.

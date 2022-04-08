@@ -292,36 +292,35 @@
                       (unsupplied-or-nil displaced-to)
                       (unsupplied-or-nil fill-pointer)))
          (spec
-           (or `(,(if simple 'simple-array 'array)
-                 ;; element-type is usually an LVAR or nil,
-                 ;; but MAKE-WEAK-VECTOR derive-type passes in 'T.
-                 ,(cond ((or (not element-type) (eq element-type 't))
-                         t)
-                        ((ctype-p element-type)
-                         (type-specifier element-type))
-                        ((constant-lvar-p element-type)
-                         (let ((ctype (careful-specifier-type
-                                       (lvar-value element-type))))
-                           (cond
-                             ((or (null ctype) (contains-unknown-type-p ctype)) '*)
-                             (t (upgraded-array-element-type
-                                 (lvar-value element-type))))))
-                        (t
-                         '*))
-                 ,(cond ((constant-lvar-p dims)
-                         (let* ((val (lvar-value dims))
-                                (cdims (ensure-list val)))
-                           (unless (check-array-dimensions val node)
-                             (return-from derive-make-array-type))
-                           (if simple
-                               cdims
-                               (length cdims))))
-                        ((csubtypep (lvar-type dims)
-                                    (specifier-type 'integer))
-                         '(*))
-                        (t
-                         '*)))
-               'array)))
+           `(,(if simple 'simple-array 'array)
+             ;; element-type is usually an LVAR or nil,
+             ;; but MAKE-WEAK-VECTOR derive-type passes in 'T.
+             ,(cond ((or (not element-type) (eq element-type 't))
+                     t)
+                    ((ctype-p element-type)
+                     (type-specifier element-type))
+                    ((constant-lvar-p element-type)
+                     (let ((ctype (careful-specifier-type
+                                   (lvar-value element-type))))
+                       (cond
+                         ((or (null ctype) (contains-unknown-type-p ctype)) '*)
+                         (t (upgraded-array-element-type
+                             (lvar-value element-type))))))
+                    (t
+                     '*))
+             ,(cond ((constant-lvar-p dims)
+                     (let* ((val (lvar-value dims))
+                            (cdims (ensure-list val)))
+                       (unless (check-array-dimensions val node)
+                         (return-from derive-make-array-type))
+                       (if simple
+                           cdims
+                           (length cdims))))
+                    ((csubtypep (lvar-type dims)
+                                (specifier-type 'integer))
+                     '(*))
+                    (t
+                     '*)))))
     (if (and (not simple)
              (or (supplied-and-true adjustable)
                  (supplied-and-true displaced-to)
@@ -968,7 +967,7 @@
                   (declare (ignorable ,@lambda-list))
                   (let ((content-length (length initial-contents)))
                    (unless (= content-length ,(or c-length 'length))
-                     (initial-contents-error content-length  ,(or c-length 'length))))
+                     (sb-vm::initial-contents-error content-length  ,(or c-length 'length))))
                   ,(wrap `(replace ,data-alloc-form initial-contents)))))))))
 
 ;;; IMPORTANT: The order of these three MAKE-ARRAY forms matters: the least
@@ -1076,8 +1075,10 @@
                            (type-specifier (sb-vm:saetp-ctype saetp))
                            'upgraded-array-element-type
                            eltype)))
-                   ((not (ctypep value eltype-type))
-                    ;; this case will not cause an error at runtime, but
+                   ((multiple-value-bind (typep surep)
+                        (ctypep value eltype-type)
+                      (and (not typep) surep))
+                    ;; This case will not cause an error at runtime, but
                     ;; it's still worth STYLE-WARNing about.
                     (compiler-style-warn 'initial-element-mismatch-style-warning
                                          :format-control "~S is not a ~S."
@@ -1238,6 +1239,49 @@
                             :displaced-to displaced-to
                             ,@(and displaced-index-offset
                                    '(:displaced-index-offset displacement)))))))
+
+(defoptimizer (adjust-array derive-type) ((array dims &key
+                                                 fill-pointer
+                                                 displaced-to
+                                                 displaced-index-offset
+                                                 &allow-other-keys)
+                                          node)
+  (let* ((array-type (lvar-type array))
+         (complex (conservative-array-type-complexp array-type))
+         (simple (null complex))
+         (complex (eq complex t))
+         (dims (if (constant-lvar-p dims)
+                   (let ((value (lvar-value dims)))
+                     (if (check-array-dimensions value node)
+                         value
+                         (return-from adjust-array-derive-type-optimizer)))
+                   '*)))
+    (unless complex
+      (let ((null (specifier-type 'null)))
+        (flet ((simple (lvar)
+                 (when lvar
+                   (cond ((not (type= (lvar-type lvar) null))
+                          (setf simple nil))
+                         ((not (types-equal-or-intersect (lvar-type lvar) null))
+                          (setf simple nil
+                                complex t))))))
+          (simple fill-pointer)
+          (simple displaced-to)
+          (simple displaced-index-offset))))
+    (let ((int (type-intersection (strip-array-dimensions-and-complexity array-type)
+                                  (make-array-type (if (integerp dims)
+                                                       (list dims)
+                                                       dims)
+                                                   :complexp (cond ((eq complex t))
+                                                                   ((not simple) :maybe))
+                                                   :element-type *wild-type*))))
+      (if (eq int *empty-type*)
+          (let ((*compiler-error-context* node))
+            (setf (combination-kind node) :error)
+            (compiler-warn "New dimensions ~s do not match the rank of ~a"
+                           dims
+                           (type-specifier array-type)))
+          int))))
 
 ;;;; miscellaneous properties of arrays
 

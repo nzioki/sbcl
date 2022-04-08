@@ -11,10 +11,6 @@
 
 (!begin-collecting-cold-init-forms)
 
-;; %DEFCONSTANT needs this to be bound.
-(!cold-init-forms
- (setq sb-c::*compile-time-eval* nil))
-
 (define-type-class named :enumerable nil :might-contain-other-types nil)
 
 (macrolet ((frob (type global-sym)
@@ -39,9 +35,9 @@
                          ;; Make it known as a constant in the cross-compiler.
                          (setf (info :variable :kind ',global-sym) :constant))
                   (!cold-init-forms
-                   #+sb-xc (sb-impl::%defconstant ',global-sym ,global-sym
+                   #+sb-xc (sb-impl::%defconstant ',global-sym ,(symbol-value global-sym)
                                                   (sb-c:source-location))
-                   (setf (info :type :builtin ',type) ,global-sym
+                   (setf (info :type :builtin ',type) #+sb-xc-host ,global-sym #-sb-xc-host ,(symbol-value global-sym)
                          (info :type :kind ',type) :primitive))))))
   ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
   ;; special symbol which can be stuck in some places where an

@@ -21,7 +21,7 @@
 ;;;;     existence of slots, and whether they should be scavenged, is
 ;;;;     not automatically propagated. Thus e.g. if you add a
 ;;;;     SIMPLE-FUN-DEBUG-INFO slot holding a tagged object which needs
-;;;;     to be GCed, you need to tweak scav_code_header() and
+;;;;     to be GCed, you need to tweak scav_code_blob() and
 ;;;;     verify_space() in gencgc.c, and the corresponding code in gc.c.
 ;;;;   * Various code (e.g. STATIC-FSET in genesis.lisp) is hard-wired
 ;;;;     to know the name of the last slot of the object the code works
@@ -232,7 +232,7 @@ during backtrace.
                                      :widetag simple-fun-widetag)
   ;; All three function primitive-objects have the first word after the header
   ;; as some kind of entry point, either the address to jump to, in the case
-  ;; of x86, or the Lisp function to jump to, for everybody else.
+  ;; of x86oids and arm64, or the Lisp function to jump to, for everybody else.
   (self :set-known ()
         :set-trans (setf %simple-fun-self))
   ;; This slot used to be named CODE, but that was misleaing because the
@@ -251,19 +251,19 @@ during backtrace.
 (defconstant simple-fun-source-slot  2) ; form and/or docstring
 (defconstant simple-fun-info-slot    3) ; type and possibly xref
 
-#-(or x86 x86-64 arm64)
+#-(or x86 x86-64 arm64 riscv)
 (define-primitive-object (return-pc :lowtag other-pointer-lowtag :widetag t)
   (return-point :c-type "unsigned char" :rest-p t))
 
 (define-primitive-object (closure :lowtag fun-pointer-lowtag
-                                   :widetag closure-widetag
-                                   ;; This allocator is used when renaming or cloning
-                                   ;; a closure. The compiler has its own way of making
-                                   ;; closures which requires that the length be
-                                   ;; a compile-time constant.
-                                   :alloc-trans %alloc-closure)
-  (fun :init :arg :ref-trans #+(or x86 x86-64) %closure-callee
-                             #-(or x86 x86-64) %closure-fun)
+                                  :widetag closure-widetag
+                                  ;; This allocator is used when renaming or cloning
+                                  ;; a closure. The compiler has its own way of making
+                                  ;; closures which requires that the length be
+                                  ;; a compile-time constant.
+                                  :alloc-trans %alloc-closure)
+  (fun :init :arg :ref-trans #+(or x86 x86-64 arm64) %closure-callee
+                             #-(or x86 x86-64 arm64) %closure-fun)
   ;; 'fun' is an interior pointer to code, but we also need the base pointer
   ;; for MPS. I'm trying to figure out how to avoid this word of overhead,
   ;; but it works for the time being.
@@ -309,7 +309,8 @@ during backtrace.
                                        :alloc-trans make-weak-pointer)
   (value :ref-trans %weak-pointer-value :ref-known (flushable)
          :init :arg)
-  (next :c-type "struct weak_pointer *"))
+  ;; 64-bit uses spare header bytes to store the 'next' link
+  #-64-bit (next :c-type "struct weak_pointer *"))
 
 ;;;; other non-heap data blocks
 
@@ -398,9 +399,9 @@ during backtrace.
   (fdefn :ref-trans %symbol-fdefn :ref-known ()
          :cas-trans cas-symbol-fdefn)
   #-compact-symbol
-  (package :ref-trans sb-xc:symbol-package
-           :set-trans %set-symbol-package
-           :init :null)
+  (package-id :type index ; actually 16 bits. (Could go in the header)
+              :ref-trans sb-impl::symbol-package-id
+              :set-trans sb-impl::set-symbol-package-id :set-known ())
   ;; 0 tls-index means no tls-index is allocated
   ;; 64-bit put the tls-index in the header word.
   ;; For the 32-bit architectures, reading this slot as a descriptor
@@ -487,7 +488,7 @@ during backtrace.
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
 ;;; can take care of maintaining Lisp and C versions.
-#.`(define-primitive-object (thread :size primitive-thread-object-length)
+(define-primitive-object (thread :size primitive-thread-object-length)
   ;; no_tls_value_marker is borrowed very briefly at thread startup to
   ;; pass the address of the start routine into new_thread_trampoline.
   ;; tls[0] = NO_TLS_VALUE_MARKER_WIDETAG because a the tls index slot
@@ -520,7 +521,9 @@ during backtrace.
   (current-catch-block :special *current-catch-block*)
   #+(and (or riscv x86-64 arm64) sb-thread)
   (current-unwind-protect-block :special *current-unwind-protect-block*)
-  #+sb-thread (pseudo-atomic-bits #+(or x86 x86-64) :special #+(or x86 x86-64) *pseudo-atomic-bits*)
+  #+(or sb-thread sparc ppc)
+  (pseudo-atomic-bits #+(or x86 x86-64) :special #+(or x86 x86-64) *pseudo-atomic-bits*
+                      :c-type "pa_bits_t")
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   (stepping)
@@ -528,7 +531,7 @@ during backtrace.
   (profile-data :c-type "uword_t *" :pointer t)
   ;; Thread-local allocation buffers
   #+gencgc (mixed-tlab :c-type "struct alloc_region" :length 4)
-  #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
+  #+gencgc (cons-tlab :c-type "struct alloc_region" :length 4)
   ;; END of slots to keep near the beginning.
 
   ;; This is the original address at which the memory was allocated,
@@ -648,17 +651,19 @@ during backtrace.
        ;; prior to the words of NIL.
        ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
        #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
+       ;; This offset of #x100 has to do with some edge cases where a vop
+       ;; might treat UNBOUND-MARKER as a pointer. So it has an address
+       ;; that is somewhere near NIL which makes it sort of "work"
+       ;; to dereference it. See git rev f1a956a6a771 for more info.
        #+64-bit #x100
        ;; magic padding because of NIL's symbol/cons-like duality
        (* 2 n-word-bytes)
        list-pointer-lowtag))
 
-;;; MIXED-REGION is address in static space at which a 'struct alloc_region'
-;;; is overlaid on a lisp vector with element type WORD.
+;;; MIXED-REGION is at the beginning of static space
 #-sb-thread
-(defconstant mixed-region
-  (+ static-space-start
-     (* 2 n-word-bytes))) ; skip the array header
+(progn (defconstant mixed-region static-space-start)
+       (defconstant cons-region (+ mixed-region (* 4 n-word-bytes))))
 
 ;;; Start of static objects:
 ;;;

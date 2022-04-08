@@ -55,7 +55,7 @@
  ;; host and target very early.
  ("src/code/primordial-extensions" :c-headers)
  ("src/code/cold-init-helper-macros" :c-headers)
- ("src/code/early-defmethod" :not-host)
+ ("src/code/initial-method" :not-host)
 
  ;; ASAP we replace the host's backquote reader with our own, to avoid leaking
  ;; details of the host into the target. This is not a concern in make-host-2
@@ -128,7 +128,6 @@
 
  ("src/code/ansi-stream" :not-host)
  ("src/code/restart" :not-host)
- ("src/code/early-print" :not-host)
  ("src/code/early-pprint" :not-host)
  ("src/code/early-impl" :not-host)
 
@@ -171,7 +170,6 @@
  ("src/code/early-time" :c-headers)
 
  ("src/code/misc" :c-headers)
- ("src/code/early-defclass")
  ("src/code/target-error" :not-host)
  ("src/code/target-extensions" :not-host)
 
@@ -180,9 +178,8 @@
  ;;; convenient to stick them here)
 
  ("src/compiler/parse-lambda-list" :c-headers)
- ("src/compiler/fun-info" :c-headers)
- ("src/compiler/constantp" :c-headers)
  ("src/compiler/macros" :c-headers)
+ ("src/compiler/fun-info" :c-headers)
  ("src/compiler/generic/vm-macs" :c-headers)
  ("src/compiler/policies")
 
@@ -238,7 +235,6 @@
 
  ("src/code/list"   :not-host)
  ("src/code/seq"    :not-host) ; "code/seq" should come after "code/list".
- ("src/code/fdefinition"    :not-host)
  ("src/code/coerce" :not-host)
 
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
@@ -263,6 +259,8 @@
  ("src/code/source-location")
 
  ("src/compiler/proclaim" :c-headers)
+
+ ("src/compiler/constantp" :c-headers)
  ("src/compiler/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
  ("src/code/type" :c-headers)
  ("src/compiler/generic/vm-type" :c-headers)
@@ -284,7 +282,6 @@
  ;; and SPECIALIZE-ARRAY-TYPE, defined in "compiler/generic/vm-type",
  ;; and PROCLAIM, defined in "src/compiler/proclaim"
  ("src/code/defstruct"  :c-headers)
- ("src/code/target-defstruct" :not-host)
 
  ;; ALIEN-VALUE has to be defined as a class (done by DEFSTRUCT
  ;; machinery) before we can set its superclasses here.
@@ -342,13 +339,11 @@
 
  ("src/code/format-directive")
 
- ("src/code/host-c-call")
+ ("src/code/c-call")
 
  #+os-provides-dlopen ("src/code/foreign-load" :not-host)
  #+(and os-provides-dlopen (not win32)) ("src/code/unix-foreign-load" :not-host)
  #+(and os-provides-dlopen win32) ("src/code/win32-foreign-load" :not-host)
-
- ("src/code/fop") ; needs macros from code/load.lisp
 
  ("src/compiler/disassem")
  ("src/compiler/assem")
@@ -370,7 +365,6 @@
  ("src/compiler/ir1opt")
  ("src/compiler/loop")
 
- ("src/compiler/ir1final")
  ("src/compiler/constraint")
  ("src/compiler/equality-constraints")
  ("src/compiler/array-tran")
@@ -390,7 +384,6 @@
 
  ("src/compiler/debug-dump")
  ("src/compiler/generic/utils" :c-headers)
- ("src/compiler/fopcompile")
 
  ("src/assembly/assemfile" :not-target)
 
@@ -414,12 +407,14 @@
 
  ;; this file defines the INTERVAL struct which is also used in 'srctran'
  ("src/compiler/float-tran")
- ;; This is a terrible name for a file that contains type derivers
- ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
- ("src/compiler/srctran")
+ ("src/compiler/ir1final")
  ("src/compiler/generic/vm-tran")
  ("src/compiler/generic/type-vops")
  ("src/compiler/{arch}/type-vops")
+
+ ;; This is a terrible name for a file that contains type derivers
+ ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
+ ("src/compiler/srctran")
  ("src/compiler/typetran")
  ("src/compiler/generic/vm-typetran")
  ("src/code/cross-modular"  :not-target)
@@ -454,6 +449,7 @@
 
  ("src/compiler/aliencomp")
 
+ ("src/compiler/coverage")
  ("src/compiler/ltv")
  ("src/compiler/gtn")
  ("src/compiler/ltn")
@@ -474,6 +470,7 @@
 
  #+sb-dyncount ("src/compiler/dyncount")
  #+sb-dyncount ("src/code/dyncount")
+ ("src/compiler/fopcompile" :not-host)
 
  ("src/code/format-time" :not-host)
 
@@ -531,13 +528,16 @@
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
+ ("src/code/fdefinition"       :not-host)
  ("src/code/query"  :not-host)
  ("src/code/sort"  :not-host)
  ("src/code/final" :not-host)
- ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
  ("src/code/reader" :not-host) ; needs "code/readtable"
  ("src/code/print" :not-host)
+ ("src/code/pprint" :not-host)
 
+
+ ("src/code/target-defstruct"  :not-host)
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
  ("src/code/target-pathname"   :not-host)
  #-win32 ("src/code/unix-pathname"     :not-host)
@@ -572,8 +572,6 @@
  ("src/code/external-formats/enc-basic" :not-host)
  #+sb-unicode ("src/code/external-formats/enc-ucs" :not-host) ; win32 needs this
 
- #+sb-eval ("src/code/full-eval"   :not-host) ; uses INFO, ARG-COUNT-ERROR
-
  ("src/code/bit-bash"    :not-host) ; needs %NEGATE from assembly/{arch}/arith
 
  #-(or x86 x86-64) ("src/compiler/generic/sanctify" :not-host)
@@ -596,14 +594,11 @@
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; target macros and DECLAIMs installed at build-the-cross-compiler time
 
- ;; FIXME: here? earlier?  can probably be as late as possible.  Also
- ;; maybe call it FORCE-DELAYED-PROCLAIMS?
- ("src/compiler/late-proclaim")
-
  ("src/code/setf")
  ("src/code/macros")
  ("src/code/loop")
  ("src/pcl/defclass")
+ ("src/code/early-defmethod")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; other target-code-building stuff which can't be processed until
@@ -613,13 +608,7 @@
  ("src/code/target-format" :not-host)
 
  ("src/code/late-globaldb" :not-host)
- ("src/code/redblack" :not-host)
- ;; This file, which must be last, contains sanity-checks of the cross-compile.
- ;; The inputs and outputs of certain functions (currently just SXHASH) are stored
- ;; in global symbols. Relying on the fact that data are easily dumped as constants
- ;; (assuming we don't have a genesis bug), the forms in this file can audit
- ;; whether things came out right.
- ("src/code/last-file" :not-host))
+ ("src/code/redblack" :not-host))
 
 ;;; make-target-2 build steps
 (("src/code/early-ntrace" ; lets PCL hook into tracing
@@ -697,6 +686,8 @@
   "src/pcl/precom1"
   "src/pcl/precom2"
   "src/code/ntrace")
+
+  #+sb-eval ("src/code/full-eval")
 
  ("src/code/setf-funs"
   ;; miscellaneous functionality which depends on CLOS

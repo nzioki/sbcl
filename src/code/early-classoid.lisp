@@ -273,8 +273,7 @@
 ;;; FLAGS are computed on demand, and not stored.
 #+sb-xc-host
 (progn
-  (defstruct (wrapper (:include structure!object)
-                      (:constructor host-make-wrapper
+  (defstruct (wrapper (:constructor host-make-wrapper
                          (id clos-hash classoid
                           &key ((:info %info)) depthoid inherits length invalid
                           #+metaspace friend)))
@@ -294,8 +293,7 @@
     (depthoid -1 :type layout-depthoid)
     (length 0 :type layout-length)
     (%info nil :type (or null defstruct-description)))
-  #+metaspace (defstruct (sb-vm:layout (:include structure!object)
-                                       (:constructor %make-layout))
+  #+metaspace (defstruct (sb-vm:layout (:constructor %make-layout))
                 friend)
   (defun make-temporary-wrapper (clos-hash classoid inherits)
     (host-make-wrapper nil clos-hash classoid :inherits inherits :invalid nil))
@@ -320,9 +318,21 @@
                        (every (lambda (x) (eq (dsd-raw-type x) t))
                               (dd-slots dd))))
           (setf flags (logior flags +strictly-boxed-flag+))))
+      ;; KLUDGE: I really don't care to make defstruct-with-alternate-metaclass
+      ;; any more complicated than necessary. It is unable to express that
+      ;; these funcallable instances can go on pure boxed pages.
+      ;; (The trampoline is always an assembler routine, thus ignorable)
+      (when (member (wrapper-classoid-name wrapper)
+                    '(sb-pcl::ctor sb-pcl::%method-function))
+        (setf flags (logior flags +strictly-boxed-flag+)))
       flags))
   (defun wrapper-bitmap (wrapper)
-    (acond ((wrapper-%info wrapper) (dd-bitmap it)) (t +layout-all-tagged+))))
+    (acond ((wrapper-%info wrapper) (dd-bitmap it))
+           ;; Give T a 0 bitmap. It's arbitrary, but when we need some layout
+           ;; that has this bitmap we can use the layout of T.
+           ((eq wrapper (find-layout t)) 0)
+           (t
+            +layout-all-tagged+))))
 
 (defun equalp-err (a b)
   (bug "EQUALP ~S ~S" a b))
@@ -488,17 +498,13 @@
 ;;; This translation is done when type specifiers are parsed. Type
 ;;; system operations (union, subtypep, etc.) should never encounter
 ;;; translated classes, only their translation.
-(sb-xc:defstruct (built-in-classoid (:include classoid) (:copier nil)
+(def!struct (built-in-classoid (:include classoid) (:copier nil)
                                     (:constructor !make-built-in-classoid))
   ;; the type we translate to on parsing. If NIL, then this class
-  ;; stands on its own
-  (translation nil :type (or null ctype) :read-only t)
-  (predicate nil :type (sfunction (t) boolean) :read-only t))
-#+sb-xc-host
-(defstruct (built-in-classoid (:include classoid) (:copier nil)
-                              (:constructor !make-built-in-classoid))
-  ;; until bootstrap of all CTYPEs, store a dummy value distinct from NIL
-  (translation nil :type (or null ctype (member :initializing))))
+  ;; stands on its own. Only :INITIALIZING for a period during cold
+  ;; load.
+  (translation nil :type (or null ctype (member :initializing)))
+  (predicate (missing-arg) :type (sfunction (t) boolean) :read-only t))
 
 (def!struct (condition-classoid (:include classoid)
                                 (:copier nil)

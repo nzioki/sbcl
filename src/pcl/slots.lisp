@@ -121,7 +121,7 @@
          (info (cdr cell))
          (typecheck (slot-info-typecheck info)))
     (when typecheck
-      (funcall typecheck new-value))
+      (setf new-value (funcall typecheck new-value)))
     (cond ((fixnump location)
            (if (std-instance-p object)
                (setf (standard-instance-access object location) new-value)
@@ -152,7 +152,7 @@
          (info (cdr cell))
          (typecheck (slot-info-typecheck info)))
     (when typecheck
-      (funcall typecheck new-value))
+      (setf new-value (funcall typecheck new-value)))
     (let ((old (cond ((fixnump location)
                       (if (std-instance-p object)
                           (cas (standard-instance-access object location) old-value new-value)
@@ -456,11 +456,3 @@
            :format-control "~S called on ~S, which is not yet finalized."
            :format-arguments (list 'class-slots class)
            :references '((:amop :generic-function class-slots)))))
-
-(defun %set-slots (object names &rest values)
-  (mapc (lambda (name value)
-          (if (unbound-marker-p value)
-              ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
-              (slot-makunbound object name)
-              (setf (slot-value object name) value)))
-        names values))

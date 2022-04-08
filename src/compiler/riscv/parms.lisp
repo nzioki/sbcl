@@ -23,7 +23,7 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
@@ -76,7 +76,7 @@
 #+gencgc
 (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
-(defconstant linkage-table-entry-size #-64-bit 4 #+64-bit 8) ; N-WORD-BYTES (not defined yet)
+(defconstant linkage-table-entry-size #-64-bit 8 #+64-bit 24)
 (defconstant linkage-table-growth-direction :down)
 (setq *linkage-space-predefined-entries* '(#+gencgc("alloc" nil)
                                            #+gencgc("alloc_list" nil)))
@@ -116,14 +116,13 @@
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
 (defconstant-eqx +static-symbols+
- #.`#(,@+common-static-symbols+
-      *allocation-pointer*
-      #-sb-thread
-      ,@'(*binding-stack-pointer*
-          ;; interrupt handling
-          *pseudo-atomic-atomic*
-          *pseudo-atomic-interrupted*)
-      ,@*runtime-asm-routines*)
+ `#(,@+common-static-symbols+
+    #-sb-thread
+    ,@'(*binding-stack-pointer*
+        ;; interrupt handling
+        *pseudo-atomic-atomic*
+        *pseudo-atomic-interrupted*)
+    ,@*runtime-asm-routines*)
   #'equalp)
 
 (defconstant-eqx +static-fdefns+

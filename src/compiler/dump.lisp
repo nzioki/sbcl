@@ -36,9 +36,11 @@
   ;; can get them from the table rather than dumping them again. The
   ;; SIMILAR-TABLE is used for lists and strings, and the EQ-TABLE is
   ;; used for everything else. We use a separate EQ table to avoid
-  ;; performance pathologies with objects for which EQUAL degenerates
-  ;; to EQL. Everything entered in the SIMILAR table is also entered in
-  ;; the EQ table.
+  ;; performance pathologies with objects for which SIMILAR
+  ;; degenerates to EQL. Everything entered in the SIMILAR table is
+  ;; also entered in the EQ table. The NAMED-CONSTANT is used for
+  ;; named constants whose references are dumped as load time values
+  ;; of SYMBOL-GLOBAL-VALUE.
   (similar-table (make-similarity-table) :type hash-table :read-only t)
   (eq-table (make-hash-table :test 'eq) :type hash-table :read-only t)
   ;; the INSTANCE table maps dumpable instances to unique IDs for calculating
@@ -86,6 +88,8 @@
   ;; a hash table of structures that are allowed to be dumped. If we
   ;; try to dump a structure that isn't in this hash table, we lose.
   (valid-structures (make-hash-table :test 'eq) :type hash-table)
+  ;; a hash table of slots to be saved when dumping an instance.
+  (saved-slot-names (make-hash-table :test 'eq) :type hash-table)
   ;; DEBUG-SOURCE written at the very beginning
   (source-info nil :type (or null sb-c::debug-source)))
 (declaim (freeze-type fasl-output))
@@ -209,11 +213,13 @@
 ;;; This structure holds information about a circularity.
 (defstruct (circularity (:copier nil))
   ;; the kind of modification to make to create circularity
-  (type (missing-arg) :type (member :rplaca :rplacd :svset :struct-set))
+  (type (missing-arg) :type (member :rplaca :rplacd :svset :struct-set :slot-set))
   ;; the object containing circularity
   object
   ;; index in object for circularity
   (index (missing-arg) :type index)
+  ;; slot name in object for circularity
+  (slot-name nil :type symbol)
   ;; the object to be stored at INDEX in OBJECT. This is that the key
   ;; that we were using when we discovered the circularity.
   value
@@ -434,7 +440,7 @@
 ;;; dumping them. If the object is in the EQ-TABLE, then we push it,
 ;;; otherwise, we do a type dispatch to a type specific dumping
 ;;; function. The type specific branches do any appropriate
-;;; EQUAL-TABLE check and table entry.
+;;; SIMILAR-TABLE check and table entry.
 ;;;
 ;;; When we go to dump the object, we enter it in the CIRCULARITY-TABLE.
 (defun dump-non-immediate-object (x file)
@@ -466,15 +472,15 @@
                               ((eq x sb-c::*debug-name-ellipsis*) 2)
                               (t (bug "Bogus debug name marker")))))
              (instance
-              (let ((c (gethash x (sb-c::eql-constants sb-c::*ir1-namespace*))))
-                (cond ((and c (sb-c::leaf-has-source-name-p c))
-                       (dump-load-time-symbol-global-value c file))
-                      (t
-                       (dump-structure x file)
-                       (eq-save-object x file)))))
+              (multiple-value-bind (slot-names slot-names-p)
+                  (gethash x (fasl-output-saved-slot-names file))
+                (if slot-names-p
+                    (dump-instance-saving-slots x slot-names file)
+                    (dump-structure x file)))
+              (eq-save-object x file))
              (array
               ;; DUMP-ARRAY (and its callees) are responsible for
-              ;; updating the EQ and EQUAL hash tables.
+              ;; updating the EQ and SIMILAR hash tables.
               (dump-array x file))
              (number
               (unless (similar-check-table x file)
@@ -565,7 +571,10 @@
                    (:rplaca     #.(get 'fop-rplaca 'opcode))
                    (:rplacd     #.(get 'fop-rplacd 'opcode))
                    (:svset      #.(get 'fop-svset 'opcode))
-                   (:struct-set #.(get 'fop-structset 'opcode)))
+                   (:struct-set #.(get 'fop-structset 'opcode))
+                   (:slot-set
+                    (dump-object (circularity-slot-name info) file)
+                    #.(get 'fop-slotset 'opcode)))
                  file)
       (dump-varint (gethash (circularity-object info) table) file)
       (dump-varint (circularity-index info) file))))
@@ -626,8 +635,14 @@
 
 ;;; Note that the specified structure can just be dumped by
 ;;; enumerating the slots.
-(defun fasl-note-dumpable-instance (structure file)
+(defun fasl-validate-structure (structure file)
   (setf (gethash structure (fasl-output-valid-structures file)) t)
+  (values))
+
+;;; Note that the specified standard object can just be dumped by
+;;; saving its slot values.
+(defun fasl-note-instance-saves-slots (instance slot-names file)
+  (setf (gethash instance (fasl-output-saved-slot-names file)) slot-names)
   (values))
 
 ;;;; number dumping
@@ -850,7 +865,7 @@
       #+sb-xc-host (bug "Can't dump multi-dim array")))
 
 ;;; Dump the vector object. If it's not simple, then actually dump a
-;;; simple realization of it. But we enter the original in the EQ or EQUAL
+;;; simple realization of it. But we enter the original in the EQ or SIMILAR
 ;;; tables.
 (defun dump-vector (x file)
   (let ((simple-version (if (array-header-p x)
@@ -879,8 +894,9 @@
        (dump-simple-vector simple-version file)
        (eq-save-object x file))
       (t
-       (dump-specialized-vector simple-version file)
-       (eq-save-object x file)))))
+       (unless (similar-check-table x file)
+         (dump-specialized-vector simple-version file)
+         (similar-save-object x file))))))
 
 ;;; Dump a SIMPLE-VECTOR, handling any circularities.
 (defun dump-simple-vector (v file)
@@ -1085,11 +1101,6 @@
       (dump-integer info fasl-output))
     (incf n)))
 
-(defun dump-load-time-symbol-global-value (constant fasl-output)
-  (dump-object 'symbol-global-value fasl-output)
-  (dump-object (sb-c::leaf-source-name constant) fasl-output)
-  (dump-fop 'fop-funcall fasl-output 1))
-
 ;;; Dump out the constant pool and code-vector for component, push the
 ;;; result in the table, and return the offset.
 ;;;
@@ -1112,22 +1123,19 @@
          (header-length (length constants))
          (n-named-calls 0))
     (dump-object alloc-points fasl-output)
-    (collect ((patches))
+    (collect ((patches)
+              (named-constants))
       ;; Dump the constants, noting any :ENTRY constants that have to
       ;; be patched.
       (loop for i from sb-vm:code-constants-offset below header-length do
         (let ((entry (aref constants i)))
           (etypecase entry
             (constant
-             (if (and (sb-c::leaf-has-source-name-p entry)
-                      ;; We can't really reference constants defined
-                      ;; by name at load time in the same block
-                      ;; compilation unit, so dump it anonymously when
-                      ;; such a situation arises.
-                      (not (member (sb-c::leaf-source-name entry)
-                                   sb-c::*hairy-defconstants*)))
-                 (dump-load-time-symbol-global-value entry fasl-output)
-                 (dump-object (sb-c::constant-value entry) fasl-output)))
+             (cond ((sb-c::leaf-has-source-name-p entry)
+                    (named-constants (cons (sb-c::leaf-source-name entry) i))
+                    (dump-fop 'fop-misc-trap fasl-output))
+                   (t
+                    (dump-object (sb-c::constant-value entry) fasl-output))))
             (cons
              (ecase (car entry)
                (:constant ; anything that has not been wrapped in a #<CONSTANT>
@@ -1152,7 +1160,13 @@
                 (dump-fop 'fop-fdefn fasl-output))
                (:known-fun
                 (dump-object (cadr entry) fasl-output)
-                (dump-fop 'fop-known-fun fasl-output))))
+                (dump-fop 'fop-known-fun fasl-output))
+               (:coverage-marks
+                ;; Avoid the coalescence done by DUMP-VECTOR
+                (dump-specialized-vector (make-array (cdr entry)
+                                                     :element-type '(unsigned-byte 8)
+                                                     :initial-element #xFF)
+                                         fasl-output))))
             (null
              (dump-fop 'fop-misc-trap fasl-output)))))
 
@@ -1181,6 +1195,10 @@
           (push (cons handle (cdr patch))
                 (gethash (car patch)
                          (fasl-output-patch-table fasl-output))))
+        (dolist (named-constant (named-constants))
+          (dump-object (car named-constant) fasl-output)
+          (dump-push handle fasl-output)
+          (dump-fop 'fop-named-constant-set fasl-output (cdr named-constant)))
         handle))))
 
 ;;; This is only called from assemfile, which doesn't exist in the target.
@@ -1225,31 +1243,31 @@
   #+sb-dyncount
   (let ((info (sb-c::ir2-component-dyncount-info (component-info component))))
     (when info
-      (fasl-note-dumpable-instance info file)))
+      (fasl-validate-structure info file)))
 
   (let* ((2comp (component-info component))
          (entries (sb-c::ir2-component-entries 2comp))
          (nfuns (length entries))
          (code-handle
-          ;; fill in the placeholder elements of constants
-          ;; with the NAME, ARGLIST, TYPE, INFO slots of each simple-fun.
-          (let ((constants (sb-c:ir2-component-constants 2comp))
-                (wordindex (+ sb-vm:code-constants-offset
-                              (* sb-vm:code-slots-per-simple-fun nfuns))))
-            (dolist (entry entries)
-              ;; Process in reverse order of ENTRIES.
-              ;; See also MAKE-CORE-COMPONENT which does the same thing.
-              (decf wordindex sb-vm:code-slots-per-simple-fun)
-              (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
-                    `(:constant ,(sb-c::entry-info-name entry))
-                    (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
-                    `(:constant ,(sb-c::entry-info-arguments entry))
-                    (aref constants (+ wordindex sb-vm:simple-fun-source-slot))
-                    `(:constant ,(sb-c::entry-info-form/doc entry))
-                    (aref constants (+ wordindex sb-vm:simple-fun-info-slot))
-                    `(:constant ,(sb-c::entry-info-type/xref entry))))
-            (dump-code-object component code-segment code-length fixups
-                              alloc-points file)))
+           ;; fill in the placeholder elements of constants
+           ;; with the NAME, ARGLIST, TYPE, INFO slots of each simple-fun.
+           (let ((constants (sb-c:ir2-component-constants 2comp))
+                 (wordindex (+ sb-vm:code-constants-offset
+                               (* sb-vm:code-slots-per-simple-fun nfuns))))
+             (dolist (entry entries)
+               ;; Process in reverse order of ENTRIES.
+               ;; See also MAKE-CORE-COMPONENT which does the same thing.
+               (decf wordindex sb-vm:code-slots-per-simple-fun)
+               (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
+                     `(:constant ,(sb-c::entry-info-name entry))
+                     (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
+                     `(:constant ,(sb-c::entry-info-arguments entry))
+                     (aref constants (+ wordindex sb-vm:simple-fun-source-slot))
+                     `(:constant ,(sb-c::entry-info-form/doc entry))
+                     (aref constants (+ wordindex sb-vm:simple-fun-info-slot))
+                     `(:constant ,(sb-c::entry-info-type/xref entry))))
+             (dump-code-object component code-segment code-length fixups
+                               alloc-points file)))
          (fun-index nfuns))
 
     (dolist (entry entries)
@@ -1259,13 +1277,25 @@
         ;; When cross compiling, if the entry is a DEFUN, then we also
         ;; dump a FOP-FSET so that the cold loader can instantiate the
         ;; definition at cold-load time, allowing forward references
-        ;; to functions in top-level forms.
+        ;; to functions in top-level forms. If the entry is a
+        ;; DEFMETHOD, we dump a FOP-MSET so that the cold loader
+        ;; recognizes the method definition.
         #+sb-xc-host
         (let ((name (sb-c::entry-info-name entry)))
-          (when (sb-c::legal-fun-name-p name)
-            (dump-object name file)
-            (dump-push entry-handle file)
-            (dump-fop 'fop-fset file)))
+          (cond ((sb-c::legal-fun-name-p name)
+                 (dump-object name file)
+                 (dump-push entry-handle file)
+                 (dump-fop 'fop-fset file))
+                ((and (listp name)
+                      (eq (first name) 'sb-pcl::fast-method))
+                 (let ((method (second name))
+                       (qualifiers (butlast (cddr name)))
+                       (specializers (first (last name))))
+                   (dump-object method file)
+                   (dump-object qualifiers file)
+                   (dump-object specializers file)
+                   (dump-push entry-handle file)
+                   (dump-fop 'fop-mset file)))))
         (setf (gethash entry (fasl-output-entry-table file)) entry-handle)
         (let ((old (gethash entry (fasl-output-patch-table file))))
           (when old
@@ -1315,17 +1345,19 @@
 ;;;   (defvar *cpus* (... (sb-alien:alien-funcall ...)))
 ;;; and the expansion of alien-funcall involves an ALIEN-TYPE literal
 ;;; which gets multiply expanded exactly as described above.
-
 (defun load-form-is-default-mlfss-p (struct)
   ;; FIXME? this is called while writing a fasl and so might need
   ;; to invoke MAKE-LOAD-FORM, long after IR1 conversion has happened.
   ;; Surely this is not the best design.
-  (eq (nth-value 1 (sb-c::%make-load-form struct)) 'fop-struct))
+  (and (typep struct 'structure-object)
+       (multiple-value-bind (creation-form init-form)
+           (handler-case (make-load-form struct (make-null-lexenv))
+             (error (condition) (sb-c:compiler-error condition)))
+         (multiple-value-bind (ss-creation-form ss-init-form)
+             (make-load-form-saving-slots struct)
+           (and (equal creation-form ss-creation-form)
+                (equal init-form ss-init-form))))))
 
-;; Having done nothing more than load all files in obj/from-host, the
-;; cross-compiler running under any host Lisp begins life able to access
-;; SBCL-format metadata for any structure that is a subtype of STRUCTURE!OBJECT.
-;; But if it learns a layout by cross-compiling a DEFSTRUCT, that's ok too.
 (defun dump-structure (struct file)
   (unless (or (gethash struct (fasl-output-valid-structures file))
               (typep struct
@@ -1383,3 +1415,37 @@
             (1+ (wrapper-depthoid obj)) ; non-stack args can't be negative
             (logand flags sb-kernel::layout-flags-mask)
             (wrapper-length obj)))
+
+;;;; dumping instances which just save their slots
+
+(defun dump-instance-saving-slots (object slot-names file)
+  (note-potential-circularity object file)
+  (let ((circ (fasl-output-circularity-table file)))
+    (dolist (slot-name slot-names)
+      (if (slot-boundp object slot-name)
+          (let* ((value (slot-value object slot-name))
+                 (ref (gethash value circ)))
+            (cond (ref
+                   (push (make-circularity :type :slot-set
+                                           :object object
+                                           :index 0
+                                           :slot-name slot-name
+                                           :value value
+                                           :enclosing-object ref)
+                         *circularities-detected*)
+                   (sub-dump-object nil file))
+                  (t
+                   (sub-dump-object value file))))
+          (dump-fop 'fop-misc-trap file))
+      (sub-dump-object slot-name file)))
+  (sub-dump-object (class-name (class-of object)) file)
+  (dump-fop 'fop-instance file (length slot-names)))
+
+;;;; code coverage
+
+(defun dump-code-coverage-records (namestring cc file)
+  (declare (type string namestring)
+           (type list cc))
+  (dump-object namestring file)
+  (dump-object cc file)
+  (dump-fop 'fop-record-code-coverage file))

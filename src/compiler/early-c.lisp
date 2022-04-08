@@ -15,16 +15,6 @@
 
 (in-package "SB-C")
 
-;;; An OPAQUE-BOX instance is used to pass data from IR1 to IR2 as
-;;; a quoted object in a "source form" (not user-written) such that the
-;;; contained object is in a for-evaluation position but ignored by
-;;; the compiler's constant-dumping logic.
-(defstruct (opaque-box (:constructor opaquely-quote (value))
-                       (:copier nil)
-                       (:predicate opaque-box-p))
-  value)
-(declaim (freeze-type opaque-box))
-
 ;;; ANSI limits on compilation
 (defconstant call-arguments-limit most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
@@ -39,23 +29,6 @@
 
 
 ;;;; miscellaneous types used both in the cross-compiler and on the target
-
-
-;;; An INLINEP value describes how a function is called. The values
-;;; have these meanings:
-;;;     NIL     No declaration seen: do whatever you feel like, but don't
-;;;             dump an inline expansion.
-;;; NOTINLINE  NOTINLINE declaration seen: always do full function call.
-;;;    INLINE  INLINE declaration seen: save expansion, expanding to it
-;;;             if policy favors.
-;;; MAYBE-INLINE
-;;;             Retain expansion, but only use it opportunistically.
-;;;             MAYBE-INLINE is quite different from INLINE. As explained
-;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
-;;;             instantiated once per component, INLINE - for all
-;;;             references (even under #'without FUNCALL)."
-(deftype inlinep ()
-  '(member inline maybe-inline notinline nil))
 
 (defstruct (dxable-args (:constructor make-dxable-args (list))
                         (:predicate nil)
@@ -143,15 +116,6 @@ the stack without triggering overflow protection.")
 (defvar *block-compile-argument*)
 (declaim (type (member nil t :specified)
                *block-compile-default* *block-compile-argument*))
-
-;; Names seen which are defined to be hairy (i.e. non-EQ comparable)
-;; constants.
-(defvar *hairy-defconstants* '())
-(declaim (type list *hairy-defconstants*))
-
-#-sb-xc-host
-(define-load-time-global *static-linker-lock*
-    (sb-thread:make-mutex :name "static linker"))
 
 
 ;;;; miscellaneous utilities

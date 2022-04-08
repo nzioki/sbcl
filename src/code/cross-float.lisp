@@ -287,9 +287,9 @@
                                             (rest values)
                                             values)
                                         table))))
+          (setf (cdr cache) (hash-table-count table))
           (when cl:*compile-verbose*
-            (format t "~&; Float-ops cache prefill: ~D entries~%"
-                    (setf (cdr cache) (hash-table-count table)))))))
+            (format t "~&; Float-ops cache prefill: ~D entries~%" (cdr cache))))))
     table))
 
 (defun record-math-op (key &rest values)
@@ -784,7 +784,7 @@
       (if (zerop x)
           x
           (dispatch :me
-                    (make-flonum (realnumify x)
+                    (make-flonum (funcall #':me (realnumify x))
                                  (pick-result-format x))))))
 
   (intercept (*) (&rest args)

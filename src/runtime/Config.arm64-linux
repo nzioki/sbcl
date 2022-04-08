@@ -17,8 +17,6 @@ OS_LIBS = -ldl -Wl,-no-as-needed
 
 ifdef LISP_FEATURE_GENCGC
   GC_SRC = fullcgc.c gencgc.c traceroot.c
-else
-  GC_SRC = cheneygc.c
 endif
 
 ifdef LISP_FEATURE_SB_THREAD
@@ -31,7 +29,3 @@ ifdef LISP_FEATURE_LARGEFILE
   CFLAGS += -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
 endif
 LINKFLAGS += -Wl,--export-dynamic
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:

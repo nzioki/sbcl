@@ -40,7 +40,6 @@
 #include "validate.h"
 #include "gc-internal.h"
 #include "gc-private.h"
-#include "getallocptr.h"
 #include "code.h"
 
 #include <errno.h>
@@ -496,8 +495,8 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             continue;
         case CLOSURE_WIDETAG:
             fix_fun_header_layout(where, adj);
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-            // For x86[-64], the closure fun appears to be a fixnum,
+#if FUN_SELF_FIXNUM_TAGGED
+            // For x86[-64], arm64, the closure fun appears to be a fixnum,
             // and might need adjustment unless pointing to immobile code.
             // Then fall into the general case; where[1] won't get re-adjusted
             // because it doesn't satisfy is_lisp_pointer().
@@ -576,6 +575,7 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
 #ifdef SIMD_PACK_256_WIDETAG
         case SIMD_PACK_256_WIDETAG:
 #endif
+        case FILLER_WIDETAG: // non-card-spanning object pages container fillers
             continue;
         default:
           if (other_immediate_lowtag_p(widetag)
@@ -587,8 +587,8 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
         adjust_pointers(where+1, nwords-1, adj);
     }
 #if SHOW_SPACE_RELOCATION
-    fprintf(stderr, "space @ %p: fixed %d absolute + %d relative pointers\n",
-            (lispobj*)start, adj->n_relocs_abs, adj->n_relocs_rel);
+    fprintf(stderr, "space @ %p..%p: fixed %d absolute + %d relative pointers\n",
+            (lispobj*)start, end, adj->n_relocs_abs, adj->n_relocs_rel);
 #endif
 }
 
@@ -612,7 +612,8 @@ static void relocate_heap(struct heap_adjust* adj)
 #ifdef LISP_FEATURE_CHENEYGC
     relocate_space(DYNAMIC_0_SPACE_START, (lispobj*)get_alloc_pointer(), adj);
 #else
-    relocate_space(DYNAMIC_SPACE_START, (lispobj*)get_alloc_pointer(), adj);
+    relocate_space(DYNAMIC_SPACE_START, (lispobj*)dynamic_space_highwatermark(),
+                   adj);
 #endif
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     // Pointers within varyobj space to varyobj space do not need adjustment
@@ -921,11 +922,11 @@ process_directory(int count, struct ndir_entry *entry,
                 }
 #else /* gencgc */
                 {
-                uword_t aligned_start = ALIGN_UP(addr, GENCGC_CARD_BYTES);
+                uword_t aligned_start = ALIGN_UP(addr, GENCGC_PAGE_BYTES);
                 /* Misalignment can happen only if card size exceeds OS page.
                  * Drop one card to avoid overrunning the allocated space */
                 if (aligned_start > addr) // not card-aligned
-                    dynamic_space_size -= GENCGC_CARD_BYTES;
+                    dynamic_space_size -= GENCGC_PAGE_BYTES;
                 DYNAMIC_SPACE_START = addr = aligned_start;
                 check_dynamic_space_addr_ok(addr, dynamic_space_size);
                 }
@@ -979,9 +980,10 @@ process_directory(int count, struct ndir_entry *entry,
              * at the time the core was saved.
              * For gencgc this is #defined as DYNAMIC_SPACE_START */
             current_dynamic_space = (lispobj *)addr;
+#else
+            next_free_page = ALIGN_UP(entry->nwords<<WORD_SHIFT, GENCGC_PAGE_BYTES)
+              / GENCGC_PAGE_BYTES;
 #endif
-            set_alloc_pointer((lispobj)free_pointer);
-
             anon_dynamic_space_start = (os_vm_address_t)(addr + len);
         }
     }

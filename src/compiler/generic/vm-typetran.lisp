@@ -122,6 +122,7 @@
 ;;; accepting any type object.
 (define-type-predicate %standard-char-p standard-char)
 (define-type-predicate non-null-symbol-p (and symbol (not null)))
+
 
 (defglobal *backend-type-predicates-grouped*
     (let (plist)
@@ -186,3 +187,9 @@
           when (subsetp union-types types :test #'type=)
           return (values (aref predicates (1+ x))
                          (set-difference types union-types)))))
+
+(unless-vop-existsp (:translate keywordp)
+(define-source-transform keywordp (x)
+  `(let ((object ,x))
+     (and (non-null-symbol-p object)
+          (= (sb-impl::symbol-package-id object) ,sb-impl::+package-id-keyword+)))))
