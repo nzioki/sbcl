@@ -13,6 +13,21 @@
 
 (cl:in-package :cl-user)
 
+(defun bin-pwd-ignoring-result ()
+  (let ((initially-open-fds (directory "/proc/self/fd/*" :resolve-symlinks nil)))
+    (sb-ext:run-program "/usr/bin/pwd" nil :input :stream :output :stream :wait nil)
+    (length initially-open-fds)))
+
+(with-test (:name (run-program :autoclose-streams)
+            :broken-on :sbcl  ;; not reliable enough
+            :skipped-on (not :linux))
+  (let ((n-initially-open-fds (bin-pwd-ignoring-result)))
+    (gc)
+    (sb-sys:scrub-control-stack) ; Make sure we're not referencing the #<process>
+    (gc) ; now nothing should reference the streams
+    (assert (= (length (directory "/proc/self/fd/*" :resolve-symlinks nil))
+               n-initially-open-fds))))
+
 ;; In addition to definitions lower down the impurity we're avoiding
 ;; is the sigchld handler that RUN-PROGRAM sets up, which interfers
 ;; with the manual unix process control done by the test framework
@@ -220,7 +235,8 @@
 
 ;;; This used to crash on Darwin and trigger recursive lock errors on
 ;;; every platform.
-(with-test (:name (run-program :stress))
+;;; ...and now it triggers recursive lock errors on safepoint + linux.
+(with-test (:name (run-program :stress) :skipped-on (:and :sb-safepoint :linux))
   ;; Do it a hundred times in batches of 10 so that with a low limit
   ;; of the number of processes the test can have a chance to pass.
   ;;

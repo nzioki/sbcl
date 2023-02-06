@@ -274,11 +274,12 @@
                     (funcall-stm-handler j-unread-char encap t))
                   (if (eq char stream) eof-value char))))
             ((eq peek-type t)
-             (do ((char char (funcall-stm-handler j-read-char encap
+             (do ((readtable *readtable*)
+                  (char char (funcall-stm-handler j-read-char encap
                                                   eof-error-p
                                                   stream t)))
                  ((or (eq char stream)
-                      (not (sb-impl::whitespace[2]p char)))
+                      (not (sb-impl::whitespace[2]p char readtable)))
                   (unless (eq char stream)
                     (funcall-stm-handler j-unread-char encap t))
                   (if (eq char stream) eof-value char))))
@@ -526,32 +527,36 @@
          (single-channel-simple-stream
           (with-stream-class (single-channel-simple-stream stream)
             (loop with max-ptr fixnum = (sm buf-len stream)
-                  for src-pos fixnum = start then (+ src-pos count)
+                  with src-pos fixnum = start
                   for src-rest fixnum = (- end src-pos)
-                  while (> src-rest 0) ; FIXME: this is non-ANSI
-                  for ptr fixnum = (let ((ptr (sm buffpos stream)))
-                                     (if (>= ptr max-ptr)
-                                         (flush-buffer stream t)
-                                         ptr))
-                  for buf-rest fixnum = (- max-ptr ptr)
-                  for count fixnum = (min buf-rest src-rest)
-                  do (progn (setf (sm mode stream) 1)
-                            (setf (sm buffpos stream) (+ ptr count))
-                            (buffer-copy seq src-pos (sm buffer stream) ptr count)))))
+                  while (> src-rest 0)
+                  do (let* ((ptr (let ((ptr (sm buffpos stream)))
+                                   (if (>= ptr max-ptr)
+                                       (flush-buffer stream t)
+                                       ptr)))
+                            (buf-rest (- max-ptr ptr))
+                            (count (min buf-rest src-rest)))
+                       (declare (type fixnum ptr buf-rest count))
+                       (setf (sm mode stream) 1)
+                       (setf (sm buffpos stream) (+ ptr count))
+                       (buffer-copy seq src-pos (sm buffer stream) ptr count)
+                       (incf src-pos count)))))
          (dual-channel-simple-stream
           (with-stream-class (dual-channel-simple-stream stream)
             (loop with max-ptr fixnum = (sm max-out-pos stream)
-                  for src-pos fixnum = start then (+ src-pos count)
+                  with src-pos fixnum = start
                   for src-rest fixnum = (- end src-pos)
-                  while (> src-rest 0) ; FIXME: this is non-ANSI
-                  for ptr fixnum = (let ((ptr (sm outpos stream)))
-                                     (if (>= ptr max-ptr)
-                                         (flush-out-buffer stream t)
-                                         ptr))
-                  for buf-rest fixnum = (- max-ptr ptr)
-                  for count fixnum = (min buf-rest src-rest)
-                  do (progn (setf (sm outpos stream) (+ ptr count))
-                            (buffer-copy seq src-pos (sm out-buffer stream) ptr count)))))
+                  while (> src-rest 0)
+                  do (let* ((ptr (let ((ptr (sm outpos stream)))
+                                   (if (>= ptr max-ptr)
+                                       (flush-out-buffer stream t)
+                                       ptr)))
+                            (buf-rest (- max-ptr ptr))
+                            (count (min buf-rest src-rest)))
+                       (declare (type fixnum ptr buf-rest count))
+                       (setf (sm outpos stream) (+ ptr count))
+                       (buffer-copy seq src-pos (sm out-buffer stream) ptr count)
+                       (incf src-pos count)))))
          (string-simple-stream
           (error 'simple-type-error
                  :datum stream

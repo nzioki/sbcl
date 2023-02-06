@@ -380,7 +380,7 @@
 ;;; methods are passed an additional POLICY argument, and IR2-CONVERT
 ;;; methods are passed an additional IR2-BLOCK argument.
 (defmacro defoptimizer (what (lambda-list
-                              &optional (node (sb-xc:gensym) node-p)
+                              &optional (node (gensym))
                               &rest vars)
                         &body body)
   (let ((name (flet ((function-name (name)
@@ -402,37 +402,55 @@
              ,@body)
            ,@(loop for vop-name in (ensure-list (second what))
                    collect
-                   `(set-vop-optimizer (template-or-lose ',vop-name) #',name)))
+                   `(set-vop-optimizer (template-or-lose ',vop-name)
+                                       ,(if (cddr what)
+                                            `(cons #',name ',(caddr what))
+                                            `#',name))))
         (binding* (((forms decls) (parse-body body nil))
                    ((var-decls more-decls) (extract-var-decls decls vars))
-                   ;; In case the BODY declares IGNORE of the formal NODE var,
-                   ;; we rebind it from N-NODE and never reference it from BINDS.
-                   (n-node (make-symbol "NODE"))
-                   ((binds lambda-vars gensyms)
-                    (parse-deftransform lambda-list n-node
+                   ((binds lambda-vars)
+                    (parse-deftransform lambda-list node
                                         `(return-from ,name
                                            ,(if (and (consp what)
                                                      (eq (second what)
                                                          'equality-constraint))
                                                 :give-up
-                                                nil)))))
+                                                nil))))
+                   (args (gensym)))
           (declare (ignore lambda-vars))
           `(progn
              ;; We can't stuff the BINDS as &AUX vars into the lambda list
              ;; because there can be a RETURN-FROM in there.
-             (defun ,name (,n-node ,@vars)
+             (defun ,name (,node ,@vars &rest ,args)
+               (declare (ignorable ,node ,@(butlast vars))
+                        (ignore ,args))
                ,@(if var-decls (list var-decls))
-               (let* (,@binds ,@(if node-p `((,node ,n-node))))
-                 ;; Syntax requires naming NODE even if undesired if VARS
-                 ;; are present, so in that case make NODE ignorable.
-                 (declare (ignorable ,@(if (and vars node-p) `(,node))
-                                     ,@gensyms))
+               (let* (,@binds)
+                 (declare (ignorable ,@(mapcar #'car binds)))
                  ,@more-decls ,@forms))
              ,@(when (consp what)
                  `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
                              (symbolicate "FUN-INFO-" (second what)))
                           (fun-info-or-lose ',(first what)))
                          #',name))))))))
+
+(defmacro defoptimizers (kind names (lambda-list
+                                     &optional (node (gensym))
+                                     &rest vars)
+                         &body body)
+  (let ((optimizer-name (symbolicate (car names)
+                                     "-"
+                                     kind
+                                     "-OPTIMIZER")))
+    `(progn
+       (defoptimizer ,optimizer-name
+           (,lambda-list ,node ,@vars)
+         ,@body)
+       ,@(loop for name in names
+               collect `(setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
+                                  (symbolicate "FUN-INFO-" kind))
+                               (fun-info-or-lose ',name))
+                              #',optimizer-name)))))
 
 ;;;; IR groveling macros
 
@@ -448,7 +466,7 @@
 (defmacro do-blocks ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (sb-xc:gensym))
+  (let ((n-component (gensym))
         (n-tail (gensym)))
     `(let* ((,n-component ,component)
             (,n-tail ,(if (member ends '(:both :tail))
@@ -464,7 +482,7 @@
 (defmacro do-blocks-backwards ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (sb-xc:gensym))
+  (let ((n-component (gensym))
         (n-head (gensym)))
     `(let* ((,n-component ,component)
             (,n-head ,(if (member ends '(:both :head))
@@ -572,11 +590,11 @@
            while ,node-var
            do (progn ,@body))))
 
-(defmacro do-nested-cleanups ((cleanup-var lexenv &optional return-value)
+(defmacro do-nested-cleanups ((cleanup-var block &optional return-value)
                               &body body)
   `(block nil
      (map-nested-cleanups
-      (lambda (,cleanup-var) ,@body) ,lexenv ,return-value)))
+      (lambda (,cleanup-var) ,@body) ,block ,return-value)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
 ;;; so that new, extra IR1 conversion related to NODE can be done
@@ -603,17 +621,14 @@
 (defvar *source-paths*)
 
 (defmacro with-source-paths (&body forms)
-  (with-unique-names (source-paths)
-    `(let* ((,source-paths (make-hash-table :test 'eq))
-            (*source-paths* ,source-paths))
-      (unwind-protect
-           (progn ,@forms)
-        (clrhash ,source-paths)))))
+  `(let ((*source-paths* (make-hash-table :test 'eq)))
+     ,@forms))
 
 ;;; Bind the hashtables used for keeping track of global variables,
 ;;; functions, etc.
 (defmacro with-ir1-namespace (&body forms)
-  `(let ((*ir1-namespace* (make-ir1-namespace))) ,@forms))
+  `(let ((*ir1-namespace* (make-ir1-namespace)))
+     ,@forms))
 
 ;;; Look up NAME in the lexical environment namespace designated by
 ;;; SLOT, returning the <value, T>, or <NIL, NIL> if no entry. The
@@ -639,114 +654,6 @@
                      ,@body)
            (setf (component-last-block ,component)
                  ,old-last-block))))))
-
-
-;;;; DEFPRINTER
-
-;;; These functions are called by the expansion of the DEFPRINTER
-;;; macro to do the actual printing.
-(declaim (ftype (function (symbol t stream) (values))
-                defprinter-prin1 defprinter-princ))
-(defun defprinter-prin1 (name value stream)
-  (defprinter-prinx #'prin1 name value stream))
-(defun defprinter-princ (name value stream)
-  (defprinter-prinx #'princ name value stream))
-(defun defprinter-prinx (prinx name value stream)
-  (declare (type function prinx))
-  (when *print-pretty*
-    (pprint-newline :linear stream))
-  (format stream ":~A " name)
-  (funcall prinx value stream)
-  (values))
-(defun defprinter-print-space (stream)
-  (write-char #\space stream))
-
-(defvar *print-ir-nodes-pretty* nil)
-
-;;; Define some kind of reasonable PRINT-OBJECT method for a
-;;; STRUCTURE-OBJECT class.
-;;;
-;;; NAME is the name of the structure class, and CONC-NAME is the same
-;;; as in DEFSTRUCT.
-;;;
-;;; The SLOT-DESCS describe how each slot should be printed. Each
-;;; SLOT-DESC can be a slot name, indicating that the slot should
-;;; simply be printed. A SLOT-DESC may also be a list of a slot name
-;;; and other stuff. The other stuff is composed of keywords followed
-;;; by expressions. The expressions are evaluated with the variable
-;;; which is the slot name bound to the value of the slot. These
-;;; keywords are defined:
-;;;
-;;; :PRIN1    Print the value of the expression instead of the slot value.
-;;; :PRINC    Like :PRIN1, only PRINC the value
-;;; :TEST     Only print something if the test is true.
-;;;
-;;; If no printing thing is specified then the slot value is printed
-;;; as if by PRIN1.
-;;;
-;;; The structure being printed is bound to STRUCTURE and the stream
-;;; is bound to STREAM.
-;;;
-;;; If PRETTY-IR-PRINTER is supplied, the form is invoked when
-;;; *PRINT-IR-NODES-PRETTY* is true.
-(defmacro defprinter ((name
-                       &key
-                       (conc-name (concatenate 'simple-string
-                                               (symbol-name name)
-                                               "-"))
-                       identity
-                       pretty-ir-printer)
-                      &rest slot-descs)
-  (let ((first? t)
-        maybe-print-space
-        (reversed-prints nil))
-    (flet ((sref (slot-name)
-             `(,(symbolicate conc-name slot-name) structure)))
-      (dolist (slot-desc slot-descs)
-        (if first?
-            (setf maybe-print-space nil
-                  first? nil)
-            (setf maybe-print-space `(defprinter-print-space stream)))
-        (cond ((atom slot-desc)
-               (push maybe-print-space reversed-prints)
-               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) stream)
-                     reversed-prints))
-              (t
-               (let ((sname (first slot-desc))
-                     (test t))
-                 (collect ((stuff))
-                   (do ((option (rest slot-desc) (cddr option)))
-                       ((null option)
-                        (push `(let ((,sname ,(sref sname)))
-                                 (when ,test
-                                   ,maybe-print-space
-                                   ,@(or (stuff)
-                                         `((defprinter-prin1
-                                             ',sname ,sname stream)))))
-                              reversed-prints))
-                     (case (first option)
-                       (:prin1
-                        (stuff `(defprinter-prin1
-                                  ',sname ,(second option) stream)))
-                       (:princ
-                        (stuff `(defprinter-princ
-                                  ',sname ,(second option) stream)))
-                       (:test (setq test (second option)))
-                       (t
-                        (error "bad option: ~S" (first option)))))))))))
-    (let ((normal-printer `(pprint-logical-block (stream nil)
-                             (print-unreadable-object (structure
-                                                       stream
-                                                       :type t
-                                                       :identity ,identity)
-                               ,@(nreverse reversed-prints))) ))
-      `(defmethod print-object ((structure ,name) stream)
-         ,(cond (pretty-ir-printer
-                 `(if *print-ir-nodes-pretty*
-                      ,pretty-ir-printer
-                      ,normal-printer))
-                (t
-                 normal-printer))))))
 
 
 ;;;; boolean attribute utilities
@@ -806,8 +713,8 @@
               #-sb-xc-host get-setf-expansion place env)
            (when (cdr stores)
              (error "multiple store variables for ~S" place))
-           (let ((newval (sb-xc:gensym))
-                 (n-place (sb-xc:gensym))
+           (let ((newval (gensym))
+                 (n-place (gensym))
                  (mask (encode-attribute-mask attributes ,vector)))
              (values `(,@temps ,n-place)
                      `(,@values ,getter)

@@ -15,6 +15,7 @@
   (load "compiler-test-util.lisp"))
 
 (declaim (optimize (debug 3) (speed 2) (space 1)))
+(declaim (muffle-conditions compiler-note))
 
 ;;; this would fail an AVER in NOTE-POTENTIAL-CIRCULARITY
 (defparameter *circular-2d-array* #1=#2A((a b) (#1# x)))
@@ -228,6 +229,14 @@
 
 )) ; end EVAL-WHEN
 
+(defun load-form-is-default-mlfss-p (object)
+  (multiple-value-bind (creation-form init-form)
+      (make-load-form object)
+    (multiple-value-bind (ss-creation-form ss-init-form)
+        (make-load-form-saving-slots object)
+      (and (equal creation-form ss-creation-form)
+           (equal init-form ss-init-form)))))
+
 ;; Redefine the MAKE-LOAD-FORM method on FOO.
 (remove-method #'make-load-form (find-method #'make-load-form nil (list 'foo)))
 (defvar *foo-save-slots* nil)
@@ -240,13 +249,13 @@
   (let ((foo (make-foo :x 'x :y 'y)))
     (flet ((assert-canonical (slots)
              (let ((*foo-save-slots* slots))
-               (assert (sb-fasl:load-form-is-default-mlfss-p foo)))))
+               (assert (load-form-is-default-mlfss-p foo)))))
       (assert-canonical :all)
       (assert-canonical '(x y)) ; specifying all slots explicitly is still canonical
       (assert-canonical '(y x)))
     ;; specifying only one slot is not canonical
     (let ((*foo-save-slots* '(x)))
-      (assert (not (sb-fasl:load-form-is-default-mlfss-p foo))))))
+      (assert (not (load-form-is-default-mlfss-p foo))))))
 
 ;; A huge constant vector. This took 9 seconds to compile (on a MacBook Pro)
 ;; prior to the optimization for using fops to dump.
@@ -484,6 +493,7 @@
     (assert (cadr z))))
 
 (macrolet ((expand ()
+             (declare (muffle-conditions compiler-note)) ; why is DECLAIM not enough?
              `(progn
                 ,@(loop for i from 0 below sb-vm:n-word-bits
                         collect
@@ -524,3 +534,20 @@
 
 (with-test (:name :coalesce-numeric-arrays)
   (assert (eq (use-numeric-vector-a) (use-numeric-vector-b))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defstruct person id)
+(defstruct (spy (:include person (id "   " :type (simple-string 2)))) gadgetry)
+(defmethod make-load-form ((self spy) &optional environment)
+  (declare (ignore environment))
+  (make-load-form-saving-slots self)))
+
+(defvar *agent* #.(let ((s (make-spy :id "86" :gadgetry '(shoe-phone))))
+                    (setf (person-id s) "max")
+                    s))
+
+;;; If lp#1969318 is fixed, then *AGENT* should not be reconstructed
+;;; from its load form, let alone dumped in the first place.
+;;; But thankfully we trap the read of the ID slot.
+(with-test (:name :illegal-typed-slot-value)
+  (assert-error (spy-id *agent*)))

@@ -495,7 +495,7 @@
 ;;; MOD and REM. Test that the transform is indeed triggered and test
 ;;; several cases for correct results.
 (with-test (:name (:integer-division-using-multiplication :used)
-                  :skipped-on (not (or :x86-64 :x86)))
+            :skipped-on (not (or :x86-64 :x86 :arm64)))
   (dolist (fun '(truncate floor ceiling mod rem))
     (let* ((foo (checked-compile
                  `(lambda (x)
@@ -1033,62 +1033,113 @@
       (- a b))
    (((- (expt 2 sb-vm:n-word-bits) 10) (- (expt 2 sb-vm:n-word-bits) 9)) -1)))
 
-(with-test (:name :overflow-arith)
-  (flet ((normalize-type (type)
-           (sb-kernel:type-specifier (sb-kernel:specifier-type type))))
-    (let ((ops '(+ - *))
-          (types (mapcar #'normalize-type
-                         `(t fixnum (integer ,(- (expt 2 sb-vm:n-word-bits) 10)
-                                             ,(- (expt 2 sb-vm:n-word-bits) 1))
-                             (signed-byte ,sb-vm:n-word-bits)
-                             (unsigned-byte ,sb-vm:n-word-bits)
-                             (signed-byte 8)
-                             (unsigned-byte 8))))
-          (arguments (list 0 1 2 3 4 -1 -2 -3 -4
-                           (- (expt 2 sb-vm:n-word-bits) 1)
-                           (- (expt 2 sb-vm:n-word-bits) 5)
-                           (- (expt 2 (1- sb-vm:n-word-bits)) 1)
-                           (- (expt 2 (1- sb-vm:n-word-bits)) 5)
-                           (- (expt 2 (1- sb-vm:n-word-bits)))
-                           (- 10 (expt 2 (1- sb-vm:n-word-bits)))
-                           (expt 2 (1- sb-vm:n-word-bits))
-                           most-positive-fixnum
-                           most-negative-fixnum
-                           (1- most-positive-fixnum)
-                           (1+ most-negative-fixnum)
-                           (floor most-positive-fixnum 2)
-                           (floor most-negative-fixnum 2))))
-      (loop for op in ops
-            do (loop for a-type in types
-                     do (loop for b-type in types
-                              do (loop for result-type in types
-                                       do
-                                       (let* ((lambda `(lambda (a b)
-                                                         (declare (,a-type a)
-                                                                  (,b-type b))
-                                                         (the ,result-type (,op a b))))
-                                              (fun (checked-compile lambda :allow-warnings t)))
-                                         (loop for a in arguments
-                                               when (typep a a-type)
-                                               do (loop for b in arguments
-                                                        for result = (funcall op a b)
-                                                        when (typep b b-type)
-                                                        do
-                                                        (handler-case
-                                                            (funcall fun a b)
-                                                          (error (c)
-                                                            (if (typep result result-type)
-                                                                (error "~a => ~a /= ~a" (list lambda a b) c result)
-                                                                (let ((x (type-error-datum c))
-                                                                      (type (type-error-expected-type c)))
-                                                                  (cond ((not (equal type result-type))
-                                                                         (error "~a => type error ~a /= ~a" (list lambda a b)
-                                                                                c
-                                                                                result-type))
-                                                                        ((not (eql x result))
-                                                                         (error "~a => type error ~a /= ~a" (list lambda a b)
-                                                                                c
-                                                                                x))))))
-                                                          (:no-error (x)
-                                                            (unless (= x result)
-                                                              (error "~a = ~a /= ~a" (list lambda a b) x result))))))))))))))
+(with-test (:name :>=-fixnum-integer)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b)
+      (declare (fixnum a))
+      (and (integerp b)
+           (>= a b)))
+   ((1 2) nil)
+   ((2 2) t)
+   ((3 2) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b)
+      (declare (fixnum a))
+      (and (integerp b)
+           (<= a b)))
+   ((1 2) t)
+   ((2 2) t)
+   ((3 2) nil)))
+
+(with-test (:name :ash-signed-negation-overflow :fails-on :arm)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (fixnum a)
+                  (sb-vm:signed-word b))
+         (truly-the sb-vm:signed-word (ash a b)))
+    ((-44 (- (expt 2 (1- sb-vm:n-word-bits)))) -1)
+    ((44 2) 176)))
+
+(with-test (:name :-constant-mnf)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (logand most-positive-fixnum
+                 (- (the fixnum a) most-negative-fixnum)))
+    ((10) 10)))
+
+(with-test (:name :unary-truncate-discard-second-value)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (truncate (expt (complex a 0) 0))
+      1)
+   ((1) 1)))
+
+(with-test (:name :unary-truncate-discard-second-value.2)
+  (checked-compile-and-assert
+   (:allow-style-warnings t)
+   `(lambda (a b)
+      (boole boole-nand
+             (dpb (* b (unwind-protect 0 b)) (byte 31 28) a)
+             (ignore-errors
+              (truncate
+               (eval
+                (values 1 2))))))
+   ((1 2) -2)))
+
+(with-test (:name :logtest-immediate)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (logtest (- (expt 2 63) 3) (the fixnum x)))
+    ((1) t)
+    ((2) nil)))
+
+(with-test (:name :logand-negative-derive)
+  (assert
+   (subtypep (second (third (sb-kernel:%simple-fun-type
+                             (checked-compile
+                              `(lambda (a b)
+                                 (declare ((not unsigned-byte) a b))
+                                 (logand a b))))))
+             '(integer * -1))))
+
+(with-test (:name :ash-mod64-constant-folding)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a d)
+         (declare (fixnum a)
+                  ((unsigned-byte 64) d))
+         (setq a -64)
+         (logand d (ash -1 a)))
+    ((0 3) 3)))
+
+(with-test (:name :signed-unsigned-cmp-elision)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (declare (fixnum a)
+                  ((or (integer -1 0)
+                       (unsigned-byte 64)) b))
+         (let ((v2 (abs b)))
+           (if (> a v2)
+               a
+               (>= a v2))))
+      ((1 2) nil)
+      ((1 1) t)
+      ((3 0) 3)))
+
+(with-test (:name :integer-fixnum-<)
+  (checked-compile-and-assert
+   ()
+   `(lambda (f b &optional a c d e g h i j k l m n o p q r s)
+      (declare (fixnum f))
+      (eval (list 'list a b c d e f g h i j k l m n o p q r s t))
+      (and (integerp b)
+           (< f b)))
+   ((1 t) nil)
+   ((1 10) t)))

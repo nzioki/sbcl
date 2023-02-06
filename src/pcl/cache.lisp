@@ -64,6 +64,7 @@
 ;;;; Subsequences of the cache vector are called cache lines.
 ;;;;
 
+(declaim (inline %copy-cache))
 (defstruct (cache (:constructor %make-cache)
                   (:copier %copy-cache))
   ;; Number of keys the cache uses.
@@ -90,6 +91,15 @@
   (depth 0 :type index)
   ;; Maximum allowed probe-depth before the cache needs to expand.
   (limit 0 :type index))
+;;; There is no syntax to freeze a type before the copier function
+;;; is defined. That's sad, because it means that the global defun
+;;; for %COPY-CACHE does *not* inline its allocator, for two different reasons:
+;;; 1. the DEFSTRUCT-DESCRIPTION doesn't exist yet
+;;; 2. the classoid isn't in sealed state when the DEFUN occurs
+;;; (i.e. those are generally true of any defstruct form)
+;;; However, all other uses of %COPY-CACHE aside from the global one
+;;; _are_ inlined. So we're ok- we get the desired result, unless
+;;; somebody funcalls #'%copy-cache, which nobody does.
 (declaim (freeze-type cache))
 
 (defun compute-cache-mask (vector-length line-size)
@@ -124,7 +134,7 @@
 
 ;;; Return VALUE if it is not the unbound marker, otherwise executes ELSE:
 (defmacro non-empty-or (value else)
-  (with-unique-names (n-value)
+  (let ((n-value '#:val))
     `(let ((,n-value ,value))
        (if (unbound-marker-p ,n-value)
            ,else
@@ -197,12 +207,19 @@
 ;;; In other words, produces inlined code for COMPUTE-CACHE-INDEX when
 ;;; number of keys and presence of values in the cache is known
 ;;; beforehand.
+(defglobal *hash-vars*
+  (make-array 6 :initial-contents
+              (loop for i from 0 below 6 collect (make-symbol (format nil "H~D" i)))))
 (defun emit-cache-lookup (cache-var layout-vars miss-tag value-var)
   (declare (muffle-conditions code-deletion-note))
-  (with-unique-names (probe n-vector n-depth n-mask
+  (multiple-value-bind (probe n-vector n-depth n-mask
                       MATCH-WRAPPERS EXIT-WITH-HIT)
+      (values '#:probe '#:vect '#:depth '#:mask '#:try '#:hit)
     (let* ((num-keys (length layout-vars))
-           (hash-vars (make-gensym-list num-keys))
+           (hash-vars (loop for i from 0 below num-keys
+                            collect (if (< i #.(length *hash-vars*))
+                                        (aref *hash-vars* i)
+                                        (make-symbol (format nil "H~D" i)))))
            (pointer
             ;; We don't need POINTER if the cache has 1 key and no value,
             ;; or if FOLD-INDEX-ADDRESSING is supported, in which case adding
@@ -488,7 +505,7 @@
   cache)
 
 ;;; Copying a cache without expanding it is very much like mapping it:
-;;; we need to be carefull because there may be updates while we are
+;;; we need to be careful because there may be updates while we are
 ;;; copying it, and we don't want to copy incomplete entries or invalid
 ;;; ones.
 (defun copy-cache (cache)
@@ -545,7 +562,8 @@
                             `(setf ,s)
                             (slot-reader-name s)
                             (slot-writer-name s)
-                            (slot-boundp-name s)))
+                            (slot-boundp-name s)
+                            (slot-makunbound-name s)))
           (when (fboundp name)
             (let ((fun (fdefinition name)))
               (when (typep fun 'generic-function)

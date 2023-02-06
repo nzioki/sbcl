@@ -465,7 +465,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; Automatically handle *PRINT-LEVEL* abbreviation. If we are too
 ;;; deep, then a #\# is printed to STREAM and BODY is ignored.
 (defmacro descend-into ((stream) &body body)
-  (let ((flet-name (sb-xc:gensym "DESCEND")))
+  (let ((flet-name (gensym "DESCEND")))
     `(flet ((,flet-name ()
               ,@body))
        (cond ((and (null *print-readably*)
@@ -660,7 +660,7 @@ variable: an unreadable object representing the error is printed instead.")
             (unless (and accessible (eq found symbol))
               (output-token (or (package-local-nickname package current)
                                 (package-name package)))
-              (write-string (if (eql (find-external-symbol name package) 0) "::" ":")
+              (write-string (if (symbol-externalp symbol package) ":" "::")
                             stream)))))
         (output-token name)))))
 
@@ -1061,22 +1061,35 @@ variable: an unreadable object representing the error is printed instead.")
             (t
              (output-unreadable-array-readably vector stream))))))
 
-;;; This function outputs a string quoting characters sufficiently
-;;; so that someone can read it in again. Basically, put a slash in
-;;; front of an character satisfying NEEDS-SLASH-P.
+;;; Output a string, quoting characters to be readable by putting a slash in front
+;;; of any character satisfying NEEDS-SLASH-P.
 (defun quote-string (string stream)
   (macrolet ((needs-slash-p (char)
                ;; KLUDGE: We probably should look at the readtable, but just do
                ;; this for now. [noted by anonymous long ago] -- WHN 19991130
-               `(or (char= ,char #\\)
-                 (char= ,char #\"))))
+               `(let ((c ,char)) (or (char= c #\\) (char= c #\"))))
+             (scan (type)
+               ;; Pre-test for any escaping, and if needed, do char-at-a-time output.
+               ;; For 1 or 0 characters, always take the WRITE-CHAR branch.
+               `(let ((data (truly-the ,type data)))
+                  (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                  (when (or (<= (- end start) 1)
+                            (do ((index start (1+ index)))
+                                ((>= index end))
+                              (when (needs-slash-p (schar data index)) (return t))))
+                    (do ((index start (1+ index)))
+                        ((>= index end) (return-from quote-string))
+                      (let ((char (schar data index)))
+                        (when (needs-slash-p char) (write-char #\\ stream))
+                        (write-char char stream)))))))
     (with-array-data ((data string) (start) (end)
                       :check-fill-pointer t)
-      (do ((index start (1+ index)))
-          ((>= index end))
-        (let ((char (schar data index)))
-          (when (needs-slash-p char) (write-char #\\ stream))
-          (write-char char stream))))))
+      (if (simple-base-string-p data)
+          (scan simple-base-string)
+          #+sb-unicode (scan simple-character-string)))
+    ;; If no escaping needed, WRITE-STRING is way faster, up to 2x in my testing,
+    ;; than WRITE-CHAR because the stream layer will get so many fewer calls.
+    (write-string string stream)))
 
 (defun array-readably-printable-p (array)
   (and (eq (array-element-type array) t)
@@ -1880,10 +1893,7 @@ variable: an unreadable object representing the error is printed instead.")
 (defmethod print-object ((component code-component) stream)
   (print-unreadable-object (component stream :identity t)
     (let (dinfo)
-      (cond ((code-obj-is-filler-p component)
-             (format stream "filler ~dw"
-                     (ash (code-object-size component) (- sb-vm:word-shift))))
-            ((eq (setq dinfo (%code-debug-info component)) :bpt-lra)
+      (cond ((eq (setq dinfo (%code-debug-info component)) :bpt-lra)
              (write-string "bpt-trap-return" stream))
             ((functionp dinfo)
              (format stream "trampoline ~S" dinfo))
@@ -1918,88 +1928,92 @@ variable: an unreadable object representing the error is printed instead.")
 #+sb-simd-pack
 (defmethod print-object ((pack simd-pack) stream)
   (cond ((and *print-readably* *read-eval*)
-         (multiple-value-bind (format maker extractor)
-             (etypecase pack
-               ((simd-pack double-float)
-                (values "#.(~S ~S ~S)"
-                        '%make-simd-pack-double #'%simd-pack-doubles))
-               ((simd-pack single-float)
-                (values "#.(~S ~S ~S ~S ~S)"
-                        '%make-simd-pack-single #'%simd-pack-singles))
-               (t
-                (values "#.(~S #X~16,'0X #X~16,'0X)"
-                        '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
-           (multiple-value-call
-               #'format stream format maker (funcall extractor pack))))
+         (format stream "#.(~S #b~3,'0b #x~16,'0X #x~16,'0X)"
+                 '%make-simd-pack
+                 (%simd-pack-tag pack)
+                 (%simd-pack-low pack)
+                 (%simd-pack-high pack)))
         (*print-readably*
          (print-not-readable-error pack stream))
         (t
          (print-unreadable-object (pack stream)
-           (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
-                    (= (logand value mask) mask))
-                  (split-num (value start)
-                    (loop
-                       for i from 0 to 3
-                       and v = (ash value (- start)) then (ash v -8)
-                       collect (logand v #xFF))))
-             (multiple-value-bind (low high)
-                 (%simd-pack-ub64s pack)
-               (etypecase pack
-                 ((simd-pack double-float)
-                  (multiple-value-bind (v0 v1) (%simd-pack-doubles pack)
-                    (format stream "~S~@{ ~:[~,13E~;~*TRUE~]~}"
-                            'simd-pack
-                            (all-ones-p low 0 64) v0
-                            (all-ones-p high 0 64) v1)))
-                 ((simd-pack single-float)
-                  (multiple-value-bind (v0 v1 v2 v3) (%simd-pack-singles pack)
-                    (format stream "~S~@{ ~:[~,7E~;~*TRUE~]~}"
-                            'simd-pack
-                            (all-ones-p low 0 32) v0
-                            (all-ones-p low 32 64) v1
-                            (all-ones-p high 0 32) v2
-                            (all-ones-p high 32 64) v3)))
-                 (t
-                  (format stream "~S~@{ ~{ ~2,'0X~}~}"
-                          'simd-pack
-                          (split-num low 0) (split-num low 32)
-                          (split-num high 0) (split-num high 32))))))))))
+           (etypecase pack
+             ((simd-pack double-float)
+              (multiple-value-call #'format stream "~S~@{ ~,13E~}" 'simd-pack
+                (%simd-pack-doubles pack)))
+             ((simd-pack single-float)
+              (multiple-value-call #'format stream "~S~@{ ~,7E~}" 'simd-pack
+                (%simd-pack-singles pack)))
+             ((simd-pack (unsigned-byte 8))
+              (multiple-value-call #'format stream "~S~@{ ~3D~}" 'simd-pack
+                (%simd-pack-ub8s pack)))
+             ((simd-pack (unsigned-byte 16))
+              (multiple-value-call #'format stream "~S~@{ ~5D~}" 'simd-pack
+                (%simd-pack-ub16s pack)))
+             ((simd-pack (unsigned-byte 32))
+              (multiple-value-call #'format stream "~S~@{ ~10D~}" 'simd-pack
+                (%simd-pack-ub32s pack)))
+             ((simd-pack (unsigned-byte 64))
+              (multiple-value-call #'format stream "~S~@{ ~20D~}" 'simd-pack
+                (%simd-pack-ub64s pack)))
+             ((simd-pack (signed-byte 8))
+              (multiple-value-call #'format stream "~S~@{ ~4,@D~}" 'simd-pack
+                (%simd-pack-sb8s pack)))
+             ((simd-pack (signed-byte 16))
+              (multiple-value-call #'format stream "~S~@{ ~6,@D~}" 'simd-pack
+                (%simd-pack-sb16s pack)))
+             ((simd-pack (signed-byte 32))
+              (multiple-value-call #'format stream "~S~@{ ~11@D~}" 'simd-pack
+                (%simd-pack-sb32s pack)))
+             ((simd-pack (signed-byte 64))
+              (multiple-value-call #'format stream "~S~@{ ~20@D~}" 'simd-pack
+                (%simd-pack-sb64s pack))))))))
 
 #+sb-simd-pack-256
 (defmethod print-object ((pack simd-pack-256) stream)
   (cond ((and *print-readably* *read-eval*)
-         (multiple-value-bind (format maker extractor)
-             (etypecase pack
-               ((simd-pack-256 double-float)
-                (values "#.(~@{~S~^ ~})"
-                        '%make-simd-pack-256-double #'%simd-pack-256-doubles))
-               ((simd-pack-256 single-float)
-                (values "#.(~@{~S~^ ~})"
-                        '%make-simd-pack-256-single #'%simd-pack-256-singles))
-               (t
-                (values "#.(~S~@{ #X~16,'0X~})"
-                        '%make-simd-pack-256-ub64 #'%simd-pack-256-ub64s)))
-           (multiple-value-call
-               #'format stream format maker (funcall extractor pack))))
+         (format stream "#.(~S #b~3,'0B #x~16,'0D #x~16,'0D #x~16,'0D #x~16,'0D)"
+                 '%make-simd-pack-256
+                 (%simd-pack-256-tag pack)
+                 (%simd-pack-256-0 pack)
+                 (%simd-pack-256-1 pack)
+                 (%simd-pack-256-2 pack)
+                 (%simd-pack-256-3 pack)))
         (*print-readably*
          (print-not-readable-error pack stream))
         (t
          (print-unreadable-object (pack stream)
            (etypecase pack
              ((simd-pack-256 double-float)
-              (multiple-value-call #'format stream "~S~@{ ~,13E~}"
-                'simd-pack-256
+              (multiple-value-call #'format stream "~S~@{ ~,13E~}" 'simd-pack-256
                 (%simd-pack-256-doubles pack)))
              ((simd-pack-256 single-float)
-              (multiple-value-call #'format stream "~S~@{ ~,7E~}"
-                'simd-pack-256
+              (multiple-value-call #'format stream "~S~@{ ~,7E~}" 'simd-pack-256
                 (%simd-pack-256-singles pack)))
-             (t
-              (multiple-value-bind (p0 p1 p2 p3)
-                  (%simd-pack-256-ub64s pack)
-                (format stream "~S~@{ ~16,'0X~}"
-                        'simd-pack-256
-                        p0 p1 p2 p3))))))))
+             ((simd-pack-256 (unsigned-byte 8))
+              (multiple-value-call #'format stream "~S~@{ ~3D~}" 'simd-pack-256
+                (%simd-pack-256-ub8s pack)))
+             ((simd-pack-256 (unsigned-byte 16))
+              (multiple-value-call #'format stream "~S~@{ ~5D~}" 'simd-pack-256
+                (%simd-pack-256-ub16s pack)))
+             ((simd-pack-256 (unsigned-byte 32))
+              (multiple-value-call #'format stream "~S~@{ ~10D~}" 'simd-pack-256
+                (%simd-pack-256-ub32s pack)))
+             ((simd-pack-256 (unsigned-byte 64))
+              (multiple-value-call #'format stream "~S~@{ ~20D~}" 'simd-pack-256
+                (%simd-pack-256-ub64s pack)))
+             ((simd-pack-256 (signed-byte 8))
+              (multiple-value-call #'format stream "~S~@{ ~4@D~}" 'simd-pack-256
+                (%simd-pack-256-sb8s pack)))
+             ((simd-pack-256 (signed-byte 16))
+              (multiple-value-call #'format stream "~S~@{ ~6@D~}" 'simd-pack-256
+                (%simd-pack-256-sb16s pack)))
+             ((simd-pack-256 (signed-byte 32))
+              (multiple-value-call #'format stream "~S~@{ ~11@D~}" 'simd-pack-256
+                (%simd-pack-256-sb32s pack)))
+             ((simd-pack-256 (signed-byte 64))
+              (multiple-value-call #'format stream "~S~@{ ~20@D~}" 'simd-pack-256
+                (%simd-pack-256-sb64s pack))))))))
 
 ;;;; functions
 
@@ -2030,16 +2044,20 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;;; catch-all for unknown things
 
-(declaim (inline lowtag-of))
-(defun lowtag-of (x) (logand (get-lisp-obj-address x) sb-vm:lowtag-mask))
-
 (defmethod print-object ((object t) stream)
   (when (eq object sb-pcl:+slot-unbound+)
     ;; If specifically the unbound marker with 0 data,
     ;; as opposed to any other unbound marker.
     (print-unreadable-object (object stream) (write-string "unbound" stream))
     (return-from print-object))
-  (when (eql (get-lisp-obj-address object) sb-vm:no-tls-value-marker-widetag)
+  ;; NO-TLS-VALUE was added here as a printable object type for #+ubsan which,
+  ;; among other things, detects read-before-write on a per-array-element basis.
+  ;; Git rev 22d8038118 caused uninitialized SIMPLE-VECTORs to get prefilled
+  ;; with NO_TLS_VALUE_MARKER, but a better choice would be
+  ;; (logior (mask-field (byte (- n-word-bits 8) 8) -1) unbound-marker-widetag).
+  ;; #+ubsan has probably bitrotted for other reasons, so this is untested.
+  #+ubsan
+  (when (eql (get-lisp-obj-address object) unwritten-vector-element-marker)
     (print-unreadable-object (object stream) (write-string "novalue" stream))
     (return-from print-object))
   (print-unreadable-object (object stream :identity t)
@@ -2051,6 +2069,7 @@ variable: an unreadable object representing the error is printed instead.")
              (#.sb-vm:value-cell-widetag
               (write-string "value cell " stream)
               (output-object (value-cell-ref object) stream))
+             #+nil
              (#.sb-vm:filler-widetag
               (write-string "pad " stream)
               (write (1+ (get-header-data object)) :stream stream)

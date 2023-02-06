@@ -10,22 +10,25 @@
 /* Abstract out the data for an allocation region allowing a single
  * routine to be used for allocation and closing. */
 /* Caution: if you change this, you may have to change compiler/generic/objdef
- * (for the THREAD object), all the backends' allocators, and room.lisp */
+ * (for the THREAD object), all the backends' allocators, and room.lisp.
+ * But as long as the first two words are left alone,
+ * it's generally OK to add or remove other words.
+ */
 struct alloc_region {
-
     /* These two are needed for quick allocation. */
     void  *free_pointer;
     void  *end_addr; /* pointer to the byte after the last usable byte */
-
-    /* These are needed when closing the region. */
-    /* 'last_page' is identical to 'find_page_index((char*)end_addr - 1)'
-     * whenever the region is in an open state. The value is preserved on
-     * closing so that allocation can potentially resume where it left off,
-     * though that's not quite how things are implemented at present.
-     */
-    page_index_t  last_page;
     void  *start_addr;
 };
+
+typedef struct {
+    struct alloc_region cons;
+    struct alloc_region mixed;
+    uword_t token;
+} arena_state;
+
+// Macro to statically initialize instead of using set_region_empty()
+#define ALLOC_REGION_INITIALIZER {(void*)0x1000, (void*)1000, 0}
 
 // One region for each of page type.
 // These indices have no correlation to PAGE_TYPE constants.
@@ -38,6 +41,13 @@ extern struct alloc_region  gc_alloc_region[6];
 #define code_region    (&gc_alloc_region[3])
 #define boxed_region   (&gc_alloc_region[4])
 #define cons_region    (&gc_alloc_region[5])
+#define ASSERT_REGIONS_CLOSED() \
+    gc_assert(!((uintptr_t)gc_alloc_region[0].start_addr \
+               |(uintptr_t)gc_alloc_region[1].start_addr \
+               |(uintptr_t)gc_alloc_region[2].start_addr \
+               |(uintptr_t)gc_alloc_region[3].start_addr \
+               |(uintptr_t)gc_alloc_region[4].start_addr \
+               |(uintptr_t)gc_alloc_region[5].start_addr))
 
 extern generation_index_t from_space, new_space;
 extern int gencgc_alloc_profiler;

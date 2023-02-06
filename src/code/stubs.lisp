@@ -112,9 +112,11 @@
   (def %caller-pc ())
   (def sb-vm::%code-fixups)
   #+x86-64 (def pointerp)
+  (def sb-bignum:%bignum-length)
 
   ;; instances
   (def %make-instance) ; Allocate a new instance with X data slots.
+  (def %make-instance/mixed)
   (def %instance-length) ; Given an instance, return its length.
   (def %instance-layout)
   (def %instance-wrapper)
@@ -157,9 +159,8 @@
   (def current-fp ())
   (def stack-ref (s n))
   (def fun-code-header)
+  (def symbol-package-id)
   (def symbol-hash)
-  (def sb-vm::symbol-extra)
-  #+sb-thread (def symbol-tls-index)
   (def symbol-%info) ; primitive reader always needs a stub
   ;; but the "wrapped" reader might not need a stub.
   ;; If it's already a proper function, then it doesn't.
@@ -204,6 +205,15 @@
             (inherits (wrapper-inherits object-layout)))
         (and (> (length inherits) depthoid)
              (eq (svref inherits depthoid) test-layout)))))
+
+(defun sb-c::structure-typep (object test-layout)
+  (and (%instancep object)
+       (let ((object-layout (%instance-layout object)))
+        (or (eq object-layout test-layout)
+            (let ((depthoid (wrapper-depthoid test-layout))
+                  (inherits (wrapper-inherits object-layout)))
+              (and (> (length inherits) depthoid)
+                   (eq (svref inherits depthoid) test-layout)))))))
 
 (defun %other-pointer-subtype-p (x choices)
   (and (%other-pointer-p x)

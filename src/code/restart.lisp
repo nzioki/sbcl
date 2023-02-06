@@ -124,9 +124,9 @@
   ;;   for HANDLER-BIND
   ;; * MAKE-APPLY-AND-RETURN which generates TAGBODY entries executing
   ;;   the respective BODY.
-  (let ((block-tag (sb-xc:gensym "BLOCK"))
+  (let ((block-tag (gensym "BLOCK"))
         (temp-var (gensym)))
-    (labels ((parse-keywords-and-body (keywords-and-body)
+    (labels ((parse-keywords-and-body (keywords-and-body source-form)
                (do ((form keywords-and-body (cddr form))
                     (result '())) (nil)
                  (destructuring-bind (&optional key (arg nil argp) &rest rest)
@@ -137,14 +137,19 @@
                           (cond
                             ((and (eq key :report) argp)
                              (list :report-function
-                                   (if (stringp arg)
-                                       `#'(lambda (stream)
-                                            (write-string ,arg stream))
-                                       `#',arg)))
+                                   `(sb-c::with-source-form ,source-form
+                                      ,(if (stringp arg)
+                                           `#'(lambda (stream)
+                                                (write-string ,arg stream))
+                                           `#',arg))))
                             ((and (eq key :interactive) argp)
-                             (list :interactive-function `#',arg))
+                             (list :interactive-function
+                                   `(sb-c::with-source-form ,source-form
+                                      #',arg)))
                             ((and (eq key :test) argp)
-                             (list :test-function `#',arg))
+                             (list :test-function
+                                   `(sb-c::with-source-form ,source-form
+                                      #',arg)))
                             (t
                              (return (values result form))))
                           result)))))
@@ -156,7 +161,7 @@
                           'restart-case clause))
                  (destructuring-bind (name lambda-list &body body) clause
                    (multiple-value-bind (keywords body)
-                       (parse-keywords-and-body body)
+                       (parse-keywords-and-body body clause)
                      (list name (gensym "TAG") keywords lambda-list body)))))
              (make-binding (clause-data)
                (destructuring-bind (name tag keywords lambda-list body) clause-data
@@ -174,7 +179,7 @@
                      (locally (declare (optimize (safety 0)))
                        (go ,tag)))
                    ,@keywords)))
-             (make-apply-and-return (clause-data)
+             (make-apply-and-return (clause-data source-form)
                (destructuring-bind (name tag keywords lambda-list body) clause-data
                  (declare (ignore name keywords))
                  (multiple-value-bind (body declarations) (parse-body body nil)
@@ -185,11 +190,13 @@
                                          (not (member (car lambda-list)
                                                       '(&optional &key &aux))))
                                     `(funcall (lambda ,lambda-list
+                                                (declare (sb-c::source-form ,source-form))
                                                 ,@declarations
                                                 (progn ,@body))
                                               ,temp-var))
                                    (t
                                     `(apply (lambda ,lambda-list
+                                              (declare (sb-c::source-form ,source-form))
                                               ,@declarations
                                               (progn ,@body))
                                             ,temp-var)))))))))
@@ -202,7 +209,7 @@
                     ,(mapcar #'make-binding clauses-data)
                   (return-from ,block-tag
                     ,(munge-restart-case-expression expression env)))
-                ,@(mapcan #'make-apply-and-return clauses-data))))))))
+                ,@(mapcan #'make-apply-and-return clauses-data clauses))))))))
 
 (defmacro with-simple-restart ((restart-name format-string
                                                        &rest format-arguments)
@@ -212,7 +219,7 @@
    If restart-name is not invoked, then all values returned by forms are
    returned. If control is transferred to this restart, it immediately
    returns the values NIL and T."
-  (let ((stream (sb-xc:gensym "STREAM")))
+  (let ((stream (gensym "STREAM")))
    `(restart-case
         ;; If there's just one body form, then don't use PROGN. This allows
         ;; RESTART-CASE to "see" calls to ERROR, etc.

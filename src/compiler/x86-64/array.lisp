@@ -141,7 +141,7 @@
   (:generator 2
     (let ((c (dpb (encode-array-rank rank) (byte 8 array-rank-position)
                   simple-array-widetag)))
-      (cond ((other-pointer-tn-ref-p args)
+      (cond ((other-pointer-tn-ref-p args t)
              (inst cmp :word (ea (- other-pointer-lowtag) value) c))
             (t
              (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
@@ -369,7 +369,7 @@
        ,type vector-data-offset other-pointer-lowtag ,scs
        ,element-type)))
 (progn
-  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg immediate)
+  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg immediate constant)
   (def-full-data-vector-frobs simple-array-unsigned-byte-64 unsigned-num
     unsigned-reg)
   (def-full-data-vector-frobs simple-array-fixnum tagged-num any-reg)
@@ -410,7 +410,8 @@
                  (new (sb-c::emit-and-insert-vop
                        (sb-c::vop-node vop) (vop-block vop)
                        (template-or-lose 'svref-with-addend+if-eq)
-                       new-args nil vop (vop-codegen-info vop))))
+                       new-args nil vop (append (vop-codegen-info vop)
+                                                (vop-codegen-info next)))))
             (sb-c::delete-vop vop)
             (sb-c::delete-vop next)
             new))))))

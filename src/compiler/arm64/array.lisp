@@ -21,8 +21,8 @@
          (rank :scs (any-reg)))
   (:arg-types tagged-num tagged-num)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result) header)
-  (:temporary (:sc non-descriptor-reg) pa-flag ndescr)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc non-descriptor-reg) ndescr)
+  (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
   (:results (result :scs (descriptor-reg)))
   (:generator 5
     ;; Compute the allocation size.
@@ -30,8 +30,8 @@
     (inst add ndescr ndescr (+ (* array-dimensions-offset n-word-bytes)
                                lowtag-mask))
     (inst and ndescr ndescr (bic-mask lowtag-mask))
-    (pseudo-atomic (pa-flag)
-      (allocation nil ndescr other-pointer-lowtag header :flag-tn pa-flag :lip lip)
+    (pseudo-atomic (lr)
+      (allocation nil ndescr other-pointer-lowtag header :flag-tn lr)
       ;; Now that we have the space allocated, compute the header
       ;; value.
       ;; See ENCODE-ARRAY-RANK.
@@ -183,72 +183,52 @@
 ;;; Variants built on top of word-index-ref, etc.  I.e. those vectors whos
 ;;; elements are represented in integer registers and are built out of
 ;;; 8, 16, 32, or 64 bit elements.
-(macrolet ((def-full-data-vector-frobs (type element-type &rest scs)
-  `(progn
-     (define-full-reffer ,(symbolicate "DATA-VECTOR-REF/" type) ,type
-       vector-data-offset other-pointer-lowtag
-       ,scs
-       ,element-type
-       data-vector-ref)
-     (define-full-setter ,(symbolicate "DATA-VECTOR-SET/" type) ,type
-       vector-data-offset other-pointer-lowtag ,scs ,element-type
-       data-vector-set)))
+(macrolet ((full (type element-type &rest scs)
+             `(progn
+                (define-full-reffer ,(symbolicate "DATA-VECTOR-REF/" type) ,type
+                  vector-data-offset other-pointer-lowtag
+                  ,scs
+                  ,element-type
+                  data-vector-ref)
+                (define-full-setter ,(symbolicate "DATA-VECTOR-SET/" type) ,type
+                  vector-data-offset other-pointer-lowtag ,scs ,element-type
+                  data-vector-set)))
 
-           (def-partial-data-vector-frobs (type element-type size signed &rest scs)
-  `(progn
-     (define-partial-reffer ,(symbolicate "DATA-VECTOR-REF/" type) ,type
-       ,size ,signed vector-data-offset other-pointer-lowtag ,scs
-       ,element-type data-vector-ref)
-     (define-partial-setter ,(symbolicate "DATA-VECTOR-SET/" type) ,type
-       ,size vector-data-offset other-pointer-lowtag ,scs
-       ,element-type data-vector-set))))
+           (partial (type element-type size signed &rest scs)
+             `(progn
+                (define-partial-reffer ,(symbolicate "DATA-VECTOR-REF/" type) ,type
+                  ,size ,signed vector-data-offset other-pointer-lowtag ,scs
+                  ,element-type data-vector-ref)
+                (define-partial-setter ,(symbolicate "DATA-VECTOR-SET/" type) ,type
+                  ,size vector-data-offset other-pointer-lowtag ,scs
+                  ,element-type data-vector-set))))
 
-  (def-full-data-vector-frobs simple-vector *
-    descriptor-reg any-reg)
+  (full simple-vector * descriptor-reg any-reg)
+  (full simple-array-unsigned-byte-63 unsigned-num unsigned-reg)
+  (full simple-array-unsigned-byte-64 unsigned-num unsigned-reg)
+  (full simple-array-unsigned-fixnum positive-fixnum any-reg)
+  (full simple-array-fixnum tagged-num any-reg)
+  (full simple-array-signed-byte-64 signed-num signed-reg)
 
-  (def-partial-data-vector-frobs simple-base-string character
-    :byte nil character-reg)
+  (partial simple-base-string character :byte nil character-reg)
   #+sb-unicode
-  (def-partial-data-vector-frobs simple-character-string character
-    :word nil character-reg)
+  (partial simple-character-string character :word nil character-reg)
 
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-7 positive-fixnum
-    :byte nil unsigned-reg signed-reg)
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-8 positive-fixnum
-    :byte nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-7 positive-fixnum :byte nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-8 positive-fixnum :byte nil unsigned-reg signed-reg)
 
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-15 positive-fixnum
-    :short nil unsigned-reg signed-reg)
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-16 positive-fixnum
-    :short nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-15 positive-fixnum :short nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-16 positive-fixnum :short nil unsigned-reg signed-reg)
 
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-31 positive-fixnum
-    :word nil unsigned-reg signed-reg)
-  (def-partial-data-vector-frobs simple-array-unsigned-byte-32 positive-fixnum
-    :word nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-31 positive-fixnum :word nil unsigned-reg signed-reg)
+  (partial simple-array-unsigned-byte-32 positive-fixnum :word nil unsigned-reg signed-reg)
 
-  (def-full-data-vector-frobs simple-array-unsigned-byte-63 unsigned-num
-    unsigned-reg)
+  (partial simple-array-signed-byte-8 tagged-num :byte t signed-reg)
+  (partial simple-array-signed-byte-16 tagged-num :short t signed-reg)
+  (partial simple-array-signed-byte-32 tagged-num :word t signed-reg)
 
-  (def-full-data-vector-frobs simple-array-unsigned-byte-64 unsigned-num
-    unsigned-reg)
-
-  (def-partial-data-vector-frobs simple-array-signed-byte-8 tagged-num
-    :byte t signed-reg)
-
-  (def-partial-data-vector-frobs simple-array-signed-byte-16 tagged-num
-    :short t signed-reg)
-
-  (def-partial-data-vector-frobs simple-array-signed-byte-32 tagged-num
-    :word t signed-reg)
-
-  (def-full-data-vector-frobs simple-array-unsigned-fixnum positive-fixnum
-    any-reg)
-  (def-full-data-vector-frobs simple-array-fixnum tagged-num
-    any-reg)
-
-  (def-full-data-vector-frobs simple-array-signed-byte-64 signed-num
-    signed-reg))
+  (partial simple-array-single-float single-float :single-float nil single-reg)
+  (full simple-array-double-float double-float double-reg))
 
 ;;; Integer vectors whose elements are smaller than a byte.  I.e. bit, 2-bit,
 ;;; and 4-bit vectors.
@@ -265,14 +245,13 @@
          (:arg-types ,type positive-fixnum)
          (:results (result :scs (unsigned-reg)))
          (:result-types positive-fixnum)
-         (:temporary (:scs (interior-reg)) lip)
          (:temporary (:scs (non-descriptor-reg)) temp)
          (:generator 20
            ;; Compute the offset for the word we're interested in.
            (inst lsr temp index ,bit-shift)
            ;; Load the word in question.
-           (inst add lip object (lsl temp word-shift))
-           (inst ldr result (@ lip
+           (inst add temp object (lsl temp word-shift))
+           (inst ldr result (@ temp
                                (- (* vector-data-offset n-word-bytes)
                                   other-pointer-lowtag)))
            ;; Compute the position of the bitfield we need.
@@ -344,7 +323,7 @@
                            '(:target shift)))
                 (value :scs (unsigned-reg immediate)))
          (:arg-types ,type positive-fixnum positive-fixnum)
-         (:temporary (:scs (interior-reg)) lip)
+         (:temporary (:scs (non-descriptor-reg)) lip)
          (:temporary (:scs (non-descriptor-reg)) temp old)
          ,@(unless (= bits 1)
              '((:temporary (:scs (non-descriptor-reg) :from (:argument 1)) shift)))
@@ -395,12 +374,11 @@
   (:args (object :scs (descriptor-reg)) (index :scs (unsigned-reg)))
   (:arg-types simple-bit-vector positive-fixnum)
   (:conditional :eq)
-  (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) temp x)
   (:generator 20
     (inst lsr temp index 6)
-    (inst add lip object (lsl temp word-shift))
-    (inst ldr x (@ lip (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
+    (inst add temp object (lsl temp word-shift))
+    (inst ldr x (@ temp (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
     (inst lsr x x index)
     (inst tst x 1)))
 
@@ -418,68 +396,6 @@
                                                   (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))))
       (inst tst x (ash 1 bit)))))
 
-;;; And the float variants.
-(define-vop (data-vector-ref/simple-array-single-float)
-  (:note "inline array access")
-  (:translate data-vector-ref)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types simple-array-single-float positive-fixnum)
-  (:results (value :scs (single-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:result-types single-float)
-  (:generator 5
-    (inst lsl offset index (1- (- word-shift n-fixnum-tag-bits)))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst ldr value (@ object offset))))
-
-(define-vop (data-vector-set/simple-array-single-float)
-  (:note "inline array store")
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (single-reg)))
-  (:arg-types simple-array-single-float positive-fixnum single-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:generator 5
-    (inst lsl offset index (1- (- word-shift n-fixnum-tag-bits)))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst str value (@ object offset))))
-
-(define-vop (data-vector-ref/simple-array-double-float)
-  (:note "inline array access")
-  (:translate data-vector-ref)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types simple-array-double-float positive-fixnum)
-  (:results (value :scs (double-reg)))
-  (:result-types double-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:generator 7
-    (inst lsl offset index (- word-shift n-fixnum-tag-bits))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst ldr value (@ object offset))))
-
-(define-vop (data-vector-set/simple-array-double-float)
-  (:note "inline array store")
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (double-reg)))
-  (:arg-types simple-array-double-float positive-fixnum double-float)
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 1)) offset)
-  (:generator 20
-    (inst lsl offset index (- word-shift n-fixnum-tag-bits))
-    (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
-    (inst str value (@ object offset))))
 
 ;;; Complex float arrays.
 
@@ -496,7 +412,7 @@
   (:generator 5
     (inst lsl offset index (- word-shift n-fixnum-tag-bits))
     (inst add offset offset (- (* vector-data-offset n-word-bytes)
-                               other-pointer-lowtag))
+                              other-pointer-lowtag))
     (inst ldr value (@ object offset))))
 
 (define-vop (data-vector-set/simple-array-complex-single-float)
@@ -572,7 +488,7 @@
   (:result-types unsigned-num)
   (:temporary (:sc unsigned-reg) offset)
   (:temporary (:sc non-descriptor-reg) sum)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:generator 4
     (inst lsl offset index (- word-shift n-fixnum-tag-bits))
     (inst add offset offset (- (* vector-data-offset n-word-bytes)
@@ -597,7 +513,7 @@
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
   (:temporary (:sc unsigned-reg) offset)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:guard (member :arm-v8.1 *backend-subfeatures*))
   (:generator 3
     (inst lsl offset index (- word-shift n-fixnum-tag-bits))

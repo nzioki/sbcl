@@ -82,8 +82,8 @@
                       (zerop length))
             (decf length))
           (setf pc (sap+ pc 4))
-          (let ((args (loop repeat length
-                            with index = 0
+          (let ((args (loop with index = 0
+                            repeat length
                             collect (sb-c:sap-read-var-integerf pc index))))
             (values error-number
                     (if (= first-offset zr-offset)
@@ -124,44 +124,19 @@
     (value unsigned)
     (index unsigned))
 
-  (define-alien-routine jit-patch-int
-    void
-    (address unsigned)
-    (value int))
-
-  (define-alien-routine jit-patch-uint
-    void
-    (address unsigned)
-    (value unsigned-int))
-
-  (define-alien-routine jit-patch-uchar
-    void
-    (address unsigned)
-    (value unsigned-char))
-
   (define-alien-routine jit-memcpy
     void
     (dst (* char))
     (src (* char))
     (char signed))
 
+  (define-alien-routine jit-copy-code-constants
+    void
+    (dst unsigned)
+    (src unsigned))
+
   (defun (setf sap-ref-word-jit) (value sap offset)
     (jit-patch (+ (sap-int sap) offset) value))
-
-  (defun (setf signed-sap-ref-32-jit) (value sap offset)
-    (jit-patch-int (+ (sap-int sap) offset) value))
-
-  (defun signed-sap-ref-32-jit (sap offset)
-    (signed-sap-ref-32 sap offset))
-
-  (defun (setf sap-ref-32-jit) (value sap offset)
-    (jit-patch-uint (+ (sap-int sap) offset) value))
-
-  (defun sap-ref-32-jit (sap offset)
-    (sap-ref-32 sap offset))
-
-  (defun (setf sap-ref-8-jit) (value sap offset)
-    (jit-patch-uchar (+ (sap-int sap) offset) value))
 
   (defun (setf code-header-ref) (value code index)
     (with-pinned-objects (code value)

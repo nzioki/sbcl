@@ -30,18 +30,26 @@ only."
            (when (typep def '(cons (eql macro))) (cdr def)))))))
   (values (info :function :macro-function symbol)))
 
+(defvar *setf-macro-function-hook* nil
+  "A list of functions that (SETF MACRO-FUNCTION) invokes before storing the new
+   value. The functions take the macro name and the new value.")
+
 (defun (setf macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
   (when environment
-    ;; Note: Technically there could be an ENV optional argument to SETF
-    ;; MACRO-FUNCTION, but since ANSI says that the consequences of
-    ;; supplying a non-nil one are undefined, we don't allow it.
+    ;; Note: Technically there could be an ENV optional argument to
+    ;; SETF MACRO-FUNCTION, but since ANSI says that the consequences
+    ;; of supplying a non-nil one are undefined, we don't allow it.
     ;; (Thus our implementation of this unspecified behavior is to
-    ;; complain. SInce the behavior is unspecified, this is conforming.:-)
+    ;; complain. Since the behavior is unspecified, this is
+    ;; conforming.:-)
     (error "Non-NIL environment argument in SETF of MACRO-FUNCTION ~S: ~S"
            symbol environment))
   (when (eq (info :function :kind symbol) :special-form)
     (error "~S names a special form." symbol))
+  (when (boundp '*setf-macro-function-hook*) ; unbound during cold init
+    (dolist (f *setf-macro-function-hook*)
+      (funcall f symbol function)))
   (with-single-package-locked-error (:symbol symbol "setting the macro-function of ~S")
     (clear-info :function :type symbol)
     (setf (info :function :kind symbol) :macro)

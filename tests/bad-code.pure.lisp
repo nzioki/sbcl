@@ -270,8 +270,8 @@
                          (macrolet ((macro ()
                                       `((lambda (x)
                                           (declare (number x))
-                                          ',@ (loop repeat 10000
-                                                    for cons = (list 1) then (list cons)
+                                          ',@ (loop for cons = (list 1) then (list cons)
+                                                    repeat 10000
                                                     finally (return cons)))
                                         t)))
                            (macro)))
@@ -693,3 +693,11 @@
                          (vector-push-extend 1 x))
                       :allow-warnings 'warning))))
 
+(with-test (:name :defmethod-malformed-let*)
+  (assert (nth-value 5
+                     (checked-compile
+                      `(lambda ()
+                         (cl:defmethod ,(gensym) ()
+                           (let* ((a 1 2))
+                             a)))
+                      :allow-failure t))))

@@ -12,29 +12,27 @@
 (def-alloc '%make-structure-instance 1 :structure-alloc
            sb-vm:instance-widetag sb-vm:instance-pointer-lowtag
            nil)
+(def-alloc '%make-instance/mixed 1 :var-alloc
+           sb-vm:instance-widetag sb-vm:instance-pointer-lowtag nil)
 
 (defoptimizer (%make-structure-instance stack-allocate-result)
-    ((defstruct-description &rest args) node dx)
-  (declare (ignore args dx))
+    ((defstruct-description &rest args))
   (aver (constant-lvar-p defstruct-description))
   ;; A structure instance can be stack-allocated if it has no raw
   ;; slots, or if we're on a target with a conservatively-scavenged
   ;; stack.  We have no reader conditional for stack conservation, but
   ;; it turns out that the only time stack conservation is in play is
-  ;; when we're on GENCGC (since CHENEYGC doesn't have conservation)
-  ;; and C-STACK-IS-CONTROL-STACK (otherwise, the C stack is the
+  ;; C-STACK-IS-CONTROL-STACK (otherwise, the C stack is the
   ;; number stack, and we precisely-scavenge the control stack).
-  #-(and :gencgc :c-stack-is-control-stack)
-  (every (lambda (x) (eq (dsd-raw-type x) t))
-         (dd-slots (lvar-value defstruct-description)))
-  #+(and :gencgc :c-stack-is-control-stack)
-  t)
+  (or #+c-stack-is-control-stack t
+      (not (dd-has-raw-slot-p (lvar-value defstruct-description)))))
 
 (defoptimizer (%make-instance stack-allocate-result) ((n) node dx)
-  (declare (ignore n))
+  (eq dx 'truly-dynamic-extent))
+#+(and gencgc c-stack-is-control-stack)
+(defoptimizer (%make-instance/mixed stack-allocate-result) ((n) node dx)
   (eq dx 'truly-dynamic-extent))
 (defoptimizer (%make-funcallable-instance stack-allocate-result) ((n) node dx)
-  (declare (ignore n))
   (eq dx 'truly-dynamic-extent))
 
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
@@ -75,7 +73,7 @@
          res)
     (move-lvar-result node block locs lvar)))
 
-(defun emit-inits (node block name object lowtag inits args)
+(defun emit-inits (node block object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
         (dx-p (node-stack-allocate-p node)))
@@ -100,7 +98,7 @@
                          `(ecase raw-type
                             ((t)
                              (vop set-slot node block object arg-tn
-                                  name (+ sb-vm:instance-slots-offset slot) lowtag))
+                                  :allocator (+ sb-vm:instance-slots-offset slot) lowtag))
                             ,@(map 'list
                                (lambda (rsd)
                                  `(,(sb-kernel::raw-slot-data-raw-type rsd)
@@ -114,7 +112,7 @@
            (:dd
             (vop set-slot node block object
                  (emit-constant (sb-kernel::dd-layout-or-lose slot))
-                 name sb-vm:instance-slots-offset lowtag))
+                 :allocator sb-vm:instance-slots-offset lowtag))
            (otherwise
             (if (and (eq kind :arg)
                      (zero-init-p (car args)))
@@ -146,7 +144,7 @@
                                              nil sb-vm:any-reg-sc-number)))
                                     (vop make-funcallable-instance-tramp node block tn)
                                     tn)))))
-                     name slot lowtag))))))))
+                     :allocator slot lowtag))))))))
   (unless (null args)
     (bug "Leftover args: ~S" args)))
 
@@ -172,7 +170,7 @@
          (locs (lvar-result-tns lvar (list *universal-type*)))
          (result (first locs)))
     (emit-fixed-alloc node block name words type lowtag result lvar)
-    (emit-inits node block name result lowtag inits args)
+    (emit-inits node block result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-variable-allocation
@@ -189,27 +187,33 @@
                  (ir2-lvar-stack-pointer (lvar-info lvar))))
           (vop var-alloc node block (lvar-tn node block extra) name words
                type lowtag stack-allocate-p result)))
-    (emit-inits node block name result lowtag inits args)
+    (emit-inits node block result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-structure-allocation
-    ((dd slot-specs &rest args) node block name words type lowtag inits)
-  (declare (ignore inits))
+    ((dd slot-specs &rest args) node block name words type lowtag)
   (let* ((lvar (node-lvar node))
          (locs (lvar-result-tns lvar (list *universal-type*)))
          (result (first locs)))
     (aver (and (constant-lvar-p dd) (constant-lvar-p slot-specs) (= words 1)))
+    (aver (= type sb-vm:instance-widetag))
     (let* ((c-dd (lvar-value dd))
            (c-slot-specs (lvar-value slot-specs))
            (words (+ (dd-length c-dd) words)))
-      #+compact-instance-header
-      (progn (aver (= type sb-vm:instance-widetag))
-             (emit-constant (setq type (sb-kernel::dd-layout-or-lose c-dd))))
-      (emit-fixed-alloc node block name words type lowtag result lvar)
-      (emit-inits node block name result lowtag
+      (let ((metadata #+compact-instance-header
+                      (let ((layout (sb-kernel::dd-layout-or-lose c-dd)))
+                        (emit-constant layout)
+                        layout)
+                      #-compact-instance-header
+                      c-dd))
+        (emit-fixed-alloc node block name words metadata lowtag result lvar))
+      (emit-inits node block result lowtag
                   `(#-compact-instance-header (:dd . ,c-dd) ,@c-slot-specs) args)
       (move-lvar-result node block locs lvar))))
 
+;;; FIXME: this causes emission of GC store barriers, but it should not.
+;;; The vector is freshly consed, so anything being stored into it
+;;; is at least as old.
 (defoptimizer (initialize-vector ir2-convert)
     ((vector &rest initial-contents) node block)
   (let* ((vector-ctype (lvar-type vector))
@@ -218,13 +222,14 @@
                         (bug "Unknown vector type in IR2 conversion for ~S."
                              'initialize-vector)))
          (bit-vector-p (type= elt-ctype (specifier-type 'bit)))
+         (simple-vector-p (type= elt-ctype (specifier-type 't)))
          (saetp (find-saetp-by-ctype elt-ctype))
          (lvar (node-lvar node))
          (locs (lvar-result-tns lvar (list vector-ctype)))
          (result (first locs))
          (elt-ptype (primitive-type elt-ctype))
          (tmp (make-normal-tn elt-ptype)))
-    (declare (ignorable bit-vector-p))
+    (declare (ignorable bit-vector-p simple-vector-p))
     (emit-move node block (lvar-tn node block vector) result)
     (flet ((compute-setter ()
              ;; Such cringe. I had no idea why all the "-C" vops were mandatory.
@@ -287,9 +292,17 @@
               ;; Nonetheless it's far better than it was. In all other scenarios, don't pass
               ;; a constant TN, because we don't know that generated code is better.
               (cond #+x86-64 ; still moar cringe
-                    ((and bit-vector-p (constant-lvar-p value))
+                    ((and (or bit-vector-p simple-vector-p) (constant-lvar-p value)
+                          ;; check for constant named-ness to not
+                          ;; trigger load form processing.
+                          (not (leaf-has-source-name-p (nth-value 1 (lvar-value value)))))
                      (funcall setter (tnify i) (emit-constant (lvar-value value))))
                     (t
+                     ;; FIXME: for simple-vector, fixnums should get stored via an ANY-REG
+                     ;; so that data-vector-set doesn't emit a store barrier.
+                     ;; (TMP is a descriptor-reg because ELT-CTYPE is T)
+                     ;; Or just fix this optimizer - as commented above - to somehow elide
+                     ;; the barrier for all elements.
                      (emit-move node block (lvar-tn node block value) tmp)
                      (funcall setter (tnify i) tmp))))))))
     (move-lvar-result node block locs lvar)))
@@ -328,12 +341,10 @@
                  node block (list value-tn) (node-lvar node))))))))
 
 ;;; Stack allocation optimizers per platform support
-(defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
-    args dx
-    t)
+(defoptimizer (make-array-header* stack-allocate-result) ((&rest args))
+  t)
 (defoptimizer (allocate-vector stack-allocate-result)
       ((#+ubsan poisoned type length words) node dx)
-    (declare (ignorable #+ubsan poisoned type length))
     (and
      ;; Can't put unboxed data on the stack unless we scavenge it
      ;; conservatively.
@@ -353,7 +364,6 @@
                                            sb-vm:vector-data-offset)))))))
 (defoptimizer (allocate-vector ltn-annotate)
     ((#+ubsan poisoned type length words) call ltn-policy)
-  (declare (ignore #+ubsan poisoned type length words))
   (vectorish-ltn-annotate-helper call ltn-policy
                                  (if (sb-c:msan-unpoison sb-c:*compilation*)
                                      'sb-vm::allocate-vector-on-stack+msan-unpoison
@@ -376,30 +386,24 @@
         (annotate-1-value-lvar arg))))
 
 ;;; ...lists
-(progn
-  (defoptimizer (list stack-allocate-result) ((&rest args) node dx)
-    (declare (ignore dx))
-    (not (null args)))
-  (defoptimizer (list* stack-allocate-result) ((&rest args) node dx)
-    (declare (ignore dx))
-    (not (null (rest args))))
-  (defoptimizer (%listify-rest-args stack-allocate-result) ((&rest args) node dx)
-    (declare (ignore args dx))
-    t))
+
+(defoptimizer (list stack-allocate-result) ((&rest args))
+  (not (null args)))
+(defoptimizer (list* stack-allocate-result) ((&rest args))
+  (not (null (rest args))))
+(defoptimizer (%listify-rest-args stack-allocate-result) ((&rest args))
+  t)
 
 ;;; ...conses
-(defoptimizer (cons stack-allocate-result) ((&rest args) node dx)
-    (declare (ignore args dx))
-    t)
-(defoptimizer (%make-complex stack-allocate-result) ((&rest args) node dx)
-    (declare (ignore args dx))
-    t)
+(defoptimizer (cons stack-allocate-result) ((&rest args))
+  t)
+(defoptimizer (%make-complex stack-allocate-result) ((&rest args))
+  t)
 
 ;;; MAKE-LIST optimizations
 #+x86-64
 (progn
   (defoptimizer (%make-list stack-allocate-result) ((length element) node dx)
-    (declare (ignore element))
     (or (eq dx 'truly-dynamic-extent)
         (zerop (policy node safety))
         ;; At most one page (this is more paranoid than %listify-rest-args).
@@ -411,7 +415,6 @@
                          (specifier-type
                           `(integer 0 ,(/ +backend-page-bytes+ sb-vm:n-word-bytes 2))))))
   (defoptimizer (%make-list ltn-annotate) ((length element) call ltn-policy)
-    (declare (ignore length element))
     (vectorish-ltn-annotate-helper call ltn-policy
                                    'sb-vm::allocate-list-on-stack
                                    'sb-vm::allocate-list-on-heap)))
@@ -475,3 +478,35 @@
                     (primitive-object-slots (primitive-object 'array)))
                '(fill-pointer elements data
                  displacement displaced-p displaced-from dimensions)))
+
+(define-vop (touch-object)
+  (:translate touch-object)
+  (:args (object))
+  (:ignore object)
+  (:policy :fast-safe)
+  (:arg-types t)
+  (:generator 0))
+
+#+(or x86 x86-64)
+(define-vop ()
+  (:translate touch-object-identity)
+  (:args (object :scs (descriptor-reg any-reg sap-reg
+                       signed-reg unsigned-reg)
+                 :target res))
+  (:policy :fast-safe)
+  (:results (res :scs (descriptor-reg)))
+  (:generator 0
+    (move res object)))
+
+;;; By pure coincidence, almost all the architectures that lack a +-MODFX vop
+;;; have an instruction named ADD with the same argument order.
+;;; MIPS needs to use ADDU to avoid trapping on overflow.
+#+(or arm mips ppc sparc)
+(define-vop (+-modfx)
+  (:translate +-modfx)
+  (:policy :fast-safe)
+  (:args (x :scs (any-reg)) (y :scs (any-reg)))
+  (:arg-types tagged-num tagged-num)
+  (:results (res :scs (any-reg)))
+  (:result-types fixnum)
+  (:generator 1 (inst #+mips addu #-mips add res x y)))

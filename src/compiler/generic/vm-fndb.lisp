@@ -56,14 +56,11 @@
            #+long-float simple-array-complex-long-float-p
            simple-rank-1-array-*-p
            system-area-pointer-p realp
-           ;; #-64-bit
+           signed-byte-8-p signed-byte-16-p
            unsigned-byte-32-p
-           ;; #-64-bit
            signed-byte-32-p
-           #+64-bit
-           unsigned-byte-64-p
-           #+64-bit
-           signed-byte-64-p
+           #+64-bit unsigned-byte-64-p
+           #+64-bit signed-byte-64-p
            weak-pointer-p code-component-p lra-p
            sb-int:unbound-marker-p
            pointerp
@@ -73,6 +70,8 @@
            function-with-layout-p
            non-null-symbol-p)
     (t) boolean (movable foldable flushable))
+
+(defknown car-eq-if-listp (t t) boolean (movable foldable flushable))
 
 (defknown #.(loop for (name) in *vector-without-complex-typecode-infos*
                   collect name)
@@ -95,14 +94,24 @@
 (defknown pointer-hash (t) fixnum (flushable))
 
 (defknown %sp-string-compare
-  (simple-string index (or null index) simple-string index (or null index))
+  (simple-string simple-string index (or null index) index (or null index))
   (values index fixnum)
   (foldable flushable no-verify-arg-count))
 (defknown %sp-string=
-  (simple-string index (or null index) simple-string index (or null index))
+  (simple-string simple-string index (or null index) index (or null index))
   boolean
   (foldable flushable no-verify-arg-count))
 
+(defknown (sb-impl::instance-sxhash sb-impl::%instance-sxhash)
+    (instance) hash-code (flushable))
+;;; SXHASH values on numbers and strings are predictable, therefore the next batch
+;;; of functions are flushable. Perhaps not entirely obviously, symbol hashes are
+;;; predictable because we hash by name. And while ENSURE-SYMBOL-HASH is not
+;;; - strictly speaking - a side-effectless operation, it has no effect as far as
+;;; user-written code is concerned. i.e. nothing portably expressed can discern
+;;; whether memoization of the hash occurred. (I feel like we would have a cleaner
+;;; implementation if we just eagerly compute the hash anyway. Practically all
+;;; symbols eventually get hashed)
 (defknown sb-impl::number-sxhash (number) hash-code (foldable flushable))
 (defknown %sxhash-string (string) hash-code (foldable flushable))
 (defknown %sxhash-simple-string (simple-string) hash-code (foldable flushable))
@@ -129,7 +138,7 @@
 
 ;;; SYMBOL-PACKAGE-ID for #+compact-symbol demands a vop which avoids loading
 ;;; a raw bit value in a descriptor register (the SLOT vop returns a descriptor)
-(defknown sb-impl::symbol-package-id (symbol) (unsigned-byte 16))
+(defknown symbol-package-id (symbol) (unsigned-byte 16))
 ;;; TODO: I'd like to eliminate the (OR NULL) from this return type.
 ;;; For that to happen, I probably need +nil-packed-infos+ to become
 ;;; placed in static space because assembly routines may need it.
@@ -205,7 +214,7 @@
   (flushable no-verify-arg-count)
   :result-arg 0)
 
-(defknown %make-instance (index) instance
+(defknown (%make-instance %make-instance/mixed) (index) instance
   (flushable))
 (defknown %make-structure-instance (defstruct-description list &rest t) instance
   (flushable always-translatable))
@@ -242,23 +251,25 @@
 #+(or arm64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
   sb-vm:word ())
-#+riscv
+#+(or arm64 riscv x86 x86-64)
 (defknown %raw-instance-cas/signed-word (instance index sb-vm:signed-word sb-vm:signed-word)
   sb-vm:signed-word ())
 (defknown %raw-instance-xchg/word (instance index sb-vm:word) sb-vm:word ())
 
-#.`(progn
-     ,@(map 'list
-            (lambda (rsd)
-              (let* ((reader (sb-kernel::raw-slot-data-reader-name rsd))
-                     (writer (sb-kernel::raw-slot-data-writer-name rsd))
-                     (type (sb-kernel::raw-slot-data-raw-type rsd)))
-                `(progn
-                   (defknown ,reader (instance index) ,type
-                     (flushable always-translatable))
-                   (defknown ,writer (instance index ,type) (values)
-                     (always-translatable)))))
-            sb-kernel::*raw-slot-data*))
+(macrolet ((define-raw-slot-defknowns ()
+             `(progn
+                ,@(map 'list
+                       (lambda (rsd)
+                         (let* ((reader (sb-kernel::raw-slot-data-reader-name rsd))
+                                (writer (sb-kernel::raw-slot-data-writer-name rsd))
+                                (type (sb-kernel::raw-slot-data-raw-type rsd)))
+                           `(progn
+                              (defknown ,reader (instance index) ,type
+                                  (flushable always-translatable))
+                              (defknown ,writer (instance index ,type) (values)
+                                  (always-translatable)))))
+                       sb-kernel::*raw-slot-data*))))
+  (define-raw-slot-defknowns))
 
 #+compare-and-swap-vops
 (defknown %raw-instance-atomic-incf/word (instance index sb-vm:word) sb-vm:word
@@ -341,13 +352,29 @@
       (flushable movable foldable))
   (defknown %make-simd-pack-ub32 ((unsigned-byte 32) (unsigned-byte 32)
                                   (unsigned-byte 32) (unsigned-byte 32))
-      (simd-pack integer)
+      (simd-pack (unsigned-byte 32))
       (flushable movable #-sb-xc-host foldable))
   (defknown %make-simd-pack-ub64 ((unsigned-byte 64) (unsigned-byte 64))
-      (simd-pack integer)
+      (simd-pack (unsigned-byte 64))
       (flushable movable #-sb-xc-host foldable))
   (defknown (%simd-pack-low %simd-pack-high) (simd-pack)
       (unsigned-byte 64)
+      (flushable movable foldable))
+  (defknown %simd-pack-ub8s (simd-pack)
+      (values (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8))
+      (flushable movable foldable))
+  (defknown %simd-pack-ub16s (simd-pack)
+      (values (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16))
       (flushable movable foldable))
   (defknown %simd-pack-ub32s (simd-pack)
       (values (unsigned-byte 32) (unsigned-byte 32)
@@ -355,6 +382,29 @@
       (flushable movable foldable))
   (defknown %simd-pack-ub64s (simd-pack)
       (values (unsigned-byte 64) (unsigned-byte 64))
+      (flushable movable foldable))
+  (defknown %simd-pack-sb8s (simd-pack)
+      (values (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8))
+      (flushable movable foldable))
+  (defknown %simd-pack-sb16s (simd-pack)
+      (values (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16))
+      (flushable movable foldable))
+  (defknown %simd-pack-sb32s (simd-pack)
+      (values (signed-byte 32) (signed-byte 32)
+              (signed-byte 32) (signed-byte 32))
+      (flushable movable foldable))
+  (defknown %simd-pack-sb64s (simd-pack)
+      (values (signed-byte 64) (signed-byte 64))
       (flushable movable foldable))
   (defknown %simd-pack-singles (simd-pack)
       (values single-float single-float single-float single-float)
@@ -380,13 +430,29 @@
       (flushable movable foldable))
   (defknown %make-simd-pack-256-ub32 ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
                                       (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
-      (simd-pack-256 integer)
+      (simd-pack-256 (unsigned-byte 32))
       (flushable movable foldable))
   (defknown %make-simd-pack-256-ub64 ((unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
-      (simd-pack-256 integer)
+      (simd-pack-256 (unsigned-byte 64))
       (flushable movable foldable))
   (defknown (%simd-pack-256-0 %simd-pack-256-1 %simd-pack-256-2 %simd-pack-256-3) (simd-pack-256)
       (unsigned-byte 64)
+      (flushable movable foldable))
+  (defknown %simd-pack-256-ub8s (simd-pack-256)
+      (values (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8)
+              (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 8))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-ub16s (simd-pack-256)
+      (values (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16)
+              (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16) (unsigned-byte 16))
       (flushable movable foldable))
   (defknown %simd-pack-256-ub32s (simd-pack-256)
       (values (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
@@ -394,6 +460,29 @@
       (flushable movable foldable))
   (defknown %simd-pack-256-ub64s (simd-pack-256)
       (values (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-sb8s (simd-pack-256)
+      (values (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8)
+              (signed-byte 8) (signed-byte 8) (signed-byte 8) (signed-byte 8))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-sb16s (simd-pack-256)
+      (values (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16)
+              (signed-byte 16) (signed-byte 16) (signed-byte 16) (signed-byte 16))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-sb32s (simd-pack-256)
+      (values (signed-byte 32) (signed-byte 32) (signed-byte 32) (signed-byte 32)
+              (signed-byte 32) (signed-byte 32) (signed-byte 32) (signed-byte 32))
+      (flushable movable foldable))
+  (defknown %simd-pack-256-sb64s (simd-pack-256)
+      (values (signed-byte 64) (signed-byte 64) (signed-byte 64) (signed-byte 64))
       (flushable movable foldable))
   (defknown %simd-pack-256-singles (simd-pack-256)
       (values single-float single-float single-float single-float
@@ -467,6 +556,7 @@
 
 (defknown %bignum-ref (bignum bignum-index) bignum-element-type
   (flushable #-bignum-assertions always-translatable))
+
 #+(or x86 x86-64)
 (defknown %bignum-ref-with-offset (bignum fixnum (signed-byte 24))
   bignum-element-type (flushable always-translatable))
@@ -475,18 +565,25 @@
   (values)
   (#-bignum-assertions always-translatable))
 
+(defknown %half-bignum-ref (bignum sb-kernel::half-bignum-index) sb-kernel::half-bignum-element-type
+    (flushable #-bignum-assertions always-translatable))
+
+(defknown (setf %half-bignum-ref) (sb-kernel::half-bignum-element-type bignum sb-kernel::half-bignum-index)
+    (values)
+    (#-bignum-assertions always-translatable))
+
 ;;; Return T if digit is positive, or NIL if negative.
 (defknown %digit-0-or-plusp (bignum-element-type) boolean
-  (foldable flushable movable always-translatable))
+    (foldable flushable movable always-translatable))
 
 ;;; %ADD-WITH-CARRY returns a bignum digit and a carry resulting from adding
 ;;; together a, b, and an incoming carry.
 ;;; %SUBTRACT-WITH-BOROW returns a bignum digit and a borrow resulting from
 ;;; subtracting b from a, and subtracting a possible incoming borrow.
 (defknown (%add-with-carry %subtract-with-borrow)
-          (bignum-element-type bignum-element-type (mod 2))
-  (values bignum-element-type (mod 2))
-  (foldable flushable movable always-translatable))
+    (bignum-element-type bignum-element-type (mod 2))
+    (values bignum-element-type (mod 2))
+    (foldable flushable movable always-translatable))
 
 ;;; This multiplies x-digit and y-digit, producing high and low digits
 ;;; manifesting the result. Then it adds the low digit, res-digit, and
@@ -499,19 +596,19 @@
 ;;; accumulating partial results which is where the res-digit comes
 ;;; from.
 (defknown %multiply-and-add
-          (bignum-element-type bignum-element-type bignum-element-type
-                               &optional bignum-element-type)
-  (values bignum-element-type bignum-element-type)
-  (foldable flushable movable always-translatable))
+    (bignum-element-type bignum-element-type bignum-element-type
+                         &optional bignum-element-type)
+    (values bignum-element-type bignum-element-type)
+    (foldable flushable movable always-translatable))
 
 ;;; Multiply two digit-size numbers, returning a 2*digit-size result
 ;;; split into two digit-size quantities.
 (defknown %multiply (bignum-element-type bignum-element-type)
-  (values bignum-element-type bignum-element-type)
-  (foldable flushable movable always-translatable))
+    (values bignum-element-type bignum-element-type)
+    (foldable flushable movable always-translatable))
 
 (defknown %lognot (bignum-element-type) bignum-element-type
-  (foldable flushable movable always-translatable))
+    (foldable flushable movable always-translatable))
 
 (defknown (%logand %logior %logxor) (bignum-element-type bignum-element-type)
   bignum-element-type
@@ -526,11 +623,15 @@
   (values bignum-element-type bignum-element-type)
   (foldable flushable movable always-translatable))
 
+(defknown %half-bigfloor (half-bignum-element-type half-bignum-element-type half-bignum-element-type)
+  (values half-bignum-element-type half-bignum-element-type)
+  (foldable flushable movable always-translatable))
+
 ;;; Convert the input, a BIGNUM-ELEMENT-TYPE, to a signed word.
 ;;; FIXME: considering that both the input and output have N-WORD-BITS significant bits,
 ;;; this is really a bad name for the operation.
 (defknown %fixnum-digit-with-correct-sign (bignum-element-type) sb-vm:signed-word
-  (foldable flushable movable always-translatable))
+    (foldable flushable movable always-translatable))
 
 ;;; %ASHR- take a digit-size quantity and shift it to the left,
 ;;; returning a digit-size quantity.
@@ -724,3 +825,23 @@
 
 (defknown (%unary-truncate %unary-round) (real) integer
   (movable foldable flushable no-verify-arg-count))
+
+(defknown (%unary-floor %unary-ceiling) (real) integer
+  (movable foldable flushable))
+
+#+(or arm64 x86-64)
+(defknown sb-lockless::get-next (sb-lockless::list-node) (values sb-lockless::list-node t))
+
+(defknown sb-vm::fastrem-32 ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32))
+  (unsigned-byte 32)
+  (flushable))
+(defknown sb-vm::fastrem-64 ((unsigned-byte 64) (unsigned-byte 64) (unsigned-byte 64))
+  (unsigned-byte 64)
+  (flushable))
+
+;;; +-modfx is useful for computing a hash that is commutative in its inputs.
+;;; These architectures lack a complete set of modular operations; they have operations
+;;; which are modular in N-WORD-BITS, but not that accept fixnums.
+#+(or arm mips ppc sparc)
+(defknown sb-vm::+-modfx (integer integer) fixnum
+          (movable foldable flushable always-translatable))

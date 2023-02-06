@@ -50,7 +50,7 @@
          (nwords (+ fixed-words extra-id-words bitmap-words))
          (layout
           (truly-the sb-vm:layout
-                     #-(or metaspace immobile-space) (%make-instance nwords)
+                     #-(or metaspace immobile-space) (%make-instance/mixed nwords)
                      #+metaspace (sb-vm::allocate-metaspace-chunk (1+ nwords))
                      #+(and immobile-space (not metaspace))
                      (sb-vm::alloc-immobile-fixedobj
@@ -79,6 +79,7 @@
       (dotimes (i bitmap-words)
         (%raw-instance-set/word layout (+ bitmap-base i)
               (ldb (byte sb-vm:n-word-bits (* i sb-vm:n-word-bits)) bitmap))))
+    (aver (= (%layout-bitmap layout) bitmap)) ; verify it reads back the same
     ;; It's not terribly important that we recycle layout IDs, but I have some other
     ;; changes planned that warrant a finalizer per layout.
     ;; FIXME: structure IDs should never be recycled because code blobs referencing
@@ -87,6 +88,7 @@
     (unless (built-in-classoid-p classoid)
       (let ((layout-addr (- (get-lisp-obj-address layout) sb-vm:instance-pointer-lowtag)))
         (declare (ignorable layout-addr))
+        (declare (sb-c::tlab :system))
         (finalize wrapper
                   (lambda ()
                     #+metaspace (sb-vm::unallocate-metaspace-chunk layout-addr)
@@ -115,8 +117,13 @@
 ;;; when given a STRUCTURE-OBJECT.
 (defun allocate-struct (type)
   (let* ((wrapper (classoid-wrapper (the structure-classoid (find-classoid type))))
-         (structure (%new-instance wrapper (wrapper-length wrapper))))
-    (dolist (dsd (dd-slots (wrapper-dd wrapper)) structure)
+         (dd (wrapper-dd wrapper))
+         (structure (let ((len (wrapper-length wrapper)))
+                      (if (dd-has-raw-slot-p dd)
+                          (%make-instance/mixed len)
+                          (%make-instance len)))))
+    (%set-instance-layout structure wrapper)
+    (dolist (dsd (dd-slots dd) structure)
       (when (eq (dsd-raw-type dsd) 't)
         (%instance-set structure (dsd-index dsd) (make-unbound-marker))))))
 
@@ -129,25 +136,28 @@
 (defun (setf %instance-ref) (newval instance index)
   (%instance-set instance index newval)
   newval)
-#.`(progn
-     ,@(map 'list
-            (lambda (rsd)
-              (let* ((reader (sb-kernel::raw-slot-data-reader-name rsd))
-                     (writer (sb-kernel::raw-slot-data-writer-name rsd))
-                     (type (sb-kernel::raw-slot-data-raw-type rsd)))
-                `(progn
-                   (defun ,reader (instance index) (,reader instance index))
-                   ;; create a well-behaving SETF-compatible slot setter
-                   (defun (setf ,reader) (newval instance index)
-                     (declare (,type newval))
-                     (,writer instance index newval)
-                     newval)
-                   ;; .. and a non-SETF-compatible one
-                   (defun ,writer (instance index newval)
-                     (declare (,type newval))
-                     (,writer instance index newval)
-                     (values)))))
-            sb-kernel::*raw-slot-data*))
+
+(macrolet ((define-raw-slot-accessors ()
+             `(progn
+                ,@(map 'list
+                       (lambda (rsd)
+                         (let* ((reader (sb-kernel::raw-slot-data-reader-name rsd))
+                                (writer (sb-kernel::raw-slot-data-writer-name rsd))
+                                (type (sb-kernel::raw-slot-data-raw-type rsd)))
+                           `(progn
+                              (defun ,reader (instance index) (,reader instance index))
+                              ;; create a well-behaving SETF-compatible slot setter
+                              (defun (setf ,reader) (newval instance index)
+                                (declare (,type newval))
+                                (,writer instance index newval)
+                                newval)
+                              ;; .. and a non-SETF-compatible one
+                              (defun ,writer (instance index newval)
+                                (declare (,type newval))
+                                (,writer instance index newval)
+                                (values)))))
+                       sb-kernel::*raw-slot-data*))))
+  (define-raw-slot-accessors))
 
 (macrolet ((id-bits-sap ()
              `(sap+ (int-sap (get-lisp-obj-address layout))
@@ -204,10 +214,13 @@
 ;;; Because this sure as heck doesn't check anything]
 #+(or sb-eval sb-fasteval)
 (defun %make-structure-instance (dd slot-specs &rest slot-values)
-  (let ((instance (%new-instance (dd-layout-or-lose dd)
-                                 (dd-length dd))) ; length = sans header word
+  (let ((instance (let ((len (dd-length dd))) ; # of words excluding the header
+                    (if (dd-has-raw-slot-p dd)
+                        (%make-instance/mixed len)
+                        (%make-instance len))))
         (value-index 0))
     (declare (index value-index))
+    (%set-instance-layout instance (dd-layout-or-lose dd))
     (dolist (spec slot-specs instance)
       (destructuring-bind (kind raw-type . index) spec
         (if (eq kind :unbound)
@@ -240,12 +253,27 @@
 (defun assign-equalp-impl (type-name function)
   (set-wrapper-equalp-impl (find-layout type-name) function))
 
-(defun %target-defstruct (dd equalp)
+;;; This variable is just a somewhat hokey way to pass additional
+;;; arguments to the defstruct hook (which renders the structure definition
+;;; into a CLOS class) without having to figure out some means of stashing
+;;; functions in the DD or DD for the structure.
+(defvar *struct-accesss-fragments* nil)
+(define-load-time-global *struct-accesss-fragments-delayed* nil)
+
+(defun !bootstrap-defstruct-hook (classoid)
+  ;; I hate this, but do whatever it takes...
+  ;; A better approach might be to write the correct data
+  ;; into the LAYOUT-SLOT-TABLE now.
+  ;; (I think that's where the code fragments end up)
+  (unless (member (classoid-name classoid) '(pathname condition)) ; KLUDGE
+    (push (cons (classoid-name classoid) *struct-accesss-fragments*)
+          *struct-accesss-fragments-delayed*)))
+
+(defun %target-defstruct (dd equalp &rest accessors)
   (declare (type defstruct-description dd))
 
   (when (dd-doc dd)
-    (setf (documentation (dd-name dd) 'structure)
-          (dd-doc dd)))
+    (setf (documentation (dd-name dd) 'structure) (dd-doc dd)))
 
   (let ((classoid (find-classoid (dd-name dd))))
     (let ((layout (classoid-wrapper classoid)))
@@ -278,48 +306,65 @@
                     (lambda (a b)
                       (sb-impl::instance-equalp* comparators a b)))))))
 
-    (when *type-system-initialized*
+    (let ((*struct-accesss-fragments* accessors))
       (dolist (fun *defstruct-hooks*)
         (funcall fun classoid))))
 
   (dd-name dd))
+(defun !target-defstruct-altmetaclass (dd &rest accessors)
+  (declare (type defstruct-description dd))
+  (let ((classoid (find-classoid (dd-name dd)))
+        (*struct-accesss-fragments* accessors))
+    (dolist (fun *defstruct-hooks*)
+      (funcall fun classoid)))
+  t)
 
 ;;; Copy any old kind of structure.
+
+;; The finicky backends disallow loading and storing raw words
+;; using %INSTANCE-REF. The robust backends allow it.
+;; MIPS is probably robust, but I don't care to try it.
+(macrolet ((fast-loop (result)
+             `(do ((i sb-vm:instance-data-start (1+ i)))
+                  ((>= i len) ,result)
+                (declare (index i))
+                (%instance-set ,result i (%instance-ref structure i)))))
+
+(defun sys-copy-struct (structure)
+  (declare (sb-c::tlab :system))
+  #-system-tlabs (copy-structure structure)
+  #+system-tlabs ; KISS by allocating to sys-mixed-tlab in all cases
+  (let* ((len (%instance-length structure))
+         (copy (%make-instance/mixed len)))
+    (%set-instance-layout copy (%instance-layout structure))
+    (fast-loop copy)))
+
 (defun copy-structure (structure)
   "Return a copy of STRUCTURE with the same (EQL) slot values."
   (declare (type structure-object structure))
-  (let ((wrapper (%instance-wrapper structure)))
-    (when (wrapper-invalid wrapper)
-      (error "attempt to copy an obsolete structure:~%  ~S" structure))
-    ;; Previously this had to used LAYOUT-LENGTH in the allocation,
-    ;; to avoid copying random bits from the stack to the heap if you had a
-    ;; padding word in a stack-allocated instance. This is no longer an issue.
-    ;; %INSTANCE-LENGTH returns the number of words that are logically in the
-    ;; instance, with no padding. Using %INSTANCE-LENGTH allows potentially
-    ;; interesting nonstandard things like variable-length structures.
-    (let* ((len (%instance-length structure))
-           (res (%new-instance (%instance-layout structure) len)))
-      (declare (type index len))
-      (let ((bitmap (dd-bitmap (wrapper-dd wrapper))))
-        ;; On backends which don't segregate descriptor vs. non-descriptor
-        ;; registers, we could speed up this code in an obvious way.
-        (macrolet ((copy-loop (tagged-p &optional step)
-                     `(do ((i sb-vm:instance-data-start (1+ i)))
-                          ((>= i len))
-                        (declare (index i))
-                        (if ,tagged-p
-                            (%instance-set res i (%instance-ref structure i))
-                            (%raw-instance-set/word res i
-                                  (%raw-instance-ref/word structure i)))
-                        ,step)))
-          (cond ((eql bitmap +layout-all-tagged+) (copy-loop t))
-                ;; The fixnum case uses fixnum operations for ODDP and ASH.
-                ((fixnump bitmap) ; shift and mask is faster than logbitp
-                 (copy-loop (oddp (truly-the fixnum bitmap))
-                            (setq bitmap (ash bitmap -1))))
-                (t ; bignum - use LOGBITP to avoid consing more bignums
-                 (copy-loop (logbitp i bitmap))))))
-      res)))
+  ;; %INSTANCE-LENGTH returns the number of words that are logically in the
+  ;; instance excluding any padding and/or stable-hash slot.
+  ;; Variable-length structure types are allowed.
+  (let* ((layout (%instance-layout structure))
+         (len (%instance-length structure)))
+      #+(or x86 x86-64) ; Two allocators, but same loop either way
+      (let ((res (%new-instance* layout len)))
+        (fast-loop res))
+      #-(or x86 x86-64) ; Different loops
+      (if (logtest (layout-flags layout) sb-vm::+strictly-boxed-flag+)
+          (let ((res (%new-instance layout len)))
+            (fast-loop res))
+          (let ((res (%make-instance/mixed len)))
+            (%set-instance-layout res layout)
+            ;; DO-LAYOUT-BITMAP does not visit the LAYOUT itself
+            ;; (if that occupies a whole slot vs. being in the header)
+            (do-layout-bitmap (i taggedp layout len)
+              (if taggedp
+                  (%instance-set res i (%instance-ref structure i))
+                  (%raw-instance-set/word
+                   res i (%raw-instance-ref/word structure i))))
+            res)))))
+
 ;;; Like above, but copy all slots (including the LAYOUT) as though boxed.
 ;;; If the structure might contain raw slots and the GC is precise,
 ;;; this won't ever be called.

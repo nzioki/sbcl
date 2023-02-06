@@ -11,54 +11,6 @@
 
 (load "compiler-test-util.lisp")
 
-;;;; Better ensure nothing in messed up in the ID space
-;;;; or else everything is suspect.
-(defun layout-id-vector-sap (layout)
-  (sb-sys:sap+ (sb-sys:int-sap (sb-kernel:get-lisp-obj-address layout))
-               (- (ash (+ sb-vm:instance-slots-offset
-                          (sb-kernel:get-dsd-index sb-vm:layout sb-kernel::id-word0))
-                       sb-vm:word-shift)
-                  sb-vm:instance-pointer-lowtag)))
-
-(let ((hash (make-hash-table)))
-  ;; assert that all layout IDs are unique
-  (let ((all-wrappers
-         (delete-if
-          ;; temporary layouts (created for parsing DEFSTRUCT)
-          ;; must be be culled out.
-          (lambda (x)
-            (and (typep (sb-kernel:wrapper-classoid x)
-                        'sb-kernel:structure-classoid)
-                 (eq (sb-kernel:wrapper-equalp-impl x)
-                     #'sb-kernel::equalp-err)))
-          (sb-vm::list-allocated-objects :all
-                                         :type sb-vm:instance-widetag
-                                         :test #'sb-kernel::wrapper-p))))
-    (dolist (wrapper all-wrappers)
-      (let ((id (sb-kernel:layout-id wrapper)))
-        (sb-int:awhen (gethash id hash)
-          (error "ID ~D is ~A and ~A" id sb-int:it wrapper))
-        (setf (gethash id hash) wrapper)))
-    ;; assert that all inherited ID vectors match the layout-inherits vector
-    (let ((structure-object
-           (sb-kernel:find-layout 'structure-object)))
-      (dolist (wrapper all-wrappers)
-        (when (find structure-object (sb-kernel:wrapper-inherits wrapper))
-          (let* ((layout (sb-kernel:wrapper-friend wrapper))
-                 (ids
-                  (sb-sys:with-pinned-objects (layout)
-                   (let ((sap (layout-id-vector-sap layout)))
-                     (loop for depthoid from 2 to (sb-kernel:wrapper-depthoid wrapper)
-                           collect (sb-sys:signed-sap-ref-32 sap (ash (- depthoid 2) 2))))))
-                (expected
-                 (map 'list 'sb-kernel:layout-id (sb-kernel:wrapper-inherits wrapper))))
-            (unless (equal (list* (sb-kernel:layout-id (sb-kernel:find-layout 't))
-                                  (sb-kernel:layout-id (sb-kernel:find-layout 'structure-object))
-                                  ids)
-                           (append expected (list (sb-kernel:layout-id wrapper))))
-              (error "Wrong IDs for ~A: expect ~D actual ~D~%"
-                     wrapper expected ids))))))))
-
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
 
 ;;; Type mismatch of slot default init value isn't an error until the
@@ -575,6 +527,15 @@
                       (sb-kernel:dd-slots
                        (sb-kernel:find-defstruct-description 'hugest-manyraw))))))
 
+(with-test (:name :dd-bitmap-vs-layout-bitmap)
+  (dolist (typename '(huge-manyraw hugest-manyraw))
+    (let* ((layout (sb-kernel:find-layout typename))
+           (info (sb-kernel:wrapper-dd layout))
+           (bitmap (sb-kernel::dd-bitmap info)))
+      (assert (typep bitmap 'bignum))
+      (assert (= (sb-bignum:%bignum-length bitmap)
+                 (sb-kernel:bitmap-nwords layout))))))
+
 (defun check-huge-manyraw (s)
   (assert (and (eql (huge-manyraw-df s) 8.207880688335944d-304)
                (eql (huge-manyraw-aaa s) 'aaa)
@@ -646,8 +607,6 @@
   (slot *bug210*))
 ;;; Because of bug 210, this assertion used to fail.
 (assert (typep (nth-value 1 (ignore-errors (bug210a))) 'unbound-variable))
-;;; Even with bug 210, these assertions succeeded.
-(assert (typep (nth-value 1 (ignore-errors *bug210*)) 'unbound-variable))
 (assert (typep (nth-value 1 (ignore-errors (make-bug210b))) 'unbound-variable))
 
 ;;; In sbcl-0.7.8.53, DEFSTRUCT blew up in non-toplevel contexts
@@ -1122,7 +1081,7 @@ redefinition."
     (assert-invalid instance)))
 
 ;; Some other subclass wrinkles have to do with splitting definitions
-;; accross files and compiling and loading things in a funny order.
+;; across files and compiling and loading things in a funny order.
 (with-defstruct-redefinition-test
     :defstruct/subclass-in-other-file-funny-operation-order-continue
     (((defstruct ignore pred1) :class-name redef-test-10 :slots (a))
@@ -1481,3 +1440,11 @@ redefinition."
     (assert (eq f #'sb-int:pathname=)))
   (let ((f (sb-kernel:wrapper-equalp-impl (sb-kernel:find-layout 'hash-table))))
     (assert (eq f #'sb-int:hash-table-equalp))))
+
+(defstruct (badbuf (:constructor make-badbuf ()))
+  (str (make-string 128) :type (simple-array character (128))))
+
+;; STR slot gets a type-check in the constructor. It should not
+(test-util:with-test (:name :make-string-type-inference :fails-on :sbcl)
+  (let ((things (ctu:find-code-constants #'make-badbuf :type 'list)))
+    (assert (not things))))

@@ -293,14 +293,16 @@
      (if (static-symbol-p value)
          immediate-sc-number
          nil))
-    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
-         character)
+    ((signed-byte 30)
      immediate-sc-number)
     #-sb-xc-host ; There is no such object type in the host
     (system-area-pointer
      immediate-sc-number)
     (character
-     immediate-sc-number)))
+     immediate-sc-number)
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc zero-sc-number)

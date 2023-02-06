@@ -28,8 +28,6 @@ if [ "$sbcl_os" = win32 ] ; then
    LOADLIBES=-lSynchronization featurep os-provides-wakebyaddr sb-futex
 fi
 
-# KLUDGE: ppc/darwin dlopen is special cased in make-config.sh, as
-# we fake it with a shim.
 featurep os-provides-dlopen
 
 featurep os-provides-dladdr
@@ -41,6 +39,8 @@ featurep os-provides-suseconds-t
 featurep os-provides-getprotoby-r
 
 featurep os-provides-poll
+
+featurep os-provides-close-range-wrapper
 
 if [ "$sbcl_arch" = arm ] ; then
    featurep arm-softfp

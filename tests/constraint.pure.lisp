@@ -149,40 +149,43 @@
 
 (with-test (:name :type-constraint-joining)
   (assert
-   (equal (caddr
-           (sb-kernel:%simple-fun-type
-            (checked-compile
-             `(lambda ()
-                (let ((x 'foo))
-                  (if (read)
-                      (setq x 3)
-                      (setq x 5))
-                  x)))))
-          '(values (or (integer 5 5) (integer 3 3)) &optional))))
+   (type-specifiers-equal
+    (caddr
+     (sb-kernel:%simple-fun-type
+      (checked-compile
+       `(lambda ()
+          (let ((x 'foo))
+            (if (read)
+                (setq x 3)
+                (setq x 5))
+            x)))))
+    '(values (or (integer 5 5) (integer 3 3)) &optional))))
 
 (with-test (:name :type-constraint-joining.2)
   (assert
-   (equal (caddr
-           (sb-kernel:%simple-fun-type
-            (checked-compile
-             `(lambda (x)
-                (etypecase x
-                  (integer (read))
-                  (float (read)))
-                x))))
-          '(values (or float integer) &optional))))
+   (type-specifiers-equal
+    (caddr
+     (sb-kernel:%simple-fun-type
+      (checked-compile
+       `(lambda (x)
+          (etypecase x
+            (integer (read))
+            (float (read)))
+          x))))
+    '(values (or float integer) &optional))))
 
 (with-test (:name :type-constraint-joining.3)
   (assert
-   (equal (caddr
-           (sb-kernel:%simple-fun-type
-            (checked-compile
-             `(lambda (x)
-                (if (read)
-                    (setq x (random 10))
-                    (setq x (random 10.0)))
-                x))))
-          '(values (or (single-float 0.0 (10.0)) (mod 10)) &optional))))
+   (type-specifiers-equal
+    (caddr
+     (sb-kernel:%simple-fun-type
+      (checked-compile
+       `(lambda (x)
+          (if (read)
+              (setq x (random 10))
+              (setq x (random 10.0)))
+          x))))
+    '(values (or (single-float 0.0 (10.0)) (mod 10)) &optional))))
 
 (with-test (:name :type-constraint-joining-terminates)
   (checked-compile
@@ -305,3 +308,165 @@
                           (t (error ""))))
                 x))))
           '(values (not integer) &optional))))
+
+(with-test (:name (:type-constraint-joining :infinities 1))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (number)
+                 (declare (type (or number null) number))
+                 (cond ((null number) nil)
+                       ((sb-ext:float-nan-p number) :nan)
+                       ((= number sb-ext:double-float-positive-infinity) :inf)
+                       ((= number sb-ext:double-float-negative-infinity) :-inf)
+                       (number))))))
+           '(values (or (member nil :nan :inf :-inf) float) &optional))))
+
+(with-test (:name (:type-constraint-joining :infinities 2))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (number)
+                 (declare (type (or number null) number))
+                 (cond ((null number) nil)
+                       ((sb-ext:float-nan-p number) :nan)
+                       ((= number sb-ext:double-float-positive-infinity) number)
+                       ((= number sb-ext:double-float-negative-infinity) number)
+                       (t :number))))))
+           `(values (or (single-float ,sb-ext:single-float-negative-infinity
+                                      ,sb-ext:single-float-negative-infinity)
+                        (double-float ,sb-ext:double-float-negative-infinity
+                                      ,sb-ext:double-float-negative-infinity)
+                        (single-float ,sb-ext:single-float-positive-infinity
+                                      ,sb-ext:single-float-positive-infinity)
+                        (double-float ,sb-ext:double-float-positive-infinity
+                                      ,sb-ext:double-float-positive-infinity)
+                        (member nil :nan :number))
+                    &optional))))
+
+(with-test (:name (:type-constraint-joining :infinities 3))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (number)
+                 (declare (type (or number null) number))
+                 (cond ((null number) nil)
+                       ((sb-ext:float-nan-p number) :nan)
+                       ((eql number sb-ext:double-float-positive-infinity) number)
+                       ((eql number sb-ext:double-float-negative-infinity) number)
+                       (t :number))))))
+           `(values (or (double-float ,sb-ext:double-float-negative-infinity
+                                      ,sb-ext:double-float-negative-infinity)
+                        (double-float ,sb-ext:double-float-positive-infinity
+                                      ,sb-ext:double-float-positive-infinity)
+                        (member nil :nan :number))
+                    &optional))))
+
+(with-test (:name :debug-vars)
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (a)
+                 (declare (optimize (debug 2)))
+                 (let ((x (eq a 30)))
+                   (if x
+                       a
+                       (error "")))))))
+           `(values (integer 30 30) &optional))))
+
+(with-test (:name :vector-length-constraints)
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (x y)
+                 (declare (simple-vector x))
+                 (when (< (length x) y)
+                   (> (length x) y))))))
+           `(values null &optional)))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (x y)
+                 (declare (vector x))
+                 (when (< (length x) y)
+                   (> (length x) y))))))
+           `(values boolean &optional))))
+
+(with-test (:name :non-commutative-invert)
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (x y)
+                 (if (< x y)
+                     (> y x)
+                     (error ""))))))
+            `(values (member t) &optional)))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (x y)
+                 (if (< x y)
+                     (< y x)
+                     (error ""))))))
+            `(values null &optional))))
+
+(with-test (:name :=-real)
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (a b)
+                 (declare ((real 10 20) b))
+                 (if (= a b)
+                     a
+                     (error ""))))))
+           `(values (or (real 10 20) (complex (rational 10 20)) (complex (single-float 10.0 20.0))
+                        (complex (double-float 10.0d0 20.0d0))) &optional)))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (a b)
+                 (declare (integer a)
+                          ((real 10 20) b))
+                 (if (= a b)
+                     a
+                     (error ""))))))
+           `(values (integer 10 20) &optional)))
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (a b)
+                 (declare ((real 10 20) b))
+                 (if (> a b)
+                     a
+                     (error ""))))))
+           `(values (real (10)) &optional))))
+
+(with-test (:name :<=-constraints)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (if (/= a 0)
+             (if (>= a 0)
+                 t)))
+    ((1) t)
+    ((0) nil)))
+
+(with-test (:name :vector-length-derive-type)
+  (let ((s "X"))
+    (checked-compile-and-assert
+        ()
+        `(lambda (x)
+           (declare ((or (vector t 2) (member #\@ ,s)) x))
+           (typep x '(string 1)))
+      ((s) t))))

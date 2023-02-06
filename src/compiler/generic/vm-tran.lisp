@@ -20,9 +20,7 @@
 
 (define-source-transform compiled-function-p (x)
   (once-only ((x x))
-    `(and (functionp ,x)
-          #+(or sb-fasteval sb-eval)
-          (not (typep ,x 'interpreted-function)))))
+    `(and (functionp ,x) (not (funcallable-instance-p ,x)))))
 
 (define-source-transform char-int (x)
   `(char-code ,x))
@@ -87,10 +85,18 @@
                          sb-vm:bignum-digits-offset
                          index offset))
 
-(defun dd-contains-raw-slots-p (dd)
-  (dolist (dsd (dd-slots dd))
-    (unless (eq (dsd-raw-type dsd) t) (return t))))
-
+;;; When copying a structure, try to make the best decision possible
+;;; as to placement. This matters in a few circumstances:
+;;; - when the "system" mixed TLAB is different from the "user" mixed TLAB.
+;;; - when we distinguish boxed from mixed allocation to generation 0.
+;;; GIVE-UP-IR1-TRANSFORM might put the allocation in the wrong TLAB,
+;;; as the general fallback doesn't make the same distinctions.
+;;; Unfortunately the DEFSTRUCT-defined copiers were not inlining even when
+;;; explicitly requested, because COPY-SOMESTRUCT always transforms into
+;;; COPY-STRUCTURE, so we've lost any declared inline-ness of COPY-SOMESTRUCT.
+;;; Therefore we just try to infer it based on whether this transform is
+;;; "acting as" COPY-SOMESTRUCT for a particular struct whose copier
+;;; was requested to be inline.
 (deftransform copy-structure ((instance) * * :result result :node node)
   (let* ((classoid (lvar-type instance))
          (name (and (structure-classoid-p classoid) (classoid-name classoid)))
@@ -103,18 +109,21 @@
                         (eq (classoid-state classoid) :sealed)
                         (not (classoid-subclasses classoid))))
          (dd (and class-eq (wrapper-info layout)))
+         (dd-copier (and dd (sb-kernel::dd-copier-name dd)))
          (max-inlined-words 5))
     (unless (and result ; could be unused result (but entire call wasn't flushed?)
                  layout
-                 ;; And don't copy if raw slots are present on the precisely GCed backends.
-                 ;; To enable that, we'd want variants for {"all-raw", "all-boxed", "mixed"}
+                 ;; Fail if raw slots are present on the precisely GCed backends.
                  ;; Also note that VAR-ALLOC can not cope with dynamic-extent except where
                  ;; support has been added (x86oid so far); so requiring an exact type here
                  ;; causes VAR-ALLOC to become FIXED-ALLOC which works on more architectures.
-                 #-c-stack-is-control-stack (and dd (not (dd-contains-raw-slots-p dd)))
+                 #-c-stack-is-control-stack (and dd (not (dd-has-raw-slot-p dd)))
 
                  ;; Definitely do this if copying to stack
+                 ;; (Allocation has to be inlined, otherwise there's no way to DX it)
                  (or (lvar-dynamic-extent result)
+                     (and dd-copier
+                          (eq (sb-int:info :function :inlinep dd-copier) 'inline))
                      ;; Or if it's a small fixed number of words
                      ;; and speed at least as important as size.
                      (and class-eq
@@ -126,24 +135,27 @@
     ;;   depending on whether layouts are in immobile space.
     ;; - for a small number of slots, copying them is inlined
     (cond ((not dd) ; it's going to be some subtype of NAME
-           `(%copy-instance (%make-instance (%instance-length instance)) instance))
-          ((<= (dd-length dd) max-inlined-words)
-           `(let ((copy (%make-structure-instance ,dd nil)))
-              ;; ASSUMPTION: either %INSTANCE-REF is the correct accessor for this word,
-              ;; or the GC will treat random bit patterns as conservative pointers
-              ;; (i.e. not alter them if %INSTANCE-REF is not the correct accessor)
-              ,@(loop for i from sb-vm:instance-data-start below (dd-length dd)
-                      collect `(%instance-set copy ,i (%instance-ref instance ,i)))
-              copy))
-          (t
-           `(%copy-instance-slots (%make-structure-instance ,dd nil) instance)))))
+           ;; pessimistically assume MIXED rather than choosing at runtime
+           `(%copy-instance (%make-instance/mixed (%instance-length instance)) instance))
+          ((not (logtest (dd-flags dd) +dd-varylen+)) ; fixed length
+           ;; ASSUMPTION: either %INSTANCE-REF is the correct accessor for this word,
+           ;; or the GC will treat random bit patterns as conservative pointers
+           ;; (i.e. not alter them if %INSTANCE-REF is not the correct accessor)
+           (if (> (dd-length dd) max-inlined-words)
+               `(%copy-instance-slots (%make-structure-instance ,dd nil) instance)
+               `(let ((copy (%make-structure-instance ,dd nil)))
+                  ,@(loop for i from sb-vm:instance-data-start below (dd-length dd)
+                       collect `(%instance-set copy ,i (%instance-ref instance ,i)))
+                  copy)))
+          (t ; variable-length
+           `(let ((copy (,(if (dd-has-raw-slot-p dd) '%make-instance/mixed '%make-instance)
+                          (%instance-length instance))))
+              (%set-instance-layout copy (%instance-layout instance))
+              (%copy-instance-slots copy instance))))))
 
 (defun varying-length-struct-p (classoid)
-  ;; This is a nice feature to have in general, but at present it is only possible
-  ;; to make varying length instances of SB-VM:LAYOUT (or WRAPPER if that is the same type),
-  ;; and nothing else.
-  (eq classoid (load-time-value (find-classoid #+metaspace 'sb-vm:layout
-                                               #-metaspace 'wrapper))))
+  (let ((dd (find-defstruct-description (classoid-name classoid))))
+    (logtest (dd-flags dd) +dd-varylen+)))
 
 (deftransform %instance-length ((instance))
   (let ((classoid (lvar-type instance)))
@@ -155,6 +167,15 @@
              (not (classoid-subclasses classoid)))
         (dd-length (wrapper-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
         (give-up-ir1-transform))))
+
+;;; This doesn't help a whole lot, but it does fire during compilation of 'info-vector'
+;;; which uses variable-length instances of PACKED-INFO, having no slot transforms.
+(define-source-transform (setf %instance-ref) (newval instance index)
+  `(let ((.newval. ,newval)
+         (.instance. ,instance)
+         (.index. ,index))
+     (%instance-set .instance. .index. .newval.)
+     .newval.))
 
 (define-source-transform %instance-wrapper (x) `(layout-friend (%instance-layout ,x)))
 (define-source-transform %fun-wrapper (x) `(layout-friend (%fun-layout ,x)))
@@ -270,12 +291,12 @@
         ;; so explicitly return the NEW-VALUE
         `(typecase string
            ((simple-array character (*))
-            (let ((c (the* (character :context :aref) new-value)))
+            (let ((c (the* (character :context 'aref-context) new-value)))
               (data-vector-set string index c)
               c))
            #+sb-unicode
            ((simple-array base-char (*))
-            (let ((c (the* (base-char :context :aref :silent-conflict t) new-value)))
+            (let ((c (the* (base-char :context 'aref-context :silent-conflict t) new-value)))
               (data-vector-set string index c)
               c))))))
 
@@ -752,15 +773,14 @@
   (logior sb-vm:character-widetag
           (ash (char-code (lvar-value obj)) sb-vm:n-widetag-bits)))
 
+;;; FIXME: The following should really be done by defining
+;;; UNBOUND-MARKER as a primitive object.
 ;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
 ;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.
 #-sb-xc-host
 (defun make-unbound-marker () ; for interpreters
   (sb-sys:%primitive make-unbound-marker))
-;; Get the main compiler to transform MAKE-UNBOUND-MARKER
-;; without the fopcompiler seeing it - the fopcompiler does
-;; expand compiler-macros, but not source-transforms -
-;; because %PRIMITIVE is not generally fopcompilable.
+;; Get the main compiler to transform MAKE-UNBOUND-MARKER.
 (sb-c:define-source-transform make-unbound-marker ()
   `(sb-sys:%primitive make-unbound-marker))
 

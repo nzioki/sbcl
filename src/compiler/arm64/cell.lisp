@@ -37,7 +37,7 @@
          (new :scs (descriptor-reg any-reg)))
   (:info name offset lowtag)
   (:ignore name)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   (:generator 5
     (inst add-sub lip object (- (* offset n-word-bytes) lowtag))
@@ -68,32 +68,43 @@
   (:vop-var vop)
   (:save-p :compute-only))
 
-;;; With Symbol-Value, we check that the value isn't the trap object.  So
-;;; Symbol-Value of NIL is NIL.
+;;; With Symbol-Value, we check that the value isn't the trap object.
 #+sb-thread
 (progn
+  (eval-when (:compile-toplevel)
+    ;; Assert that "CMN reg, 1" is the same as "CMP reg, NO-TLS-VALUE-MARKER"
+    (aver (= (ldb (byte 64 0) -1) no-tls-value-marker)))
+  (defmacro compare-to-no-tls-value-marker (x) `(inst cmn ,x 1))
   (define-vop (set)
-    (:args (object :scs (descriptor-reg))
+    (:args (object :scs (descriptor-reg)
+                   :load-if (not (and (sc-is object constant)
+                                      (symbol-always-has-tls-value-p (tn-value object)))))
            (value :scs (descriptor-reg any-reg zero)))
     (:temporary (:sc any-reg) tls-index)
     (:generator 4
-      (inst ldr (32-bit-reg tls-index) (tls-index-of object))
-      (inst ldr tmp-tn (@ thread-tn tls-index))
-      (inst cmp tmp-tn no-tls-value-marker-widetag)
-      (inst b :ne LOCAL)
-      (storew value object symbol-value-slot other-pointer-lowtag)
-      (inst b DONE)
-      LOCAL
-      (inst str value (@ thread-tn tls-index))
-      DONE))
+      (sc-case object
+        (constant
+         (inst str value (@ thread-tn (make-fixup (tn-value object) :symbol-tls-index))))
+        (t
+         (assemble ()
+           (inst ldr (32-bit-reg tls-index) (tls-index-of object))
+           (inst ldr tmp-tn (@ thread-tn tls-index))
+           (compare-to-no-tls-value-marker tmp-tn)
+           (inst b :ne LOCAL)
+           (storew value object symbol-value-slot other-pointer-lowtag)
+           (inst b DONE)
+           LOCAL
+           (inst str value (@ thread-tn tls-index))
+           DONE)))))
 
   (define-vop (symbol-value checked-cell-ref)
-    (:translate symeval)
+    (:translate symbol-value)
     (:args (symbol :scs (descriptor-reg) :to :save
                    :load-if (not (and (sc-is symbol constant)
-                                      (or (symbol-always-has-tls-value-p (tn-value symbol))
-                                          (symbol-always-has-tls-index-p (tn-value symbol)))))))
-    (:args-var symbol-tn-ref)
+                                      (let ((pkg (sb-xc:symbol-package (tn-value symbol))))
+                                        (or (and pkg (system-package-p pkg))
+                                            (eq pkg *cl-package*)))))))
+    (:arg-refs symbol-tn-ref)
     (:temporary (:sc any-reg) tls-index)
     (:variant-vars check-boundp)
     (:variant t)
@@ -116,7 +127,7 @@
               (inst ldr value (@ thread-tn tls-index))))
 
            (assemble ()
-             (inst cmp value no-tls-value-marker-widetag)
+             (compare-to-no-tls-value-marker value)
              (inst b :ne LOCAL)
              (when known-symbol
                (load-constant vop symbol (setf symbol (tn-ref-load-tn symbol-tn-ref))))
@@ -141,7 +152,7 @@
   (define-vop (set cell-set)
     (:variant symbol-value-slot other-pointer-lowtag))
   (define-vop (symbol-value checked-cell-ref)
-    (:translate symeval)
+    (:translate symbol-value)
     (:generator 9
                 (loadw value object symbol-value-slot other-pointer-lowtag)
                 (let ((err-lab (generate-error-code vop 'unbound-symbol-error object)))
@@ -150,7 +161,7 @@
   (define-vop (fast-symbol-value cell-ref)
     (:variant symbol-value-slot other-pointer-lowtag)
     (:policy :fast)
-    (:translate symeval)))
+    (:translate symbol-value)))
 
 (define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
@@ -163,7 +174,7 @@
   (:generator 9
       (inst ldr (32-bit-reg value) (tls-index-of object))
       (inst ldr value (@ thread-tn value))
-      (inst cmp value no-tls-value-marker-widetag)
+      (compare-to-no-tls-value-marker value)
       (inst b :ne LOCAL)
       (loadw value object symbol-value-slot other-pointer-lowtag)
       LOCAL
@@ -181,11 +192,11 @@
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate sym-global-val))
+  (:translate symbol-global-value))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
-  (:translate sym-global-val)
+  (:translate symbol-global-value)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -200,7 +211,7 @@
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:args-var args)
+  (:arg-refs args)
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 2
@@ -216,10 +227,11 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
-  (:translate sb-impl::symbol-package-id)
+  (:translate symbol-package-id)
   (:policy :fast-safe)
-  (:generator 1 ; ASSUMPTION: symbol-package-bits = 16
-   (inst ldrh result (@ symbol (+ (ash symbol-name-slot word-shift)
+  (:generator 1
+    #.(assert (= sb-impl::package-id-bits 16))
+    (inst ldrh result (@ symbol (+ (ash symbol-name-slot word-shift)
                                   (- other-pointer-lowtag)
                                   6))))) ; little-endian
 (define-vop ()
@@ -227,11 +239,10 @@
   (:translate symbol-name)
   (:args (symbol :scs (descriptor-reg)))
   (:results (result :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg) pa-flag)
   (:generator 5
-    (pseudo-atomic (pa-flag :sync nil)
-      (loadw result symbol symbol-name-slot other-pointer-lowtag)
-      (inst and result result (1- (ash 1 sb-impl::symbol-name-bits))))))
+    (pseudo-atomic (tmp-tn :sync nil)
+      (loadw tmp-tn symbol symbol-name-slot other-pointer-lowtag)
+      (inst and result tmp-tn (1- (ash 1 sb-impl::symbol-name-bits))))))
 
 (define-vop (%compare-and-swap-symbol-value)
   (:translate %compare-and-swap-symbol-value)
@@ -241,7 +252,7 @@
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   #+sb-thread
   (:temporary (:sc any-reg) tls-index)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 15
@@ -256,7 +267,7 @@
       (inst str new (@ thread-tn tls-index))
       DONT-STORE-TLS
 
-      (inst cmp result no-tls-value-marker-widetag)
+      (compare-to-no-tls-value-marker result)
       (inst b :ne CHECK-UNBOUND))
     (inst add-sub lip symbol (- (* symbol-value-slot n-word-bytes)
                                 other-pointer-lowtag))
@@ -283,7 +294,7 @@
   (:results (result :scs (descriptor-reg any-reg) :from :load))
   #+sb-thread
   (:temporary (:sc any-reg) tls-index)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:policy :fast-safe)
   (:vop-var vop)
   (:guard (member :arm-v8.1 *backend-subfeatures*))
@@ -298,7 +309,7 @@
       (inst str new (@ thread-tn tls-index))
       DONT-STORE-TLS
 
-      (inst cmp result no-tls-value-marker-widetag)
+      (compare-to-no-tls-value-marker result)
       (inst b :ne CHECK-UNBOUND))
     (inst add-sub lip symbol (- (* symbol-value-slot n-word-bytes)
                                 other-pointer-lowtag))
@@ -334,7 +345,7 @@
   (:translate (setf fdefn-fun))
   (:args (function :scs (descriptor-reg) :target result)
          (fdefn :scs (descriptor-reg)))
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
   (:results (result :scs (descriptor-reg)))
   (:generator 38
@@ -343,7 +354,7 @@
     (load-type type function (- fun-pointer-lowtag))
     (inst cmp type simple-fun-widetag)
     (inst b :eq SIMPLE-FUN)
-    (load-inline-constant lip '(:fixup closure-tramp :assembly-routine) lip)
+    (load-inline-constant lip '(:fixup closure-tramp :assembly-routine))
     SIMPLE-FUN
     (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
@@ -354,10 +365,9 @@
   (:translate fdefn-makunbound)
   (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:temporary (:scs (interior-reg)) lip)
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (load-inline-constant temp '(:fixup undefined-tramp :assembly-routine) lip)
+    (load-inline-constant temp '(:fixup undefined-tramp :assembly-routine))
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 
@@ -371,38 +381,66 @@
   (define-vop (dynbind)
     (:args (value :scs (any-reg descriptor-reg zero) :to :save)
            (symbol :scs (descriptor-reg)
-                   :load-if (not (and (sc-is symbol constant)
-                                      (or (symbol-always-has-tls-value-p (tn-value symbol))
-                                          (symbol-always-has-tls-index-p (tn-value symbol)))))))
-    (:temporary (:sc descriptor-reg) value-temp)
+                   :target alloc-tls-symbol))
     (:temporary (:sc descriptor-reg :offset r8-offset :from (:argument 1)) alloc-tls-symbol)
     (:temporary (:sc non-descriptor-reg :offset nl0-offset) tls-index)
     (:temporary (:sc non-descriptor-reg :offset nl1-offset) free-tls-index)
-    (:temporary (:sc interior-reg) lip)
+    (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
     (:ignore free-tls-index)
     (:temporary (:scs (any-reg)) bsp)
-     (:generator 5
+    (:generator 5
       (load-binding-stack-pointer bsp)
       (inst add bsp bsp (* binding-size n-word-bytes))
       (store-binding-stack-pointer bsp)
-      (let* ((known-symbol-p (sc-is symbol constant))
-             (known-symbol (and known-symbol-p (tn-value symbol)))
+      (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
+      (inst cbnz (32-bit-reg tls-index) TLS-INDEX-VALID)
+      (move alloc-tls-symbol symbol)
+      (load-inline-constant lr '(:fixup alloc-tls-index :assembly-routine))
+      (inst blr lr)
+      TLS-INDEX-VALID
+      (inst ldr alloc-tls-symbol (@ thread-tn tls-index))
+      (inst stp alloc-tls-symbol tls-index
+        (@ bsp (* (- binding-value-slot binding-size)
+                 n-word-bytes)))
+      (inst str value (@ thread-tn tls-index))))
+
+  (defun load-time-tls-index (symbol)
+    (let ((component (component-info *component-being-compiled*)))
+      (ash (or (position-if (lambda (x)
+                              (and (typep x '(cons (eql :tls-index)))
+                                   (eq (cdr x) symbol)))
+                            (ir2-component-constants component))
+               (vector-push-extend (cons :tls-index symbol)
+                                   (ir2-component-constants component)))
+           word-shift)))
+
+  (define-vop (bind)
+    (:args (value :scs (any-reg descriptor-reg zero) :to :save))
+    (:temporary (:sc non-descriptor-reg) tls-index)
+    (:temporary (:sc descriptor-reg) temp)
+    (:info symbol)
+    (:temporary (:scs (any-reg)) bsp)
+    (:generator 5
+      (load-binding-stack-pointer bsp)
+      (inst add bsp bsp (* binding-size n-word-bytes))
+      (store-binding-stack-pointer bsp)
+      (let* ((pkg (sb-xc:symbol-package symbol))
+             ;; These symbols should have a small enough index to be
+             ;; immediately encoded.
+             (known-symbol-p (or (and pkg (system-package-p pkg))
+                                 (eq pkg *cl-package*)))
              (tls-index-reg tls-index)
-             (tls-index (if known-symbol
-                            (make-fixup known-symbol :symbol-tls-index)
+             (tls-index (if known-symbol-p
+                            (make-fixup symbol :symbol-tls-index)
                             tls-index)))
         (assemble ()
-          (cond (known-symbol
+          (cond (known-symbol-p
                  (inst movz tls-index-reg tls-index))
                 (t
-                 (inst ldr (32-bit-reg tls-index) (tls-index-of symbol))
-                 (inst cbnz (32-bit-reg tls-index) TLS-INDEX-VALID)
-                 (move alloc-tls-symbol symbol)
-                 (load-inline-constant value-temp '(:fixup alloc-tls-index :assembly-routine) lip)
-                 (inst blr value-temp)))
-          TLS-INDEX-VALID
-          (inst ldr value-temp (@ thread-tn tls-index))
-          (inst stp value-temp tls-index-reg
+                 ;; TODO: a fixup could replace this with an immediate
+                 (inst load-constant tls-index (load-time-tls-index symbol))))
+          (inst ldr temp (@ thread-tn tls-index))
+          (inst stp temp tls-index-reg
                 (@ bsp (* (- binding-value-slot binding-size)
                           n-word-bytes)))
           (inst str value (@ thread-tn tls-index))))))
@@ -566,6 +604,16 @@
   (:result-types unsigned-num)
   (:translate %raw-instance-cas/word))
 
+(define-vop (%raw-instance-cas/signed-word %instance-cas)
+  (:args (object)
+         (index)
+         (old-value :scs (signed-reg))
+         (new-value :scs (signed-reg)))
+  (:arg-types * tagged-num signed-num signed-num)
+  (:results (result :scs (signed-reg) :from :load))
+  (:result-types signed-num)
+  (:translate %raw-instance-cas/signed-word))
+
 
 ;;;; Code object frobbing.
 
@@ -581,10 +629,9 @@
          (value :scs (any-reg descriptor-reg)))
   (:arg-types * tagged-num *)
   (:temporary (:scs (non-descriptor-reg)) temp card)
-  (:temporary (:scs (interior-reg)) lip)
   (:temporary (:sc non-descriptor-reg) pa-flag)
   (:generator 10
-    (load-inline-constant temp `(:fixup "gc_card_table_mask" :foreign-dataref) lip)
+    (load-inline-constant temp `(:fixup "gc_card_table_mask" :foreign-dataref))
     (inst ldr temp (@ temp))
     (inst ldr (32-bit-reg temp) (@ temp)) ; 4-byte int
     (pseudo-atomic (pa-flag)
@@ -592,7 +639,7 @@
       (inst lsr card object gencgc-card-shift)
       (inst and card card temp)
       ;; Load mark table base
-      (load-inline-constant temp `(:fixup "gc_card_mark" :foreign-dataref) lip)
+      (load-inline-constant temp `(:fixup "gc_card_mark" :foreign-dataref))
       (inst ldr temp (@ temp))
       (inst ldr temp (@ temp))
       ;; Touch the card mark byte.
@@ -668,7 +715,7 @@
          (diff :scs (unsigned-reg)))
   (:arg-types * positive-fixnum unsigned-num)
   (:temporary (:sc non-descriptor-reg) sum)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
   (:generator 4
@@ -692,7 +739,7 @@
          (index :scs (any-reg))
          (diff :scs (unsigned-reg)))
   (:arg-types * positive-fixnum unsigned-num)
-  (:temporary (:sc interior-reg) lip)
+  (:temporary (:sc non-descriptor-reg) lip)
   (:results (result :scs (unsigned-reg) :from :load))
   (:result-types unsigned-num)
   (:guard (member :arm-v8.1 *backend-subfeatures*))

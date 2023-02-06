@@ -162,7 +162,7 @@ void
 arch_handle_after_breakpoint(os_context_t *context)
 {
     *skipped_break_addr = trap_Breakpoint;
-    os_flush_icache(skipped_break_addr, sizeof(unsigned int));
+    os_flush_icache((os_vm_address_t)skipped_break_addr, sizeof(unsigned int));
     skipped_break_addr = NULL;
     *(unsigned long *)OS_CONTEXT_PC(context) = displaced_after_inst;
     /* context->sigmask = orig_sigmask; */
@@ -304,7 +304,7 @@ void arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-  char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
+  char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;
