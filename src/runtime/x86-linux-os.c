@@ -22,8 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -54,7 +53,8 @@ int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
 #ifdef LISP_FEATURE_SB_THREAD
     struct user_desc desc = {
-        0, (unsigned long) thread, dynamic_values_bytes,
+        0, (unsigned long) thread,
+        (dynamic_values_bytes>>12)-1,
         1, 0, 0, 1, 0, 1
     };
 

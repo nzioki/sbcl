@@ -293,7 +293,7 @@
              `(let (ints
                     floats
                     (start (- ,(find-symbol (format nil
-                                                    "MOST-~A-EXACTLY-~A-FIXNUM"
+                                                    "MOST-~A-EXACTLY-~A-INTEGER"
                                                     sign type)
                                             :sb-kernel)
                               ,range)))
@@ -687,16 +687,16 @@
     ((16779072918521075607 21371810342718833263) 2923729245085762055)))
 
 (with-test (:name (ldb :negative-index-no-error))
-  (checked-compile-and-assert ()
+  (checked-compile-and-assert (:optimize :safe)
       '(lambda (x y) (ldb (byte x y) 100))
     ((-1 -2) (condition 'error)))
-  (checked-compile-and-assert ()
+  (checked-compile-and-assert (:optimize :safe)
       '(lambda (x y) (mask-field (byte x y) 100))
     ((-1 -2) (condition 'error)))
-  (checked-compile-and-assert ()
+  (checked-compile-and-assert (:optimize :safe)
       '(lambda (x y) (dpb 0 (byte x y) 100))
     ((-1 -2) (condition 'error)))
-  (checked-compile-and-assert ()
+  (checked-compile-and-assert (:optimize :safe)
       '(lambda (x y) (deposit-field 0 (byte x y) 100))
     ((-1 -2) (condition 'error))))
 
@@ -893,20 +893,16 @@
     ((nil) 0)))
 
 (with-test (:name :lognot-type-derive)
-  (assert
-   (equal (caddr (sb-kernel:%simple-fun-type
-                  (checked-compile
-                   `(lambda (b)
-                      (lognot (if b -1 2))))))
-          '(values (or (integer -3 -3) (integer 0 0)) &optional))))
+  (assert-type
+   (lambda (b)
+     (lognot (if b -1 2)))
+   (or (integer -3 -3) (integer 0 0))))
 
 (with-test (:name :logand-minus-1-type-derive)
-  (assert
-   (equal (caddr (sb-kernel:%simple-fun-type
-                   (checked-compile
-                    `(lambda (b)
-                       (logand #xf (if b -1 2))))))
-          '(values (or (integer 2 2) (integer 15 15)) &optional))))
+  (assert-type
+   (lambda (b)
+     (logand #xf (if b -1 2)))
+   (or (integer 2 2) (integer 15 15))))
 
 (with-test (:name :ash-vop-liftimes)
   (checked-compile-and-assert
@@ -1143,3 +1139,46 @@
            (< f b)))
    ((1 t) nil)
    ((1 10) t)))
+
+(with-test (:name :cast-externally-checkable-p-satisfies)
+  (checked-compile-and-assert
+   ()
+   `(lambda (u s)
+      (the (unsigned-byte 64) (+ (the (or null (unsigned-byte 64)) u) (the fixnum s))))
+   ((1 2) 3)))
+
+(with-test (:name :rem-derive-type)
+  (flet ((test (form type)
+           (assert
+            (type-specifiers-equal
+             (caddr
+              (sb-kernel:%simple-fun-type
+               (checked-compile
+                `(lambda (a b)
+                   ,form))))
+             `(values ,type &optional)))))
+    (test `(rem (the fixnum a) (the integer b))
+          'fixnum)
+    (test `(rem (the fixnum a) (the (integer 0 20) b))
+          '(integer -19 19))
+    (test `(rem (the (unsigned-byte 32) a) (the (integer 0 20) b))
+          '(integer 0 19))
+    (test `(rem (the (signed-byte 32) a) (the (unsigned-byte 32) b))
+          '(signed-byte 32))
+    (test `(rem (the (signed-byte 8) a) (the (unsigned-byte 7) b))
+          '(integer -126 126))))
+
+(with-test (:name :logand-positive-negative-type-derive)
+  (flet ((test (form type)
+           (assert
+            (type-specifiers-equal
+             (caddr
+              (sb-kernel:%simple-fun-type
+               (checked-compile
+                `(lambda (a)
+                   ,form))))
+             `(values ,type &optional)))))
+    (test `(logand (ash -1 20) (the (integer 0 20) a))
+          '(eql 0))
+    (test `(logand #xFF (the (integer -20 -1) a))
+          '(integer 236 255))))

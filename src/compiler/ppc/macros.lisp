@@ -21,11 +21,9 @@
        (inst mr ,n-dst ,n-src))))
 
 (defmacro load-asm-rtn-addr (reg name)
-  ;; Gencgc has asm code in static space and we can reference it relative to NIL.
-  #+gencgc `(inst addi ,reg null-tn (make-fixup ,name :assembly-routine*))
-  ;; Cheneygc has asm code in read-only space which is not within
-  ;; a sufficiently small displacement.
-  #+cheneygc `(inst lr ,reg (make-fixup ,name :assembly-routine)))
+  ;; asm code resides in static space and we can reference it relative to NIL.
+  ;; The :L fixup subtracts the address of NIL for you.
+  `(inst addi ,reg null-tn (make-fixup ,name :assembly-routine)))
 
 (macrolet
     ((def (op inst shift)
@@ -199,7 +197,10 @@
          (inst stb null-tn thread-base-tn (* n-word-bytes thread-pseudo-atomic-bits-slot))))
      ,@forms
      (unless ,elide-if
-       (when ,sync ; why???
+       (when ,sync
+         ;; sync is generally needed so that stores aren't delayed past the end of P-A,
+         ;; which is important for GC-correctness.
+         ;; Given that, I'm unsure why it's ever not needed.
          (inst sync))
        (without-scheduling ()
          (inst stb thread-base-tn thread-base-tn (* n-word-bytes thread-pseudo-atomic-bits-slot))

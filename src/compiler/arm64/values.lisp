@@ -109,7 +109,7 @@
 ;;; unknown values continuations.
 (define-vop (values-list)
   (:args (arg :scs (descriptor-reg) :target list))
-  (:arg-types list)
+  (:arg-refs arg-ref)
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
@@ -124,14 +124,17 @@
 
     (unless (eq (tn-kind start) :unused)
       (move start csp-tn))
+    (when (and (policy node (> safety 0))
+               (not (csubtypep (tn-ref-type arg-ref) (specifier-type 'list))))
+      (inst b type-check))
 
     LOOP
     (inst cmp list null-tn)
     (loadw temp list cons-car-slot list-pointer-lowtag)
     (inst b :eq DONE)
     (loadw list list cons-cdr-slot list-pointer-lowtag)
-    (inst add csp-tn csp-tn n-word-bytes)
-    (storew temp csp-tn -1)
+    (inst str temp (@ csp-tn n-word-bytes :post-index))
+    TYPE-CHECK
     (cond ((policy node (> safety 0))
            (test-type list ndescr LOOP nil (list-pointer-lowtag))
            (cerror-call vop 'bogus-arg-to-values-list-error list))
@@ -143,6 +146,46 @@
       (inst sub count csp-tn start)
       (inst asr count count (- word-shift n-fixnum-tag-bits)))))
 
+(define-vop (sb-c::reverse-values-list)
+  (:args (arg :scs (descriptor-reg) :target list)
+         (length :scs (any-reg) :target count))
+  (:arg-refs arg-ref)
+  (:policy :fast-safe)
+  (:results (start :scs (any-reg) :from (:argument 0))
+            (count :scs (any-reg)))
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg)) temp)
+  (:temporary (:scs (non-descriptor-reg)) ndescr)
+  (:temporary (:scs (non-descriptor-reg)) end)
+  (:vop-var vop)
+  (:node-var node)
+  (:save-p :compute-only)
+  (:generator 0
+    (move list arg)
+
+    (unless (eq (tn-kind start) :unused)
+      (move start csp-tn))
+    (unless (eq (tn-kind count) :unused)
+      (move count length))
+
+    (inst add csp-tn csp-tn (lsl length (- word-shift n-fixnum-tag-bits)))
+    (inst sub end csp-tn n-word-bytes)
+    (when (and (policy node (> safety 0))
+               (not (csubtypep (tn-ref-type arg-ref) (specifier-type 'list))))
+      (inst b type-check))
+    LOOP
+    (inst cmp list null-tn)
+    (loadw temp list cons-car-slot list-pointer-lowtag)
+    (inst b :eq DONE)
+    (loadw list list cons-cdr-slot list-pointer-lowtag)
+    (inst str temp (@ end (- n-word-bytes) :post-index))
+    TYPE-CHECK
+    (cond ((policy node (> safety 0))
+           (test-type list ndescr LOOP nil (list-pointer-lowtag))
+           (error-call vop 'bogus-arg-to-values-list-error list))
+          (t
+           (inst b LOOP)))
+    DONE))
 
 ;;; Copy the more arg block to the top of the stack so we can use them
 ;;; as function arguments.
@@ -170,5 +213,38 @@
     (inst subs i i n-word-bytes)
     (inst ldr temp (@ context i))
     (inst str temp (@ start i))
+    (inst b :ne LOOP)
+    DONE))
+
+(define-vop (%more-arg-values-skip)
+  (:args (context :scs (descriptor-reg any-reg) :target src)
+         (skip :scs (any-reg immediate))
+         (num :scs (any-reg) :target count :to (:result 1)))
+  (:temporary (:sc any-reg :from (:argument 0)) src)
+  (:arg-types * positive-fixnum positive-fixnum)
+  (:temporary (:sc descriptor-reg) temp)
+  (:temporary (:sc any-reg) i)
+  (:results (start :scs (any-reg))
+            (count :scs (any-reg)))
+  (:generator 20
+    (sc-case skip
+      (immediate
+       (inst add src context (* (tn-value skip) n-word-bytes))
+       (inst subs i num (fixnumize (add-sub-immediate (tn-value skip)))))
+      (any-reg
+       (inst add src context (lsl skip (- word-shift n-fixnum-tag-bits)))
+       (inst subs i num skip)))
+    (unless (eq (tn-kind count) :unused)
+      (inst csel count zr-tn i :le))
+
+    (when (eq (tn-kind start) :unused)
+      (setf start tmp-tn))
+    (move start csp-tn)
+
+    (inst b :le DONE)
+    LOOP
+    (inst ldr temp (@ src 8 :post-index))
+    (inst str temp (@ csp-tn 8 :post-index))
+    (inst subs i i (fixnumize 1))
     (inst b :ne LOOP)
     DONE))

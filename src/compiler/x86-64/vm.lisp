@@ -37,8 +37,7 @@
 ;;; be used.
 ;;; This is only enabled for certain build configurations that need
 ;;; a scratch register in various random places.
-#-ubsan (eval-when (:compile-toplevel :load-toplevel :execute)
-          (defconstant global-temp-reg nil))
+#-ubsan (defconstant global-temp-reg nil)
 #+ubsan (progn (define-symbol-macro temp-reg-tn r11-tn)
                (defconstant global-temp-reg 11))
 
@@ -82,18 +81,14 @@
 (defconstant msan-temp-reg-number 0)
 
 ;;; The encoding anomaly for r12 makes it a perfect choice for the card table base.
-;;; It will never be used with a constant displacement.
+;;; It will seldom be used with a constant displacement.
 (define-symbol-macro card-table-reg 12)
 (define-symbol-macro gc-card-table-reg-tn r12-tn)
-(define-symbol-macro card-index-mask (make-fixup nil :gc-barrier))
+(define-symbol-macro card-index-mask (make-fixup nil :card-table-index-mask))
 
 (macrolet ((defreg (name offset size)
              (declare (ignore size))
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                    ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
-                    ;; (in the same file) depends on compile-time evaluation
-                    ;; of the DEFCONSTANT. -- AL 20010224
-                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
+             `(defconstant ,(symbolicate name "-OFFSET") ,offset))
            (defregset (name &rest regs)
              ;; FIXME: this would be DEFCONSTANT-EQX were it not
              ;; for all the style-warnings about earmuffs on a constant.
@@ -108,9 +103,7 @@
            (define-gprs (want-offsets offsets-list names array)
              `(progn
                 (defconstant-eqx ,names ,array #'equalp)
-                ;; We need the constants evaluable because of the DEFGLOBAL
-                ;; which is needed because of forms such as #.*qword-regs*
-                (eval-when (:compile-toplevel :load-toplevel :execute)
+                (progn
                   ,@(when want-offsets
                       (let ((i -1))
                         (map 'list
@@ -187,9 +180,7 @@
 ;;; Start from 2, for the old RBP (aka OCFP) and return address
 (define-storage-base stack :unbounded :size 2 :size-increment 1)
 (define-storage-base constant :non-packed)
-(define-storage-base immediate-constant :non-packed)
-(define-storage-base noise :unbounded :size 2)
-)
+(define-storage-base immediate-constant :non-packed))
 
 ;;;; SC definitions
 
@@ -244,12 +235,6 @@
   (double-avx2-stack stack :element-size 4)
   #+sb-simd-pack-256
   (single-avx2-stack stack :element-size 4)
-
-  ;;
-  ;; magic SCs
-  ;;
-
-  (ignore-me noise)
 
   ;;
   ;; things that can go in the integer registers
@@ -464,11 +449,6 @@
             (symbol-value (symbolicate register-arg-name "-TN")))
           *register-arg-names*))
 
-#-sb-xc-host
-(defun pseudostatic-immobile-symbol-p (symbol)
-  (and (immobile-space-obj-p symbol)
-       (= (generation-of symbol) +pseudo-static-generation+)))
-
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
@@ -477,33 +457,30 @@
          character)
      immediate-sc-number)
     (symbol ; Symbols in static and immobile space are immediate
-     (when (or ;; With #+immobile-symbols, all symbols are in immobile-space.
-               ;; And the cross-compiler always uses immobile-space if enabled.
-               #+(or immobile-symbols (and immobile-space sb-xc-host)) t
-
-               ;; Otherwise, if #-immobile-symbols, and the symbol is pseudostatic
-               ;; in immobile space, it is an immediate value.
-               ;; If compiling to memory, the symbol's address alone suffices.
-               #+(and (not sb-xc-host) immobile-space (not immobile-symbols))
-               (or (pseudostatic-immobile-symbol-p value)
-                   (locally (declare (notinline sb-c::producing-fasl-file))
-                     (and (not (sb-c::producing-fasl-file))
-                          (immobile-space-obj-p value))))
-
-               (static-symbol-p value))
+     (when (or (static-symbol-p value)
+               ;; The cross-compiler always uses immobile-space if it exists.
+               #+(and immobile-space sb-xc-host) t
+               ;; With either of these two features, all interned symbols are
+               ;; as-if static
+               #+(or permgen immobile-symbols) (sb-xc:symbol-package value)
+               #-sb-xc-host
+               (if (immobile-space-obj-p value)
+                   (or (= (generation-of value) +pseudo-static-generation+)
+                       ;; If compiling to memory, the symbol's address alone suffices.
+                       (locally (declare (notinline sb-c::producing-fasl-file))
+                         (not (sb-c::producing-fasl-file))))))
        immediate-sc-number))
-    #+metaspace (sb-vm:layout (bug "Can't reference layout as a constant"))
-    #+(and immobile-space (not metaspace)) (wrapper immediate-sc-number)
+    #+compact-instance-header (layout immediate-sc-number)
     (single-float
-       (if (eql value $0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
+       (if (eql value 0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
     (double-float
-       (if (eql value $0d0) fp-double-zero-sc-number fp-double-immediate-sc-number))
+       (if (eql value 0d0) fp-double-zero-sc-number fp-double-immediate-sc-number))
     ((complex single-float)
-       (if (eql value (complex $0f0 $0f0))
+       (if (eql value #c(0f0 0f0))
             fp-complex-single-zero-sc-number
             fp-complex-single-immediate-sc-number))
     ((complex double-float)
-       (if (eql value (complex $0d0 $0d0))
+       (if (eql value #c(0d0 0d0))
             fp-complex-double-zero-sc-number
             fp-complex-double-immediate-sc-number))
     ;; This case has to follow the numeric cases because proxy floating-point numbers
@@ -535,8 +512,8 @@
           (symbol   (if (static-symbol-p val)
                         (+ nil-value (static-symbol-offset val))
                         (make-fixup val :immobile-symbol)))
-          #+(and immobile-space (not metaspace))
-          (wrapper
+          #+(or immobile-space permgen)
+          (layout
            (make-fixup val :layout))
           (character (if tag
                          (logior (ash (char-code val) n-widetag-bits)
@@ -549,7 +526,7 @@
                  bits)))
           (structure-object
            (if (eq val sb-lockless:+tail+)
-               (progn (aver tag) sb-vm::lockfree-list-tail-value)
+               (progn (aver tag) (+ static-space-start lockfree-list-tail-value-offset))
                (bug "immediate structure-object ~S" val)))))
       tn))
 
@@ -606,36 +583,7 @@
 (defconstant nargs-offset rcx-offset)
 (defconstant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
 
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((or (valid-funtype '(fixnum fixnum) '*)
-              ;; todo: nothing prevents this from testing an unsigned word against
-              ;; a signed word, except for the mess of VOPs it would demand
-              (valid-funtype '((signed-byte 64) (signed-byte 64)) '*)
-              (valid-funtype '((unsigned-byte 64) (unsigned-byte 64)) '*))
-          (values :maybe nil))
-         (t
-          (values :default nil))))
-      (logbitp
-       (if (or
-            (valid-funtype '((mod 64) word) '*)
-            (valid-funtype '((mod 64) signed-word) '*))
-           (values :transform '(lambda (index integer) (%logbitp index integer)))
-           (values :default nil)))
-      (t
-       (values :default nil)))))
-
 (defvar *register-names* +qword-register-names+)
-
-(defmacro unbound-marker-bits ()
-  (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag))
 
 ;;; See WRITE-FUNINSTANCE-PROLOGUE in x86-64-vm.
 ;;; There are 4 bytes available in the imm32 operand of a dummy MOV instruction.
@@ -644,3 +592,44 @@
 (defmacro compact-fsc-instance-hash (fin)
   `(sap-ref-32 (int-sap (get-lisp-obj-address ,fin))
                (+ (ash 3 word-shift) 4 (- fun-pointer-lowtag))))
+
+(eval-when (:compile-toplevel)
+  (let ((locs (sb-c::sc-locations (gethash 'any-reg sb-c:*backend-sc-names*))))
+    ;; These locations are not saved by WITH-REGISTERS-PRESERVED
+    ;; because Lisp can't treat them as general purpose.
+    ;; By design they are also (i.e. must be) nonvolatile aross C call.
+    (aver (not (logbitp 12 locs)))
+    #-gs-seg (aver (not (logbitp 13 locs)))))
+
+#+sb-xc-host
+(setq *backend-cross-foldable-predicates*
+      '(power-of-two-p))
+
+#+nil
+(define-cond-sc 32-bit-immediate immediate
+  (typep (tn-value tn) '(signed-byte 32)))
+
+(defmacro sb-impl::symbol-allocator-macro (kind name)
+  (declare (ignorable kind))
+  #+permgen
+  `(truly-the symbol (if (eql ,kind 0) ; uninterned
+                         (sb-vm::%alloc-symbol ,name)
+                         (allocate-permgen-symbol ,name)))
+  #-permgen
+  `(truly-the symbol
+          ;; If no immobile-space, easy: all symbols go in dynamic-space
+          #-immobile-space (sb-vm::%alloc-symbol ,name)
+          ;; If #+immobile-symbols, then uninterned symbols go in dynamic space, but
+          ;; interned symbols go in immobile space. Good luck IMPORTing an uninterned symbol-
+          ;; it'll work at least superficially, but if used as a code constant, the symbol's
+          ;; address may violate the assumption that it's an imm32 operand.
+          #+immobile-symbols
+          (if (eql ,kind 0) (sb-vm::%alloc-symbol ,name) (sb-vm::%alloc-immobile-symbol ,name))
+          #+(and immobile-space (not immobile-symbols))
+          (if (or (eql ,kind 1) ; keyword
+                  (and (eql ,kind 2) ; random interned symbol
+                       (plusp (length ,name))
+                       (char= (char ,name 0) #\*)
+                       (char= (char ,name (1- (length ,name))) #\*)))
+              (sb-vm::%alloc-immobile-symbol ,name)
+              (sb-vm::%alloc-symbol ,name))))

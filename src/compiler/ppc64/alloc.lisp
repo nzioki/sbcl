@@ -161,14 +161,12 @@
   (:translate make-fdefn)
   (:generator 37
     (with-fixed-allocation (result pa-flag temp fdefn-widetag fdefn-size)
-      (inst addi temp null-tn (make-fixup 'undefined-tramp :assembly-routine*))
-      (storew name result fdefn-name-slot other-pointer-lowtag)
-      (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
-      (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
+      (storew name result fdefn-name-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
@@ -187,7 +185,8 @@
                           :temp-tn temp :flag-tn pa-flag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag))))
         (storew temp result 0 fun-pointer-lowtag)
-        (storew function result closure-fun-slot fun-pointer-lowtag)))))
+        (inst addi temp function (- 16 fun-pointer-lowtag)) ; untag
+        (storew temp result closure-fun-slot fun-pointer-lowtag)))))
 
 ;;; The compiler likes to be able to directly make value cells.
 ;;;
@@ -211,12 +210,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst li result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst addi result null-tn (make-fixup 'funcallable-instance-tramp :assembly-routine*))))
 
 (define-vop (fixed-alloc)
   (:args)

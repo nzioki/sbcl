@@ -12,7 +12,7 @@
 
 (in-package "SB-IMPL")
 
-;;;; the SYMBOL-HASHSET structure
+;;;; the SYMBOL-TABLE structure
 
 ;;; Packages are implemented using a special kind of hashtable -
 ;;; the storage is a single vector in which each cell is both key and value.
@@ -36,15 +36,7 @@
 ;;;       symbol whose name is spelled "NIL" have the identical strange hash
 ;;;       so that the hash is a pure function of the name's characters.
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant package-id-bits 16)
-  ;; Give 48 bits to SYMBOL-NAME, which spans 256 TiB of memory.
-  ;; Omitting the lowtag bits could span up to 4 PiB because we could left-shift
-  ;; and re-tag to read the name.  That seems excessive though. Another viable
-  ;; technique would be to store a heap-base-relative pointer, which might be
-  ;; needed if dynamic-space is small but at a very high address.
-  ;; For now, it seems fine to treat the low 48 bits as a tagged pointer.
-  (defconstant symbol-name-bits (- sb-vm:n-word-bits package-id-bits)))
+(defconstant package-id-bits 16)
 (defconstant +package-id-overflow+ (1- (ash 1 package-id-bits)))
 (defconstant +package-id-none+     0)
 (defconstant +package-id-lisp+     1)
@@ -52,15 +44,28 @@
 (defconstant +package-id-user+     3)
 (defconstant +package-id-kernel+   4)
 
-(sb-xc:defstruct (symbol-hashset
+(sb-xc:defstruct (symtbl-magic (:conc-name "SYMTBL-")
+                  (:copier nil)
+                  (:predicate nil)
+                  (:constructor make-symtbl-magic (hash1-mask hash1-c hash2-mask)))
+  (hash1-mask 0 :type (unsigned-byte 32))
+  (hash1-c    0 :type (unsigned-byte 32))
+  ;; These values were both needed for the secondary hash but they aren't now
+  ;; because the secondary hash is not computed by taking a remainder. It's just a mask.
+  (hash2-mask 0 :type (unsigned-byte 32))
+  ;(hash2-c    0 :type (unsigned-byte 32))
+  )
+
+(sb-xc:defstruct (symbol-table
                   (:conc-name "SYMTBL-")
                   (:predicate nil)
-                  (:constructor %make-symbol-hashset
+                  (:constructor %make-symbol-table
                                 (%cells size &aux (free size)))
                   (:copier nil))
   ;; An extra indirection to the symbol vector allows atomically changing the symbols
   ;; and the division magic parameters.
-  (%cells (missing-arg) :type (cons t simple-vector))
+  (%cells (missing-arg) :type (cons (or symtbl-magic (function (hash-code) index))
+                                    simple-vector))
   (modified nil :type boolean)
   (package nil :type (or null package)) ; backpointer, only if externals
   ;; SIZE is roughly related to the number of symbols the client code asked to be
@@ -100,11 +105,11 @@
   (mru-table-index 0 :type index)
   ;; packages that use this package
   (%used-by nil :type (or null weak-pointer))
-  ;; SYMBOL-HASHSETs of internal & external symbols
-  (internal-symbols nil :type symbol-hashset)
-  (external-symbols nil :type symbol-hashset)
+  ;; SYMBOL-TABLEs of internal & external symbols
+  (internal-symbols nil :type symbol-table)
+  (external-symbols nil :type symbol-table)
   ;; shadowing symbols
-  ;; Todo: dynamically changeover to a SYMBOL-HASHSET if list gets long
+  ;; Todo: dynamically changeover to a SYMBOL-TABLE if list gets long
   (%shadowing-symbols () :type list)
   ;; documentation string for this package
   (doc-string nil :type (or simple-string null))
@@ -122,10 +127,10 @@
   ;; redundancy now that each package gets an integer ID (to compresss the backlinks
   ;; from symbols to packages). Nickname IDs were invented first, and it is certainly
   ;; confusing that there are 2 distinct spaces of small integer IDs.
-  (%local-nicknames nil :type (or null (cons simple-vector simple-vector)))
+  (%local-nicknames nil :type (or null (cons simple-vector weak-vector)))
   ;; Definition source location
   (source-location nil :type (or null sb-c:definition-source-location)))
-(proclaim '(freeze-type symbol-hashset package))
+(proclaim '(freeze-type symbol-table package))
 
 (defconstant +initial-package-bits+ 2) ; for genesis
 
@@ -134,6 +139,12 @@
   `(logbitp 1 (package-%bits ,package)))
 
 (defmacro package-lock (package) `(logbitp 0 (package-%bits ,package)))
+
+(defmacro without-package-locks (&body body)
+  "Ignores all runtime package lock violations during the execution of
+body. Body can begin with declarations."
+  `(let ((*ignored-package-locks* t))
+    ,@body))
 
 (defmacro with-loader-package-names (&body body)
   #+sb-xc-host

@@ -84,7 +84,45 @@
 
 ;;;; SLOT-VALUE, (SETF SLOT-VALUE), SLOT-BOUNDP, SLOT-MAKUNBOUND
 
+;;; Structure-slot-value is usually faster than our litle chunks of code that are
+;;; automatically cobbled together for SLOT-VALUE on an unknown type but constant slot name.
+;;; While the global generic for a specific slot might only need to invoke a type-check,
+;;; the dispatch function is not faster than this, if even as fast.
+;;; If "flexible" defstructs (multiple inheritance, standard-object ancestors) are ever
+;;; brought to life, this might be inadmissible. Probably we would not store the
+;;; fast map in such situations.
+(defun structure-slot-value (instance slot-name)
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  (let* ((layout (%instance-layout (truly-the structure-object instance)))
+         (mapper (sb-kernel::layout-slot-mapper layout))
+         (bits (cond ((functionp mapper)
+                      ;; Something earlier has asserted that SLOT-NAME is a symbol
+                      ;; so SYMBOL-HASH won't croak on it.
+                      (funcall mapper slot-name))
+                     ((simple-vector-p mapper)
+                      (search-struct-slot-name-vector mapper slot-name)))))
+    (if bits
+        (let ((raw-type (logand (truly-the fixnum bits) sb-vm:dsd-raw-type-mask))
+              (index (truly-the index (ash bits (- sb-vm:dsd-index-shift)))))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+          ;; We don't transform SLOT-VALUE to STRUCTURE-SLOT-VALUE in safety 3,
+          ;; so this need not check for unbound-marker.
+          (if (/= raw-type 0)
+              (funcall (sb-kernel::raw-slot-data-accessor-fun
+                        (svref (load-time-value sb-kernel::*raw-slot-data* t)
+                               (truly-the index (1- raw-type))))
+                       instance index)
+              (%instance-ref instance index)))
+        ;; not found, take the slow path
+        (locally (declare (notinline slot-value))
+          (slot-value instance slot-name)))))
+
 (declaim (ftype (sfunction (t symbol) t) slot-value))
+;;; It would be nifty if this could utilize the LAYOUT-STRUCT-SLOT-MAP
+;;; to optimize for subtypes of STRUCTURE-OBJECT in here, but as currently
+;;; defined, STRUCTURE-SLOT-VALUE calls SLOT-VALUE when either it can't find
+;;; the slot or the slot is raw. Since that function punts to this as a fallback,
+;;; this can't utilize that or else they enter an infinite loop on failure.
 (defun slot-value (object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (find-slot-cell wrapper slot-name))
@@ -428,7 +466,7 @@
        ;; in list. The only exceptions are when there are non-local slots
        ;; before the one we want.
        (slot-definition-name
-        (find position (wrapper-slot-list (wrapper-of instance))
+        (find position (wrapper-slot-list (layout-of instance))
               :key #'slot-definition-location)))
       (cons
        (car position))))))

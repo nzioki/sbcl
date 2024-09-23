@@ -32,7 +32,6 @@
 #+long-float
 (define-type-predicate long-float-p long-float)
 (define-type-predicate ratiop ratio)
-(define-type-predicate short-float-p short-float)
 (define-type-predicate single-float-p single-float)
 (define-type-predicate simple-array-p simple-array)
 (define-type-predicate simple-array-nil-p (simple-array nil (*)))
@@ -117,17 +116,13 @@
 (define-type-predicate simd-pack-256-p simd-pack-256)
 (define-type-predicate weak-pointer-p weak-pointer)
 (define-type-predicate code-component-p code-component)
-#-(or x86 x86-64) (define-type-predicate lra-p lra)
+#-(or x86 x86-64 arm64) (define-type-predicate lra-p lra)
 (define-type-predicate fdefn-p fdefn)
-(macrolet
-    ((def ()
-       `(progn ,@(loop for (name spec) in *vector-without-complex-typecode-infos*
-                       collect `(define-type-predicate ,name (vector ,spec))))))
-  (def))
 ;;; Unlike the un-%'ed versions, these are true type predicates,
 ;;; accepting any type object.
 (define-type-predicate %standard-char-p standard-char)
 (define-type-predicate non-null-symbol-p (and symbol (not null)))
+(define-type-predicate string-designator-p string-designator)
 
 
 (defglobal *backend-type-predicates-grouped*
@@ -184,7 +179,9 @@
           for union-types = (union-type-types (aref predicates x))
           when (subsetp union-types types :test #'type=)
           return (values (aref predicates (1+ x))
-                         (set-difference types union-types)))))
+                         (remove-if
+                          (lambda (x) (member x union-types :test #'type=))
+                          types)))))
 
 (unless-vop-existsp (:translate keywordp)
 (define-source-transform keywordp (x)

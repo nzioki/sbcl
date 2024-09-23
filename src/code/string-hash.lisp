@@ -14,8 +14,9 @@
 ;;;; Note that this operation is used in compiler symbol table
 ;;;; lookups, so we'd like it to be fast.
 ;;;;
-;;;; As of 2004-03-10, we implement the one-at-a-time algorithm
-;;;; designed by Bob Jenkins (see
+;;;; As of 2024-07-31, we implement the 32-bit FNV-1A hash, which was
+;;;; found to be slightly faster on x86-64 that the Jenkins
+;;;; one-at-a-time hash (see
 ;;;; <http://burtleburtle.net/bob/hash/doobs.html> for some more
 ;;;; information).
 
@@ -32,28 +33,70 @@
   #-sb-xc-host (declare (optimize (speed 3) (safety 0)))
   (macrolet ((guts ()
                `(loop for i of-type index from start below end do
-                  (set-result (+ result (char-code (aref string i))))
-                  (set-result (+ result (ash result 10)))
-                  (set-result (logxor result (ash result -6)))))
+                 (set-result (logxor result (char-code (aref string i))))
+                 (set-result (* result 16777619))))
              (set-result (form)
                `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
-    (let ((result 238625159)) ; (logandc2 most-positive-fixnum (sxhash #\S)) on 32 bits
+    (let ((result 2166136261))
       (declare (type word result))
-      ;; Avoid accessing elements of a (simple-array nil (*)).
-      ;; The expansion of STRING-DISPATCH involves ETYPECASE,
-      ;; so we can't simply omit one case. Therefore that macro
-      ;; is unusable here.
+      #-sb-xc-host (string-dispatch (simple-base-string (simple-array character (*))) string
+                     (guts))
+      ;; just do it, don't care about loop unswitching or simple-ness of the string.
+      #+sb-xc-host (guts)
+
+      (logand result most-positive-fixnum))))
+
+;;; Like %SXHASH-SIMPLE-SUBSTRING, but don't hash more than
+;;; MAX-N-CHARS (skipping characters in the middle).
+#-sb-xc-host (declaim (inline %sxhash-simple-substring/truncating))
+(defun %sxhash-simple-substring/truncating (string start end max-n-chars)
+  ;; FIXME: As in MIX above, we wouldn't need (SAFETY 0) here if the
+  ;; cross-compiler were smarter about ASH, but we need it for
+  ;; sbcl-0.5.0m.  (probably no longer true?  We might need SAFETY 0
+  ;; to elide some type checks, but then again if this is inlined in
+  ;; all the critical places, we might not -- CSR, 2004-03-10)
+
+  ;; Never decrease safety in the cross-compiler. It's not worth the headache
+  ;; of tracking down insidious host/target compatibility bugs.
+  #-sb-xc-host (declare (type string string)
+                        (type index start end)
+                        (type fixnum max-n-chars)
+                        (optimize (speed 3) (safety 0)))
+  (let* ((len (- end start))
+         (n (min max-n-chars len))
+         ;; Mixing in the length is a cheap way to introduce some
+         ;; information about the hole.
+         (result len)
+         (limit (+ start (ash n -1))))
+    (declare (type word result))
+    (macrolet ((guts ()
+                 `(let ((i start))
+                    (loop while (< i limit)
+                          for j of-type index downfrom (1- end)
+                          do (add-char (aref string i))
+                             (add-char (aref string j))
+                             (incf i))
+                    (when (oddp n)
+                      (add-char (aref string i)))))
+               (add-char (char)
+                 `(progn
+                    (set-result (logxor result (char-code ,char)))
+                    (set-result (* result 16777619))))
+               (set-result (form)
+                 `(setf result (ldb (byte #.sb-vm:n-word-bits 0) ,form))))
+      ;; Avoid accessing elements of a (simple-array nil (*)). The
+      ;; expansion of STRING-DISPATCH involves ETYPECASE, so we can't
+      ;; simply omit one case. Therefore that macro is unusable here.
       #-sb-xc-host (typecase string
                      (simple-base-string (guts))
                      ((simple-array character (*)) (guts)))
 
-      ;; just do it, don't care about loop unswitching or simple-ness of the string.
+      ;; Just do it, don't care about loop unswitching or simple-ness
+      ;; of the string.
       #+sb-xc-host (guts)
 
-      (set-result (+ result (ash result 3)))
-      (set-result (logxor result (ash result -11)))
-      (set-result (logxor result (ash result 15)))
-      (logand result most-positive-fixnum))))
+      (values (logand result most-positive-fixnum) (the fixnum (- len n))))))
+
 ;;; test:
 ;;;   (let ((ht (make-hash-table :test 'equal)))
 ;;;     (do-all-symbols (symbol)
@@ -73,21 +116,13 @@
   ;; KLUDGE: this FLET is a workaround (suggested by APD) for presence
   ;; of let conversion in the cross compiler, which otherwise causes
   ;; strongly suboptimal register allocation.
+  ;; I'm not sure I believe the comment about FLET TRICK being needed.
+  ;; The generated code seems tight enough, and the comment is, after all,
+  ;; >14 years old. -- DK, 2018-11-29
   (flet ((trick (x)
            (%sxhash-simple-substring x 0 (length x))))
     (declare (notinline trick))
     (trick x)))
-#+sb-xc-host
-(defun symbol-name-hash (x)
-  (cond ((string= x "NIL") ; :NIL must hash the same as NIL
-         ;; out-of-order with defconstant nil-value
-         (ash (sb-vm::get-nil-taggedptr) (- sb-vm:n-fixnum-tag-bits)))
-        (t
-         ;; (STRING X) could be a non-simple string, it's OK.
-         (let ((hash (logxor (%sxhash-simple-string (string x))
-                             most-positive-fixnum)))
-           (aver (ldb-test (byte (- 32 sb-vm:n-fixnum-tag-bits) 0) hash))
-           hash))))
 
 ;;;; mixing hash values
 
@@ -151,6 +186,7 @@
 ;;; These are Lisp implementations of
 ;;; https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
 ;;; Please excuse the C-like syle.
+;;; (To avoid consing, you might want the wrappers that mask to fixnum.)
 #-64-bit
 (progn
 (declaim (inline murmur3-fmix32))
@@ -175,21 +211,13 @@
   (logxor k (ash k -33)))
 (defmacro murmur3-fmix-word (x) `(murmur3-fmix64 ,x)))
 
-;;; You probably don't want to use this function because it (almost surely)
-;;; has to cons the result. Better to use the /FIXNUM functions below.
-(defun murmur-fmix-word-for-unit-test (x)
-  (murmur3-fmix-word (the sb-vm:word x)))
-(export 'murmur-fmix-word-for-unit-test) ; protect from tree-shaker
-
 ;;; This hash function on sb-vm:word returns a fixnum, does not cons,
 ;;; and has better avalanche behavior then SXHASH - changing any one input bit
 ;;; should affect each bit of output with equal chance.
-#-sb-xc-host
-(progn
 (declaim (inline murmur-hash-word/fixnum)) ; don't want to cons the word to pass in
 (defun murmur-hash-word/fixnum (x) ; result may be positive or negative
   (%make-lisp-obj (logandc2 (murmur3-fmix-word (truly-the sb-vm:word x))
-                            sb-vm:fixnum-tag-mask))))
+                            sb-vm:fixnum-tag-mask)))
 ;;; Similar, but the sign bit is always 0
 (declaim (inline murmur-hash-word/+fixnum))
 (defun murmur-hash-word/+fixnum (x)

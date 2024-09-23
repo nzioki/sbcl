@@ -26,14 +26,13 @@
 
 #include <sys/ucontext.h>
 
-#include "./signal.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include <sys/types.h>
 #include <signal.h>
@@ -74,6 +73,27 @@ int arch_os_thread_init(struct thread *thread) {
 
 int arch_os_thread_cleanup(struct thread __attribute__((unused)) *thread) {
     return 1;
+}
+
+void visit_context_registers(void (*p)(os_context_register_t,void*),
+                             os_context_t *context, void* arg)
+{
+    mcontext_t* m = &context->uc_mcontext;
+    p(m->gregs[REG_RIP], arg);
+    // This is the order the registers appear in gregset_t (which makes no difference of course).
+    // Not sure why the order is so kooky.
+    p(m->gregs[REG_R8 ], arg); p(m->gregs[REG_R9 ], arg); p(m->gregs[REG_R10], arg);
+    p(m->gregs[REG_R11], arg);
+#ifndef LISP_FEATURE_SOFT_CARD_MARKS
+    p(m->gregs[REG_R12], arg);  /* CARD_TABLE_REG */
+#endif
+#ifndef LISP_FEATURE_SB_THREAD
+    p(m->gregs[REG_R13], arg);  /* THREAD_BASE_REG */
+#endif
+    p(m->gregs[REG_R14], arg); p(m->gregs[REG_R15], arg);
+    p(m->gregs[REG_RDI], arg); p(m->gregs[REG_RSI], arg); p(m->gregs[REG_RBX], arg);
+    p(m->gregs[REG_RDX], arg); p(m->gregs[REG_RAX], arg); p(m->gregs[REG_RCX], arg);
+    // We could implicitly pin objects pointed to by parts of an XMM or YMM register here
 }
 
 // This array is indexed by the encoding of the register in an instruction.
@@ -132,7 +152,7 @@ void sb_dump_mcontext(char *reason, ucontext_t* context)
     }
     sigset_tostring(&context->uc_sigmask, smallbuf, sizeof smallbuf);
     ptr += snprintf(obuf+ptr, REMAINING, "sigmask=%s\n", smallbuf);
-    write(2, obuf, ptr);
+    ignore_value(write(2, obuf, ptr));
 }
 
 os_context_register_t *
@@ -198,3 +218,76 @@ os_flush_icache(os_vm_address_t __attribute__((unused)) address,
 // observable to the linker. Any one symbol suffices to resolve all of them.
 #include <math.h>
 const long libm_anchor = (long)acos;
+
+#ifdef LISP_FEATURE_SW_INT_AVOIDANCE
+extern void sigtrap_handler();
+extern char* vm_thread_name(struct thread*);
+extern void sigset_tostring(const sigset_t*, char*, int);
+void synchronous_trap(lispobj* sp_at_interrupt, char* savearea)
+{
+    os_context_t context;
+    memset(&context, 0, sizeof context);
+
+    // Create the signal context from the values pushed on the stack
+    // by the lisp assembly routine.
+    context.uc_mcontext.fpregs = &context.__fpregs_mem;
+    if (sizeof context.uc_mcontext.fpregs->_xmm[0].element != 16) lose("sigcontext size bug");
+    memcpy(context.uc_mcontext.fpregs->_xmm[0].element, savearea, 16*16);
+    char* gprsave = savearea + 16*16;
+    memcpy(context.uc_mcontext.gregs, gprsave, 15*8);
+
+    context.uc_mcontext.gregs[REG_RSP] = (greg_t)sp_at_interrupt;
+    // Take the return-PC to the user code which is 1 word down from exactly where
+    // the stack-pointer was at the simulated INT3, then add 1 because a real INT
+    // instructions leaves the PC pointing after it.
+    long pc_at_interrupt = sp_at_interrupt[-1];
+    context.uc_mcontext.gregs[REG_RIP] = 1 + pc_at_interrupt;
+    // The first instruction of the asm routine was to push EFLAGS
+    context.uc_mcontext.gregs[REG_EFL] = sp_at_interrupt[-2];
+    // The next instruction was to push RBP
+    context.uc_mcontext.gregs[REG_RBP] = sp_at_interrupt[-3];
+
+    sigset_t curmask;
+    thread_sigmask(SIG_UNBLOCK, 0, &curmask); // to read the mask
+# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+    memcpy(&context.uc_sigmask, &curmask, REAL_SIGSET_SIZE_BYTES);
+    thread_sigmask(SIG_BLOCK, &blockable_sigset, 0);
+    sigset_t newmask;
+    sigorset(&newmask, &blockable_sigset, &curmask);
+
+    /* char newmask_string[100];
+    sigset_tostring(&newmask, newmask_string, sizeof newmask_string);
+    fprintf(stderr, "[%s]: trap: pc=%lx sp=%p savearea=%p newmask=%s\n",
+            vm_thread_name(get_sb_vm_thread()),
+            os_context_pc(&context), sp_at_interrupt, savearea,
+            newmask_string); */
+
+    sigtrap_handler(0, 0, &context);
+
+    if (context.uc_mcontext.gregs[REG_RSP] != (greg_t)sp_at_interrupt ||
+        context.uc_mcontext.gregs[REG_RBP] != (greg_t)sp_at_interrupt[-3])
+        lose("don't know how return to a different frame\n");
+
+    // Handler can alter the return PC which we need to stuff into
+    // the return PC location that the assembly routine received.
+    uword_t return_pc = context.uc_mcontext.gregs[REG_RIP];
+    sp_at_interrupt[-1] = return_pc;
+
+    // act like a return-from-signal by restoring the signal mask
+    // Ideally this would be performed in the asm routine only after restoring
+    // registers, but it doesn't matter too much.
+    thread_sigmask(SIG_SETMASK, &context.uc_sigmask, 0);
+}
+int wrapped_pthread_sigmask(int how, const void* new, void* old)
+{
+     char new_string[80], old_string[80];
+     sigset_tostring(new, new_string, sizeof new_string);
+     int res = pthread_sigmask(how, new, old);
+     sigset_tostring(old, old_string, sizeof old_string);
+     fprintf(stderr, "[%s]: pthread_sigmask(%s,%s) -> %s\n",
+             vm_thread_name(get_sb_vm_thread()),
+             how==SIG_BLOCK?"BLOCK":how==SIG_UNBLOCK?"UNBLOCK":"SETMASK",
+             new_string, old_string);
+     return res;
+}
+#endif

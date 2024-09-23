@@ -1,7 +1,8 @@
 ;;; This comment might make sourceforge stop thinking that the file
 ;;; is binary its diff view.
 ;;; Or not.
-(("aprof.impure.lisp"
+(("alien-struct-by-value.impure.lisp" "tests/alien-struct-by-value.so")
+ ("aprof.impure.lisp"
   "src/code/aprof.lisp"
   "src/code/shaketree.lisp")
  ("avltree.pure.lisp" "tests/bbtree-test-util.lisp")
@@ -9,9 +10,6 @@
  ("brothertree.impure.lisp"
   "src/code/brothertree.lisp")
  ("case.pure.lisp" "tests/case-test.lisp")
- ("chill.test.sh"
-  "src/cold/chill.lisp"
-  "package-data-list.lisp-expr")
  ("clos.impure.lisp"
   "contrib/sb-cltl2.fasl"
   "tests/package-ctor-bug.lisp"
@@ -65,6 +63,7 @@
   "tests/data/wonky4.lisp")
  ("load.pure.lisp"
   "tests/data/wonky1.lisp")
+ ("mrgc-ht-rehash.impure.lisp" "src/pcl/walk.lisp")
  ("octets.pure.lisp"
   "tests/data/compile-file-pos.lisp"
   "tests/data/compile-file-pos-utf16be.lisp")
@@ -78,6 +77,11 @@
   "tests/package-test-5.lisp"
   "tests/package-test-6.lisp"
   "tests/package-test-7.lisp")
+ ("perfecthash.impure.lisp"
+  "tools-for-build/unicode-phash.lisp-expr"
+  "../xperfecthash30.lisp-expr"
+  "../xperfecthash63.lisp-expr"
+  "../xperfecthash61.lisp-expr")
  ("redblack.pure.lisp" "tests/bbtree-test-util.lisp" "src/code/redblack.lisp")
  ("run-program.impure.lisp" "contrib/sb-posix.fasl")
  ("sb-aclrepl.impure.lisp" "contrib/sb-aclrepl.fasl"

@@ -207,6 +207,30 @@
     (princ "!!" stream)
     (assert (equal "0b2d!!" (get-output-stream-string stream)))))
 
+(with-test (:name (make-string-output-stream file-position :lp-1839040))
+  (let ((stream (make-string-output-stream)))
+    (dotimes (i 64) (write-char #\a stream))
+    (file-position stream 40)
+    (write-char #\x stream)
+    (file-position stream 39)
+    (write-char #\y stream)
+    (file-position stream 41)
+    (write-char #\z stream)
+    (let ((string (get-output-stream-string stream)))
+      (assert (equal "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaayxzaaaaaaaaaaaaaaaaaaaaaa" string))))
+  (let ((stream (make-string-output-stream)))
+    (dotimes (i 64) (write-char #\a stream))
+    (dotimes (i 64) (write-char #\b stream))
+    (file-position stream 3)
+    (file-position stream 4)
+    (write-char #\x stream)
+    (let ((string (get-output-stream-string stream))
+          (expected (concatenate
+                     'string
+                     (loop for i from 0 below 64 collect (if (= i 4) #\x #\a))
+                     (loop for i from 0 below 64 collect #\b))))
+      (assert (equal expected string)))))
+
 ;;; WITH-OUTPUT-TO-STRING (when provided with a string argument)
 ;;;
 ;;; * Observe FILE-POSITION :START and :END, and allow setting of
@@ -511,3 +535,14 @@
       (assert-error (read-char syn))
       (close syn) ; no error
       (assert (eql (read-char *some-stream*) #\o)))))
+
+(with-test (:name :read-sequence-displaced-offset
+            :skipped-on :win32)
+  (let* ((d (make-array 3 :element-type '(unsigned-byte 8)
+                          :initial-element 1))
+         (x (make-array 1 :element-type '(unsigned-byte 8) :displaced-to d
+                          :displaced-index-offset 1)))
+    (with-open-file (s "/dev/zero" :element-type '(unsigned-byte 8))
+      (assert (= (read-sequence x s) 1))
+      (assert (equalp d #(1 0 1)))
+      (assert (equalp x #(0))))))

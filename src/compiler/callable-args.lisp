@@ -43,7 +43,7 @@
   (let ((fun-type (global-ftype caller)))
     (collect ((lvars))
       (let ((arg-position -1)
-            (positional-count (fun-type-positional-count fun-type)))
+            (optional-args (nthcdr (fun-type-positional-count fun-type) lvars)))
         (labels ((record-lvar (lvar)
                    (lvars lvar)
                    (incf arg-position))
@@ -51,9 +51,18 @@
                    (loop for (key value*) on options by #'cddr
                          for value = (if (or (eq key :key)
                                              (eq key :value))
-                                         (let ((lvar (getf (nthcdr positional-count lvars) value*)))
-                                           (and lvar
-                                                (record-lvar lvar)))
+                                         (if (consp value*)
+                                             (let ((value-lvar (getf optional-args (car value*))))
+                                               (when value-lvar
+                                                 (let ((if (getf optional-args (second value*))))
+                                                   (cond (if
+                                                          (list (record-lvar value-lvar)
+                                                                (record-lvar if) (third value*)))
+                                                         ((null (third value*))
+                                                          (record-lvar value-lvar))))))
+                                             (let ((lvar (getf optional-args value*)))
+                                               (and lvar
+                                                    (record-lvar lvar))))
                                          value*)
                          when value
                          collect key
@@ -66,7 +75,7 @@
                        (list* (record-lvar (nth (cadr arg) lvars))
                               (handle-keys (cddr arg)))))
                      (rest-args
-                      (loop for lvar in (nthcdr positional-count lvars)
+                      (loop for lvar in optional-args
                             collect
                             (list* (record-lvar lvar)
                                    (handle-keys (cdr arg)))))
@@ -101,7 +110,7 @@
                      ((eq key-value
                           :allow-other-keys))
                      (t
-                      (setf unknown t))))
+                      (push key unknown))))
       unknown)))
 
 ;;; Turn constant LVARs in keyword arg positions to constants so that
@@ -133,14 +142,24 @@
       (multiple-value-bind (arg-lvars unknown) (resolve-key-args (combination-args combination) type)
         (flet ((call (lvar annotation)
                  (destructuring-bind (args &optional results . options) annotation
-                   (apply function lvar args results
+                   (apply function lvar
+                          (loop for arg in args
+                                if (typep arg '(cons (eql rest-args)))
+                                nconc (loop repeat (- (length (combination-args combination))
+                                                      (fun-type-positional-count type))
+                                            collect arg)
+                                else
+                                collect arg)
+                          results
                           :arg-lvars arg-lvars
                           :unknown-keys unknown
                           options))))
           (loop for (n kind . annotation) in (fun-type-annotation-positional annotation)
                 when (memq kind '(function function-designator))
                 do
-                (call (nth n arg-lvars) annotation))
+                (let ((arg (nth n arg-lvars)))
+                  (when arg
+                    (call arg annotation))))
           (loop with keys = (nthcdr (fun-type-positional-count type)
                                     arg-lvars)
                 for (key (kind . annotation)) on (fun-type-annotation-key annotation) by #'cddr
@@ -150,37 +169,44 @@
                   (when lvar
                     (call lvar annotation)))))))))
 
-(defun lvar-fun-type (lvar &optional defined-here declared-only)
-  ;; Handle #'function,  'function and (lambda (x y))
-  (let* ((use (principal-lvar-use lvar))
-         (lvar-type (lvar-type lvar))
+;; Handle #'function,  'function and (lambda (x y))
+(defun node-fun-type (node &optional defined-here asserted-type)
+  (let* ((use node)
+         (lvar-type (single-value-type (node-derived-type use)))
          (leaf (if (ref-p use)
                    (ref-leaf use)
-                   (return-from lvar-fun-type
+                   (return-from node-fun-type
                      (values lvar-type
-                             (typecase use
-                               (node
-                                (node-source-form use))
-                               (t
-                                '.anonymous.))))))
+                             (node-source-form use)))))
+         (asserted t)
          (defined-type (and (global-var-p leaf)
+                            (eq (global-var-kind leaf) :global-function)
                             (case (leaf-where-from leaf)
                               (:declared
                                (leaf-type leaf))
-                              ((:defined :defined-here)
-                               (if (or (and (defined-fun-p leaf)
-                                            (eq (defined-fun-inlinep leaf) 'notinline))
-                                       declared-only
-                                       (and defined-here
-                                            (eq (leaf-where-from leaf) :defined))
-                                       (fun-lexically-notinline-p (leaf-%source-name leaf)
-                                                                  (node-lexenv (lvar-dest lvar))))
-                                   lvar-type
-                                   (global-ftype (leaf-%source-name leaf))))
+                              (:defined
+                               (cond ((or defined-here
+                                          asserted-type
+                                          (and (defined-fun-p leaf)
+                                               (eq (defined-fun-inlinep leaf) 'notinline))
+                                          (fun-lexically-notinline-p (leaf-%source-name leaf)
+                                                                     (node-lexenv (lvar-dest (node-lvar node)))))
+                                      (setf asserted nil)
+                                      lvar-type)
+                                     (t
+                                      (global-ftype (leaf-%source-name leaf)))))
+                              ((:defined-here :declared-verify)
+                               (cond ((or (and (defined-fun-p leaf)
+                                               (eq (defined-fun-inlinep leaf) 'notinline))
+                                          (fun-lexically-notinline-p (leaf-%source-name leaf)
+                                                                     (node-lexenv (lvar-dest (node-lvar node)))))
+                                      lvar-type)
+                                     (t
+                                      (global-ftype (leaf-%source-name leaf)))))
                               (t
                                (global-var-defined-type leaf)))))
          (entry-fun (if (and (functional-p leaf)
-                             (eq (functional-kind leaf) :external))
+                             (functional-kind-eq leaf external))
                         (functional-entry-fun leaf)
                         leaf))
          (lvar-type (cond ((and defined-type
@@ -191,20 +217,26 @@
                            (functional-type entry-fun))
                           ((and (not (fun-type-p lvar-type))
                                 (lambda-p entry-fun)
-                                (null (lambda-kind entry-fun))
+                                (functional-kind-eq entry-fun nil)
                                 (lambda-tail-set entry-fun))
                            (make-fun-type :wild-args t
                                           :returns
                                           (tail-set-type (lambda-tail-set entry-fun))))
+                          ((and asserted-type
+                                (not (constant-p leaf)))
+                           (setf asserted nil)
+                           ;; Don't trust FUNCTION type declarations,
+                           ;; they perform no runtime assertions.
+                           (specifier-type 'function))
                           (t
+                           (setf asserted nil)
                            lvar-type)))
          (fun-name (cond ((or (fun-type-p lvar-type)
                               (functional-p leaf)
-                              (global-var-p leaf))
-                          (cond ((or (constant-lvar-p lvar)
-                                     ;; A constant may fail some checks in constant-lvar-p
-                                     (constant-p leaf))
-                                 (let ((value (lvar-value lvar)))
+                              (and (global-var-p leaf)
+                                   (eq (global-var-kind leaf) :global-function)))
+                          (cond ((constant-p leaf)
+                                 (let ((value (constant-value leaf)))
                                    (etypecase value
                                      #-sb-xc-host
                                      (function
@@ -212,21 +244,22 @@
                                      (symbol
                                       value))))
                                 ((and (lambda-p leaf)
-                                      (eq (lambda-kind leaf) :external))
+                                      (functional-kind-eq leaf external))
                                  (leaf-debug-name (lambda-entry-fun leaf)))
                                 (t
                                  (leaf-debug-name leaf))))
-                         ((constant-lvar-p lvar)
-                          (lvar-value lvar))
+                         ((constant-p leaf)
+                          (constant-value leaf))
                          (t
-                          (return-from lvar-fun-type lvar-type))))
+                          (return-from node-fun-type lvar-type))))
          (type (cond ((fun-type-p lvar-type)
                       lvar-type)
                      ((symbolp fun-name)
-                      (if (or defined-here
-                              declared-only
-                              (fun-lexically-notinline-p fun-name
-                                                         (node-lexenv (lvar-dest lvar))))
+                      (if (or (fun-lexically-notinline-p fun-name
+                                                         (node-lexenv (lvar-dest (node-lvar node))))
+                              (and (or asserted-type
+                                       defined-here)
+                                   (neq (info :function :where-from fun-name) :declared)))
                           lvar-type
                           (global-ftype fun-name)))
                      ((functional-p leaf)
@@ -236,15 +269,34 @@
                             lvar-type)))
                      (t
                       lvar-type))))
-    (values type fun-name leaf)))
+    (values type fun-name leaf asserted)))
+
+(defun lvar-fun-type (lvar &optional defined-here asserted-type)
+  (let* ((use (principal-lvar-use lvar))
+         (lvar-type (lvar-type lvar)))
+    (if (ref-p use)
+        (multiple-value-bind (type fun-name leaf asserted) (node-fun-type use defined-here asserted-type)
+          (let ((int (if (fun-type-p lvar-type)
+                         ;; save the cast type
+                         (type-intersection type lvar-type)
+                         type)))
+            (values (if (neq int *empty-type*)
+                        int
+                        lvar-type)
+                    fun-name leaf asserted)))
+        (values lvar-type
+                (typecase use
+                  (node
+                   (node-source-form use))
+                  (t
+                   '.anonymous.))))))
 
 (defun callable-argument-lossage-kind (fun-name leaf soft hard)
   (if (or (not leaf)
-          (and (neq (leaf-where-from leaf) :defined-here)
+          (and (not (memq (leaf-where-from leaf) '(:defined-here :declared-verify)))
                (not (and (functional-p leaf)
                          (or (lambda-p leaf)
-                             (member (functional-kind leaf)
-                                     '(:toplevel-xep)))))
+                             (functional-kind-eq leaf toplevel-xep))))
                (or (not fun-name)
                    (not (info :function :info fun-name)))))
       soft
@@ -300,40 +352,63 @@
                           (value-nth (getf options :value))
                           (key-nth (getf options :key))
                           (value (and value-nth
-                                      (nth value-nth deps)))
+                                      (nth (if (consp value-nth)
+                                               (car value-nth)
+                                               value-nth)
+                                           deps)))
                           (key (and key-nth (nth key-nth deps)))
-                          (key-return-type (cond (value-nth
-                                                  (if (lvar-p value)
-                                                      (lvar-type value)
-                                                      *universal-type*))
-                                                 ((not key)
-                                                  nil)
-                                                 ((lvar-p key)
-                                                  (multiple-value-bind (type name) (lvar-fun-type key)
-                                                    (cond ((eq name 'identity)
-                                                           nil)
-                                                          ((fun-type-p type)
-                                                           (single-value-type (fun-type-returns type)))
-                                                          (t
-                                                           *universal-type*))))
-                                                 (t
-                                                  *universal-type*))))
-                     (cond (key-return-type)
-                           ((getf options :sequence)
-                            (sequence-element-type (arg-type arg)))
-                           ((getf options :sequence-type)
-                            (or (let* ((value (cond ((constant-p arg)
-                                                     (constant-value arg))
-                                                    ((and (lvar-p arg)
-                                                          (constant-lvar-p arg))
-                                                     (lvar-value arg))))
-                                       (type (and value
-                                                  (careful-specifier-type value))))
-                                  (and type
-                                       (sequence-element-type type)))
-                                *universal-type*))
+                          (key-return-type (and key
+                                                (multiple-value-bind (type name)
+                                                    (cond ((global-var-p key)
+                                                           (values (global-var-defined-type key)
+                                                                   (leaf-%source-name key)))
+                                                          ((lvar-p key)
+                                                           (lvar-fun-type key)))
+                                                  (cond ((eq name 'identity)
+                                                         nil)
+                                                        ((fun-type-p type)
+                                                         (single-value-type (fun-type-returns type)))
+                                                        (t
+                                                         *universal-type*)))))
+                          (type (cond (key-return-type)
+                                      ((getf options :sequence)
+                                       (sequence-element-type (arg-type arg)))
+                                      ((getf options :sequence-type)
+                                       (or (let* ((value (cond ((constant-p arg)
+                                                                (constant-value arg))
+                                                               ((and (lvar-p arg)
+                                                                     (constant-lvar-p arg))
+                                                                (lvar-value arg))))
+                                                  (type (and value
+                                                             (careful-specifier-type value))))
+                                             (and type
+                                                  (sequence-element-type type)))
+                                           *universal-type*))
+                                      (t
+                                       (arg-type arg)))))
+                     (cond (value-nth
+                            (if (consp value-nth)
+                                (let* ((option (nth (second value-nth) deps))
+                                       (option-p (third value-nth))
+                                       (false (or (not option)
+                                                  (csubtypep (lvar-type option) (specifier-type 'null))))
+                                       (true (and option
+                                                  (csubtypep (lvar-type option) (specifier-type '(not null)))))
+                                       (unknown (not (or true false))))
+                                  (cond (unknown
+                                         (type-union (lvar-type value)
+                                                     type))
+                                        ((and true option-p)
+                                         (lvar-type value))
+                                        ((and false (not option-p))
+                                         (lvar-type value))
+                                        (t
+                                         type)))
+                                (if (lvar-p value)
+                                    (lvar-type value)
+                                    *universal-type*)))
                            (t
-                            (arg-type arg))))))
+                            type)))))
                (process-arg (spec)
                  (if (eq (car spec) 'or)
                      (cons 'or (mapcar #'%process-arg (cdr spec)))
@@ -375,15 +450,24 @@
             do (push rest result)))
     (nreverse result)))
 
-(defun report-arg-count-mismatch (callee caller type arg-count
+(defun report-arg-count-mismatch (fun caller type arg-count
                                   condition-type
-                                  &key lossage-fun)
+                                  &optional lossage-fun name)
   (flet ((lose (format-control &rest format-args)
            (if lossage-fun
                (apply lossage-fun format-control format-args)
                (warn condition-type :format-control format-control
                                     :format-arguments format-args))
-           t))
+           t)
+         (callee ()
+           (or name
+               (nth-value 1 (lvar-fun-type fun))))
+         (caller ()
+           (or caller
+               (loop for annotation in (lvar-annotations fun)
+                     when (typep annotation 'lvar-function-designator-annotation)
+                     do (setf *compiler-error-context* annotation)
+                        (return (lvar-function-designator-annotation-caller annotation))))))
     (multiple-value-bind (min max optional) (fun-type-arg-limits type)
       (or
        (cond
@@ -393,19 +477,19 @@
           (when (/= arg-count min)
             (lose
              "The function ~S is called~@[ by ~S~] with ~R argument~:P, but wants exactly ~R."
-             callee caller
+             (callee) (caller)
              arg-count min)))
          ((< arg-count min)
           (lose
            "The function ~S is called~@[ by ~S~] with ~R argument~:P, but wants at least ~R."
-           callee caller
+           (callee) (caller)
            arg-count min))
          ((not max)
           nil)
          ((> arg-count max)
           (lose
            "The function ~S called~@[ by ~S~] with ~R argument~:P, but wants at most ~R."
-           callee caller
+           (callee) (caller)
            arg-count max)))
        (let ((positional (fun-type-positional-count type)))
          (when (and (fun-type-keyp type)
@@ -413,10 +497,17 @@
                     (oddp (- arg-count positional)))
            (lose
             "The function ~s is called with odd number of keyword arguments."
-            callee)))))))
+            (callee))))))))
 
 (defun disable-arg-count-checking (leaf type arg-count)
   (when (lambda-p leaf)
+    (let ((once nil))
+      ;; TODO: what if all destinations can disable arg count checking.
+      (map-leaf-refs (lambda (dest)
+                       (declare (ignore dest))
+                       (when (shiftf once t)
+                         (return-from disable-arg-count-checking)))
+                     leaf))
     (multiple-value-bind (min max) (fun-type-arg-limits type)
       (when (and min
                  (if max
@@ -430,87 +521,94 @@
 ;;; This can provide better errors and better handle OR types than a
 ;;; simple type intersection.
 (defun check-function-designator-lvar (lvar annotation)
-  (multiple-value-bind (type name leaf) (lvar-fun-type lvar)
-    (cond
-      ((and name
-            (valid-function-name-p name)
-            (memq (info :function :kind name) '(:macro :special-form)))
-       (compiler-warn "~(~a~) ~s where a function is expected"
-                      (info :function :kind name) name))
-      ((fun-type-p type)
-       ;; If the destination is a combination-fun that means the function
-       ;; is called here and not passed somewhere else, there's no longer a
-       ;; need to check the function type, the arguments to the call will
-       ;; do the same job.
-       (unless (let* ((dest (lvar-dest lvar)))
-                 (and (basic-combination-p dest)
-                      (eq (basic-combination-fun dest) lvar)))
-         (multiple-value-bind (args results)
-             (function-designator-lvar-types annotation)
-           (let* ((condition (callable-argument-lossage-kind name
-                                                             leaf
-                                                             'simple-style-warning
-                                                             'simple-warning))
-                  (type-condition (case condition
-                                    (simple-style-warning
-                                     'type-style-warning)
-                                    (t
-                                     'type-warning)))
-                  (caller (lvar-function-designator-annotation-caller annotation))
-                  (arg-count (length args)))
-             (or (report-arg-count-mismatch name caller
-                                            type
-                                            arg-count
-                                            condition)
-                 (let ((param-types (fun-type-n-arg-types arg-count type)))
-                   (unless (and (eq caller 'reduce)
-                                (eql arg-count 2))
-                     (disable-arg-count-checking leaf type arg-count))
-                   (block nil
-                     ;; Need to check each OR seperately, a UNION could
-                     ;; intersect with the function parameters
-                     (labels ((hide-ors (current-or or-part)
-                                (loop for spec in args
-                                      collect (cond ((eq spec current-or)
-                                                     or-part)
-                                                    ((typep spec '(cons (eql or)))
-                                                     (sb-kernel::%type-union (cdr spec)))
-                                                    (t
-                                                     spec))))
-                              (check (arg param &optional
-                                                  current-spec)
-                                (when (eq (type-intersection param arg) *empty-type*)
-                                  (warn type-condition
-                                        :format-control
-                                        "The function ~S is called by ~S with ~S but it accepts ~S."
-                                        :format-arguments
-                                        (list
-                                         name
-                                         caller
-                                         (mapcar #'type-specifier (hide-ors current-spec arg))
-                                         (mapcar #'type-specifier param-types)))
-                                  (return t))))
-                       (loop for arg-type in args
-                             for param-type in param-types
-                             if (typep arg-type '(cons (eql or)))
-                             do (loop for type in (cdr arg-type)
-                                      do (check type param-type arg-type))
-                             else do (check arg-type param-type)))))
-                 (let ((returns (single-value-type (fun-type-returns type))))
-                   (when (and (neq returns *wild-type*)
-                              (neq returns *empty-type*)
-                              (neq results *wild-type*)
-                              (eq (type-intersection returns results) *empty-type*))
-                     (warn type-condition
-                           :format-control
-                           "The function ~S called by ~S returns ~S but ~S is expected"
-                           :format-arguments
-                           (list
-                            name
-                            caller
-                            (type-specifier returns)
-                            (type-specifier results)))))))))
-       t))))
+  (map-all-uses
+   (lambda (node)
+     (multiple-value-bind (type name leaf) (node-fun-type node)
+       (cond
+         ((and name
+               (valid-function-name-p name)
+               (memq (info :function :kind name) '(:macro :special-form)))
+          (compiler-warn "~(~a~) ~s where a function is expected"
+                         (info :function :kind name) name))
+         ((fun-type-p type)
+          ;; If the destination is a combination-fun that means the function
+          ;; is called here and not passed somewhere else, there's no longer a
+          ;; need to check the function type, the arguments to the call will
+          ;; do the same job.
+          (unless (let* ((dest (lvar-dest lvar)))
+                    (and (basic-combination-p dest)
+                         (eq (basic-combination-fun dest) lvar)))
+            (multiple-value-bind (args results)
+                (function-designator-lvar-types annotation)
+              (let* ((condition (if (eq node (principal-lvar-use lvar))
+                                    (callable-argument-lossage-kind name
+                                                                    leaf
+                                                                    'simple-style-warning
+                                                                    'simple-warning)
+                                    'simple-style-warning))
+                     (type-condition (case condition
+                                       (simple-style-warning
+                                        'type-style-warning)
+                                       (t
+                                        'type-warning)))
+                     (caller (lvar-function-designator-annotation-caller annotation))
+                     (arg-count (length args)))
+                (or (report-arg-count-mismatch lvar caller
+                                               type
+                                               arg-count
+                                               condition
+                                               nil
+                                               name)
+                    (let ((param-types (fun-type-n-arg-types arg-count type)))
+                      (unless (and (eq caller 'reduce)
+                                   (eql arg-count 2))
+                        (disable-arg-count-checking leaf type arg-count))
+                      (block nil
+                        ;; Need to check each OR seperately, a UNION could
+                        ;; intersect with the function parameters
+                        (labels ((hide-ors (current-or or-part)
+                                   (loop for spec in args
+                                         collect (cond ((eq spec current-or)
+                                                        or-part)
+                                                       ((typep spec '(cons (eql or)))
+                                                        (sb-kernel::%type-union (cdr spec)))
+                                                       (t
+                                                        spec))))
+                                 (check (arg param &optional
+                                                     current-spec)
+                                   (when (eq (type-intersection param arg) *empty-type*)
+                                     (warn type-condition
+                                           :format-control
+                                           "The function ~S is called by ~S with ~S but it accepts ~S."
+                                           :format-arguments
+                                           (list
+                                            name
+                                            caller
+                                            (mapcar #'type-specifier (hide-ors current-spec arg))
+                                            (mapcar #'type-specifier param-types)))
+                                     (return t))))
+                          (loop for arg-type in args
+                                for param-type in param-types
+                                if (typep arg-type '(cons (eql or)))
+                                do (loop for type in (cdr arg-type)
+                                         do (check type param-type arg-type))
+                                else do (check arg-type param-type)))))
+                    (let ((returns (single-value-type (fun-type-returns type))))
+                      (when (and (neq returns *wild-type*)
+                                 (neq returns *empty-type*)
+                                 (neq results *wild-type*)
+                                 (eq (type-intersection returns results) *empty-type*))
+                        (warn type-condition
+                              :format-control
+                              "The function ~S called by ~S returns ~S but ~S is expected"
+                              :format-arguments
+                              (list
+                               name
+                               caller
+                               (type-specifier returns)
+                               (type-specifier results)))))))))))))
+   lvar)
+  t)
 
 (defun check-function-lvar (lvar annotation)
   (let ((atype (lvar-function-annotation-type annotation)))

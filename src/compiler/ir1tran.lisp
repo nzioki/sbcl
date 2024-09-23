@@ -41,6 +41,8 @@
 
 (defvar *transforming* 0)
 (defvar *inlining* 0)
+(declaim (type fixnum *transforming* *inlining*)
+         #-sb-xc-host (always-bound *transforming* *inlining*))
 
 (defun ensure-source-path (form)
   (flet ((level> (value kind)
@@ -53,27 +55,12 @@
         (cond ((level> *transforming* 'transformed)
                ;; Don't hide all the transformed paths, since we might want
                ;; to look at the final form for error reporting.
-               (list* (simplify-source-path-form form)
-                      'transformed *transforming* *current-path*))
+               (list* form 'transformed *transforming* *current-path*))
               ;; Avoids notes about inlined code leaking out
               ((level> *inlining* 'inlined)
-               (list* (simplify-source-path-form form)
-                      'inlined *inlining* *current-path*))
+               (list* form 'inlined *inlining* *current-path*))
               (t
-               (cons (simplify-source-path-form form)
-                     *current-path*))))))
-
-(defun simplify-source-path-form (form)
-  (if (consp form)
-      (let ((op (car form)))
-        ;; In the compiler functions can be directly represented
-        ;; by leaves. Having leaves in the source path is pretty
-        ;; hard on the poor user, however, so replace with the
-        ;; source-name when possible.
-        (if (and (leaf-p op) (leaf-has-source-name-p op))
-            (cons (leaf-source-name op) (cdr form))
-            form))
-      form))
+               (cons form *current-path*))))))
 
 (defun note-source-path (form &rest arguments)
   (when (source-form-has-path-p form)
@@ -182,7 +169,7 @@
 (defun maybe-defined-here (name where)
   (if (and (eq :defined where)
            (boundp '*compilation*)
-           (member name (fun-names-in-this-file *compilation*) :test #'equal))
+           (hashset-find (fun-names-in-this-file *compilation*) name))
       :defined-here
       where))
 
@@ -214,6 +201,17 @@
          (compiler-warn "~(~a~) ~s where a function is expected" kind name)))
       (let ((ftype (global-ftype name))
             (notinline (fun-lexically-notinline-p name)))
+        #-sb-xc-host
+        (when (and (eq where :declared)
+                   (policy *lexenv* (and (>= safety 1)
+                                         (= debug 3)))
+                   (not (or
+                         (info :function :info name)
+                         (let ((name (if (consp name)
+                                         (second name)
+                                         name)))
+                           (system-package-p (symbol-package name))))))
+          (setf where :declared-verify))
         (make-global-var
          :kind :global-function
          :%source-name name
@@ -317,12 +315,7 @@
                    `(macro . (the ,type ,expansion))))
                 (:constant
                  (let ((value (symbol-value name)))
-                   ;; Objects that are freely coalescible become
-                   ;; anonymous since we aren't interested in
-                   ;; accessing them through their name.
-                   (if (sb-xc:typep value '(or number character symbol))
-                       (find-constant value)
-                       (make-constant value (ctype-of value) name))))
+                   (make-constant value (ctype-of value) name)))
                 (t
                  (make-global-var :kind kind
                                   :%source-name name
@@ -339,10 +332,9 @@
                             system-area-pointer
                             #+sb-simd-pack simd-pack
                             #+sb-simd-pack-256 simd-pack-256))
-      (cl:typep obj 'debug-name-marker)
       ;; STANDARD-OBJECT layouts use MAKE-LOAD-FORM, but all other layouts
       ;; have the same status as symbols - composite objects but leaflike.
-      (and (typep obj 'wrapper) (not (layout-for-pcl-obj-p obj)))
+      (and (typep obj 'layout) (not (layout-for-pcl-obj-p obj)))
       ;; PACKAGEs are also leaflike.
       (cl:typep obj 'package)
       ;; The cross-compiler wants to dump CTYPE instances as leaves,
@@ -393,7 +385,7 @@
            ;; user-defined MAKE-LOAD-FORM methods?
            (when (emit-make-load-form value)
              #+sb-xc-host
-             (aver (eql (wrapper-bitmap (%instance-wrapper value))
+             (aver (eql (layout-bitmap (%instance-layout value))
                         sb-kernel:+layout-all-tagged+))
              (do-instance-tagged-slot (i value)
                (grovel (%instance-ref value i)))))
@@ -470,6 +462,16 @@
     (link-node-to-previous-ctran old temp))
   (values))
 
+(defun insert-node-after (old new)
+  (let ((next (node-next old)))
+    (cond (next
+           (insert-node-before (ctran-next next) new))
+          (t
+           (let ((ctran (make-ctran)))
+             (link-node-to-previous-ctran new ctran)
+             (setf (block-last (node-block old)) new)
+             (use-ctran old ctran))))))
+
 ;;; This function is used to set the ctran for a node, and thus
 ;;; determine what receives the value.
 (defun use-lvar (node lvar)
@@ -527,11 +529,10 @@
     (setf (component-kind component) :initial)
     (let* ((forms (if for-value `(,form) `(,form nil)))
            (res (ir1-convert-lambda-body
-                 forms ()
-                 :debug-name (debug-name 'top-level-form #+sb-xc-host nil #-sb-xc-host form))))
+                 forms () :debug-name "top level form")))
       (setf (functional-entry-fun res) res
             (functional-arg-documentation res) ()
-            (functional-kind res) :toplevel)
+            (functional-kind res) (functional-kind-attributes toplevel))
       res)))
 
 ;;; This function is called on freshly read forms to record the
@@ -595,7 +596,8 @@
                       ir1-convert-combination-args reference-leaf
                       reference-constant
                       expand-compiler-macro
-                      maybe-reanalyze-functional))
+                      maybe-reanalyze-functional
+                      ir1-convert-common-functoid))
 
 ;;; Translate FORM into IR1. The code is inserted as the NEXT of the
 ;;; CTRAN START. RESULT is the LVAR which receives the value of the
@@ -628,17 +630,16 @@
 ;;; if necessary. If we are producing a fasl file, make sure that
 ;;; MAKE-LOAD-FORM gets used on any parts of the constant that it
 ;;; needs to be.
-(defun reference-constant (start next result value)
+(defun reference-constant (start next result value &optional (emit-load-forms (producing-fasl-file)))
   (declare (type ctran start next)
            (type (or lvar null) result))
-  (ir1-error-bailout (start next result value)
-    (when (producing-fasl-file)
-      (maybe-emit-make-load-forms value))
-    (let* ((leaf (find-constant value))
-           (res (make-ref leaf)))
-      (push res (leaf-refs leaf))
-      (link-node-to-previous-ctran res start)
-      (use-continuation res next result)))
+  (when emit-load-forms
+    (maybe-emit-make-load-forms value))
+  (let* ((leaf (find-constant value))
+         (res (make-ref leaf)))
+    (push res (leaf-refs leaf))
+    (link-node-to-previous-ctran res start)
+    (use-continuation res next result))
   (values))
 
 ;;; Add FUNCTIONAL to the COMPONENT-REANALYZE-FUNCTIONALS, unless it's
@@ -646,7 +647,7 @@
 ;;;
 ;;; FUNCTIONAL is returned.
 (defun maybe-reanalyze-functional (functional)
-  (aver (not (eql (functional-kind functional) :deleted))) ; bug 148
+  (aver (not (functional-kind-eq functional deleted))) ; bug 148
   (aver-live-component *current-component*)
   ;; When FUNCTIONAL is of a type for which reanalysis isn't a trivial
   ;; no-op
@@ -667,11 +668,10 @@
                         (neq (defined-fun-inlinep leaf) 'notinline)
                         (defined-fun-same-block-p leaf)
                         (let ((functional (defined-fun-functional leaf)))
-                          (when (and functional (not (functional-kind functional)))
+                          (when (and functional (functional-kind-eq functional nil))
                             (maybe-reanalyze-functional functional))))
                    (when (and (functional-p leaf)
-                              (memq (functional-kind leaf)
-                                    '(nil :optional)))
+                              (functional-kind-eq leaf nil optional))
                      (maybe-reanalyze-functional leaf))
                    leaf))
          (ref (make-ref leaf name)))
@@ -709,6 +709,9 @@
     (etypecase var
       (leaf
        (when (lambda-var-p var)
+         (let ((home (ctran-home-lambda-or-null start)))
+           (when (and home (neq (lambda-var-home var) home))
+             (sset-adjoin var (lambda-calls-or-closes home))))
          (when (lambda-var-ignorep var)
            ;; (ANSI's specification for the IGNORE declaration requires
            ;; that this be a STYLE-WARNING, not a full WARNING.)
@@ -875,6 +878,49 @@
                           (find-free-fun fun "shouldn't happen! (no-cmacro)")
                           form))))
 
+;;; This may produce false matches when there are multiple copies and
+;;; they are reordered, duplicated or omitted. Still better than
+;;; nothing.
+(defun recover-source-paths (original-form expanded)
+  (when (policy *lexenv* (> debug 1))
+    (let ((equal-table (make-hash-table :test #'equal))
+          some)
+      (let ((seen (alloc-xset)))
+        (labels ((rec (form)
+                   (when (and (consp form)
+                              (not (xset-member-p form seen)))
+                     (let ((path (gethash form *source-paths*)))
+                       (push path (gethash form equal-table))
+                       (when path
+                         (setf some t)))
+                     (loop while (and (consp form)
+                                      (not (xset-member-p form seen)))
+                           do
+                           (add-to-xset form seen)
+                           (rec (pop form))))))
+          (rec original-form)))
+      (when some
+        (let ((seen (alloc-xset)))
+          (labels ((rec (form)
+                     (unless (xset-member-p form seen)
+                       (let ((original (gethash form equal-table)))
+                         (when original
+                           (let ((location
+                                   (if (cdr original)
+                                       (prog1 (car (last original))
+                                         (setf (gethash form equal-table)
+                                               (nbutlast original)))
+                                       (car original))))
+                             (when (and location
+                                        (not (gethash form *source-paths*)))
+                               (setf (gethash form *source-paths*) location))))
+                         (loop while (and (consp form)
+                                          (not (xset-member-p form seen)))
+                               do
+                               (add-to-xset form seen)
+                               (rec (pop form)))))))
+            (rec expanded)))))))
+
 ;;; Expand FORM using the macro whose MACRO-FUNCTION is FUN, trapping
 ;;; errors which occur during the macroexpansion.
 (defun careful-expand-macro (fun form &optional cmacro)
@@ -906,7 +952,10 @@
                          (t
                           (compiler-error "~@<~A~@:_ ~A~:>"
                                           (wherestring) c))))))
-      (funcall (valid-macroexpand-hook) fun form *lexenv*))))
+      (let ((result (funcall (valid-macroexpand-hook) fun form *lexenv*)))
+        #-sb-xc-host
+        (recover-source-paths form result)
+        result))))
 
 ;;;; conversion utilities
 
@@ -964,7 +1013,7 @@
            #-sb-xc-host (values combination))
   (let ((ctran (make-ctran))
         (fun-lvar (make-lvar)))
-    (ir1-convert start ctran fun-lvar `(the (or function symbol) ,fun))
+    (reference-leaf start ctran fun-lvar fun)
     (let ((combination
            (ir1-convert-combination-args fun-lvar ctran next result
                                          (cdr (proper-list form)))))
@@ -1056,11 +1105,6 @@
                                            (proper-list form)
                                            var))))))
 
-
-;;; KLUDGE: If we insert a synthetic IF for a function with the PREDICATE
-;;; attribute, don't generate any branch coverage instrumentation for it.
-(defvar *instrument-if-for-code-coverage* t)
-
 ;;; If the function has the PREDICATE attribute, and the RESULT's DEST
 ;;; isn't an IF, then we convert (IF <form> T NIL), ensuring that a
 ;;; predicate always appears in a conditional context.
@@ -1072,15 +1116,39 @@
            (type (or lvar null) result)
            (list form)
            (type global-var var))
-  (if (vop-existsp :named sb-vm::move-conditional-result)
-      (ir1-convert-combination-checking-type start next result form var)
-      (let ((info (info :function :info (leaf-source-name var))))
-        (if (and info
-                 (ir1-attributep (fun-info-attributes info) predicate)
-                 (not (if-p (and result (lvar-dest result)))))
-            (let ((*instrument-if-for-code-coverage* nil))
-              (ir1-convert start next result `(if ,form t nil)))
-            (ir1-convert-combination-checking-type start next result form var)))))
+  (let ((info (info :function :info (leaf-source-name var))))
+    (if (and info
+             (ir1-attributep (fun-info-attributes info) predicate)
+             (not (if-p (and result (lvar-dest result)))))
+        (wrap-predicate start next result form var)
+        (ir1-convert-combination-checking-type start next result form var))))
+
+;;; Like (if form t nil) but without coverage and without inserting
+;;; leafs coming from %funcall into *current-path*
+(defun wrap-predicate (start next result form var)
+  (let* ((pred-ctran (make-ctran))
+         (pred-lvar (make-lvar))
+         (then-ctran (make-ctran))
+         (then-block (ctran-starts-block then-ctran))
+         (else-ctran (make-ctran))
+         (else-block (ctran-starts-block else-ctran))
+         (node (make-if :test pred-lvar
+                        :consequent then-block
+                        :alternative else-block)))
+    (setf (lvar-dest pred-lvar) node)
+    (ir1-convert-combination-checking-type start pred-ctran pred-lvar form var)
+    (link-node-to-previous-ctran node pred-ctran)
+
+    (let ((start-block (ctran-block pred-ctran)))
+      (setf (block-last start-block) node)
+      (ctran-starts-block next)
+
+      (link-blocks start-block then-block)
+      (link-blocks start-block else-block))
+    (let ((*current-path* (cons t *current-path*)))
+      (reference-constant then-ctran next result t))
+    (let ((*current-path* (cons nil *current-path*)))
+      (reference-constant else-ctran next result nil))))
 
 ;;; Actually really convert a global function call that we are allowed
 ;;; to early-bind.
@@ -1124,8 +1192,7 @@
 
 (declaim (start-block process-decls make-new-inlinep
                       find-in-bindings
-                      process-muffle-decls
-                      %processing-decls))
+                      process-muffle-decls))
 
 ;;; Given a list of LAMBDA-VARs and a variable name, return the
 ;;; LAMBDA-VAR for that name, or NIL if it isn't found. We return the
@@ -1468,69 +1535,57 @@
   (values))
 
 (defvar *stack-allocate-dynamic-extent* t
-  "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
+  "If true (the default), the compiler believes DYNAMIC-EXTENT declarations
 and stack allocates otherwise inaccessible parts of the object whenever
-possible. Potentially long (over one page in size) vectors are, however, not
-stack allocated except in zero SAFETY code, as such a vector could overflow
-the stack without triggering overflow protection.")
+possible.")
 
-(defun process-extent-decl (names vars fvars kind)
-  (let ((extent
-          (ecase kind
-            ((dynamic-extent dynamic-extent-no-note)
-             (when *stack-allocate-dynamic-extent*
-               kind))
-            ((indefinite-extent truly-dynamic-extent)
-             kind))))
-    (if extent
-        (dolist (name names)
-          (cond
-            ((symbolp name)
-             (let* ((bound-var (find-in-bindings vars name))
-                    (var (or bound-var
-                             (lexenv-find name vars)
-                             (find-free-var name))))
-               (maybe-note-undefined-variable-reference var name)
-               (etypecase var
-                 (leaf
-                  (cond
-                    ((and (typep var 'global-var) (eq (global-var-kind var) :unknown)))
-                    (bound-var
-                     (if (and (leaf-extent var) (neq extent (leaf-extent var)))
-                         (warn "Multiple incompatible extent declarations for ~S?" name)
-                         (setf (leaf-extent var) extent)))
-                    (t (compiler-notify "Ignoring free ~S declaration: ~S" kind name))))
-                 (cons
-                  (compiler-error "~S on symbol-macro: ~S" kind name))
-                 (heap-alien-info
-                  (compiler-error "~S on alien-variable: ~S" kind name)))))
-            ((and (consp name)
-                  (eq (car name) 'function)
-                  (null (cddr name))
-                  (valid-function-name-p (cadr name))
-                  (neq extent 'indefinite-extent))
-             (let* ((fname (cadr name))
-                    (bound-fun (find fname fvars
-                                     :key (lambda (x)
-                                            (unless (consp x) ;; macrolet
-                                              (leaf-source-name x)))
-                                     :test #'equal))
-                    (fun (or bound-fun (lexenv-find fname funs))))
-               (etypecase fun
-                 (leaf
-                  (if bound-fun
-                      (setf (leaf-extent bound-fun) extent)
-                      (compiler-notify
-                       "Ignoring free DYNAMIC-EXTENT declaration: ~S" name)))
-                 (cons
-                  (compiler-error "DYNAMIC-EXTENT on macro: ~S" name))
-                 (null
-                  (compiler-style-warn
-                   "Unbound function declared DYNAMIC-EXTENT: ~S" name)))))
-            (t
-             (compiler-error "~S on a weird thing: ~S" kind name))))
-        (when (policy *lexenv* (= speed 3))
-          (compiler-notify "Ignoring DYNAMIC-EXTENT declarations: ~S" names)))))
+(defun process-dynamic-extent-decl (names vars fvars)
+  (if *stack-allocate-dynamic-extent*
+      (dolist (name names)
+        (cond
+          ((symbolp name)
+           (let* ((bound-var (find-in-bindings vars name))
+                  (var (or bound-var
+                           (lexenv-find name vars)
+                           (find-free-var name))))
+             (maybe-note-undefined-variable-reference var name)
+             (etypecase var
+               (leaf
+                (cond
+                  ((and (typep var 'global-var) (eq (global-var-kind var) :unknown)))
+                  (bound-var
+                   (setf (leaf-dynamic-extent var) t))
+                  (t (compiler-notify "Ignoring free DYNAMIC-EXTENT declaration: ~S" name))))
+               (cons
+                (compiler-error "DYNAMIC-EXTENT on symbol-macro: ~S" name))
+               (heap-alien-info
+                (compiler-error "DYNAMIC-EXTENT on alien-variable: ~S" name)))))
+          ((and (consp name)
+                (eq (car name) 'function)
+                (null (cddr name))
+                (valid-function-name-p (cadr name)))
+           (let* ((fname (cadr name))
+                  (bound-fun (find fname fvars
+                                   :key (lambda (x)
+                                          (unless (consp x) ;; macrolet
+                                            (leaf-source-name x)))
+                                   :test #'equal))
+                  (fun (or bound-fun (lexenv-find fname funs))))
+             (etypecase fun
+               (leaf
+                (if bound-fun
+                    (setf (leaf-dynamic-extent bound-fun) t)
+                    (compiler-notify
+                     "Ignoring free DYNAMIC-EXTENT declaration: ~S" name)))
+               (cons
+                (compiler-error "DYNAMIC-EXTENT on macro: ~S" name))
+               (null
+                (compiler-style-warn
+                 "Unbound function declared DYNAMIC-EXTENT: ~S" name)))))
+          (t
+           (compiler-error "DYNAMIC-EXTENT on a weird thing: ~S" name))))
+      (when (policy *lexenv* (= speed 3))
+        (compiler-notify "Ignoring DYNAMIC-EXTENT declarations: ~S" names))))
 
 ;;; FIXME: This is non-ANSI, so the default should be T, or it should
 ;;; go away, I think.
@@ -1588,8 +1643,8 @@ the stack without triggering overflow protection.")
          :default res
          :handled-conditions (process-unmuffle-conditions-decl
                               spec (lexenv-handled-conditions res))))
-       ((dynamic-extent truly-dynamic-extent indefinite-extent dynamic-extent-no-note)
-        (process-extent-decl (cdr spec) vars fvars (first spec))
+       ((dynamic-extent)
+        (process-dynamic-extent-decl (cdr spec) vars fvars)
         res)
        ((disable-package-locks enable-package-locks)
         (make-lexenv
@@ -1603,8 +1658,8 @@ the stack without triggering overflow protection.")
        (current-defmethod
         (destructuring-bind (name qualifiers specializers lambda-list)
             (cdr spec)
-          (let* ((gfs (or *methods-in-compilation-unit*
-                          (setf *methods-in-compilation-unit*
+          (let* ((gfs (or (cu-methods *compilation-unit*)
+                          (setf (cu-methods *compilation-unit*)
                                 (make-hash-table :test #'equal))))
                  (methods (or (gethash name gfs)
                               (setf (gethash name gfs)
@@ -1669,7 +1724,7 @@ the stack without triggering overflow protection.")
         (post-binding-lexenv (if binding-form-p (list nil)))) ; dummy cell
     (flet ((process-it (spec decl)
              (cond ((atom spec)
-                    (compiler-error "malformed declaration specifier ~S in ~S"
+                    (compiler-warn "malformed declaration specifier ~S in ~S"
                                     spec decl))
                    ((and (eq allow-lambda-list t)
                          (typep spec '(cons (eql lambda-list) (cons t null))))
@@ -1732,34 +1787,6 @@ the stack without triggering overflow protection.")
             lambda-list explicit-check source-form
             (when local-optimize
               (process-optimize-decl local-optimize (lexenv-policy lexenv))))))
-
-(defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
-  (multiple-value-bind (*lexenv* result-type post-binding-lexenv)
-      (process-decls decls vars fvars :binding-form-p binding-form-p)
-    (cond ((eq result-type *wild-type*)
-           (funcall fun ctran lvar post-binding-lexenv))
-          (t
-           (let ((value-ctran (make-ctran))
-                 (value-lvar (make-lvar)))
-             (multiple-value-prog1
-                 (funcall fun value-ctran value-lvar post-binding-lexenv)
-               (let ((cast (make-cast value-lvar result-type
-                                      (lexenv-policy *lexenv*))))
-                 (link-node-to-previous-ctran cast value-ctran)
-                 (setf (lvar-dest value-lvar) cast)
-                 (use-continuation cast ctran lvar))))))))
-
-(defmacro processing-decls ((decls vars fvars ctran lvar
-                                   &optional post-binding-lexenv)
-                            &body forms)
-  (declare (symbol ctran lvar))
-  (let ((post-binding-lexenv-p (not (null post-binding-lexenv)))
-        (post-binding-lexenv (or post-binding-lexenv (gensym "LEXENV"))))
-    `(%processing-decls ,decls ,vars ,fvars ,ctran ,lvar
-                        ,post-binding-lexenv-p
-                        (lambda (,ctran ,lvar ,post-binding-lexenv)
-                          (declare (ignorable ,post-binding-lexenv))
-                          ,@forms))))
 
 ;;; Return the SPECVAR for NAME to use when we see a local SPECIAL
 ;;; declaration. If there is a global variable of that name, then

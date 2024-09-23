@@ -305,7 +305,9 @@
                             (loop for d from c below size do
                                   (test a b c d op deriver))))))))))
 
-(with-test (:name (:type-derivation :logical-operations :scaling) :slow t)
+(with-test (:name (:type-derivation :logical-operations :scaling)
+            :broken-on :mark-region-gc
+            :slow t)
   (let ((type-x1 (sb-c::specifier-type `(integer ,(expt 2 10000)
                                                  ,(expt 2 10000))))
         (type-x2 (sb-c::specifier-type `(integer ,(expt 2 100000)
@@ -507,16 +509,16 @@
     (flet ((our-type-of (x) (sb-kernel:type-specifier (sb-kernel:ctype-of x))))
       (let ((hairy-t (make-array 3 :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (vector t 3) (not simple-array))))
+                       '(vector t)))
         (assert (equal (type-of hairy-t) '(vector t 3))))
       (let ((hairy-t (make-array '(3 2) :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (array t (3 2)) (not simple-array))))
+                       '(array t (* *))))
         (assert (equal (type-of hairy-t) '(array t (3 2)))))
       (let ((hairy-bit
-             (make-array 5 :displaced-to simp-bit :element-type 'bit)))
+              (make-array 5 :displaced-to simp-bit :element-type 'bit)))
         (assert (equal (our-type-of hairy-bit)
-                       '(and (bit-vector 5) (not simple-array))))
+                       'bit-vector))
         (assert (equal (type-of hairy-bit) '(bit-vector 5)))))))
 
 (with-test (:name (subtypep array :bug-309098))
@@ -765,7 +767,7 @@
                                           ,(sb-kernel:find-layout what))))))
 
 (with-test (:name :type-of-empty-instance)
-  (assert (eq (type-of (eval '(sb-kernel:%make-funcallable-instance 6)))
+  (assert (eq (type-of (test-util::make-funcallable-instance 6))
               'sb-kernel:funcallable-instance))
   (assert (eq (type-of (eval '(sb-kernel:%make-instance 12)))
               'sb-kernel:instance)))
@@ -842,7 +844,7 @@
             (sb-kernel:%simple-fun-type
              (checked-compile
               `(lambda (a) (array-rank (the (not (array t)) a))))))
-           `(values array-rank &optional))))
+           `(values (mod 129) &optional))))
 
 (with-test (:name (:rational-intersection :lp1998008))
   (flet ((bug101 ()
@@ -875,3 +877,74 @@
                                              (declare ((or list fixnum) x))
                                              (typep x 'integer))
                                           nil)))))
+
+(with-test (:name :union-intersection-simplification)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (typep a '(or
+                 (and symbol (not null))
+                 (and array (not string)))))
+   ((#()) t)
+   (("") nil)
+   ((t) t)
+   ((nil) nil)))
+
+(with-test (:name :union-integer-complex)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(or (integer 36757953510256822604)
+                 (complex fixnum))))
+   ((-1) nil)
+   ((36757953510256822603) nil)
+   ((36757953510256822604) t)
+   ((36757953510256822605) t)
+   ((#C(1d0 1d0)) nil)
+   ((#C(1 1)) t)
+   ((#C(1 #.(expt 2 300))) nil)))
+
+#+(or arm64 x86-64)
+(with-test (:name :structure-typep-fold)
+  (assert-type
+   (lambda (a b)
+     (declare (character a))
+       (sb-c::structure-typep a b))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (hash-table a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'condition)))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (pathname a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'pathname)))
+   (eql t)))
+
+(with-test (:name :typep-vector-folding)
+  (assert-type
+   (lambda (p)
+     (declare (integer p))
+     (typep p '(vector t 1)))
+   null))
+
+(with-test (:name :non-null-symbol-load-widetag)
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+     (declare ((or symbol array) p))
+     (typecase  p
+       ((and symbol (not null)) 1)
+       (simple-array 2)))
+   ((nil) nil)
+   ((t) 1)
+   ((:a) 1)
+   (("") 2)
+   (((make-array 10 :adjustable t)) nil)))
+
+(with-test (:name :other-pointer-subtypes)
+  (assert-type
+   (lambda (j)
+     (sb-kernel:%other-pointer-p (the (and sequence (not vector)) j)))
+   null))

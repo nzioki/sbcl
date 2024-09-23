@@ -100,26 +100,6 @@ these hooks.")
   (let ((index (binary-search* value seq key)))
     (if index
         (svref seq index))))
-
-(defun double-vector-binary-search (value vector)
-  (declare (simple-vector vector)
-           (optimize speed)
-           (integer value))
-  (labels ((recurse (start end)
-             (declare (type index start end))
-             (when (< start end)
-               (let* ((i (+ start (truncate (- end start) 2)))
-                      (elt (svref vector (truly-the index (* 2 i)))))
-                 (declare (type integer elt)
-                          (type index i))
-                 (cond ((< value elt)
-                        (recurse start i))
-                       ((> value elt)
-                        (recurse (1+ i) end))
-                       (t
-                        (svref vector (truly-the index (1+ (* 2 i))))))))))
-    (recurse 0 (truncate (length vector) 2))))
-
 
 ;;;; helpers for C library calls
 
@@ -147,7 +127,9 @@ these hooks.")
 (defmacro with-push-char ((&key (element-type 'character) (initial-size 28)) &body body)
   (with-unique-names (string size pointer)
     `(let* ((,size ,initial-size)
-            (,string (make-array ,size :element-type ',element-type))
+            (,string (make-array ,size
+                                 :element-type ',element-type
+                                 :initial-element (code-char 0)))
             (,pointer 0))
        (declare (type (integer 0 ,array-dimension-limit) ,size)
                 (type (integer 0 ,(1- array-dimension-limit)) ,pointer)
@@ -157,7 +139,8 @@ these hooks.")
                 (when (= ,pointer ,size)
                   (let ((old ,string))
                     (setf ,size (* 2 (+ ,size 2))
-                          ,string (make-array ,size :element-type ',element-type))
+                          ,string (make-array ,size :element-type ',element-type
+                                                    :initial-element (code-char 0)))
                     (replace ,string old)))
                 (setf (char ,string ,pointer) char)
                 (incf ,pointer))
@@ -167,8 +150,10 @@ these hooks.")
                   (setf ,size 0
                         ,pointer 0
                         ,string ,(coerce "" `(simple-array ,element-type (*))))
-                  ;; This is really local, so we can be destructive!
-                  (%shrink-vector string size)
+                  ;; ASSUMPTION: we use pre-zeroed memory for unboxed objects.
+                  ;; So we can avoid calling %SHRINK-VECTOR, and instead directly
+                  ;; set the length.
+                  (setf (%array-fill-pointer string) size)
                   string)))
          ,@body))))
 
@@ -179,9 +164,6 @@ ownership of the table. If HASH-TABLE is not synchronized, BODY will
 execute with other WITH-LOCKED-HASH-TABLE bodies excluded -- exclusion
 of hash-table accesses not surrounded by WITH-LOCKED-HASH-TABLE is
 unspecified."
-  ;; Needless to say, this also excludes some internal bits, but
-  ;; getting there is too much detail when "unspecified" says what
-  ;; is important -- unpredictable, but harmless.
   `(sb-thread:with-recursive-lock ((hash-table-lock ,hash-table))
      ,@body))
 

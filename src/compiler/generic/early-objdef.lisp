@@ -163,7 +163,7 @@
 ;;; and we have one winner.  The situation is slightly different for 32-bit.
 
 ;; FIXME: our nomenclature is baffling in more ways than implied by comments in
-;; package-data-list regarding use of the word "complex" in both a numerical
+;; exports.lisp regarding use of the word "complex" in both a numerical
 ;; sense and "non-simple" sense:
 ;; - There is no widetag specific to (AND (VECTOR T) (NOT SIMPLE-ARRAY)), i.e.
 ;; COMPLEX-VECTOR-WIDETAG is not the complex version of SIMPLE-VECTOR-WIDETAG
@@ -196,7 +196,7 @@
   ratio-widetag                                   ;  0E   15       |
   single-float-widetag                            ;  12   19       |
   double-float-widetag                            ;  16   1D       | EQL-hash picks off this
-  complex-widetag                                 ;  1A   21       | range of widetags.
+  complex-rational-widetag                        ;  1A   21       | range of widetags.
   complex-single-float-widetag                    ;  1E   25       |
   complex-double-float-widetag                    ;  22   29       |
   ;; -- end of numeric widetags --                                 |
@@ -290,6 +290,14 @@
 ;;; on the heap.
 (defconstant no-tls-value-marker most-positive-word)
 
+(defmacro unbound-marker-bits ()
+  ;; By having unbound-marker-bits appear to be a valid pointer into static
+  ;; space, it admits some optimizations that might "dereference" the value
+  ;; before checking the widetag.
+  ;; Architectures other than x86-64 do not take that liberty.
+  #+x86-64 (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag)
+  #-x86-64 unbound-marker-widetag)
+
 ;;; Map each widetag symbol to a string to go in 'tagnames.h'.
 ;;; I didn't want to mess with the formatting of the table above.
 (defparameter *widetag-string-alist*
@@ -297,7 +305,7 @@
     (ratio-widetag "ratio")
     (single-float-widetag "sfloat")
     (double-float-widetag "dfloat")
-    (complex-widetag "cplxnum")
+    (complex-rational-widetag "cplxnum")
     (complex-single-float-widetag "cplx-sfloat")
     (complex-double-float-widetag "cplx-dfloat")
     (symbol-widetag "symbol")
@@ -370,7 +378,6 @@
 
 ;;; "extra" contain the following fields:
 ;;;  - generation number for immobile space (4 low bits of extra)
-;;;  - fullcgc mark bit (header bit index 31), not used by Lisp
 ;;;  - VISITED bit (header bit index 30) for weak vectors, not used by Lisp
 ;;;  - ALLOC-DYNAMIC-EXTENT (bit index 29), not used by lisp
 ;;;  - ALLOC-MIXED-REGION (bit index 28), not used by Lisp
@@ -433,11 +440,23 @@
 ;; Set if vector is weak. Weak hash tables have both this AND the hashing bit.
 (defconstant vector-weak-flag          #x01)
 
-;;; This header bit is set for symbols which were present in the pristine core.
-;;; The backend may emit different code when referencing such symbols.
-;;; For x86-64, symbols with this bit set may be assumed to have been
-;;; allocated in immobile space.
-(defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
+;;; There are 2 symbol flag bits. The placement restrictions on these stipulate:
+;;; - no conflict with the generation number (byte 3, low 4 bits)
+;;; - avoid #+permgen use of byte bit 7 as the "remembered" bit
+;;; - prefer that the uint32_t package ID be naturally aligned if it matters.
+;;; Given the above:
+;;; - for x864: byte indices 1 and 2 for the package, byte index 3 for flags so that
+;;;   the generation byte can stay where it is
+;;; - for others: byte indices 2 and 3 for package, byte index 1 for flags.
+
+;;; A symbol that is "fast bindable" is neither constant, nor global,
+;;; nor a global symbol-macro, nor in a locked package. Such symbols can be
+;;; bound by PROGV without calling ABOUT-TO-MODIFY-SYMBOL-VALUE, except in the
+;;; case where PROGV invokes UNBIND.
+(defconstant +symbol-fast-bindable+ #+x86-64 #x200000
+                                    #-x86-64 #x80)
+(defconstant +symbol-initial-core+  #+x86-64 #x400000
+                                    #-x86-64 #x40)
 
 ;;; Bit indices of the status bits in an INSTANCE header
 ;;; that implement lazily computed stable hash codes.
@@ -451,50 +470,9 @@
   #-sb-thread
   (defglobal function-layout 0))        ; set by genesis
 
-;;; MIXED-REGION is at the beginning of static space
-;;; Be sure to update "#define main_thread_mixed_region" etc
-;;; if these get changed.
+;;; These regions occupy the initial words of static space.
 #-sb-thread
-(progn (defconstant mixed-region static-space-start)
-       (defconstant cons-region (+ mixed-region (* 3 n-word-bytes)))
-       (defconstant boxed-region (+ cons-region (* 3 n-word-bytes))))
-
-#|
-;; Run this in the SB-VM package once for each target feature combo.
-(defun rewrite-widetag-comments ()
-  (rename-file "src/compiler/generic/early-objdef.lisp" "early-objdef.old")
-  (with-open-file (in "src/compiler/generic/early-objdef.old")
-    (with-open-file (out "src/compiler/generic/early-objdef.lisp"
-                         :direction :output :if-exists :supersede)
-      (let* ((target-features
-              (if (find-package "SB-COLD")
-                  (symbol-value (find-symbol "*FEATURES*" "SB-XC"))
-                  *features*))
-             (feature-bits
-              (+ (if (= n-word-bits 64) 1 0)
-                 (if (member :sb-unicode target-features) 0 2)))
-             (comment-col)
-             (comment-offset (aref #(3 8 12 17) feature-bits))
-             (state 0))
-        (loop
-         (let* ((line (read-line in nil))
-                (trimmed (and line (string-left-trim " " line)))
-                symbol)
-           (unless line
-             (return))
-           (when (and (zerop state) (eql 0 (search "bignum-widetag" trimmed)))
-             (setq state 1 comment-col (position #\; line)))
-           (if (and (= state 1) (plusp (length trimmed))
-                    (alpha-char-p (char trimmed 0))
-                    (boundp (setq symbol (read-from-string trimmed))))
-               (let ((new (make-string (+ comment-col 19)
-                                       :initial-element #\Space)))
-                 (replace new line)
-                 (replace new (format nil "~2,'0X" (symbol-value symbol))
-                          :start1 (+ comment-col comment-offset))
-                 (write-line new out))
-               (progn
-                 (write-line line out)
-                 (if (and (= state 1) (string= line ")"))
-                     (setq state 2))))))))))
-|#
+(progn
+  (defconstant mixed-region-offset 0)
+  (defconstant cons-region-offset (* 3 n-word-bytes))
+  (defconstant boxed-region-offset (* 6 n-word-bytes)))

@@ -13,6 +13,15 @@
 
 (in-package "SB-IMPL")
 
+;;; Like DEFUN, but hides itself in the backtrace. This is meant for
+;;; trivial functions which just do some argument parsing and call
+;;; ERROR for real. Hence, having them and their locals in the
+;;; backtrace would add no useful information pertaining to the error.
+(defmacro define-error-wrapper (name lambda-list &body body)
+  `(defun ,name (,@lambda-list
+                 &aux #-sb-xc-host (sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint* ',name)))
+     ,@body))
+
 ;;; FIXME: a lot of places in the code that should use ARRAY-RANGE
 ;;; instead use INDEX and vice-versa, but the thing is, we have
 ;;; a ton of fenceposts errors all over the place regardless.
@@ -104,7 +113,7 @@
 ;;; have cycles and isn't too large.
 (defun coalesce-tree-p (x)
   (let ((depth-limit 12)
-        (size-limit (expt 2 25)))
+        (size-limit (expt 2 12)))
     (declare (fixnum size-limit))
     (and (consp x)
          (labels ((safe-cddr (cons)
@@ -171,7 +180,9 @@
 ;;;; comment from CMU CL: "the ultimate collection macro..."
 
 ;;; helper function for COLLECT, which becomes the expander of the
-;;; MACROLET definitions created by COLLECT if collecting a list.
+;;; MACROLET definitions created by COLLECT if collecting a list
+;;; and an INITIAL-VALUE was specified, so we don't know at each step
+;;; whether the tail is NIL or not.
 ;;; N-TAIL is the pointer to the current tail of the list,  or NIL
 ;;; if the list is empty.
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
@@ -198,37 +209,67 @@
 ;;; the collection macro with no arguments.
 ;;;
 ;;; INITIAL-VALUE is the value that the collection starts out with,
-;;; which defaults to NIL. FUNCTION is the function which does the
+;;; which defaults to NIL. COLLECTOR is the function which does the
 ;;; collection. It is a function which will accept two arguments: the
 ;;; value to be collected and the current collection. The result of
 ;;; the function is made the new value for the collection. As a
-;;; totally magical special-case, FUNCTION may be COLLECT, which tells
-;;; us to build a list in forward order; this is the default. If an
-;;; INITIAL-VALUE is supplied for COLLECT, the stuff will be RPLACD'd
-;;; onto the end. Note that FUNCTION may be anything that can appear
-;;; in the functional position, including macros and lambdas.
+;;; special-case, omitting COLLECTOR causes a list to be built in forward
+;;; order. If INITIAL-VALUE is supplied for the default usage, new items
+;;; will be RPLACD'd onto the end.
+;;; Note that COLLECTOR may be anything that can appear in the functional
+;;; position, including macros and lambdas.
+;;; Also note that invocation of the collector macro for effect, i.e. other
+;;; than with 0 arguments, is not prescribed to have any particular value.
 (defmacro collect (collections &body body)
   (let ((macros ())
         (binds ())
+        (dx ())
         (ignores ()))
     (dolist (spec collections)
-      (destructuring-bind (name &optional default collector
-                                &aux (n-value (copy-symbol name))) spec
-        (push `(,n-value ,default) binds)
+      (destructuring-bind (name &optional initial-value (collector nil collectorp)
+                                &aux (n-value (copy-symbol name)))
+          spec
+        (push `(,n-value ,(if (or initial-value collectorp)
+                              initial-value
+                              `(#-sb-xc-host unaligned-dx-cons
+                                #+sb-xc-host list
+                                nil)))
+              binds)
         (let ((macro-body
-               (if (or (null collector) (eq collector 'collect))
-                   (let ((n-tail (gensymify* name "-TAIL")))
-                     (push n-tail ignores)
-                     (push `(,n-tail ,(if default `(last ,n-value))) binds)
-                     `(collect-list-expander ',n-value ',n-tail args))
+               (cond
+                 (collectorp
                    ``(progn
                        ,@(mapcar (lambda (x)
                                    `(setq ,',n-value (,',collector ,x ,',n-value)))
                                  args)
-                       ,',n-value))))
+                       ,',n-value))
+                 ((not initial-value)
+                  ;; Use a dummy cons to skip the test for TAIL being NIL with each
+                  ;; inserted item.
+                  (push n-value dx)
+                  (let ((n-tail (gensymify* name "-TAIL")))
+                    (push n-tail ignores)
+                    (push `(,n-tail ,n-value) binds)
+                    `(if args
+                         `(progn
+                            ,@(mapcar (lambda (x)
+                                        `(setf ,',n-tail (setf (cdr ,',n-tail)
+                                                               (list ,x))))
+                                      args))
+                         `(cdr ,',n-value))))
+                 ;; collecting a list given a list to start with.
+                 ;; It's possible to use the "fancy" strategy to avoid testing for NIL
+                 ;; at each step but I choose not to.  The initializer would have to be
+                 ;; (cons nil initial-value). It's unimportant.
+                 (initial-value
+                  (let ((n-tail (gensymify* name "-TAIL")))
+                    (push n-tail ignores)
+                    (push `(,n-tail (last ,n-value)) binds)
+                    `(collect-list-expander ',n-value ',n-tail args))))))
           (push `(,name (&rest args) ,macro-body) macros))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
+         ,@(if dx `((declare (dynamic-extent ,@dx))))
          ;; Even if the user reads each collection result,
          ;; reader conditionals might statically eliminate all writes.
          ;; Since we don't know, all the -n-tail variable are ignorable.
@@ -236,16 +277,6 @@
          ,@body))))
 
 ;;; Functions for compatibility sake:
-
-(defun memq (item list)
-  "Return tail of LIST beginning with first element EQ to ITEM."
-  (declare (inline member))
-  (member item list :test #'eq))
-
-(defun assq (item alist)
-  "Return the first pair of alist where item is EQ to the key of pair."
-  (declare (inline assoc))
-  (assoc item alist :test #'eq))
 
 ;;; Delete just one item
 (defun delq1 (item list)
@@ -324,6 +355,19 @@
                (error "malformed plist, odd number of elements"))
              (setq ,val (pop ,tail))
              (progn ,@body)))))
+
+;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
+;;; Otherwise, evaluate DEFAULT, store the resulting value in
+;;; HASH-TABLE and return two values: 1) the result of evaluating
+;;; DEFAULT 2) NIL.
+(defmacro ensure-gethash (key hash-table default)
+  (with-unique-names (n-key n-hash-table value foundp)
+    `(let ((,n-key ,key)
+           (,n-hash-table ,hash-table))
+       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
+         (if ,foundp
+             (values ,value t)
+             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 ;;; (binding* ({(names initial-value [flag])}*) body)
 ;;; FLAG may be NIL or :EXIT-IF-NULL
@@ -767,8 +811,7 @@ NOTE: This interface is experimental and subject to change."
 (deftype function-name () '(satisfies legal-fun-name-p))
 
 ;;; Signal an error unless NAME is a legal function name.
-(defun legal-fun-name-or-type-error (name)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper legal-fun-name-or-type-error (name)
   (unless (legal-fun-name-p name)
     (error 'simple-type-error
            :datum name
@@ -856,11 +899,22 @@ NOTE: This interface is experimental and subject to change."
 ;;; with this should reduce the size of the system by enough to be
 ;;; worthwhile.)
 (defmacro aver (expr)
-  `(unless ,expr
-     (%failed-aver ',expr)))
+  ;; Don't hold on to symbols, helping shake-packages.
+  (labels ((replace-symbols (expr)
+             (typecase expr
+               (null expr)
+               (symbol
+                (symbol-name expr))
+               (cons
+                (cons (replace-symbols (car expr))
+                      (replace-symbols (cdr expr))))
+               (t
+                expr))))
+    `(unless ,expr
+       (%failed-aver ',(replace-symbols expr)))))
 
 (defun %failed-aver (expr)
-  (bug "~@<failed AVER: ~2I~_~S~:>" expr))
+  (bug "~@<failed AVER: ~2I~_~A~:>" expr))
 
 (defun bug (format-control &rest format-arguments)
   (error 'bug
@@ -1138,8 +1192,7 @@ NOTE: This interface is experimental and subject to change."
 ;;; Without a proclaimed type, the call is "untrusted" and so the compiler
 ;;; would generate a post-call check that the function did not return.
 (declaim (ftype (function (t t t t t) nil) deprecation-error))
-(defun deprecation-error (software version namespace name replacements)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper deprecation-error (software version namespace name replacements)
   (error 'deprecation-error
          :namespace namespace
          :name name
@@ -1256,7 +1309,6 @@ NOTE: This interface is experimental and subject to change."
                                 ((or (listp id) ; must be a type-specifier
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
-                                                truly-dynamic-extent
                                                 sb-c::constant-value
                                                 sb-c::no-constraints))
                                      (info :type :kind id))
@@ -1312,7 +1364,7 @@ NOTE: This interface is experimental and subject to change."
 
 (defun call-with-sane-io-syntax (function)
   (declare (type function function))
-  #-sb-xc-host (declare (dynamic-extent function)) ; "unable"
+  (declare (dynamic-extent function))
   ;; force BOUNDP to be tested by declaring maximal safety
   ;; in case unsafe code really screwed things up.
   (declare (optimize (safety 3)))
@@ -1439,5 +1491,14 @@ NOTE: This interface is experimental and subject to change."
               (eq (symbol-value x) x))))
     (cons nil)
     (t t)))
+
+(declaim (inline first-bit-set))
+(defun first-bit-set (x)
+  #+(and x86-64 (not sb-xc-host))
+  (truly-the (values (mod #.sb-vm:n-word-bits) &optional)
+             (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
+  #-(and x86-64 (not sb-xc-host))
+  (1- (integer-length (logand x (- x)))))
+
 
 (defvar *top-level-form-p* nil)

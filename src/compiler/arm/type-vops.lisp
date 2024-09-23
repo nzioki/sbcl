@@ -17,22 +17,25 @@
     (inst tst value fixnum-tag-mask)
     (inst b (if not-p :ne :eq) target)))
 
-(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref)
+(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref immediate-tested)
   (let ((drop-through (gen-label)))
     (assemble ()
       (inst ands temp value fixnum-tag-mask)
       (inst b :eq (if not-p drop-through target)))
     (%test-headers value temp target not-p nil headers
                    :drop-through drop-through
-                   :value-tn-ref value-tn-ref)))
+                   :value-tn-ref value-tn-ref
+                   :immediate-tested immediate-tested)))
 
-(defun %test-immediate (value temp target not-p immediate)
+(defun %test-immediate (value temp target not-p immediate &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst and temp value widetag-mask)
     (inst cmp temp immediate)
     (inst b (if not-p :ne :eq) target)))
 
-(defun %test-lowtag (value temp target not-p lowtag)
+(defun %test-lowtag (value temp target not-p lowtag &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst and temp value lowtag-mask)
     (inst cmp temp lowtag)
@@ -40,8 +43,8 @@
 
 (defun %test-headers (value temp target not-p function-p headers
                       &key (drop-through (gen-label))
-                           value-tn-ref)
-  (declare (ignore value-tn-ref))
+                           value-tn-ref immediate-tested)
+  (declare (ignore value-tn-ref immediate-tested))
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind (when-true when-false)
         (if not-p
@@ -185,122 +188,6 @@
    (let ((not-target (gen-label)))
      (unsigned-byte-32-test value temp not-p target not-target)
      (emit-label not-target))))
-
-
-;;; MOD type checks
-(defun power-of-two-limit-p (x)
-  (and (fixnump x)
-       (= (logcount (1+ x)) 1)
-       ;; Immediate encodable
-       (> x (expt 2 23))))
-
-(define-vop (test-fixnum-mod-power-of-two)
-  (:args (value :scs (any-reg descriptor-reg
-                      unsigned-reg signed-reg)))
-  (:arg-types *
-              (:constant (satisfies power-of-two-limit-p)))
-  (:translate fixnum-mod-p)
-  (:conditional :eq)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 2
-     (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                          hi
-                          (fixnumize hi))))
-       (inst tst value (lognot fixnum-hi)))))
-
-(define-vop (test-fixnum-mod-tagged-unsigned-imm)
-  (:args (value :scs (any-reg unsigned-reg signed-reg)))
-  (:arg-types (:or tagged-num unsigned-num signed-num)
-              (:constant (satisfies encodable-immediate)))
-  (:translate fixnum-mod-p)
-  (:conditional :ls)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 3
-     (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                          hi
-                          (fixnumize hi))))
-       (inst cmp value fixnum-hi))))
-
-(defun encodable-immediate+1 (x)
-  (encodable-immediate (1+ x)))
-
-;;; Adding 1 and changing the codntions from <= to < allows to encode
-;;; more immediates.
-(define-vop (test-fixnum-mod-tagged-unsigned-imm+1)
-  (:args (value :scs (any-reg descriptor-reg
-                      unsigned-reg signed-reg)))
-  (:arg-types (:or tagged-num unsigned-num signed-num)
-              (:constant (satisfies encodable-immediate+1)))
-  (:translate fixnum-mod-p)
-  (:conditional :cc)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 3
-     (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                          (1+ hi)
-                          (fixnumize (1+ hi)))))
-       (inst cmp value fixnum-hi))))
-
-(define-vop (test-fixnum-mod-tagged-unsigned)
-  (:args (value :scs (any-reg unsigned-reg signed-reg)))
-  (:arg-types (:or tagged-num unsigned-num signed-num)
-              (:constant fixnum))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:translate fixnum-mod-p)
-  (:conditional :ls)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 4
-     (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                          hi
-                          (fixnumize hi))))
-       (load-immediate-word temp fixnum-hi)
-       (inst cmp value temp))))
-
-(defun encodable-immediate/+1 (x)
-  (or (encodable-immediate x)
-      (encodable-immediate (1+ x))))
-
-(define-vop (test-fixnum-mod-*-imm)
-  (:args (value :scs (any-reg descriptor-reg)))
-  (:arg-types * (:constant (satisfies encodable-immediate/+1)))
-  (:translate fixnum-mod-p)
-  (:conditional)
-  (:info target not-p hi)
-  (:policy :fast-safe)
-  (:generator 5
-    (let* ((1+ (not (encodable-immediate hi)))
-           (fixnum-hi (fixnumize (if 1+
-                                     (1+ hi)
-                                     hi)))
-           (skip (gen-label)))
-      (inst tst value fixnum-tag-mask)
-      (inst b :ne (if not-p target skip))
-      (inst cmp value fixnum-hi)
-      (inst b (if not-p
-                  (if 1+ :cs :hi)
-                  (if 1+ :cc :ls))
-            target)
-      (emit-label SKIP))))
-
-(define-vop (test-fixnum-mod-*)
-  (:args (value :scs (any-reg descriptor-reg)))
-  (:arg-types * (:constant fixnum))
-  (:translate fixnum-mod-p)
-  (:temporary (:scs (any-reg)) temp)
-  (:conditional)
-  (:info target not-p hi)
-  (:policy :fast-safe)
-  (:generator 6
-    (inst tst value fixnum-tag-mask)
-    (inst b :ne (if not-p target skip))
-    (let ((condition (if not-p :hi :ls)))
-      (load-immediate-word temp (fixnumize hi))
-      (inst cmp value temp)
-      (inst b condition target))
-    SKIP))
 
 ;;;; List/symbol types:
 ;;;

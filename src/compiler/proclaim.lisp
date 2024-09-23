@@ -33,8 +33,8 @@
     (let ((name (uncross name)))
       (setq *undefined-warnings*
             (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
+                         (and (eq (undefined-warning-kind x) kind)
+                              (equal (undefined-warning-name x) name)))
                        *undefined-warnings*))))
   (values))
 
@@ -243,6 +243,7 @@
           #-sb-xc-host
           (let ((type (compiler-specifier-type typespec)))
             (cond ((not type))
+                  ((contains-unknown-type-p type))
                   (ospec
                    (setf (car ospec) (type-union (car ospec) type)))
                   (t
@@ -320,11 +321,8 @@
       (:symbol name "globally declaring ~A ~A" kind)
     (if (eq kind 'always-bound)
         (setf (info :variable :always-bound name) info-value)
-        (setf (info :variable :kind name) info-value))))
-
-(defun type-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'type-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
+        (setf (info :variable :kind name) info-value)))
+  #-sb-xc-host (sb-impl::unset-symbol-progv-optimize name))
 
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
@@ -332,17 +330,29 @@
 
   (with-single-package-locked-error
       (:symbol name "globally declaring the TYPE of ~A")
-    (when (eq (info :variable :where-from name) :declared)
-      (let ((old-type (info :variable :type name)))
-        (when (type/= type old-type)
-          (type-proclamation-mismatch-warn
-           name (type-specifier old-type) type-specifier))))
+    (let (warned)
+     (when (eq (info :variable :where-from name) :declared)
+       (let ((old-type (info :variable :type name)))
+         (when (type/= type old-type)
+           (setf warned t)
+           (warn 'type-proclamation-mismatch-warning
+                 :name name
+                 :old (type-specifier old-type)
+                 :new type-specifier))))
+      (when (and (not warned)
+                 (boundp name))
+        #-sb-xc-host
+        (let ((value (symbol-value name)))
+          (when (multiple-value-bind (p really) (ctypep value type)
+                  (and really
+                       (not p)))
+            (warn 'type-proclamation-mismatch-warning
+                  :name name
+                  :old (type-of value)
+                  :value value
+                  :new type-specifier)))))
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
-
-(defun ftype-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'ftype-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
 
 (defun proclaim-ftype (name type-oid type-specifier where-from)
   (declare (type (or ctype defstruct-description) type-oid))
@@ -353,23 +363,45 @@
     (error "Not a function type: ~/sb-impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
-    (when (eq (info :function :where-from name) :declared)
-      (let ((old-type (global-ftype name))
-            (type (if (ctype-p type-oid)
-                      type-oid
-                      (specifier-type type-specifier))))
-        (cond
-          ((not (type/= type old-type))) ; not changed
-          ((not (info :function :info name)) ; not a known function
-           (ftype-proclamation-mismatch-warn
-            name (type-specifier old-type) type-specifier))
-          ((csubtypep type old-type)) ; tighten known function type
-          (t
-           (cerror "Continue"
-                   'ftype-proclamation-mismatch-error
+    (let ((from (info :function :where-from name)))
+     (case from
+       (:declared
+        (let ((old-type (global-ftype name))
+              (type (if (ctype-p type-oid)
+                        type-oid
+                        (specifier-type type-specifier))))
+          (cond
+            ((not (type/= type old-type)))    ; not changed
+            ((not (info :function :info name)) ; not a known function
+             (warn 'ftype-proclamation-mismatch-warning
                    :name name
                    :old (type-specifier old-type)
-                   :new type-specifier)))))
+                   :new type-specifier))
+            ((csubtypep type old-type)) ; tighten known function type
+            (t
+             (cerror "Continue"
+                     'ftype-proclamation-mismatch-error
+                     :name name
+                     :old (type-specifier old-type)
+                     :new type-specifier)))))
+       (:defined
+        (when (and #+sb-xc-host (not (sb-cold::make-host-2-parallelism)))
+          (let* ((old-type (global-ftype name))
+                 (type (if (ctype-p type-oid)
+                           type-oid
+                           (specifier-type type-specifier)))
+                 (old-return-type (if (fun-type-p old-type)
+                                      (fun-type-returns old-type)
+                                      *wild-type*))
+                 (return-type (if (fun-type-p type)
+                                  (fun-type-returns type)
+                                  *wild-type*)))
+            (cond
+              ((values-subtypep old-return-type return-type))
+              (t
+               (style-warn 'sb-kernel::ftype-proclamation-derived-mismatch-warning
+                           :name name :old (type-specifier old-type)
+                           :new type-specifier))))))))
     ;; Now references to this function shouldn't be warned about as
     ;; undefined, since even if we haven't seen a definition yet, we
     ;; know one is planned.
@@ -386,8 +418,8 @@
 (defun seal-class (classoid)
   (declare (type classoid classoid))
   (setf (classoid-state classoid) :sealed)
-  (sb-kernel::do-subclassoids ((subclassoid wrapper) classoid)
-    (declare (ignore wrapper))
+  (sb-kernel::do-subclassoids ((subclassoid layout) classoid)
+    (declare (ignore layout))
     (setf (classoid-state subclassoid) :sealed)))
 
 (defun process-freeze-type-declaration (type-specifier)

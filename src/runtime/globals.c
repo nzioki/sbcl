@@ -17,7 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "validate.h"
@@ -58,18 +58,13 @@ lispobj *static_code_space_free_pointer;
 #endif
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-lispobj *text_space_highwatermark;
 lispobj *fixedobj_free_pointer;
-lispobj ALIEN_LINKAGE_TABLE_SPACE_START;
+lispobj ALIEN_LINKAGE_SPACE_START;
 #endif
 os_vm_address_t anon_dynamic_space_start;
 // The end of immobile text mapped from disk, equivalently the starting address
 // of new objects handed out by the code allocator.
 lispobj* tlsf_mem_start; // meaningful only if immobile space
-
-#ifndef LISP_FEATURE_GENCGC /* GENCGC has its own way to record trigger */
-lispobj *current_auto_gc_trigger;
-#endif
 
 lispobj lisp_package_vector;
 // Tagged lisp pointer to a 'struct arena' (which is also a lisp DEFSTRUCT)
@@ -82,11 +77,6 @@ void globals_init(void)
      * validate() and coreparse(). */
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || !defined(LISP_FEATURE_SB_THREAD)
     current_control_frame_pointer = (lispobj *)0;
-#endif
-
-#ifndef LISP_FEATURE_GENCGC
-    /* no GC trigger yet */
-    current_auto_gc_trigger = NULL;
 #endif
 
 #ifndef LISP_FEATURE_SB_THREAD
@@ -102,3 +92,22 @@ void globals_init(void)
 #endif
 #endif
 }
+
+uword_t permgen_bounds[2];
+lispobj *permgen_space_free_pointer;
+
+uword_t FIXEDOBJ_SPACE_START, TEXT_SPACE_START;
+lispobj *text_space_highwatermark;
+#ifndef LISP_FEATURE_IMMOBILE_SPACE
+/* this is a KLUDGE. If #+immobile-space then text_space_size gets statically
+ * initialized from the genesis constant TEXT_SPACE_SIZE, as it requires because
+ * the text space card table is allocated before parsing the core.
+ * But if #-immobile-space then genesis does not emit that constant.
+ * The right thing might be to read the space size from the core before making
+ * the card table. But I don't want to, since I have WIP to remove the card table
+ * for code and instead track written objects in a linked list. (Card table scan
+ * time is proportional to space size, but remembered set scan time is proportional
+ * to old object mutation rate which is near zero for pages of code)
+ */
+unsigned int text_space_size;
+#endif

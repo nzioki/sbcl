@@ -343,7 +343,8 @@
   ;; info about how to emit MOVE-ARG VOPs for the &MORE operand in
   ;; call/return VOPs
   (move-args nil :type (member nil :local-call :full-call :known-return :fixed))
-  (before-load :unspecified :type (or (member :unspecified) list)))
+  (before-load :unspecified :type (or (member :unspecified) list))
+  (gc-barrier nil))
 (declaim (freeze-type vop-parse))
 (defprinter (vop-parse)
   name
@@ -371,7 +372,7 @@
 ;;; The list of slots in the structure, not including the OPERANDS slot.
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
-    '(arg-types args before-load body conditional-p cost guard ignores info-args inherits
+    '(arg-types args before-load body conditional-p cost gc-barrier guard ignores info-args inherits
       ltn-policy more-args more-results move-args name node-var note optional-results result-types
       results save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
@@ -623,34 +624,36 @@
 (defun find-move-funs (op load-p)
   (collect ((funs))
     (dolist (sc-name (operand-parse-scs op))
-      (let* ((sc (sc-or-lose sc-name))
-             (scn (sc-number sc))
-             (load-scs (append (when load-p
-                                 (sc-constant-scs sc))
-                               (sc-alternate-scs sc))))
-        (cond
-         (load-scs
-          (dolist (alt load-scs)
-            (unless (member (sc-name alt) (operand-parse-scs op) :test #'eq)
-              (let* ((altn (sc-number alt))
-                     (name (if load-p
-                               (svref (sc-move-funs sc) altn)
-                               (svref (sc-move-funs alt) scn)))
-                     (found (or (assoc alt (funs) :test #'member)
-                                (rassoc name (funs)))))
-                (unless name
-                  (error "no move function defined to ~:[save~;load~] SC ~S ~
+      (unless (or (consp sc-name)
+                  (getf *backend-cond-scs* sc-name))
+        (let* ((sc (sc-or-lose sc-name))
+               (scn (sc-number sc))
+               (load-scs (append (when load-p
+                                   (sc-constant-scs sc))
+                                 (sc-alternate-scs sc))))
+          (cond
+            (load-scs
+             (dolist (alt load-scs)
+               (unless (member (sc-name alt) (operand-parse-scs op) :test #'eq)
+                 (let* ((altn (sc-number alt))
+                        (name (if load-p
+                                  (svref (sc-move-funs sc) altn)
+                                  (svref (sc-move-funs alt) scn)))
+                        (found (or (assoc alt (funs) :test #'member)
+                                   (rassoc name (funs)))))
+                   (unless name
+                     (error "no move function defined to ~:[save~;load~] SC ~S ~
                           ~:[to~;from~] from SC ~S"
-                         load-p sc-name load-p (sc-name alt)))
-                (cond (found
-                       (pushnew alt (car found)))
-                      (t
-                       (funs (cons (list alt) name))))))))
-         ((member (sb-kind (sc-sb sc)) '(:non-packed :unbounded)))
-         (t
-          (error "SC ~S has no alternate~:[~; or constant~] SCs, yet it is~@
+                            load-p sc-name load-p (sc-name alt)))
+                   (cond (found
+                          (pushnew alt (car found)))
+                         (t
+                          (funs (cons (list alt) name))))))))
+            ((member (sb-kind (sc-sb sc)) '(:non-packed :unbounded)))
+            (t
+             (error "SC ~S has no alternate~:[~; or constant~] SCs, yet it is~@
                   mentioned in the restriction for operand ~S"
-                 sc-name load-p (operand-parse-name op))))))
+                    sc-name load-p (operand-parse-name op)))))))
     (funs)))
 
 ;;; Return a form to load/save the specified operand when it has a
@@ -830,13 +833,11 @@
 
 (defvar *parse-vop-operand-count*)
 (defun make-operand-parse-temp ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-TEMP-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C") "OPERAND-PARSE-TEMP-"
+                *parse-vop-operand-count*))
 (defun make-operand-parse-load-tn ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-LOAD-TN-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C")
+                "OPERAND-PARSE-LOAD-TN-" *parse-vop-operand-count*))
 
 ;;; Given a list of operand specifications as given to DEFINE-VOP,
 ;;; return a list of OPERAND-PARSE structures describing the fixed
@@ -1105,6 +1106,8 @@
          (setf (vop-parse-optional-results parse)
                (append (vop-parse-optional-results parse)
                        (rest spec))))
+        (:gc-barrier
+         (setf (vop-parse-gc-barrier parse) (rest spec)))
         (t
          (error "unknown option specifier: ~S" (first spec)))))
     (cond (arg-refs-p
@@ -1153,43 +1156,63 @@
   (declare (type operand-parse op))
   (let ((scs (operand-parse-scs op))
         (costs (make-array sb-vm:sc-number-limit :initial-element nil))
-        (load-scs (make-array sb-vm:sc-number-limit :initial-element nil)))
+        (load-scs (make-array sb-vm:sc-number-limit :initial-element nil))
+        (cond-scs))
     (dolist (sc-name (reverse scs))
-      (let* ((load-sc (sc-or-lose sc-name))
-             (load-scn (sc-number load-sc)))
-        (setf (svref costs load-scn) 0)
-        (setf (svref load-scs load-scn) t)
-        (dolist (op-sc (append (when load-p
-                                 (sc-constant-scs load-sc))
-                               (sc-alternate-scs load-sc)))
-          (let* ((op-scn (sc-number op-sc))
-                 (load (if load-p
-                           (aref (sc-load-costs load-sc) op-scn)
-                           (aref (sc-load-costs op-sc) load-scn))))
-            (unless load
-              (error "no move function defined to move ~:[from~;to~] SC ~
+      (let ((load-sc (gethash sc-name *backend-sc-names*)))
+        (cond (load-sc
+               (let* ((load-scn (sc-number load-sc)))
+                 (setf (svref costs load-scn) 0)
+                 (setf (svref load-scs load-scn) t)
+                 (dolist (op-sc (append (when load-p
+                                          (sc-constant-scs load-sc))
+                                        (sc-alternate-scs load-sc)))
+                   (let* ((op-scn (sc-number op-sc))
+                          (load (if load-p
+                                    (aref (sc-load-costs load-sc) op-scn)
+                                    (aref (sc-load-costs op-sc) load-scn))))
+                     (unless load
+                       (error "no move function defined to move ~:[from~;to~] SC ~
                       ~S~%~:[to~;from~] alternate or constant SC ~S"
-                     load-p sc-name load-p (sc-name op-sc)))
+                              load-p sc-name load-p (sc-name op-sc)))
 
-            (let ((op-cost (svref costs op-scn)))
-              (when (or (not op-cost) (< load op-cost))
-                (setf (svref costs op-scn) load)))
+                     (let ((op-cost (svref costs op-scn)))
+                       (when (or (not op-cost) (< load op-cost))
+                         (setf (svref costs op-scn) load)))
 
-            (let ((op-load (svref load-scs op-scn)))
-              (unless (eq op-load t)
-                (pushnew load-scn (svref load-scs op-scn))))))
+                     (let ((op-load (svref load-scs op-scn)))
+                       (unless (eq op-load t)
+                         (pushnew load-scn (svref load-scs op-scn))))))
 
-        (dotimes (i sb-vm:sc-number-limit)
-          (unless (svref costs i)
-            (let ((op-sc (svref *backend-sc-numbers* i)))
-              (when op-sc
-                (let ((cost (if load-p
-                                (svref (sc-move-costs load-sc) i)
-                                (svref (sc-move-costs op-sc) load-scn))))
-                  (when cost
-                    (setf (svref costs i) cost)))))))))
+                 (dotimes (i sb-vm:sc-number-limit)
+                   (unless (svref costs i)
+                     (let ((op-sc (svref *backend-sc-numbers* i)))
+                       (when op-sc
+                         (let ((cost (if load-p
+                                         (svref (sc-move-costs load-sc) i)
+                                         (svref (sc-move-costs op-sc) load-scn))))
+                           (when cost
+                             (setf (svref costs i) cost)))))))))
+              ((let ((cond-sc (getf *backend-cond-scs* sc-name)))
+                 (when cond-sc
+                   (push cond-sc cond-scs))))
+              ((consp sc-name)
+               (push sc-name cond-scs))
+              (t
+               (error "~S is not a defined storage class." sc-name)))))
 
-    (values costs load-scs)))
+    (values costs load-scs
+            (loop for (cond-sc . test) in cond-scs
+                  collect
+                  (let* ((load-sc (sc-or-lose cond-sc))
+                         (load-scn (sc-number load-sc)))
+                    `(setf (svref load-scs ,load-scn)
+                           ,(if (symbolp test)
+                                `(,test ',(svref load-scs load-scn))
+                                `(lambda (tn)
+                                   (if (progn ,@test)
+                                       t
+                                       ',(svref load-scs load-scn))))))))))
 
 (defconstant-eqx +no-costs+
   (make-array sb-vm:sc-number-limit :initial-element 0)
@@ -1208,16 +1231,24 @@
 
 (defun compute-costs-and-restrictions-list (ops load-p)
   (declare (list ops))
-  (collect ((costs)
-            (scs))
-    (dolist (op ops)
-      (multiple-value-bind (costs scs) (compute-loading-costs-if-any op load-p)
-        (costs costs)
-        (scs scs)))
-    (values (costs) (scs))))
+  (let ((fixups))
+   (collect ((costs)
+             (scs))
+     (dolist (op ops)
+       (multiple-value-bind (costs scs fixup) (compute-loading-costs-if-any op load-p)
+         (costs costs)
+         (cond (fixup
+                (setf fixups t)
+                (scs `(let ((load-scs (vector ,@(loop for sc across scs
+                                                      collect `',sc))))
+                        ,@fixup
+                        load-scs)))
+               (t
+                (scs scs)))))
+     (values (costs) (scs) fixups))))
 
 (defun make-costs-and-restrictions (parse)
-  (multiple-value-bind (arg-costs arg-scs)
+  (multiple-value-bind (arg-costs arg-scs fixups)
       (compute-costs-and-restrictions-list (vop-parse-args parse) t)
     (multiple-value-bind (result-costs result-scs)
         (compute-costs-and-restrictions-list (vop-parse-results parse) nil)
@@ -1227,12 +1258,14 @@
           `(:cost ,(vop-parse-cost parse)
 
             :arg-costs ',arg-costs
-            :arg-load-scs ',arg-scs
+            :arg-load-scs ,(if fixups
+                               `(list ,@arg-scs)
+                               `',arg-scs)
             :result-costs ',result-costs
             :result-load-scs ',result-scs
 
             :more-arg-costs ',more-arg-costs
-            :more-arg-load-scs ',(unless (eq more-arg-costs +no-loads+)
+            :more-arg-load-scs ',(unless (eq more-arg-costs +no-costs+)
                                    (substitute-if nil #'listp more-arg-scs))
 
             :more-result-costs
@@ -1321,7 +1354,12 @@
         (unless (or (eq type '*)
                     (dolist (ptype ptypes nil)
                       (when (sc-allowed-by-primitive-type
-                             (sc-or-lose sc)
+                             (or (gethash (if (consp sc)
+                                              (car sc)
+                                              sc)
+                                          *backend-sc-names*)
+                                 (sc-or-lose (car (getf *backend-cond-scs* sc)))
+                                 (error "~S is not a defined storage class." sc))
                              (primitive-type-or-lose ptype))
                         (return t)))
                     #+arm64
@@ -1493,7 +1531,10 @@
                     it
                     `(lambda (node) (declare (ignore node)) ,it)))
       :note ',(vop-parse-note parse)
-      :info-arg-count ,(length (vop-parse-info-args parse))
+      :info-arg-count ,(- (length (vop-parse-info-args parse))
+                          (if (vop-parse-gc-barrier parse)
+                              1
+                              0))
       :ltn-policy ',(vop-parse-ltn-policy parse)
       :save-p ',(vop-parse-save-p parse)
       :move-args ',(vop-parse-move-args parse)
@@ -1507,7 +1548,8 @@
       :variant (list ,@variant)
       :after-sc-selection
       ;; TODO: inherit it?
-      ,(make-after-sc-function parse))))
+      ,(make-after-sc-function parse)
+      :gc-barrier ',(vop-parse-gc-barrier parse))))
 
 ;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
 ;;; If specified, INHERITS is the name of a VOP that we default
@@ -1757,51 +1799,90 @@
             (temps)
             (results)
             (result-types))
-    (loop for (var arg) in vars
-          for (name this-sc) = var
-          for (nil sc type . rest) = (if this-sc
-                                         var
-                                         prev)
-          for prev = (if this-sc
-                         var
-                         prev)
-          do (cond ((eq name :info)
-                    (infos this-sc)
-                    (input arg))
-                   (arg
-                    (input arg)
-                    (args (list* name :scs (list sc) rest))
-                    (arg-types (or type '*)))
-                   (t
-                    (temps `(:temporary (:sc ,sc ,@rest)
-                                        ,name)))))
-    (loop for result in results
-          for (name this-sc) = result
-          for (nil sc type . rest) = (if this-sc
-                                         result
-                                         prev)
-          for prev = (if this-sc
-                         result
-                         prev)
-          do (results (list* name :scs (list sc) rest))
-             (result-types (or type '*)))
-    `(inline-%primitive
-      ,(eval (%define-vop nil nil
-                          (delete nil
-                                  (list* (and (args)
-                                              (list* :args (args)))
-                                         (and (arg-types)
-                                              (list* :arg-types (arg-types)))
-                                         (and (results)
-                                              (list* :results (results)))
-                                         (and (result-types)
-                                              (list* :result-types (result-types)))
-                                         (and (infos)
-                                              (list* :info (infos)))
-                                         (list* :generator 0 body)
-                                         (temps)))
-                          nil))
-      ,@(input))))
+    (flet ((sc-to-primtype (sc)
+             (case sc
+               (sb-vm::any-reg
+                'fixnum)
+               (sb-vm::unsigned-reg
+                'sb-vm::unsigned-num)
+               (sb-vm::signed-reg
+                'sb-vm::signed-num)
+               (sb-vm::sap-reg
+                'system-area-pointer)
+               (sb-vm::descriptor-reg
+                t)
+               (sb-vm::single-reg
+                'single-float)
+               (sb-vm::double-reg
+                'double-float)
+               (sb-vm::complex-double-reg
+                'complex-double-float)
+               (sb-vm::complex-single-reg
+                'complex-single-float)
+               (t
+                '*)))
+           (primtype-to-type (type)
+             (case type
+               (sb-vm::unsigned-num
+                'word)
+               (sb-vm::signed-num
+                'sb-vm:signed-word)
+               (sb-vm::tagged-num
+                'fixnum)
+               (complex-double-float
+                '(complex double-float))
+               (complex-single-float
+                '(complex single-float))
+               (* t)
+               (t (primitive-type-specifier (primitive-type-or-lose type))))))
+      (loop for (var arg) in vars
+            for (name this-sc) = var
+            for (nil sc type . rest) = (if this-sc
+                                           var
+                                           prev)
+            for prev = (if this-sc
+                           var
+                           prev)
+            do (cond ((eq name :info)
+                      (infos this-sc)
+                      (input arg))
+                     (arg
+                      (args (list* name :scs (list sc) rest))
+                      (let ((type (or type (sc-to-primtype sc))))
+                        (arg-types type)
+                        (input `(the ,(primtype-to-type type) ,arg))))
+                     (t
+                      (temps `(:temporary (:sc ,sc ,@rest)
+                                          ,name)))))
+      (loop for result in results
+            for (name this-sc) = result
+            for (nil sc type . rest) = (if this-sc
+                                           result
+                                           prev)
+            for prev = (if this-sc
+                           result
+                           prev)
+            do (results (list* name :scs (list sc) rest))
+               (result-types (or type (sc-to-primtype sc))))
+      `(truly-the
+        (values ,@(mapcar #'primtype-to-type (result-types)) &optional)
+        (inline-%primitive
+         ,(eval (%define-vop nil nil
+                             (delete nil
+                                     (list* (and (args)
+                                                 (list* :args (args)))
+                                            (and (arg-types)
+                                                 (list* :arg-types (arg-types)))
+                                            (and (results)
+                                                 (list* :results (results)))
+                                            (and (result-types)
+                                                 (list* :result-types (result-types)))
+                                            (and (infos)
+                                                 (list* :info (infos)))
+                                            (list* :generator 0 body)
+                                            (temps)))
+                             nil))
+         ,@(input))))))
 
 (macrolet
     ((def ()
@@ -1936,12 +2017,18 @@
     (let ((n-head nil)
           (n-prev nil))
       (dolist (op fixed)
-        (let ((n-ref (gensym)))
-          (binds `(,n-ref (reference-tn ,op ,write-p)))
-          (if n-prev
-              (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
-              (setq n-head n-ref))
-          (setq n-prev n-ref)))
+        (multiple-value-bind (op lvar)
+            (if (typep op '(cons (eql :lvar)))
+                (values (third op) (second op))
+                op)
+          (let ((n-ref (gensym)))
+            (binds `(,n-ref (reference-tn ,op ,write-p)))
+            (when lvar
+              (forms `(setf (tn-ref-type ,n-ref) (lvar-type ,lvar))))
+            (if n-prev
+                (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
+                (setq n-head n-ref))
+            (setq n-prev n-ref))))
 
       (when more
         (let ((n-more (gensym)))
@@ -1978,7 +2065,10 @@
   (let* ((parse (vop-parse-or-lose name))
          (arg-count (length (vop-parse-args parse)))
          (result-count (length (vop-parse-results parse)))
-         (info-count (length (vop-parse-info-args parse)))
+         (info-count (- (length (vop-parse-info-args parse))
+                        (if (vop-parse-gc-barrier parse)
+                            1
+                            0)))
          (noperands (+ arg-count result-count info-count))
          (n-node (gensym))
          (n-block (gensym))

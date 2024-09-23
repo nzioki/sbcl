@@ -150,7 +150,7 @@
                              (car body)))
       (let ((default-constructor
              (dd-default-constructor
-              (sb-kernel::wrapper-%info (classoid-wrapper classoid)))))
+              (sb-kernel::layout-%info (classoid-layout classoid)))))
         (unless default-constructor
           (simple-reader-error
            stream
@@ -267,7 +267,7 @@
         (return-from recurse (sharp-equal-wrapper-value tree)))
       ;; pick off types that never need to be sought in or added to the xset.
       ;; (there are others, but these are common and quick to check)
-      (when (typep tree '(or number symbol))
+      (when (or (unbound-marker-p tree) (typep tree '(or number symbol)))
         (return-from recurse tree))
       (unless (xset-member-p tree circle-table)
         (add-to-xset tree circle-table)
@@ -296,7 +296,7 @@
                       (i sb-vm:instance-data-start (1+ i)))
                      ((>= i len))
                    (process (%instance-ref tree i)))
-                 (let ((dd (wrapper-dd (%instance-wrapper tree))))
+                 (let ((dd (layout-dd (%instance-layout tree))))
                    (dolist (dsd (dd-slots dd))
                      (when (eq (dsd-raw-type dsd) t)
                        (process (%instance-ref tree (dsd-index dsd))))))))

@@ -16,8 +16,8 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 1)
 
-(defconstant +backend-fasl-file-implementation+ :x86-64)
-(defconstant-eqx +fixup-kinds+ #(:abs32 :rel32 :absolute) #'equalp)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:abs32 :*abs32 :rel32 :absolute) #'equalp)
 
 ;;; This size is supposed to indicate something about the actual granularity
 ;;; at which you can map memory.  We just hardwire it, but that may or may not
@@ -30,26 +30,20 @@
 (defconstant gencgc-page-bytes 32768)
 ;;; The divisor relative to page-bytes which computes the granularity
 ;;; at which writes to old generations are logged.
-(defconstant cards-per-page 32)
+#+soft-card-marks (defconstant cards-per-page
+                               #+mark-region-gc (/ gencgc-page-bytes 128)
+                               #-mark-region-gc 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
 (defconstant immobile-card-bytes 4096)
 
-;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
-;;; and a 16 bit quantity depending on context. This is because Intel
-;;; insists on calling 16 bit things words and 32 bit things
-;;; double-words (or dwords). Therefore, in the instruction definition
-;;; and register specs, we use the Intel convention. But whenever we
-;;; are talking about stuff the rest of the lisp system might be
-;;; interested in, we use ``word'' to mean the size of a descriptor
-;;; object, which is 64 bits.
+;;; ### Note: 'lispword' always means 8 bytes, and 'word' usually means
+;;; the same as 'lispword', except in the assembler and disassembler,
+;;; where 'word' means 2 bytes to match AMD/Intel terminology.
 
 ;;;; machine architecture parameters
 
@@ -92,25 +86,38 @@
 ;;; it would cause. -- JES, 2005-12-11
 
 #+(or linux darwin)
-(!gencgc-space-setup #x50000000
-                     :read-only-space-size #+metaspace #.(* 2 1024 1024)
-                                           #-metaspace 0
-                     :fixedobj-space-size #.(* 40 1024 1024)
+(gc-space-setup #x50000000
+                     :read-only-space-size 0
+                     :fixedobj-space-size #.(* 60 1024 1024)
                      :text-space-size #.(* 130 1024 1024)
+                     :text-space-start #xB800000000
                      :dynamic-space-start #x1000000000)
 
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
-;;; run under the default 512M data size limit.
+;;; run under the default 1G data size limit.
 
 #-(or linux darwin)
-(!gencgc-space-setup #x20000000
+(gc-space-setup #x20000000
                      :read-only-space-size 0
-                     :dynamic-space-start #x1000000000
-                     #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
+                     :fixedobj-space-size #.(* 60 1024 1024)
+                     :text-space-size #.(* 130 1024 1024)
+                     :text-space-start #x1000000000
+                     :dynamic-space-start #x1100000000
+                     #+openbsd :dynamic-space-size #+openbsd #x2fff0000)
 
 (defconstant alien-linkage-table-growth-direction :up)
 (defconstant alien-linkage-table-entry-size 16)
 
+#+(and sb-xc-host (not immobile-space))
+(defparameter lisp-linkage-space-addr #x1500000000) ; arbitrary
+#+(and sb-xc-host immobile-space)
+(progn
+(defparameter lisp-linkage-space-addr
+  ;; text space:
+  ;;   | ALIEN LINKAGE | LISP LINKAGE | CODE OBJECTS ...
+  ;;   |<------------->|<------------>| ....
+  (- text-space-start (* (ash 1 n-linkage-index-bits) 8)))
+(defparameter alien-linkage-space-start (- lisp-linkage-space-addr alien-linkage-space-size)))
 
 (defenum (:start 8)
   halt-trap
@@ -120,7 +127,6 @@
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  undefined-function-trap
   invalid-arg-count-trap
   memory-fault-emulation-trap
   #+sb-safepoint global-safepoint-trap
@@ -152,10 +158,11 @@
 (defconstant-eqx +static-symbols+
  `#(,@+common-static-symbols+
     #+(and immobile-space (not sb-thread)) function-layout
+    ;; I had trouble making alien_stack_pointer use the thread slot for #-sb-thread
+    ;; because WITH-ALIEN binds SB-C:*ALIEN-STACK-POINTER* in an ordinary LET.
+    ;; That being so, it has to use the #-sb-thread mechanism of placing the new value
+    ;; in the symbol's value slot for compatibility with UNBIND and all else.
     #-sb-thread *alien-stack-pointer*    ; a thread slot if #+sb-thread
-     ;; interrupt handling
-    #-sb-thread *pseudo-atomic-bits*     ; ditto
-    #-sb-thread *binding-stack-pointer* ; ditto
     ;; Since the text space and alien linkage table might both get relocated on startup
     ;; under #+immobile-space, an alien callback wrapper can't wire in the address
     ;; of a word that holds the C function pointer to callback_wrapper_trampoline.
@@ -166,17 +173,19 @@
     *cpu-feature-bits*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-    `#(ensure-symbol-hash sb-impl::install-hash-table-lock update-object-layout
-       ,@common-static-fdefns)
-  #'equalp)
+;; No static-fdefns are actually needed, but #() here causes the
+;; "recursion in known function" error to occur in ltn
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 #+sb-simd-pack
 (progn
   (defconstant-eqx +simd-pack-element-types+
-      #(single-float double-float
-        (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32) (unsigned-byte 64)
-        (signed-byte 8) (signed-byte 16) (signed-byte 32) (signed-byte 64))
+      (coerce
+       (hash-cons
+        '(single-float double-float
+          (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32) (unsigned-byte 64)
+          (signed-byte 8) (signed-byte 16) (signed-byte 32) (signed-byte 64)))
+       'vector)
     #'equalp)
   (defconstant sb-kernel::+simd-pack-wild+
     (ldb (byte (length +simd-pack-element-types+) 0) -1))
@@ -190,14 +199,3 @@
         simd-pack-256-ub8 simd-pack-256-ub16 simd-pack-256-ub32 simd-pack-256-ub64
         simd-pack-256-sb8 simd-pack-256-sb16 simd-pack-256-sb32 simd-pack-256-sb64)
     #'equalp))
-
-(defconstant undefined-fdefn-header
-  ;; This constant is constructed as follows: Take the INT opcode
-  ;; plus the undefined-fun trap byte, then the bytes of the 'disp' field
-  ;; of the JMP instruction that would overwrite the INT instruction.
-  ;;   INT3 <trap-code> = CC **
-  ;;   JMP [RIP+16]     = FF 25 10 00 00 00 00
-  ;; When assigning a function we'll change the first two bytes to 0xFF 0x25.
-  ;; The 'disp' field will aready be correct.
-  (logior (ash undefined-function-trap 8)
-          (+ #x100000 (or #+int4-breakpoints #xCE #xCC))))

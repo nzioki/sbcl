@@ -122,28 +122,11 @@
       (let (#+gs-seg (thread-tn nil))
         (ea thread-segment-reg (ash slot-index word-shift) thread-tn))))
 
-#+sb-thread
-(progn
-  ;; Return an EA for the TLS of SYMBOL, or die.
-  (defun symbol-known-tls-cell (symbol)
-    (let ((index (info :variable :wired-tls symbol)))
-      (aver (integerp index))
-      (thread-tls-ea index)))
+(defmacro load-tl-symbol-value (reg symbol)
+  `(inst mov ,reg (thread-slot-ea ,(symbol-thread-slot symbol))))
 
-  ;; LOAD/STORE-TL-SYMBOL-VALUE macros are ad-hoc (ugly) emulations
-  ;; of (INFO :VARIABLE :WIRED-TLS) = :ALWAYS-THREAD-LOCAL
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(inst mov ,reg (symbol-known-tls-cell ',symbol)))
-
-  (defmacro store-tl-symbol-value (reg symbol)
-    `(inst mov (symbol-known-tls-cell ',symbol) ,reg)))
-
-#-sb-thread
-(progn
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(inst mov ,reg (static-symbol-value-ea ',symbol)))
-  (defmacro store-tl-symbol-value (reg symbol)
-    `(inst mov (static-symbol-value-ea ',symbol) ,reg)))
+(defmacro store-tl-symbol-value (reg symbol)
+  `(inst mov (thread-slot-ea ,(symbol-thread-slot symbol)) ,reg))
 
 (defmacro load-binding-stack-pointer (reg)
   `(load-tl-symbol-value ,reg *binding-stack-pointer*))
@@ -169,17 +152,16 @@
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (:elsewhere)
-    (let ((start-lab (gen-label)))
-      (emit-label start-lab)
-      (when preamble-emitter
-        (funcall preamble-emitter))
-      (emit-error-break vop
-                        (case error-code ; should be named ERROR-SYMBOL really
-                          (invalid-arg-count-error invalid-arg-count-trap)
-                          (t error-trap))
-                        (error-number-or-lose error-code)
-                        values)
-      start-lab)))
+    START
+    (when preamble-emitter
+      (funcall preamble-emitter))
+    (emit-error-break vop
+                      (case error-code ; should be named ERROR-SYMBOL really
+                        (invalid-arg-count-error invalid-arg-count-trap)
+                        (t error-trap))
+                      (error-number-or-lose error-code)
+                      values)
+    (values start))) ; prevent START from being seen as a label defn
 
 
 ;;;; PSEUDO-ATOMIC
@@ -203,41 +185,43 @@
   ;; straight-line code, e.g. (LIST (LIST X Y) (LIST Z W)) should emit 1 safepoint
   ;; not 3, even if we consider it 3 separate pointer bumps.
   ;; (Ideally we'd only do 1 pointer bump, but that's a separate issue)
-  (inst test :byte rax-tn (ea (- static-space-start gc-safepoint-trap-offset))))
+  (inst test :byte rax-tn (ea -8 gc-card-table-reg-tn)))
+
+(macrolet ((pa-bits-ea ()
+             `(thread-slot-ea thread-pseudo-atomic-bits-slot
+                              #+gs-seg ,@(if thread (list thread))))
+           (nonzero-bits ()
+             ;; reg-mem move is allegedly faster than imm-mem according to
+             ;; someone at some point. Whether that's true or not, it is what it is.
+             ;; THREAD-TN is a better choice than RBP-TN since it's constant.
+             #+(and sb-thread (not gs-seg)) 'thread-tn
+             #-(and sb-thread (not gs-seg)) 'rbp-tn))
+  (defun emit-begin-pseudo-atomic ()
+    #-sb-safepoint (inst mov (pa-bits-ea) (nonzero-bits)))
+  (defun emit-end-pseudo-atomic ()
+    #+sb-safepoint (emit-safepoint)
+    #-sb-safepoint
+    (assemble ()
+      (inst xor (pa-bits-ea) (nonzero-bits))
+      (inst jmp :z OUT)
+      ;; if PAI was set, interrupts were disabled at the same time
+      ;; using the process signal mask.
+      #+int1-breakpoints (inst icebp)
+      #-int1-breakpoints (inst break pending-interrupt-trap)
+      OUT)))
 
 ;;; This macro is purposely unhygienic with respect to THREAD-TN,
 ;;; which is either a global symbol macro, or a LET-bound variable,
 ;;; depending on #+gs-seg.
-(defmacro pseudo-atomic ((&key ((:thread-tn thread)) elide-if) &body forms)
+(defmacro pseudo-atomic ((&key ((:thread-tn thread)) elide-if (default-exit t))
+                         &body forms)
   (declare (ignorable thread))
-  #+sb-safepoint
-  `(progn ,@forms (unless ,elide-if (emit-safepoint)))
-  #-sb-safepoint
-  (with-unique-names (label pa-bits-ea)
-   (let ((true
-          ;; TRUE is anything nonzero. Moving a register to memory is
-          ;; allegedly faster than reading an imm8 operand. I don't know,
-          ;; but I'm not going to debate it. However THREAD-TN is a better
-          ;; choice than RBP-TN since it's never written to.
-          #+(and sb-thread (not gs-seg)) 'thread-tn
-          #-(and sb-thread (not gs-seg)) 'rbp-tn))
-    `(let ((,label (gen-label))
-           (,pa-bits-ea
-            #+sb-thread (thread-slot-ea
-                         thread-pseudo-atomic-bits-slot
-                         #+gs-seg ,@(if thread (list thread)))
-            #-sb-thread (static-symbol-value-ea '*pseudo-atomic-bits*)))
-       (unless ,elide-if
-         (inst mov ,pa-bits-ea ,true))
-       ,@forms
-       (unless ,elide-if
-         (inst xor ,pa-bits-ea ,true)
-         (inst jmp :z ,label)
-         ;; if PAI was set, interrupts were disabled at the same time
-         ;; using the process signal mask.
-         #+int1-breakpoints (inst icebp)
-         #-int1-breakpoints (inst break pending-interrupt-trap)
-         (emit-label ,label))))))
+  `(macrolet ((exit-pseudo-atomic () '(emit-end-pseudo-atomic)))
+     (unless ,elide-if
+       (emit-begin-pseudo-atomic))
+     (assemble () ,@forms)
+     (when (and ,default-exit (not ,elide-if))
+       (exit-pseudo-atomic))))
 
 ;;;; indexed references
 
@@ -264,10 +248,11 @@
        (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg) :to :eval)
-              (index :scs (,@(when (member translate '(%instance-cas %raw-instance-cas/word))
-                               '(immediate))
-                           any-reg signed-reg unsigned-reg) :to :eval)
-              (old-value :scs ,scs #|:target rax|#)
+              (index :scs (any-reg signed-reg unsigned-reg
+                                   (immediate
+                                    (typep (- (* (+ (tn-value tn) ,offset) n-word-bytes) ,lowtag) '(signed-byte 32))))
+                     :to :eval)
+              (old-value :scs (,@scs immediate) #|:target rax|#)
               (new-value :scs ,scs))
        (:vop-var vop)
        (:arg-types ,type tagged-num ,el-type ,el-type)
@@ -288,12 +273,12 @@
            ,@(ecase name
                (%compare-and-swap-svref
                 ;; store barrier needs the EA of the affected element
-                '((emit-gc-store-barrier object ea rax (vop-nth-arg 3 vop) new-value)))
+                '((emit-gengc-barrier object ea rax (vop-nth-arg 3 vop))))
                (%instance-cas
                 ;; store barrier affects only the object's base address
-                '((emit-gc-store-barrier object nil rax (vop-nth-arg 3 vop) new-value)))
+                '((emit-gengc-barrier object nil rax (vop-nth-arg 3 vop))))
                ((%raw-instance-cas/word %raw-instance-cas/signed-word)))
-           (move rax old-value)
+           (move-immediate rax (encode-value-if-immediate old-value ,(and (memq 'any-reg scs) t)))
            (inst cmpxchg :lock ea new-value)
            (move value rax))))))
 
@@ -408,16 +393,38 @@
 ;;; used for: INSTANCE-INDEX-SET %CLOSURE-INDEX-SET
 ;;;           SB-BIGNUM:%BIGNUM-SET %SET-ARRAY-DIMENSION %SET-VECTOR-RAW-BITS
 (defmacro define-full-setter (name type offset lowtag scs el-type translate)
-  `(define-vop (,name)
+  (let ((tagged (and (member 'any-reg scs)
+                     t))
+        (barrier (member name '(instance-index-set %closure-index-set %weakvec-set))))
+    `(define-vop (,name)
        (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg immediate signed-reg unsigned-reg))
-              (value :scs ,scs))
+              (index :scs (any-reg signed-reg unsigned-reg
+                                   (immediate
+                                    (typep (- (* (+ ,offset (tn-value tn)) n-word-bytes) ,lowtag)
+                                           '(signed-byte 32)))))
+              (value :scs (,@scs
+                           ,(if barrier ;; will use value-temp anyway
+                                'immediate
+                                `(immediate (let ((value (tn-value tn)))
+                                              (and (integerp value)
+                                                   (plausible-signed-imm32-operand-p (,(if tagged 'fixnumize 'progn) value)))))))))
        (:arg-types ,type tagged-num ,el-type)
+       (:arg-refs obj-ref ind-ref val-ref)
        (:vop-var vop)
-       (:temporary (:sc unsigned-reg) val-temp)
+       ,@(and barrier
+              `((:gc-barrier 0 2)
+                (:info barrier)
+                (:temporary (:sc unsigned-reg) val-temp)))
        (:generator 4
+         #+permgen
+         ,@(when (string= name 'instance-index-set)
+             `((when (and (eq (tn-ref-type obj-ref) (specifier-type 'layout))
+                          ;; since ANY-REG is non-pointer, OBJECT doesn't need remembering
+                          (not (sc-is value any-reg)))
+                 (inst push object)
+                 (invoke-asm-routine 'call 'gc-remember-layout vop))))
          ,@(when (eq translate 'sb-bignum:%bignum-set)
              '((bignum-index-check object index 0 vop)))
          (let ((ea (if (sc-is index immediate)
@@ -425,6 +432,16 @@
                            object)
                        (ea (- (* ,offset n-word-bytes) ,lowtag)
                            object index (index-scale n-word-bytes index)))))
-           ,@(when (member name '(instance-index-set %closure-index-set))
-               '((emit-gc-store-barrier object nil val-temp (vop-nth-arg 2 vop) value)))
-           (gen-cell-set ea value val-temp)))))
+           ,@(if barrier
+                 `((when barrier
+                     (emit-gengc-barrier object nil val-temp t))
+                   (emit-store ea value val-temp))
+                 `((inst mov :qword ea (encode-value-if-immediate value ,tagged)))))))))
+
+;;; This is not "very" arch-specific apart from use of the EA macro
+(defmacro mutex-slot (base-reg slot-name)
+  (let* ((slots (dd-slots (find-defstruct-description 'sb-thread:mutex)))
+         (slot (find slot-name slots :key #'dsd-name :test #'string=))
+         (word-index (+ instance-slots-offset (dsd-index slot))))
+    `(ea ,(- (ash word-index word-shift) instance-pointer-lowtag)
+         ,base-reg)))

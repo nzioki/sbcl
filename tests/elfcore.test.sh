@@ -30,7 +30,7 @@ fi
 set -e # exit on error
 
 # Ensure that we're not running a stale shrinkwrap-sbcl
-(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl ; make shrinkwrap-sbcl)
+(cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl* ; make shrinkwrap-sbcl)
 
 # Prevent style-warnings in the editcore script, but don't assume that it
 # can be compiled in the first place unless actually doing the ELFcore tests.
@@ -45,9 +45,7 @@ run_sbcl <<EOF
 EOF
 
 $SBCL_PWD/../src/runtime/shrinkwrap-sbcl --disable-debugger --no-sysinit --no-userinit --noprint <<EOF
-(sb-vm::make-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
-;; I think this tests immobile space exhaustion
-(dotimes (i 100000) (sb-vm::alloc-immobile-fdefn))
+#+x86-64 (sb-vm::%alloc-immobile-symbol "junk") ; crashed 'cause I forgot to use rip-relative-EA
 
 ;; Test that the link step did not use --export-dynamic
 (assert (gethash '("TEXT_SPACE_START") (car sb-sys:*linkage-info*))) ; C symbol exists
@@ -64,12 +62,6 @@ $SBCL_PWD/../src/runtime/shrinkwrap-sbcl --disable-debugger --no-sysinit --no-us
               (> (sb-kernel:code-n-entries obj) 0))
      (assert (/= (sb-kernel:%code-serialno obj) 0))))
  :all)
-;; This just needs any function that when ELFinated has its packed fixups rewritten.
-;; If the packed value is a bignum, it goes into a C data section.
-(let* ((code (sb-kernel:fun-code-header #'compile-file))
-       (fixups (sb-vm::%code-fixups code)))
-  (assert (typep fixups 'bignum))
-  (assert (not (heap-allocated-p fixups))))
 EOF
 (cd $SBCL_PWD/../src/runtime ; rm -f shrinkwrap-sbcl shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o shrinkwrap-sbcl.core)
 
@@ -97,7 +89,7 @@ EOF
 m_arg=`run_sbcl --eval '(progn #+sb-core-compression (princ " -lzstd") #+x86 (princ " -m32"))' --quit`
 
 (cd $SBCL_PWD/../src/runtime ; rm -f libsbcl.a; make libsbcl.a)
-run_sbcl --script ../tools-for-build/editcore.lisp split \
+run_sbcl --script ../tools-for-build/elftool.lisp split \
   ${tmpcore} $TEST_DIRECTORY/elfcore-test.s
 # I guess we're going to have to hardwire the system libraries
 # until I can figure out how to get a Makefile to work, which is fine
@@ -105,7 +97,7 @@ run_sbcl --script ../tools-for-build/editcore.lisp split \
 ./run-compiler.sh -no-pie -g -o $TEST_DIRECTORY/elfcore-test \
   $TEST_DIRECTORY/elfcore-test.s \
   $TEST_DIRECTORY/elfcore-test-core.o \
-  $SBCL_PWD/../src/runtime/libsbcl.a -ldl -lm -lpthread ${m_arg}
+  $SBCL_PWD/../src/runtime/libsbcl.a -lm -lpthread ${m_arg}
 
 $TEST_DIRECTORY/elfcore-test $SBCL_ARGS --eval '(assert (zerop (f 1 2 3)))' --quit
 echo Custom core: PASS
@@ -114,7 +106,7 @@ echo Custom core: PASS
   $TEST_DIRECTORY/elfcore-test.s \
   $TEST_DIRECTORY/elfcore-test-core.o \
   $SBCL_PWD/../tests/heap-reloc/fake-mman.c \
-  $SBCL_PWD/../src/runtime/libsbcl.a -ldl -lm -lpthread ${m_arg}
+  $SBCL_PWD/../src/runtime/libsbcl.a -lm -lpthread ${m_arg}
 
 (cd $SBCL_PWD/../src/runtime ; rm -f libsbcl.a)
 

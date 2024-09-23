@@ -12,6 +12,7 @@
 
 (in-package "SB-VM")
 
+(declaim (maybe-inline allocate-system-memory))
 (define-alien-routine ("os_allocate" allocate-system-memory)
   system-area-pointer
   (bytes unsigned))
@@ -21,7 +22,7 @@
   (addr system-area-pointer)
   (bytes unsigned))
 
-(define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
+(define-load-time-global *allocator-mutex* nil)
 
 (defun allocate-static-vector (widetag length words)
   (declare (type (unsigned-byte #.n-widetag-bits) widetag)
@@ -72,36 +73,36 @@
              :format-control
              "Not enough room left in static code space to allocate vector.")))
 
+(define-alien-variable ("text_space_highwatermark" *text-space-free-pointer*)
+  system-area-pointer)
 #+immobile-space
 (progn
 
 (define-alien-variable text-space-size (unsigned 32))
 (define-alien-variable ("FIXEDOBJ_SPACE_START" fixedobj-space-start) unsigned-long)
-(define-alien-variable ("text_space_highwatermark" *text-space-free-pointer*)
-  system-area-pointer)
 (define-alien-variable ("fixedobj_free_pointer" *fixedobj-space-free-pointer*)
   system-area-pointer)
 
-(eval-when (:compile-toplevel) ; FIXME: these assertions look irrelevant now
-  (assert (eql code-boxed-size-slot 1))
-  (assert (eql code-debug-info-slot 2)))
+(eval-when (:compile-toplevel)
+  (aver (eql code-boxed-size-slot 1)))
 
 ;;; Size-class segregation (implying which page we try to allocate to)
-;;; is done from lisp now, not C. There are 3 objects types we'll see,
-;;; each in its own size class (even if some are coincidentally the same size).
-;;;  - Symbols
-;;;  - FDEFNs
-;;;  - Layouts
-;;; The first two are truly fixed in size. Layouts occur in varying sizes.
+;;; is done from lisp now, not C. There are 2 objects types:
+;;;  - Symbols have exactly 1 size-class
+;;;  - Layouts have varying size-class
 (defun alloc-immobile-fixedobj (nwords header)
   (let* ((widetag (logand (truly-the fixnum header) widetag-mask))
-         (aligned-nwords (truly-the fixnum (align-up nwords 2)))
+         (aligned-nwords (truly-the fixnum (align-up (the fixnum nwords) 2)))
          (size-class
           ;; If you change this, then be sure to update tests/immobile-space.impure
           ;; which hardcodes a size class to not conflict with anything.
+          ;; There is too much magic in layout_size_class_nwords for me to
+          ;; attempt to rearrange these, that's why "2" is absent below.
+          ;; As a practical matter, the largest layout I've ever seen in a real
+          ;; application is 20 words (7 words of raw/tagged-slot bitmap),
+          ;; so we're not really hurting for more size classes.
           (ecase widetag
             (#.symbol-widetag 1)
-            (#.fdefn-widetag  2)
             (#.instance-widetag
              (cond ((<= aligned-nwords  8) (setq aligned-nwords  8) 3)
                    ((<= aligned-nwords 16) (setq aligned-nwords 16) 4)
@@ -109,17 +110,14 @@
                    ((<= aligned-nwords 32) (setq aligned-nwords 32) 6)
                    ((<= aligned-nwords 48) (setq aligned-nwords 48) 7)
                    (t (error "Oversized layout")))))))
-    (values (%primitive !alloc-immobile-fixedobj
-                        size-class
-                        aligned-nwords
-                        header))))
+    (values (%primitive alloc-immobile-fixedobj size-class aligned-nwords header))))
 
-(defun make-immobile-symbol (name)
+(defun %alloc-immobile-symbol (name)
   (let ((symbol (truly-the symbol
-                 (or (%primitive !fast-alloc-immobile-symbol)
+                 (or #+x86-64 (%primitive !fast-alloc-immobile-symbol)
                      (alloc-immobile-fixedobj
                       symbol-size
-                      (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag))))))
+                      (compute-object-header (1- symbol-size) symbol-widetag))))))
     ;; symbol-hash and package ID start out as 0
     (%primitive set-slot symbol name 'make-symbol symbol-name-slot other-pointer-lowtag)
     (%primitive set-slot symbol nil 'make-symbol symbol-info-slot other-pointer-lowtag)
@@ -167,7 +165,7 @@
 
 (defun update-dynamic-space-code-tree (obj)
   (with-pinned-objects (obj)
-    (let ((addr (logandc2 (get-lisp-obj-address obj) other-pointer-lowtag))
+    (let ((addr (logandc2 (get-lisp-obj-address obj) lowtag-mask))
           (tree *dynspace-codeblob-tree*))
       (loop (let ((newtree (sb-brothertree:insert addr tree)))
               ;; check that it hasn't been promoted from gen0 -> gen1 already
@@ -176,15 +174,22 @@
               (let ((oldval (cas *dynspace-codeblob-tree* tree newtree)))
                 (if (eq oldval tree) (return) (setq tree oldval))))))))
 
+(defglobal *code-alloc-count* 0) ; frlock: bump once on entry, again on exit
+(declaim (fixnum *code-alloc-count*))
+
 ;;; Allocate a code component with BOXED words in the header
 ;;; followed by UNBOXED bytes of raw data.
 ;;; BOXED must be the exact count of boxed words desired. No adjustments
 ;;; are made for alignment considerations or the fixed slots.
+;;; FIXME: it's not necessary that there be two different locks: *allocator-mutex*
+;;; and code_allocator_lock. The Lisp mutex should subsume the C mutex,
+;;; and we should acquire the Lisp one around the entire body of this function.
 (defun allocate-code-object (space boxed unboxed)
   (declare (ignorable space))
   (let* ((total-words
            (the (unsigned-byte 22) ; Enforce limit on total words as well
                 (align-up (+ boxed (ceiling unboxed n-word-bytes)) 2))))
+    (atomic-incf *code-alloc-count*)
     #+immobile-code
     (when (member space '(:immobile :auto))
       (let (addr code holder)
@@ -211,6 +216,7 @@
           (let ((tree *immobile-codeblob-tree*))
             (loop (when (eq tree (setq tree (cas *immobile-codeblob-tree* tree
                                                  (sb-brothertree:insert addr tree))))
+                    (atomic-incf *code-alloc-count*)
                     (return-from allocate-code-object (values code total-words)))))))
       (when (eq space :immobile)
         (error "Immobile code space exhausted")))
@@ -232,6 +238,7 @@
     ;; of the object so that we can find the function table.
     ;; But what about other things that create code objects?
     ;; It could be a subtle source of nondeterministic core images.
+      (atomic-incf *code-alloc-count*)
       (values code total-words))))
 
 ;; The freelist can only be read while holding a mutex because the codeblobs
@@ -277,3 +284,30 @@
           (alien-funcall tlsf-unalloc-codeblob tlsf-control addr)
           (setf (car scratchpad) (pop-1)))))
     t))
+
+#+permgen
+(progn
+(defun allocate-permgen-symbol (name)
+  (with-system-mutex (*allocator-mutex* :without-gcing t)
+    (let ((freeptr *permgen-space-free-pointer*))
+      (setf *permgen-space-free-pointer*
+            (sap+ freeptr (ash symbol-size word-shift)))
+      (aver (<= (sap-int *permgen-space-free-pointer*)
+                (+ permgen-space-start permgen-space-size)))
+      (setf (sap-ref-word freeptr 0) symbol-widetag)
+      (setf (sap-ref-lispobj freeptr (ash symbol-name-slot word-shift)) name
+            (sap-ref-lispobj freeptr (ash symbol-info-slot word-shift)) nil
+            (sap-ref-word freeptr (ash symbol-value-slot word-shift))
+            unbound-marker-widetag)
+      (%make-lisp-obj (sap-int (sap+ freeptr other-pointer-lowtag))))))
+(defun sb-kernel::allocate-permgen-layout (nwords)
+  (with-system-mutex (*allocator-mutex* :without-gcing t)
+    (let ((freeptr *permgen-space-free-pointer*))
+      (setf *permgen-space-free-pointer*
+            ;; round-to-odd, add the header word
+            (sap+ freeptr (ash (1+ (logior nwords 1)) word-shift)))
+      (aver (<= (sap-int *permgen-space-free-pointer*)
+                (+ permgen-space-start permgen-space-size)))
+      (setf (sap-ref-word freeptr 0)
+            (logior (ash nwords instance-length-shift) instance-widetag))
+      (%make-lisp-obj (sap-int (sap+ freeptr instance-pointer-lowtag)))))))

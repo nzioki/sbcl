@@ -274,11 +274,10 @@
    (let* #())
    ()))
 
-(with-test (:name (:source-path typep :invalid-type-specifier))
+(with-test (:name (:source-path typep :unknown-type-specifier))
   (assert-condition-source-paths
    (typep 1 'undefined-type)
-   ;; both the style-warning and the note count
-   (2) (2)))
+   (2)))
 
 (with-test (:name :dead-code-note-after-transforms)
   (assert
@@ -287,6 +286,19 @@
                       `(lambda (x)
                          (when nil
                            (funcall x)))))
+          '(cons sb-ext:code-deletion-note null))))
+
+(with-test (:name :dead-code-note-after-transforms.2)
+  (assert
+   (typep (nth-value 4
+                     (checked-compile
+                      `(lambda (a v)
+                         (declare (vector v))
+                         (block nil
+                           (when (integerp a)
+                             (if (integerp a)
+                                 (return))
+                             (length v))))))
           '(cons sb-ext:code-deletion-note null))))
 
 (with-test (:name :ignore-deleted-subforms)

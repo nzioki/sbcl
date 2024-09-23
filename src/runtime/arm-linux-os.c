@@ -17,8 +17,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -101,8 +100,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     uint32_t trap_instruction = *(uint32_t *)OS_CONTEXT_PC(context);
 
     if (trap_instruction != 0xe7f001f0) {
-        lose("Unrecognized trap instruction %08lx in sigtrap_handler()",
-             trap_instruction);
+        lose("Unrecognized trap instruction %08x in sigtrap_handler()", trap_instruction);
     }
 
     if (code == trap_PendingInterrupt) {

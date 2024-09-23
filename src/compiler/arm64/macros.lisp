@@ -158,14 +158,15 @@
 ;;; surround a call to ALLOCATION anyway), and to indicate that the
 ;;; P-A FLAG-TN is also acceptable here.
 
-#+gencgc
-(defun allocation-tramp (type alloc-tn size back-label)
+#+generational
+(defun allocation-tramp (type alloc-tn size back-label systemp)
   (if (integerp size)
       (load-immediate-word tmp-tn size)
       (inst mov tmp-tn size))
-  (let ((asm-routine (if (eq type 'list) 'list-alloc-tramp 'alloc-tramp)))
-    (load-inline-constant alloc-tn `(:fixup ,asm-routine :assembly-routine)))
-  (inst blr alloc-tn)
+  (let ((asm-routine (if systemp
+                         (if (eq type 'list) 'sys-list-alloc-tramp 'sys-alloc-tramp)
+                         (if (eq type 'list) 'list-alloc-tramp 'alloc-tramp))))
+    (invoke-asm-routine asm-routine alloc-tn))
   (inst b back-label))
 
 ;;; Leaves the untagged pointer in TMP-TN,
@@ -173,31 +174,45 @@
 (defun allocation (type size lowtag result-tn
                    &key flag-tn
                         stack-allocate-p
-                        overflow)
+                        overflow
+                        (systemp (system-tlab-p type (sb-c::vop-node sb-assem::*current-vop*))))
   (declare (ignorable type))
   ;; Normal allocation to the heap.
   (if stack-allocate-p
       (assemble ()
-        (inst add tmp-tn csp-tn lowtag-mask)
-        (inst and tmp-tn tmp-tn (lognot lowtag-mask))
-        (inst add csp-tn tmp-tn (add-sub-immediate size result-tn))
-        (inst add result-tn tmp-tn lowtag))
+        (cond ((aligned-stack-p stack-allocate-p)
+               (assemble ()
+                 (inst tst csp-tn lowtag-mask)
+                 (inst b :eq skip)
+                 (inst add csp-tn csp-tn 8)
+                 (error-call nil 'sb-kernel::unreachable-error)
+                 skip)
+               (move tmp-tn csp-tn)
+               (inst add csp-tn csp-tn (add-sub-immediate size result-tn))
+               (inst add result-tn tmp-tn lowtag))
+              (t
+               (inst add tmp-tn csp-tn lowtag-mask)
+               (inst and tmp-tn tmp-tn (lognot lowtag-mask))
+               (inst add csp-tn tmp-tn (add-sub-immediate size result-tn))
+               (inst add result-tn tmp-tn lowtag))))
       (let ((alloc (gen-label))
-            #+sb-thread (tlab (if (eq type 'list) thread-cons-tlab-slot thread-mixed-tlab-slot))
-            #-sb-thread (region (if (eq type 'list) cons-region mixed-region))
+            #+sb-thread (tlab (if systemp
+                                  (if (eq type 'list) thread-sys-cons-tlab-slot thread-sys-mixed-tlab-slot)
+                                  (if (eq type 'list) thread-cons-tlab-slot thread-mixed-tlab-slot)))
+            #-sb-thread (region-offset (if (eq type 'list)
+                                           cons-region-offset
+                                           mixed-region-offset))
             (back-from-alloc (gen-label)))
         #-sb-thread
         (progn
-          ;; load-pair can't base off null-tn because the displacement
-          ;; has to be a multiple of 8
-          (load-immediate-word flag-tn region)
-          (inst ldp result-tn flag-tn (@ flag-tn 0)))
+          (loadw result-tn null-tn 0 (- nil-value-offset region-offset))
+          (loadw flag-tn null-tn 1 (- nil-value-offset region-offset)))
         #+sb-thread
         (inst ldp tmp-tn flag-tn (@ thread-tn (* n-word-bytes tlab)))
         (inst add result-tn tmp-tn (add-sub-immediate size result-tn))
         (inst cmp result-tn flag-tn)
         (inst b :hi ALLOC)
-        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- region nil-value))))
+        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- region-offset nil-value-offset))))
         #+sb-thread (storew result-tn thread-tn tlab)
 
         (emit-label BACK-FROM-ALLOC)
@@ -209,7 +224,8 @@
               (allocation-tramp type
                                 result-tn
                                 size
-                                BACK-FROM-ALLOC))))))
+                                BACK-FROM-ALLOC
+                                systemp))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -276,11 +292,16 @@
     (emit-alignment 2)))
 
 (defun generate-error-code (vop error-code &rest values)
+  (apply #'generate-error-code+ nil vop error-code values))
+
+(defun generate-error-code+ (preamble-emitter vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
+      (when preamble-emitter
+        (funcall preamble-emitter))
       (emit-error-break vop
                         (if (eq error-code 'invalid-arg-count-error)
                             invalid-arg-count-trap
@@ -293,14 +314,14 @@
 #+sb-safepoint
 (defun emit-safepoint ()
   (inst ldr zr-tn (@ null-tn
-                     (- (+ gc-safepoint-trap-offset n-word-bytes
-                           other-pointer-lowtag)))))
+                     (load-store-offset
+                      (- (+ nil-value-offset gc-safepoint-trap-offset))))))
 
 ;;; handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((flag-tn &key elide-if (sync t)) &body forms)
   (declare (ignorable sync))
   #+sb-safepoint
-  `(progn ,@forms (emit-safepoint))
+  `(progn ,flag-tn (assemble () ,@forms) (unless ,elide-if (emit-safepoint)))
   #-sb-safepoint
   `(progn
      (unless ,elide-if
@@ -340,13 +361,11 @@
                               &optional translate)
   `(define-vop (,name)
      ,@(when translate
-             `((:translate ,translate)))
+         `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (any-reg immediate)))
+            (index :scs (any-reg unsigned-reg signed-reg immediate)))
      (:arg-types ,type tagged-num)
-     (:temporary (:scs (non-descriptor-reg)
-                  :unused-if (sc-is index immediate)) lip)
      (:results (value :scs ,scs))
      (:result-types ,el-type)
      (:generator 5
@@ -356,44 +375,86 @@
                                      (- (ash (+ ,offset (tn-value index)) word-shift)
                                         ,lowtag)))))
          (t
-          (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
-          (loadw value lip ,offset ,lowtag))))))
+          (inst add tmp-tn object (lsl index (- word-shift (if (sc-is index any-reg)
+                                                               n-fixnum-tag-bits
+                                                               0))))
+          (loadw value tmp-tn ,offset ,lowtag))))))
 
 (defmacro define-full-setter (name type offset lowtag scs el-type
-                              &optional translate)
-  `(define-vop (,name)
-     ,@(when translate
-             `((:translate ,translate)))
-     (:policy :fast-safe)
-     (:args (object :scs (descriptor-reg))
-            (index :scs (any-reg immediate))
-            (value :scs (,@scs zero)))
-     (:arg-types ,type tagged-num ,el-type)
-     (:temporary (:scs (non-descriptor-reg)
-                  :unused-if (sc-is index immediate)) lip)
-     (:generator 2
-       (sc-case index
-         (immediate
-          (inst str value (@ object (load-store-offset
-                                     (- (ash (+ ,offset (tn-value index)) word-shift)
-                                        ,lowtag)))))
-         (t
-          (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
-          (storew value lip ,offset ,lowtag))))))
+                              &optional translate
+                              &aux (barrierp (member 'descriptor-reg scs)))
+  (case name
+    ((data-vector-set/simple-vector %weakvec-set)
+     `(define-vop (,name)
+        (:translate ,translate)
+        (:policy :fast-safe)
+        (:args (object :scs (descriptor-reg))
+               (index :scs (any-reg unsigned-reg signed-reg immediate))
+               (value :scs (,@scs zero)))
+        (:arg-types ,type tagged-num ,el-type)
+        (:temporary (:sc non-descriptor-reg) ea)
+        (:vop-var vop)
+        (:generator 2
+          (cond ((require-gengc-barrier-p object (vop-nth-arg 2 vop) value)
+                 (sc-case index
+                   (immediate
+                    (inst add ea object (load-store-offset
+                                         (- (ash (+ ,offset (tn-value index)) word-shift)
+                                            ,lowtag))))
+                   (t
+                    ;; Scale the index
+                    (let ((unshift (if (sc-is index any-reg) n-fixnum-tag-bits 0)))
+                      (inst add ea object (lsl index (- word-shift unshift))))
+                    ;; Calculate the exact cell address to ensure the right card is marked
+                    (inst add ea ea (- (ash vector-data-offset word-shift) other-pointer-lowtag))))
+                 (emit-gengc-barrier object ea tmp-tn t)
+                 (storew value ea 0 0))
+                (t
+                 (sc-case index
+                   (immediate
+                    (inst str value (@ object (load-store-offset
+                                               (- (ash (+ ,offset (tn-value index)) word-shift)
+                                                  ,lowtag)))))
+                   (t
+                    (let ((unshift (if (sc-is index any-reg) n-fixnum-tag-bits 0)))
+                      (inst add tmp-tn object (lsl index (- word-shift unshift))))
+                    (storew value tmp-tn ,offset ,lowtag))))))))
+    (t
+     `(define-vop (,name)
+        (:translate ,translate)
+        (:policy :fast-safe)
+        (:args (object :scs (descriptor-reg))
+               (index :scs (any-reg unsigned-reg signed-reg immediate))
+               (value :scs (,@scs zero)))
+        (:arg-types ,type tagged-num ,el-type)
+        (:vop-var vop)
+        ,@(if barrierp '((:gc-barrier 0 2)
+                         (:info barrier)))
+        (:generator 2
+          ,@(when barrierp
+              '((when barrier
+                  (emit-gengc-barrier object nil tmp-tn t))))
+          (sc-case index
+            (immediate
+             (inst str value (@ object (load-store-offset
+                                        (- (ash (+ ,offset (tn-value index)) word-shift)
+                                           ,lowtag)))))
+            (t
+             (let ((unshift (if (sc-is index any-reg) n-fixnum-tag-bits 0)))
+               (inst add tmp-tn object (lsl index (- word-shift unshift))))
+             (storew value tmp-tn ,offset ,lowtag))))))))
 
 (defmacro define-partial-reffer (name type size signed offset lowtag scs
                                  el-type &optional translate)
   `(define-vop (,name)
      ,@(when translate
-             `((:translate ,translate)))
+         `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (any-reg unsigned-reg immediate)))
+            (index :scs (any-reg unsigned-reg signed-reg immediate)))
      (:arg-types ,type tagged-num)
      (:results (value :scs ,scs))
      (:result-types ,el-type)
-     (:temporary (:scs (non-descriptor-reg)
-                  :unused-if (sc-is index immediate)) lip)
      (:generator 5
        ,@(multiple-value-bind (op shift)
              (ecase size
@@ -417,14 +478,13 @@
                                                (- (* ,offset n-word-bytes) ,lowtag))))))
                  (t
                   (let ((shift ,shift))
-                    (sc-case index
-                      (any-reg
-                       (decf shift n-fixnum-tag-bits)))
-                    (inst add lip object (if (minusp shift)
-                                             (asr index (- shift))
-                                             (lsl index shift)))
+                    (when (sc-is index any-reg)
+                      (decf shift n-fixnum-tag-bits))
+                    (inst add tmp-tn object (if (minusp shift)
+                                                (asr index (- shift))
+                                                (lsl index shift)))
                     (inst ,op
-                          ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))))))))
+                          ,value (@ tmp-tn (- (* ,offset n-word-bytes) ,lowtag))))))))))))
 
 (defmacro define-partial-setter (name type size offset lowtag scs el-type
                                  &optional translate)
@@ -439,7 +499,7 @@
       (:args ,@(when setf-p
                  value)
              (object :scs (descriptor-reg))
-             (index :scs (any-reg unsigned-reg immediate))
+             (index :scs (any-reg unsigned-reg signed-reg immediate))
              ,@(unless setf-p
                  value))
       (:arg-types ,@(when setf-p
@@ -448,8 +508,6 @@
                   tagged-num
                   ,@(unless setf-p
                       `(,el-type)))
-      (:temporary (:scs (non-descriptor-reg)
-                   :unused-if (sc-is index immediate)) lip)
       (:generator 5
         (when (sc-is value immediate)
           (setf value zr-tn))
@@ -472,14 +530,13 @@
                                                 (- (* ,offset n-word-bytes) ,lowtag))))))
                   (t
                    (let ((shift ,shift))
-                     (sc-case index
-                       (any-reg
-                        (decf shift n-fixnum-tag-bits)))
-                     (inst add lip object (if (minusp shift)
-                                              (asr index (- shift))
-                                              (lsl index shift)))
+                     (when (sc-is index any-reg)
+                       (decf shift n-fixnum-tag-bits))
+                     (inst add tmp-tn object (if (minusp shift)
+                                                 (asr index (- shift))
+                                                 (lsl index shift)))
                      (inst ,op
-                           ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))))))
+                           ,value (@ tmp-tn (- (* ,offset n-word-bytes) ,lowtag)))))))))))))
 
 (defun load-inline-constant (dst &rest constant-descriptor)
   (inst load-from-label dst (cdr (apply #'register-inline-constant constant-descriptor))))
@@ -509,3 +566,31 @@
   `(inst str ,reg (@ thread-tn ,(info :variable :wired-tls symbol)))
   #-sb-thread
   `(store-symbol-value ,reg ,symbol))
+
+;;; Load constants, stack-values, reusing when possible
+(defmacro maybe-load (tn &optional (temp 'temp))
+  (once-only ((tn tn))
+    `(sc-case ,tn
+       ((any-reg descriptor-reg)
+        ,tn)
+       ((immediate constant)
+        (cond ((not (sb-c::tn-leaf ,tn))
+               (load-constant vop ,tn ,temp)
+               ,temp)
+              ((eql (tn-value ,tn) 0)
+               zr-tn)
+              ((or (eql prev-constant (tn-value ,tn))
+                   (progn
+                     (setf prev-constant (tn-value ,tn))
+                     nil))
+               temp)
+              ((sc-is ,tn constant)
+               (load-constant vop ,tn ,temp)
+               ,temp)
+              (t
+               (load-immediate vop ,tn ,temp)
+               ,temp)))
+       (control-stack
+        (setf prev-constant nil)
+        (load-stack-tn ,temp ,tn)
+        ,temp))))

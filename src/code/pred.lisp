@@ -58,18 +58,18 @@
 ;;; These aren't so much "wrappers" as they are the actual installed DEFUNs.
 ;;; I supposed they "wrap" a vop or source-transform.
 (macrolet ((def-type-predicate-wrapper (pred)
-             (let* ((name (symbol-name pred))
-                    (stem (string-left-trim "%" (string-right-trim "P-" name)))
-                    (article (if (position (schar name 0) "AEIOU") "an" "a")))
-               `(defun ,pred (object)
-                  ;; Document the standardized predicates and not the internal ones.
-                  ,@(when (eql (sb-xc:symbol-package pred) *cl-package*)
+             `(defun ,pred (object)
+                ;; Document the standardized predicates and not the internal ones.
+                ,@(when (eq (sb-xc:symbol-package pred) *cl-package*)
+                    (let* ((name (symbol-name pred))
+                           (stem (string-left-trim "%" (string-right-trim "P-" name)))
+                           (article (if (position (schar name 0) "AEIOU") "an" "a")))
                       (list (format nil
                                     "Return true if OBJECT is ~A ~A, and NIL otherwise."
                                     article
-                                    stem)))
+                                    stem))))
                   ;; (falling through to low-level implementation)
-                  (,pred object)))))
+                (,pred object))))
   (def-type-predicate-wrapper array-header-p)
   (def-type-predicate-wrapper simple-array-header-p)
   (def-type-predicate-wrapper arrayp)
@@ -111,10 +111,11 @@
   #-(or x86 x86-64 arm64 riscv) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
+  (sb-c::when-vop-existsp (:translate pointerp)
+    (def-type-predicate-wrapper pointerp))
   (def-type-predicate-wrapper rationalp)
   (def-type-predicate-wrapper ratiop)
   (def-type-predicate-wrapper realp)
-  (def-type-predicate-wrapper short-float-p)
   (def-type-predicate-wrapper single-float-p)
   #+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
   #+sb-simd-pack-256 (def-type-predicate-wrapper simd-pack-256-p)
@@ -155,12 +156,8 @@
   (def-type-predicate-wrapper simple-rank-1-array-*-p)
   (def-type-predicate-wrapper simple-string-p)
   (def-type-predicate-wrapper stringp)
+  (def-type-predicate-wrapper sb-c::string-designator-p)
   (def-type-predicate-wrapper vectorp))
-
-(sb-c::when-vop-existsp (:translate fixnum-mod-p)
-  (defun fixnum-mod-p (x limit)
-    (and (fixnump x)
-         (<= 0 x limit))))
 
 (sb-c::when-vop-existsp (:translate car-eq-if-listp)
   (defun car-eq-if-listp (value object)
@@ -214,19 +211,11 @@
      (type-specifier (ctype-of object)))
     (simple-fun 'compiled-function)
     (t
-     #+metaspace ; WRAPPER-OF can't be called on layoutless objects.
-     (unless (logtest (get-lisp-obj-address (%instanceoid-layout object))
-                      sb-vm:widetag-mask)
-       ;; [fun-]instances momentarily have no layout in any code interrupted
-       ;; just after allocating and before assigning slots.
-       ;; OUTPUT-UGLY-OBJECT has a similar precaution as this.
-       (return-from type-of (if (functionp object) 'funcallable-instance 'instance)))
-     (let ((wrapper (wrapper-of object)))
-       #-metaspace ; already checked for a good layout if metaspace
-       (when (= (get-lisp-obj-address wrapper) 0)
+     (let ((layout (layout-of object)))
+       (when (= (get-lisp-obj-address layout) 0)
          (return-from type-of
            (if (functionp object) 'funcallable-instance 'instance)))
-       (let* ((classoid (wrapper-classoid wrapper))
+       (let* ((classoid (layout-classoid layout))
               (name (classoid-name classoid)))
          ;; FIXME: should the first test be (not (or (%instancep) (%funcallable-instance-p)))?
          ;; God forbid anyone makes anonymous classes of generic functions.
@@ -247,24 +236,9 @@
 (defun eq (obj1 obj2)
   "Return T if OBJ1 and OBJ2 are the same object, otherwise NIL."
   (eq obj1 obj2))
-;;; and this too, but it's only needed for backends on which
-;;; IR1 might potentially transform EQL into %EQL/INTEGER.
-#+integer-eql-vop
-(defun %eql/integer (obj1 obj2)
-  ;; This is just for constant folding, there's no real need to transform
-  ;; into the %EQL/INTEGER VOP. But it's confusing if it becomes identical to
-  ;; EQL, and then due to ICF we find that #'EQL => #<FUNCTION %EQL/INTEGER>.
-  ;; Type declarations don't suffice because we don't know which arg is an integer
-  ;; (if not both). We could ensure selection of the vop by using %PRIMITIVE.
-  ;; Anyway it suffices to disable type checking and pretend its the always
-  ;; the first arg that's an integer, but that won't work on the host because
-  ;; it might enforce the type since we can't portably unenforce after declaring.
-  (declare (optimize (sb-c::type-check 0)))
-  (eql (the integer obj1) obj2))
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
-  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   #+x86-64 (eql obj1 obj2) ; vop fully implements all cases of EQL
   #-x86-64 ; else this is the only full implementation of EQL
   (or (eq obj1 obj2)
@@ -286,8 +260,10 @@
              #+long-float
              (long-float eql)
              (bignum
-              #-integer-eql-vop (lambda (x y) (zerop (bignum-compare x y)))
-              #+integer-eql-vop eql) ; will become %eql/integer
+              #.(sb-c::if-vop-existsp (:named sb-vm::%eql/integer)
+                  'eql
+                  '(lambda (x y)
+                    (zerop (bignum-compare x y)))))
              (ratio
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
@@ -306,6 +282,7 @@
                      (eql (imagpart x) (imagpart y))))))))))
 
 (defun eql (x y)
+  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   ;; On x86-64, EQL is just an interpreter stub for a vop.
   ;; For others it's a call to the implementation of generic EQL.
   (#+x86-64 eql #-x86-64 %eql x y))
@@ -335,30 +312,41 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
   ;; Non-tail self-recursion implemented with a local auxiliary function
   ;; is a lot faster than doing it the straightforward way (at least
   ;; on x86oids) due to calling convention differences. -- JES, 2005-12-30
-  (labels ((equal-aux (x y)
-             (cond ((%eql x y)
-                    t)
-                   ((consp x)
-                    (and (consp y)
-                         (equal-aux (car x) (car y))
-                         (equal-aux (cdr x) (cdr y))))
-                   ((stringp x)
-                    (and (stringp y) (string= x y)))
-                   ;; We could remove this case by ensuring that MAKE-PATHNAME,
-                   ;; PARSE-NAMESTRING, MERGE-PATHNAME, etc look in a weak hash-based
-                   ;; thing first for an EQUAL pathname, ensuring that if two pathnames
-                   ;; are EQUAL then they are EQ. That would elide this test at the
-                   ;; expense of pathname construction which seems like a good tradeoff.
-                   ((pathnamep x)
-                    (and (pathnamep y) (pathname= x y)))
-                   ((bit-vector-p x)
-                    (and (bit-vector-p y)
-                         (bit-vector-= x y)))
-                   (t nil))))
-    ;; Use MAYBE-INLINE to get the inline expansion only once (instead
-    ;; of 200 times with INLINE). -- JES, 2005-12-30
-    (declare (maybe-inline equal-aux))
-    (equal-aux x y)))
+  (macrolet ((equal-body (recurse-car recurse-cdr)
+               `(cond ((%eql x y)
+                       t)
+                      ((consp x)
+                       (and (consp y)
+                            (,recurse-car (car x) (car y))
+                            (,recurse-cdr (cdr x) (cdr y))))
+                      ((stringp x)
+                       (and (stringp y) (string= x y)))
+                      ;; We could remove this case by ensuring that
+                      ;; MAKE-PATHNAME, PARSE-NAMESTRING,
+                      ;; MERGE-PATHNAME, etc look in a weak hash-based
+                      ;; thing first for an EQUAL pathname, ensuring
+                      ;; that if two pathnames are EQUAL then they are
+                      ;; EQ. That would elide this test at the expense
+                      ;; of pathname construction, which seems like a
+                      ;; good tradeoff.
+                      ((pathnamep x)
+                       (and (pathnamep y) (pathname= x y)))
+                      ((bit-vector-p x)
+                       (and (bit-vector-p y)
+                            (bit-vector-= x y)))
+                      (t nil))))
+    ;; Calling local functions is still slow, so we inline
+    ;; self-recursion on CAR (at even depths only to avoid infinite
+    ;; inlining). This doubles the code size, but it also makes
+    ;; comparing lists much faster. -- MG, 2023-10-13
+    (labels ((equal-not-inline (x y)
+               ;; Don't inline self-recursion on CDR because that's
+               ;; conveniently in tail position.
+               (equal-body equal-inline equal-not-inline))
+             (equal-inline (x y)
+               (equal-body equal-not-inline equal-not-inline)))
+      (declare (inline equal-inline))
+      (equal-not-inline x y))))
 
 ;;; Like EQUAL, but any two gensyms whose names are STRING= are equalish.
 (defun fun-names-equalish (x y)
@@ -408,96 +396,88 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                      ((functionp test) (funcall test i x y))
                      (t)))))
 
-(macrolet ((numericp (v)
-             (let ((widetags
-                    (map 'list #'sb-vm:saetp-typecode
-                         (remove-if (lambda (x)
-                                      (not (typep (sb-vm:saetp-ctype x) 'numeric-type)))
-                                    sb-vm:*specialized-array-element-type-properties*))))
-               `(%other-pointer-subtype-p ,v ',widetags)))
-           (compare-loop (typespec)
-             `(let ((x (truly-the (simple-array ,typespec 1) x))
-                    (y (truly-the (simple-array ,typespec 1) y)))
-                (loop for x-i fixnum from start-x below end-x
-                      for y-i fixnum from start-y
-                      always (= (aref x x-i) (aref y y-i))))))
 (defun array-equalp (a b)
-  (flet
-      ((data-vector-compare (x y start-x end-x start-y)
-         (declare (index start-x end-x start-y)
-                  (optimize (sb-c:insert-array-bounds-checks 0)))
-         (let ((xtag (%other-pointer-widetag (truly-the (simple-array * 1) x)))
-               (ytag (%other-pointer-widetag (truly-the (simple-array * 1) y))))
-           (case (if (= xtag ytag) xtag 0)
-             (#.sb-vm:simple-vector-widetag
-              (let ((x (truly-the simple-vector x))
-                    (y (truly-the simple-vector y)))
-                (loop for x-i fixnum from start-x below end-x
-                      for y-i fixnum from start-y
-                      always (let ((a (svref x x-i)) (b (svref y y-i)))
-                               (or (eq a b) (equalp a b))))))
-             ;; Special-case the important array types that would cause consing in aref.
-             ;; Though (UNSIGNED-BYTE 62) and (UNSIGNED-BYTE 63) arrays exist,
-             ;; I highly doubt that they occur anywhere except in contrived code
-             ;; that does nothing but test that those types exist. i.e. They are
-             ;; beyond worthless, and are frankly wasteful of space in array dispatch
-             ;; scenarios, or to put it mildy: I disagree with their existence per se.
-             #+64-bit (#.sb-vm:simple-array-unsigned-byte-64-widetag
-                       (compare-loop (unsigned-byte 64)))
-             #+64-bit (#.sb-vm:simple-array-signed-byte-64-widetag
-                       (compare-loop (signed-byte 64)))
-             #-64-bit (#.sb-vm:simple-array-unsigned-byte-32-widetag
-                       (compare-loop (unsigned-byte 32)))
-             #-64-bit (#.sb-vm:simple-array-signed-byte-32-widetag
-                       (compare-loop (signed-byte 32)))
-             ;; SINGLE-FLOAT wouldn't cons on 64-bit, but it should be treated
-             ;; no less efficiently than DOUBLE-FLOAT.
-             (#.sb-vm:simple-array-single-float-widetag
-              (compare-loop single-float))
-             (#.sb-vm:simple-array-double-float-widetag
-              (compare-loop double-float))
-             (#.sb-vm:simple-array-complex-single-float-widetag
-              (compare-loop (complex single-float)))
-             (#.sb-vm:simple-array-complex-double-float-widetag
-              (compare-loop (complex double-float)))
-             (t
-              (let* ((reffers %%data-vector-reffers%%)
-                     (getter-x (truly-the function (svref reffers xtag)))
-                     (getter-y (truly-the function (svref reffers ytag))))
-                ;; The arrays won't both be strings, because EQUALP has a case for that.
-                ;; If they're both numeric, use = as the test.
-                (if (and (numericp x) (numericp y))
-                    (loop for x-i fixnum from start-x below end-x
-                          for y-i fixnum from start-y
-                          always (= (funcall getter-x x x-i) (funcall getter-y y y-i)))
-                    ;; Everything else
-                    (loop for x-i fixnum from start-x below end-x
-                          for y-i fixnum from start-y
-                          for x-el = (funcall getter-x x x-i)
-                          for y-el = (funcall getter-y y y-i)
-                          always (or (eq x-el y-el)
-                                     (equalp x-el y-el))))))))))
-    (if (vectorp (truly-the array a))
-        (and (vectorp (truly-the array b))
-             (= (length a) (length b))
-             (with-array-data ((x a) (start-x) (end-x)
-                               :force-inline t :check-fill-pointer t)
-               (with-array-data ((y b) (start-y) (end-y)
-                                 :force-inline t :check-fill-pointer t)
-                 (declare (ignore end-y))
-                 (data-vector-compare x y start-x end-x start-y))))
-        (let ((rank (array-rank (truly-the array a))))
-          (and (= rank (array-rank (truly-the array b)))
-               (dotimes (axis rank t)
-                 (unless (= (%array-dimension a axis)
-                            (%array-dimension b axis))
-                   (return nil)))
-               (with-array-data ((x a) (start-x) (end-x)
-                                 :force-inline t :array-header-p t)
-                 (with-array-data ((y b) (start-y) (end-y)
-                                   :force-inline t :array-header-p t)
-                   (declare (ignore end-y))
-                   (data-vector-compare x y start-x end-x start-y)))))))))
+  (declare (explicit-check))
+  (macrolet ((numericp (v)
+               (let ((widetags
+                       (map 'list #'sb-vm:saetp-typecode
+                            (remove-if (lambda (x)
+                                         (not (typep (sb-vm:saetp-ctype x) 'numeric-type)))
+                                       sb-vm:*specialized-array-element-type-properties*))))
+                 `(%other-pointer-subtype-p ,v ',widetags)))
+             (compare-loop (typespec)
+               `(let ((x (truly-the (simple-array ,typespec 1) x))
+                      (y (truly-the (simple-array ,typespec 1) y)))
+                  (loop for x-i from start-x below end-x
+                        for y-i from start-y
+                        always (= (aref x x-i)
+                                  (aref y (truly-the index y-i))))))
+             (numeric-cases (&body rest)
+               `(case (if (= xtag ytag) (ash xtag -2) 0)
+                  ,@(loop for s across sb-vm:*specialized-array-element-type-properties*
+                          when (and (typep (sb-vm:saetp-ctype s) 'numeric-type)
+                                    (neq (sb-vm:saetp-specifier s) 'bit))
+                          collect `(,(ash (sb-vm:saetp-typecode s) -2)
+                                    (compare-loop ,(sb-vm:saetp-specifier s))))
+                  ,@rest)))
+    (flet
+        ((data-vector-compare (x y start-x end-x start-y)
+           (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+           (let ((xtag (%other-pointer-widetag (truly-the (simple-array * 1) x)))
+                 (ytag (%other-pointer-widetag (truly-the (simple-array * 1) y))))
+             (declare (optimize (sb-c:jump-table 3)))
+             (numeric-cases
+              (#.(ash sb-vm:simple-vector-widetag -2)
+                 (let ((x (truly-the simple-vector x))
+                       (y (truly-the simple-vector y)))
+                   (loop for x-i from start-x below end-x
+                         for y-i from start-y
+                         always (let ((a (svref x x-i))
+                                      (b (svref y (truly-the index y-i))))
+                                  (or (eq a b)
+                                      (equalp a b))))))
+              (t
+               (let* ((reffers %%data-vector-reffers%%)
+                      (getter-x (locally (declare (optimize (safety 0))) ;; don't check for a function
+                                  (svref reffers xtag)))
+                      (getter-y (locally (declare (optimize (safety 0)))
+                                  (svref reffers ytag))))
+                 ;; The arrays won't both be strings, because EQUALP has a case for that.
+                 ;; If they're both numeric, use = as the test.
+                 (if (and (numericp x) (numericp y))
+                     (loop for x-i fixnum from start-x below end-x
+                           for y-i = start-y then (truly-the fixnum (1+ y-i))
+                           always (= (funcall getter-x x (truly-the fixnum x-i))
+                                     (funcall getter-y y (truly-the fixnum y-i))))
+                     ;; Everything else
+                     (loop for x-i fixnum from start-x below end-x
+                           for y-i = start-y then (truly-the fixnum (1+ y-i))
+                           for x-el = (funcall getter-x x (truly-the fixnum x-i))
+                           for y-el = (funcall getter-y y (truly-the fixnum y-i))
+                           always (or (eq x-el y-el)
+                                      (equalp x-el y-el))))))))))
+      (or (eq a b)
+          (if (vectorp (truly-the array a))
+              (and (vectorp (truly-the array b))
+                   (= (length a) (length b))
+                   (with-array-data ((x a) (start-x) (end-x)
+                                     :force-inline t :check-fill-pointer t)
+                     (with-array-data ((y b) (start-y) (end-y)
+                                       :force-inline t :check-fill-pointer t)
+                       (declare (ignore end-y))
+                       (data-vector-compare x y start-x end-x start-y))))
+              (let ((rank (array-rank (truly-the array a))))
+                (and (= rank (array-rank (truly-the array b)))
+                     (dotimes (axis rank t)
+                       (unless (= (%array-dimension a axis)
+                                  (%array-dimension b axis))
+                         (return nil)))
+                     (with-array-data ((x a) (start-x) (end-x)
+                                       :force-inline t :array-header-p t)
+                       (with-array-data ((y b) (start-y) (end-y)
+                                         :force-inline t :array-header-p t)
+                         (declare (ignore end-y))
+                         (data-vector-compare x y start-x end-x start-y))))))))))
 
 (defun equalp (x y)
   "Just like EQUAL, but more liberal in several respects.
@@ -519,8 +499,7 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                 (and (logtest (logior +structure-layout-flag+ +pathname-layout-flag+)
                               (layout-flags layout))
                      (eq (%instance-layout y) layout)
-                     (funcall (wrapper-equalp-impl (layout-friend layout))
-                              x y)))))
+                     (funcall (layout-equalp-impl layout) x y)))))
         ((arrayp x)
          (and (arrayp y)
               ;; string-equal is nearly 2x the speed of array-equalp for comparing strings
@@ -530,16 +509,13 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
         (t nil)))
 
 #-sb-show ;; I don't know why these tests crash with #+sb-show
-(let ((test-cases `(($0.0 $-0.0 t)
-                    ($0.0 $1.0 nil)
-                    ;; There is no cross-compiler #C reader macro.
-                    ;; SB-XC:COMPLEX does not want uncanonical input, i.e. imagpart
-                    ;; of rational 0 which downgrades the result to just an integer.
-                    (1 ,(complex $1.0 $0.0) t)
-                    (,(complex 0 1) ,(complex $0.0 $1.0) t)
+(let ((test-cases '((0.0 -0.0 t)
+                    (0.0 1.0 nil)
+                    (#c(1 0) #c(1.0 0.0) t)
+                    (#c(0 1) #c(0.0 1.0) t)
                     ;; 11/10 is unequal to real 1.1 due to roundoff error.
                     ;; COMPLEX here is a red herring
-                    (,(complex $1.1 $0.0) 11/10 nil)
+                    (#c(1.1 0.0) #c(11/10 0) nil)
                     ("Hello" "hello" t)
                     ("Hello" #(#\h #\E #\l #\l #\o) t)
                     ("Hello" "goodbye" nil))))

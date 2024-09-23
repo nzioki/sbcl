@@ -12,7 +12,12 @@
 (in-package "SB-VM")
 
 #-sb-assembling ; avoid redefinition warning
-(progn
+(macrolet ((static-fun-addr (name)
+             #+immobile-code `(rip-relative-ea (make-fixup ,name :linkage-cell))
+             #-immobile-code
+             `(progn
+                (inst mov rax-tn (thread-slot-ea sb-vm::thread-linkage-table-slot))
+                (ea (make-fixup ,name :linkage-cell) rax-tn))))
 (defun both-fixnum-p (temp x y)
   (inst mov :dword temp x)
   (inst or :dword temp y)
@@ -22,10 +27,6 @@
   (inst mov :dword temp x)
   (inst and :dword temp y)
   (inst test :byte temp fixnum-tag-mask))
-
-(defun static-fun-addr (name)
-  #+immobile-code (make-fixup name :static-call)
-  #-immobile-code (ea (+ nil-value (static-fun-offset name))))
 
 (defun call-static-fun (fun arg-count)
   (inst push rbp-tn)
@@ -351,7 +352,8 @@
 ;;;   (define-assembly-routine ... ((:temp ...)) (:let ((c (register-inline-constant ...)))))
 ;;; It just doesn't seem worth the effort to do all that.
 (defparameter eql-dispatch nil)
-(define-assembly-routine (generic-eql (:return-style :none))
+(define-assembly-routine (generic-eql (:return-style :none)
+                                      (:export eql-ratio))
     ((:temp rcx unsigned-reg rcx-offset)  ; callee-saved
      (:temp rax unsigned-reg rax-offset)  ; vop temps
      (:temp rsi unsigned-reg rsi-offset)
@@ -435,19 +437,12 @@
   EQL-BIGNUM
   (inst mov rax (ea (- other-pointer-lowtag) rdi))
   (inst xor rax (ea (- other-pointer-lowtag) rsi))
-  ;; kill the GC mark bit by shifting out (as if we'd actually get fullcgc
-  ;; to concurrently mark the heap. Well, I can hope can't I?)
-  (inst shl rax 1)
   (inst jmp :ne done) ; not equal
-  ;; Preserve rcx and compute the header length in words.
-  ;; Maybe we should deem that bignums have at most (2^32-1) payload words
-  ;; so that I can use an unaligned 'movl'. Or, maybe I should put the length
-  ;; in the high 4 bytes of the header so that the same GC mark bit would work
-  ;; as for all other objects (in byte index 3 of the header)
+  ;; Preserve rcx and compute the length in words.
+  ;; MAXIMUM-BIGNUM-LENGTH is a 4-byte quantity. Probably better if this would use
+  ;; the high 4 bytes of the header to naturally align the load.
   (inst push rcx)
-  (inst mov rcx (ea (- other-pointer-lowtag) rdi))
-  (inst shl rcx 1) ; shift out GC mark bit
-  (inst shr rcx (1+ n-widetag-bits))
+  (inst mov :dword rcx (ea (- 1 other-pointer-lowtag) rdi))
   #+bignum-assertions
   (progn (inst mov r11 rcx)
          (inst or r11 1)) ; align to start of ubsan bits
@@ -518,13 +513,14 @@
 ;; the same widetag, but not bignum-widetag, the behavior is undefined.
 ;;
 (define-assembly-routine (%eql/integer
-                          (:translate %eql/integer)
+                          (:translate eql)
                           ;; :safe would imply signaling an error
                           ;; if the args are not integer, which this doesn't.
                           (:policy :fast-safe)
                           (:conditional :e)
-                          (:cost 10))
-                         ((:arg x (descriptor-reg any-reg) rdx-offset)
+                          (:cost 10)
+                          (:arg-types (:or integer bignum) *))
+                         ((:arg x (descriptor-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
                           (:temp rcx unsigned-reg rcx-offset)
                           (:temp rax unsigned-reg rax-offset))
@@ -554,3 +550,9 @@
   (inst jmp :ne loop)
   ;; If the Z flag is set, the integers were EQL
   done)
+
+#-sb-assembling
+(define-vop (%eql/integer2 %eql/integer)
+  (:args (x :scs (descriptor-reg any-reg) :target x-arg-temp)
+         (y :scs (descriptor-reg) :target y-arg-temp))
+  (:arg-types * (:or integer bignum)))

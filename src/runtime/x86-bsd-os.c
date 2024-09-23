@@ -1,13 +1,21 @@
 #include <signal.h>
 #include <stdio.h>
-#include "sbcl.h"
+#include <errno.h>
+#include "genesis/sbcl.h"
+#include "interr.h"
 #include "runtime.h"
 #include "thread.h"
 
 
 #ifdef LISP_FEATURE_SB_THREAD
+#ifdef LISP_FEATURE_DARWIN
+#include <architecture/i386/table.h>
+#include <i386/user_ldt.h>
+#include <mach/mach_init.h>
+#else
 #include <machine/segments.h>
 #include <machine/sysarch.h>
+#endif /* LISP_FEATURE_DARWIN */
 #endif
 
 #if defined(LISP_FEATURE_FREEBSD) || defined(LISP_FEATURE_DRAGONFLY)
@@ -28,9 +36,23 @@
  * almost every line of code. It would be nice to find some way to
  * factor out the commonality better; failing that, it might be best
  * just to split this generic-BSD code into one variant for each BSD.
- */
+ *
+ * KLUDGE II: this split has begun with the addition of the Darwin BSD
+ * flavour, with the cross-architecture complications that this
+ * entails; unfortunately, currently the situation is worse, not
+ * better, than in the above paragraph. */
 
-#if defined(LISP_FEATURE_FREEBSD) || defined(__OpenBSD__) || defined(__DragonFly__)
+#ifdef LISP_FEATURE_NETBSD
+#define _REG_eax _REG_EAX
+#define _REG_ecx _REG_ECX
+#define _REG_edx _REG_EDX
+#define _REG_ebx _REG_EBX
+#define _REG_esp _REG_ESP
+#define _REG_ebp _REG_EBP
+#define _REG_esi _REG_ESI
+#define _REG_edi _REG_EDI
+#endif
+
 int *
 os_context_register_addr(os_context_t *context, int offset)
 {
@@ -51,15 +73,17 @@ os_context_register_addr(os_context_t *context, int offset)
         return (int *)CONTEXT_ADDR_FROM_STEM(esi);
     case 14:
         return (int *)CONTEXT_ADDR_FROM_STEM(edi);
+#ifdef __NetBSD__
+    /* Arguably the line in interrupt.c which uses reg_UESP could be changed
+     * to access c->uc_mcontext.__gregs[_REG_UESP] directly since nothing else
+     * needs this case, but I don't care enough to figure out why x86 + NetBSD
+     * crashes in cold-init regardless of any recent changes */
+    case 16:
+        return CONTEXT_ADDR_FROM_STEM(UESP);
+#endif
     default:
         return 0;
     }
-}
-
-int *
-os_context_sp_addr(os_context_t *context)
-{
-    return (int *)CONTEXT_ADDR_FROM_STEM(esp);
 }
 
 int *
@@ -68,39 +92,19 @@ os_context_fp_addr(os_context_t *context)
     return (int *)CONTEXT_ADDR_FROM_STEM(ebp);
 }
 
-#endif /* LISP_FEATURE_FREEBSD || __OpenBSD__ || __DragonFly__ */
-
-#ifdef __NetBSD__
-int *
-os_context_register_addr(os_context_t *context, int offset)
-{
-    switch(offset) {
-    case  0:
-        return CONTEXT_ADDR_FROM_STEM(EAX);
-    case  2:
-        return CONTEXT_ADDR_FROM_STEM(ECX);
-    case  4:
-        return CONTEXT_ADDR_FROM_STEM(EDX);
-    case  6:
-        return CONTEXT_ADDR_FROM_STEM(EBX);
-    case  8:
-        return CONTEXT_ADDR_FROM_STEM(ESP);
-    case 10:
-        return CONTEXT_ADDR_FROM_STEM(EBP);
-    case 12:
-        return CONTEXT_ADDR_FROM_STEM(ESI);
-    case 14:
-        return CONTEXT_ADDR_FROM_STEM(EDI);
-    case 16:
-        return CONTEXT_ADDR_FROM_STEM(UESP);
-    default:
-        return 0;
-    }
-}
-
+#if defined(LISP_FEATURE_FREEBSD) || defined(__OpenBSD__) || defined(LISP_FEATURE_DARWIN) || defined(__DragonFly__)
 int *
 os_context_sp_addr(os_context_t *context)
 {
+    return (int *)CONTEXT_ADDR_FROM_STEM(esp);
+}
+#endif
+
+#ifdef __NetBSD__
+int *
+os_context_sp_addr(os_context_t *context)
+{
+    // UC_MACHINE_SP refers to _REG_UESP, not _REG_ESP
     return &(_UC_MACHINE_SP(context));
 }
 
@@ -114,6 +118,11 @@ void
 os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
 }
+
+/* Note: the Darwin versions of arch_os_thread_init found in
+ * x86-darwin-os.c
+*/
+#if !defined(LISP_FEATURE_DARWIN)
 
 #ifdef LISP_FEATURE_SB_THREAD
 
@@ -129,6 +138,9 @@ void set_data_desc_addr(struct segment_descriptor* desc, void* addr)
     desc->sd_hibase = ((unsigned int)addr & 0xff000000) >> 24;
 }
 
+#endif
+
+#ifdef LISP_FEATURE_SB_THREAD
 void
 arch_os_load_ldt(struct thread *thread)
 {
@@ -171,7 +183,8 @@ int arch_os_thread_init(struct thread *thread) {
     sigstack.ss_sp    = calc_altstack_base(thread);
     sigstack.ss_flags = 0;
     sigstack.ss_size  = calc_altstack_size(thread);
-    sigaltstack(&sigstack,0);
+    if (sigaltstack(&sigstack,0)<0)
+        lose("Cannot sigaltstack: %s",strerror(errno));
 #endif
 
     return 1;                  /* success */
@@ -192,6 +205,7 @@ int arch_os_thread_cleanup(struct thread *thread) {
     return 1;                  /* success */
 }
 
+#endif /* !LISP_FEATURE_DARWIN */
 
 #if defined(LISP_FEATURE_FREEBSD)
 #if defined(LISP_FEATURE_RESTORE_TLS_SEGMENT_REGISTER_FROM_CONTEXT)

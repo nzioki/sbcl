@@ -353,28 +353,6 @@
 ;;; null, we don't care.
 (define-info-type (:function :inlinep) :type-spec sb-c::inlinep)
 
-;;; Track how many times IR2 converted a call to this function as a full call
-;;; that was not in the scope of a local or global notinline declaration.
-;;; Useful for finding functions that were supposed to have been converted
-;;; through some kind of transformation but were not.
-(define-info-type (:function :emitted-full-calls) :type-spec list)
-
-;; Return the number of calls to NAME that IR2 emitted as full calls,
-;; not counting calls via #'F that went untracked.
-;; Return 0 if the answer is nonzero but a warning was already signaled
-;; about any full calls were emitted. This return convention satisfies the
-;; intended use of this statistic - to decide whether to generate a warning
-;; about failure to inline NAME, which is shown at most once per name
-;; to avoid unleashing a flood of identical warnings.
-(defun emitted-full-call-count (name)
-  (let ((status (car (info :function :emitted-full-calls name))))
-     (and (integerp status)
-          ;; Bit 0 tells whether any call was NOT in the presence of
-          ;; a 'notinline' declaration, thus eligible to be inline.
-          ;; Bit 1 tells whether any warning was emitted yet.
-          (= (logand status 3) #b01)
-          (ash status -2)))) ; the call count as tracked by IR2
-
 ;;; a macro-like function which transforms a call to this function
 ;;; into some other Lisp form. This expansion is inhibited if inline
 ;;; expansion is inhibited.
@@ -483,6 +461,12 @@
 ;;     Note that this does not affect elision of the check for unbound-marker
 ;;     which is under control of the :ALWAYS-BOUND info.
 ;;  - an integer is a permanent index, and also implies :ALWAYS-THREAD-LOCAL.
+;;    This last case is theoretically subsumed by the former, because
+;;    :ALWAYS-THREAD-LOCAL can resolve to a TLS index at load-time, at least for
+;;    the SET vop. The down-side is that some CPU architectures might have trouble
+;;    with an unknown integer in instructions that have [thread+n] addressing mode
+;;    where the immediate operand size is not as generous as for x86.
+;;    e.g.. what if the imm operand exceeds (signed-byte 16) for PPC?
 ;; Specials in the CL package (notably reader/printer controls) use a wired-tls,
 ;; whether or not we bind per-thread [if we don't, that's a bug!]
 ;; We don't assume wired TLS more generally, because user code often defines
@@ -535,10 +519,10 @@
 
 ;;; wrapper for this type being used by the compiler
 (define-info-type (:type :compiler-layout)
-  :type-spec (or wrapper null)
+  :type-spec (or layout null)
   :default (lambda (name)
              (let ((class (find-classoid name nil)))
-               (and class (classoid-wrapper class)))))
+               (and class (classoid-layout class)))))
 
 ;;; DEFTYPE lambda-list
 ;; FIXME: remove this after making swank-fancy-inspector not use it.

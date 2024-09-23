@@ -34,14 +34,14 @@
 
 (defun dfun-arg-symbol (arg-number)
   (or (nth arg-number *dfun-arg-symbols*)
-      (pcl-format-symbol ".ARG~A." arg-number)))
+      (pcl-symbolicate ".ARG" arg-number ".")))
 
 (declaim (list *slot-vector-symbols*))
 (define-load-time-global *slot-vector-symbols* '(.SLOTS0. .SLOTS1. .SLOTS2. .SLOTS3.))
 
 (defun slot-vector-symbol (arg-number)
   (or (nth arg-number *slot-vector-symbols*)
-      (pcl-format-symbol ".SLOTS~A." arg-number)))
+      (pcl-symbolicate ".SLOTS" arg-number ".")))
 
 (declaim (inline make-dfun-required-args))
 (defun make-dfun-required-args (count)
@@ -73,7 +73,7 @@
     ;; of the vop operand restrictions or something that I don't understand.
     ;; Which is to say, PCL compilation reliably broke when changed to INDEX.
     (if applyp
-        (values (sb-impl::sys-tlab-append required '(&more .more-context. .more-count.))
+        (values (sys-tlab-append required '(&more .more-context. .more-count.))
                 required
                 '((sb-c:%listify-rest-args
                    .more-context. (the (and unsigned-byte fixnum)
@@ -193,7 +193,8 @@
   (let ((lambda `(lambda ,closure-variables
                    ,@(when (member 'miss-fn closure-variables)
                        `((declare (type function miss-fn))))
-                   (declare (optimize (sb-c:store-source-form 0)))
+                   (declare (optimize (sb-c:store-source-form 0)
+                                      (sb-c::store-xref-data 0)))
                    (declare (optimize (sb-c::store-closure-debug-pointer 3)))
                    #'(lambda ,args
                        (let () ; What is this LET doing?
@@ -233,15 +234,15 @@
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (std-instance-slots ,instance))))
-                               (%instance-wrapper ,instance))
+                               (%instance-layout ,instance))
                               ((fsc-instance-p ,instance)
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (fsc-instance-slots ,instance))))
-                               (%fun-wrapper ,instance)))))
+                               (%fun-layout ,instance)))))
         (block access
           (when (and wrapper
-                     (not (zerop (wrapper-clos-hash wrapper)))
+                     (not (zerop (layout-clos-hash wrapper)))
                      ,@(if (eql 1 1-or-2-class)
                            `((eq wrapper wrapper-0))
                            `((or (eq wrapper wrapper-0)
@@ -255,8 +256,8 @@
                  `((let ((value ,read-form))
                      (return-from access (not (unbound-marker-p value))))))
                 (:makunbound
-                 `(progn (setf ,read-form +slot-unbound+)
-                         ,instance))
+                 `((progn (setf ,read-form +slot-unbound+)
+                          ,instance)))
                 (:writer
                  `((return-from access (setf ,read-form ,(car arglist)))))))
           (funcall miss-fn ,@arglist))))))
@@ -368,7 +369,7 @@
          (wrapper-bindings (mapcan (lambda (arg mt)
                                      (unless (eq mt t)
                                        (incf index)
-                                       `((,(pcl-format-symbol "WRAPPER-~D" index)
+                                       `((,(pcl-symbolicate "WRAPPER-" index)
                                           ,(emit-fetch-wrapper
                                             mt arg miss-tag (pop slot-vars))))))
                                    args metatypes))
@@ -401,18 +402,18 @@
      (with-unique-names (wrapper)
        `(cond ((std-instance-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (%instance-wrapper ,argument)))
+                    `(let ((,wrapper (%instance-layout ,argument)))
                        (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (std-instance-slots ,argument)))
                        ,wrapper)
-                    `(%instance-wrapper ,argument)))
+                    `(%instance-layout ,argument)))
               ((fsc-instance-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (%fun-wrapper ,argument)))
+                    `(let ((,wrapper (%fun-layout ,argument)))
                        (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (fsc-instance-slots ,argument)))
                        ,wrapper)
-                    `(%fun-wrapper ,argument)))
+                    `(%fun-layout ,argument)))
                (t (go ,miss-tag)))))
     ;; Sep92 PCL used to distinguish between some of these cases (and
     ;; spuriously exclude others).  Since in SBCL
@@ -423,7 +424,7 @@
      (when slots-var
        (bug "SLOT requested for metatype ~S, but it isn't going to happen."
             metatype))
-     `(wrapper-of ,argument))
+     `(layout-of ,argument))
     ;; a metatype of NIL should never be seen here, as NIL is only in
     ;; the metatypes before a generic function is fully initialized.
     ;; T should never be seen because we never need to get a wrapper

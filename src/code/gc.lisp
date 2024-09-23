@@ -15,12 +15,7 @@
 
 (declaim (inline dynamic-usage))
 (defun dynamic-usage ()
-  #+gencgc
-  (extern-alien "bytes_allocated" os-vm-size-t)
-  #-gencgc
-  (truly-the word
-             (- (sap-int (sb-c::dynamic-space-free-pointer))
-                sb-vm:dynamic-space-start)))
+  (extern-alien "bytes_allocated" os-vm-size-t))
 
 (defun static-space-usage ()
   (- (sap-int sb-vm:*static-space-free-pointer*) sb-vm:static-space-start))
@@ -56,7 +51,8 @@
   ;; and we need a function in C to do that.
   (gc)
   (setf *n-bytes-freed-or-purified* 0
-        *gc-run-time* 0))
+        *gc-run-time* 0
+        *gc-real-time* 0))
 
 (declaim (ftype (sfunction () unsigned-byte) get-bytes-consed))
 (defun get-bytes-consed ()
@@ -82,6 +78,8 @@ and submit it as a patch."
 
 ;;;; GC hooks
 
+;;; N.B.: hooks need to be sufficiently uncomplicated as to be harmless,
+;;; and should not expect any particular thread context.
 (define-load-time-global *after-gc-hooks* nil
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
@@ -125,21 +123,32 @@ run in any thread.")
      (alien-funcall (extern-alien "release_gc_lock" (function void)))
      t))
 
+(defmacro get-gc-real-time ()
+  ;; 64-bit is just a call to clock-gettime and some math that won't ever cons
+  #+64-bit '(get-internal-real-time)
+  ;; 32-bit memoizes the result to try to avoid bignum consing,
+  ;; which can fail during foreign thread creation.
+  #-64-bit 0)
+
 (defun sub-gc (gen)
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
         (t
          (flet ((perform-gc ()
+                  (declare (sb-c::tlab :system)) ; for *gc-epoch*
                   ;; Called from WITHOUT-GCING and WITHOUT-INTERRUPTS
                   ;; after the world has been stopped, but it's an
                   ;; awkwardly long piece of code to nest so deeply.
                   (let ((old-usage (dynamic-usage))
                         (new-usage 0)
-                        (start-time (get-internal-run-time)))
+                        (start-time (get-internal-run-time))
+                        (start-real-time (get-gc-real-time)))
                     (collect-garbage gen)
                     (setf *gc-epoch* (cons 0 0))
-                    (let ((run-time (- (get-internal-run-time) start-time)))
+                    (let ((run-time (- (get-internal-run-time) start-time))
+                          (real-time (- (get-gc-real-time) start-real-time)))
+                      (incf *gc-real-time* real-time)
                       ;; KLUDGE: Sometimes we see the second getrusage() call
                       ;; return a smaller value than the first, which can
                       ;; lead to *GC-RUN-TIME* to going negative, which in
@@ -215,13 +224,9 @@ run in any thread.")
 
 #+sb-thread
 (defun post-gc ()
-  (sb-impl::finalizer-thread-notify)
+  (sb-impl::finalizer-thread-notify 1) ; Tell it to perform post-GC hooks
   (alien-funcall (extern-alien "empty_thread_recyclebin" (function void)))
-  ;; Post-GC actions are invoked synchronously by the GCing thread,
-  ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
-  ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
-  ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
-  (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))
+  nil)
 
 #-sb-thread
 (defun post-gc ()
@@ -275,40 +280,26 @@ run in any thread.")
       (sb-thread::without-thread-waiting-for ()
         (with-interrupts
           (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))
+  nil)
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
-  #+gencgc
   "Initiate a garbage collection.
 
 The default is to initiate a nursery collection, which may in turn
 trigger a collection of one or more older generations as well. If FULL
 is true, all generations are collected. If GEN is provided, it can be
-used to specify the oldest generation guaranteed to be collected.
-
-On CheneyGC platforms arguments FULL and GEN take no effect: a full
-collection is always performed."
-  #-gencgc
-  "Initiate a garbage collection.
-
-The collection is always a full collection.
-
-Arguments FULL and GEN can be used for compatibility with GENCGC
-platforms: there the default is to initiate a nursery collection,
-which may in turn trigger a collection of one or more older
-generations as well. If FULL is true, all generations are collected.
-If GEN is provided, it can be used to specify the oldest generation
-guaranteed to be collected."
-  #-gencgc (declare (ignore full))
-  (let (#+gencgc (gen (if full sb-vm:+pseudo-static-generation+ gen)))
+used to specify the oldest generation guaranteed to be collected."
+  (let ((gen (if full sb-vm:+pseudo-static-generation+ gen)))
     (when (eq t (sub-gc gen))
       (post-gc))))
 
 (define-alien-routine scrub-control-stack void)
 
+(defglobal sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
-  #-gencgc (declare (ignore gen))
+  (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
   ;; as having these cons more than we have space left leads to huge
   ;; badness.
@@ -316,18 +307,18 @@ guaranteed to be collected."
   ;; Power cache of the bignum printer: drops overly large bignums and
   ;; removes duplicate entries.
   (scrub-power-cache)
+  (setf sb-unicode::*name->char-buffers* nil)
+  (setf sb-c::*phash-lambda-cache* nil)
   ;; Clear caches depending on the generation being collected.
-  #+gencgc
   (cond ((eql 0 gen)
-         ;; Drop strings because the hash is pointer-hash
-         ;; but there is no automatic cache rehashing after GC.
+         ;; Drop strings because the hash is address-based, but there
+         ;; is no automatic cache rehashing after GC.
          (sb-format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
          (sb-format::tokenize-control-string-cache-clear))
         (t
-         (drop-all-hash-caches)))
-  #-gencgc
-  (drop-all-hash-caches))
+         (setq sb-di::*uncompacted-fun-maps* nil sb-di::*compiled-debug-funs* nil)
+         (drop-all-hash-caches))))
 
 ;;;; auxiliary functions
 
@@ -343,8 +334,11 @@ Note: currently changes to this value are lost when saving core."
 
 (defun (setf bytes-consed-between-gcs) (val)
   (declare (type (and fixnum unsigned-byte) val))
-  (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t)
-        val))
+  #+(or gencgc mark-region-gc)
+  (let ((current (extern-alien "bytes_consed_between_gcs" os-vm-size-t)))
+    (when (< val current)
+      (decf (extern-alien "auto_gc_trigger" os-vm-size-t) (- current val))))
+  (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t) val))
 
 (declaim (inline maybe-handle-pending-gc))
 (defun maybe-handle-pending-gc ()
@@ -396,7 +390,7 @@ statistics are appended to it."
     (array generation #.(1+ sb-vm:+pseudo-static-generation+)))
 
 ;;; Why is PAGE-INDEX-T in SB-KERNEL but PAGE and the page table are in SB-VM?
-(define-alien-type (struct sb-vm::page)
+(define-alien-type nil
     (struct sb-vm::page
             ;; To cut down the size of the page table, the scan_start_offset
             ;; - a/k/a "start" - is measured in 4-byte integers regardless
@@ -409,9 +403,20 @@ statistics are appended to it."
             (sb-vm::flags (unsigned 8)) ; this named 'type' in C
             (sb-vm::gen (signed 8))))
 (define-alien-variable ("page_table" sb-vm:page-table) (* (struct sb-vm::page)))
-(declaim (inline sb-vm:find-page-index))
-(define-alien-routine ("ext_find_page_index" sb-vm:find-page-index) page-index-t (address unsigned))
 
+(declaim (ftype (sfunction (t) (integer -1 #.(floor most-positive-word sb-vm:gencgc-page-bytes)))
+                sb-vm:find-page-index)
+         (inline sb-vm:find-page-index))
+(defun sb-vm:find-page-index (address)
+  (with-alien ((find-page-index (function page-index-t unsigned) :extern "ext_find_page_index"))
+    (truly-the (integer -1 #.(floor most-positive-word sb-vm:gencgc-page-bytes))
+               (alien-funcall find-page-index address))))
+
+(defun pages-allocated ()
+  (loop for n below (extern-alien "next_free_page" page-index-t)
+        count (not (zerop (slot (deref sb-vm:page-table n) 'sb-vm::flags)))))
+
+#-mark-region-gc
 (defun generation-of (object)
   (with-pinned-objects (object)
     (let* ((addr (get-lisp-obj-address object))
@@ -423,8 +428,15 @@ statistics are appended to it."
              (when (simple-fun-p object)
                (setq addr (get-lisp-obj-address (fun-code-header object))))
              (let ((sap (int-sap (logandc2 addr sb-vm:lowtag-mask))))
-               (logand (if (fdefn-p object) (sap-ref-8 sap 1) (sap-ref-8 sap 3))
-                       #xF)))))))
+               (logand (sap-ref-8 sap 3) #xF)))))))
+
+#+mark-region-gc
+(defun generation-of (object)
+  (with-alien ((gc-gen-of (function char unsigned int) :extern))
+    (let ((result (with-pinned-objects (object)
+                    (alien-funcall gc-gen-of
+                                   (get-lisp-obj-address object) 127))))
+      (unless (= result 127) result))))
 
 (export 'page-protected-p)
 (macrolet ((addr->mark (addr)
@@ -518,6 +530,16 @@ Experimental: interface subject to change."
                     ((< sb-vm:read-only-space-start addr
                         (sap-int sb-vm:*read-only-space-free-pointer*))
                      :read-only)
+                    #+permgen
+                    ((< sb-vm:permgen-space-start addr
+                        (sap-int sb-vm:*permgen-space-free-pointer*))
+                     :permgen)
+                    ;; Without immobile-space, the text range is
+                    ;; more-or-less an extension of static space.
+                    #-immobile-space
+                    ((< sb-vm:text-space-start addr
+                        (sap-int sb-vm:*text-space-free-pointer*))
+                     :static)
                     ((< sb-vm:static-space-start addr
                         (sap-int sb-vm:*static-space-free-pointer*))
                      :static))))

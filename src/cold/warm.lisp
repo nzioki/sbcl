@@ -25,7 +25,12 @@ sb-kernel::
          (,(find-classoid-cell 'step-condition) . sb-impl::invoke-stepper))))
 ;;;; And now a trick: splice those into the oldest *HANDLER-CLUSTERS*
 ;;;; which had a placeholder NIL reserved for this purpose.
-sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
+(defun splice-handler-clusters ()
+  sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**)))
+
+;;; Don't use the evaluator, it establishes its own dynamic-extent
+;;; bindings for *handler-clusters*
+(splice-handler-clusters)
 
 ;;;; Use the same settings as PROCLAIM-TARGET-OPTIMIZATION
 ;;;; I could not think of a trivial way to ensure that this stays functionally
@@ -80,37 +85,6 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 
 ;;; Verify that compile-time floating-point math matches load-time.
 (defvar *compile-files-p*)
-(when (or (not (boundp '*compile-files-p*)) *compile-files-p*)
-  (with-open-file (stream "float-math.lisp-expr" :if-does-not-exist nil)
-    (when stream
-      (format t "; Checking ~S~%" (pathname stream))
-      ;; Ensure that we're reading the correct variant of the file
-      ;; in case there is more than one set of floating-point formats.
-      (assert (eq (read stream) :default))
-      (sb-kernel::with-float-traps-masked (:overflow :divide-by-zero)
-        (let ((*readtable* (copy-readtable))
-              (*package* (find-package "SB-KERNEL")))
-          (set-dispatch-macro-character
-           #\# #\. (lambda (stream subchar arg)
-                     (declare (ignore subchar arg))
-                     (let ((expr (read stream t nil t)))
-                       (ecase (car expr)
-                         (sb-kernel:make-single-float
-                          (sb-kernel:make-single-float (second expr)))
-                         (sb-kernel:make-double-float
-                          (sb-kernel:make-double-float (second expr) (third expr)))))))
-          (dolist (expr (read stream))
-            (destructuring-bind (fun args . result) expr
-              (let ((result (if (eq (first result) 'sb-kernel::&values)
-                                (rest result)
-                                result))
-                    (actual (multiple-value-list (apply fun (sb-int:ensure-list args)))))
-                (unless (equalp actual result)
-                  (#+sb-devel cerror #+sb-devel ""
-                   #-sb-devel format #-sb-devel t
-                   "FLOAT CACHE LINE ~S vs COMPUTED ~S~%"
-                   expr actual))))))))))
-
 (when (if (boundp '*compile-files-p*) *compile-files-p* t)
   (with-open-file (output "output/cold-vop-usage.txt" :if-does-not-exist nil)
     (when output
@@ -146,10 +120,17 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 ;;;     (declare (optimize (speed 0))))))
 ;;;
 (defvar *sbclroot* "")
+(defvar *generated-sources-root* "output/ucd/")
 (let ((sources (with-open-file (f (merge-pathnames "build-order.lisp-expr" *load-pathname*))
                  (read f) ; skip over the make-host-{1,2} input files
                  (read f)))
       (sb-c::*handled-conditions* sb-c::*handled-conditions*))
+ ;; The CONCATENATE transform involves REPLACE which involves UBn-BASH-COPY which involves
+ ;; SHIFT-TOWARDS-{START|END} which is called with a constant arg. But the interpreter stubs
+ ;; aren't compiled yet. So in attempting to constant-fold the call, CAREFUL-CALL gets an
+ ;; undefined-fun error, which is handled fine unless you've broken the handler for undefined-fun
+ ;; and are trying to debug it in early warm load.
+ (declare (notinline concatenate))
  (proclaim '(sb-ext:muffle-conditions compiler-note))
  (flet ((do-srcs (list)
          (dolist (stem list)
@@ -248,7 +229,7 @@ sb-kernel::(rplaca (last *handler-clusters*) (car **initial-handler-clusters**))
 
 (sb-c::dump/restore-interesting-types 'write)
 (when (hash-table-p sb-c::*static-vop-usage-counts*)
-  (with-open-file (output "output/warm-vop-usage.txt"
+  (with-open-file (output (merge-pathnames "warm-vop-usage.txt" *objfile-prefix*)
                           :direction :output :if-exists :supersede)
     (let (list)
       (sb-int:dohash ((name vop) sb-c::*backend-parsed-vops*)

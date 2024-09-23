@@ -41,12 +41,12 @@
 (define-load-time-global *sgf-wrapper*
   (!boot-make-wrapper (!early-class-size 'standard-generic-function)
                       'standard-generic-function
-                      sb-kernel::standard-gf-primitive-obj-layout-bitmap))
+                      sb-kernel::funinstance-layout-bitmap))
 
 
 (defun allocate-standard-instance (wrapper)
   (let* ((instance (%new-instance wrapper (1+ sb-vm:instance-data-start)))
-         (slots (make-array (wrapper-length wrapper) :initial-element +slot-unbound+)))
+         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+)))
     (%instance-set instance sb-vm:instance-data-start slots)
     instance))
 
@@ -64,19 +64,19 @@
           :format-arguments (list ,fin)))
 
 (defun allocate-standard-funcallable-instance (wrapper name)
-  (declare (wrapper wrapper))
+  (declare (layout wrapper))
   (let* ((hash (if name
                    ;; Named functions have a predictable hash
-                   (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
+                   (mix (sxhash name) (symbol-hash :generic-function)) ; arb. constant
                    (sb-kernel::quasi-random-address-based-hash
                     (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte)))
                     most-positive-fixnum)))
-         (slots (make-array (wrapper-length wrapper) :initial-element +slot-unbound+))
+         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
          (fin (truly-the funcallable-instance
                          (%make-standard-funcallable-instance
-                          slots #-compact-instance-header hash))))
-    (setf (%fun-wrapper fin) wrapper)
-    #+compact-instance-header
+                          slots #-executable-funinstances hash))))
+    (setf (%fun-layout fin) wrapper)
+    #+executable-funinstances
     (let ((32-bit-hash
            ;; don't know how good our hash is, so use all N-FIXNUM-BITS of it
            ;; as input to murmur-hash, which should definitely affect all bits,
@@ -117,15 +117,16 @@
 ;;;;
 ;;;; This function builds the base metabraid from the early class definitions.
 
+(defmacro wrapper-info (x) `(sb-kernel::layout-%info ,x))
 (declaim (inline wrapper-slot-list))
 (defun wrapper-slot-list (wrapper)
-  (let ((info (sb-kernel::wrapper-%info wrapper)))
+  (let ((info (wrapper-info wrapper)))
     (if (listp info) info)))
 (defun (setf wrapper-slot-list) (newval wrapper)
   ;; The current value must be a list, otherwise we'd clobber
   ;; a defstruct-description.
-  (aver (listp (sb-kernel::wrapper-%info wrapper)))
-  (setf (sb-kernel::wrapper-%info wrapper) newval))
+  (aver (listp (wrapper-info wrapper)))
+  (setf (wrapper-info wrapper) newval))
 
 (macrolet
     ((with-initial-classes-and-wrappers ((&rest classes) &body body)
@@ -184,12 +185,12 @@
           (multiple-value-bind (slots cpl default-initargs direct-subclasses)
               (!early-collect-inheritance name)
             (let* ((class (find-class name))
-                   ;; All funcallable objects get the bitmap of standard-GF.
+                   ;; All funcallable instances have the same bitmap
                    ;; This is checked in verify_range() of gencgc.
                    (bitmap (if (memq name '(standard-generic-function
                                             funcallable-standard-object
                                             generic-function))
-                               sb-kernel::standard-gf-primitive-obj-layout-bitmap
+                               sb-kernel::funinstance-layout-bitmap
                                +layout-all-tagged+))
                    (wrapper (cond ((eq class slot-class)
                                    slot-class-wrapper)
@@ -243,7 +244,7 @@
                      name class slots
                      standard-effective-slot-definition-wrapper t))
 
-              (setf (wrapper-slot-table wrapper) (make-slot-table class slots t))
+              (setf (layout-slot-table wrapper) (make-slot-table class slots t))
               (when (layout-for-pcl-obj-p wrapper)
                 (setf (wrapper-slot-list wrapper) slots))
 
@@ -345,7 +346,7 @@
       (destructuring-bind (name supers subs cpl prototype) e
         (let* ((class (find-class name))
                (lclass (find-classoid name))
-               (wrapper (classoid-wrapper lclass)))
+               (wrapper (classoid-layout lclass)))
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class
@@ -413,7 +414,7 @@
                                  slot-class))
       (set-slot 'direct-slots direct-slots)
       (set-slot 'slots slots)
-      (setf (wrapper-slot-table wrapper)
+      (setf (layout-slot-table wrapper)
             (make-slot-table class slots
                              (member metaclass-name
                                      '(standard-class funcallable-standard-class))))
@@ -719,10 +720,8 @@
 (defun find-slot-cell (wrapper slot-name)
   (declare (symbol slot-name))
   (declare (optimize (sb-c:insert-array-bounds-checks 0)))
-  (let* ((vector (wrapper-slot-table wrapper))
+  (let* ((vector (layout-slot-table wrapper))
          (modulus (truly-the index (svref vector 0)))
-         ;; Can elide the 'else' branch of (OR symbol-hash ensure-symbol-hash)
-         ;; because every symbol in the slot-table already got a nonzero hash.
          (index (rem (symbol-hash slot-name) modulus))
          (probe (svref vector (1+ index))))
     (declare (simple-vector vector) (index index))
@@ -737,6 +736,7 @@
           ((eq (car (truly-the list probe)) slot-name)
            (cdr probe)))))
 
+;;; TODO: this should just be a call to MAKE-HASH-BASED-SLOT-MAPPER.
 (defun make-slot-table (class slots &optional bootstrap)
   (unless slots
     ;; *** If changing this empty table value to something else,
@@ -750,11 +750,12 @@
     (flet ((add-to-vector (name slot)
              (declare (symbol name)
                       (optimize (sb-c:insert-array-bounds-checks 0)))
-             (let ((index (rem (ensure-symbol-hash name) n)))
+             (let ((index (rem (symbol-hash name) n)))
                (setf (svref vector index)
                      (acons name
                             (cons (when (or bootstrap
-                                            (and (standard-class-p class)
+                                            (and (or (standard-class-p class)
+                                                     (funcallable-standard-class-p class))
                                                  (slot-accessor-std-p slot 'all)))
                                     (if bootstrap
                                         (early-slot-definition-location slot)

@@ -58,11 +58,13 @@
 
 ;;; Signal a warning if appropriate and set *FOO-DETECTED*.
 (defun note-lossage (format-string &rest format-args)
+  (declare (explicit-check))
   (setq *lossage-detected* t)
   (when *lossage-fun*
     (apply *lossage-fun* format-string format-args))
   (values))
 (defun note-unwinnage (format-string &rest format-args)
+  (declare (explicit-check))
   (setq *unwinnage-detected* t)
   (when *unwinnage-fun*
     (apply *unwinnage-fun* format-string format-args))
@@ -124,20 +126,13 @@
                (max-args (+ min-args (length optional)))
                (rest (fun-type-rest type))
                (keyp (fun-type-keyp type))
-               (fun (combination-fun call))
-               (caller (loop for annotation in (lvar-annotations fun)
-                             when (typep annotation 'lvar-function-designator-annotation)
-                             do (setf *compiler-error-context* annotation)
-                                (return (lvar-function-designator-annotation-caller annotation))))
-               (name (nth-value 1 (lvar-fun-type fun))))
+               (fun (combination-fun call)))
           (cond
-            ((report-arg-count-mismatch name
-                                        caller type nargs nil
-                                        :lossage-fun #'note-lossage))
+            ((report-arg-count-mismatch fun nil type nargs nil #'note-lossage))
             (t
              (check-fixed-and-rest args (append required optional) rest)
              (when (and keyp
-                        (check-key-args name args max-args type))
+                        (check-key-args fun args max-args type))
                (setf unknown-keys t))))
 
           (when result-test
@@ -166,6 +161,44 @@
     (cond (*lossage-detected* (values nil t unknown-keys))
           (*unwinnage-detected* (values nil nil unknown-keys))
           (t (values t t unknown-keys)))))
+
+(defun valid-transform-fun (call type arg-fun result-fun)
+  (declare (function arg-fun result-fun))
+  (let ((args (combination-args call)))
+    (flet ((check (lvar type)
+             (if (constant-type-p type)
+                 (and (constant-lvar-p lvar)
+                      (ctypep (lvar-value lvar)
+                              (constant-type-type type)))
+                 (funcall arg-fun (lvar-type lvar) type))))
+      (and (or (fun-type-wild-args type)
+               (and (loop for type in (fun-type-required type)
+                          always (and args
+                                      (check (pop args) type)))
+                    (loop for type in (fun-type-optional type)
+                          always (if args
+                                     (check (pop args) type)
+                                     (return-from valid-transform-fun t)))
+                    (or (not args)
+                        ;; Assume that validate-call-type has ensured that
+                        ;; the keys are all constant.
+                        (cond ((fun-type-keyp type)
+                               (loop with keywords = (fun-type-keywords type)
+                                     for (key value) on args by #'cddr
+                                     for info = (find (lvar-value key)
+                                                      (fun-type-keywords type)
+                                                      :key #'key-info-name)
+                                     always (and info
+                                                 (check value
+                                                        (key-info-type info)))))
+                              ((let ((rest (fun-type-rest type)))
+                                 (and rest
+                                      (or (eq rest *universal-type*)
+                                          (loop for arg in args
+                                                always (csubtypep (lvar-type arg) rest))))))))))
+           (let ((return-type (fun-type-returns type)))
+             (or (eq return-type *wild-type*)
+                 (funcall result-fun (node-asserted-type call) return-type)))))))
 
 ;;;
 
@@ -208,24 +241,29 @@
               (let ((initform (if (typep lambda-list-element '(cons t cons))
                                   (second lambda-list-element)
                                   (dsd-default slot))))
-                ;; Return T if value-form definitely does not satisfy
-                ;; the type-check for DSD. Return NIL if we can't decide.
-                (when (if (constantp initform)
-                          (not (sb-xc:typep (constant-form-value initform)
-                                            (dsd-type slot)))
-                          ;; Find uses of nil-returning functions as defaults,
-                          ;; like ERROR and MISSING-ARG.
-                          (and (sb-kernel::dd-null-lexenv-p dd)
-                               (listp initform)
-                               (let ((f (car initform)))
-                                 ;; Don't examine :function :type of macros!
-                                 (and (eq (info :function :kind f) :function)
-                                      (let ((info (info :function :type f)))
-                                        (and (fun-type-p info)
-                                             (type= (fun-type-returns info)
-                                                    *empty-type*)))))))
-                  (note-lossage "The slot ~S does not have a suitable default, ~
-and no value was provided for it." name))))))))))
+                (if (logtest sb-kernel::dsd-default-error (sb-kernel::dsd-bits slot))
+                    (note-lossage "The slot ~S default form ~s doesn't match :type ~s"
+                                  name
+                                  (dsd-default slot)
+                                  (dsd-type slot))
+                    ;; Return T if value-form definitely does not satisfy
+                    ;; the type-check for DSD. Return NIL if we can't decide.
+                    (when (if (constantp initform)
+                              (not (sb-xc:typep (constant-form-value initform)
+                                                (dsd-type slot)))
+                              ;; Find uses of nil-returning functions as defaults,
+                              ;; like ERROR and MISSING-ARG.
+                              (and (sb-kernel::dd-null-lexenv-p dd)
+                                   (listp initform)
+                                   (let ((f (car initform)))
+                                     ;; Don't examine :function :type of macros!
+                                     (and (eq (info :function :kind f) :function)
+                                          (let ((info (info :function :type f)))
+                                            (and (fun-type-p info)
+                                                 (type= (fun-type-returns info)
+                                                        *empty-type*)))))))
+                      (note-lossage "The slot ~S does not have a suitable default, ~
+and no value was provided for it." name)))))))))))
 
 ;;; Check that the derived type of the LVAR is compatible with TYPE. N
 ;;; is the arg number, for error message purposes. We return true if
@@ -237,6 +275,9 @@ and no value was provided for it." name))))))))))
 (defun check-arg-type (lvar type n)
   (declare (type lvar lvar) (type ctype type) (type index n))
   (cond
+    ((eq (lvar-type lvar) *empty-type*)
+     (note-unwinnage "The ~:R argument never returns a value." n)
+     nil)
     ((not *ctype-test-fun*))
     ((not (constant-type-p type))
      (let* ((ctype (lvar-type lvar))
@@ -245,9 +286,6 @@ and no value was provided for it." name))))))))))
               (unless (type= ctype (specifier-type '(eql dummy)))
                 (note-lossage "The ~:R argument is a ~S, not a ~S."
                               n (type-specifier ctype) (type-specifier type)))
-              nil)
-             ((eq ctype *empty-type*)
-              (note-unwinnage "The ~:R argument never returns a value." n)
               nil)
              (t t))))
     ((not (constant-lvar-p lvar))
@@ -289,9 +327,9 @@ and no value was provided for it." name))))))))))
 ;;; be known and the corresponding argument should be of the correct
 ;;; type. If the key isn't a constant, then we can't tell, so we can
 ;;; complain about absence of manifest winnage.
-(defun check-key-args (name args pre-key type)
+(defun check-key-args (fun args pre-key type)
   (declare (list args) (fixnum pre-key) (type fun-type type))
-  (declare (ignorable name))
+  (declare (ignorable fun))
   (let (lossages allow-other-keys
         unknown-keys)
     (do ((key (nthcdr pre-key args) (cddr key))
@@ -329,18 +367,19 @@ and no value was provided for it." name))))))))))
                                     (1+ n)))))))))
     (when (and lossages (member allow-other-keys '(nil :no)))
       (setf lossages (nreverse lossages))
-
-      (cond #-sb-xc-host
-            ((or (eq (info :function :type name) :generic-function)
-                 (eq (info :function :where-from name) :defined-method))
-             (note-key-arg-mismatch name lossages))
-            ((cdr lossages)
-             (note-lossage "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
-                           (butlast lossages)
-                           (car (last lossages))))
-            (t
-             (note-lossage "~S is not a known argument keyword."
-                           (car lossages)))))
+      (let (#-sb-xc-host
+            (name (nth-value 1 (lvar-fun-type fun))))
+        (cond #-sb-xc-host
+              ((or (eq (info :function :type name) :generic-function)
+                   (eq (info :function :where-from name) :defined-method))
+               (note-key-arg-mismatch name lossages))
+              ((cdr lossages)
+               (note-lossage "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
+                             (butlast lossages)
+                             (car (last lossages))))
+              (t
+               (note-lossage "~S is not a known argument keyword."
+                             (car lossages))))))
     unknown-keys))
 
 ;;; Construct a function type from a definition.
@@ -349,11 +388,11 @@ and no value was provided for it." name))))))))))
 ;;; the &REST type.
 (defun definition-type (functional)
   (declare (type functional functional)
-           #-sb-xc-host (values fun-type))
+           #-sb-xc-host (values fun-type &optional))
   (if (lambda-p functional)
       (make-fun-type
        :required (mapcar #'leaf-type (lambda-vars functional))
-       :returns (if (eq (functional-kind functional) :deleted)
+       :returns (if (functional-kind-eq functional deleted)
                     *empty-type*
                     (tail-set-type (lambda-tail-set functional))))
       (let ((rest nil))
@@ -434,6 +473,9 @@ and no value was provided for it." name))))))))))
 ;;; CALL. If TYPE is supplied and not null, then we merge the
 ;;; information into the information already accumulated in TYPE.
 (defun note-fun-use (call &optional type)
+  (declare (inline make-approximate-key-info
+                   make-approximate-fun-type)
+           (sb-c::tlab :system))
   (declare (type combination call)
            (type (or approximate-fun-type null) type)
            #-sb-xc-host
@@ -900,18 +942,31 @@ and no value was provided for it." name))))))))))
                      :returns (fun-type-returns type))
       type))
 
+
+(defun single-value-args (call)
+  (let ((args (basic-combination-args call)))
+   (if (mv-combination-p call)
+       (loop for arg in args
+             while (type-single-value-p (lvar-derived-type arg))
+             collect arg)
+       args)))
+
 ;;; Call FUN with (arg-lvar arg-type lvars &optional annotation)
-(defun map-combination-args-and-types (fun call &optional info
-                                                          unknown-keys-fun
-                                                          declared-only)
-  (declare (type function fun) (type combination call))
-  (binding* ((type (lvar-fun-type (combination-fun call) declared-only declared-only))
+(defun map-combination-args-and-types (fun call &key info
+                                                     unknown-keys-fun
+                                                     defined-here
+                                                     asserted-type
+                                                     type)
+  (declare (type function fun)
+           (type basic-combination call))
+  (binding* ((type (or type
+                       (lvar-fun-type (basic-combination-fun call) defined-here asserted-type)))
              (nil (fun-type-p type) :exit-if-null)
              (annotation (and info
                               (fun-info-annotation info)))
+             (args (single-value-args call))
              ((arg-lvars unknown-keys)
-              (resolve-key-args (combination-args call) type))
-             (args (combination-args call))
+              (resolve-key-args args type))
              (i -1))
     (flet ((positional-annotation ()
              (and annotation
@@ -956,7 +1011,7 @@ and no value was provided for it." name))))))))))
               (call lvar (key-info-type key) (key-annotation name)))))
         (when (and unknown-keys-fun
                    unknown-keys)
-          (funcall unknown-keys-fun))))))
+          (funcall unknown-keys-fun unknown-keys))))))
 
 (defun assert-array-index-lvar-type (lvar type policy)
   (let ((internal-lvar (make-lvar))
@@ -972,9 +1027,9 @@ and no value was provided for it." name))))))))))
         (use-lvar cast internal-lvar)
         t))))
 
-(defun apply-type-annotation (fun-name arg type lvars policy &optional annotation)
+(defun apply-type-annotation (fun-name arg type lvars policy &optional annotation context)
   (case (car annotation)
-    (function-designator
+    ((function function-designator)
      (assert-function-designator fun-name lvars arg (cdr annotation) policy)
      t)
     (t
@@ -996,12 +1051,12 @@ and no value was provided for it." name))))))))))
         (add-annotation arg
                         (make-lvar-proper-sequence-annotation
                          :kind (car annotation)))))
-     (assert-lvar-type arg type policy))))
+     (assert-lvar-type arg type policy context))))
 
 ;;; Assert that CALL is to a function of the specified TYPE. It is
 ;;; assumed that the call is legal and has only constants in the
 ;;; keyword positions.
-(defun assert-call-type (call type &optional (trusted t))
+(defun assert-call-type (call type trusted where-from)
   (declare (type combination call) (type fun-type type))
   (let ((policy (lexenv-policy (node-lexenv call)))
         (returns (fun-type-returns type)))
@@ -1017,10 +1072,11 @@ and no value was provided for it." name))))))))))
           ;; less use there, but they can cause the MV call conversion
           ;; to cause astray.
           (when (and lvar
-                     (not (return-p (lvar-dest lvar)))
-                     (not (mv-combination-p (lvar-dest lvar)))
-                     (lvar-has-single-use-p lvar))
-            (when (assert-lvar-type lvar returns policy)
+                     (or (eq where-from :declared-verify)
+                         (and (not (return-p (lvar-dest lvar)))
+                              (not (mv-combination-p (lvar-dest lvar)))
+                              (lvar-has-single-use-p lvar))))
+            (when (assert-node-type call returns policy 'ftype-context)
               (reoptimize-lvar lvar)))))
     (let* ((name (lvar-fun-name (combination-fun call) t))
            (info (and name
@@ -1032,13 +1088,15 @@ and no value was provided for it." name))))))))))
            (lambda (arg type lvars &optional annotation)
              (when (and
                     (apply-type-annotation name arg type
-                                           lvars policy annotation)
+                                           lvars policy annotation
+                                           (and (not trusted)
+                                                'ftype-context))
                     (not trusted))
                (reoptimize-lvar arg)))
            call
-           info
-           nil
-           t))))
+           :info info
+           :defined-here t
+           :type type))))
   (values))
 
 ;;;; FIXME: Move to some other file.

@@ -604,7 +604,7 @@ bootstrapping.
              (eq (car fn) 'function)
              (consp (setq fn-lambda (cadr fn)))
              (eq (car fn-lambda) 'lambda)
-             (bug "Really got here"))
+             (sb-impl::unreachable))
         (let* ((specls (mapcar (lambda (specl)
                                  (if (consp specl)
                                      ;; CONSTANT-FORM-VALUE?  What I
@@ -1185,8 +1185,8 @@ bootstrapping.
                    `(,type
                      (,function-name
                       proto-generic-function proto-method specializer))))
-               '(specializer symbol t class-eq-specializer eql-specializer
-                 structure-class system-class class)))))
+               '(specializer symbol t #|class-eq-specializer eql-specializer
+                 structure-class system-class class|#)))))
     (delegations)))
 
 (unless (fboundp 'specializer-type-specifier)
@@ -1834,6 +1834,11 @@ bootstrapping.
     (load-defmethod-internal class name quals specls
                              ll initargs source-location)))
 
+(define-condition find-method-length-mismatch
+    (reference-condition simple-error)
+  ()
+  (:default-initargs :references '((:ansi-cl :function find-method))))
+
 (defun load-defmethod-internal
     (method-class gf-spec qualifiers specializers lambda-list
                   initargs source-location)
@@ -2196,6 +2201,12 @@ bootstrapping.
       (clos-slots-ref (std-instance-slots method) +sm-qualifiers-index+)
       (method-qualifiers method)))
 
+(defconstant +sgf-name-index+
+  (!bootstrap-slot-index 'standard-generic-function 'name))
+(declaim (inline !early-gf-name))
+(defun !early-gf-name (gf)
+  (clos-slots-ref (get-slots gf) +sgf-name-index+))
+
 (defun set-arg-info1 (gf arg-info new-method methods was-valid-p first-p)
   (let* ((existing-p (and methods (cdr methods) new-method))
          (nreq (length (arg-info-metatypes arg-info)))
@@ -2385,12 +2396,6 @@ bootstrapping.
     (typecase state
       (function nil)
       (cons (cddr state)))))
-
-(defconstant +sgf-name-index+
-  (!bootstrap-slot-index 'standard-generic-function 'name))
-
-(defun !early-gf-name (gf)
-  (clos-slots-ref (get-slots gf) +sgf-name-index+))
 
 (defun gf-lambda-list (gf)
   (let ((arg-info (if (eq **boot-state** 'complete)
@@ -2714,6 +2719,9 @@ bootstrapping.
       (when existing (remove-method gf existing))
       (add-method gf new))))
 
+(defmacro skip-update-dfun-in-add/remove-method (f)
+  `(assoc (!early-gf-name ,f) *!generic-function-fixups* :test #'equal))
+
 ;;; This is the early version of ADD-METHOD. Later this will become a
 ;;; generic function. See !FIX-EARLY-GENERIC-FUNCTIONS which has
 ;;; special knowledge about ADD-METHOD.
@@ -2724,9 +2732,7 @@ bootstrapping.
     (error "Early ADD-METHOD didn't get an early method."))
   (push method (early-gf-methods generic-function))
   (set-arg-info generic-function :new-method method)
-  (unless (assoc (!early-gf-name generic-function)
-                 *!generic-function-fixups*
-                 :test #'equal)
+  (unless (skip-update-dfun-in-add/remove-method generic-function)
     (update-dfun generic-function)))
 
 ;;; This is the early version of REMOVE-METHOD. See comments on
@@ -2739,9 +2745,7 @@ bootstrapping.
   (setf (early-gf-methods generic-function)
         (remove method (early-gf-methods generic-function)))
   (set-arg-info generic-function)
-  (unless (assoc (!early-gf-name generic-function)
-                 *!generic-function-fixups*
-                 :test #'equal)
+  (unless (skip-update-dfun-in-add/remove-method generic-function)
     (update-dfun generic-function)))
 
 ;;; This is the early version of GET-METHOD. See comments on the early
@@ -2808,8 +2812,9 @@ bootstrapping.
                                   (apply #'real-make-a-method args)))
                               (early-gf-methods gf))))
         (setf (generic-function-method-class gf) *the-class-standard-method*)
-        (setf (generic-function-method-combination gf)
-              *standard-method-combination*)
+        (let ((mc *standard-method-combination*))
+          (setf (generic-function-method-combination gf) mc)
+          (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
         (set-methods gf methods)))
 
     (dolist (fn *!early-functions*)
@@ -2820,26 +2825,19 @@ bootstrapping.
           for gf = (gdefinition fspec) do
           (labels ((translate-source-location (function)
                      ;; This is lifted from sb-introspect, OAOO and all that.
-                     (let* ((function-object (sb-kernel::%fun-fun function))
-                            (function-header (sb-kernel:fun-code-header function-object))
-                            (debug-info (sb-kernel:%code-debug-info function-header))
-                            (debug-source (sb-c::debug-info-source debug-info))
-                            (debug-fun (debug-info-debug-function function debug-info))
-                            (tlf (and debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
+                     (let ((code (fun-code-header (sb-kernel::%fun-fun function)))
+                           (debug-fun (sb-di::fun-debug-fun function)))
                        (sb-c::%make-definition-source-location
-                        (sb-c::debug-source-namestring debug-source)
-                        tlf
-                        (sb-c::compiled-debug-fun-form-number debug-fun))))
-                   (debug-info-debug-function (function debug-info)
-
-                     (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
-                           (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
-                       (or (loop for fmap-entry = map then next
-                                 for next = (sb-c::compiled-debug-fun-next fmap-entry)
-                                 when (eq (sb-c::compiled-debug-fun-name fmap-entry) name)
-                                 return fmap-entry
-                                 while next)
-                           map)))
+                        (sb-c::debug-source-namestring
+                         (sb-c::debug-info-source (sb-kernel:%code-debug-info code)))
+                        (sb-c::compiled-debug-fun-tlf-number
+                         (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                        (handler-case (sb-di::code-location-form-number
+                                       (sb-di::debug-fun-start-location debug-fun))
+                          (sb-di::unknown-code-location (cond)
+                            (declare (ignore cond))
+                            (sb-c::compiled-debug-fun-blocks
+                             (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun)))))))
                    (make-method (spec)
                      (destructuring-bind
                          (lambda-list specializers qualifiers fun-name) spec
@@ -2855,12 +2853,12 @@ bootstrapping.
                           'standard-method
                           qualifiers lambda-list specializers initargs nil
                           'source (translate-source-location fun))))))
-            (setf (generic-function-method-class gf)
-                  *the-class-standard-method*
-                  (generic-function-method-combination gf)
-                  (ecase method-combination
-                    (standard *standard-method-combination*)
-                    (or *or-method-combination*)))
+            (let ((mc (ecase method-combination
+                        (standard *standard-method-combination*)
+                        (or *or-method-combination*))))
+              (setf (generic-function-method-class gf) *the-class-standard-method*
+                    (generic-function-method-combination gf) mc)
+              (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
             (set-methods gf (mapcar #'make-method methods)))))
 
   (/show "leaving !FIX-EARLY-GENERIC-FUNCTIONS"))

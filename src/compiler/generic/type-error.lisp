@@ -66,12 +66,12 @@
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
 
-#+immobile-space
+#+(or immobile-space permgen) ; i.e. can LAYOUT instance have immediate SC
 (defun type-err-type-tn-loadp (thing)
   (cond ((sc-is thing immediate)
          (let ((obj (tn-value thing)))
            (typecase obj
-             (wrapper nil)
+             (layout nil)
              ;; non-static symbols can be referenced as error-break args
              ;; because they appear in the code constants.
              ;; static symbols can't be referenced as error-break args
@@ -92,7 +92,7 @@
                                                 unsigned-reg signed-reg constant
                                                 single-reg double-reg
                                                 complex-single-reg complex-double-reg)
-                                          #+immobile-space
+                                          #+(or immobile-space permgen)
                                           ,@(if (eq name 'sb-c::%type-check-error)
                                                 `(:load-if (type-err-type-tn-loadp ,arg)))))
                                  args))
@@ -111,7 +111,7 @@
   (def "UNKNOWN-KEY-ARG"         sb-c::%unknown-key-arg-error t   key)
   (def "ECASE-FAILURE"           ecase-failure                nil value keys)
   (def "ETYPECASE-FAILURE"       etypecase-failure            nil value keys)
-  (def "NIL-FUN-RETURNED"        nil                          nil fun)
+  (def "NIL-FUN-RETURNED"        nil-fun-returned-error       nil fun)
   (def "UNREACHABLE"             sb-impl::unreachable         nil)
   (def "FAILED-AVER"             sb-impl::%failed-aver        nil form))
 
@@ -127,19 +127,43 @@
     (inst byte code))
   (encode-internal-error-args values))
 
+(defvar *adjustable-vectors*)
+
+(defmacro with-adjustable-vector ((var) &rest body)
+  `(let ((,var (or (pop *adjustable-vectors*)
+                   (make-array 16
+                               :element-type '(unsigned-byte 8)
+                               :fill-pointer 0
+                               :adjustable t))))
+     ;; Don't declare the length - if it gets adjusted and pushed back
+     ;; onto the freelist, it's anyone's guess whether it was expanded.
+     ;; This code was wrong for >12 years, so nobody must have needed
+     ;; more than 16 elements. Maybe we should make it nonadjustable?
+     (declare (type (vector (unsigned-byte 8)) ,var))
+     (setf (fill-pointer ,var) 0)
+     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
+     ;; and this macro is about speeding up the compiler, not slowing it down.
+     ;; GC will clean up any debris, and since the vector does not point
+     ;; to anything, even an accidental promotion to a higher generation
+     ;; will not cause transitive garbage retention.
+     (prog1 (progn ,@body)
+       (push ,var *adjustable-vectors*))))
+
 (defun encode-internal-error-args (values)
   (with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset
-       (cond ((not (tn-p where))
+       (cond ((consp where)
+              (make-sc+offset immediate-sc-number (car where)))
+             ((not (tn-p where))
               where)
              ((and (sc-is where immediate)
                    (fixnump (tn-value where)))
               (make-sc+offset immediate-sc-number (tn-value where)))
              (t
               (make-sc+offset (if (and (sc-is where immediate)
-                                       (typep (tn-value where) '(or symbol wrapper)))
+                                       (typep (tn-value where) '(or symbol layout)))
                                   constant-sc-number
                                   (sc-number (tn-sc where)))
                               (or (tn-offset where) 0))))

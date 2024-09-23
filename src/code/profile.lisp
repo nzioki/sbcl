@@ -7,11 +7,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-;;;; Due to a feature of genesis, symbols created as external in package-data-list
-;;;; that are not referenced when cross-compiling do not make it into the core.
-;;;; The benefit is that we automatically weed out junk. The drawback is that
-;;;; symbols which want to be external might have to be exported "again".
-;;;; On the whole, the benefit outweights the drawback, imho.
+;;;; Due to a feature of genesis, symbols created as external in
+;;;; exports.lisp that are not referenced when cross-compiling do not
+;;;; make it into the core. The benefit is that we automatically weed
+;;;; out junk. The drawback is that symbols which want to be external
+;;;; might have to be exported "again".  On the whole, the benefit
+;;;; outweights the drawback, imho.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (export 'sb-kernel::profile-deinit "SB-KERNEL"))
 
@@ -188,7 +189,7 @@
              (dconsing 0)
              (inner-enclosed-profiles 0)
              (dgc-run-time 0))
-         (declare (truly-dynamic-extent dticks dconsing inner-enclosed-profiles))
+         (declare (dynamic-extent dticks dconsing inner-enclosed-profiles))
          (unwind-protect
               (let ((start-ticks (get-internal-ticks))
                     (start-gc-run-time *gc-run-time*)

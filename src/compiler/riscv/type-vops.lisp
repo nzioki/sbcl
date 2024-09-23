@@ -19,27 +19,33 @@
         (inst bne temp zero-tn target)
         (inst beq temp zero-tn target))))
 
-(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref)
+(defun %test-fixnum-and-headers (value temp target not-p headers
+                                 &key value-tn-ref
+                                      immediate-tested)
   (let ((drop-through (gen-label)))
     (assemble ()
       (inst andi temp value fixnum-tag-mask)
       (inst beq temp zero-tn (if not-p drop-through target)))
     (%test-headers value temp target not-p nil headers
                    :drop-through drop-through
-                   :value-tn-ref value-tn-ref)))
+                   :value-tn-ref value-tn-ref
+                   :immediate-tested immediate-tested)))
 
 #+64-bit
 (defun %test-fixnum-immediate-and-headers (value temp target not-p immediate
-                                           headers &key value-tn-ref)
+                                           headers &key value-tn-ref
+                                                        immediate-tested)
   (let ((drop-through (gen-label)))
     (inst andi temp value fixnum-tag-mask)
     (inst beq temp zero-tn (if not-p drop-through target))
     (%test-immediate-and-headers value temp target not-p immediate headers
                                  :drop-through drop-through
-                                 :value-tn-ref value-tn-ref)))
+                                 :value-tn-ref value-tn-ref
+                                 :immediate-tested immediate-tested)))
 
 
-(defun %test-immediate (value temp target not-p immediate)
+(defun %test-immediate (value temp target not-p immediate &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst andi temp value widetag-mask)
     (inst xori temp temp immediate)
@@ -47,7 +53,8 @@
         (inst bne temp zero-tn target)
         (inst beq temp zero-tn target))))
 
-(defun %test-lowtag (value temp target not-p lowtag)
+(defun %test-lowtag (value temp target not-p lowtag &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst andi temp value lowtag-mask)
     (inst xori temp temp lowtag)
@@ -56,7 +63,7 @@
         (inst beq temp zero-tn target))))
 
 (defun %test-headers (value temp target not-p function-p headers
-                      &key (drop-through (gen-label)) value-tn-ref)
+                      &key (drop-through (gen-label)) value-tn-ref immediate-tested)
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind
         (when-true when-false)
@@ -68,7 +75,7 @@
       (assemble ()
         (unless (and value-tn-ref
                      (eq lowtag other-pointer-lowtag)
-                     (other-pointer-tn-ref-p value-tn-ref))
+                     (other-pointer-tn-ref-p value-tn-ref nil immediate-tested))
           (%test-lowtag value temp when-false t lowtag))
         (load-type temp value (- lowtag))
         (let ((delta 0))
@@ -103,13 +110,15 @@
 
 (defun %test-immediate-and-headers (value temp target not-p immediate headers
                                     &key (drop-through (gen-label))
-                                         value-tn-ref)
+                                         value-tn-ref
+                                         immediate-tested)
   (inst andi temp value widetag-mask)
   (inst xori temp temp immediate)
   (inst beq temp zero-tn (if not-p drop-through target))
   (%test-headers value temp target not-p nil headers
                  :drop-through drop-through
-                 :value-tn-ref value-tn-ref))
+                 :value-tn-ref value-tn-ref
+                 :immediate-tested immediate-tested))
 
 
 ;;;; Other integer ranges.
@@ -203,4 +212,15 @@
   (:generator 8
     (inst beq value null-tn (if not-p target drop-thru))
     (test-type value temp target not-p (list-pointer-lowtag))
+    DROP-THRU))
+
+#+64-bit
+(define-vop (pointerp type-predicate)
+  (:translate pointerp)
+  (:generator 3
+    (inst xori temp value 3)
+    (inst andi temp temp 3)
+    (if not-p
+        (inst bne temp zero-tn target)
+        (inst beq temp zero-tn target))
     DROP-THRU))

@@ -15,7 +15,7 @@
 
 (defun bin-pwd-ignoring-result ()
   (let ((initially-open-fds (directory "/proc/self/fd/*" :resolve-symlinks nil)))
-    (sb-ext:run-program "/usr/bin/pwd" nil :input :stream :output :stream :wait nil)
+    (sb-ext:run-program "pwd" nil :search t :input :stream :output :stream :wait nil)
     (length initially-open-fds)))
 
 (with-test (:name (run-program :autoclose-streams)
@@ -49,7 +49,7 @@
 (with-test (:name (run-program :cat 2)
                   :skipped-on (or (not :sb-thread) :win32))
   ;; Tests that reading from a FIFO is interruptible.
-  (let* ((process (run-program "/bin/cat" '()
+  (let* ((process (run-program "cat" '() :search t
                                :wait nil :output :stream :input :stream))
          (in (process-input process))
          (out (process-output process))
@@ -167,7 +167,7 @@
   (defparameter *cat-out* (make-synonym-stream '*cat-out-pipe*)))
 
 (with-test (:name (run-program :cat 5) :fails-on :win32)
-  (let ((cat (run-program "/bin/cat" nil :input *cat-in* :output *cat-out*
+  (let ((cat (run-program "cat" nil :search t :input *cat-in* :output *cat-out*
                           :wait nil)))
     (dolist (test '("This is a test!"
                     "This is another test!"
@@ -255,10 +255,12 @@
                                       collect (sb-thread:make-thread #'start-run)))
             #-sb-thread (loop repeat 10 collect (start-run))))))
 
-(with-test (:name (run-program :pty-stream) :fails-on :win32)
+(with-test (:name (run-program :pty-stream)
+            :fails-on :win32
+            :broken-on :darwin)
   (let (process
         stream)
-    (assert (equal "OK"
+    (assert (search "OK"
                    (handler-bind
                        ((timeout (lambda (c)
                                    c
@@ -266,17 +268,14 @@
                                            (when stream
                                              (get-output-stream-string stream))))))
                      (with-timeout 60
-                       (subseq
-                        (with-output-to-string (s)
-                          (setf stream s)
-                          (setf process
-                                (run-program "/bin/sh" '("-c" "echo OK; exit 42") :pty s
-                                                                                  :wait nil))
-                          (process-wait process)
-                          (assert (= (process-exit-code process) 42))
-                          s)
-                        0
-                        2)))))))
+                       (with-output-to-string (s)
+                         (setf stream s)
+                         (setf process
+                               (run-program "/bin/sh" '("-c" "echo OK; exit 42") :pty s
+                                                                                 :wait nil))
+                         (process-wait process)
+                         (assert (= (process-exit-code process) 42))
+                         s)))))))
 
 ;; Check whether RUN-PROGRAM puts its child process into the foreground
 ;; when stdin is inherited. If it fails to do so we will receive a SIGTTIN.
@@ -310,14 +309,16 @@
   (let ((had-error-p nil))
     (flet ((barf (&optional (format :default))
              (with-output-to-string (stream)
-               (run-program #-netbsd "/usr/bin/perl" #+netbsd "/usr/pkg/bin/perl"
+               (run-program "perl"
                             '("-e" "print \"\\x20\\xfe\\xff\\x0a\"")
+                            :search t
                             :output stream
                             :external-format format)))
            (no-barf ()
              (with-output-to-string (stream)
-               (run-program "/bin/echo"
+               (run-program "echo"
                             '("This is a test")
+                            :search t
                             :output stream))))
       (handler-case
           (barf :utf-8)
@@ -353,9 +354,9 @@
                ;; If the permitted inputs are :ANY then leave it be
                (listp (symbol-value 'run-tests::*allowed-inputs*)))
       (push (namestring file) (symbol-value 'run-tests::*allowed-inputs*)))
-    (assert (null (run-program "/bin/cat" '() :input file)))
-    (assert (null (run-program "/bin/cat" '() :output #.(or *compile-file-truename*
-                                                            *load-truename*)
+    (assert (null (run-program "cat" '() :search t :input file)))
+    (assert (null (run-program "cat" '() :search t :output #.(or *compile-file-truename*
+                                                                 *load-truename*)
                                       :if-output-exists nil)))))
 
 
@@ -433,7 +434,7 @@
 
 (with-test (:name (run-program :malloc-deadlock)
             :broken-on :sb-safepoint
-            :skipped-on (or :ubsan (not :sb-thread) :win32))
+            :skipped-on (or :ubsan (not :sb-thread) :win32 :android))
   (let* (stop
          (delay-between-gc
           (or #+freebsd

@@ -21,15 +21,17 @@
   (generate-fixnum-test value)
   (inst jmp (if not-p :nz :z) target))
 
-(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref)
+(defun %test-fixnum-and-headers (value temp target not-p headers
+                                 &key value-tn-ref immediate-tested)
   (let ((drop-through (gen-label)))
     (generate-fixnum-test value)
     (inst jmp :z (if not-p drop-through target))
     (%test-headers value temp target not-p nil headers
-                   :drop-through drop-through :value-tn-ref value-tn-ref)))
+                   :drop-through drop-through :value-tn-ref value-tn-ref
+                   :immediate-tested immediate-tested)))
 
-(defun %test-immediate (value temp target not-p immediate)
-  (declare (ignore temp))
+(defun %test-immediate (value temp target not-p immediate &key value-tn-ref)
+  (declare (ignore temp value-tn-ref))
   ;; Code a single instruction byte test if possible.
   (let ((offset (tn-offset value)))
     (cond ((and (sc-is value any-reg descriptor-reg)
@@ -44,8 +46,8 @@
            (inst cmp al-tn immediate))))
   (inst jmp (if not-p :ne :e) target))
 
-(defun %test-lowtag (value temp target not-p lowtag)
-  (declare (ignore temp))
+(defun %test-lowtag (value temp target not-p lowtag &key value-tn-ref)
+  (declare (ignore temp value-tn-ref))
   (inst lea eax-tn (make-ea :dword :base value :disp (- lowtag)))
   (inst test al-tn lowtag-mask)
   ;; FIXME: another 'optimization' which doesn't appear to work:
@@ -59,7 +61,7 @@
   (inst jmp (if not-p :ne :e) target))
 
 (defun %test-headers (value temp target not-p function-p headers
-                      &key except (drop-through (gen-label)) value-tn-ref)
+                      &key except (drop-through (gen-label)) value-tn-ref immediate-tested)
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind (equal less-or-equal greater-or-equal when-true when-false)
         ;; EQUAL, LESS-OR-EQUAL and GREATER-OR-EQUAL are the conditions for
@@ -71,7 +73,7 @@
             (values :e :na :nb target drop-through))
       (unless (and value-tn-ref
                    (eq lowtag other-pointer-lowtag)
-                   (other-pointer-tn-ref-p value-tn-ref))
+                   (other-pointer-tn-ref-p value-tn-ref nil immediate-tested))
         (%test-lowtag value temp when-false t lowtag))
       (cond
         ((and (null (cdr headers))
@@ -272,56 +274,6 @@
         (inst jmp (if not-p :s :ns) target)
 
         (emit-label not-target)))))
-
-(defun power-of-two-limit-p (x)
-  (and (fixnump x)
-       (= (logcount (1+ x)) 1)))
-
-(define-vop (test-fixnum-mod-power-of-two)
-  (:args (value :scs (any-reg descriptor-reg
-                      unsigned-reg signed-reg)))
-  (:arg-types *
-              (:constant (satisfies power-of-two-limit-p)))
-  (:translate sb-c::fixnum-mod-p)
-  (:conditional :e)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 4
-     (let* ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                           hi
-                           (fixnumize hi))))
-       (inst test value (lognot fixnum-hi)))))
-
-(define-vop (test-fixnum-mod-tagged-unsigned)
-  (:args (value :scs (any-reg unsigned-reg signed-reg)))
-  (:arg-types (:or tagged-num unsigned-num signed-num)
-              (:constant fixnum))
-  (:translate sb-c::fixnum-mod-p)
-  (:conditional :be)
-  (:info hi)
-  (:policy :fast-safe)
-  (:generator 5
-     (let ((fixnum-hi (if (sc-is value unsigned-reg signed-reg)
-                          hi
-                          (fixnumize hi))))
-       (inst cmp value fixnum-hi))))
-
-(define-vop (test-fixnum-mod-*)
-  (:args (value :scs (any-reg descriptor-reg)))
-  (:arg-types * (:constant fixnum))
-  (:translate sb-c::fixnum-mod-p)
-  (:conditional)
-  (:info target not-p hi)
-  (:policy :fast-safe)
-  (:generator 6
-     (let* ((fixnum-hi (fixnumize hi))
-            (skip (gen-label)))
-       (generate-fixnum-test value)
-       (inst jmp :ne (if not-p target skip))
-       (inst cmp value fixnum-hi)
-       (inst jmp (if not-p :a :be) target)
-       (emit-label skip))))
-
 
 ;;;; list/symbol types
 ;;;

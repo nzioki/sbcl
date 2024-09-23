@@ -91,7 +91,7 @@
                    (not (memq restart stack))
                    (or (not call-test-p)
                        (let ((*restart-test-stack* (cons restart stack)))
-                         (declare (truly-dynamic-extent *restart-test-stack*))
+                         (declare (dynamic-extent *restart-test-stack*))
                          (funcall (restart-test-function restart) condition))))
           (funcall function restart))))))
 
@@ -111,7 +111,7 @@ restarts associated with CONDITION (or with no condition) will be returned."
            (when (eq identifier (restart-name restart))
              (return-from %find-restart restart))))
     ;; KLUDGE: can the compiler infer this dx automatically?
-    (declare (truly-dynamic-extent #'eq-restart-p #'named-restart-p))
+    (declare (dynamic-extent #'eq-restart-p #'named-restart-p))
     (if (typep identifier 'restart)
         ;; The code under #+previous-... below breaks the abstraction
         ;; introduced by MAP-RESTARTS, but is about twice as
@@ -150,8 +150,7 @@ with that condition (or with no condition) will be returned."
 
 ;;; helper for the various functions which are ANSI-spec'ed to do
 ;;; something with a restart or signal CONTROL-ERROR if there is none
-(defun find-restart-or-control-error (identifier &optional condition (call-test-p t))
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper find-restart-or-control-error (identifier &optional condition (call-test-p t))
   (or (%find-restart identifier condition call-test-p)
       (error 'simple-control-error
              :format-control "No restart ~S is active~@[ for ~S~]."
@@ -285,21 +284,21 @@ with that condition (or with no condition) will be returned."
          ;; right thing is..
          (new-inherits
           (order-layout-inherits (concatenate 'simple-vector
-                                              (wrapper-inherits cond-layout)
-                                              (mapcar #'classoid-wrapper cpl)))))
+                                              (layout-inherits cond-layout)
+                                              (mapcar #'classoid-layout cpl)))))
     (if (and olayout
-             (not (mismatch (wrapper-inherits olayout) new-inherits)))
+             (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
         ;; All condition classoid layouts carry the same LAYOUT-INFO - the defstruct
         ;; description for CONDITION - which is a representation of the primitive object
         ;; and not the lisp-level object.
         (make-layout (hash-layout-name name)
                      (make-undefined-classoid name)
-                     :info (wrapper-info cond-layout)
+                     :info (layout-info cond-layout)
                      :flags (logior +condition-layout-flag+ +strictly-boxed-flag+)
                      :inherits new-inherits
                      :depthoid -1
-                     :length (wrapper-length cond-layout)))))
+                     :length (layout-length cond-layout)))))
 
 ) ; EVAL-WHEN
 
@@ -346,76 +345,6 @@ with that condition (or with no condition) will be returned."
     (dolist (slot (condition-classoid-slots sclass))
       (when (eq (condition-slot-name slot) slot-name)
         (return-from find-condition-class-slot slot)))))
-
-(defun set-condition-slot-value (condition new-value name)
-  (dolist (cslot (condition-classoid-class-slots
-                  (wrapper-classoid (%instance-wrapper condition)))
-                 (setf (getf (condition-assigned-slots condition) name)
-                       new-value))
-    (when (eq (condition-slot-name cslot) name)
-      (return (setf (car (condition-slot-cell cslot)) new-value)))))
-
-(defun condition-slot-value (condition name)
-  (let* ((sentinel (load-time-value (cons nil nil)))
-         (val (getf (condition-assigned-slots condition) name sentinel)))
-    (cond
-      ((unbound-marker-p val)
-       (let* ((classoid (wrapper-classoid (%instance-wrapper condition)))
-              (class (classoid-pcl-class classoid)))
-         (values (slot-unbound class condition name))))
-      ((eql val sentinel)
-       (let ((classoid (wrapper-classoid (%instance-wrapper condition))))
-         (dolist (cslot
-                  (condition-classoid-class-slots classoid)
-                  (let ((instance-length (%instance-length condition))
-                        (slot (or (find-condition-class-slot classoid name)
-                                  (return-from condition-slot-value
-                                    (let ((class (classoid-pcl-class classoid)))
-                                      (values (slot-missing class condition name 'slot-value)))))))
-                    (setf (getf (condition-assigned-slots condition) name)
-                          (do ((i (+ sb-vm:instance-data-start 1) (+ i 2)))
-                              ((>= i instance-length)
-                               (find-slot-default condition classoid slot))
-                            (when (member (%instance-ref condition i)
-                                          (condition-slot-initargs slot))
-                              (return (%instance-ref condition (1+ i))))))))
-           (when (eq (condition-slot-name cslot) name)
-             (let ((value (car (condition-slot-cell cslot))))
-               (if (unbound-marker-p value)
-                   (let ((class (classoid-pcl-class classoid)))
-                     (return (values (slot-unbound class condition name))))
-                   (return value)))))))
-      (t val))))
-
-(defun condition-slot-boundp (condition name)
-  (let* ((sentinel (load-time-value (cons nil nil)))
-         (val (getf (condition-assigned-slots condition) name sentinel)))
-    (cond
-      ((unbound-marker-p val) nil)
-      ((eql val sentinel)
-       (let ((classoid (wrapper-classoid (%instance-wrapper condition))))
-         (dolist (cslot
-                  (condition-classoid-class-slots classoid)
-                  (let ((instance-length (%instance-length condition))
-                        (slot (or (find-condition-class-slot classoid name)
-                                  (return-from condition-slot-boundp
-                                    (not (not (slot-missing (classoid-pcl-class classoid)
-                                                            condition name 'slot-boundp)))))))
-                    (let ((val (do ((i (+ sb-vm:instance-data-start 1) (+ i 2)))
-                                   ((>= i instance-length)
-                                    (find-slot-default condition classoid slot t))
-                                 (when (member (%instance-ref condition i)
-                                               (condition-slot-initargs slot))
-                                   (return (%instance-ref condition (1+ i)))))))
-                      (setf (getf (condition-assigned-slots condition) name) val)
-                      (not (unbound-marker-p val)))))
-           (when (eq (condition-slot-name cslot) name)
-             (let ((value (car (condition-slot-cell cslot))))
-               (return (not (unbound-marker-p value))))))))
-      (t t))))
-
-(defun condition-slot-makunbound (condition name)
-  (set-condition-slot-value condition sb-pcl:+slot-unbound+ name))
 
 ;;;; MAKE-CONDITION
 
@@ -454,11 +383,11 @@ with that condition (or with no condition) will be returned."
     (flet ((stream-err-p (layout)
              (let ((stream-err-layout (load-time-value (find-layout 'stream-error))))
                (or (eq layout stream-err-layout)
-                   (find stream-err-layout (wrapper-inherits layout)))))
+                   (find stream-err-layout (layout-inherits layout)))))
            (type-err-p (layout)
              (let ((type-err-layout (load-time-value (find-layout 'type-error))))
                (or (eq layout type-err-layout)
-                   (find type-err-layout (wrapper-inherits layout)))))
+                   (find type-err-layout (layout-inherits layout)))))
            ;; avoid full calls to STACK-ALLOCATED-P here
            (stackp (x)
              (let ((addr (get-lisp-obj-address x)))
@@ -468,7 +397,7 @@ with that condition (or with no condition) will be returned."
       (let* ((any-dx
                (loop for arg-index from 1 below (length initargs) by 2
                        thereis (stackp (fast-&rest-nth arg-index initargs))))
-             (layout (classoid-wrapper classoid))
+             (layout (classoid-layout classoid))
              (extra (if (and any-dx (type-err-p layout)) 2 0)) ; space for secret initarg
              (instance (%new-instance layout
                                       (+ sb-vm:instance-data-start
@@ -553,9 +482,9 @@ with that condition (or with no condition) will be returned."
       (when (dolist (initarg (condition-slot-initargs hslot) t)
               (unless (unbound-marker-p (getf initargs initarg sb-pcl:+slot-unbound+))
                 (return nil)))
-        (setf (getf (condition-assigned-slots condition)
-                    (condition-slot-name hslot))
-              (find-slot-default condition classoid hslot))))
+        (push (cons (condition-slot-name hslot)
+                    (find-slot-default condition classoid hslot))
+              (condition-assigned-slots condition))))
 
     condition))
 
@@ -600,25 +529,25 @@ with that condition (or with no condition) will be returned."
       (insured-find-classoid name
                              #'condition-classoid-p
                              #'make-condition-classoid)
-    (setf (wrapper-classoid layout) class)
+    (setf (layout-classoid layout) class)
     (setf (classoid-direct-superclasses class)
           (mapcar #'find-classoid direct-supers))
     (cond ((not old-layout)
            (register-layout layout))
           ((not *type-system-initialized*)
-           (setf (wrapper-classoid old-layout) class)
+           (setf (layout-classoid old-layout) class)
            (setq layout old-layout)
-           (unless (eq (classoid-wrapper class) layout)
+           (unless (eq (classoid-layout class) layout)
              (register-layout layout)))
           ((warn-if-altered-layout  "current"
                                     old-layout
                                     "new"
-                                    (wrapper-length layout)
-                                    (wrapper-inherits layout)
-                                    (wrapper-depthoid layout)
-                                    (wrapper-bitmap layout))
+                                    (layout-length layout)
+                                    (layout-inherits layout)
+                                    (layout-depthoid layout)
+                                    (layout-bitmap layout))
            (register-layout layout :invalidate t))
-          ((not (classoid-wrapper class))
+          ((not (classoid-layout class))
            (register-layout layout)))
 
     (setf (find-classoid name) class)
@@ -909,6 +838,8 @@ with that condition (or with no condition) will be returned."
                type)))
     ((eql sb-c::ftype-context)
      "from the function type declaration.")
+    ((member map)
+     (format nil "for the result type of ~a." context))
     ((and symbol
           (not null))
      (format nil "when binding ~s" context))
@@ -922,23 +853,30 @@ with that condition (or with no condition) will be returned."
   (:report report-general-type-error))
 (defun report-general-type-error (condition stream)
   (let ((type (type-error-expected-type condition))
-        (context (type-error-context condition)))
-    (if (eq context :multiple-values)
-        (format stream  "~@<The values ~
+        (context (type-error-context condition))
+        (datum (type-error-datum condition)))
+    (case context
+      (:multiple-values
+       (format stream  "~@<The values ~
                          ~@:_~2@T~S ~
                          ~@:_are not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~:@>"
-                   (type-error-datum condition)
-                   type)
-        (format stream  "~@<The value ~
+               datum
+               type))
+      (sb-c::coerce-context
+       (format stream "~S can't be converted to type ~
+                       ~/sb-impl:print-type-specifier/."
+               datum type))
+      (t
+       (format stream  "~@<The value ~
                          ~@:_~2@T~S ~
                          ~@:_is not of type ~
                          ~@:_~2@T~/sb-impl:print-type-specifier/~@[ ~
                          ~@:_~a~]~:@>"
-                (type-error-datum condition)
-                type
-                (decode-type-error-context (type-error-context condition)
-                                           type)))))
+               datum
+               type
+               (decode-type-error-context (type-error-context condition)
+                                          type))))))
 
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
@@ -983,7 +921,7 @@ with that condition (or with no condition) will be returned."
   ()
   (:report
    (lambda (condition stream)
-     (format stream "~@<Attempt to use ~S on a dotted list: ~
+     (format stream "~@<Attempt to use ~S on a dotted list or non-list: ~
                      ~2I~_~S~:>"
              'values-list (type-error-datum condition)))))
 
@@ -1458,14 +1396,15 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((array (invalid-array-index-error-array condition))
            (index (type-error-datum condition)))
        (if (integerp index)
-           (format stream "Invalid index ~S for ~@[axis ~W of ~]~S, ~
-                           should be a non-negative integer below ~W."
+           (format stream "Invalid index ~D for ~@[axis ~D of ~]~
+~S~@[, ~:@_should be a non-negative integer below ~D~]."
                    (type-error-datum condition)
                    (when (> (array-rank array) 1)
                      (invalid-array-index-error-axis condition))
                    (type-of array)
                    ;; Extract the bound from (INTEGER 0 (BOUND))
-                   (caaddr (type-error-expected-type condition)))
+                   (let ((max (caaddr (type-error-expected-type condition))))
+                     (if (> max 0) max)))
            (format stream "~s is not of type INTEGER." index))))))
 
 (define-condition invalid-array-error (reference-condition type-error) ()
@@ -1518,15 +1457,15 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((sequence (slot-value condition 'sequence))
            (index (type-error-datum condition)))
        (if (vectorp sequence)
-           (format stream "Invalid index ~W for ~S ~@[with fill-pointer ~a~], ~
-                           should be a non-negative integer below ~W."
+           (format stream "Invalid index ~D for ~S~@[ with fill-pointer ~D~]~
+~@[, ~:@_should be a non-negative integer below ~D~]."
                    index
                    (type-of sequence)
                    (and (array-has-fill-pointer-p sequence)
                         (fill-pointer sequence))
-                   (length sequence))
+                   (let ((l (length sequence))) (if (> l 0) l)))
            (format stream
-                   "The index ~S is too large for a ~a of length ~s."
+                   "The index ~D is too large for a ~a of length ~D."
                    index
                    (if (listp sequence)
                        "list"
@@ -1832,7 +1771,7 @@ handled by any other handler, it will be muffled.")
          (debug-source (when debug-info
                          (sb-c::debug-info-source debug-info)))
          (namestring (when debug-source
-                       (debug-source-namestring debug-source))))
+                       (sb-c::debug-source-namestring debug-source))))
     namestring))
 
 (defun interesting-function-redefinition-warning-p (warning old)
@@ -2025,20 +1964,34 @@ the usual naming convention (names like *FOO*) for special variables"
    (description :initarg :description :reader proclamation-mismatch-description :initform nil)
    (name :initarg :name :reader proclamation-mismatch-name)
    (old :initarg :old :reader proclamation-mismatch-old)
-   (new :initarg :new :reader proclamation-mismatch-new))
+   (new :initarg :new :reader proclamation-mismatch-new)
+   (value :initarg :value))
   (:report
    (lambda (condition stream)
-     (format stream
-             "~@<The new ~A proclamation for~@[ ~A~] ~
+     (if (slot-boundp condition 'value)
+         (format stream
+                 "~@<The new ~A proclamation for~@[ ~A~] ~
+               ~/sb-ext:print-symbol-with-prefix/~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
+               does not match the current value ~S of type~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
+                 (proclamation-mismatch-kind condition)
+                 (proclamation-mismatch-description condition)
+                 (proclamation-mismatch-name condition)
+                 (proclamation-mismatch-new condition)
+                 (slot-value condition 'value)
+                 (proclamation-mismatch-old condition))
+         (format stream
+                 "~@<The new ~A proclamation for~@[ ~A~] ~
                ~/sb-ext:print-symbol-with-prefix/~
                ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
                does not match the old ~4:*~A~3* proclamation~
                ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
-             (proclamation-mismatch-kind condition)
-             (proclamation-mismatch-description condition)
-             (proclamation-mismatch-name condition)
-             (proclamation-mismatch-new condition)
-             (proclamation-mismatch-old condition)))))
+                 (proclamation-mismatch-kind condition)
+                 (proclamation-mismatch-description condition)
+                 (proclamation-mismatch-name condition)
+                 (proclamation-mismatch-new condition)
+                 (proclamation-mismatch-old condition))))))
 
 (define-condition type-proclamation-mismatch (proclamation-mismatch)
   ()
@@ -2061,6 +2014,21 @@ the usual naming convention (names like *FOO*) for special variables"
   ()
   (:default-initargs :kind 'ftype :description "known function"))
 
+(define-condition ftype-proclamation-derived-mismatch-warning (ftype-proclamation-mismatch-warning)
+  ()
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "~@<The new ~A proclamation for~@[ ~A~] ~
+               ~/sb-ext:print-symbol-with-prefix/~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:_~
+               does not match the derived return type~
+               ~@:_~2@T~/sb-impl:print-type-specifier/~@:>"
+             (proclamation-mismatch-kind condition)
+             (proclamation-mismatch-description condition)
+             (proclamation-mismatch-name condition)
+             (proclamation-mismatch-new condition)
+             (proclamation-mismatch-old condition)))))
 
 ;;;; deprecation conditions
 
@@ -2358,6 +2326,16 @@ the restart does not exist."))
              (character-coding-error-external-format c)
              (character-decoding-error-octets c)))))
 
+
+(define-condition stack-allocated-object-overflows-stack (storage-condition)
+  ((size :initarg :size :reader stack-allocated-object-overflows-stack-size))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "~@<Stack allocating object of size ~D bytes exceeds the ~
+remaining space left on the control stack.~@:>"
+             (stack-allocated-object-overflows-stack-size condition)))))
+
 (define-condition control-stack-exhausted (storage-condition)
   ()
   (:report
@@ -2537,16 +2515,14 @@ you did not expect to see this message, please report it."
         :interactive read-evaluated-form
         value))))
 
-(defun etypecase-failure (value keys)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper etypecase-failure (value keys)
   (error 'case-failure
          :name 'etypecase
          :datum value
          :expected-type (if (symbolp keys) keys `(or ,@keys))
          :possibilities keys))
 
-(defun ecase-failure (value keys)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper ecase-failure (value keys)
   ;; inline definition not seen yet. Can't move this file later
   ;; in build because **<foo>-clusters** are needed early.
   (declare (notinline coerce))

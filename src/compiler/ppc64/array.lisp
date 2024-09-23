@@ -139,7 +139,7 @@
                (t
                 (inst addi ea index (- (ash vector-data-offset word-shift) other-pointer-lowtag))
                 (inst add ea object ea)))
-         (emit-gc-store-barrier object ea (list t1) (vop-nth-arg 2 vop) value)
+         (emit-gengc-barrier object ea (list t1) (vop-nth-arg 2 vop))
          (inst std value ea 0)))
     `(define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type))
                   ,(symbolicate (string variant) "-SET"))
@@ -514,6 +514,15 @@
          (index :scs (any-reg immediate))
          (value :scs (unsigned-reg)))
   (:arg-types * positive-fixnum unsigned-num)
+  (:variant vector-data-offset other-pointer-lowtag))
+
+;;; Weak vectors
+(define-vop (%weakvec-ref word-index-ref)
+  (:translate %weakvec-ref)
+  (:variant vector-data-offset other-pointer-lowtag))
+
+(define-vop (%weakvec-set word-index-set)
+  (:translate %weakvec-set)
   (:variant vector-data-offset other-pointer-lowtag))
 
 ;;;

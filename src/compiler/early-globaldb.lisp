@@ -80,10 +80,7 @@
 
 ;;; At run time, we represent the type of a piece of INFO in the globaldb
 ;;; by a small integer between 1 and 63.  [0 is reserved for internal use.]
-;;; CLISP, and maybe others, need EVAL-WHEN because without it, the constant
-;;; is not seen by the "#." expression a few lines down.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant info-number-bits 6))
+(defconstant info-number-bits 6)
 (deftype info-number () `(unsigned-byte ,info-number-bits))
 
 ;;; A map from info-number to its META-INFO object.
@@ -131,16 +128,13 @@
 ;;; Otherwise, it is in state 2 so return the value as-is.
 ;;; NIL is an acceptable substitute for +NIL-PACKED-INFOS+,
 ;;; but I might change that.
-;;;
-;;; Define SYMBOL-INFO as an inline function unless a vop translates it.
-;;; (Inlining occurs first, which would cause the vop not to be used.)
 #-sb-xc-host
-(sb-c::unless-vop-existsp (:translate sb-kernel:symbol-dbinfo)
-  (declaim (inline symbol-dbinfo))
-  (defun symbol-dbinfo (symbol)
-    (let ((info-holder (symbol-%info symbol)))
-      (truly-the (or null instance)
-                 (if (listp info-holder) (cdr info-holder) info-holder)))))
+(progn
+(declaim (inline symbol-dbinfo))
+(defun symbol-dbinfo (symbol)
+  (let ((info-holder (symbol-%info symbol)))
+    (truly-the (or null packed-info)
+               (if (listp info-holder) (cdr info-holder) info-holder)))))
 
 ;; Perform the equivalent of (GET-INFO-VALUE KIND +INFO-METAINFO-TYPE-NUM+)
 ;; but skipping the defaulting logic.
@@ -227,8 +221,7 @@
                 (get-info-value ,name ,(meta-info-number meta-info))))
 
   (def (setf info) (new-value category kind name)
-    (let* (#+sb-xc-host (sb-xc:*gensym-counter* sb-xc:*gensym-counter*)
-           (tin (meta-info-number meta-info)) ; info-type id number
+    (let* ((tin (meta-info-number meta-info)) ; info-type id number
            (type-spec (meta-info-type-spec meta-info))
            (new (make-symbol "NEW"))
            (check
@@ -255,18 +248,12 @@
 ;; Atomic update will be important for making the fasloader threadsafe
 ;; using a predominantly lock-free design, and other nice things.
 (defmacro atomic-set-info-value (category kind name lambda)
-  (with-unique-names (info-number proc)
+  (with-unique-names (info-number)
     `(let ((,info-number
             ,(if (and (keywordp category) (keywordp kind))
                  (meta-info-number (meta-info category kind))
                  `(meta-info-number (meta-info ,category ,kind)))))
-       ,(if (and (listp lambda) (eq (car lambda) 'lambda))
-            ;; rewrite as FLET because the compiler is unable to dxify
-            ;;   (DX-LET ((x (LAMBDA <whatever>))) (F x))
-            (destructuring-bind (lambda-list . body) (cdr lambda)
-              `(dx-flet ((,proc ,lambda-list ,@body))
-                 (%atomic-set-info-value ,name ,info-number #',proc)))
-            `(%atomic-set-info-value ,name ,info-number ,lambda)))))
+       (%atomic-set-info-value ,name ,info-number ,lambda))))
 
 ;; Perform the approximate equivalent operations of retrieving
 ;; (INFO :CATEGORY :KIND NAME), but if no info is found, invoke CREATION-FORM
@@ -279,13 +266,11 @@
 ;; A mutex-guarded table would probably be more appropriate in such cases.
 ;;
 (defmacro get-info-value-initializing (category kind name creation-form)
-  (let ((proc (make-symbol "THUNK")))
-    `(dx-flet ((,proc () ,creation-form))
-       (%get-info-value-initializing
-        ,(if (and (keywordp category) (keywordp kind))
-             (meta-info-number (meta-info category kind))
-             `(meta-info-number (meta-info ,category ,kind)))
-        ,name #',proc))))
+  `(%get-info-value-initializing
+    ,(if (and (keywordp category) (keywordp kind))
+         (meta-info-number (meta-info category kind))
+         `(meta-info-number (meta-info ,category ,kind)))
+    ,name (lambda () ,creation-form)))
 
 #+sb-xc-host
 (progn
@@ -324,7 +309,6 @@
       (:function . :assumed-type)
       (:type . :deprecated)
       (:type . :expander)
-      (:function . :emitted-full-calls)
       (:setf . :expander)
       (:type . :compiler-layout)
       (:variable . :wired-tls)

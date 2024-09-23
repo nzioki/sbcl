@@ -292,10 +292,11 @@
 (defmacro with-environment-vars ((symbols end) env &body body)
   `(awhen (env-symbols ,env)
      (let ((,symbols (truly-the simple-vector (if (listp it) (cdr it) it)))
-           (,end #+ubsan (if (listp it) (car it) (sb-c::vector-length it))
-                 #-ubsan (locally (declare (optimize (safety 0))) (car it))))
+           (,end #+(or ubsan ppc64) (if (listp it) (car it) (sb-c::vector-length it))
+                 #-(or ubsan ppc64) (locally (declare (optimize (safety 0))) (car it))))
        (declare (index-or-minus-1 ,end))
        ,@body)))
+#-ppc64
 (eval-when (:compile-toplevel)
   ;; Assert that the claims made in the above comment remain true.
   (assert (= (- (* sb-vm:n-word-bytes sb-vm:cons-car-slot)
@@ -528,8 +529,7 @@
 ;; variable-affecting declaration it is.
 (defun applies-to-variables-p (decl)
   (let ((id (car decl)))
-    (or (find id '(ignorable ignore type special
-                   dynamic-extent truly-dynamic-extent))
+    (or (find id '(ignorable ignore type special dynamic-extent))
         (if (or (listp id) ; it must be a type-specifier (including NIL)
                 (info :type :kind id))
             'type))))
@@ -1072,9 +1072,9 @@
         (payload (env-payload env)))
     (flet ((specialize (binding) ; = make a global var, not make less general
              (let ((sym (binding-symbol binding)))
-               (cons sym (make-global-var :%source-name sym
-                                          :kind :special
-                                          :where-from :declared))))
+               (cons sym (sb-c::make-global-var :%source-name sym
+                                                :kind :special
+                                                :where-from :declared))))
            (macroize (name thing) (list* name 'sb-sys:macro thing))
            (fname (f) (second (fun-name f))))
       (multiple-value-bind (vars funs)
@@ -1094,7 +1094,7 @@
                          ;; "Destructive function (SETF SVREF) called on constant data"
                          (macroize sym `(svref (load-time-value ,payload) ,i)))
                         (t
-                         (let ((leaf (make-lambda-var
+                         (let ((leaf (sb-c::make-lambda-var
                                       :%source-name sym
                                       :type (or (cdr binding) *universal-type*))))
                            (setf (gethash binding var-map) leaf)
@@ -1176,7 +1176,7 @@
                              (typecase thing
                                (cons x) ; symbol-macro
                                (sb-c::lambda-var thing)
-                               (sb-c::global-var (make-lambda-var
+                               (sb-c::global-var (sb-c::make-lambda-var
                                                   :specvar thing
                                                   :%source-name (car x))))))
                          vars)

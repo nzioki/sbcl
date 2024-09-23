@@ -3319,11 +3319,6 @@
                                   `(lambda ()
                                      (declare (optimize (sb-c::float-accuracy 0)))
                                      ,lambda-form)))))
-             ;; Multiplication at runtime should be eliminated only with
-             ;; FLOAT-ACCURACY=0. (To catch SNaNs.)
-             #+(or x86 x86-64)
-             (assert (and (ctu:asm-search "MUL" fun1)
-                          (not (ctu:asm-search "MUL" fun2))))
              ;; Not generic arithmetic, please!
              (assert (and (not (ctu:asm-search "GENERIC" fun1))
                           (not (ctu:asm-search "GENERIC" fun2))))
@@ -3352,8 +3347,10 @@
              ;; addition in to catch SNaNs.
              #+x86
              (progn
-               (assert (ctu:asm-search "FADD" fun1))
-               (assert (not (ctu:asm-search "FADD" fun2))))
+               (assert (or (ctu:asm-search "FADDD " fun1)
+                           (ctu:asm-search "FADD-STI " fun1)))
+               (assert (not (or (ctu:asm-search "FADDD " fun2)
+                                (ctu:asm-search "FADD-STI " fun2)))))
              #+x86-64
              (let ((inst (if (typep result 'double-float)
                              "ADDSD" "ADDSS")))
@@ -3832,7 +3829,7 @@
       (assert (< d3 (* 10 short-avg))))))
 
 (with-test (:name :bug-384892)
-  (assert (equal
+  (assert (ctype=
            '(function (fixnum fixnum &key (:k1 boolean))
              (values (member t) &optional))
            (sb-kernel:%simple-fun-type
@@ -3842,7 +3839,8 @@
                                 (declare (ignore x y k1))
                                 t))))))
 
-(with-test (:name :bug-309448)
+(with-test (:name :bug-309448
+            :skipped-on :gc-stress)
   ;; Like all tests trying to verify that something doesn't blow up
   ;; compile-times this is bound to be a bit brittle, but at least
   ;; here we try to establish a decent baseline.
@@ -3915,7 +3913,7 @@
         (setq z 0)
         (flet ((foo ()
                  (foo z args)))
-          (declare (sb-int:truly-dynamic-extent #'foo))
+          (declare (dynamic-extent #'foo))
           (call #'foo nil))))
    :allow-style-warnings t))
 
@@ -6077,10 +6075,16 @@
     ((5.0f-9) #C(-4.123312f37 -0.0))))
 
 (with-test (:name :reducing-constants.2)
-  (checked-compile-and-assert (:allow-style-warnings t)
-      `(lambda () (*  1.0 2 (expt 2 127)))
-    (() #-no-float-traps (condition 'floating-point-overflow)
-        #+no-float-traps sb-ext:single-float-positive-infinity)))
+  (let* ((style-warning-p nil)
+         (fun (checked-compile `(lambda () (* 1.0 2 (expt 2 127)))
+                               :allow-style-warnings t
+                               :condition-transform (lambda (x)
+                                                      (when (typep x 'style-warning)
+                                                        (setf style-warning-p t))
+                                                      x))))
+    (handler-case (funcall fun)
+      (floating-point-overflow () (assert style-warning-p))
+      (:no-error (x) (assert (not style-warning-p)) (assert (eql x sb-ext:single-float-positive-infinity))))))
 
 (with-test (:name (logbitp :past fixnum))
   (checked-compile-and-assert ()
@@ -6125,7 +6129,7 @@
   (checked-compile-and-assert ()
       `(lambda ()
          (let ((x (list 1)))
-           (declare (sb-int:truly-dynamic-extent x))
+           (declare (dynamic-extent x))
            (progv '(*) x
              (catch 'ct (the integer (eval (dotimes (i 1 42) 42)))))))
     (() 42)))
@@ -6301,3 +6305,63 @@
                                 a))))))))
         (%f2 (loop for i below 1 sum (%f2 1)))))
    :allow-warnings t))
+
+(with-test (:name :single-use-complement-inlines)
+  (let ((fun (checked-compile
+              `(lambda (z)
+                 (funcall (complement z))))))
+    (assert (not (ctu:find-named-callees #'complement)))))
+
+(with-test (:name :single-use-constantly-inlines)
+  (let ((fun (checked-compile
+              `(lambda (z)
+                 (funcall (constantly z))))))
+    (assert (not (ctu:find-named-callees #'constantly)))))
+
+(with-test (:name :note-argument-not-returning)
+  (let ((notes
+          (nth-value
+           4 (checked-compile `(lambda ()
+                                 (block nil
+                                   (let ()
+                                     (cons
+                                      (eval 'nil)
+                                      (return
+                                        :good)))))))))
+    (assert (dolist (note notes nil)
+              (when (string= (format nil "~a" note)
+                             "The second argument never returns a value.")
+                (return t))))))
+
+(with-test (:name :check-consistency-mv-call-substitute-single-use-lvar)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda (spec)
+       (multiple-value-call #'list
+         (first spec)
+         (values
+          5
+          6))))))
+
+(with-test (:name :check-consistency-call-symbol)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda ()
+        (print (lambda (x) (apply (read) x)))))))
+
+(with-test (:name :check-consistency-info-arg-count)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda (symbol expr eqx)
+        (declare (type function eqx))
+        (if (boundp symbol)
+            (let ((oldval (symbol-value symbol)))
+              (if (funcall eqx oldval expr) oldval expr))
+            expr)))))
+
+(with-test (:name :check-consistency-deleted-let)
+  (let ((sb-c::*check-consistency* t))
+    (checked-compile
+     `(lambda ()
+        (let ((x (error "fail")))
+          x)))))

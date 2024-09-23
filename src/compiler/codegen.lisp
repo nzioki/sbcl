@@ -44,17 +44,19 @@
 
 ;;; the TN that is used to hold the number stack frame-pointer in
 ;;; VOP's function, or NIL if no number stack frame was allocated
+#-c-stack-is-control-stack
 (defun current-nfp-tn (vop)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
     (let ((block (ir2-block-block (vop-block vop))))
-    (when (ir2-environment-number-stack-p
-           (environment-info
-            (block-environment block)))
-      (ir2-component-nfp (component-info (block-component block)))))))
+      (when (ir2-environment-number-stack-p
+             (environment-info
+              (block-environment block)))
+        (ir2-component-nfp (component-info (block-component block)))))))
 
 ;;; the TN that is used to hold the number stack frame-pointer in the
 ;;; function designated by 2ENV, or NIL if no number stack frame was
 ;;; allocated
+#-c-stack-is-control-stack
 (defun callee-nfp-tn (2env)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
     (when (ir2-environment-number-stack-p 2env)
@@ -65,6 +67,50 @@
 (defun callee-return-pc-tn (2env)
   (ir2-environment-return-pc-pass 2env))
 
+;;;; Fixups
+
+;;; a fixup of some kind
+(defstruct (fixup
+            (:constructor make-fixup (name flavor &optional offset))
+            (:copier nil))
+  ;; the name and flavor of the fixup. The assembler makes no
+  ;; assumptions about the contents of these fields; their semantics
+  ;; are imposed by the dumper.
+  (name nil :read-only t)
+  ;; FIXME: "-flavor" and "-kind" are completedly devoid of meaning.
+  ;; They former should probably be "fixup-referent-type" or "fixup-source"
+  ;; to indicate that it denotes a namespace for NAME, and latter should be
+  ;; "fixup-how" as it conveys a manner in which to modify encoded bytes.
+  (flavor nil :read-only t)
+  ;; OFFSET is an optional offset from whatever external label this
+  ;; fixup refers to. Or in the case of the :CODE-OBJECT flavor of
+  ;; fixups on the :X86 architecture, NAME is always NIL, so this
+  ;; fixup doesn't refer to an external label, and OFFSET is an offset
+  ;; from the beginning of the current code block.
+  ;; A LABEL can also be used for ppc or ppc64 in which case the value
+  ;; of the fixup will be the displacement to the label from CODE-TN.
+  (offset 0 :type (or sb-vm:signed-word label)
+            :read-only t))
+
+;;; A FIXUP-NOTE tells you where the assembly patch is to be performed
+(defstruct (fixup-note
+            (:constructor make-fixup-note (kind fixup position))
+            (:copier nil))
+  ;; KIND is architecture-dependent (see the various 'vm' files)
+  (kind nil :type symbol)
+  (fixup (missing-arg) :type fixup)
+  (position 0 :type fixnum))
+(declaim (freeze-type fixup fixup-note))
+
+;;; Record a FIXUP of KIND occurring at the current position in SEGMENT
+(defun note-fixup (segment kind fixup)
+  (emit-back-patch
+   segment 0
+   (lambda (segment posn)
+     (push (make-fixup-note kind fixup
+                            (- posn (segment-header-skew segment)))
+           (sb-assem::segment-fixup-notes segment)))))
+
 ;;;; noise to emit an instruction trace
 
 (defun trace-instruction (section vop inst args state
@@ -186,91 +232,6 @@
       (dovector (constant (sb-vm:sort-inline-constants constants) t)
         (sb-vm:emit-inline-constant section (car constant) (cdr constant))))))
 
-;;; If a constant is already loaded into a register use that register.
-(defun optimize-constant-loads (component)
-  (let* ((register-sb (sb-or-lose 'sb-vm::registers))
-         (loaded-constants
-           (make-array (sb-size register-sb)
-                       :initial-element nil)))
-    (do-ir2-blocks (block component)
-      (fill loaded-constants nil)
-      (do ((vop (ir2-block-start-vop block) (vop-next vop)))
-          ((null vop))
-        (labels ((register-p (tn)
-                   (and (tn-p tn)
-                        (not (eq (tn-kind tn) :unused))
-                        (eq (sc-sb (tn-sc tn)) register-sb)))
-                 (constant-eql-p (a b)
-                   (or (eq a b)
-                       (and (eq (sc-name (tn-sc a)) 'constant)
-                            (eq (tn-sc a) (tn-sc b))
-                            (eql (tn-offset a) (tn-offset b)))))
-                 (remove-constant (tn)
-                   (when (register-p tn)
-                     (setf (svref loaded-constants (tn-offset tn)) nil)))
-                 (remove-written-tns ()
-                   (cond ((memq (vop-info-save-p (vop-info vop))
-                                '(t :force-to-stack))
-                          (fill loaded-constants nil))
-                         (t
-                          (do ((ref (vop-results vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-tn ref))
-                            (remove-constant (tn-ref-load-tn ref)))
-                          (do ((ref (vop-temps vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-tn ref)))
-                          (do ((ref (vop-args vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-load-tn ref))))))
-                 (compatible-scs-p (a b)
-                   (or (eql a b)
-                       (and (eq (sc-name a) 'sb-vm::control-stack)
-                            (eq (sc-name b) 'sb-vm::descriptor-reg))
-                       (and (eq (sc-name b) 'sb-vm::control-stack)
-                            (eq (sc-name a) 'sb-vm::descriptor-reg))))
-                 (find-constant-tn (constant sc)
-                   (loop for (saved-constant . tn) across loaded-constants
-                         when (and saved-constant
-                                   (constant-eql-p saved-constant constant)
-                                   (compatible-scs-p (tn-sc tn) sc))
-                         return tn)))
-          (case (vop-name vop)
-            ((move sb-vm::move-arg)
-             (let* ((args (vop-args vop))
-                    (results (vop-results vop))
-                    (x (tn-ref-tn args))
-                    (x-load-tn (tn-ref-load-tn args))
-                    (y (tn-ref-tn results))
-                    constant)
-               (cond ((or (eq (sc-name (tn-sc x)) 'null)
-                          (not (eq (tn-kind x) :constant)))
-                      (remove-written-tns))
-                     ((setf constant (find-constant-tn x (tn-sc y)))
-                      (when (register-p y)
-                        (setf (svref loaded-constants (tn-offset y))
-                              (cons x y)))
-                      ;; XOR is more compact on x86oids and many
-                      ;; RISCs have a zero register
-                      (unless (and (constant-p (tn-leaf x))
-                                   (eql (tn-value x) 0)
-                                   (register-p y))
-                        (setf (tn-ref-tn args) constant)
-                        (setf (tn-ref-load-tn args) nil)))
-                     ((register-p y)
-                      (setf (svref loaded-constants (tn-offset y))
-                            (cons x y)))
-                     ((and x-load-tn
-                           (or (not (tn-ref-load-tn results))
-                               (location= (tn-ref-load-tn results)
-                                          x-load-tn)))
-                      (setf (svref loaded-constants (tn-offset x-load-tn))
-                            (cons x x-load-tn)))
-                     (t
-                      (remove-written-tns)))))
-            (t
-             (remove-written-tns))))))))
-
 ;; Collect "static" count of number of times each vop is employed.
 ;; (as opposed to "dynamic" - how many times its code is hit at runtime)
 (defglobal *static-vop-usage-counts* nil)
@@ -288,6 +249,7 @@
          (filler-pattern 0)
          (asmstream (make-asmstream))
          (*asmstream* asmstream))
+    (declare (special sb-vm::*adjustable-vectors*))
 
     (emit (asmstream-elsewhere-section asmstream)
           (asmstream-elsewhere-label asmstream))
@@ -359,7 +321,7 @@
         ;; phase (codegen has not made use of component-header-length),
         ;; so extending can be done with impunity.
         #+arm64
-        (vector-push-extend (cons :coverage-marks (length coverage-map))
+        (vector-push-extend (list :coverage-marks (length coverage-map))
                             (ir2-component-constants ir2-component))
         (vector-push-extend
          (make-constant (cons 'coverage-map
@@ -381,9 +343,8 @@
       (multiple-value-bind (segment text-length fixup-notes fun-table)
           (assemble-sections
            asmstream
-           (mapcar #'entry-info-offset (ir2-component-entries ir2-component))
-           (make-segment :header-skew skew
-                         :run-scheduler (default-segment-run-scheduler)))
+           (ir2-component-entries ir2-component)
+           (make-segment (default-segment-run-scheduler) skew))
         (values segment text-length fun-table
                 (asmstream-elsewhere-label asmstream) fixup-notes
                 (sb-assem::get-allocation-points asmstream))))))

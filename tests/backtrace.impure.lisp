@@ -222,7 +222,7 @@
                                    (error "foo"))))
            (with-timeout 0.1
              (sb-thread:condition-wait q m)))))
-     `((sb-thread:condition-wait ,q ,m :timeout nil)))))
+     `((sb-thread::%condition-wait ,q ,m t nil nil nil nil nil nil)))))
 
 ;;; Division by zero was a common error on PPC. It depended on the
 ;;; return function either being before INTEGER-/-INTEGER in memory,
@@ -251,13 +251,13 @@
   (with-test (:name (:backtrace :divide-by-zero :bug-346)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
+                      `((/ 42 &rest)
                         ((flet test :in ,*p*) ,#'optimized))))
 
   (with-test (:name (:backtrace :divide-by-zero :bug-356)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'not-optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
+                      `((/ 42 &rest)
                         ((flet not-optimized :in ,*p*))
                         ((flet test :in ,*p*) ,#'not-optimized)))))
 
@@ -345,7 +345,8 @@
           ;; no lambda-list saved
           (defun ,(intern (format nil "BT.~A.3" n)) ,ll
             (declare (optimize (debug 0)))
-            ,@body)))
+            (let (*) ;; disable tail calls enabled by debug-0
+              ,@body))))
      :allow-style-warnings t)))
 
 (defbt 1 (&key key)
@@ -549,7 +550,7 @@
   (gf-dispatch-test/gf 1 1)
   ;; Wrong argument count
   (assert-backtrace (lambda () (gf-dispatch-test/f 42))
-                    '(((sb-pcl::gf-dispatch gf-dispatch-test/gf) 42))))
+                    '((gf-dispatch-test/gf 42))))
 
 (defgeneric gf-default-only-test/gf (x y)
   (:method (x y) (+ x y)))

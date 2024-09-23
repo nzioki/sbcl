@@ -13,7 +13,7 @@
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 (defconstant sb-assem:+assem-max-locations+ 100)
 
-(defconstant +backend-fasl-file-implementation+ :sparc)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :sparc)
 (defconstant +backend-page-bytes+ 8192)
 
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
@@ -25,9 +25,6 @@
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -81,7 +78,7 @@
 
 ;;;; Description of the target address space.
 
-(!gencgc-space-setup #x0f800000 :dynamic-space-start #x30000000)
+(gc-space-setup #x0f800000 :dynamic-space-start #x30000000)
 
 ;; Size of one alien-linkage-table entry in bytes. See comment in
 ;; src/runtime/sparc-arch.c

@@ -392,15 +392,23 @@
        (result '() (cons initial-element result)))
       ((<= count 0) result)
     (declare (type index count))))
+
+(defun %sys-make-list (size initial-element)
+  (declare (type index size)
+           (sb-c::tlab :system))
+  (do ((count size (1- count))
+       (result '() (cons initial-element result)))
+      ((<= count 0) result)
+    (declare (type index count))))
 
 (defun append (&rest lists)
   "Construct and return a list by concatenating LISTS."
-  (let* ((result (list nil))
+  (let* ((result (unaligned-dx-cons nil))
          (tail result)
          (index 0)
          (length (length lists))
          (last (1- length)))
-    (declare (truly-dynamic-extent result))
+    (declare (dynamic-extent result))
     (loop
      (cond
        ((< (truly-the index index) last)
@@ -420,16 +428,14 @@
        (cdr result)))))
 
 (defun append2 (x y)
-  (declare (optimize (sb-c:verify-arg-count 0)))
   (if (null x)
       y
-      (let ((result (list (car x))))
-        (do ((more (cdr x) (cdr more))
-             (tail result (cdr tail)))
+      (let* ((result (cons (car x) y))
+             (tail result))
+        (do ((more (cdr x) (cdr more)))
             ((null more)
-             (rplacd (truly-the cons tail) y)
              result)
-                    (rplacd (truly-the cons tail) (list (car more)))))))
+          (rplacd (truly-the cons tail) (setf tail (cons (car more) y)))))))
 
 
 ;;;; list copying functions
@@ -437,6 +443,16 @@
 (defun copy-list (list)
   "Return a new list which is EQUAL to LIST. LIST may be improper."
   (copy-list-macro list))
+
+(defun copy-list-to (list tail)
+  (declare (explicit-check))
+  (the list (cdr (truly-the cons tail)))
+  (do ((orig list (cdr orig))
+       (splice tail
+               (let ((cell (list (car orig))))
+                 (rplacd (truly-the cons splice) cell)
+                 cell)))
+      ((atom orig) (rplacd (truly-the cons splice) orig))))
 
 (defun ensure-heap-list (list)
   (declare (sb-c::tlab :system))
@@ -1319,6 +1335,7 @@
         (if accumulate
             (cdr ret-list)
             non-acc-result))
+    (declare (dynamic-extent ret-list))
     (do ((l arglists (cdr l))
          (arg args (cdr arg)))
         ((null l))
@@ -1328,14 +1345,8 @@
     (case accumulate
       (:nconc
        (when res
-         (setf (cdr temp) res)
-         ;; KLUDGE: it is said that MAPCON is equivalent to
-         ;; (apply #'nconc (maplist ...)) which means (nconc 1) would
-         ;; return 1, but (nconc 1 1) should signal an error.
-         ;; The transformed MAP code returns the last result, do that
-         ;; here as well for consistency and simplicity.
-         (when (consp res)
-           (setf temp (last res)))))
+         (psetf temp res
+                (cdr (last temp)) res)))
       (:list (setf (cdr temp) (list res)
                    temp (cdr temp))))))
 
@@ -1375,7 +1386,6 @@
                 (let* ((body-loop
                         `(do ((list list (cdr list)))
                              ((null list) nil)
-                           (declare (list list))
                            (let ((this (car list)))
                              ,(let ((cxx (if (char= #\A (char (string name) 0))
                                              'car    ; assoc, assoc-if, assoc-if-not
@@ -1421,7 +1431,6 @@
                                  body-loop)))
                   `(defun ,(intern (format nil "%~A~{-~A~}~@[-~A~]" name funs variant))
                        (x list ,@funs)
-                     (declare (optimize speed (sb-c:verify-arg-count 0)))
                      ,@(when funs `((declare (function ,@funs)
                                              (dynamic-extent ,@funs))))
                      ,@(unless (member name '(member assoc adjoin rassoc))
@@ -1458,6 +1467,10 @@
       (funcall test x target))
   (def (test-not)
       (not (funcall test-not x target))))
+
+(defun sys-tlab-adjoin-eq (item list)
+  (declare (sb-c::tlab :system))
+  (if (memq item list) list (cons item list)))
 
 (defun sys-tlab-append (a b)
   (declare (sb-c::tlab :system))

@@ -136,6 +136,7 @@
             :fails-on (or (and :arm64 (not :darwin))
                           :arm
                           (and :ppc :openbsd)
+                          (and :ppc :darwin)
                           (and :x86 :netbsd)))
   (assert-error
    (sb-sys:without-interrupts
@@ -157,6 +158,7 @@
             :fails-on (or (and :arm64 (not :darwin))
                           :arm
                           (and :ppc :openbsd)
+                          (and :ppc :darwin)
                           (and :x86 :netbsd)))
   (assert-error
    (sb-sys:without-interrupts
@@ -275,6 +277,54 @@
     (assert (eql 0.0d0 (funcall f 123.0d0 0.0)))
     (assert (eql 0.0d0 (funcall f 123.0d0 0.0d0)))
     (assert (eql 0.0d0 (funcall f 123.0 0.0d0)))))
+
+(with-test (:name (:log2 :non-negative-powers-of-two))
+  (let ((diffs
+          (loop for i from 0 to 128
+                for x = (log (expt 2 i) 2.0d0)
+                if (or (not (typep x 'double-float)) (/= x i)) collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log2 :negative-powers-of-two))
+  (let ((diffs
+          (loop for i from -128 to -1
+                for x = (log (expt 2 i) 2.0d0)
+                if (or (not (typep x 'double-float)) (/= x i)) collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log2 :powers-of-two-negative))
+  (let ((diffs
+          (loop for i from -128 to 128
+                for x = (log (- (expt 2 i)) 2.0d0)
+                if (or (not (typep x '(complex double-float)))
+                       (/= (realpart x) i))
+                collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log :ratios-near-1))
+  ;; LOG of 1 +/- 1/2^100 is approximately +/-1/2^100, comfortably
+  ;; within single-float range.
+  (let ((nvals
+          (loop for i from -128 to 128
+                for x = (log (/ (+ i (expt 2 100)) (+ i (expt 2 100) 1)))
+                collect x))
+        (pvals
+          (loop for i from -128 to 128
+                for x = (log (/ (+ i (expt 2 100) 1) (+ i (expt 2 100))))
+                collect x)))
+    (assert (= (length (remove-duplicates nvals)) 1))
+    (assert (< (first nvals) 0))
+    (assert (= (length (remove-duplicates pvals)) 1))
+    (assert (> (first pvals) 0))))
+
+(with-test (:name (:log :same-base-different-precision))
+  (let ((twos (list 2 2.0f0 2.0d0 #c(2.0f0 0.0f0) #c(2.0d0 0.0d0))))
+    (let ((result (loop for number in twos
+                        append (loop for base in twos
+                                     for result = (log number base)
+                                     if (/= (realpart result) 1)
+                                     collect (list number base result)))))
+      (assert (null result)))))
 
 ;; Bug reported by Eric Marsden on July 15 2009. The compiler
 ;; used not to constant fold calls with arguments of type
@@ -629,7 +679,9 @@
         ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
          :test #'car-type-equal))
       (checked-compile-and-assert () '(lambda (x y) (ctu:compiler-derived-type (atan x y)))
-        ((1 2) (values `(or ,long single-float (complex ,long) (complex single-float)) t) :test #'car-type-equal)))))
+        ((1 2) (values `(float ,(- pi) ,pi)
+                       t)
+         :test #'car-type-equal)))))
 
 (with-test (:name :comparison-transform-overflow)
   (checked-compile-and-assert
@@ -687,14 +739,10 @@
 
 ;;; For #+64-bit we could eradicate the legacy interface
 ;;; to MAKE-DOUBLE-FLOAT, and just take the bits.
-(defun mdf (x)
-  (let ((f (sb-sys:%primitive sb-vm::fixed-alloc
-                              'make-double-float 2 sb-vm:double-float-widetag
-                              sb-vm:other-pointer-lowtag nil)))
-    (setf (sb-sys:sap-ref-word (sb-sys:int-sap (sb-kernel:get-lisp-obj-address f))
-                               (- 8 sb-vm:other-pointer-lowtag))
-          (the sb-vm:word x))
-    f))
+(defun mdf (bits)
+  (let ((hi (ldb (byte 32 32) bits))
+        (lo (ldb (byte 32  0) bits)))
+    (sb-kernel:make-double-float (sb-disassem:sign-extend hi 32) lo)))
 (compile 'mdf)
 
 #+64-bit
@@ -773,3 +821,46 @@
 (with-test (:name :rational-not-bignum)
   (assert (equal (type-of (eval '(rational -4.3973217e12)))
                  (type-of -4397321682944))))
+
+(with-test (:name :single-to-double-comparsion)
+  (assert (= (count 'sb-kernel:%double-float
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (single-float x))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :float-to-known-comparison)
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize speed))
+                        (= x 1d0))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x y)
+                        (declare (float x)
+                                 ((signed-byte 8) y)
+                                 (optimize speed))
+                        (= x y))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize (speed 1)))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :tan-single-float-type-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (tan (the (single-float -1.5707964 1.5707964) x)))
+    ((1.5707964) -2.2877332e7)))

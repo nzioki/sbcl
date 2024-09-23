@@ -17,14 +17,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
-#include "dynbind.h"
 #include "thread.h"
 #include "interr.h"
 #include "genesis/symbol.h"
-#include "genesis/binding.h"
 
 /* Specially bind SYMBOL to VALUE. In a multithreaded build, SYMBOL must already
    have been assigned a thread-local storage index. See *KNOWN-TLS-SYMBOLS* in

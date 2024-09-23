@@ -5,7 +5,7 @@
 (import 'sb-lockless::(+hash-nbits+ %node-next
                        get-next node-hash
                        so-head so-bins so-key so-data so-count
-                       so-key-node-p dummy-node-p
+                       so-key-node-p
                        so-insert so-delete so-find so-find/string so-maplist
                        make-so-map/string make-so-set/string make-so-map/addr
                        make-marked-ref))
@@ -13,6 +13,8 @@
 ;;; Make sure no promotions occur so that objects will be movable
 ;;; throughout these tests.
 (setf (generation-number-of-gcs-before-promotion 0) 1000000)
+
+(defun dummy-node-p (node) (evenp (node-hash node)))
 
 ;;; Show all nodes including dummies.
 (defun show-list (solist)
@@ -109,8 +111,15 @@
 (defparameter *strings*
   (let ((h (make-hash-table :test 'equal)))
     (dolist (str (sb-vm:list-allocated-objects :all :test #'simple-string-p))
-      (setf (gethash (string str) h) t))
+      (setf (gethash str h) t
+            (gethash (string-upcase str) h) t
+            (gethash (string-downcase str) h) t)
+      (setq str (reverse str))
+      (setf (gethash str h) t
+            (gethash (string-upcase str) h) t
+            (gethash (string-downcase str) h) t))
     (loop for str being each hash-key of h collect str)))
+(format t "~&Using ~D strings for test~%" (length *strings*))
 
 (defun fill-table-from (table list)
   (dolist (key list table)
@@ -451,7 +460,8 @@
                      (assert (not found))
                      (assert (eq found node))))
                (setq node next)))))
-    (assert (>= addr-change 24)))) ; seems about right
+    #-mark-region-gc
+    (assert (>= addr-change 22)))) ; seems about right
 
 ;;; SO-MAPLIST does not include deleted nodes.
 ;;; Nodes marked for deletion should still be marked after GC
@@ -465,6 +475,59 @@
     (so-maplist (lambda (node)
                   (assert (string= (so-key node) (pop present-keys))))
                 *so-map*)))
+
+(defvar *example-objects*
+  (subseq (append
+           (remove-if (lambda (x) (/= (sb-kernel:generation-of x) sb-vm:+pseudo-static-generation+))
+                      (sb-vm:list-allocated-objects :dynamic :type sb-vm:simple-base-string-widetag))
+           (sb-vm:list-allocated-objects :read-only :type sb-vm:simple-base-string-widetag))
+          0 1000))
+
+(test-util:with-test (:name :c-find-in-solist)
+  (let ((set (sb-lockless:make-so-set/addr))  )
+    (dolist (x *example-objects*)
+      (sb-lockless:so-insert set x))
+    (assert (not (sb-lockless:c-so-find/addr set 'random)))
+    (dolist (x *example-objects*)
+      (let ((node (sb-lockless:c-so-find/addr set x)))
+        (assert node)
+        (assert (eq (sb-lockless:so-key node) x))))))
+
+(test-util:with-test (:name :solist-2-phase-insert)
+  (let ((set (sb-lockless:make-so-set/addr))
+        (example-objects *example-objects*)
+        (n-deleted 0)
+        (nodes))
+    ;; This example is artificial. The real usage would allocate one object and perform
+    ;; both insert phases in the following pattern:
+    ;;   begin pseudo-atomic
+    ;;     allocate split-order node 'n'
+    ;;     allocate off-heap large unboxed object
+    ;;     phase1 insert node 'n' pointing to large-object
+    ;;   end pseudo-atomic
+    ;;   phase2 insert
+    ;; If GC occurs just after the pseudo-atomic section, it is possible to test each stack word
+    ;; as being a conservative pointer to an off-heap object based on its presence in the table.
+    (dolist (object example-objects)
+      (let ((node (sb-lockless::%make-so-set-node 0 0)))
+        (push node nodes)
+        (sb-lockless::%so-eq-set-phase1-insert set node object)))
+    ;; It has no bearing on currectness that the table count is understated and that
+    ;; the number of bins may be too few prior to running the second step.
+    ;; This is evident from the loop below which shows that each example-object can be found.
+    (dolist (node nodes)
+      (sb-lockless::%so-eq-set-phase2-insert set node)
+      ;; delete some keys at random. This could occur only after the node is fully inserted.
+      (when (zerop (random 10))
+        (sb-lockless:so-delete set (sb-lockless:so-key node))
+        (incf n-deleted))
+      (let ((table-count
+             (loop for object in example-objects
+                   count (sb-lockless:so-find set object))))
+        (assert (= table-count (- 1000 n-deleted)))))
+    ;; Finally the table count should be correct
+    (assert (= (sb-lockless::so-count set) (- 1000 n-deleted)))
+    set))
 
 #|
 ;; Speedup: 4x
@@ -537,3 +600,19 @@ Evaluation took:
   187,631,304 processor cycles
   22,077,904 bytes consed
 |#
+
+#+nil
+(let* ((t0 (get-internal-real-time))
+       (table (test-insert-to-synchronized-table 1 8 10))
+       (t1 (get-internal-real-time))
+       (sb-lockless::*desired-elts-per-bin* 9)
+       (solist (test-insert-to-lockfree-table 1 8 10))
+       (t2 (get-internal-real-time))
+       (et1 (- t1 t0))
+       (et2 (- t2 t1))
+       (deep-size-ht (deep-size table))
+       (deep-size-so (deep-size solist)))
+  (print table)
+  (print solist)
+  (format t "~&Speedup-ratio = ~F~%" (/ et1 et2))
+  (format t "Size ratio ~F~%" (/ deep-size-so deep-size-ht)))

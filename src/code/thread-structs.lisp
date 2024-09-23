@@ -72,11 +72,11 @@ future."
 (sb-ext:define-load-time-global *profiled-threads* :all)
 (declaim (type (or (eql :all) list) *profiled-threads*))
 
-(sb-xc:defstruct (thread (:constructor %make-thread (name %ephemeral-p semaphore))
+(sb-xc:defstruct (thread (:constructor %make-thread (%name %ephemeral-p semaphore))
                          (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
-  (name          nil :type (or null simple-string)) ; C code could read this
+  (%name         nil :type (or null simple-string)) ; C code could read this
   (%ephemeral-p  nil :type boolean :read-only t)
   ;; This is one of a few different views of a lisp thread:
   ;;  1. the memory space (thread->os_addr in C)
@@ -145,6 +145,15 @@ in future versions."
             :type sb-vm:signed-word)
   #-64-bit (internal-real-time)
 
+  (max-stw-pause 0 :type sb-vm:word) ; microseconds
+  (sum-stw-pause 0 :type sb-vm:word) ; "
+  (ct-stw-pauses 0 :type sb-vm:word) ; to compute the avg
+  ;; Measure elapsed time in GC in the resolution that clock_gettime returns
+  ;; (nanoseconds) for 64-bit, or microseconds for 32-bit.
+  ;; This can indicate >584 years if 64-bit or slightly over an hour if 32-bit.
+  ;; Consider restarting your SBCL before wraparound occurs, if you care.
+  (gc-virtual-time 0 :type sb-vm:word)
+
   ;; On succesful execution of the thread's lambda, a list of values.
   (result 0)
   ;; The completion condition _could_ be manifested as a condition var, but a difficulty
@@ -159,7 +168,7 @@ in future versions."
 
 (sb-xc:defstruct (foreign-thread
                   (:copier nil)
-                  (:include thread (name "callback"))
+                  (:include thread (%name "callback"))
                   (:constructor make-foreign-thread ())
                   (:conc-name "THREAD-"))
   "Type of native threads which are attached to the runtime as Lisp threads

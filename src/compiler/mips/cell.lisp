@@ -26,12 +26,11 @@
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg null zero)))
   (:info name offset lowtag)
-  (:ignore name)
   (:temporary (:sc non-descriptor-reg) temp)
   (:vop-var vop)
   (:generator 1
     (without-scheduling ()
-      (emit-gc-store-barrier object nil temp (vop-nth-arg 1 vop) value)
+      (emit-gengc-barrier object nil temp (vop-nth-arg 1 vop) name)
       (storew value object offset lowtag))))
 
 ;;;; Symbol hacking VOPs:
@@ -86,33 +85,34 @@
   (:policy :fast)
   (:translate symbol-value))
 
-(define-vop (symbol-hash)
-  (:policy :fast-safe)
-  (:translate symbol-hash)
-  (:args (symbol :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; cdr slot, so we have to strip off the two low bits to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
-    (loadw temp symbol symbol-hash-slot other-pointer-lowtag)
-    (inst srl temp n-fixnum-tag-bits)
-    (inst sll res temp n-fixnum-tag-bits)))
-
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
   (:translate symbol-global-value))
 (define-vop (fast-symbol-global-value fast-symbol-value)
   (:translate symbol-global-value))
+
+(define-vop (symbol-hash)
+  (:policy :fast-safe)
+  (:translate symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:sc unsigned-reg) tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum.
+    (inst li tmp #x1fffffff)
+    (inst and res res tmp)))
+
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:ignore tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srl res res 3))) ; shift out the 3 pseudorandom bits
 
 ;;;; Fdefinition (fdefn) objects.
-
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -131,18 +131,16 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
       (without-scheduling ()
-        (emit-gc-store-barrier fdefn nil type)) ; type = temp
+        (emit-gengc-barrier fdefn nil type)) ; type = temp
       (load-type type function (- fun-pointer-lowtag))
       (inst xor type simple-fun-widetag)
-      (inst beq type normal-fn)
+      (inst beq type SIMPLE)
       (inst addu lip function
             (- (ash simple-fun-insts-offset word-shift)
                fun-pointer-lowtag))
@@ -156,10 +154,9 @@
       ;;   - lack of thread support makes a GC interrupt somewhat unlikely,
       ;;     (though any interrupt could call into lisp, also unlikely)
       (inst li lip (make-fixup 'closure-tramp :assembly-routine))
-    NORMAL-FN
+    SIMPLE
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-      (move result function)))
+      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -190,7 +187,7 @@
     (storew temp bsp-tn (- binding-value-slot binding-size))
     (storew symbol bsp-tn (- binding-symbol-slot binding-size))
     (without-scheduling ()
-      (emit-gc-store-barrier symbol nil temp2)
+      (emit-gengc-barrier symbol nil temp2)
       (storew val symbol symbol-value-slot other-pointer-lowtag))))
 
 (define-vop (unbind)
@@ -200,7 +197,7 @@
     (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
     (loadw value bsp-tn (- binding-value-slot binding-size))
     (without-scheduling ()
-      (emit-gc-store-barrier symbol nil temp)
+      (emit-gengc-barrier symbol nil temp)
       (storew value symbol symbol-value-slot other-pointer-lowtag))
     (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
     (storew zero-tn bsp-tn (- binding-value-slot binding-size))
@@ -213,29 +210,26 @@
   (:temporary (:scs (descriptor-reg)) symbol value)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 0
-    (let ((loop (gen-label))
-          (skip (gen-label))
-          (done (gen-label)))
       (move where arg)
       (inst beq where bsp-tn done)
       (inst nop)
 
-      (emit-label loop)
+      LOOP
       (loadw symbol bsp-tn (- binding-symbol-slot binding-size))
       (inst beq symbol skip)
       (loadw value bsp-tn (- binding-value-slot binding-size))
       (without-scheduling ()
-        (emit-gc-store-barrier symbol nil temp)
+        (emit-gengc-barrier symbol nil temp)
         (storew value symbol symbol-value-slot other-pointer-lowtag))
       (storew zero-tn bsp-tn (- binding-symbol-slot binding-size))
 
-      (emit-label skip)
+      SKIP
       (storew zero-tn bsp-tn (- binding-value-slot binding-size))
       (inst addu bsp-tn bsp-tn (* -2 n-word-bytes))
       (inst bne where bsp-tn loop)
       (inst nop)
 
-      (emit-label done))))
+      DONE))
 
 
 
@@ -263,11 +257,12 @@
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
-  (:info offset)
+  (:info offset dx)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 4
     (without-scheduling ()
-      (emit-gc-store-barrier object nil temp)
+      (unless dx
+        (emit-gengc-barrier object nil temp))
       (storew value object (+ closure-info-offset offset) fun-pointer-lowtag))))
 
 (define-vop (closure-init-from-fp)
@@ -277,9 +272,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; Value Cell hackery.
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))

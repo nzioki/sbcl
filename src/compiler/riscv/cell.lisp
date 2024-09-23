@@ -197,23 +197,22 @@
 (define-vop (fast-symbol-global-value fast-symbol-value)
   (:translate symbol-global-value))
 
+#+64-bit
+(progn
 (define-vop (symbol-hash)
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; cdr slot, so we have to strip off the two low bits to make
-    ;; sure it is a fixnum.  The lowtag selection magic that is
-    ;; required to ensure this is explained in the comment in
-    ;; objdef.lisp
-    (loadw temp symbol symbol-hash-slot other-pointer-lowtag)
-    (inst andi res temp (lognot fixnum-tag-mask))))
-
-#+64-bit
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srli res res n-symbol-hash-discard-bits)))
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash hash-as-if-symbol-name)
+  (:generator 1
+    (inst lwu res symbol ; little-endian
+          (- (+ 4 (ash symbol-hash-slot word-shift)) other-pointer-lowtag))))
 (define-vop ()
   (:args (symbol :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -221,25 +220,10 @@
   (:translate symbol-package-id)
   (:policy :fast-safe)
   (:generator 1 ; ASSUMPTION: symbol-package-bits = 16
-   (inst lhu result symbol (+ (ash symbol-name-slot word-shift)
-                              (- other-pointer-lowtag)
-                              6)))) ; little-endian
-#+64-bit
-(define-vop ()
-  (:policy :fast-safe)
-  (:translate symbol-name)
-  (:args (symbol :scs (descriptor-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg) pa-flag)
-  (:generator 5
-    (pseudo-atomic (pa-flag)
-      (loadw result symbol symbol-name-slot other-pointer-lowtag)
-      (inst slli result result sb-impl::package-id-bits)
-      (inst srli result result sb-impl::package-id-bits))))
+   (inst lhu result symbol (- 2 other-pointer-lowtag)))) ; little-endian
+) ; end PROGN
 
 ;;;; Fdefinition (fdefn) objects.
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -255,12 +239,10 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 3
     (load-type type function (- fun-pointer-lowtag))
     (inst xori type type simple-fun-widetag)
@@ -269,8 +251,7 @@
     (inst li lip (make-fixup 'closure-tramp :assembly-routine))
     SIMPLE-FUN
     (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-    (move result function)))
+    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -414,7 +395,8 @@
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
-  (:info offset)
+  (:info offset dx)
+  (:ignore dx)
   (:generator 4
     (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
@@ -425,8 +407,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; Value Cell hackery.
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))

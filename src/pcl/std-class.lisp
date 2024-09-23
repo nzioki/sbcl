@@ -144,7 +144,7 @@
 ;;;; various class accessors that are a little more complicated than can be
 ;;;; done with automatically generated reader methods
 
-(defmethod class-prototype :before (class)
+(defmethod class-prototype :before ((class pcl-class))
   (unless (class-finalized-p class)
     (error "~@<~S is not finalized.~:@>" class)))
 
@@ -183,12 +183,12 @@
   (with-slots (direct-subclasses) class
     (with-world-lock ()
       (pushnew subclass direct-subclasses :test #'eq)
-      (let ((wrapper (class-wrapper subclass)))
-        (when wrapper
-          (let ((classoid (wrapper-classoid wrapper)))
-            (dovector (super-wrapper (wrapper-inherits wrapper))
-              (sb-kernel::add-subclassoid (wrapper-classoid super-wrapper)
-                                          classoid wrapper))))))
+      (let ((layout (class-wrapper subclass)))
+        (when layout
+          (let ((classoid (layout-classoid layout)))
+            (dovector (super-layout (layout-inherits layout))
+              (sb-kernel::add-subclassoid (layout-classoid super-layout)
+                                          classoid layout))))))
     subclass))
 (defmethod remove-direct-subclass ((class class) (subclass class))
   (with-slots (direct-subclasses) class
@@ -196,9 +196,9 @@
       (setq direct-subclasses (remove subclass direct-subclasses))
       ;; Remove from classoid subclasses as well.
       (let ((classoid (class-classoid subclass)))
-        (dovector (super-wrapper (wrapper-inherits (classoid-wrapper classoid)))
+        (dovector (super-layout (layout-inherits (classoid-layout classoid)))
           (sb-kernel::remove-subclassoid classoid
-                                         (wrapper-classoid super-wrapper)))))
+                                         (layout-classoid super-layout)))))
     subclass))
 
 ;;; Maintaining the direct-methods and direct-generic-functions backpointers.
@@ -221,38 +221,65 @@
 ;;; function using the same lock.
 (define-load-time-global *specializer-lock* (sb-thread:make-mutex :name "Specializer lock"))
 
-(defmethod add-direct-method :around ((specializer specializer) method)
+(defmethod add-direct-method :around ((specializer specializer) (method method))
   ;; All the actions done under this lock are done in an order
   ;; that is safe to unwind at any point.
   (sb-thread::with-recursive-system-lock (*specializer-lock*)
     (call-next-method)))
 
-(defmethod remove-direct-method :around ((specializer specializer) method)
+(defmethod remove-direct-method :around ((specializer specializer) (method method))
   ;; All the actions done under this lock are done in an order
   ;; that is safe to unwind at any point.
   (sb-thread::with-recursive-system-lock (*specializer-lock*)
     (call-next-method)))
 
 (defmethod add-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  ;; Method "list" storage is a simple-vector. A hashset would probably be best,
+  ;; or a list that upgrades to a hashset. But a vector is already an improvement
+  ;; over a list because it can be examined faster. Quite often GFs gain
+  ;; thousands of methods, especially PRINT-OBJECT, where the vector eliminates
+  ;; all the CDR pointers thus having a better memory access pattern.
+  (flet ((adjoin-to (collection)
+           (let ((collection (the simple-vector (or collection (vector 0 0 0 0))))
+                 (hole))
+             (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+             (loop for i downfrom (1- (length collection)) to 0
+                   do (let ((elt (svref collection i)))
+                        (cond ((eq elt method) (return-from adjoin-to collection))
+                              ((eql elt 0) (setq hole i)))))
+             (when hole
+               (setf (svref collection hole) method)
+               (return-from adjoin-to collection))
+             (let* ((old-size (length collection))
+                    (new-size (ash (* old-size 3) -1)) ; scale up by 3/2
+                    (new (replace (make-array new-size) collection)))
+               (setf (aref new old-size) method)
+               new))))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (adjoin method (car cell) :test #'eq)))
-  method)
+      (setf (cdr cell) ()
+            (car cell) (adjoin-to (car cell)))))
+    method)
 
 (defmethod remove-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  (flet ((remove-from (collection)
+           (when collection
+             (awhen (position method (the simple-vector collection) :test #'eq)
+               (setf (svref collection it) 0)))
+           collection))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (remove method (car cell))))
+      (setf (cdr cell) ()
+            (car cell) (remove-from (car cell)))))
   method)
 
 (defmethod specializer-direct-methods ((specializer specializer))
-  (car (specializer-method-holder specializer nil)))
+  (let ((collection (car (specializer-method-holder specializer nil))))
+    (coerce (remove 0 collection) 'list)))
 
 (defmethod specializer-direct-generic-functions ((specializer specializer))
   (let ((cell (specializer-method-holder specializer nil)))
@@ -264,11 +291,12 @@
           (setf (cdr cell)
                 (with-system-mutex (*specializer-lock*)
                   (let (collect)
-                    (dolist (m (car cell) (nreverse collect))
+                    (dovector (m (or (car cell) #()) (nreverse collect))
                 ;; the old PCL code used COLLECTING-ONCE which used
                 ;; #'EQ to check for newness
-                      (pushnew (method-generic-function m) collect
-                               :test #'eq)))))))))
+                      (unless (eql m 0)
+                        (pushnew (method-generic-function m) collect
+                                 :test #'eq))))))))))
 
 (defmethod specializer-method-holder ((self specializer) &optional create)
   ;; CREATE can be ignored, because instances of SPECIALIZER
@@ -623,7 +651,7 @@
             finalized-p t
             (classoid-pcl-class classoid) class
             direct-supers direct-superclasses
-            wrapper (classoid-wrapper classoid)
+            wrapper (classoid-layout classoid)
             %class-precedence-list (compute-class-precedence-list class)
             cpl-available-p t
             (getf plist 'direct-default-initargs)
@@ -631,7 +659,7 @@
       (add-direct-subclasses class direct-superclasses)
       (let ((slots (compute-slots class)))
         (setf (slot-value class 'slots) slots)
-        (setf (wrapper-slot-table wrapper) (make-slot-table class slots)))))
+        (setf (layout-slot-table wrapper) (make-slot-table class slots)))))
   ;; Comment from Gerd's PCL, 2003-05-15:
   ;;
   ;; We don't ADD-SLOT-ACCESSORS here because we don't want to
@@ -775,8 +803,8 @@
        ;;  (LAMBDA () (SB-PCL::FAST-MAKE-INSTANCE #<STRUCTURE-CLASS THING>))
        ;; So maybe we can figure out how to bundle two lambdas together?
        (lambda ()
-         (let* ((dd (wrapper-dd (class-wrapper class)))
-                (f (%make-structure-instance-allocator dd nil)))
+         (let* ((dd (layout-dd (class-wrapper class)))
+                (f (%make-structure-instance-allocator dd nil nil)))
            (if (functionp f)
                (funcall (setf (slot-value class 'defstruct-constructor) f))
                (error "Can't allocate ~S" class)))))
@@ -851,10 +879,11 @@
     (let ((slots (compute-slots class)))
       (setf (slot-value class 'slots) slots)
       (let* ((lclass (find-classoid (slot-value class 'name)))
-             (layout (classoid-wrapper lclass)))
+             (layout (classoid-layout lclass)))
         (setf (classoid-pcl-class lclass) class)
         (setf (slot-value class 'wrapper) layout)
-        (setf (wrapper-slot-table layout) (make-slot-table class slots))))
+        (sb-kernel::install-struct-slot-mapper layout)
+        (setf (layout-slot-table layout) (make-slot-table class slots))))
     (setf (slot-value class 'finalized-p) t)
     (add-slot-accessors class direct-slots)))
 
@@ -1003,7 +1032,11 @@
   (when cpl
     (let ((first (car cpl)))
       (dolist (c (cdr cpl))
-        (pushnew c (slot-value first 'can-precede-list) :test #'eq)))
+        ;; This is (PUSHNEW c (SLOT-VALUE FIRST 'can-precede-list) :TEST #'EQ)))
+        ;; but avoids consing in an arena. Perhaps the ADJOIN transform could sense
+        ;; whether to change %ADJOIN-EQ to SYS-TLAB-ADJOIN-EQ ?
+        (with-slots (can-precede-list) first
+          (setf can-precede-list (sys-tlab-adjoin-eq c can-precede-list)))))
     (update-class-can-precede-p (cdr cpl))))
 
 (defun class-can-precede-p (class1 class2)
@@ -1104,13 +1137,11 @@
       (%update-lisp-class-layout class nwrapper)
       (setf (slot-value class 'slots) eslotds
             (wrapper-slot-list nwrapper) eslotds
-            (wrapper-slot-table nwrapper) (make-slot-table class eslotds)
-            (wrapper-length nwrapper) nslots
+            (layout-slot-table nwrapper) (make-slot-table class eslotds)
+            (layout-length nwrapper) nslots
             (slot-value class 'wrapper) nwrapper)
       (style-warn-about-duplicate-slots class)
-      (setf (slot-value class 'finalized-p) t)
-      (unless (eq owrapper nwrapper)
-        (maybe-update-standard-slot-locations class)))))
+      (setf (slot-value class 'finalized-p) t))))
 
 (defun update-gf-dfun (class gf)
   (let ((*new-class* class)
@@ -1404,21 +1435,21 @@
            (eq (class-of class) *the-class-standard-class*))))
 
 ;;; What this does depends on which of the four possible values of
-;;; WRAPPER-INVALID the PCL wrapper has; the simplest case is when it
+;;; LAYOUT-INVALID the PCL wrapper has; the simplest case is when it
 ;;; is (:FLUSH <wrapper>) or (:OBSOLETE <wrapper>), when there is
 ;;; nothing to do, as the new wrapper has already been created.  If
-;;; WRAPPER-INVALID returns NIL, then we invalidate it (setting it to
+;;; LAYOUT-INVALID returns NIL, then we invalidate it (setting it to
 ;;; (:FLUSH <wrapper>); UPDATE-SLOTS later gets to choose whether or
 ;;; not to "upgrade" this to (:OBSOLETE <wrapper>).
 ;;;
-;;; This leaves the case where WRAPPER-INVALID returns T, which happens
+;;; This leaves the case where LAYOUT-INVALID returns T, which happens
 ;;; when REGISTER-LAYOUT has invalidated a superclass of CLASS (which
 ;;; invalidated all the subclasses in SB-KERNEL land).  Again, here we
 ;;; must flush the caches and allow UPDATE-SLOTS to decide whether to
 ;;; obsolete the wrapper.
 ;;;
 ;;; FIXME: either here or in INVALID-WRAPPER-P looks like a good place
-;;; for (AVER (NOT (EQ (WRAPPER-INVALID OWRAPPER)
+;;; for (AVER (NOT (EQ (LAYOUT-INVALID OWRAPPER)
 ;;;                    :UNINITIALIZED)))
 ;;;
 ;;; Thanks to Gerd Moellmann for the explanation.  -- CSR, 2002-10-29
@@ -1435,19 +1466,19 @@
                 ;; a violation of locality or what might be considered
                 ;; good style.  There has to be a better way!  -- CSR,
                 ;; 2002-10-29
-                (eq (wrapper-invalid owrapper) t))
-        (let ((nwrapper (make-wrapper (wrapper-length owrapper)
+                (eq (layout-invalid owrapper) t))
+        (let ((nwrapper (make-wrapper (layout-length owrapper)
                                       class)))
           (setf (wrapper-slot-list nwrapper) (wrapper-slot-list owrapper))
-          (setf (wrapper-slot-table nwrapper) (wrapper-slot-table owrapper))
+          (setf (layout-slot-table nwrapper) (layout-slot-table owrapper))
           (%update-lisp-class-layout class nwrapper)
           (setf (slot-value class 'wrapper) nwrapper)
           ;; Use :OBSOLETE instead of :FLUSH if any superclass has
           ;; been obsoleted.
           (if (find-if (lambda (x)
                          (and (consp x) (eq :obsolete (car x))))
-                       (wrapper-inherits owrapper)
-                       :key #'wrapper-invalid)
+                       (layout-inherits owrapper)
+                       :key #'layout-invalid)
               (%invalidate-wrapper owrapper :obsolete nwrapper)
               (%invalidate-wrapper owrapper :flush nwrapper))))))
   nil)
@@ -1458,14 +1489,14 @@
 (defmethod make-instances-obsolete ((class std-class))
   (with-world-lock ()
     (let* ((owrapper (class-wrapper class))
-           (nwrapper (make-wrapper (wrapper-length owrapper)
+           (nwrapper (make-wrapper (layout-length owrapper)
                                    class)))
       (unless (class-finalized-p class)
         (if (class-has-a-forward-referenced-superclass-p class)
             (return-from make-instances-obsolete class)
             (%update-cpl class (compute-class-precedence-list class))))
       (setf (wrapper-slot-list nwrapper) (wrapper-slot-list owrapper))
-      (setf (wrapper-slot-table nwrapper) (wrapper-slot-table owrapper))
+      (setf (layout-slot-table nwrapper) (layout-slot-table owrapper))
       (%update-lisp-class-layout class nwrapper)
       (setf (slot-value class 'wrapper) nwrapper)
       (%invalidate-wrapper owrapper :obsolete nwrapper)
@@ -1552,11 +1583,11 @@
 
 (macrolet ((replace-wrapper-and-slots (thing layout slot-vector)
              `(if (functionp ,thing)
-                  (setf (%fun-wrapper ,thing) ,layout
+                  (setf (%fun-layout ,thing) ,layout
                         (fsc-instance-slots ,thing) ,slot-vector)
                   ;; TODO: use a double-wide CAS here if CPU supports it
                   (progn
-                    (setf (%instance-wrapper ,thing) ,layout)
+                    (setf (%instance-layout ,thing) ,layout)
                     (%instance-set ,thing sb-vm:instance-data-start ,slot-vector)))))
 
 (defun %obsolete-instance-trap (owrapper nwrapper instance)
@@ -1565,7 +1596,7 @@
      (binding* ((class (wrapper-class nwrapper))
                 (oslots (get-slots instance))
                 (nwrapper (class-wrapper class))
-                (nslots (make-array (wrapper-length nwrapper)
+                (nslots (make-array (layout-length nwrapper)
                                     :initial-element +slot-unbound+))
                 (added ())
                 (discarded ())
@@ -1664,9 +1695,9 @@
 
 (defun %change-class (copy instance new-class initargs)
   (binding* ((new-wrapper (class-wrapper (ensure-class-finalized new-class)))
-             (new-slots (make-array (wrapper-length new-wrapper)
+             (new-slots (make-array (layout-length new-wrapper)
                                     :initial-element +slot-unbound+))
-             (old-wrapper (wrapper-of instance))
+             (old-wrapper (layout-of instance))
              (old-class (wrapper-class old-wrapper))
              (old-slots (get-slots instance))
              (safe (safe-p new-class))

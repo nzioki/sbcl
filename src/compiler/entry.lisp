@@ -31,8 +31,10 @@
   (declare (type clambda fun) (type entry-info info))
   (let ((bind (lambda-bind fun))
         (internal-fun (functional-entry-fun fun)))
-    (setf (entry-info-closure-p info)
-          (not (null (environment-closure (lambda-environment fun)))))
+    (setf (entry-info-closure-tn info)
+          (if (environment-closure (lambda-environment fun))
+              (make-normal-tn *backend-t-primitive-type*)
+              nil))
     (setf (entry-info-offset info) (gen-label))
     (setf (entry-info-name info)
           (leaf-debug-name internal-fun))
@@ -74,6 +76,8 @@ missing MAKE-LOAD-FORM methods?")
                       (and (policy bind (> store-source-form 0))
                            inline-expansion)))
            (doc (functional-documentation internal-fun)))
+      (when doc
+        (setf doc (possibly-base-stringize doc)))
       (setf (entry-info-form/doc info)
             (if (and form doc) (cons form doc) (or form doc))))
     (when (policy bind (>= debug 1))
@@ -122,12 +126,12 @@ missing MAKE-LOAD-FORM methods?")
 (defun replace-toplevel-xeps (component)
   (let ((res nil))
     (dolist (lambda (component-lambdas component))
-      (case (functional-kind lambda)
-        (:external
+      (functional-kind-case lambda
+        (external
          (unless (lambda-has-external-references-p lambda)
            (let* ((ef (functional-entry-fun lambda))
                   (new (make-functional
-                        :kind :toplevel-xep
+                        :kind (functional-kind-attributes toplevel-xep)
                         :info (leaf-info lambda)
                         :%source-name (functional-%source-name ef)
                         :%debug-name (functional-%debug-name ef)
@@ -136,7 +140,7 @@ missing MAKE-LOAD-FORM methods?")
                   (closure (and
                             ;; It may have been deleted due to none of
                             ;; the optional entries reaching it.
-                            (neq (functional-kind main-entry) :deleted)
+                            (not (functional-kind-eq main-entry deleted))
                             (environment-closure (lambda-environment main-entry)))))
              (dolist (ref (leaf-refs lambda))
                (let ((ref-component (node-component ref)))
@@ -149,6 +153,6 @@ missing MAKE-LOAD-FORM methods?")
                         (push ref (leaf-refs new))
                         (setf (leaf-refs lambda)
                               (delq1 ref (leaf-refs lambda))))))))))
-        (:toplevel
+        (toplevel
          (setq res t))))
     res))

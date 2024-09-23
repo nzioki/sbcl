@@ -13,8 +13,8 @@
 (in-package "SB-C")
 
 ;;; A definite inconsistency has been detected. Signal an error.
-(declaim (ftype (function (string &rest t) (values)) barf))
 (defun barf (string &rest args)
+  (declare (string string))
   (apply #'bug string args))
 
 ;;; *SEEN-BLOCKS* is a hashtable with true values for all blocks which
@@ -29,8 +29,8 @@
 
 ;;; Barf if NODE is in a block which wasn't reached during the graph
 ;;; walk.
-(declaim (ftype (function (node) (values)) check-node-reached))
 (defun check-node-reached (node)
+  (declare (type node node))
   (unless (gethash (ctran-block (node-prev node)) *seen-blocks*)
     (barf "~S was not reached." node))
   (values))
@@ -45,8 +45,8 @@
 ;;; in hashtables. Next, we iterate over the blocks again, looking at
 ;;; the actual code and control flow. Finally, we scan the global leaf
 ;;; hashtables, looking for lossage.
-(declaim (ftype (function (list) (values)) check-ir1-consistency))
 (defun check-ir1-consistency (components &aux (ns *ir1-namespace*))
+  (declare (type list components))
   (let ((*seen-blocks* (make-hash-table :test 'eq))
         (*seen-funs* (make-hash-table :test 'eq)))
     (unwind-protect
@@ -89,6 +89,8 @@
            (maphash (lambda (k v)
                       (declare (ignore k))
                       (unless (or (eq v :deprecated)
+                                  (typep v '(cons (eql macro)))
+                                  (heap-alien-info-p v)
                                   (constant-p v)
                                   (and (global-var-p v)
                                        (member (global-var-kind v)
@@ -129,7 +131,7 @@
   (declare (type functional x))
   (when (gethash x *seen-funs*)
     (barf "~S was seen more than once." x))
-  (unless (eq (functional-kind x) :deleted)
+  (unless (functional-kind-eq x deleted)
     (setf (gethash x *seen-funs*) t)))
 
 ;;; Check that the specified function has been seen.
@@ -142,26 +144,26 @@
 ;;; In an OPTIONAL-DISPATCH, check that the entry points were seen. If
 ;;; the function is deleted, ignore it.
 (defun check-fun-stuff (functional)
-  (ecase (functional-kind functional)
-    (:external
+  (functional-kind-case functional
+    (external
      (let ((fun (functional-entry-fun functional)))
        (check-fun-reached fun functional)
-       (when (functional-kind fun)
+       (unless (functional-kind-eq fun nil)
          (barf "The function for XEP ~S has kind." functional))
        (unless (eq (functional-entry-fun fun) functional)
          (barf "bad back-pointer in function for XEP ~S" functional))))
-    ((:let :mv-let :assignment) ; i.e. SOMEWHAT-LETLIKE-P
+    ((let mv-let assignment)            ; i.e. SOMEWHAT-LETLIKE-P
      (check-fun-reached (lambda-home functional) functional)
      (when (functional-entry-fun functional)
        (barf "The LET ~S has entry function." functional))
      (unless (member functional (lambda-lets (lambda-home functional)))
        (barf "The LET ~S is not in LETs for HOME." functional))
-     (unless (eq (functional-kind functional) :assignment)
+     (unless (functional-kind-eq functional assignment)
        (when (rest (leaf-refs functional))
          (barf "The LET ~S has multiple references." functional)))
      (when (lambda-lets functional)
        (barf "LETs in a LET: ~S" functional)))
-    (:optional
+    (optional
      (when (functional-entry-fun functional)
        (barf ":OPTIONAL ~S has an ENTRY-FUN." functional))
      (let ((ef (lambda-optional-dispatch functional)))
@@ -174,27 +176,26 @@
                    (eq functional (optional-dispatch-main-entry ef)))
          (barf ":OPTIONAL ~S is not an e-p for its OPTIONAL-DISPATCH ~S."
                functional ef))))
-    (:toplevel
+    (toplevel
      (unless (eq (functional-entry-fun functional) functional)
        (barf "The ENTRY-FUN in ~S isn't a self-pointer." functional)))
-    ((nil :escape :cleanup)
+    ((nil escape cleanup)
      (let ((ef (functional-entry-fun functional)))
        (when ef
          (check-fun-reached ef functional)
-         (unless (eq (functional-kind ef) :external)
+         (unless (functional-kind-eq ef external)
            (barf "The ENTRY-FUN in ~S isn't an XEP: ~S." functional ef)))))
-    (:deleted
+    (deleted
      (return-from check-fun-stuff)))
 
-  (case (functional-kind functional)
-    ((nil :optional :external :toplevel :escape :cleanup)
-     (when (lambda-p functional)
-       (dolist (fun (lambda-lets functional))
-         (unless (eq (lambda-home fun) functional)
-           (barf "The home in ~S is not ~S." fun functional))
-         (check-fun-reached fun functional))
-       (unless (eq (lambda-home functional) functional)
-         (barf "home not self-pointer in ~S" functional)))))
+  (when (functional-kind-eq functional nil optional external toplevel escape cleanup)
+    (when (lambda-p functional)
+      (dolist (fun (lambda-lets functional))
+        (unless (eq (lambda-home fun) functional)
+          (barf "The home in ~S is not ~S." fun functional))
+        (check-fun-reached fun functional))
+      (unless (eq (lambda-home functional) functional)
+        (barf "home not self-pointer in ~S" functional))))
 
   (etypecase functional
     (clambda
@@ -224,7 +225,7 @@
     (dolist (new-fun (component-new-functionals c))
       (observe-functional new-fun))
     (dolist (fun (component-lambdas c))
-      (when (eq (functional-kind fun) :external)
+      (when (functional-kind-eq fun external)
         (let ((ef (functional-entry-fun fun)))
           (when (optional-dispatch-p ef)
             (observe-functional ef))))
@@ -236,7 +237,7 @@
     (dolist (new-fun (component-new-functionals c))
       (check-fun-stuff new-fun))
     (dolist (fun (component-lambdas c))
-      (when (eq (functional-kind fun) :deleted)
+      (when (functional-kind-eq fun deleted)
         (barf "deleted lambda ~S in Lambdas for ~S" fun c))
       (check-fun-stuff fun)
       (dolist (let (lambda-lets fun))
@@ -248,8 +249,8 @@
 ;;; and that all blocks in the loops are known blocks. We also mark each block
 ;;; that we see so that we can do a check later to detect blocks that weren't
 ;;; in any loop.
-(declaim (ftype (function (cloop (or cloop null)) (values)) check-loop-consistency))
 (defun check-loop-consistency (loop superior)
+  (declare (type cloop loop) (type (or cloop null) superior))
   (unless (eq (loop-superior loop) superior)
     (barf "wrong superior in ~S, should be ~S" loop superior))
   (when (and superior
@@ -277,8 +278,8 @@
   (values))
 
 ;;; Check that Block is either in Loop or an inferior.
-(declaim (ftype (function (cblock cloop) (values)) check-loop-block))
 (defun check-loop-block (block loop)
+  (declare (type cblock block) (type cloop loop))
   (unless (gethash block *seen-blocks*)
     (barf "unseen block ~S in loop info for ~S" block loop))
   (labels ((walk (l)
@@ -293,9 +294,8 @@
 ;;; Check a block for consistency at the general flow-graph level, and
 ;;; call CHECK-NODE-CONSISTENCY on each node to locally check for
 ;;; semantic consistency.
-(declaim (ftype (function (cblock) (values)) check-block-consistency))
 (defun check-block-consistency (block)
-
+  (declare (type cblock block))
   (dolist (pred (block-pred block))
     (unless (gethash pred *seen-blocks*)
       (barf "unseen predecessor ~S in ~S" pred block))
@@ -303,7 +303,7 @@
       (barf "bad predecessor link ~S in ~S" pred block)))
 
   (let* ((fun (block-home-lambda block))
-         (fun-deleted (eq (functional-kind fun) :deleted))
+         (fun-deleted (functional-kind-eq fun deleted))
          (this-ctran (block-start block))
          (last (block-last block)))
     (unless fun-deleted
@@ -364,8 +364,8 @@
 
 ;;; Check that BLOCK is properly terminated. Each successor must be
 ;;; accounted for by the type of the last node.
-(declaim (ftype (function (cblock) (values)) check-block-successors))
 (defun check-block-successors (block)
+  (declare (type cblock block))
   (let ((last (block-last block))
         (succ (block-succ block)))
 
@@ -390,7 +390,7 @@
        (unless (member (if-alternative last) succ)
          (barf "The ALTERNATIVE for ~S isn't in SUCC for ~S." last block)))
       (creturn
-       (unless (if (eq (functional-kind (return-lambda last)) :deleted)
+       (unless (if (functional-kind-eq (return-lambda last) deleted)
                    (null succ)
                    (and (= (length succ) 1)
                         (eq (first succ)
@@ -410,16 +410,13 @@
 
 ;;; Check that the DEST for LVAR is the specified NODE. We also mark
 ;;; the block LVAR is in as SEEN.
-#+nil(declaim (ftype (function (lvar node) (values)) check-dest))
 (defun check-dest (lvar node)
+  (declare (type lvar lvar) (type node node))
   (do-uses (use lvar)
     (unless (gethash (node-block use) *seen-blocks*)
       (barf "Node ~S using ~S is in an unknown block." use lvar)))
   (unless (eq (lvar-dest lvar) node)
     (barf "DEST for ~S should be ~S." lvar node))
-  (unless (find-uses lvar)
-    (barf "Lvar ~S has a destinatin, but no uses."
-          lvar))
   (values))
 
 ;;; This function deals with checking for consistency of the
@@ -430,7 +427,7 @@
     (ref
      (let ((leaf (ref-leaf node)))
        (when (functional-p leaf)
-         (if (eq (functional-kind leaf) :toplevel-xep)
+         (if (functional-kind-eq leaf toplevel-xep)
              (unless (component-toplevelish-p (block-component (node-block node)))
                (barf ":TOPLEVEL-XEP ref in non-top-level component: ~S"
                      node))
@@ -446,7 +443,7 @@
            (unless (lambda-p fun)
              (barf "function ~S in a local mv-combination ~S is not local"
                    fun node))
-           (unless (eq (functional-kind fun) :mv-let)
+           (unless (functional-kind-eq fun mv-let)
              (barf "function ~S in a local mv-combination ~S is not of kind :MV-LET"
                    fun node)))))
      (dolist (arg (basic-combination-args node))
@@ -482,6 +479,10 @@
      (check-dest (if-test node) node)
      (unless (eq (block-last (node-block node)) node)
        (barf "IF not at block end: ~S" node)))
+    (jump-table
+     (check-dest (jump-table-index node) node)
+     (unless (eq (block-last (node-block node)) node)
+       (barf "JUMP-TABLE not at block end: ~S" node)))
     (cset
      (check-dest (set-value node) node))
     (cast
@@ -504,6 +505,7 @@
        (let ((enclose (functional-enclose fun)))
          (unless (eq node enclose)
            (barf "~S is not the ENCLOSE for its FUN ~S." node enclose)))))
+    (cdynamic-extent)
     (exit
      (let ((entry (exit-entry node))
            (value (exit-value node)))
@@ -618,11 +620,17 @@
                      (if (template-conditional-p info) 0 (length rtypes))
                      (template-more-results-type info) "results")
       (check-tn-refs (vop-temps vop) vop t 0 t "temps")
-      (unless (= (+ (length (vop-codegen-info vop))
-                    (if (typep (template-result-types info) '(cons (eql :conditional)))
-                        -1
-                        0))
-                 (template-info-arg-count info))
+      (unless (or (= (length (vop-codegen-info vop))
+                     (+ (template-info-arg-count info)
+                        (if (vop-info-gc-barrier info)
+                            1
+                            0)))
+                  ;; Allow these 2 allocator vops to take an undeclared info arg
+                  (member (vop-info-name info) '(sb-vm::fixed-alloc sb-vm::var-alloc))
+                  ;; FIXME: The current representation for conditional
+                  ;; flag setting VOPs makes it difficult to check
+                  ;; agreement between declared and actual info args.
+                  (typep (template-result-types info) '(cons (eql :conditional))))
         (barf "wrong number of codegen info args in ~S" vop))))
   (values))
 
@@ -827,11 +835,11 @@
              (let ((tn (tn-ref-tn op))
                    (load-tn (tn-ref-load-tn op)))
                (unless (or (eq (tn-kind tn) :unused)
-                           (eq (svref (car scs)
-                                      (sc-number
-                                       (tn-sc
-                                        (or load-tn tn))))
-                               t))
+                           (typep (svref (car scs)
+                                         (sc-number
+                                          (tn-sc
+                                           (or load-tn tn))))
+                                  '(or (eql t) function)))
                  (barf "operand restriction not satisfied: ~S" op))))))
     (do-ir2-blocks (block component)
       (do ((vop (ir2-block-last-vop block) (vop-prev vop)))
@@ -925,14 +933,19 @@
      (format stream "~S {~A}" (leaf-debug-name leaf) (global-var-kind leaf)))
     (clambda
      (format stream "lambda ~@[~S ~]~:S"
-             (and (leaf-has-source-name-p leaf)
-                  (functional-debug-name leaf))
+             (if (leaf-has-source-name-p leaf)
+                 (leaf-source-name leaf)
+                 (functional-debug-name leaf))
              (mapcar #'leaf-debug-name (lambda-vars leaf))))
     (optional-dispatch
-     (format stream "optional-dispatch ~S" (mapcar #'leaf-debug-name (optional-dispatch-arglist leaf))))
+     (format stream "optional-dispatch ~a ~S"
+             (if (leaf-has-source-name-p leaf)
+                 (leaf-source-name leaf)
+                 (functional-debug-name leaf))
+             (mapcar #'leaf-debug-name (optional-dispatch-arglist leaf))))
     (functional
-     (case (functional-kind leaf)
-       (:toplevel-xep
+     (functional-kind-case leaf
+       (toplevel-xep
         (format stream "TL-XEP ~S" (entry-info-name (leaf-info leaf))))
        (t
         (format stream "~S ~S" (type-of leaf) (functional-debug-name leaf)))))))
@@ -940,7 +953,7 @@
 ;;; Attempt to find a block given some thing that has to do with it.
 (declaim (ftype (sfunction (t) cblock) block-or-lose))
 (defun block-or-lose (thing)
-  (ctypecase thing
+  (etypecase thing
     (cblock thing)
     (ir2-block (ir2-block-block thing))
     (vop (block-or-lose (vop-block thing)))
@@ -971,7 +984,9 @@
 (defun print-lvar-stack (stack &optional (stream *standard-output*))
   (loop for (lvar . rest) on stack
         do (format stream "~:[u~;d~]v~D~@[ ~]"
-                   (lvar-dynamic-extent lvar) (cont-num lvar) rest)))
+                   (eq (ir2-lvar-kind (lvar-info lvar)) :stack)
+                   (cont-num lvar)
+                   rest)))
 
 (defvar *debug-print-types* nil)
 (defvar *debug-print-vop-temps* nil)
@@ -986,6 +1001,10 @@
     (when (block-delete-p block)
       (format t " <deleted>"))
 
+    (pprint-newline :mandatory)
+    (let ((pred (block-pred block)))
+      (format t "predecessors~{ c~D~}~%"
+              (mapcar (lambda (x) (cont-num (block-start x))) pred)))
     (pprint-newline :mandatory)
     (when (block-start-cleanup block)
       (format t "cleanup ~s~%" (cleanup-kind (block-start-cleanup block))))
@@ -1008,7 +1027,9 @@
                      (if (node-tail-p node) "tail " "")
                      kind
                      (type-of node))
+             (format t "{~a " (combination-fun-debug-name node))
              (print-lvar (basic-combination-fun node))
+             (format t "} ")
              (dolist (arg (basic-combination-args node))
                (if arg
                    (print-lvar arg)
@@ -1024,32 +1045,24 @@
            (print-lvar (if-test node))
            (print-ctran (block-start (if-consequent node)))
            (print-ctran (block-start (if-alternative node))))
+          (jump-table
+           (write-string "jump-table ")
+           (print-lvar (jump-table-index node))
+           (loop for (index . target) in (jump-table-targets node)
+                 do (format t "~a>" index)
+                    (print-ctran (block-start target))))
           (bind
            (write-string "bind ")
            (print-leaf (bind-lambda node))
-           (when (functional-kind (bind-lambda node))
-             (format t " ~S ~S" :kind (functional-kind (bind-lambda node)))))
+           (unless (functional-kind-eq (bind-lambda node) nil)
+             (format t " ~S ~S" :kind (decode-functional-kind-attributes
+                                       (functional-kind (bind-lambda node))))))
           (creturn
            (write-string "return ")
            (print-lvar (return-result node))
            (print-leaf (return-lambda node)))
           (entry
-           (let ((cleanup (entry-cleanup node)))
-             (case (cleanup-kind cleanup)
-               ((:dynamic-extent)
-                (format t "entry DX~{ v~D~}"
-                        (mapcar (lambda (lvar-or-cell)
-                                  (typecase lvar-or-cell
-                                    (cons
-                                     (cons (car lvar-or-cell)
-                                           (cont-num (cdr lvar-or-cell))))
-                                    (enclose
-                                     lvar-or-cell)
-                                    (t
-                                     (cont-num lvar-or-cell))))
-                                (cleanup-nlx-info cleanup))))
-               (t
-                (format t "entry ~S" (entry-exits node))))))
+           (format t "entry ~S" (entry-exits node)))
           (exit
            (let ((value (exit-value node)))
              (cond (value
@@ -1072,16 +1085,20 @@
            (write-string "enclose ")
            (dolist (leaf (enclose-funs node))
              (print-leaf leaf)
-             (write-char #\space)
-             (let* ((entry-fun (functional-entry-fun leaf))
-                    (env (and entry-fun (lambda-environment entry-fun))))
-               (when env
-                 (write-string "{env:")
-                 (dolist (leaf (environment-closure env))
-                   (write-char #\space)
-                   (print-leaf leaf))
-                 (write-string "}")))
-             (write-char #\space))))
+             (when (lambda-p leaf)
+               (write-char #\space)
+               (let ((env (lambda-environment leaf)))
+                 (when env
+                   (write-string "{env:")
+                   (dolist (thing (environment-closure env))
+                     (write-char #\space)
+                     (etypecase thing
+                       (leaf (print-leaf thing))
+                       (nlx-info (princ thing))))
+                   (write-string "}"))))
+             (write-char #\space)))
+          (cdynamic-extent
+           (format t "dynamic extent ~S" (dynamic-extent-values node))))
         (when (and *debug-print-types*
                    (valued-node-p node))
           (write-char #\space)
@@ -1153,23 +1170,19 @@
       (princ #\}))
     (pprint-newline :linear)
     (when (vop-codegen-info vop)
-      (case (vop-name vop)
-       (multiway-branch-if-eq
-        (princ (vop-codegen-info vop)))
-       (t
-        (princ (%with-output-to-string (stream)
-                 ;; Current print depth varies based on whether PRINT-VOP
-                 ;; is called by DESCRIBE-IR2-COMPONENT or TRACE-INSTRUCTION,
-                 ;; so any fixed value of *PRINT-LEVEL* changes its effect
-                 ;; depending on the call context. Resetting depth to 0 seems
-                 ;; like the best way to get consistent output.
-                 ;; We shouldn't bind the printer limits to NIL, because
-                 ;; hairy internal objects such as ENVIRONMENT can be printed.
-                 ;; See also the comment above FUNCALL-WITH-DEBUG-IO-SYNTAX.
-                 (let (#-sb-xc-host (*current-level-in-print* 0)
-                       (*print-level* 2)
-                       (*print-length* 15))
-                   (format stream "{~{~S~^ ~}} " (vop-codegen-info vop)))))))
+      (princ (%with-output-to-string (stream)
+               ;; Current print depth varies based on whether PRINT-VOP
+               ;; is called by DESCRIBE-IR2-COMPONENT or TRACE-INSTRUCTION,
+               ;; so any fixed value of *PRINT-LEVEL* changes its effect
+               ;; depending on the call context. Resetting depth to 0 seems
+               ;; like the best way to get consistent output.
+               ;; We shouldn't bind the printer limits to NIL, because
+               ;; hairy internal objects such as ENVIRONMENT can be printed.
+               ;; See also the comment above FUNCALL-WITH-DEBUG-IO-SYNTAX.
+               (let (#-sb-xc-host (*current-level-in-print* 0)
+                     (*print-level* 2)
+                     (*print-length* 15))
+                 (format stream "{~{~S~^ ~}} " (vop-codegen-info vop)))))
       (pprint-newline :linear))
     (when (vop-results vop)
       (princ "=> ")
@@ -1437,9 +1450,55 @@ is replaced with replacement."
                        (format stream "~a -> ~a~a;~%"
                                (block-label block)
                                (block-label succ)
-                               attr)))
-            (when (nle-block-p block)
-              (format stream "~a -> ~a [style=dotted];~%"
-                      (block-label block)
-                      (block-label (nle-block-entry-block block))))))))
+                               attr)))))
+        (dolist (ep (block-succ (component-head component)))
+          (when (not (bind-p (block-start-node ep)))
+            (format stream "~a -> ~a [style=dotted];~%"
+                    (block-label ep)
+                    (block-label (node-block
+                                  (cleanup-mess-up
+                                   (block-start-cleanup ep)))))))))
     (write-line "}" stream)))
+
+(defun print-constraint (constraint &optional kind)
+  (let ((kind* (constraint-kind constraint)))
+    (when (or (not kind)
+              (eq kind* kind))
+      (flet ((f (x)
+               (cond ((lambda-var-p x)
+                      (leaf-source-name x))
+                     ((ctype-p x)
+                      (type-specifier x))
+                     (t x))))
+        (format t "   ~a~a ~a ~a~%" (if (eq kind* 'equality)
+                                        (format nil "~a ~a~@[ ~a~]" kind* (equality-constraint-operator constraint)
+                                                (when (/= (equality-constraint-amount constraint) 0)
+                                                  (equality-constraint-amount constraint)))
+                                        kind*)
+                (if (constraint-not-p constraint)
+                    " NOT"
+                    "")
+                (f (constraint-x constraint))
+                (f (constraint-y constraint)))))))
+
+(defun print-conset (conset &optional kind)
+  (do-conset-elements (con conset)
+    (print-constraint con kind)))
+
+(defun print-constraints (component &optional kind)
+  (do-blocks (block component)
+    (handler-case (progn
+                    (terpri)
+                    (terpri)
+                    ;(print-conset (block-in block) kind)
+                    (print-nodes block)
+                    (let ((last (block-last block)))
+                      (cond ((if-p last)
+                             (format t "  CONSEQ~%")
+                             (print-conset (if-consequent-constraints last) kind)
+                             (format t "  ALT~%")
+                             (print-conset (if-alternative-constraints last) kind))
+                            (t
+                             (print-conset (block-out block) kind)))))
+      (error (condition)
+        (format t "~&~A...~%" condition)))))

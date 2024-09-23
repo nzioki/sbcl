@@ -67,7 +67,8 @@
          (let ((fill-pointer (pretty-stream-buffer-fill-pointer stream)))
            (setf (schar (pretty-stream-buffer stream) fill-pointer) char)
            (setf (pretty-stream-buffer-fill-pointer stream)
-                 (1+ fill-pointer))))))
+                 (1+ fill-pointer)))))
+  char)
 
 (defun pretty-sout (stream string start end)
   (declare (type pretty-stream stream)
@@ -518,17 +519,20 @@
            (type newline until))
   (let* ((target (pretty-stream-target stream))
          (buffer (pretty-stream-buffer stream))
+         (buffer-significant-spaces (pretty-stream-buffer-significant-spaces stream))
          (kind (newline-kind until))
          (literal-p (eq kind :literal))
          (amount-to-consume (posn-index (newline-posn until) stream))
          (amount-to-print
           (if literal-p
               amount-to-consume
-              (let ((last-non-blank
-                     (position #\space buffer :end amount-to-consume
-                               :from-end t :test #'char/=)))
-                (if last-non-blank
-                    (1+ last-non-blank)
+              (let ((last-significant-char-pos
+                     (loop for pos downfrom (1- amount-to-consume) to 0
+                           if (or (char/= (char buffer pos) #\Space)
+                                  (member pos buffer-significant-spaces))
+                           do (return pos))))
+                (if last-significant-char-pos
+                    (1+ last-significant-char-pos)
                     0)))))
     (write-string buffer target :end amount-to-print)
     (let ((line-number (pretty-stream-line-number stream)))
@@ -573,6 +577,10 @@
                  :end1 prefix-len)
         (setf (pretty-stream-buffer-fill-pointer stream) new-fill-ptr)
         (incf (pretty-stream-buffer-offset stream) shift)
+        (when buffer-significant-spaces
+          (setf (pretty-stream-buffer-significant-spaces stream)
+                (remove-if #'minusp
+                           (mapcar (lambda (x) (- x shift)) buffer-significant-spaces))))
         (unless literal-p
           (setf (logical-block-section-column block) prefix-len)
           (setf (logical-block-section-start-line block) line-number))))))
@@ -771,7 +779,7 @@ line break."
   (or (and (eq (info :type :kind type-spec) :instance)
            (let ((layout (info :type :compiler-layout type-spec)))
              (and layout
-                  (let ((info (wrapper-info layout)))
+                  (let ((info (layout-info layout)))
                     (and info
                          (let ((pred (dd-predicate-name info)))
                            (and pred (fboundp pred)
@@ -800,8 +808,11 @@ line break."
   (let* ((orig (or table *initial-pprint-dispatch-table*))
          (new (make-pprint-dispatch-table (copy-seq (pp-dispatch-entries orig))
                                           (pp-dispatch-number-matchable-p orig)
-                                          (pp-dispatch-only-initial-entries orig))))
-    (hash-table-replace (pp-dispatch-cons-entries new) (pp-dispatch-cons-entries orig))
+                                          (pp-dispatch-only-initial-entries orig)))
+         (orig-cons-entries (pp-dispatch-cons-entries orig)))
+    (if (functionp orig-cons-entries)
+        (setf (pp-dispatch-cons-entries new) orig-cons-entries)
+        (hash-table-replace (pp-dispatch-cons-entries new) orig-cons-entries))
     new))
 
 (defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
@@ -831,8 +842,12 @@ line break."
           (when possibly-matchable
             (let ((cons-entry
                    (and (consp object)
-                        (sb-impl::gethash/eql (car object) (pp-dispatch-cons-entries table) nil))))
-              (cond ((not cons-entry) ; impossible, unless you've removed all initial cons entries
+                        (let ((mapping (pp-dispatch-cons-entries table))
+                              (key (car object)))
+                          (if (functionp mapping)
+                              (funcall mapping key)
+                              (sb-impl::gethash/eql-hash key mapping nil))))))
+              (cond ((not cons-entry)
                      (dovector (entry (pp-dispatch-entries table) nil)
                        (when (funcall (pprint-dispatch-entry-test-fn
                                        (truly-the pprint-dispatch-entry entry))
@@ -912,6 +927,27 @@ line break."
       (setf (pp-dispatch-number-matchable-p table) t))
     (if consp
         (let ((hashtable (pp-dispatch-cons-entries table)))
+          (when (functionp hashtable)
+            (let ((symbols)
+                  (ppd-v)
+                  (code (fun-code-header hashtable)))
+              (loop for i from sb-vm:code-constants-offset
+                    below (code-header-words code)
+                    do (let ((const (code-header-ref code i)))
+                         (when (simple-vector-p const)
+                           (typecase (aref const 0)
+                             (symbol
+                              (aver (not symbols))
+                              (setq symbols const))
+                             (pprint-dispatch-entry
+                              (aver (not ppd-v))
+                              (setq ppd-v const))))))
+              (let* ((n (length symbols))
+                     (new (make-hash-table :size (ceiling n 4/5) :test 'eql)))
+                (dotimes (i n)
+                  (setf (gethash (aref symbols i) new) (aref ppd-v i)))
+                (setf hashtable new
+                      (pp-dispatch-cons-entries table) new))))
           (dolist (key (member-type-members (cons-type-car-type ctype)))
             (if function
                 (setf (gethash key hashtable) entry)
@@ -1491,6 +1527,14 @@ line break."
   (with-pretty-stream (stream)
     (funcall fun stream object)))
 
+;;; Called to inform the pretty stream that a #\Space character just
+;;; written is significant even if it is at end-of-line.
+(defun note-significant-space (stream)
+  (declare (type stream stream))
+  (when (pretty-stream-p stream)
+    (push (1- (pretty-stream-buffer-fill-pointer stream))
+          (pretty-stream-buffer-significant-spaces stream))))
+
 ;;; Warm bootup is slightly less brittle if we can avoid first having to run
 ;;; the compiler to make the predicates for the initial PPD type specifiers.
 ;;; Factoring this out avoids retaining excess junk as part of the codeblob
@@ -1509,7 +1553,7 @@ line break."
            ;; adjust the computation of POSSIBLY-MATCHABLE in PPRINT-DISPATCH.
            ;; For identical priorities, we pick the first match, but that's technically
            ;; unspecified behavior because insertion isn't necessarily stable,
-           ;; thought it is in this implementation.
+           ;; though it is in this implementation.
            (entry '(and array (not (or string bit-vector))) 'pprint-array)
            (entry '(cons (and symbol (satisfies fboundp))) 'pprint-call-form)
            (entry 'cons 'pprint-fill 'consp)
@@ -1526,8 +1570,8 @@ line break."
   (setf *standard-pprint-dispatch-table* (make-pprint-dispatch-table #() nil nil))
   (setf *initial-pprint-dispatch-table* nil)
   (let* ((initial-entries (get-initial-ppd-entries))
-         (*print-pprint-dispatch*
-          (make-pprint-dispatch-table initial-entries nil nil)))
+         (ppd (make-pprint-dispatch-table initial-entries nil nil))
+         (*print-pprint-dispatch* ppd))
     ;; cons cells with interesting things for the car
     (/show0 "doing SET-PPRINT-DISPATCH for CONS with interesting CAR")
     (dolist (magic-form '((lambda pprint-lambda)
@@ -1582,8 +1626,12 @@ line break."
       (set-pprint-dispatch `(cons (member ,@(ensure-list (first magic-form))))
                            (second magic-form)
                            most-negative-single-float))
-    (setf (pp-dispatch-only-initial-entries *print-pprint-dispatch*) t
-          *initial-pprint-dispatch-table* *print-pprint-dispatch*))
+    ;; Convert CONS-ENTRIES to a perfect hash.
+    (let* ((alist (%hash-table-alist (pp-dispatch-cons-entries ppd)))
+           (f (compile nil `(lambda (x) (cdr (assoc x ',alist))))))
+      (setf (pp-dispatch-cons-entries ppd) f))
+    (setf (pp-dispatch-only-initial-entries ppd) t
+          *initial-pprint-dispatch-table* ppd))
 
   (setf *standard-pprint-dispatch-table*
         (copy-pprint-dispatch *initial-pprint-dispatch-table*))

@@ -64,27 +64,34 @@
 (define-load-time-global **primitive-object-layouts** nil)
 (declaim (type simple-vector **primitive-object-layouts**)))
 
+;;; Nothing can see element 1 of **PRIMITIVE-OBJECT-LAYOUTS** except the special case
+;;; in x86-64 LAYOUT-OF. How do we know that? Because any object header word which has
+;;; a 1 in its least-significant-byte represents a GC forwarding pointer, and would
+;;; indicate heap corruption if you could read said word from user code.
+(defconstant index-of-layout-for-null 1)
 #-sb-xc-host
 (!cold-init-forms
-
-;; This vector is allocated in immobile space when possible. There isn't
-;; a way to do that from lisp, so it's special-cased in genesis.
-#-immobile-space (setq **primitive-object-layouts** (make-array 256))
-;; If #+metaspace, we can't generally store layouts in heap objects except in
-;; the instance header, but this vector can because it too will go in metaspace.
+;; This vector is allocated into immobile fixedobj space if #+compact-instance-header.
+;; There isn't a way to do that from lisp, so it's special-cased in genesis.
+#-compact-instance-header (setq **primitive-object-layouts** (make-array 256))
 (map-into **primitive-object-layouts**
-          (lambda (name) (wrapper-friend (classoid-wrapper (find-classoid name))))
+          (lambda (name) (classoid-layout (find-classoid name)))
           #.(let ((table (make-array 256 :initial-element 'sb-kernel::random-class)))
               (dolist (x sb-kernel::*builtin-classoids*)
                 (destructuring-bind (name &key codes &allow-other-keys) x
                   (dolist (code codes)
                     (setf (svref table code) name))))
+              ;; widetag-of can return n-widetag-bits-long result for immediates/conses/functions.
               (loop for i from sb-vm:list-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
-                      below 256
+                    below 256
                     do (setf (aref table i) 'cons))
+              (loop for i from sb-vm:fun-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
+                    below 256
+                    do (setf (aref table i) 'function))
               (loop for i from sb-vm:even-fixnum-lowtag by (ash 1 sb-vm:n-fixnum-tag-bits)
-                      below 256
+                    below 256
                     do (setf (aref table i) 'fixnum))
+              (setf (aref table index-of-layout-for-null) 'null)
               table)))
 
 (!defun-from-collected-cold-init-forms !primordial-type-cold-init)

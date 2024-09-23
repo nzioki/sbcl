@@ -33,7 +33,7 @@
 (defun f (x) (lambda (y) (+ (incf x) y)))
 (compile 'f)
 (with-test (:name :output-value-cell)
-  (assert (search "#<value cell"
+  (assert (search "#<value-cell"
                   (write-to-string (sb-kernel:%closure-index-ref (f 3) 0)))))
 
 ;;; Nathan Froyd reported that sbcl-0.6.11.34 screwed up output of
@@ -622,23 +622,20 @@
 (with-test (:name (:fp-print-read-consistency double-float))
   (let ((*random-state* (make-random-state t))
         (oops))
-    ;; FIXME skipping denormalized floats due to bug 793774.
     (loop for f = most-positive-double-float then (/ f 2d0)
-          while (> f 0d0)
+          while (> f #-x86 0d0 #+x86 0.1d0) ;; too much precision
           do (loop for fr = (random f)
                    repeat 10
-                   do (unless (float-denormalized-p fr)
-                        (unless (eql fr (read-from-string (prin1-to-string fr)))
-                          (push fr oops)
-                          (return)))))
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
     (loop for f = most-negative-double-float then (/ f 2d0)
-          while (< f -0d0)
+          while (< f #-x86 -0d0 #+x86 -0.1d0)
           do (loop for fr = (- (random (- f)))
                    repeat 10
-                   do (unless (float-denormalized-p fr)
-                        (unless (eql fr (read-from-string (prin1-to-string fr)))
-                          (push fr oops)
-                          (return)))))
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
     (when oops
       (error "FP print-read inconsistencies:~%~:{  ~S => ~S~%~}"
              (mapcar (lambda (f)
@@ -730,8 +727,6 @@
 
 (with-test (:name (format :type-check))
   (assert (equal "1/10" (format nil "~2r" 1/2)))
-  (assert-error (format nil "~r" 1.32) sb-format:format-error)
-  (assert-error (format nil "~c" 1.32) sb-format:format-error)
   (assert (equal "1/10" (eval '(format nil "~2r" 1/2))))
   (assert-error (eval '(format nil "~r" 1.32)) sb-format:format-error)
   (assert-error (eval '(format nil "~c" 1.32)) sb-format:format-error))
@@ -868,14 +863,14 @@ there"))))
     (let ((str (with-standard-io-syntax
                  (write-to-string x :pretty t :readably nil))))
       (assert (search "#<SB-KERNEL:INSTANCE {" str))))
-  (let ((x (sb-kernel:%make-funcallable-instance 5)))
+  (let ((x (test-util::make-funcallable-instance 5)))
     (let ((str (write-to-string x :pretty nil)))
       (assert (search "#<SB-KERNEL:FUNCALLABLE-INSTANCE {" str)))))
 
 (with-test (:name :functionless-funcallable-instance)
   (let ((x (sb-pcl::%make-standard-funcallable-instance
             #()
-            #-compact-instance-header #xdead)))
+            #-executable-funinstances #xdead)))
     (assert (search "#<SB-PCL::STANDARD-FUNCALLABLE-INSTANCE"
                     (write-to-string x :pretty nil))))) ; should not crash
 

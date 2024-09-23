@@ -32,7 +32,10 @@
   (binding*  ((cons-region-p (or #+use-cons-region (eq type 'list)))
               ((region-base-tn field-offset)
                #-sb-thread
-               (values null-tn (- (if cons-region-p cons-region mixed-region) nil-value))
+               (values null-tn (- (if cons-region-p
+                                      cons-region-offset
+                                      mixed-region-offset)
+                                  nil-value-offset))
                #+sb-thread
                (values thread-base-tn
                        (ash (if cons-region-p thread-cons-tlab-slot thread-mixed-tlab-slot)
@@ -155,7 +158,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
@@ -198,12 +202,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst li result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (load-asm-rtn-addr result 'funcallable-instance-tramp)))
 
 (define-vop (fixed-alloc)
   (:args)

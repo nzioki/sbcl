@@ -4,17 +4,20 @@ set -e
 # Remove everything in directories which are only used for output.
 # In most cases, we can remove the directories, too.
 #
-# (We don't remove all the directories themselves for a stupid technical
-# reason: "gmake clean" in the src/runtime directory gets unhappy if the
-# output/ directory doesn't exist, because it tries to build Depends
-# before it cleans itself, and src/c-runtime/sbcl.h is a symlink into
-# the output/ directory, and it gets the gcc dependency processing gets
-# all confused trying to figure out a header file which is a symlink
-# into a directory which doesn't exist. We'd like to be able to run
-# this script (including "gmake clean" in the src/runtime directory)
-# several times in a row without failure.. so we leave the output/
-# directory in place.)
-rm -rf obj/* output/* src/runtime/genesis/ src/runtime/sbcl.mk
+# Preserving the skeletons of some directories might or might not not be relevant.
+rm -rf obj/* src/runtime/genesis/ src/runtime/sbcl.mk src/runtime/*.dSYM
+
+if [ -z "$SBCL_LEAVE_OUTPUT" ]
+then
+    rm -fr output/*
+else
+    for f in output/*; do
+        
+        if [ $f != output/ucd ]; then
+            rm -r $f
+        fi
+    done
+fi
 
 # Ensure that we know GNUMAKE.
 . ./find-gnumake.sh
@@ -36,13 +39,8 @@ done
 
 # Within all directories, remove things which don't look like source
 # files. Some explanations:
-#   (symlinks)
-#     are never in the sources, so must've been created
 #   sbcl
 #     the runtime environment, created by compiling C code
-#   sbcl.h
-#     information about Lisp code needed to build the runtime environment,
-#     created by running GENESIS
 #   Config, target
 #     architecture-dependent or OS-dependent symlinks
 #   core
@@ -76,9 +74,10 @@ find . \( \
         -name CVS -o \
         -name .hg -o \
         -name .git -o \
-        -name .svn \) -type d -prune -o \
+        -name .svn -o \
+        -name android-libs \) -type d -prune -o \
        \( \
-        -type l -o \
+        \( -type l -path ./src/runtime/\* \) -o \
         -name '*~' -o \
         -name '#*#' -o \
         -name '.#*' -o \
@@ -109,23 +108,10 @@ find . \( \
         -name 'test-status.lisp-expr' -o \
         -name 'last-random-state.lisp-expr' -o \
         -name 'test.log' -o \
-        -name 'whitespace-stamp' -o \
         -name 'a.out' -o \
         -name 'sbcl' -o \
-        -name 'sbcl.h' -o \
         -name 'ppc-linux-mcontext.h' -o \
         -name 'depend' -o \
         -name 'TAGS' -o \
         -name 'tags' -o \
-        -name 'local-target-features.lisp-expr' \) -print | \
-    if test -f .cleanignore; then
-        # Because this file deletes all symlinks, it prevents building
-        # in a tree of symlinks. Here's a low-tech workaround: have
-        # whatever tool creates your tree of symlinks enumerate
-        # relative paths to each one in a file called .cleanignore,
-        # and this script won't delete them. This .cleanignore file
-        # doesn't support any wildcards or comments.
-        awk 'BEGIN{while(getline <".cleanignore"!=0){ign["./" $0]=1}} ign[$0]!=1';
-    else
-        cat;
-    fi | xargs rm -fr
+        -name 'local-target-features.lisp-expr' \) -print | xargs rm -fr

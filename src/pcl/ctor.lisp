@@ -275,7 +275,7 @@
 
 (declaim (inline sxhash-symbol-or-class))
 (defun sxhash-symbol-or-class (x)
-  (cond ((symbolp x) (sxhash x))
+  (cond ((symbolp x) (symbol-hash x))
         ((std-instance-p x) (sb-impl::instance-sxhash x))
         ((fsc-instance-p x) (fsc-instance-hash x))
         (t
@@ -505,8 +505,7 @@
   (destructuring-bind (class-arg &rest args) (cdr form)
     (flet (;; Return the name of parameter number I of a constructor
            ;; function.
-           (parameter-name (i)
-             (pcl-format-symbol ".P~D." i))
+           (parameter-name (i) (pcl-symbolicate ".P" i "."))
            ;; Check if CLASS-ARG is a constant symbol.  Give up if
            ;; not.
            (constant-class-p ()
@@ -601,7 +600,7 @@
       ;; ...), because part of the deal is that those only happen from
       ;; FORCE-CACHE-FLUSHES, which create a new valid wrapper for the
       ;; class.  An invalid layout of T needs to be flushed, however.
-      (when (eq (wrapper-invalid (class-wrapper class)) t)
+      (when (eq (layout-invalid (class-wrapper class)) t)
         (%force-cache-flushes class))
       (setf (ctor-class ctor) class)
       (pushnew-in-ctors ctor class)
@@ -625,7 +624,7 @@
       ;; ...), because part of the deal is that those only happen from
       ;; FORCE-CACHE-FLUSHES, which create a new valid wrapper for the
       ;; class.  An invalid layout of T needs to be flushed, however.
-      (when (eq (wrapper-invalid (class-wrapper class)) t)
+      (when (eq (layout-invalid (class-wrapper class)) t)
         (%force-cache-flushes class))
       (setf (ctor-class ctor) class)
       (pushnew-in-ctors ctor class)
@@ -806,7 +805,7 @@
        `(lambda ,(make-ctor-parameter-list ctor)
          (declare #.*optimize-speed*)
          (block nil
-           (when (wrapper-invalid ,wrapper)
+           (when (layout-invalid ,wrapper)
              (install-initial-constructor ,ctor t)
              (return (funcall ,ctor ,@(make-ctor-parameter-list ctor))))
            ,(wrap-in-allocate-forms ctor body early-unbound-markers-p)))
@@ -819,7 +818,7 @@
     `(lambda ()
        (declare #.*optimize-speed*)
        (block nil
-         (when (wrapper-invalid ,wrapper)
+         (when (layout-invalid ,wrapper)
            (install-initial-constructor ,ctor t)
            (return (funcall ,ctor)))
          ,(wrap-in-allocate-forms ctor nil t)))))
@@ -840,7 +839,7 @@
     ;; but there aren't allocation vops that do that.
     (etypecase class
       (standard-class
-        `(let ((.slots. (make-array ,(wrapper-length wrapper)
+        `(let ((.slots. (make-array ,(layout-length wrapper)
                                     ,@(when early-unbound-markers-p
                                         '(:initial-element +slot-unbound+))))
                (.instance. (%new-instance ,wrapper (1+ sb-vm:instance-data-start))))
@@ -970,7 +969,7 @@
          (safe-p (ctor-safe-p ctor))
          (wrapper (class-wrapper class))
          (slot-vector
-          (make-array (wrapper-length wrapper) :initial-element nil))
+          (make-array (layout-length wrapper) :initial-element nil))
          (class-inits ())
          (default-inits ())
          (defaulting-initargs ())
@@ -996,8 +995,8 @@
                (unless (initializedp location)
                  (setf (aref slot-vector location)
                        (list kind val type slotd))))
-             (default-init-var-name (i) (pcl-format-symbol ".D~D." i))
-             (location-var-name (i) (pcl-format-symbol ".L~D." i)))
+             (default-init-var-name (i) (pcl-symbolicate ".D" i "."))
+             (location-var-name (i) (pcl-symbolicate ".L" i ".")))
       ;; Loop over supplied initargs and values and record which
       ;; instance and class slots they initialize.
       (loop for (key value) on initargs by #'cddr

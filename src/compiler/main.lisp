@@ -25,9 +25,6 @@
 
 (defvar *check-consistency* nil)
 
-;;; Set to NIL to disable loop analysis for register allocation.
-(defvar *loop-analyze* t)
-
 (defvar *compile-verbose* t
   "The default for the :VERBOSE argument to COMPILE-FILE.")
 (defvar *compile-print* nil
@@ -53,21 +50,13 @@
 ;;; identifiable compilation.
 (defvar *source-info* nil)
 
-;;; This is true if we are within a WITH-COMPILATION-UNIT form (which
-;;; normally causes nested uses to be no-ops).
-(defvar *in-compilation-unit* nil)
-
-;;; Count of the number of compilation units dynamically enclosed by
-;;; the current active WITH-COMPILATION-UNIT that were unwound out of.
-(defvar *aborted-compilation-unit-count*)
-
 ;;; Mumble conditional on *COMPILE-PROGRESS*.
 (defun maybe-mumble (&rest foo)
   (when *compile-progress*
     (apply #'compiler-mumble foo)))
 
 
-(deftype object () '(or fasl-output core-object null))
+(deftype object () '(or fasl-output #-sb-xc-host core-object null))
 
 (defvar *compile-object* nil)
 (declaim (type object *compile-object*))
@@ -174,22 +163,22 @@ Examples:
                  (*source-namestring*
                   (awhen (or source-namestring *source-namestring*)
                     (possibly-base-stringize it))))
-             (if (and *in-compilation-unit* (not override))
+             (if (and *compilation-unit* (not override))
                  ;; Inside another WITH-COMPILATION-UNIT, a WITH-COMPILATION-UNIT is
                  ;; ordinarily (unless OVERRIDE) basically a no-op.
                  (unwind-protect
                       (multiple-value-prog1 (funcall fn) (setf succeeded-p t))
                    (unless succeeded-p
-                     (incf *aborted-compilation-unit-count*)))
-                 (let ((*aborted-compilation-unit-count* 0)
-                       (*compiler-error-count* 0)
-                       (*compiler-warning-count* 0)
-                       (*compiler-style-warning-count* 0)
-                       (*compiler-note-count* 0)
-                       (*undefined-warnings* nil)
-                       *argument-mismatch-warnings*
-                       *methods-in-compilation-unit*
-                       (*in-compilation-unit* t))
+                     (incf (cu-aborted-count *compilation-unit*))))
+                 ;; (Were it not for UIOP+ASDF touching *undefined-warnings*, it should be an alist
+                 ;; of hash-tables, the alist keys denoting the KINDs of warnings and the
+                 ;; hash-table keys being the NAMEs that have been warned about of each KIND.
+                 ;; Currently NOTE-NAME-DEFINED takes time proportional to the number of warnings
+                 ;; issued, which may number in the hundredsd. Perhaps some trick with a SETF
+                 ;; function will work to convert between pretend and actual representation)
+                 (let ((*undefined-warnings* nil) ; UIOP both reads and writes this
+                       *argument-mismatch-warnings* ; bound in SIMPLE-EVAL-LOCALLY also
+                       (*compilation-unit* (make-compilation-unit)))
                    (handler-bind ((parse-unknown-type
                                     (lambda (c)
                                       (note-undefined-reference
@@ -198,7 +187,7 @@ Examples:
                      (unwind-protect
                           (multiple-value-prog1 (funcall fn) (setf succeeded-p t))
                        (unless succeeded-p
-                         (incf *aborted-compilation-unit-count*))
+                         (incf (cu-aborted-count *compilation-unit*)))
                        (summarize-compilation-unit (not succeeded-p)))))))))
     (if policy
         (let ((*policy* (process-optimize-decl policy (unless override *policy*)))
@@ -229,7 +218,7 @@ Examples:
 ;;; aborted by throwing out. ABORT-COUNT is the number of dynamically
 ;;; enclosed nested compilation units that were aborted.
 (defun summarize-compilation-unit (abort-p)
-  (let (summary)
+  (let ((cu *compilation-unit*) summary)
     (unless abort-p
       (let ((undefs (sort *undefined-warnings* #'string<
                           :key (lambda (x)
@@ -290,11 +279,11 @@ Examples:
                          more kind name))))))))))
 
     (unless (and (not abort-p)
-                 (zerop *aborted-compilation-unit-count*)
-                 (zerop *compiler-error-count*)
-                 (zerop *compiler-warning-count*)
-                 (zerop *compiler-style-warning-count*)
-                 (zerop *compiler-note-count*))
+                 (zerop (cu-aborted-count cu))
+                 (zerop (cu-error-count cu))
+                 (zerop (cu-warning-count cu))
+                 (zerop (cu-style-warning-count cu))
+                 (zerop (cu-note-count cu)))
       (fresh-line *error-output*)
       (pprint-logical-block (*error-output* nil :per-line-prefix "; ")
         (format *error-output* "~&compilation unit ~:[finished~;aborted~]"
@@ -310,11 +299,11 @@ Examples:
                                 ~[~:;~:*~&  caught ~W WARNING condition~:P~]~
                                 ~[~:;~:*~&  caught ~W STYLE-WARNING condition~:P~]~
                                 ~[~:;~:*~&  printed ~W note~:P~]"
-                *aborted-compilation-unit-count*
-                *compiler-error-count*
-                *compiler-warning-count*
-                *compiler-style-warning-count*
-                *compiler-note-count*))
+                (cu-aborted-count cu)
+                (cu-error-count cu)
+                (cu-warning-count cu)
+                (cu-style-warning-count cu)
+                (cu-note-count cu)))
       (terpri *error-output*)
       (force-output *error-output*))))
 
@@ -409,7 +398,8 @@ necessary, since type inference may take arbitrarily long to converge.")
   (event ir1-optimize-until-done)
   (let ((count 0)
         (cleared-reanalyze nil)
-        (fastp nil))
+        (fastp nil)
+        reoptimized)
     (loop
       (when (component-reanalyze component)
         (setf count 0
@@ -419,21 +409,15 @@ necessary, since type inference may take arbitrarily long to converge.")
       (setf (component-reoptimize component) nil)
       (ir1-optimize component fastp)
       (cond ((component-reoptimize component)
+             (setf reoptimized t)
              (incf count)
              (when (and (>= count *max-optimize-iterations*)
                         (not (component-reanalyze component))
                         (eq (component-reoptimize component) :maybe))
                (maybe-mumble "*")
-               (cond ((retry-delayed-ir1-transforms :optimize)
-                      (maybe-mumble "+")
-                      (setq count 0))
-                     (t
-                      (event ir1-optimize-maxed-out)
-                      (ir1-optimize-last-effort component)
-                      (return)))))
-            ((retry-delayed-ir1-transforms :optimize)
-             (setf count 0)
-             (maybe-mumble "+"))
+               (event ir1-optimize-maxed-out)
+               (ir1-optimize-last-effort component)
+               (return)))
             (t
              (return)))
       (when (setq fastp (>= count *max-optimize-iterations*))
@@ -441,8 +425,8 @@ necessary, since type inference may take arbitrarily long to converge.")
       (maybe-mumble (if fastp "-" ".")))
     (when cleared-reanalyze
       (setf (component-reanalyze component) t))
-    (maybe-mumble " "))
-  (values))
+    (maybe-mumble " ")
+    reoptimized))
 
 (defparameter *constraint-propagate* t)
 
@@ -455,36 +439,36 @@ necessary, since type inference may take arbitrarily long to converge.")
   (when (component-reanalyze component)
     (maybe-mumble "DFO")
     (loop
-      (find-dfo component)
+     (find-dfo component)
       (unless (component-reanalyze component)
         (maybe-mumble " ")
         (return))
-      (maybe-mumble ".")))
-  (values))
+      (maybe-mumble "."))
+    t))
 
 (defparameter *reoptimize-limit* 10)
 
 (defun ir1-optimize-phase-1 (component)
   (let ((loop-count 0)
-        (*constraint-propagate* *constraint-propagate*))
+        (constraint-propagate *constraint-propagate*)
+        reoptimized)
     (tagbody
      again
        (loop
-        (ir1-optimize-until-done component)
+        (setf reoptimized (ir1-optimize-until-done component))
         (cond ((or (component-new-functionals component)
                    (component-reanalyze-functionals component))
                (maybe-mumble "Locall ")
                (locall-analyze-component component))
               ((and (>= loop-count 1)
-                    (not (or (component-reoptimize component)
-                             (component-reanalyze component))))
+                    (not (component-reanalyze component))
+                    (not reoptimized))
                ;; Constraint propagation did something but that
                ;; information didn't lead to any new optimizations.
                ;; Don't run constraint-propagate again.
                (return)))
-        (eliminate-dead-code component)
         (dfo-as-needed component)
-        (when *constraint-propagate*
+        (when constraint-propagate
           (maybe-mumble "Constraint ")
           (constraint-propagate component)
           (when (retry-delayed-ir1-transforms :constraint)
@@ -507,7 +491,7 @@ necessary, since type inference may take arbitrarily long to converge.")
        ;; part, so avoid it.
        (when (retry-delayed-ir1-transforms :ir1-phases)
          (setf loop-count 0
-               *constraint-propagate* nil)
+               constraint-propagate nil)
          (go again)))))
 
 ;;; Do all the IR1 phases for a non-top-level component.
@@ -531,22 +515,6 @@ necessary, since type inference may take arbitrarily long to converge.")
   (ir1-finalize component)
   (values))
 
-;;; COMPILE-FILE usually puts all nontoplevel code in immobile space, but COMPILE
-;;; offers a choice. Because the immobile space GC does not run often enough (yet),
-;;; COMPILE usually places code in the dynamic space managed by our copying GC.
-;;; Change this variable if your application always demands immobile code.
-;;; In particular, ELF cores shrink the immobile code space down to just enough
-;;; to contain all code, plus about 1/2 MiB of spare, which means that you can't
-;;; subsequently compile a whole lot into immobile space.
-;;; The value is changed to :AUTO in make-target-2-load.lisp which supresses
-;;; codegen optimizations for immobile space, but nonetheless prefers to allocate
-;;; the code there, falling back to dynamic space if there is no room left.
-;;; These controls exist whether or not the immobile-space feature is present.
-(declaim (type (member :immobile :dynamic :auto) *compile-to-memory-space*)
-         (type (member :immobile :dynamic) *compile-file-to-memory-space*))
-(defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
-(defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
-
 #-immobile-code
 (defun component-mem-space (component)
   (component-%mem-space component))
@@ -555,6 +523,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (progn
   (defun component-mem-space (component)
     (or (component-%mem-space component)
+        #-sb-xc-host
         (setf (component-%mem-space component)
               (if (fasl-output-p *compile-object*)
                   (and (eq *compile-file-to-memory-space* :immobile)
@@ -567,10 +536,10 @@ necessary, since type inference may take arbitrarily long to converge.")
   (defun code-immobile-p (thing)
     #+sb-xc-host (declare (ignore thing)) #+sb-xc-host t
     #-sb-xc-host
-    (let ((component (typecase thing
+    (let ((component (etypecase thing
                        (vop  (node-component (vop-node thing)))
                        (node (node-component thing))
-                       (t    thing))))
+                       (component thing))))
       (eq (component-mem-space component) :immobile))))
 
 (defun %compile-component (component)
@@ -586,13 +555,8 @@ necessary, since type inference may take arbitrarily long to converge.")
   (report-code-deletion)
 
   (when (or (ir2-component-values-receivers (component-info component))
-            (component-dx-lvars component))
+            (ir2-component-stack-allocates-p (component-info component)))
     (maybe-mumble "Stack ")
-    ;; STACK only uses dominance information for DX LVAR back
-    ;; propagation (see BACK-PROPAGATE-ONE-DX-LVAR).
-    (when (component-dx-lvars component)
-      (clear-dominators component)
-      (find-dominators component))
     (stack-analyze component)
     ;; Assign BLOCK-NUMBER for any cleanup blocks introduced by
     ;; stack analysis. There shouldn't be any unreachable code after
@@ -701,9 +665,9 @@ necessary, since type inference may take arbitrarily long to converge.")
   (dolist (fun (component-lambdas component) (delete-component component))
     (when (functional-has-external-references-p fun)
       (return))
-    (case (functional-kind fun)
-      (:toplevel (return))
-      (:external
+    (functional-kind-case fun
+      (toplevel (return))
+      (external
        (unless (every (lambda (ref)
                         (eq (node-component ref) component))
                       (leaf-refs fun))
@@ -712,22 +676,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defvar *compile-component-hook* nil)
 
 (defun compile-component (component)
-
-  ;; miscellaneous sanity checks
-  ;;
-  ;; FIXME: These are basically pretty wimpy compared to the checks done
-  ;; by the old CHECK-IR1-CONSISTENCY code. It would be really nice to
-  ;; make those internal consistency checks work again and use them.
   (aver-live-component component)
-  (do-blocks (block component)
-    (aver (eql (block-component block) component)))
-  (dolist (lambda (component-lambdas component))
-    ;; sanity check to prevent weirdness from propagating insidiously as
-    ;; far from its root cause as it did in bug 138: Make sure that
-    ;; thing-to-COMPONENT links are consistent.
-    (aver (eql (lambda-component lambda) component))
-    (aver (eql (node-component (lambda-bind lambda)) component)))
-
   (let* ((*component-being-compiled* component))
 
     (when *compile-progress*
@@ -742,20 +691,20 @@ necessary, since type inference may take arbitrarily long to converge.")
 
     (ir1-phases component)
 
-    ;; This should happen at some point before ENVIRONMENT-ANALYZE,
-    ;; and after RECORD-COMPONENT-XREFS.  Beyond that, I haven't
-    ;; really thought things through.  -- AJB, 2014-Jun-08
-    (eliminate-dead-code component)
+    ;; KLUDGE: We should instead set COMPONENT-REOPTIMIZE to T
+    ;; whenever a REF gets deleted so that DFO-AS-NEEDED kicks in only
+    ;; when needed, and we don't need this call to do a final
+    ;; unreachable entry point scan.
+    (find-dfo component)
 
-    (when *loop-analyze*
-      (dfo-as-needed component)
-      (maybe-mumble "Dom ")
-      (find-dominators component)
-      (maybe-mumble "Loop ")
-      (loop-analyze component))
+    (dfo-as-needed component)
+    (maybe-mumble "Dom ")
+    (find-dominators component)
+    (maybe-mumble "Loop ")
+    (loop-analyze component)
 
     #|
-    (when (and *loop-analyze* *compiler-trace-output*)
+    (when *compiler-trace-output*
       (labels ((print-blocks (block)
                  (format *compiler-trace-output* "    ~A~%" block)
                  (when (block-loop-next block)
@@ -771,6 +720,8 @@ necessary, since type inference may take arbitrarily long to converge.")
     (maybe-mumble "Env ")
     (environment-analyze component)
     (dfo-as-needed component)
+
+    (delete-if-no-entries component)
 
     (if (eq (block-next (component-head component))
             (component-tail component))
@@ -836,11 +787,11 @@ necessary, since type inference may take arbitrarily long to converge.")
     (let ((ir1-namespace *ir1-namespace*))
       (clrhash (free-funs ir1-namespace))
       (clrhash (free-vars ir1-namespace))
-      ;; FIXME: It would make sense to clear these tables as well, but
-      ;; ARM64 relies on the constant for NIL to stay around in order to
-      ;; assign a wired TN to it, so we let people share it. Investigate a
-      ;; proper fix.
-      #+(or)
+      ;; FIXME: It would make sense to clear these tables on arm64 as
+      ;; well, but it relies on the constant for NIL to stay around in
+      ;; order to assign a wired TN to it. A possible fix is to give
+      ;; arm64 NULL-SC like on other platforms.
+      #-arm64
       (progn
         (clrhash (eql-constants ir1-namespace))
         (clrhash (similar-constants ir1-namespace))))))
@@ -861,7 +812,7 @@ necessary, since type inference may take arbitrarily long to converge.")
     (format t "~4TL~D: ~S~:[~; [closure]~]~%"
             (label-id (entry-info-offset entry))
             (entry-info-name entry)
-            (entry-info-closure-p entry)))
+            (entry-info-closure-tn entry)))
   (terpri)
   (pre-pack-tn-stats component *standard-output*)
   (terpri)
@@ -888,20 +839,10 @@ necessary, since type inference may take arbitrarily long to converge.")
                :subforms (if form-tracking-p (make-array 100 :fill-pointer 0 :adjustable t))
                :write-date (file-write-date file))))
 
-;; LOAD-AS-SOURCE uses this.
-(defun make-file-stream-source-info (file-stream)
-  (make-source-info
-   :file-info (make-file-info :truename (truename file-stream) ; FIXME: WHY USE TRUENAME???
-                              ;; This T-L-P has been around since at least 2011.
-                              ;; It's unclear why an LPN isn't good enough.
-                              :pathname (translate-logical-pathname file-stream)
-                              :external-format (stream-external-format file-stream)
-                              :write-date (file-write-date file-stream))))
-
 ;;; Return a SOURCE-INFO to describe the incremental compilation of FORM.
 (defun make-lisp-source-info (form &key parent)
   (make-source-info
-   :file-info (make-file-info :truename :lisp
+   :file-info (make-file-info :%truename :lisp
                               :forms (vector form)
                               :positions '#(0))
    :parent parent))
@@ -915,7 +856,8 @@ necessary, since type inference may take arbitrarily long to converge.")
             (finfo (source-info-file-info sinfo)
                    (source-info-file-info sinfo)))
            ((or (not (source-info-p (source-info-parent sinfo)))
-                (pathnamep (file-info-truename finfo)))
+                ;; :DEFER is as if satifsying PATHNAMEP
+                (typep (file-info-%truename finfo) '(or (eql :defer) pathname)))
             finfo))))
 
 ;;; If STREAM is present, return it, otherwise open a stream to the
@@ -950,7 +892,7 @@ necessary, since type inference may take arbitrarily long to converge.")
           ;; it seems to me that asking the stream for its name is expressly backwards]
           (setf *compile-file-pathname* (if *merge-pathnames* (pathname stream) pathname)
                 *compile-file-truename* (truename stream)
-                (file-info-truename file-info) *compile-file-truename*)
+                (file-info-%truename file-info) *compile-file-truename*)
           (when (file-info-subforms file-info)
             (setf (form-tracking-stream-observer stream)
                   (make-form-tracking-stream-observer file-info)))
@@ -977,8 +919,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;; a subtype of not-so-aptly-named INPUT-ERROR-IN-COMPILE-FILE.
 (defun %do-forms-from-info (function info condition-name)
   (declare (function function))
-  ; FIXME: why "could not stack-allocate" in a few call sites?
-  ; (declare (dynamic-extent function))
+  (declare (dynamic-extent function))
   (let* ((file-info (source-info-file-info info))
          (stream (get-source-stream info))
          (pos (file-position stream))
@@ -1171,24 +1112,6 @@ necessary, since type inference may take arbitrarily long to converge.")
                         situations)
           (intersection '(:load-toplevel load) situations)
           (intersection '(:execute eval) situations)))
-
-
-;;; utilities for extracting COMPONENTs of FUNCTIONALs
-(defun functional-components (f)
-  (declare (type functional f))
-  (etypecase f
-    (clambda (list (lambda-component f)))
-    (optional-dispatch (let ((result nil))
-                         (flet ((maybe-frob (maybe-clambda)
-                                  (when (and maybe-clambda
-                                             (promise-ready-p maybe-clambda))
-                                    (pushnew (lambda-component
-                                              (force maybe-clambda))
-                                             result))))
-                           (map nil #'maybe-frob (optional-dispatch-entry-points f))
-                           (maybe-frob (optional-dispatch-more-entry f))
-                           (maybe-frob (optional-dispatch-main-entry f)))
-                         result))))
 
 ;;; Print some noise about FORM if *COMPILE-PRINT* is true.
 (defun note-top-level-form (form)
@@ -1445,8 +1368,8 @@ necessary, since type inference may take arbitrarily long to converge.")
         ;; compiler data structures (see :IGNORE-IT), and to avoid
         ;; unnecessary top level lambda forcing.
         ((and (null creation-form) (null init-form))
-         (sb-fasl::dump-fop 'sb-fasl::fop-empty-list fasl)
-         (fasl-note-handle-for-constant constant (sb-fasl::dump-pop fasl) fasl)
+         (dump-fop 'fop-empty-list fasl)
+         (fasl-note-handle-for-constant constant (dump-pop fasl) fasl)
          nil)
         ((and
           ;; MAKE-LOAD-FORM-SAVING-SLOTS on the cross-compiler needs
@@ -1524,6 +1447,7 @@ necessary, since type inference may take arbitrarily long to converge.")
   (let ((object *compile-object*))
     (etypecase object
       (fasl-output (fasl-dump-toplevel-lambda-call tll object))
+      #-sb-xc-host
       (core-object (core-call-toplevel-lambda      tll object))
       (null))))
 
@@ -1590,16 +1514,13 @@ necessary, since type inference may take arbitrarily long to converge.")
   (locall-analyze-clambdas-until-done lambdas)
 
   (maybe-mumble "IDFO ")
-  (multiple-value-bind (components top-components hairy-top)
+  (multiple-value-bind (components top-components)
       (find-initial-dfo lambdas)
     (when *check-consistency*
       (maybe-mumble "[Check]~%")
       (check-ir1-consistency (append components top-components)))
 
     (let ((top-level-closure nil))
-      (dolist (component (append hairy-top top-components))
-        (when (pre-environment-analyze-top-level component)
-          (setq top-level-closure t)))
       (dolist (component components)
         (compile-component component)
         (when (replace-toplevel-xeps component)
@@ -1613,8 +1534,6 @@ necessary, since type inference may take arbitrarily long to converge.")
           (compile-load-time-value-lambda lambdas)
           (compile-toplevel-lambdas lambdas top-level-closure)))
 
-    (dolist (component components)
-      (clear-ir1-info component))
     (clear-ir1-namespace))
   (values))
 
@@ -1658,8 +1577,8 @@ necessary, since type inference may take arbitrarily long to converge.")
 
   (defun handle-condition-handler (condition)
     (let ((muffles (get-handled-conditions)))
-      (aver muffles) ; FIXME: looks redundant with "fell through"
-      (dolist (muffle muffles (bug "fell through"))
+      (aver muffles) ; FIXME: looks redundant with UNREACHABLE
+      (dolist (muffle muffles (sb-impl::unreachable))
         (destructuring-bind (type . restart-name) muffle
           (when (handle-p condition type)
             (awhen (find-restart restart-name condition)
@@ -1717,7 +1636,7 @@ necessary, since type inference may take arbitrarily long to converge.")
         (sb-impl::*eval-tlf-index* nil)
         (sb-impl::*eval-source-context* nil))
     (handler-case
-        (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
+        (handler-bind (((satisfies handle-condition-p) 'handle-condition-handler))
           (with-compilation-values
             (with-compilation-unit ()
               (fasl-dump-partial-source-info info *compile-object*)
@@ -1741,13 +1660,12 @@ necessary, since type inference may take arbitrarily long to converge.")
                       (null)))))
               (let ((code-coverage-records
                       (code-coverage-records (coverage-metadata *compilation*))))
-                  (unless (zerop (hash-table-count code-coverage-records))
-                    ;; Dump the code coverage records into the fasl.
-                    (sb-fasl::dump-code-coverage-records
-                     (namestring *compile-file-pathname*)
-                     (loop for k being each hash-key of code-coverage-records
-                           collect (cons k +code-coverage-unmarked+))
-                     *compile-object*)))
+                (unless (zerop (hash-table-count code-coverage-records))
+                  ;; Dump the code coverage records into the fasl.
+                  (dump-code-coverage-records
+                   (loop for k being each hash-key of code-coverage-records
+                         collect k)
+                   *compile-object*)))
                 nil)))
       ;; Some errors are sufficiently bewildering that we just fail
       ;; immediately, without trying to recover and compile more of
@@ -1763,21 +1681,23 @@ necessary, since type inference may take arbitrarily long to converge.")
        (values t t t)))))
 
 ;;; Return a pathname for the named file. The file must exist.
+(macrolet ((fast-probe-file (x)
+             #+sb-xc-host `(probe-file ,x)
+             #-sb-xc-host `(sb-impl::query-file-system ,x :existence nil)))
 (defun verify-source-file (pathname-designator)
   (let* ((pathname (pathname pathname-designator))
          (default-host (make-pathname :host (pathname-host pathname))))
-    (flet ((try-with-type (path type error-p)
+    (flet ((try-with-type (type)
              (let ((new (merge-pathnames
-                         path (make-pathname :type type
-                                             :defaults default-host))))
-               (if (probe-file new)
-                   new
-                   (and error-p (truename new))))))
-      (cond ((typep pathname 'logical-pathname)
-             (try-with-type pathname "LISP" t))
-            ((probe-file pathname) pathname)
-            ((try-with-type pathname "lisp"  nil))
-            ((try-with-type pathname "lisp"  t))))))
+                         pathname (make-pathname :type type :defaults default-host))))
+               ;; This is more efficient than always calling (TRUENAME NEW)
+               ;; because the truename isn't actually needed yet, if at all -
+               ;; the call merely forces a FILE-DOES-NOT-EXIST error.
+               (cond ((fast-probe-file new) new)
+                     (t (truename new))))))
+      (cond ((typep pathname 'logical-pathname) (try-with-type "LISP"))
+            ((fast-probe-file pathname) pathname)
+            ((try-with-type "lisp")))))))
 
 (defun elapsed-time-to-string (internal-time-delta)
   (multiple-value-bind (tsec remainder)
@@ -1817,20 +1737,15 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defglobal *compile-elapsed-time* 0) ; nanoseconds
 (defglobal *compile-file-elapsed-time* 0) ; nanoseconds
 (defun get-thread-virtual-time ()
-  #+(and linux (not sb-xc-host))
-  (multiple-value-bind (sec nsec)
-      (sb-unix::clock-gettime sb-unix:clock-thread-cputime-id)
-    (cons sec nsec))
-  #-(and linux (not sb-xc-host))
-  '(0 . 0))
+  #+(and linux (not sb-xc-host)) (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id)
+  #-(and linux (not sb-xc-host)) (values 0 0))
 
-(defun accumulate-compiler-time (symbol start)
-  (declare (ignorable symbol start))
+(defun accumulate-compiler-time (symbol start-sec start-nsec)
+  (declare (ignorable symbol start-sec start-nsec))
   #+(and linux (not sb-xc-host))
-  (destructuring-bind (sec-after . nsec-after) (get-thread-virtual-time)
-    (destructuring-bind (sec-before . nsec-before) start
-      (let* ((sec-diff (- sec-after sec-before))
-             (nsec-diff (- nsec-after nsec-before))
+  (multiple-value-bind (stop-sec stop-nsec) (get-thread-virtual-time)
+      (let* ((sec-diff (- stop-sec start-sec))
+             (nsec-diff (- stop-nsec start-nsec))
              (total-nsec-diff (+ (* sec-diff (* 1000 1000 1000))
                                  nsec-diff))
              (old (symbol-global-value symbol)))
@@ -1843,7 +1758,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                                   (cas (symbol-value symbol) old new)
                                   #+x86-64
                                   (%cas-symbol-global-value symbol old new)))
-                (return))))))))
+                (return)))))))
 
 ;;; Open some files and call SUB-COMPILE-FILE. If something unwinds
 ;;; out of the compile, then abort the writing of the output file, so
@@ -1913,14 +1828,15 @@ returning its filename.
   :EMIT-CFASL
      (Experimental). If true, outputs the toplevel compile-time effects
      of this file into a separate .cfasl file."
-  (let* ((output-file-pathname nil)
+  (binding*
+        ((output-file-pathname nil)
          (fasl-output nil)
          (cfasl-pathname nil)
          (cfasl-output nil)
          (abort-p t)
          (warnings-p nil)
          (failure-p t) ; T in case error keeps this from being set later
-         (clock-start (get-thread-virtual-time))
+         ((start-sec start-nsec) (get-thread-virtual-time))
          (input-pathname (verify-source-file input-file))
          (source-info
           (make-file-source-info input-pathname external-format
@@ -1980,7 +1896,7 @@ returning its filename.
       (when (and trace-file (not (streamp trace-file)))
         (close *compiler-trace-output*)))
 
-    (accumulate-compiler-time '*compile-file-elapsed-time* clock-start)
+    (accumulate-compiler-time '*compile-file-elapsed-time* start-sec start-nsec)
 
     ;; CLHS says that the first value is NIL if the "file could not
     ;; be created". We interpret this to mean "a valid fasl could not

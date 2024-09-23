@@ -15,7 +15,7 @@
 (with-test (:name :aprof-smoketest-struct
                   :skipped-on :darwin
             ;; reverse-engineering the allocation instructions fails but should not
-            :fails-on (not :immobile-space))
+            :fails-on (and (not :immobile-space) (not :mark-region-gc)))
   (let ((nbytes
          (sb-aprof:aprof-run
             (checked-compile
@@ -109,7 +109,7 @@ sb-vm::
   (declare (optimize sb-c::instrument-consing))
   (values (make-this-struct) (make-that-struct)))
 (compile 'make-structs)
-(with-test (:name :aprof-instance :skipped-on (not :immobile-space))
+(with-test (:name :aprof-instance :skipped-on (not :compact-instance-header))
   (let (seen-this seen-that)
     (dolist (line (split-string
                    (with-output-to-string (s)

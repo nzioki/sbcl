@@ -22,18 +22,18 @@
 (macrolet ((defbiggy ()
              `(defstruct biggy
                 ,@(loop for i from 1 to 64
-                        collect `(,(sb-int:symbolicate "SLOT" (write-to-string i))
+                        collect `(,(sb-int:symbolicate "SLOT" i)
                                   0 :type ,(if (= i 64) 'sb-ext:word t))))))
   (defbiggy))
 
 (macrolet ((def-100slots ()
              `(defstruct 100slots
                ,@(loop for i from 0 repeat 100
-                    collect `(,(sb-int:symbolicate "SLOT" (write-to-string i))
+                    collect `(,(sb-int:symbolicate "SLOT" i)
                               ,(format nil "This is ~D" i))))))
   (def-100slots))
 
-(assert (typep (sb-kernel:wrapper-bitmap
+(assert (typep (sb-kernel:layout-bitmap
                 (sb-kernel::find-layout 'biggy)) 'bignum))
 
 (defvar *x* nil)
@@ -60,14 +60,14 @@
 ;; Run it twice to make sure things really worked.
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:wrapper-bitmap
+      (*x* (sb-kernel:layout-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-1) (terpri)
 (force-output)
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:wrapper-bitmap
+      (*x* (sb-kernel:layout-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-2) (terpri)
@@ -99,7 +99,7 @@
   (c 'cee))                                      ;    13       9
 
 (defvar *afoo* (make-foo1))
-(assert (= (sb-kernel:wrapper-length (sb-kernel:wrapper-of *afoo*))
+(assert (= (sb-kernel:layout-length (sb-kernel:layout-of *afoo*))
            (sb-kernel:%instance-length *afoo*)))
 (with-test (:name :tagged-slot-iterator-macro)
   ;; on 32-bit, the logical length is 14, which means 15 words (with header),
@@ -165,7 +165,7 @@
 (macrolet ((def ()
              `(defstruct foo-lotsaslots
                 ,@(loop for i below 100 collect
-                        `(,(sb-int:symbolicate "S" (write-to-string i))
+                        `(,(sb-int:symbolicate "S" i)
                           0 :type ,(if (oddp i) 'sb-ext:word 't))))))
   (def))
 

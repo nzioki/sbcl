@@ -333,7 +333,7 @@
      (ctype-of-number x))
     (array
      ;; It is critical not to inquire of the host for the array's element type.
-     (let ((etype (specifier-type (sb-xc:array-element-type x))))
+     (let ((etype (specifier-type (array-element-type x))))
        (make-array-type (array-dimensions x)
                         ;; complexp relies on the host implementation,
                         ;; but in practice any array for which we need to
@@ -368,3 +368,12 @@
 (defun sb-pcl::class-has-a-forward-referenced-superclass-p (x)
   (declare (ignore x))
   nil)
+
+(defun non-null-symbol-p (x) (and x (symbolp x)))
+;; these two functions don't need to be fully general
+(defun pointerp (x)
+  (aver (or (symbolp x) (fixnump x)))
+  (symbolp x))
+;; Use of non-ASCII during build occurs no sooner than make-target-2,
+;; therefore _every_ character satisfies BASE-CHAR-P prior to that.
+#+sb-unicode (defun base-char-p (x) (characterp x))

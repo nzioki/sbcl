@@ -249,11 +249,6 @@
       (add-method generic-function new)
       new)))
 
-(define-condition find-method-length-mismatch
-    (reference-condition simple-error)
-  ()
-  (:default-initargs :references '((:ansi-cl :function find-method))))
-
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
                                   always-check-specializers)
@@ -387,8 +382,7 @@
   (gf-info-fast-mf-p (slot-value gf 'arg-info)))
 
 (defun add-to-weak-hashset (key set)
-  (with-system-mutex ((hashset-mutex set))
-    (hashset-insert set key)))
+  (hashset-insert-if-absent set key #'identity)) ; implicitly locks
 (defun remove-from-weak-hashset (key set)
   (with-system-mutex ((hashset-mutex set))
     (hashset-remove set key)))
@@ -502,9 +496,9 @@
 
 (defun compute-gf-ftype (name)
   (let ((gf (and (fboundp name) (fdefinition name)))
-        (methods-in-compilation-unit (and (boundp 'sb-c::*methods-in-compilation-unit*)
-                                          sb-c::*methods-in-compilation-unit*
-                                          (gethash name sb-c::*methods-in-compilation-unit*))))
+        (methods-in-compilation-unit (binding* ((cu sb-c::*compilation-unit* :exit-if-null)
+                                                (methods (sb-c::cu-methods cu) :exit-if-null))
+                                       (gethash name methods))))
     (cond ((generic-function-p gf)
            (let* ((ll (generic-function-lambda-list gf))
                   ;; If the GF has &REST without &KEY then we don't augment
@@ -923,9 +917,9 @@
                                    'get-accessor-method-function)))
                     ,optimized-std-fun)))
                 (wrappers
-                 (let ((wrappers (list (wrapper-of class)
+                 (let ((wrappers (list (layout-of class)
                                        (class-wrapper class)
-                                       (wrapper-of slotd))))
+                                       (layout-of slotd))))
                    (if (eq type 'writer)
                        (cons (class-wrapper *the-class-t*) wrappers)
                        wrappers)))
@@ -1287,11 +1281,6 @@
                                            (do-if t) (do-if nil))))))))))
       (do-column precedence methods ()))))
 
-(defun compute-secondary-dispatch-function (generic-function net &optional
-                                            method-alist wrappers)
-  (funcall (the function (compute-secondary-dispatch-function1 generic-function net))
-           method-alist wrappers))
-
 (defvar *eq-case-table-limit* 15)
 (defvar *case-table-limit* 10)
 
@@ -1391,7 +1380,9 @@
 (defun methods-converter (form generic-function)
   (cond ((and (consp form) (eq (car form) 'methods))
          (cons '.methods.
-               (get-effective-method-function1 generic-function (cadr form))))
+               ;; force to heap since the method list is stored in the %CACHE slot
+               (get-effective-method-function1 generic-function
+                                               (ensure-heap-list (cadr form)))))
         ((and (consp form) (eq (car form) 'unordered-methods))
          (default-secondary-dispatch-function generic-function))))
 
@@ -1417,13 +1408,13 @@
              (:assoc
               alist)
              (:hash-table
-              (let ((table (make-hash-table :test (if (car mp) 'eq 'eql))))
+              (let ((table (sb-vm:without-arena
+                            (make-hash-table :test (if (car mp) 'eq 'eql)))))
                 (dolist (k+m alist)
                   (setf (gethash (car k+m) table) (cdr k+m)))
                 table)))))))
 
-(defun compute-secondary-dispatch-function1 (generic-function net
-                                             &optional function-p)
+(defun compute-secondary-dispatch-function1 (generic-function net &optional function-p)
   (cond
    ((and (eq (car net) 'methods) (not function-p))
     (get-effective-method-function1 generic-function (cadr net)))
@@ -1688,7 +1679,7 @@
    gf (generic-function-encapsulations gf) (call-next-method)))
 
 (defmethod (setf class-name) (new-value class)
-  (let ((classoid (wrapper-classoid (class-wrapper class))))
+  (let ((classoid (layout-classoid (class-wrapper class))))
     (if (and new-value (symbolp new-value))
         (setf (classoid-name classoid) new-value)
         (setf (classoid-name classoid) nil)))

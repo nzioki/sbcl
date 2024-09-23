@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "os.h"
 #include "globals.h"
@@ -29,8 +29,9 @@ uword_t DYNAMIC_0_SPACE_START, DYNAMIC_1_SPACE_START;
 #else
 uword_t DYNAMIC_SPACE_START;
 #endif
-#ifndef LISP_FEATURE_DARWIN_JIT
 uword_t READ_ONLY_SPACE_START, READ_ONLY_SPACE_END;
+#ifdef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
+uword_t STATIC_SPACE_START, STATIC_SPACE_END;
 #endif
 
 uword_t asm_routines_start, asm_routines_end;
@@ -81,7 +82,7 @@ ensure_undefined_alien(void) {
     }
 }
 
-boolean allocate_hardwired_spaces(boolean hard_failp)
+bool allocate_hardwired_spaces(bool hard_failp)
 {
     struct {
         uword_t start;
@@ -90,7 +91,7 @@ boolean allocate_hardwired_spaces(boolean hard_failp)
     } preinit_spaces[] = {
         { READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE, READ_ONLY_CORE_SPACE_ID },
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
-        { ALIEN_LINKAGE_TABLE_SPACE_START, ALIEN_LINKAGE_TABLE_SPACE_SIZE, ALIEN_LINKAGE_TABLE_CORE_SPACE_ID },
+        { ALIEN_LINKAGE_SPACE_START, ALIEN_LINKAGE_SPACE_SIZE, ALIEN_LINKAGE_TABLE_CORE_SPACE_ID },
 #endif
         { STATIC_SPACE_START, STATIC_SPACE_SIZE, STATIC_CORE_SPACE_ID },
 #ifdef LISP_FEATURE_DARWIN_JIT
@@ -117,7 +118,7 @@ boolean allocate_hardwired_spaces(boolean hard_failp)
 }
 
 void
-allocate_lisp_dynamic_space(boolean did_preinit)
+allocate_lisp_dynamic_space(bool did_preinit)
 {
     // Small spaces can be allocated after large spaces are.
     // The above code is only utilized when heap relocation is disabled.

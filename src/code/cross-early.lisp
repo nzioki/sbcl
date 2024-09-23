@@ -11,8 +11,6 @@
 
 (in-package "SB-IMPL")
 
-(declaim (declaration truly-dynamic-extent))
-
 ;;; MAYBE-INLINE, FREEZE-TYPE, and block compilation declarations can be safely ignored
 ;;; (possibly at some cost in efficiency).
 (declaim (declaration freeze-type maybe-inline start-block end-block))
@@ -23,41 +21,86 @@
 
 (declaim (declaration explicit-check always-bound))
 
+(defmacro sb-xc:defconstant (&rest args)
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (cl:defconstant ,@args)))
+
 (defgeneric sb-xc:make-load-form (obj &optional env))
 
 ;;; Restore normalcy of MOD and RATIONAL as type specifiers.
 (deftype mod (n) `(integer 0 ,(1- n)))
 (deftype rational (&optional low high) `(cl:rational ,low ,high))
 
-;;; Target floating-point and COMPLEX number representation
-;;; is defined sufficiently early to avoid "undefined type" warnings.
+;;; To ensure that target numbers compare by EQL correctly under the
+;;; host's definition of EQL (so that we don't have to intercept it
+;;; and all else that uses EQL such as EQUAL, EQUALP and sequence
+;;; traversers etc), we enforce that EQL numbers are in fact EQ by
+;;; hash consing either on the bits for floats or on the real and
+;;; imaginary parts for complex numbers.
 (defstruct (target-num (:constructor nil)))
 (defstruct (float (:include target-num)
                   (:conc-name "FLONUM-")
-                  (:constructor %make-flonum (%bits format))
+                  (:constructor nil)
                   (:predicate floatp))
   ;; the bits are canonical as regards hash-consing
-  (%bits nil :type integer :read-only t)
-  ;; the numerical value is used for computation.
-  ;; values that might not be exposed in the host use a symbol instead.
-  (%value nil :type (or null cl:float (member :+infinity :-infinity :minus-zero)))
-  ;; SHORT-FLOAT and LONG-FLOAT are not choices here,
-  ;; since we're trying to exactly model the supported target float formats.
-  (format nil :type (member single-float double-float) :read-only t))
+  (bits (error "unspecified BITS") :type integer :read-only t))
+(defstruct (single-float (:include float
+                          (bits (error "unspecified %BITS") :type (signed-byte 32)))
+                         (:constructor %%make-single-float (bits))))
+
+(defmethod print-object ((obj single-float) stream)
+  (format stream "#.(MAKE-SINGLE-FLOAT #x~x)" (single-float-bits obj)))
+
+(defmethod cl:make-load-form ((obj single-float) &optional env)
+  (declare (ignore env))
+  `(make-single-float ,(single-float-bits obj)))
+
+(defvar *interned-single-floats* (make-hash-table))
+
+(defun make-single-float (bits)
+  (declare (type (signed-byte 32) bits))
+  (let ((table *interned-single-floats*))
+    (or (gethash bits table)
+        (setf (gethash bits table) (%%make-single-float bits)))))
+
+(defstruct (double-float (:include float
+                          (bits (error "unspecifier %BITS") :type (signed-byte 64)))
+                         (:constructor %%make-double-float (bits))))
+
+(defmethod print-object ((obj double-float) stream)
+  (format stream "#.(MAKE-DOUBLE-FLOAT #x~x #x~x)"
+          (double-float-high-bits obj)
+          (double-float-low-bits obj)))
+
+(defmethod cl:make-load-form ((obj double-float) &optional env)
+  (declare (ignore env))
+  `(%make-double-float ,(double-float-bits obj)))
+
+(defvar *interned-double-floats* (make-hash-table))
+
+;;; This is the preferred constructor for 64-bit machines
+(defun %make-double-float (bits)
+  (declare (type (signed-byte 64) bits))
+  (let ((table *interned-double-floats*))
+    (or (gethash bits table)
+        (setf (gethash bits table) (%%make-double-float bits)))))
+
+(defun make-double-float (hi lo)
+  (declare (type (signed-byte 32) hi)
+           (type (unsigned-byte 32) lo))
+  (%make-double-float (logior (ash hi 32) lo)))
+
+(defun double-float-low-bits (x)
+  (logand (double-float-bits x) #xffffffff))
+(defun double-float-high-bits (x)
+  (ash (double-float-bits x) -32))
 
 (deftype real () '(or cl:rational float))
 (declaim (inline realp))
 (defun realp (x) (cl:typep x 'real))
 
-(declaim (inline short-float-p single-float-p double-float-p long-float-p))
-(defun single-float-p (x) (and (floatp x) (eq (flonum-format x) 'single-float)))
-(defun double-float-p (x) (and (floatp x) (eq (flonum-format x) 'double-float)))
-(defun short-float-p  (x) (single-float-p x))
+(declaim (inline long-float-p))
 (defun long-float-p   (x) (double-float-p x))
-
-(deftype short-float  () '(satisfies short-float-p))
-(deftype single-float () '(satisfies single-float-p))
-(deftype double-float () '(satisfies double-float-p))
 (deftype long-float   () '(satisfies long-float-p))
 
 ;;; This is used not only for (COMPLEX FLOAT) but also (COMPLEX RATIONAL)
@@ -68,31 +111,173 @@
   (real nil :type real :read-only t)
   (imag nil :type real :read-only t))
 
+(defmethod print-object ((obj complexnum) stream)
+  (write-string "#C( " stream)
+  (prin1 (complexnum-real obj) stream)
+  (write-char #\Space stream)
+  (prin1 (complexnum-imag obj) stream)
+  (write-char #\) stream))
+
+(defmethod cl:make-load-form ((obj complexnum) &optional env)
+  (declare (ignore env))
+  `(complex ,(complexnum-real obj) ,(complexnum-imag obj)))
+
+;;; KLUDGE: this is more-or-less copied from sharpm,
+(defun sb-cold::read-target-complex (stream sub-char numarg)
+  (declare (ignore sub-char numarg))
+  (let ((cnum (read stream t nil t)))
+    (when *read-suppress* (return-from sb-cold::read-target-complex nil))
+    (if (and (listp cnum) (= (length cnum) 2))
+        (complex (car cnum) (cadr cnum))
+        (error "illegal complex number format: #C~S" cnum))))
+
+(defvar *interned-complex-numbers* (make-hash-table :test #'equal))
+
+;;; REAL and IMAG are either host integers (therefore EQL-comparable)
+;;; or if not, have already been made EQ-comparable by hashing.
+(defun complex (re im)
+  (if (or (and (floatp re) (eq (type-of re) (type-of im)))
+          (and (rationalp re) (rationalp im)))
+      (if (eql im 0)
+          re
+          (let ((table *interned-complex-numbers*)
+                (key (cons re im)))
+            (or (gethash key table)
+                (setf (gethash key table)
+                      (%make-complexnum re im)))))
+      (error "Won't make complex number from ~s ~s" re im)))
+
 (defun complex-single-float-p (x)
   (and (complexp x) (single-float-p (complexnum-real x))))
 (defun complex-double-float-p (x)
   (and (complexp x) (double-float-p (complexnum-real x))))
+(defun complex-float-p (x)
+  (and (complexp x) (floatp (complexnum-real x))))
 
 ;;; Unlike for type FLOAT, where we don't in practice need lists as specifiers,
 ;;; we do use (COMPLEX foo) specifiers all over the place. But this deftype
 ;;; need not be as complete as (def-type-translator complex).
 ;;; It's just enough to handle all cases parsed by the host.
 (deftype complex (&optional spec)
-  (cond ((member spec '(* real)) 'complexnum)
+  (cond ((member spec '(* rational real)) 'complexnum)
         ((eq spec 'single-float) '(satisfies complex-single-float-p))
         ((eq spec 'double-float) '(satisfies complex-double-float-p))
+        #+long-float
+        ((eq spec 'long-float) '(satisfies complex-long-float-p))
+        ((eq spec 'float) '(satisfies complex-float-p))
         (t (error "complex type specifier too complicated: ~s" spec))))
 
 (deftype number () '(or real complex))
 (declaim (inline numberp))
 (defun numberp (x) (cl:typep x 'number))
 
-;;; ZEROP is needer sooner than the rest of the cross-float. (Not sure why exactly)
-(declaim (inline zerop))
-(defun zerop (x) (if (rationalp x) (= x 0) (xfloat-zerop x)))
+(declaim (inline ratiop))
+(defun ratiop (x) (cl:typep x 'ratio))
 
-(defmethod cl:make-load-form ((self target-num) &optional env)
-  (declare (ignore env))
-  (if (complexp self)
-      `(complex ,(complexnum-real self) ,(complexnum-imag self))
-      `(make-flonum ,(flonum-%bits self) ',(flonum-format self))))
+(declaim (inline sequencep))
+(defun sequencep (x) (cl:typep x 'sequence))
+
+(declaim (inline zerop))
+(defun zerop (x) (if (rationalp x) (= x 0) (sb-xc:= x 0)))
+
+(declaim (inline minusp))
+(defun minusp (x) (if (rationalp x) (< x 0) (sb-xc:< x 0)))
+
+(declaim (inline expt))
+(defun expt (base power)
+  (if (and (rationalp base) (integerp power))
+      (cl:expt base power)
+      (xfloat-expt base power)))
+
+(macrolet ((define (name)
+             `(defun ,name (numerator denominator)
+                (declare (integer numerator denominator))
+                (cl:/ numerator denominator))))
+  (define %make-ratio))
+
+(declaim (inline bignum-ashift-left-fixnum))
+(defun bignum-ashift-left-fixnum (fixnum count)
+  (ash fixnum count))
+
+(macrolet ((define (name type)
+             `(progn
+                (declaim (inline ,name))
+                (defun ,name (bignum)
+                  (coerce bignum ',type)))))
+  (define bignum-to-single-float single-float)
+  (define bignum-to-double-float double-float))
+
+(macrolet ((define (name)
+             `(defun ,name (x exp)
+                (declare (ignore x exp))
+                (error "Unimplemented."))))
+  (define sb-kernel::scale-single-float-maybe-underflow)
+  (define sb-kernel::scale-single-float-maybe-overflow)
+  (define sb-kernel::scale-double-float-maybe-underflow)
+  (define sb-kernel::scale-double-float-maybe-overflow))
+
+(macrolet ((define (name float-fun)
+             `(progn
+                (declaim (inline ,name))
+                (defun ,name (number &optional (divisor 1))
+                  (if (and (rationalp number) (rationalp divisor))
+                      (,(intern (string name) "CL") number divisor)
+                      (,float-fun number divisor))))))
+  (define floor xfloat-floor)
+  (define ceiling xfloat-ceiling)
+  (define truncate xfloat-truncate)
+  (define round xfloat-round))
+
+(macrolet ((define (name float-fun)
+             `(progn
+                (declaim (inline ,name))
+                (defun ,name (number divisor)
+                  (if (and (rationalp number) (rationalp divisor))
+                      (,(intern (string name) "CL") number divisor)
+                      (,float-fun number divisor))))))
+  (define mod xfloat-mod)
+  (define rem xfloat-rem))
+
+(macrolet ((define (name float-fun)
+             `(progn
+                (declaim (inline ,name))
+                (defun ,name (x)
+                  (if (rationalp x)
+                      (,(intern (string name) "CL") x)
+                      (,float-fun x))))))
+  (define abs xfloat-abs)
+  (define signum xfloat-signum))
+
+(defmacro validate-args (&rest args)
+  `(when (or ,@(mapcar (lambda (arg) `(typep ,arg '(or cl:float cl:complex))) args))
+     (error "Unexpectedly got host float/complex args")))
+
+(defun coerce (object type)
+  ;; OBJECT is validated prior to testing the quick bail out case,
+  ;; because supposing that we accidentally got a host complex number
+  ;; or float, and we accidentally got CL:FLOAT or something else in
+  ;; CL as the type, NUMBER would return NIL because host floats do
+  ;; NOT satisfy "our" NUMBERP. But we want this to fail, not succeed.
+  (validate-args object)
+  (cond ((numberp object)
+         (xfloat-coerce object type))
+        ((and (or (arrayp object) (listp object))
+              (not (or (member type '(list vector simple-vector
+                                      simple-string simple-base-string))
+                       (equal type '(simple-array character (*))))))
+         ;; specializable array
+         (sb-xc:make-array (length object) :initial-contents object
+                           :element-type
+                           (ecase (car type)
+                             (simple-array
+                              (destructuring-bind (et &optional dims)
+                                  (cdr type)
+                                (assert (or (eql dims 1)
+                                            (equal dims '(*))))
+                                et))
+                             (vector
+                              (destructuring-bind (et)
+                                  (cdr type)
+                                et)))))
+        (t
+         (cl:coerce object type))))

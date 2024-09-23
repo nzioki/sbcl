@@ -11,6 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(with-test (:name :keyform-always-used)
+  (checked-compile '(lambda (x) (case x (t 'thing)))))
+
 (with-test (:name (case :duplicate-key :compile-time-warning))
  (loop
     for (expected kind . clauses) in
@@ -54,3 +57,23 @@
 
 (with-test (:name :duplicate-cases-load)
   (assert (load "case-test.lisp")))
+
+(with-test (:name :no-notes-e-failure)
+  (checked-compile '(lambda (x)
+                     (when (typep x 'sequence)
+                       (etypecase x
+                         (list 1)
+                         (sequence 10))))
+                   :allow-notes nil)
+  (checked-compile '(lambda (x)
+                     (when (typep x 'symbol)
+                       (ecase x
+                         (a 1)
+                         (2 10))))
+                   :allow-notes nil))
+
+(with-test (:name :duplicate-typecase)
+  (assert (nth-value 3
+                     (checked-compile '(lambda (x)
+                                        (typecase x (number 1) (integer 2)))
+                                      :allow-style-warnings t))))

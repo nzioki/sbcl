@@ -75,7 +75,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
@@ -111,17 +112,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst mov result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:temporary (:sc interior-reg) lip)
-  (:generator 1
-    (let ((fixup (gen-label)))
-      (inst load-from-label result lip fixup)
-      (assemble (:elsewhere)
-        (emit-label fixup)
-        (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine))))))
 
 (define-vop (fixed-alloc)
   (:args)

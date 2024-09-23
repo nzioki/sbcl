@@ -132,8 +132,6 @@ maintained."
 ;;;
 ;;; KLUDGE: Some functions (e.g. ANSI-STREAM-READ-LINE) use these variables
 ;;; directly, instead of indirecting through FAST-READ-CHAR.
-;;; When ANSI-STREAM-INPUT-CHAR-POS is non-null, we take care to update it,
-;;; but not for each character of input.
 (defmacro prepare-for-fast-read-char (stream &body forms)
   `(let* ((%frc-stream% ,stream)
           (%frc-method% (ansi-stream-in %frc-stream%))
@@ -151,10 +149,7 @@ maintained."
 ;;; If buffer refills occurred within FAST-READ-CHAR, the refill logic
 ;;; similarly scans the cin-buffer before placing anything new into it.
 (defmacro done-with-fast-read-char ()
-  `(progn
-     (when (ansi-stream-input-char-pos %frc-stream%)
-       (update-input-char-pos %frc-stream% %frc-index%))
-     (setf (ansi-stream-in-index %frc-stream%) %frc-index%)))
+  `(setf (ansi-stream-in-index %frc-stream%) %frc-index%))
 
 ;;; a macro with the same calling convention as READ-CHAR, to be used
 ;;; within the scope of a PREPARE-FOR-FAST-READ-CHAR.
@@ -164,7 +159,7 @@ maintained."
 (defmacro fast-read-char (&optional (eof-error-p t) (eof-value ()))
   (let ((result
          `(if (not %frc-buffer%)
-              (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value)
+              (values (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value))
               (block nil
                 (when (= %frc-index% +ansi-stream-in-buffer-length+)
                   (let ((index-or-nil
@@ -234,12 +229,12 @@ maintained."
                        &body body)
   ;; If the &REST arg never needs to be reified, this is slightly quicker
   ;; than using a DX list.
-  (let ((index (gensym "INDEX")))
+  (let ((index (or index-var (gensym "INDEX"))))
     `(let ((,index ,start))
+       (declare (index ,index))
        (loop
         (cond ((< (truly-the index ,index) (length ,rest-var))
-               (let ((,var (fast-&rest-nth ,index ,rest-var))
-                     ,@(if index-var `((,index-var ,index))))
+               (let ((,var (fast-&rest-nth ,index ,rest-var)))
                  ,@body)
                (incf ,index))
               (t

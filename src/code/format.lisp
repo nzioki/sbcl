@@ -24,7 +24,9 @@
 (defun-cached (tokenize-control-string
                :memoizer memoize
                :hash-bits 7
-               :hash-function #'pointer-hash)
+               :hash-function (lambda (string)
+                                (ash (get-lisp-obj-address string)
+                                     #.(- sb-vm:n-lowtag-bits))))
               ((string eq))
   (declare (simple-string string))
   (macrolet ((compute-it ()
@@ -329,8 +331,9 @@
 (defun %formatter (control-string &optional (arg-count 0) (need-retval t)
                    &aux (lambda-name
                          (logically-readonlyize
-                          (possibly-base-stringize
-                           (concatenate 'string "fmt$" control-string)))))
+                          (format nil "fmt$~36R"
+                                  (#+sb-xc-host %sxhash-simple-string
+                                   #-sb-xc-host sxhash control-string)))))
   ;; ARG-COUNT is supplied only when the use of this formatter is in a literal
   ;; call to FORMAT, in which case we can possibly elide &optional parsing.
   ;; But we can't in general, because FORMATTER may be called by users
@@ -454,12 +457,8 @@
         ,*default-format-error-control-string*
         ,(or offset *default-format-error-offset*))
       (let ((symbol
-             (without-package-locks
-                 (package-symbolicate
-                  #.(find-package "SB-FORMAT")
-                  "FORMAT-ARG"
-                  (write-to-string (incf *format-gensym-counter*)
-                                   :pretty nil :base 10 :radix nil)))))
+             (symbolicate! #.(find-package "SB-FORMAT")
+                           "FORMAT-ARG" (incf *format-gensym-counter*))))
         (push (cons symbol (or offset *default-format-error-offset*))
               *simple-args*)
         symbol)))
@@ -470,21 +469,19 @@
         (collect ((expander-bindings) (runtime-bindings))
           (dolist (spec specs)
             (destructuring-bind (var default) spec
-              (let ((symbol (gensym "FVAR")))
-                (expander-bindings
-                 `(,var ',symbol))
-                (runtime-bindings
-                 `(list ',symbol
-                   (let* ((param-and-offset (pop ,params))
-                          (offset (car param-and-offset))
-                          (param (cdr param-and-offset)))
-                     (case param
-                       (:arg `(or ,(expand-next-arg offset) ,,default))
-                       (:remaining
-                        (setf *only-simple-args* nil)
-                        '(length args))
-                       ((nil) ,default)
-                       (t param))))))))
+              (expander-bindings `(,var ',var))
+              (runtime-bindings
+               `(list ',var
+                 (let* ((param-and-offset (pop ,params))
+                        (offset (car param-and-offset))
+                        (param (cdr param-and-offset)))
+                   (case param
+                     (:arg `(or ,(expand-next-arg offset) ,,default))
+                     (:remaining
+                      (setf *only-simple-args* nil)
+                      '(length args))
+                     ((nil) ,default)
+                     (t param)))))))
           `(let ,(expander-bindings)
             `(let ,(list ,@(runtime-bindings))
               ,@(if ,params
@@ -501,10 +498,18 @@
 
 ;;;; format directive machinery
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun directive-handler-name (char suffix)
+    (package-symbolicate "SB-FORMAT"
+                         (if (char= char #\Newline) "NL" (string char))
+                         suffix)))
+
 (defmacro def-complex-format-directive (char lambda-list &body body)
-  (let ((defun-name (intern (format nil
-                                    "~:@(~:C~)-FORMAT-DIRECTIVE-EXPANDER"
-                                    char)))
+  ;; Assert that it isn't lowercase
+  (let ((code (sb-xc:char-code char)))
+    (when (<= (sb-xc:char-code #\a) code (sb-xc:char-code #\z))
+      (error "Come on, use uppercase why don't you?")))
+  (let ((defun-name (directive-handler-name char "-COMPILER"))
         (directive (gensym "DIRECTIVE"))
         (directives (if lambda-list (car (last lambda-list)) (gensym "DIRECTIVES"))))
     `(progn
@@ -517,7 +522,9 @@
                    ,@body))
                `((declare (ignore ,directive ,directives))
                  ,@body)))
-       (%set-format-directive-expander ,char #',defun-name))))
+       (setf (aref *format-directive-expanders* ,(sb-xc:char-code char))
+             #',defun-name)
+       ',defun-name)))
 
 (defmacro def-format-directive (char lambda-list &body body)
   (let ((directives (gensym "DIRECTIVES"))
@@ -533,11 +540,6 @@
        ,@declarations
        (values (progn ,@body-without-decls)
                ,directives))))
-
-(defun %set-format-directive-expander (char fn)
-  (let ((code (char-code (char-upcase char))))
-    (setf (aref *format-directive-expanders* code) fn))
-  char)
 
 (defun find-directive (directives kind stop-at-semi)
   (if directives
@@ -594,10 +596,7 @@
 (def-format-directive #\C (colonp atsignp params string end)
   (expand-bind-defaults () params
     (let ((n-arg (gensym "ARG")))
-      `(let ((,n-arg ,(expand-next-arg)))
-         (unless (typep ,n-arg 'character)
-           (format-error-at ,string ,(1- end)
-                            "~S is not of type CHARACTER." ,n-arg))
+      `(let ((,n-arg (the* (character :context (format ,string ,(1- end))) ,(expand-next-arg))))
          ,(cond (colonp
                  `(format-print-named-character ,n-arg stream))
                 (atsignp
@@ -626,9 +625,7 @@
         `(format-print-integer stream ,(expand-next-arg) ,colonp ,atsignp
                                ,base ,mincol ,padchar ,commachar
                                ,commainterval))
-      `(let ((*print-base* ,base)
-             (*print-radix* nil))
-         (princ ,(expand-next-arg) stream))))
+      `(format-integer ,(expand-next-arg) ,base stream)))
 
 (def-format-directive #\D (colonp atsignp params)
   (expand-format-integer 10 colonp atsignp params))
@@ -647,11 +644,16 @@
       ((base nil) (mincol 0) (padchar #\space) (commachar #\,)
        (commainterval 3))
       params
-    (let ((n-arg (gensym "ARG")))
-      `(let ((,n-arg ,(expand-next-arg)))
-         (unless (or ,base
-                     (integerp ,n-arg))
-           (format-error-at ,string ,(1- end) "~S is not of type INTEGER." ,n-arg))
+
+    (let ((n-arg (gensym "ARG"))
+          (expanded-arg (expand-next-arg)))
+      `(let ((,n-arg ,(if (car params)
+                          expanded-arg
+                          `(the* (integer :context (format ,string ,(1- end))) ,expanded-arg))))
+         ,@(if (car params)
+               `((unless (or ,base
+                             (integerp ,n-arg))
+                   (format-error-at ,string ,(1- end) "~S is not of type INTEGER." ,n-arg))))
          (if ,base
              (format-print-integer stream ,n-arg ,colonp ,atsignp
                                    ,base ,mincol
@@ -1109,9 +1111,9 @@
 ;;;; format directives and support functions for justification
 
 (defconstant-eqx !illegal-inside-justification
-  (mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
-          '("~:>" "~:@>"
-            "~:T" "~:@T"))
+    '#.(mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
+               '("~:>" "~:@>"
+                 "~:T" "~:@T"))
   #'equal)
 
 ;;; Reject ~W, ~_, ~I and certain other specific values of modifier+character.
@@ -1317,9 +1319,9 @@
                          ,@(expand-directive-list (pop segments))))
                  ,(expand-bind-defaults
                       ((extra 0)
-                       (line-len '(or (sb-impl::line-length stream) 72)))
+                       (line-length '(or (sb-impl::line-length stream) 72)))
                       (directive-params first-semi)
-                    `(setf extra-space ,extra line-len ,line-len))))
+                    `(setf extra-space ,extra line-len ,line-length))))
            ,@(mapcar (lambda (segment)
                        `(push (%with-output-to-string (stream)
                                 ,@(expand-directive-list segment))

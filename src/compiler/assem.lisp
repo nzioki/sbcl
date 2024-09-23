@@ -44,8 +44,7 @@
 ;;; the maximum alignment we can guarantee given the object format. If
 ;;; the loader only loads objects 8-byte aligned, we can't do any
 ;;; better than that ourselves.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant max-alignment 5))
+(defconstant max-alignment 5)
 
 (deftype alignment ()
   `(integer 0 ,max-alignment))
@@ -54,7 +53,9 @@
 ;;;; the SEGMENT structure
 
 ;;; This structure holds the state of the assembler.
-(defstruct (segment (:copier nil))
+(defstruct (segment (:constructor make-segment
+                        (&optional run-scheduler (header-skew 0)))
+                    (:copier nil))
   ;; This is a vector where instructions are written.
   ;; It used to be an adjustable array, but we now do the array size
   ;; management manually for performance reasons (as of 2006-05-13 hairy
@@ -139,16 +140,6 @@
   (collect-dynamic-statistics nil))
 (declaim (freeze-type segment))
 (defprinter (segment :identity t))
-
-;;; Record a FIXUP of KIND occurring at the current position in SEGMENT
-(defun sb-c:note-fixup (segment kind fixup)
-  (emit-back-patch
-   segment
-   0
-   (lambda (segment posn)
-     (push (sb-c:make-fixup-note kind fixup
-                                  (- posn (segment-header-skew segment)))
-           (segment-fixup-notes segment)))))
 
 (declaim (inline segment-current-index))
 (defun segment-current-index (segment)
@@ -317,7 +308,8 @@
 (defun section-start (section) (car section))
 (defmacro section-tail (section) `(cdr ,section))
 
-(defstruct asmstream
+(defstruct (asmstream (:constructor make-asmstream ())
+                      (:copier nil))
   (data-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
@@ -349,7 +341,7 @@
   ;; Convert the label positions to a packed integer
   ;; Utilize PACK-CODE-FIXUP-LOCS to perform compression.
   (awhen (mapcar 'label-posn (asmstream-alloc-points asmstream))
-    (sb-c:pack-code-fixup-locs it nil nil)))
+    (sb-c:pack-code-fixup-locs it)))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)
@@ -425,29 +417,56 @@
 ;;; or current segment (if machine-encoding). Use ASSEMBLE to change it.
 (defvar *current-destination*)
 
-(defmacro assemble ((&optional dest vop &key labels) &body body
-                    &environment env)
+;;; This formerly had some absolutely bizarre behavior regarding a manually-specified
+;;; list of labels. It was so confusing that I couldn't figure out either what it was
+;;; designed to do, or what it did do, because they certainly weren't the same thing.
+;;; My best guess is that if you needed labels which were not directly at the "spine"
+;;; of the ASSEMBLE form, but nested within, you could force it to call GEN-LABEL
+;;; for you, which is no different from calling GEN-LABEL _outside_ of the ASSEMBLE.
+;;; (Which most people do anyway if they need to)
+;;; But in anything more than a straightfoward usage, the expansion could be wrong.
+;;; For example this fragment calls EMIT-LABEL on the same label instance twice:
+#|
+ (sb-cltl2:macroexpand-all
+  '(assemble ()
+     B
+     (assemble (nil nil :labels (foo))
+       (inst pop rax-tn)
+       B
+       (assemble ()
+         B
+         (wat)))))
+=>
+(LET* ((B (GEN-LABEL)))
+  (SYMBOL-MACROLET ()
+    (EMIT-LABEL B)
+    (LET* ((B (GEN-LABEL)) (FOO (GEN-LABEL)))
+      (SYMBOL-MACROLET ((SB-ASSEM::..INHERITED-LABELS.. (B)))
+        (INST* 'POP RAX-TN)
+        (EMIT-LABEL B)
+        (LET* ()
+          (SYMBOL-MACROLET ((SB-ASSEM::..INHERITED-LABELS.. NIL))
+            (EMIT-LABEL B)
+            (WAT)))))))
+|#
+
+(defmacro assemble ((&optional dest vop) &body body &environment env)
   "Execute BODY (as a progn) with DEST as the current section or segment."
-  (flet ((label-name-p (thing)
-           (and thing (symbolp thing))))
-    (let* ((visible-labels (remove-if-not #'label-name-p body))
-           (inherited-labels
-             (multiple-value-bind (expansion expanded)
-                 (#+sb-xc-host cl:macroexpand
-                  #-sb-xc-host %macroexpand '..inherited-labels.. env)
-               (if expanded (copy-list expansion) nil)))
-           (new-labels
-             (sort (append labels
-                           (set-difference visible-labels
-                                           inherited-labels))
-                   #'string<))
-           (nested-labels
-             (sort (set-difference (append inherited-labels new-labels)
-                                   visible-labels)
-                   #'string<)))
-      (when (intersection labels inherited-labels)
-        (error "duplicate nested labels: ~S"
-               (intersection labels inherited-labels)))
+  (flet ((label-name-p (thing) (typep thing '(and symbol (not null)))))
+    (let ((inherited (multiple-value-bind (expansion expanded)
+                         (#+sb-xc-host cl:macroexpand-1
+                          #-sb-xc-host %macroexpand-1 '..inherited-labels.. env)
+                       (if expanded expansion)))
+          (new-labels (sort (copy-list (remove-if-not #'label-name-p body)) #'string<)))
+      ;; Compare for dups using STRING=. Two reasons to use that rather than EQ:
+      ;; (1) the assembler input is generally string-like - consider that instruction
+      ;;     mnemonics are looked up by string even though written as symbols.
+      ;; (2) the above SORT could yield an unpredictable result across build hosts
+      (unless (= (length (remove-duplicates new-labels :test #'string=))
+                 (length new-labels))
+        (error "Repeated labels in ASSEMBLE body"))
+      (awhen (intersection inherited new-labels)
+        (style-warn "Shadowed asm labels ~S should be renamed not to conflict" it))
       `(let* (,@(when dest
                   `((*current-destination*
                      ,(case dest
@@ -455,11 +474,9 @@
                         (:elsewhere '(asmstream-elsewhere-section *asmstream*))
                         (t dest)))))
               ,@(when vop `((*current-vop* ,vop)))
-              ,@(mapcar (lambda (name)
-                          `(,name (gen-label)))
+              ,@(mapcar (lambda (name) `(,name (gen-label)))
                         new-labels))
-         (symbol-macrolet (,@(when (or inherited-labels nested-labels)
-                               `((..inherited-labels.. ,nested-labels))))
+         (symbol-macrolet ((..inherited-labels.. ,(append inherited new-labels)))
            ,@(mapcar (lambda (form)
                        (if (label-name-p form)
                            `(emit-label ,form)
@@ -1493,21 +1510,21 @@
   (finalize-segment segment))
 
 ;;; The interface to %ASSEMBLE
-(defun assemble-sections (asmstream simple-fun-labels segment)
-  (let* ((n-entries (length simple-fun-labels))
+(defun assemble-sections (asmstream entries segment)
+  (let* ((n-entries (length entries))
          (trailer-len (* (+ n-entries 1) 4))
          (end-text (gen-label))
          (combined
            (append-sections
-             (append-sections (asmstream-data-section asmstream)
-                              (asmstream-code-section asmstream))
-             (let ((section (asmstream-elsewhere-section asmstream)))
-               (emit section
-                     end-text
-                     `(.align 2)
-                     `(.skip ,trailer-len)
-                     `(.align ,sb-vm:n-lowtag-bits))
-               section)))
+            (append-sections (asmstream-data-section asmstream)
+                             (asmstream-code-section asmstream))
+            (let ((section (asmstream-elsewhere-section asmstream)))
+              (emit section
+                    end-text
+                    `(.align 2)
+                    `(.skip ,trailer-len)
+                    `(.align ,sb-vm:n-lowtag-bits))
+              section)))
          (fun-offsets)
          (octets (segment-buffer (%assemble segment combined)))
          (index (length octets)))
@@ -1544,8 +1561,8 @@
         ;;  ... simple-fun-2 | simple-fun-1 | simple-fun-0
         ;; And because we use PUSH, we collect them in forward order
         ;; which is the correct thing to return.
-        (dolist (label simple-fun-labels)
-          (let ((val (label-position label)))
+        (dolist (entry entries)
+          (let ((val (label-position (sb-c::entry-info-offset entry))))
             (push val fun-offsets)
             (setf (sap-ref-32 sap index) val)
             (incf index 4)))))
@@ -1715,21 +1732,28 @@
                                  total-bits assembly-unit-bits))
                         quo))
            (bytes (make-array num-bytes :initial-element nil))
-           (segment-arg (gensym "SEGMENT-")))
+           (segment-arg '#:segment))
       (dolist (byte-spec-expr byte-specs)
         (let* ((byte-spec (eval byte-spec-expr))
                (byte-size (byte-size byte-spec))
                (byte-posn (byte-position byte-spec))
-               (arg (gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))))
+               ;; if exactly one arg, then it is named literally #:integer
+               (arg (if (cdr byte-specs)
+                        (gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))
+                        '#:integer)))
           (when (ldb-test (byte byte-size byte-posn) overall-mask)
             (error "The byte spec ~S either overlaps another byte spec, or ~
                     extends past the end."
                    byte-spec-expr))
           (setf (ldb byte-spec overall-mask) -1)
           (arg-names arg)
-          (arg-types `(type (integer ,(ash -1 (1- byte-size))
-                                     ,(1- (ash 1 byte-size)))
-                            ,arg))
+          (arg-types
+           ;; the two arms of the IF are equivalent,
+           ;; but literal integers get ugly beyond a certain point.
+           (let ((spec (if (<= byte-size 16)
+                           `(integer ,(ash -1 (1- byte-size)) ,(1- (ash 1 byte-size)))
+                           `(or (signed-byte ,byte-size) (unsigned-byte ,byte-size)))))
+             `(type ,spec ,arg)))
           (multiple-value-bind (start-byte offset)
               (floor byte-posn assembly-unit-bits)
             (let ((end-byte (floor (1- (+ byte-posn byte-size))
@@ -1772,6 +1796,10 @@
                           (svref bytes end-byte))))))))))
       (unless (= overall-mask -1)
         (error "There are holes."))
+      ;; Note: the way this would typically be done efficiently
+      ;; (at least in the target) for 2 or 4 bytes is to first ensure
+      ;; adequate buffer space followed by exactly 1 store.
+      ;; For portability we have to split octets apart by hand.
       (let ((forms nil))
         (dotimes (i num-bytes)
           (let ((pieces (svref bytes i)))
@@ -2029,4 +2057,17 @@
                       (setq next (stmt-prev new-next)
                             any-changes t)
                       (return)))))))))
-      (unless any-changes (return)))))
+      (unless any-changes (return))))
+  #+x86-64
+  ;; Build the label -> stmt map
+  (let ((label->stmt (make-hash-table)))
+    (do ((stmt (section-start section) (stmt-next stmt)))
+        ((null stmt))
+      (dolist (label (ensure-list (stmt-labels stmt)))
+        (aver (not (gethash label label->stmt)))
+        (setf (gethash label label->stmt) stmt)))
+    (perform-jump-to-jump-elimination (section-start section) label->stmt)))
+
+;; Remove macros that users should not invoke
+(push '("SB-ASSEM" define-instruction define-instruction-macro)
+      *!removable-symbols*)

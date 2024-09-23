@@ -16,14 +16,13 @@
 ;;; to CALL-WITH-FOO less ugly.
 (defmacro dx-flet (functions &body forms)
   `(flet ,functions
-     (declare (#+sb-xc-host dynamic-extent #-sb-xc-host truly-dynamic-extent
-               ,@(mapcar (lambda (func) `#',(car func)) functions)))
+     (declare (dynamic-extent ,@(mapcar (lambda (func) `#',(car func)) functions)))
      ,@forms))
 
 ;;; Another similar one.
 (defmacro dx-let (bindings &body forms)
   `(let ,bindings
-     (declare (#+sb-xc-host dynamic-extent #-sb-xc-host truly-dynamic-extent
+     (declare (dynamic-extent
                ,@(mapcar (lambda (bind) (if (listp bind) (car bind) bind))
                          bindings)))
      ,@forms))
@@ -55,12 +54,11 @@
 ;;; Incidentally, this is essentially the same operator which
 ;;; _On Lisp_ calls WITH-GENSYMS.
 (defmacro with-unique-names (symbols &body body)
-  (declare (notinline every)) ; because we can't inline ALPHA-CHAR-P
   `(let ,(mapcar (lambda (symbol)
                    (let* ((symbol-name (symbol-name symbol))
-                          (stem (if (every #'alpha-char-p symbol-name)
-                                    symbol-name
-                                    (string (gensymify* symbol-name "-")))))
+                          (stem (if (find #\- symbol-name)
+                                    (string (gensymify* symbol-name "-"))
+                                    symbol-name)))
                      `(,symbol (gensym ,stem))))
                  symbols)
      ,@body))
@@ -95,15 +93,17 @@
       (gensym (symbol-name x))
       (gensym)))
 
-(eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
-(labels ((symbol-concat (package &rest things)
+(labels ((symbol-concat (package ignore-lock &rest things)
            (dx-let ((strings (make-array (length things)))
                     (length 0)
                     (only-base-chars t))
              ;; This loop is nearly like DO-REST-ARG
              ;; but it works on the host too.
              (loop for index from 0 below (length things)
-                   do (let* ((s (string (nth index things)))
+                   do (let* ((thing (nth index things))
+                             (s (if (integerp thing)
+                                    (write-to-string thing :base 10 :radix nil :pretty nil)
+                                    (string thing)))
                              (l (length s)))
                         (setf (svref strings index) s)
                         (incf length l)
@@ -123,7 +123,8 @@
                  (setq name (make-array length :element-type elt-type)))
                (dotimes (index (length things)
                                (if package
-                                   (values (%intern name length package elt-type nil))
+                                   (values (%intern name length package elt-type
+                                                    ignore-lock))
                                    (make-symbol name)))
                  (let ((s (svref strings index)))
                    (replace name s :start1 start)
@@ -136,19 +137,26 @@
   ;; Concatenate together the names of some strings and symbols,
   ;; producing a symbol in the current package.
   (defun symbolicate (&rest things)
-    (apply #'symbol-concat (sane-package) things))
-  ;; SYMBOLICATE in given package.
+    (apply #'symbol-concat (sane-package) nil things))
+  ;; "bang" means intern even if the specified package is locked.
+  ;; Obviously it takes a package, so it doesn't need PACKAGE- in its name.
+  ;; The main use is to create interned temp vars. It really seems like there
+  ;; ought to be a single package into which all such vars go,
+  ;; avoiding any interning in locked packages.
+  (defun symbolicate! (package &rest things)
+    (apply #'symbol-concat (find-package package) t things))
+  ;; SYMBOLICATE in given package respecting package-lock.
   (defun package-symbolicate (package &rest things)
-    (apply #'symbol-concat (find-package package) things))
+    (apply #'symbol-concat (find-package package) nil things))
   ;; like SYMBOLICATE, but producing keywords
   (defun keywordicate (&rest things)
-    (apply #'symbol-concat *keyword-package* things))
+    (apply #'symbol-concat *keyword-package* nil things))
   ;; like the above, but producing an uninterned symbol.
   ;; [we already have GENSYMIFY, and naming this GENSYMICATE for
   ;; consistency with the above would not be particularly enlightening
   ;; as to how it isn't just GENSYMIFY]
   (defun gensymify* (&rest things)
-    (apply #'symbol-concat nil things))))
+    (apply #'symbol-concat nil nil things)))
 
 ;;; Access *PACKAGE* in a way which lets us recover when someone has
 ;;; done something silly like (SETF *PACKAGE* :CL-USER) in unsafe code.
@@ -226,20 +234,73 @@
                                        (1- max))))
         (t nil)))
 
+;;; Brent's cycle detection algorithm for sequences of iterated
+;;; function values (the rabbit). It's faster than Floyd's. See
+;;; PROPER-LIST-P for a simple example.
+;;;
+;;; TURTLE is lexically bound to INITIAL-VALUE, which should be one
+;;; step behind the rabbit. BODY computes the next value in the
+;;; sequence. Assuming the next value is in the variable RABBIT, BODY
+;;; can detect a circularity with (EQ TURTLE RABBIT). If no
+;;; circularity is detected, then (and only then) BODY must call
+;;; (UPDATE-TURTLE RABBIT).
+;;;
+;;; Positive N-LAG-BITS values make the turtle slower to start moving,
+;;; which slightly reduces the overhead in the non-circular case but
+;;; catches circularities a bit later.
+(defmacro with-turtle (((turtle &optional initial-value) &key (n-lag-bits 0))
+                       &body body)
+  ;; Instead of the usual implementation with two variables (one to
+  ;; count the steps the turtle rested, another for the current power
+  ;; of two limit), we use a single STEP variable and test it for
+  ;; being a power of 2, which tightens the code and lessens register
+  ;; pressure.
+  ;;
+  ;; This should be WITH-UNIQUE-NAMES, but GENSYM is not yet defined
+  ;; in the cross-compiler.
+  (let ((step (make-symbol "STEP")))
+    (flet ((update-turtle-body ()
+             `(progn
+                ;; Is STEP + 1 a power of 2?
+                ;;
+                ;; Because the standard algorithm (when N-LAG-BITS is
+                ;; 0) finds the STEP with the smallest
+                ;; POWER-OF-TWO-CEILING that's greater than the
+                ;; position of both the cycle's start and its length,
+                ;; we run out of memory before STEP ceases to be a
+                ;; WORD provided that the values in the sequence do
+                ;; exist at the same time in the image (i.e. not
+                ;; lazily generated).
+                (when (zerop (let ((step ,step))
+                               (logand step (locally #-sb-xc-host
+                                              (declare (optimize (safety 0)))
+                                                     (setq ,step (1+ step))))))
+                  (setq ,turtle rabbit)))))
+      `(let ((,turtle ,initial-value)
+             (,step ,(ash 1 n-lag-bits)))
+         #-sb-xc-host (declare (type sb-vm:word ,step))
+         (macrolet ((update-turtle (rabbit)
+                      ;; Avoid nested backquotes ...
+                      (subst rabbit 'rabbit ',(update-turtle-body)))
+                    (reset-turtle ()
+                      '(setq ,turtle ,initial-value
+                        ,step ,(ash 1 n-lag-bits))))
+           ,@body)))))
+
 (defun proper-list-p (x)
   (unless (consp x)
     (return-from proper-list-p (null x)))
-  (let ((rabbit (cdr x))
-        (turtle x))
-    (flet ((pop-rabbit ()
-             (when (eql rabbit turtle) ; circular
-               (return-from proper-list-p nil))
-             (when (atom rabbit)
-               (return-from proper-list-p (null rabbit)))
-             (pop rabbit)))
-      (loop (pop-rabbit)
-            (pop-rabbit)
-            (pop turtle)))))
+  (let ((rabbit (cdr x)))
+    (with-turtle ((turtle x) :n-lag-bits 2)
+      (loop
+        ;; Check for circularity. Use EQ because TURTLE is a CONS.
+        (when (eq rabbit turtle)
+          (return nil))
+        (when (atom rabbit)
+          (return (null rabbit)))
+        ;; RABBIT is a CONS here.
+        (update-turtle rabbit)
+        (pop rabbit)))))
 
 (declaim (inline ensure-list))
 (defun ensure-list (thing)
@@ -269,19 +330,6 @@
                       `(let ((it ,it)) (declare (ignorable it)) ,@body)
                       it)
                  (acond ,@rest)))))))
-
-;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
-;;; Otherwise, evaluate DEFAULT, store the resulting value in
-;;; HASH-TABLE and return two values: 1) the result of evaluating
-;;; DEFAULT 2) NIL.
-(defmacro ensure-gethash (key hash-table default)
-  (with-unique-names (n-key n-hash-table value foundp)
-    `(let ((,n-key ,key)
-           (,n-hash-table ,hash-table))
-       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
-         (if ,foundp
-             (values ,value t)
-             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 (defvar *!removable-symbols* nil)
 
@@ -314,3 +362,32 @@
 (defmacro defconstant-eqx (symbol expr eqx &optional doc)
   `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
      ,@(when doc (list doc))))
+
+;;; utility for coalescing list substructure in quoted constants, for
+;;; ease of guarding against differences in host compilers with
+;;; respect to coalescing structure in (host) fasl files, which might
+;;; then be used in compiling the target.
+(defun hash-cons (list)
+  (declare (type list list)
+           #-sb-xc-host
+           (notinline gethash3 %puthash))
+  (let ((table (make-hash-table :test 'equal)))
+    (labels ((hc (thing)
+               (cond
+                 ((atom thing) thing)
+                 ((gethash thing table))
+                 (t (setf (gethash thing table)
+                          (cons (hc (car thing)) (hc (cdr thing))))))))
+      (hc list))))
+
+;;; These are shorthand.
+;;; If in some policy we decide to open-code MEMBER, there should be
+;;; no discernable difference between MEMQ and (MEMBER ... :test 'EQ).
+(declaim (inline memq assq))
+(defun memq (item list)
+  "Return tail of LIST beginning with first element EQ to ITEM."
+  (member item list :test #'eq))
+
+(defun assq (item alist)
+  "Return the first pair of alist where item is EQ to the key of pair."
+  (assoc item alist :test #'eq))

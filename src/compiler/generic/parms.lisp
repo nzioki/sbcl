@@ -38,10 +38,9 @@
   #-sb-xc-host (symbol-value 'default-dynamic-space-size))
 
 ;; By happenstance this is the same as small-space-size.
-(defconstant alien-linkage-table-space-size #x100000)
+(defconstant alien-linkage-space-size #x100000)
 
-#+gencgc
-;; Define START/END constants for GENCGC spaces.
+;; Define START/END constants for GC spaces.
 ;; Assumptions:
 ;;     We only need very small read-only and static spaces, because
 ;;     gencgc does not purify any more.  We can count on being able to
@@ -55,19 +54,16 @@
 ;;
 ;;     The safepoint page (if enabled) is to be allocated immediately
 ;;     prior to static page.
-(defmacro !gencgc-space-setup
+(defmacro gc-space-setup
     (small-spaces-start
           ;; These keywords variables have to be careful not to overlap with the
           ;; the DEFCONSTANT of the same name, hence the suffix.
           &key ((:dynamic-space-start dynamic-space-start*))
                ((:dynamic-space-size dynamic-space-size*))
-               ;; The immobile-space START parameters should not be used
-               ;; except in forcing discontiguous addresses for testing.
-               ;; And of course, don't use them if unsupported.
                ((:fixedobj-space-start fixedobj-space-start*))
-               ((:fixedobj-space-size  fixedobj-space-size*) (* 24 1024 1024))
+               ((:fixedobj-space-size  fixedobj-space-size*) (* 48 1024 1024))
                ((:text-space-start text-space-start*))
-               ((:text-space-size  text-space-size*) (* 104 1024 1024))
+               ((:text-space-size  text-space-size*) (* 160 1024 1024))
                (small-space-size #x100000)
                ((:read-only-space-size ro-space-size)
                 #+darwin-jit small-space-size
@@ -86,26 +82,28 @@
         ((spaces (append `((read-only ,ro-space-size)
                            #+(and win32 x86-64)
                            (seh-data ,(symbol-value '+backend-page-bytes+) win64-seh-data-addr)
-                           #-immobile-space (alien-linkage-table ,alien-linkage-table-space-size)
-                           #+sb-safepoint
+                           #-immobile-space (alien-linkage ,alien-linkage-space-size)
+                           ;; safepoint on 64-bit uses a relocatable trap page just below the card mark
+                           ;; table, which works nicely assuming a register is wired to the card table
+                           #+(and sb-safepoint (not x86-64))
                            ;; Must be just before NIL.
-                           (safepoint ,(symbol-value '+backend-page-bytes+) gc-safepoint-page-addr)
+                           (safepoint ,(symbol-value '+backend-page-bytes+))
                            (static ,small-space-size)
+                           (permgen 8388608) ; 8MiB
                            #+darwin-jit
                            (static-code ,small-space-size))
                          #+immobile-space
                          `((fixedobj ,fixedobj-space-size*)
-                           (alien-linkage-table ,alien-linkage-table-space-size)
                            (text ,text-space-size*))))
          (ptr small-spaces-start)
          (small-space-forms
            (loop for (space size var-name) in spaces
                  appending
                  (let* ((relocatable
-                          ;; READONLY is usually movable now.
-                          (member space '(fixedobj text
-                                          #+immobile-space alien-linkage-table
-                                          #-darwin-jit read-only)))
+                          (member space '(fixedobj text permgen
+                                          #+relocatable-static-space safepoint
+                                          #+relocatable-static-space static
+                                          read-only)))
                         (start ptr)
                         (end (+ ptr size)))
                    (setf ptr end)
@@ -140,7 +138,7 @@
                  (32 (expt 2 29))
                  (64 (expt 2 30)))))
          ;; an arbitrary value to avoid kludging genesis
-         #+(and sb-xc-host (not darwin-jit))
+         #+sb-xc-host
          (defparameter read-only-space-end read-only-space-start)
          #-soft-card-marks (defconstant cards-per-page 1)
          (defconstant gencgc-card-bytes (/ gencgc-page-bytes cards-per-page))
@@ -157,6 +155,8 @@
                                         gencgc-card-bytes))))
          (defconstant gencgc-card-table-index-mask
            (1- (ash 1 gencgc-card-table-index-nbits)))))))
+
+(defconstant card-marked #+soft-card-marks 0 #-soft-card-marks 1)
 
 (defconstant-eqx +c-callable-fdefns+
   '(sub-gc
@@ -187,22 +187,24 @@
 ;;; On #+sb-thread builds, these are not static, because access to them
 ;;; is via the TLS, not the symbol.
 (defconstant-eqx per-thread-c-interface-symbols
-  `((*free-interrupt-context-index* 0)
-    (sb-sys:*allow-with-interrupts* t)
-    (sb-sys:*interrupts-enabled* t)
-    sb-sys:*interrupt-pending*
-    #+sb-safepoint sb-sys:*thruption-pending*
-    *in-without-gcing*
-    *gc-inhibit*
-    *gc-pending*
-    #+sb-safepoint sb-impl::*in-safepoint*
-    #+sb-thread *stop-for-gc-pending*
-    *pinned-objects*
-    #+gencgc (*gc-pin-code-pages* 0)
-    ;; things needed for non-local-exit
-    (*current-catch-block* 0)
-    (*current-unwind-protect-block* 0)
-    )
+    (hash-cons
+     '((*free-interrupt-context-index* 0)
+       (sb-sys:*allow-with-interrupts* t)
+       (sb-sys:*interrupts-enabled* t)
+       sb-sys:*interrupt-pending*
+       #+sb-safepoint sb-sys:*thruption-pending*
+       *in-without-gcing*
+       *gc-inhibit*
+       *gc-pending*
+       #+sb-safepoint sb-impl::*in-safepoint*
+       #+sb-thread *stop-for-gc-pending*
+       sb-impl::*unweakened-vectors*
+       *pinned-objects*
+       (*gc-pin-code-pages* 0)
+       ;; things needed for non-local-exit
+       #+ultrafutex (*current-mutex* 0)
+       (*current-catch-block* 0)
+       (*current-unwind-protect-block* 0)))
   #'equal)
 
 (defconstant-eqx +common-static-symbols+
@@ -218,13 +220,15 @@
     ,@'(*current-catch-block*
         *current-unwind-protect-block*)
 
-    #+metaspace *metaspace-tracts*
     *immobile-codeblob-tree* ; for generations 0 through 5 inclusive
     *immobile-codeblob-vector* ; for pseudo-static-generation
     *dynspace-codeblob-tree*
+    *linkage-name-map*
+    *elf-linkage-cell-modified*
     sb-impl::**finalizer-store**
     sb-impl::*finalizer-rehashlist*
     sb-impl::*finalizers-triggered*
+    sb-impl::*run-gc-hooks*
 
     ;; stack pointers
     #-sb-thread *binding-stack-start* ; a thread slot if #+sb-thread
@@ -236,6 +240,9 @@
     ;; threading support
     #+sb-thread sb-thread::*starting-threads*
     *free-tls-index* ; always exists for benefit of C runtime
+
+    #+(and x86-64 sb-thread (not gs-seg))
+    sb-aprof::*n-profile-sites*
 
     ;; runtime linking of lisp->C calls (regardless of whether
     ;; the C function is in a dynamic shared object or not)
@@ -293,7 +300,7 @@
 |#
 
 (defconstant-eqx common-static-fdefns
-    '(;; This the standard set of assembly routines that need to call into lisp.
+    `(;; This is the standard set of assembly routines that need to call into lisp.
       ;; A few backends add TWO-ARG-/= and others to this, in their {arch}/parms
       two-arg-+
       two-arg--
@@ -302,6 +309,7 @@
       two-arg-<
       two-arg->
       two-arg-=
+      #-linkage-space ,@'(
       eql
       %negate
       ;; These next ones are not called from assembly code, but from lisp.
@@ -320,8 +328,14 @@
       ;; fdefn pointers in the core. A couple others were high on the list as well.
       hairy-data-vector-set
       hairy-data-vector-ref
+      vector-hairy-data-vector-set
+      vector-hairy-data-vector-ref
+      hairy-data-vector-set/check-bounds
+      hairy-data-vector-ref/check-bounds
+      vector-hairy-data-vector-set/check-bounds
+      vector-hairy-data-vector-ref/check-bounds
       %ldb
-      sb-kernel:vector-unsigned-byte-8-p)
+      vector-unsigned-byte-8-p))
   #'equalp)
 
 ;;; Refer to the lengthy comment in 'src/runtime/interrupt.h' about
@@ -346,20 +360,21 @@
   #-sb-thread 1024) ; crazy value
 
 ;;; Thread slots accessed at negative indices relative to struct thread.
+;;; FIXME: this is extremely unmaintainable.
 (defconstant thread-header-slots
   ;; This seems to need to be an even number.
   ;; I'm not sure what the constraint on that stems from.
   #+(and x86-64 sb-safepoint) 14 ; the safepoint trap page is at word index -15
   #+(and x86-64 (not sb-safepoint)) 16
-  #-x86-64 0)
+  #+(and (not x86-64) immobile-space) 14 ; the safepoint trap page is at word index -15
+  #+(and (not x86-64) (not immobile-space)) 0)
 
-#+gencgc
 (progn
   (defconstant +highest-normal-generation+ 5)
   (defconstant +pseudo-static-generation+ 6))
 
 (defparameter *runtime-asm-routines* nil)
-(defparameter *linkage-space-predefined-entries* nil)
+(defparameter *alien-linkage-table-predefined-entries* nil)
 
 ;;; Floating-point related constants, both format descriptions and FPU
 ;;; control register descriptions.  These don't exactly match up with
@@ -390,18 +405,32 @@
 (defconstant single-float-hidden-bit (ash 1 23))
 
 (defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
+(defconstant-eqx double-float-exponent-byte (byte 11 52) #'equalp)
+(defconstant-eqx double-float-significand-byte (byte 52 0) #'equalp)
+(defconstant-eqx double-float-hi-exponent-byte (byte 11 20) #'equalp)
+(defconstant-eqx double-float-hi-significand-byte (byte 20 0) #'equalp)
 (defconstant double-float-normal-exponent-min 1)
 (defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
+(defconstant double-float-hidden-bit (ash 1 52))
 
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) 32 1))
+(defconstant single-float-digits 24)
+(defconstant double-float-digits 53)
 )
+
+;;; Reserve some bits of SYMBOL-HASH slot for future use
+#+64-bit
+(progn (defconstant n-symbol-hash-prng-bits 10) ; how many to randomize
+       ;; If changing this constant, then see the test in pathnames.pure
+       ;; named :PATHNAME-HASH-NOT-RANDOM and adjust it as needed.
+       (defconstant n-symbol-hash-discard-bits
+         (let ((precision (+ 32 n-symbol-hash-prng-bits))) ; total N bits
+           (- 64 precision)))
+       ;; Allow .5 million global names, expandable to 4 million (22 bits)
+       (defconstant n-linkage-index-bits (or #+linkage-space 19 0))
+       (defconstant-eqx sb-impl::symbol-hash-prng-byte
+         (byte n-symbol-hash-prng-bits (- 32 n-symbol-hash-prng-bits))
+         #'equal))
+#-64-bit (defconstant-eqx sb-impl::symbol-hash-prng-byte (byte 3 0) #'equal)
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

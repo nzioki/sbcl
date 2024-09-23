@@ -30,7 +30,7 @@
 ;;; in the cross-compiler was confusing as hell.
 ;;; Consider any toplevel form in make-host-2 - it will have constants in it,
 ;;; and we need to know if each constant is dumpable. So we call DUMPABLE-LEAFLIKE-P
-;;; which invokes SB-XC:TYPEP. But SB-XC:TYPEP may know nothing of DEBUG-NAME-MARKER
+;;; which invokes SB-XC:TYPEP. But SB-XC:TYPEP may know nothing of a particular struct type
 ;;; until that DEFSTRUCT is seen. So how did it ever work? Well, for starters,
 ;;; if it's an unknown type, we need to signal a PARSE-UNKNOWN-TYPE condition.
 ;;; To signal that, we check whether that condition is in *HANDLED-CONDITIONS*.
@@ -100,6 +100,7 @@
 ;; Update the xc-readtable
 (set-macro-character #\` #'sb-impl::backquote-charmacro nil *xc-readtable*)
 (set-macro-character #\, #'sb-impl::comma-charmacro nil *xc-readtable*)
+(set-dispatch-macro-character #\# #\a 'sb-kernel::our-sharp-a-reader *xc-readtable*)
 ;; ... and since the cross-compiler hasn't seen a DEFMACRO for QUASIQUOTE,
 ;; make it think it has, otherwise it fails more-or-less immediately.
 (setf (sb-xc:macro-function 'sb-int:quasiquote)
@@ -187,7 +188,7 @@
                                    :if-exists :supersede :if-does-not-exist :create)
     (format stream ";;; SXHASH test data~%(~%")
     (let ((seen (make-hash-table)))
-      (dolist (pair sb-impl::*sxhash-crosscheck*)
+      (dolist (pair sb-c::*sxhash-crosscheck*)
         (let ((prev (gethash (car pair) seen)))
           (if prev
               (assert (= prev (cdr pair))) ; be self-consistent at least
@@ -230,7 +231,7 @@
                   (target-compile-stem stem flags)
                   (let ((elapsed (/ (- (get-internal-real-time) start)
                                     internal-time-units-per-second)))
-                    (format t " (~f sec)~%" elapsed)
+                    (format t " (~5,3f sec)~%" elapsed)
                     (incf total-time elapsed)))
                 ;(sb-kernel::show-ctype-ctor-cache-metrics)
                 (when sb-impl::*profile-hash-cache*
@@ -241,6 +242,7 @@
                 ;; compiler (i.e. making the registry a slot of the fasl-output struct)
                 (clear-specialized-array-registry)))
              (format t "~&~50t ~f~%" total-time))
+           (sb-cold::maybe-save-perfect-hashfuns-for-playback)
            (sb-c::dump/restore-interesting-types 'write)))
      (write-sxhash-xcheck-data
       (sb-cold:find-bootstrap-file "output/sxhash-calls.lisp-expr" t))

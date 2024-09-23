@@ -77,14 +77,11 @@
     (def-accessor sap-ref-lispobj)
     (def-accessor sap-ref-single)
     (def-accessor sap-ref-double))
-  (def %byte-blt (src src-start dst dst-start dst-end))
-  (def shift-towards-start (number count))
-  (def shift-towards-end (number count))
+  (def %byte-blt (src src-start dst dst-start count))
   (def get-header-data)
   (def set-header-data (x val))
   (def widetag-of)
   (def %other-pointer-widetag)
-  (def pointer-hash)
   (def vector-sap)
   (def binding-stack-pointer-sap  ())
   #+cheneygc (def dynamic-space-free-pointer ())
@@ -93,15 +90,17 @@
   (def %fun-pointer-widetag)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
+  (def make-fdefn)
   (def fdefn-name)
   (def fdefn-fun)
   (def fdefn-makunbound)
   (def sb-c::vector-length)
   (def make-array-header (type rank))
   (def code-instructions)
-  #-untagged-fdefns (def code-header-ref (code-obj index))
+  (def code-header-ref (code-obj index))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
+  #-weak-vector-readbarrier (def weak-vector-len)
   (def single-float-bits)
   (def double-float-high-bits)
   #+64-bit
@@ -110,8 +109,8 @@
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
+  (def %code-debug-info)
   (def sb-vm::%code-fixups)
-  #+x86-64 (def pointerp)
   (def sb-bignum:%bignum-length)
 
   ;; instances
@@ -119,20 +118,19 @@
   (def %make-instance/mixed)
   (def %instance-length) ; Given an instance, return its length.
   (def %instance-layout)
-  (def %instance-wrapper)
   (def %set-instance-layout (instance new-value))
   ; (def %instance-ref (instance index)) ; defined in 'target-defstruct'
   (def %instance-set (instance index new-value))
   ;; funcallable instances
-  (def %make-funcallable-instance)
+  ;(def %make-funcallable-instance)
   (def %fun-layout)
-  (def %fun-wrapper)
   (def %set-fun-layout (fin new-value))
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
-  #+compact-instance-header (progn (def wrapper-of)
+  #+compact-instance-header (progn (def layout-of)
                                    (def %instanceoid-layout))
+  #+64-bit (def layout-depthoid)
 
   ;; lists
   (def %rplaca (x val))
@@ -141,6 +139,11 @@
   #+compare-and-swap-vops
   (def* (%array-atomic-incf/word (array index diff))
         (%raw-instance-atomic-incf/word (instance index diff)))
+  #+(or x86 x86-64)
+  (def* (sb-vm::%cpu-identification (arg1 arg2))
+        (sb-vm::%vector-cas-pair (vector index old1 old2 new1 new2))
+        (sb-vm::%instance-cas-pair (instance index old1 old2 new1 new2))
+        (sb-vm::%cons-cas-pair (cons old1 old2 new1 new2)))
 
   #+sb-simd-pack
   (def* (%make-simd-pack (tag low high))
@@ -154,7 +157,7 @@
         (%make-simd-pack-256-double (a b c d))
         (%make-simd-pack-256-ub64 (a b c d))
         (%simd-pack-256-tag))
-  #+sb-thread (def sb-vm::current-thread-offset-sap)
+  #+(or sb-thread x86-64) (def sb-vm::current-thread-offset-sap)
   (def current-sp ())
   (def current-fp ())
   (def stack-ref (s n))
@@ -162,9 +165,6 @@
   (def symbol-package-id)
   (def symbol-hash)
   (def symbol-%info) ; primitive reader always needs a stub
-  ;; but the "wrapped" reader might not need a stub.
-  ;; If it's already a proper function, then it doesn't.
-  #.(if (fboundp 'symbol-dbinfo) (values) '(def symbol-dbinfo))
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
   (def get-lisp-obj-address)
@@ -195,36 +195,10 @@
   "Hints the processor that the current thread is spin-looping."
   (spin-loop-hint))
 
-;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
-;;; that the vop does, however, because the all 64-bit architectures other than
-;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
-;;; I should add a vop for uint32 access to raw slots.
-(defun sb-c::%structure-is-a (object-layout test-layout)
-  (or (eq object-layout test-layout)
-      (let ((depthoid (wrapper-depthoid test-layout))
-            (inherits (wrapper-inherits object-layout)))
-        (and (> (length inherits) depthoid)
-             (eq (svref inherits depthoid) test-layout)))))
-
-(defun sb-c::structure-typep (object test-layout)
-  (and (%instancep object)
-       (let ((object-layout (%instance-layout object)))
-        (or (eq object-layout test-layout)
-            (let ((depthoid (wrapper-depthoid test-layout))
-                  (inherits (wrapper-inherits object-layout)))
-              (and (> (length inherits) depthoid)
-                   (eq (svref inherits depthoid) test-layout)))))))
-
 (defun %other-pointer-subtype-p (x choices)
   (and (%other-pointer-p x)
        (member (%other-pointer-widetag x) choices)
        t))
-
-#+x86-64
-(defun symbol-hash* (x satisfies)
-  (declare (explicit-check)) ; actually, not
-  (declare (ignore satisfies))
-  (symbol-hash* x nil))
 
 ;;; TYPECASE could expand to contain a call to this function.
 ;;; The interpreter can ignore it, it is just compiler magic.
@@ -237,3 +211,5 @@
   ;; (OR LIST SYMBOL CLASSOID CLASS), and CLASS isn't known, and you can't
   ;; define it because it's a standard symbol.
   (setq sb-c::*undefined-warnings* nil))
+
+(setf (fdefinition 'unaligned-dx-cons) #'list)

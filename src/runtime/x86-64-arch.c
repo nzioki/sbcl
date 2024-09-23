@@ -13,29 +13,27 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
 #include "arch.h"
 #include "lispregs.h"
-#include "signal.h"
-#include "alloc.h"
+#include <signal.h>
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
-#include "unaligned.h"
+#include "align.h"
 #include "search.h"
 #include "var-io.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
-#include "forwarding-ptr.h"
 #include "core.h"
-#include "gc-private.h"
+#include "gc.h"
 
 #define INT3_INST 0xCC
 #define INTO_INST 0xCE
@@ -73,21 +71,6 @@ static void xgetbv(unsigned *eax, unsigned *edx)
 
 #define VECTOR_FILL_T "VECTOR-FILL/T"
 
-void set_alloc_tramp_vectors(int ymm_enable)
-{
-    struct code* code = (struct code*)asm_routines_start;
-    lispobj* instructions = (lispobj*)code + code_header_words(code);
-    int index;
-    get_asm_routine_by_name("FPR-SAVE", &index);
-    if (index)
-        instructions[index] =
-            (lispobj)get_asm_routine_by_name(ymm_enable ? "SAVE-YMM" : "SAVE-XMM", 0);
-    get_asm_routine_by_name("FPR-RESTORE", &index);
-    if (index)
-        instructions[index] =
-            (lispobj)get_asm_routine_by_name(ymm_enable ? "RESTORE-YMM" : "RESTORE-XMM", 0);
-}
-
 // Poke in a byte that changes an opcode to enable faster vector fill.
 // Using fixed offsets and bytes is no worse than what we do elsewhere.
 void tune_asm_routines_for_microarch(void)
@@ -111,7 +94,6 @@ void tune_asm_routines_for_microarch(void)
             }
         }
     }
-    set_alloc_tramp_vectors(avx_supported);
     int our_cpu_feature_bits = 0;
     // avx2_supported gets copied into bit 1 of *CPU-FEATURE-BITS*
     if (avx2_supported) our_cpu_feature_bits |= 1;
@@ -138,7 +120,6 @@ void untune_asm_routines_for_microarch(void)
 {
     asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
     SetSymbolValue(CPU_FEATURE_BITS, 0, 0);
-    set_alloc_tramp_vectors(0);
 }
 
 #ifndef _WIN64
@@ -159,33 +140,58 @@ arch_get_bad_addr(int __attribute__((unused)) sig,
  * want to get to, and on OS, which determines how we get to it.)
  */
 
-os_context_register_t *
-os_context_flags_addr(os_context_t *context)
+// I don't have an easy way to test changes for these OSes, so just use this
+// context visitor based on the old slightly-less-efficient way of doing it.
+#if defined LISP_FEATURE_SUNOS || defined LISP_FEATURE_HAIKU
+void visit_context_registers(void (*proc)(os_context_register_t, void*),
+                             os_context_t *context, void* arg)
 {
+    proc(os_context_pc(context), arg);
+    proc(*os_context_register_addr(context, reg_RAX), arg);
+    proc(*os_context_register_addr(context, reg_RCX), arg);
+    proc(*os_context_register_addr(context, reg_RDX), arg);
+    proc(*os_context_register_addr(context, reg_RBX), arg);
+    proc(*os_context_register_addr(context, reg_RSI), arg);
+    proc(*os_context_register_addr(context, reg_RDI), arg);
+    proc(*os_context_register_addr(context, reg_R8 ), arg);
+    proc(*os_context_register_addr(context, reg_R9 ), arg);
+    proc(*os_context_register_addr(context, reg_R10), arg);
+    proc(*os_context_register_addr(context, reg_R11), arg);
+    proc(*os_context_register_addr(context, reg_R12), arg);
+    proc(*os_context_register_addr(context, reg_R13), arg);
+    proc(*os_context_register_addr(context, reg_R14), arg);
+    proc(*os_context_register_addr(context, reg_R15), arg);
+}
+#endif
+
 #if defined __linux__
     /* KLUDGE: As of kernel 2.2.14 on Red Hat 6.2, there's code in the
      * <sys/ucontext.h> file to define symbolic names for offsets into
      * gregs[], but it's conditional on __USE_GNU and not defined, so
      * we need to do this nasty absolute index magic number thing
      * instead. */
-    return (os_context_register_t*)&context->uc_mcontext.gregs[17];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[17]
 #elif defined LISP_FEATURE_SUNOS
-    return &context->uc_mcontext.gregs[REG_RFL];
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.gregs[REG_RFL]
 #elif defined LISP_FEATURE_FREEBSD || defined(__DragonFly__)
-    return &context->uc_mcontext.mc_rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.mc_rflags
 #elif defined __HAIKU__
-    return &context->uc_mcontext.rflags;
+#   define CONTEXT_FLAGS(c) c->uc_mcontext.rflags
 #elif defined LISP_FEATURE_DARWIN
-    return CONTEXT_ADDR_FROM_STEM(rflags);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,rflags)
 #elif defined __OpenBSD__
-    return &context->sc_rflags;
+#   define CONTEXT_FLAGS(c) c->sc_rflags
 #elif defined __NetBSD__
-    return CONTEXT_ADDR_FROM_STEM(RFLAGS);
+#   define CONTEXT_FLAGS(c) CONTEXT_SLOT(c,RFLAGS)
 #elif defined _WIN64
-    return (os_context_register_t*)&context->win32_context->EFlags;
+#   define CONTEXT_FLAGS(c) c->win32_context->EFlags
 #else
 #error unsupported OS
 #endif
+
+os_context_register_t *os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)&(CONTEXT_FLAGS(context));
 }
 
 void arch_skip_instruction(os_context_t *context)
@@ -231,8 +237,6 @@ void arch_skip_instruction(os_context_t *context)
             break;
         }
 
-    FSHOW((stderr,
-           "/[arch_skip_inst resuming at %x]\n", OS_CONTEXT_PC(context)));
 }
 
 unsigned char *
@@ -241,23 +245,15 @@ arch_internal_error_arguments(os_context_t *context)
     return 1 + (unsigned char *)OS_CONTEXT_PC(context);
 }
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t __attribute__((unused)) *context)
-{
-    return get_pseudo_atomic_atomic(get_sb_vm_thread());
+bool arch_pseudo_atomic_atomic(struct thread *thread) {
+    return get_pseudo_atomic_atomic(thread);
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_set_pseudo_atomic_interrupted(struct thread *thread) {
     set_pseudo_atomic_interrupted(thread);
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
-{
-    struct thread *thread = get_sb_vm_thread();
+void arch_clear_pseudo_atomic_interrupted(struct thread *thread) {
     clear_pseudo_atomic_interrupted(thread);
 }
 
@@ -268,7 +264,7 @@ arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *conte
 unsigned int
 arch_install_breakpoint(void *pc)
 {
-    unsigned int result = *(unsigned int*)pc;
+    unsigned int result = UNALIGNED_LOAD32(pc);
 #ifdef LISP_FEATURE_INT4_BREAKPOINTS
     *(char*)pc = INTO_INST;
 #else
@@ -312,7 +308,7 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     *(pc-2) = 0x00240c81;
     *(pc-1) = 0x9d000001;
 #else
-    *os_context_flags_addr(context) |= 0x100;
+    CONTEXT_FLAGS(context) |= 0x100;
 #endif
 
     single_stepping = pc;
@@ -355,7 +351,7 @@ restore_breakpoint_from_single_step(os_context_t * context)
     *(single_stepping-2) = single_step_save2;
     *(single_stepping-1) = single_step_save3;
 #else
-    *os_context_flags_addr(context) &= ~0x100;
+    CONTEXT_FLAGS(context) &= ~0x100;
 #endif
     /* Re-install the breakpoint if possible. */
     if (((char *)OS_CONTEXT_PC(context) > (char *)single_stepping) &&
@@ -397,22 +393,6 @@ sigtrap_handler(int __attribute__((unused)) signal,
      * number of bytes will follow, the first is the length of the byte
      * arguments to follow. */
     trap = *(unsigned char *)OS_CONTEXT_PC(context);
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    if (trap == trap_UndefinedFunction) {
-        // The interrupted PC pins this fdefn. Sigtrap is delivered on the ordinary stack,
-        // not the alternate stack.
-        // (FIXME: an interior pointer to an fdefn _should_ pin it, but doesn't)
-        lispobj* fdefn = (lispobj*)(OS_CONTEXT_PC(context) & ~LOWTAG_MASK);
-        if (fdefn && widetag_of(fdefn) == FDEFN_WIDETAG) {
-            // Return to undefined-tramp
-            OS_CONTEXT_PC(context) = (uword_t)((struct fdefn*)fdefn)->raw_addr;
-            // with RAX containing the FDEFN
-            *os_context_register_addr(context,reg_RAX) =
-                make_lispobj(fdefn, OTHER_POINTER_LOWTAG);
-            return;
-        }
-    }
-#endif
     handle_trap(context, trap);
 }
 
@@ -421,7 +401,7 @@ sigill_handler(int __attribute__((unused)) signal,
                siginfo_t __attribute__((unused)) *siginfo,
                os_context_t *context) {
     unsigned char* pc = (void*)OS_CONTEXT_PC(context);
-    if (*(unsigned short *)pc == UD2_INST) {
+    if (UNALIGNED_LOAD16(pc) == UD2_INST) {
         OS_CONTEXT_PC(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
@@ -518,7 +498,7 @@ arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-    char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+    char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
     if (datap) {
         *(uword_t *)reloc_addr = (uword_t)target_addr;
         return;
@@ -584,91 +564,45 @@ arch_set_fp_modes(unsigned int mxcsr)
     asm ("ldmxcsr %0" : : "m" (temp));
 }
 
-static __attribute__((unused)) boolean codeblob_p(lispobj ptr) {
-    return lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
-           widetag_of((lispobj*)(ptr-OTHER_POINTER_LOWTAG)) == CODE_HEADER_WIDETAG;
-}
-
 /* Return the tagged pointer for which 'entrypoint' is the starting address.
- * This will be one of the following:
- * 1. a fun-pointer which is either
- *   - a simple-fun header located 2 words before the entrypoint.
- *     N.B.: This returns the SIMPLE-FUN, and _not_ its containing codeblob.
- *   - a funcallable-instance with an embedded trampoline that make it
- *     equivalent to a simple-fun
- * 2. a code-component with no simple-fun within it, that makes closures
- *    callable like simple-funs. The code header is at entrypoint minus 4 words.
- *
- * By first reading at (entrypoint - 2*N_WORD_BYTES) this does the right thing
- * when 'entrypoint' is actually type 2, because the word accessed will not be
- * an object header or forwarding marker (it will be whatever %CODE-DEBUG-INFO is).
- * Whereis if this were type 1, but we read at (entrypoint - 4*N_WORD_BYTES) first,
- * then we could perceive random uninitialized bytes of the preceding object.
+ * This result will have SIMPLE_FUN_WIDETAG or FUNCALLABLE_INSTANCE_WIDETAG.
+ * If the thing has been forwarded, we do NOT return the newspace copy.
  */
 lispobj entrypoint_taggedptr(uword_t entrypoint) {
     if (!entrypoint || points_to_asm_code_p(entrypoint)) return 0;
-    // First try
     lispobj* phdr = (lispobj*)(entrypoint - 2*N_WORD_BYTES);
     if (forwarding_pointer_p(phdr)) {
-        gc_dcheck(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
-        return make_lispobj(phdr, FUN_POINTER_LOWTAG);
+        gc_assert(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
+        // We can't assert on the widetag if forwarded, because defragmentation
+        // puts the new logical object at some totally different physical address.
+        // This function doesn't know if defrag is occurring.
+    } else {
+        __attribute__((unused)) unsigned char widetag = widetag_of(phdr);
+        gc_assert(widetag == SIMPLE_FUN_WIDETAG || widetag == FUNCALLABLE_INSTANCE_WIDETAG);
     }
-    int widetag = widetag_of(phdr);
-    if (widetag == FUNCALLABLE_INSTANCE_WIDETAG || widetag == SIMPLE_FUN_WIDETAG) {
-        return make_lispobj(phdr, FUN_POINTER_LOWTAG);
-    }
-    // Second try
-    phdr = (lispobj*)(entrypoint - 4*N_WORD_BYTES);
-    /* It is nearly impossible for forwarding to arise, by this reasoning:
-     * Case A: if some thread references the codeblob that wraps a closure,
-     *  then the codeblob is pinned; hence not forwarded.
-     * Case B: if not executing (or otherwise referenced from stack/registers),
-     *  there can exist no other tagged reference to the codeblob.
-     * Aside from the FDEFN that owns it, the only other untagged reference would
-     * be from the search tree, which isn't scavenged. (The entire tree dies after GC.)
-     * It's conceivable the debugger could store a tagged pointer to this entrypoint
-     * in something, but I tried to make it do so, and couldn't. I was, however, able
-     * to artificially cause forwarding by putting closure trampolines in symbols */
-    if (forwarding_pointer_p(phdr))
-        gc_dcheck(codeblob_p(forwarding_pointer_value(phdr)));
-    else
-        gc_dcheck(widetag_of(phdr) == CODE_HEADER_WIDETAG);
-    return make_lispobj(phdr, OTHER_POINTER_LOWTAG);
-}
-/* Return the lisp object that fdefn's raw_addr slot jumps to.
- * In the event that the referenced object was forwarded, this returns the un-forwarded
- * object (the forwarded value is used to assert some invariants though).
- * If the fdefn jumps to the UNDEFINED-FDEFN routine, then return 0.
- *
- * Some legacy baggage is evident: in the first implementation of immobile fdefns,
- * an fdefn used a 'jmp rel32' (relative to itself), and so you could decode the
- * jump target only given the address of the fdefn. That is no longer true; fdefns use
- * absolute jumps. Therefore it is possible to call entrypoint_taggedptr() with any
- * raw_addr, whether or not you know the fdefn whence the raw_addr was obtained. */
-lispobj decode_fdefn_rawfun(struct fdefn* fdefn) {
-    return entrypoint_taggedptr((uword_t)fdefn->raw_addr);
+    return make_lispobj(phdr, FUN_POINTER_LOWTAG);
 }
 
+#ifdef LISP_FEATURE_SB_THREAD
 #include "genesis/vector.h"
 #define LOCK_PREFIX 0xF0
 #undef SHOW_PC_RECORDING
 
-extern unsigned int alloc_profile_n_counters;
 extern unsigned int max_alloc_point_counters;
-#ifdef LISP_FEATURE_SB_THREAD
+
 #ifdef LISP_FEATURE_WIN32
 extern CRITICAL_SECTION alloc_profiler_lock;
 #else
 extern pthread_mutex_t alloc_profiler_lock;
 #endif
-#endif
 
-static unsigned int claim_index(int qty)
+
+static unsigned int claim_index(int qty) // qty is 1 or 2
 {
-    static boolean warning_issued;
-    unsigned int index = alloc_profile_n_counters;
-    alloc_profile_n_counters += qty;
-    if (alloc_profile_n_counters <= max_alloc_point_counters)
+    static bool warning_issued;
+    unsigned int index = fixnum_value(SYMBOL(N_PROFILE_SITES)->value);
+    SYMBOL(N_PROFILE_SITES)->value += make_fixnum(qty);
+    if (fixnum_value(SYMBOL(N_PROFILE_SITES)->value) <= max_alloc_point_counters)
        return index;
     if (!warning_issued) {
        fprintf(stderr, "allocation profile buffer overflowed\n");
@@ -677,7 +611,7 @@ static unsigned int claim_index(int qty)
     return 0; // use the overflow bin(s)
 }
 
-static boolean NO_SANITIZE_MEMORY
+static bool NO_SANITIZE_MEMORY
 instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 {
     int __attribute__((unused)) ret = mutex_acquire(&alloc_profiler_lock);
@@ -705,7 +639,7 @@ instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
 
 // logical index 'index' in the metadata array stores the code component
 // and pc-offset relative to the component base address
-static void record_pc(char* pc, unsigned int index, boolean sizedp)
+static void record_pc(char* pc, unsigned int index, bool sizedp)
 {
     lispobj *code = component_ptr_from_pc(pc);
     if (!code) {
@@ -747,8 +681,7 @@ static void record_pc(char* pc, unsigned int index, boolean sizedp)
     }
 }
 
-void AMD64_SYSV_ABI
-allocation_tracker_counted(uword_t* sp)
+void allocation_tracker_counted(uword_t* sp)
 {
     uword_t *pc, word_at_pc;
     if (instrumentp(sp, &pc, &word_at_pc)) {
@@ -779,8 +712,7 @@ allocation_tracker_counted(uword_t* sp)
     gc_assert(ret);
 }
 
-void AMD64_SYSV_ABI
-allocation_tracker_sized(uword_t* sp)
+void allocation_tracker_sized(uword_t* sp)
 {
     uword_t *pc, word_at_pc;
     if (instrumentp(sp, &pc, &word_at_pc)) {
@@ -811,6 +743,7 @@ allocation_tracker_sized(uword_t* sp)
     int __attribute__((unused)) ret = mutex_release(&alloc_profiler_lock);
     gc_assert(ret);
 }
+#endif
 
 __attribute__((sysv_abi)) lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs) {
     extern lispobj call_into_lisp_(lispobj, lispobj *, int, struct thread *)

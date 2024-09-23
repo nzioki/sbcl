@@ -2,6 +2,7 @@
 (setf *print-level* 5 *print-length* 5)
 (load "src/cold/shared.lisp")
 (in-package "SB-COLD")
+
 ;;; FIXME: these prefixes look like non-pathnamy ways of defining a
 ;;; relative pathname.  Investigate whether they can be made relative
 ;;; pathnames.
@@ -10,6 +11,8 @@
 (load "src/cold/set-up-cold-packages.lisp")
 (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 (load-or-cload-xcompiler #'host-load-stem)
+;;; Set up the perfect hash generator for the target's value of N-FIXNUM-BITS.
+(preload-perfect-hash-generator (perfect-hash-generator-journal :input))
 
 ;; Supress function/macro redefinition warnings under clisp.
 #+clisp (setf custom:*suppress-check-redefinition* t)
@@ -17,9 +20,17 @@
 ;; Avoid natively compiling new code under ecl
 #+ecl (ext:install-bytecodes-compiler)
 
+(defun copy-file-from-file (new old)
+  (with-open-file (output new :direction :output :if-exists :supersede
+                          :if-does-not-exist :create)
+    (with-open-file (input old)
+      (loop (let ((line (read-line input nil)))
+              (if line (write-line line output) (return new)))))))
+
 ;;; Run the cross-compiler to produce cold fasl files.
 (setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
 (setq sb-c::*static-vop-usage-counts* (make-hash-table))
+(defvar *emitted-full-calls*)
 (let (fail
       variables
       functions
@@ -38,6 +49,12 @@
                      (setq warnp 'warning))))
     (sb-xc:with-compilation-unit ()
       (load "src/cold/compile-cold-sbcl.lisp")
+      (setf *emitted-full-calls*
+            (sb-c::cu-emitted-full-calls sb-c::*compilation-unit*))
+      (let ((cache (math-journal-pathname :output)))
+        (when (probe-file cache)
+          (copy-file-from-file "output/xfloat-math.lisp-expr" cache)
+          (format t "~&Math journal: replaced from ~S~%" cache)))
       ;; Enforce absence of unexpected forward-references to warm loaded code.
       ;; Looking into a hidden detail of this compiler seems fair game.
       (when sb-c::*undefined-warnings*
@@ -48,8 +65,7 @@
             (:type (setf types t))
             (:function (setf functions t)))))))
   ;; Exit the compilation unit so that the summary is printed. Then complain.
-  ;; win32 is not clean
-  (when (and fail (not (target-featurep :win32)))
+  (when fail
     (cerror "Proceed anyway"
             "Undefined ~:[~;variables~] ~:[~;types~]~
              ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-ALLOWLIST*?)~]"
@@ -77,27 +93,25 @@
 
 (when sb-c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb-int:call-with-each-globaldb-name
-     (lambda (name)
-       (let* ((cell (sb-int:info :function :emitted-full-calls name))
-              (inlinep (eq (sb-int:info :function :inlinep name) 'inline))
+    (sb-int:dohash ((name cell) *emitted-full-calls*)
+       (let* ((inlinep (eq (sb-int:info :function :inlinep name) 'inline))
               (source-xform (sb-int:info :function :source-transform name))
               (info (sb-int:info :function :info name)))
-         (if (and cell
-                  (or inlinep
-                      source-xform
-                      (and info (sb-c::fun-info-templates info))
-                      (sb-int:info :function :compiler-macro-function name)))
+         (when (and cell
+                    (or inlinep
+                        source-xform
+                        (and info (sb-c::fun-info-templates info))
+                        (sb-int:info :function :compiler-macro-function name)))
              (cond (inlinep
                     ;; A full call to an inline function almost always indicates
                     ;; an out-of-order definition. If not an inline function,
                     ;; the call could be due to an inapplicable transformation.
-                    (push (cons name cell) likely-suspicious))
+                    (push (list name cell) likely-suspicious))
                    ;; structure constructors aren't inlined by default,
                    ;; though we have a source-xform.
                    ((and (listp source-xform) (eq :constructor (cdr source-xform))))
                    (t
-                    (push (cons name cell) possibly-suspicious)))))))
+                    (push (list name cell) possibly-suspicious))))))
     (flet ((show (label list)
              (when list
                (format t "~%~A suspicious calls:~:{~%~4d ~S~@{~%     ~S~}~}~%"
@@ -106,12 +120,15 @@
                                (sort list #'> :key #'cadr))))))
       ;; Called inlines not in the presence of a declaration to the contrary
       ;; indicate that perhaps the function definition appeared too late.
-      (show "Likely" likely-suspicious)
+      (show "Likely" likely-suspicious) ; "quite likely" an error
       ;; Failed transforms are considered not quite as suspicious
       ;; because it could either be too late, or that the transform failed.
-      (show "Possibly" possibly-suspicious))
+      (show "Possibly" possibly-suspicious)) ; _potentially_ an error
     ;; As each platform's build becomes warning-free,
     ;; it should be added to the list here to prevent regresssions.
+    ;; But oops! apparently this check started failing a long time ago
+    ;; but because it was done in the wrong place, the check failed to fail.
+    #+nil
     (when (and likely-suspicious
                (target-featurep '(:and (:or :x86 :x86-64) (:or :linux :darwin))))
       (warn "Expected zero inlinining failures"))))

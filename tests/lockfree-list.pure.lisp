@@ -16,7 +16,7 @@
     (assert (eq (sb-kernel::dd-%element-type
                  (sb-kernel:find-defstruct-description type))
                 '*))
-    (assert (not (logtest (sb-kernel:wrapper-flags (find-layout type))
+    (assert (not (logtest (sb-kernel:layout-flags (find-layout type))
                           sb-kernel::+strictly-boxed-flag+)))))
 
 
@@ -51,6 +51,42 @@
   (logical-delete (lfl-nth n list))
   list)
 
+(defun count-list-nodes (list &aux (n 0))
+  (do ((node (get-next (list-head list)) (get-next node)))
+      ((endp node) n)
+    (incf n)))
+
+(defun lockfree-list-with-many-deleted-nodes (n)
+  (let ((list (make-ordered-list :key-type 'fixnum)))
+    ;; insert items in descending order because otherwise this would take N^2 time
+    (loop for i from n downto 1 do (lfl-insert list i (- i)))
+    ;; logically delete half the nodes
+    (do ((i 0 (1+ i))
+         (node (list-head list) (get-next node)))
+        ((endp node))
+      (when (oddp i) (logical-delete node)))
+    list))
+
+(test-util:with-test (:name :lockfree-list-node-implicit-pin-untagged-pointer
+                            :skipped-on (not :sb-thread))
+  (let* ((keepon t)
+         (n-nodes 15000)
+         (list (lockfree-list-with-many-deleted-nodes n-nodes))
+         (thread ; Start a thread to invoke GC
+          (sb-thread:make-thread
+           (lambda ()
+             (loop
+               (sb-thread:barrier (:read))
+               (when (not keepon) (return))
+               (gc)
+               (sleep .001))))))
+    (loop repeat 1000 for i from 0
+          do (let ((counted (count-list-nodes list)))
+               (assert (= counted n-nodes))))
+    (setq keepon nil)
+    (sb-thread:barrier (:write))
+    (sb-thread:join-thread thread)))
+
 (logical-delete-nth 0 *lll2*)
 
 (defvar *lfl*)
@@ -81,7 +117,7 @@
     (when show (show (list-head *lfl*) #'get-next "del "))))
 
 ;; Enable heap validity tester
-#+gencgc (setf (sb-alien:extern-alien "verify_gens" char) 0)
+#+(and generational (not gc-stress)) (setf (sb-alien:extern-alien "verify_gens" char) 0)
 
 (test-util:with-test (:name :lockfree-list-gc-correctness)
   ;; Create a small list and perform logical deletion of 2 nodes
@@ -213,10 +249,12 @@
 
 ;; Show that nodes which are referenced only via a "fixnum" pointer
 ;; can and do actually move via GC, which adjusts the fixnum accordingly.
-(test-util:with-test (:name :lfl-not-pinned)
+(test-util:with-test (:name :lfl-not-pinned
+                      :skipped-on :gc-stress)
   (gc)
   (assert (= (sb-kernel:generation-of *5*) 0))
   (assert (= (sb-kernel:generation-of *10*) 0))
+  #-mark-region-gc
   (assert (not (eql (get-lisp-obj-address *10*)
                     *addr-of-10*))))
 
@@ -331,8 +369,8 @@
   ;; is a dummy node, so head->next is "ANT" and head->next->next is "BAT"
   ;; which can be construed as the CDR and not the CDDR of the list.
   (let ((cdr
-       (sb-lockless::get-next
-        (sb-lockless::get-next
+       (sb-lockless:get-next
+        (sb-lockless:get-next
          (sb-lockless::list-head lflist)))))
     (assert (sb-lockless:lfl-find lflist "BAT"))
     ;; starting at CDR you can't find "ANT"

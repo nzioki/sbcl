@@ -68,7 +68,7 @@
     (inst cmp
           (make-ea :dword
                    :disp (+ (id-bits-offset)
-                            (ash (- (wrapper-depthoid test) 2) 2)
+                            (ash (- (layout-depthoid test) 2) 2)
                             (- instance-pointer-lowtag))
                    :base x)
           (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
@@ -137,15 +137,6 @@
                  (ash mask -8)))
           (t
            (bug "Unimplemented")))))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg) :target res))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (move res ptr)
-    (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; allocation
 
@@ -233,10 +224,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
-    (inst lea result
-          (make-ea :byte :base result
-                   :disp (- fun-pointer-lowtag
-                            (* simple-fun-insts-offset n-word-bytes))))))
+    (inst sub result (- (* simple-fun-insts-offset n-word-bytes) fun-pointer-lowtag))))
 
 
 ;;;; other miscellaneous VOPs

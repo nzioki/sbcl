@@ -42,7 +42,7 @@
 (defun defstruct-classoid-p (classoid)
   ;; It is non-obvious to me why STRUCTURE-CLASSOID-P doesn't
   ;; work instead of this. -- NS 2008-03-14
-  (typep (sb-kernel::wrapper-%info (classoid-wrapper classoid))
+  (typep (sb-kernel::layout-%info (classoid-layout classoid))
          'defstruct-description))
 
 ;;; This excludes structure types created with the :TYPE option to
@@ -61,55 +61,17 @@
 
 ;;; Symbol contruction utilities
 (defun pkg-format-symbol (package format-string &rest format-arguments)
-  (without-package-locks
-   (intern (possibly-base-stringize
-            (apply #'format nil format-string format-arguments))
-           package)))
+  ;; It's unclear to me why ignoring package locks here is a good thing.
+  (symbolicate! package (apply #'format nil format-string format-arguments)))
 ;; Like the preceding, but always use PCL package, and override the package lock
 ;; in a more elegant way than using WITHOUT-PACKAGE-LOCKS.
-(defun pcl-format-symbol (format-string &rest format-arguments)
-  (let ((string (possibly-base-stringize
-                 (let ((*package* *keyword-package*))
-                   (apply #'format nil format-string format-arguments)))))
-    ;; Is there any way this can actually NOT be of type base-char?
-    (sb-impl::%intern string (length string) #.(find-package "SB-PCL")
-                      (if (simple-base-string-p string) 'base-char 'character)
-                      t ; ignore lock
-                      nil))) ; no inheritance. Does it matter?
+(defun pcl-symbolicate (&rest things)
+  (apply #'symbolicate! #.(find-package "SB-PCL") things))
 
 (defun condition-type-p (type)
   (and (symbolp type)
        (condition-classoid-p (find-classoid type nil))))
 
-(defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
-  `(dotimes (,var (the fixnum ,count) ,result)
-     (declare (fixnum ,var))
-     ,@body))
-
-(define-load-time-global *pcl-misc-random-state* (make-random-state))
-
-(declaim (inline random-fixnum))
-(defun random-fixnum ()
-  (random (1+ most-positive-fixnum)
-          (load-time-value *pcl-misc-random-state*)))
-
-;;; Lambda which executes its body (or not) randomly. Used to drop
-;;; random cache entries.
-;;; This formerly punted with slightly greater than 50% probability,
-;;; and there was a periodicity to the nonrandomess.
-;;; If that was intentional, it should have been commented to that effect.
-(defmacro randomly-punting-lambda (lambda-list &body body)
-  (with-unique-names (drops drop-pos)
-    `(let ((,drops (random-fixnum)) ; means a POSITIVE fixnum
-           (,drop-pos sb-vm:n-positive-fixnum-bits))
-       (declare (fixnum ,drops)
-                (type (mod #.sb-vm:n-fixnum-bits) ,drop-pos))
-       (lambda ,lambda-list
-         (when (logbitp (the unsigned-byte (decf ,drop-pos)) ,drops)
-           (locally ,@body))
-         (when (zerop ,drop-pos)
-           (setf ,drops (random-fixnum)
-                 ,drop-pos sb-vm:n-positive-fixnum-bits))))))
 
 (defun set-funcallable-instance-function (fin new-value)
   (declare (type function new-value))

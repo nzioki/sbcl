@@ -3,7 +3,8 @@
   ;; we need a few very internal symbols
   (:import-from "SB-BIGNUM"
                 "%BIGNUM-0-OR-PLUSP" "%NORMALIZE-BIGNUM"
-                "NEGATE-BIGNUM-IN-PLACE")
+                "NEGATE-BIGNUM-IN-PLACE"
+                "NEGATE-BIGNUM-NOT-FULLY-NORMALIZED")
   (:export
    ;; bignum integer operations
    #:mpz-add
@@ -82,7 +83,7 @@
 (defun %load-gmp ()
   (or (some #'try-load-shared-object
             #-(or win32 darwin) '("libgmp.so" "libgmp.so.10" "libgmp.so.3")
-            #+darwin '("libgmp.dylib" "libgmp.10.dylib" "libgmp.3.dylib")
+            #+darwin '("libgmp.dylib" "libgmp.10.dylib" "libgmp.3.dylib" #+arm64 "/opt/homebrew/lib/libgmp.dylib")
             #+win32 '("libgmp.dll" "libgmp-10.dll" "libgmp-3.dll"))
       (warn "GMP not loaded.")))
 
@@ -344,7 +345,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 (defmacro with-mpz-results (pairs &body body)
   (loop for (gres size) in pairs
         for res = (gensym "RESULT")
-        collect `(when (> ,size sb-kernel:maximum-bignum-length)
+        collect `(when (> ,size sb-bignum:maximum-bignum-length)
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,gres (struct gmpint)) into declares
         collect `(,res (allocate-bignum ,size))
@@ -377,7 +378,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
         collect `(,ga (struct gmpint)) into declares
         collect `(,barg (bassert ,a)) into gmpinits
         collect `(,plusp (%bignum-0-or-plusp ,barg (%bignum-length ,barg))) into gmpinits
-        collect `(,arg (if ,plusp ,barg (negate-bignum ,barg nil))) into gmpinits
+        collect `(,arg (if ,plusp ,barg (negate-bignum-not-fully-normalized ,barg))) into gmpinits
         collect `(,length (%bignum-length ,arg)) into gmpinits
         collect arg into vars
         collect `(setf (slot ,ga 'mp_alloc) ,length
@@ -404,7 +405,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
         collect `(__gmpz_init (addr ,gres)) into inits
         collect `(,size (abs (slot ,gres 'mp_size)))
           into resinits
-        collect `(when (> ,size (1- sb-kernel:maximum-bignum-length))
+        collect `(when (> ,size (1- sb-bignum:maximum-bignum-length))
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,res (allocate-bignum (1+ ,size)))
           into resallocs
@@ -761,7 +762,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
             (ad (bassert (denominator ,var)))
             (asign (not (%bignum-0-or-plusp an (%bignum-length an)))))
        (when asign
-           (setf an (negate-bignum an nil)))
+           (setf an (negate-bignum-not-fully-normalized an)))
        (let* ((anlen (%lsize asign an))
               (adlen (%lsize NIL ad)))
            (with-alien ((,mpqvar (struct gmprat)))
@@ -816,9 +817,9 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
                       (bd (bassert (denominator b)))
                       (bsign (not (%bignum-0-or-plusp bn (%bignum-length bn)))))
                  (when asign
-                   (setf an (negate-bignum an nil)))
+                   (setf an (negate-bignum-not-fully-normalized an)))
                  (when bsign
-                   (setf bn (negate-bignum bn nil)))
+                   (setf bn (negate-bignum-not-fully-normalized bn)))
                  (let* ((anlen (%lsize asign an))
                         (adlen (%lsize NIL ad))
                         (bnlen (%lsize bsign bn))
@@ -958,7 +959,8 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-/ x y)))
 
 (defun gmp-intexp (base power)
-  (declare (inline mpz-mul-2exp mpz-pow))
+  (declare (inline mpz-mul-2exp mpz-pow)
+           (optimize (sb-c:verify-arg-count 0)))
   (cond
     ((or (and (integerp base)
               (< (abs power) 1000)
@@ -969,7 +971,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
     (t
      (check-type power (integer #.(1+ most-negative-fixnum) #.most-positive-fixnum))
      (cond ((minusp power)
-            (/ (the integer (gmp-intexp base (- power)))))
+            (/ (gmp-intexp base (- power))))
            ((eql base 2)
             (mpz-mul-2exp 1 power))
            ((typep base 'ratio)

@@ -27,7 +27,8 @@
                           character-widetag)))
       (structure-object
        (if (eq val sb-lockless:+tail+)
-           (inst addi y null-tn (- sb-vm::lockfree-list-tail-value sb-vm:nil-value))
+           (inst addi y null-tn (- lockfree-list-tail-value-offset
+                                   nil-value-offset))
            (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
@@ -148,14 +149,12 @@
   (:note "integer to untagged word coercion")
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 4
-    (let ((done (gen-label)))
-      (inst andi. temp x fixnum-tag-mask)
-      (inst srawi y x n-fixnum-tag-bits)
+    (inst andi. temp x fixnum-tag-mask)
+    (inst srawi y x n-fixnum-tag-bits)
 
-      (inst beq done)
-      (loadw y x bignum-digits-offset other-pointer-lowtag)
-
-      (emit-label done))))
+    (inst beq done)
+    (loadw y x bignum-digits-offset other-pointer-lowtag)
+    DONE))
 (define-move-vop move-to-word/integer :move
   (descriptor-reg) (signed-reg unsigned-reg))
 

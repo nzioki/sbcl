@@ -76,8 +76,7 @@
                   (eq (first (sb-impl::ef-names external-format)) :latin-1))))))
 
 (declaim (ftype (sfunction (t) nil) null-error))
-(defun null-error (type)
-  #-sb-xc-host(declare (optimize sb-kernel:allow-non-returning-tail-call))
+(sb-kernel:define-error-wrapper null-error (type)
   (aver (alien-c-string-type-not-null type))
   (error 'type-error
          :expected-type `(alien ,(unparse-alien-type type))
@@ -136,3 +135,14 @@
              (simple-string
               (string-to-c-string ,value
                                   (c-string-external-format ,type)))))))
+;;;; Struct Support (or the lack thereof)
+;; NOTE: RECORD follows the hierarchy of RECORD -> MEM-BLOCK -> ALIEN-VALUE -> SAP.
+;; All platforms have passing SAP defined, which causes passing record by value
+;; to silently corrupt.
+;; -- Rongcui
+(define-alien-type-method (record :arg-tn) (type state)
+  (declare (ignore type state))
+  (error "Passing structs by value is unsupported on this platform."))
+(define-alien-type-method (record :result-tn) (type state)
+  (declare (ignore type state))
+  (error "Returning structs by value is unsupported on this platform."))

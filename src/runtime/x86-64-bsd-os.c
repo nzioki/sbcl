@@ -1,7 +1,9 @@
 #include <signal.h>
-#include "sbcl.h"
+#include <errno.h>
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "thread.h"
+#include "interr.h"
 #include "lispregs.h"
 
 #if defined(LISP_FEATURE_FREEBSD)
@@ -27,7 +29,39 @@
  * entails; unfortunately, currently the situation is worse, not
  * better, than in the above paragraph. */
 
-#if defined(LISP_FEATURE_FREEBSD) || defined(LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_OPENBSD) || defined(LISP_FEATURE_DRAGONFLY)
+#ifdef LISP_FEATURE_NETBSD
+#define _REG_rax _REG_RAX
+#define _REG_rcx _REG_RCX
+#define _REG_rdx _REG_RDX
+#define _REG_rbx _REG_RBX
+#define _REG_rsp _REG_RSP
+#define _REG_rbp _REG_RBP
+#define _REG_rsi _REG_RSI
+#define _REG_rdi _REG_RDI
+#define _REG_r8  _REG_R8
+#define _REG_r9  _REG_R9
+#define _REG_r10 _REG_R10
+#define _REG_r11 _REG_R11
+#define _REG_r12 _REG_R12
+#define _REG_r13 _REG_R13
+#define _REG_r14 _REG_R14
+#define _REG_r15 _REG_R15
+#endif
+
+void visit_context_registers(void (*proc)(os_context_register_t,void*),
+                             os_context_t *context, void* arg)
+{
+    proc(OS_CONTEXT_PC(context), arg);
+    proc(CONTEXT_SLOT(context, rax), arg); proc(CONTEXT_SLOT(context, r8),  arg);
+    proc(CONTEXT_SLOT(context, rcx), arg); proc(CONTEXT_SLOT(context, r9),  arg);
+    proc(CONTEXT_SLOT(context, rdx), arg); proc(CONTEXT_SLOT(context, r10), arg);
+    proc(CONTEXT_SLOT(context, rbx), arg); proc(CONTEXT_SLOT(context, r11), arg);
+    /* ignore rsp */                       proc(CONTEXT_SLOT(context, r12), arg);
+    /* ignore rbp */                       proc(CONTEXT_SLOT(context, r13), arg);
+    proc(CONTEXT_SLOT(context, rsi), arg); proc(CONTEXT_SLOT(context, r14), arg);
+    proc(CONTEXT_SLOT(context, rdi), arg); proc(CONTEXT_SLOT(context, r15), arg);
+}
+
 os_context_register_t *
 os_context_register_addr(os_context_t *context, int offset)
 {
@@ -81,56 +115,6 @@ os_context_fp_addr(os_context_t *context)
     return CONTEXT_ADDR_FROM_STEM(rbp);
 }
 
-#elif defined(LISP_FEATURE_NETBSD)
-os_context_register_t *
-os_context_register_addr(os_context_t *context, int offset)
-{
-    switch(offset) {
-    case reg_RAX:
-        return CONTEXT_ADDR_FROM_STEM(RAX);
-    case reg_RCX:
-        return CONTEXT_ADDR_FROM_STEM(RCX);
-    case reg_RDX:
-        return CONTEXT_ADDR_FROM_STEM(RDX);
-    case reg_RBX:
-        return CONTEXT_ADDR_FROM_STEM(RBX);
-    case reg_RSP:
-        return CONTEXT_ADDR_FROM_STEM(RSP);
-    case reg_RBP:
-        return CONTEXT_ADDR_FROM_STEM(RBP);
-    case reg_RSI:
-        return CONTEXT_ADDR_FROM_STEM(RSI);
-    case reg_RDI:
-        return CONTEXT_ADDR_FROM_STEM(RDI);
-    case reg_R8:
-        return CONTEXT_ADDR_FROM_STEM(R8);
-    case reg_R9:
-        return CONTEXT_ADDR_FROM_STEM(R9);
-    case reg_R10:
-        return CONTEXT_ADDR_FROM_STEM(R10);
-    case reg_R11:
-        return CONTEXT_ADDR_FROM_STEM(R11);
-    case reg_R12:
-        return CONTEXT_ADDR_FROM_STEM(R12);
-    case reg_R13:
-        return CONTEXT_ADDR_FROM_STEM(R13);
-    case reg_R14:
-        return CONTEXT_ADDR_FROM_STEM(R14);
-    case reg_R15:
-        return CONTEXT_ADDR_FROM_STEM(R15);
-    default:
-        return 0;
-    }
-}
-
-os_context_register_t *
-os_context_sp_addr(os_context_t *context)
-{
-    return CONTEXT_ADDR_FROM_STEM(RSP);
-}
-
-#endif
-
 void
 os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
@@ -144,7 +128,8 @@ int arch_os_thread_init(struct thread *thread) {
     sigstack.ss_sp    = calc_altstack_base(thread);
     sigstack.ss_flags = 0;
     sigstack.ss_size  = calc_altstack_size(thread);
-    sigaltstack(&sigstack,0);
+    if (sigaltstack(&sigstack,0)<0)
+        lose("Cannot sigaltstack: %s",strerror(errno));
     return 1;                  /* success */
 }
 

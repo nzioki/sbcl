@@ -132,9 +132,16 @@
 ;;; An IR2-BLOCK holds information about a block that is used during
 ;;; and after IR2 conversion. It is stored in the BLOCK-INFO slot for
 ;;; the associated block.
-(defstruct (ir2-block (:include block-annotation)
-                      (:constructor make-ir2-block (block))
+(defstruct (ir2-block (:constructor make-ir2-block (block))
                       (:copier nil))
+  ;; The IR1 block that this block is in the INFO for.
+  (block (missing-arg) :type cblock)
+  ;; the next and previous block in emission order (not DFO). This
+  ;; determines which block we drop though to, and is also used to
+  ;; chain together overflow blocks that result from splitting of IR2
+  ;; blocks in lifetime analysis.
+  (next nil :type (or ir2-block null))
+  (prev nil :type (or ir2-block null))
   ;; the IR2-BLOCK's number, which differs from BLOCK's BLOCK-NUMBER
   ;; if any blocks are split. This is assigned by lifetime analysis.
   (number nil :type (or index null))
@@ -155,6 +162,9 @@
   ;; first.
   (start-stack () :type list)
   (end-stack () :type list)
+  ;; list of all lvars ever pushed onto the stack when control reaches
+  ;; the start of this block.
+  (stack-mess-up () :type list)
   ;; the first and last VOP in this block. If there are none, both
   ;; slots are null.
   (start-vop nil :type (or vop null))
@@ -231,7 +241,10 @@
   ;;
   ;; If this is :UNUSED, then this LVAR should never actually be used
   ;; as the destination of a value: it is only used tail-recursively.
-  (kind :fixed :type (member :delayed :fixed :unknown :unused))
+  ;;
+  ;; If this is :STACK, then this LVAR represents the stack pointer
+  ;; used to undo stack allocation of dynamic extent objects.
+  (kind :fixed :type (member :delayed :fixed :unknown :unused :stack))
   ;; The primitive-type of the first value of this LVAR. This is
   ;; primarily for internal use during LTN, but it also records the
   ;; type restriction on delayed references. In multiple-value
@@ -248,8 +261,7 @@
   ;; since type checking is the responsibility of the values receiver,
   ;; these TNs primitive type is only based on the proven type
   ;; information.
-  (locs nil :type list)
-  (stack-pointer nil :type (or tn null)))
+  (locs nil :type list))
 
 (defprinter (ir2-lvar)
   kind
@@ -281,6 +293,7 @@
   ;; These TNs will also appear in the {NORMAL,RESTRICTED,WIRED} TNs
   ;; as appropriate to their location.
   (component-tns () :type list)
+  #-c-stack-is-control-stack
   ;; If this component has a NFP, then this is it.
   (nfp nil :type (or tn null))
   ;; a list of the explicitly specified save TNs (kind
@@ -291,12 +304,16 @@
   ;; POPPED. This slot is initialized by LTN-ANALYZE as an input to
   ;; STACK-ANALYZE.
   (values-receivers nil :type list)
+  ;; If this component stack allocates anything, this is true.
+  (stack-allocates-p nil :type boolean)
+  ;; a list of all the blocks which mess up the stack with dynamic
+  ;; extent allocated objects.
+  (stack-mess-ups nil :type list)
   ;; an adjustable vector that records all the constants in the
   ;; constant pool. A non-immediate :CONSTANT TN with offset 0 refers
   ;; to the constant in element 0, etc. Normal constants are
   ;; represented by the placing the CONSTANT leaf in this vector. A
-  ;; load-time constant is distinguished by being a cons
-  ;; (KIND WHAT TN).
+  ;; load-time constant is distinguished by being a cons (KIND WHAT).
   ;; KIND is a keyword indicating how the constant is computed, and
   ;; WHAT is some context.
   ;;
@@ -318,11 +335,14 @@
   ;;    Is replaced with the result of executing the forms
   ;;    to compute <handle>.
   ;;
+  ;; as well as a few other forms of magic - see DUMP-CODE-OBJECT.
+  ;; (:coverage-marks )
+
   ;; A null entry in this vector is a placeholder for implementation
   ;; overhead that is eventually stuffed in somehow.
   ;; Prior to performing SORT-BOXED-CONSTANTS, the index 0 is reserved
   ;; to signify something (other than NIL) if stored as a TN-OFFSET,
-  ;; though nothing makes use of this at present.
+  ;; though nothing makes use of this at present. (Uh, what did I mean by this?)
   (constants (make-array 10 :fill-pointer 1 :adjustable t
                          :initial-element :ignore)
              :type vector :read-only t)
@@ -358,8 +378,6 @@
 ;;; this case the slots aren't actually initialized until entry
 ;;; analysis runs.
 (defstruct (entry-info (:copier nil))
-  ;; True if this function has a non-null closure environment.
-  (closure-p nil :type boolean)
   ;; TN, containing closure (if needed) for this function in the home
   ;; environment.
   (closure-tn nil :type (or null tn))
@@ -416,6 +434,7 @@
   ;; True if this function has a frame on the number stack. This is
   ;; set by representation selection whenever it is possible that some
   ;; function in our tail set will make use of the number stack.
+  #-c-stack-is-control-stack
   (number-stack-p nil :type boolean)
   ;; a list of all the :ENVIRONMENT TNs live in this environment
   (live-tns nil :type list)
@@ -448,7 +467,7 @@
   ;; The return convention used:
   ;; -- If :UNKNOWN, we use the standard return convention.
   ;; -- If :FIXED, we use the known-values convention.
-  (kind (missing-arg) :type (member :fixed :unknown))
+  (kind (missing-arg) :type (member :fixed :unknown :unboxed))
   ;; the number of values returned, or :UNKNOWN if we don't know.
   ;; COUNT may be known when KIND is :UNKNOWN, since we may choose the
   ;; standard return convention for other reasons.
@@ -536,6 +555,8 @@
   ;; the link for a list running through all TN-REFs for this TN of
   ;; the same kind (read or write)
   (next nil :type (or tn-ref null))
+  ;; For faster delete-tn-ref
+  (prev nil :type (or tn-ref null))
   ;; the VOP where the reference happens, or NIL temporarily
   (vop nil :type (or vop null))
   ;; the link for a list of all TN-REFs in VOP, in reverse order of
@@ -713,7 +734,8 @@
   (optimizer nil :type (or null function (cons function symbol)))
   (optional-results nil :type list)
   move-vop-p
-  (after-sc-selection nil :type (or null function) :read-only t))
+  (after-sc-selection nil :type (or null function) :read-only t)
+  gc-barrier)
 (!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 (declaim (inline vop-name))
@@ -1141,3 +1163,10 @@
   block
   kind
   (number :test number))
+
+(defstruct (conditional-flags
+            (:constructor make-conditional-flags (flags))
+            (:copier nil))
+  flags)
+
+(declaim (freeze-type conditional-flags))

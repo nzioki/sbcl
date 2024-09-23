@@ -11,27 +11,19 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "arch.h"
 #include "globals.h"
 #include "validate.h"
 #include "os.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include "signal.h"
+#include <signal.h>
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
-#include "alloc.h"
 #include "pseudo-atomic.h"
-
-#if defined(LISP_FEATURE_GENCGC)
-#include "gencgc-alloc-region.h"
-#endif
-
-#ifdef LISP_FEATURE_SB_THREAD
-#include "pseudo-atomic.h"
-#endif
+#include "gc-assert.h"
 
   /* The header files may not define PT_DAR/PT_DSISR.  This definition
      is correct for all versions of ppc linux >= 2.0.30
@@ -46,8 +38,10 @@
 
      Caveat callers.  */
 
+#if defined (LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_LINUX)
 #ifndef PT_DAR
 #define PT_DAR          41
+#endif
 
 #ifndef PT_DSISR
 #define PT_DSISR        42
@@ -88,22 +82,16 @@ arch_internal_error_arguments(os_context_t *context)
 }
 
 
-boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
-{
-    return get_pseudo_atomic_atomic(get_sb_vm_thread());
+bool arch_pseudo_atomic_atomic(struct thread *thread) {
+    return get_pseudo_atomic_atomic(thread);
 }
 
-void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
-{
-    set_pseudo_atomic_interrupted(get_sb_vm_thread());
+void arch_set_pseudo_atomic_interrupted(struct thread *thread) {
+    set_pseudo_atomic_interrupted(thread);
 }
 
-void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
-{
-    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
+void arch_clear_pseudo_atomic_interrupted(struct thread *thread) {
+    clear_pseudo_atomic_interrupted(thread);
 }
 
 unsigned int
@@ -143,7 +131,7 @@ arch_remove_breakpoint(void *pc, unsigned int orig_inst)
 static unsigned int *skipped_break_addr, displaced_after_inst;
 static sigset_t orig_sigmask;
 
-static boolean
+static bool
 should_branch(os_context_t *context, unsigned int orig_inst)
 {
     /* orig_inst is a conditional branch instruction.  We need to
@@ -379,7 +367,7 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
      *
      */
 
-    boolean handle_it = 0;
+    bool handle_it = 0;
     unsigned prev_inst;
     if ((code & ~(31 << 16)) == ((3<<26)|(4<<21))) { // mask out RA for test
         prev_inst= ((uint32_t*)pc)[-1];
@@ -391,8 +379,11 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
     }
     if (!handle_it) return 0;
 
-    struct thread *thread = get_sb_vm_thread();
-    set_pseudo_atomic_atomic(thread);
+#ifdef DEBUG
+    sigset_t curmask;
+    pthread_sigmask(SIG_BLOCK, 0, &curmask);
+    gc_assert(sigismember(&curmask, SIG_STOP_FOR_GC));
+#endif
 
     int symbol_reg = (prev_inst >> 16) & 31;
     struct symbol *specvar =
@@ -435,7 +426,6 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
     // This is actually always going to be 0 for 64-bit code
     int tlsindex_reg = (code >> 16) & 31; // the register we trapped on
     *os_context_register_addr(context, tlsindex_reg) = tls_index;
-    clear_pseudo_atomic_atomic(thread);
     return 1; // handled this signal
 }
 #endif
@@ -516,7 +506,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
             if (handle_allocation_trap(context)) return;
         }
         if (code == 0x7C2002A6) { // pending interrupt
-            arch_clear_pseudo_atomic_interrupted(context);
+            arch_clear_pseudo_atomic_interrupted(get_sb_vm_thread());
             arch_skip_instruction(context);
             interrupt_handle_pending(context);
             return;
@@ -533,7 +523,7 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     if (code == ((3 << 26) | (0x18 << 21) | (reg_NL3 << 16))|| // TWI NE,$NL3,0
         /* trap instruction from do_pending_interrupt */
         code == 0x7fe00008) { // TW T,0,0
-        arch_clear_pseudo_atomic_interrupted(context);
+        arch_clear_pseudo_atomic_interrupted(get_sb_vm_thread());
         arch_skip_instruction(context);
         /* interrupt or GC was requested in PA; now we're done with the
            PA section we may as well get around to it */
@@ -608,7 +598,7 @@ ppc_flush_icache(os_vm_address_t address, os_vm_size_t length)
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-  char *reloc_addr = (char*)ALIEN_LINKAGE_TABLE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
+  char *reloc_addr = (char*)ALIEN_LINKAGE_SPACE_START + index * ALIEN_LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;
@@ -749,9 +739,28 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
 
+#ifdef LISP_FEATURE_64_BIT
+#include "forwarding-ptr.inc"
+/* Return the tagged pointer for which 'entrypoint' is the starting address.
+ * This result must have SIMPLE_FUN_WIDETAG.
+ * If the thing has been forwarded, we do NOT return the newspace copy.
+ */
+lispobj entrypoint_taggedptr(uword_t entrypoint) {
+    if (!entrypoint || points_to_asm_code_p(entrypoint)) return 0;
+    lispobj* phdr = (lispobj*)(entrypoint - 2*N_WORD_BYTES);
+    if (forwarding_pointer_p(phdr)) {
+        gc_assert(lowtag_of(forwarding_pointer_value(phdr)) == FUN_POINTER_LOWTAG);
+        // We can't assert on the widetag if forwarded, because defragmentation
+        // puts the new logical object at some totally different physical address.
+        // This function doesn't know if defrag is occurring.
+    } else {
+        __attribute__((unused)) unsigned char widetag = widetag_of(phdr);
+        gc_assert(widetag == SIMPLE_FUN_WIDETAG);
+    }
+    return make_lispobj(phdr, FUN_POINTER_LOWTAG);
+}
 void gcbarrier_patch_code(void* where, int nbits)
 {
-#ifdef LISP_FEATURE_64_BIT
     int m_operand = 64 - nbits;
     // the M field has a kooky encoding
     int m_encoded = ((m_operand & 0x1F) << 1) | (m_operand >> 5);
@@ -760,7 +769,5 @@ void gcbarrier_patch_code(void* where, int nbits)
     // .... ____ _xxx xxx_ ____ = 0x7E0;
     //                  ^ deposit it here, in (BYTE 6 5) of the instruction.
     *pc = (inst & ~0x7E0) | (m_encoded << 5);
-#else
-    lose("can't patch rldicl in 32-bit"); // illegal instruction
-#endif
 }
+#endif

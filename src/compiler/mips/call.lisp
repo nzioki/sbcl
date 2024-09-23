@@ -1158,21 +1158,17 @@ default-value-8
   (:policy :safe)
   (:node-var node)
   (:generator 20
-    (let* ((enter (gen-label))
-           (loop (gen-label))
-           (done (gen-label))
-           (leave-pa (gen-label))
-           (dx-p (node-stack-allocate-p node)))
-      (move context context-arg)
-      (move count count-arg)
+    (move context context-arg)
+    (move count count-arg)
       ;; Check to see if there are any arguments.
-      (inst beq count done)
-      (inst move result null-tn)
+    (inst beq count done)
+    (inst move result null-tn)
 
       ;; We need to do this atomically.
-      (pseudo-atomic (pa-flag :elide-if dx-p)
+    (pseudo-atomic (pa-flag :elide-if (node-stack-allocate-p node))
+      (assemble ()
         (inst sll count 1)
-        (cond (dx-p
+        (cond ((node-stack-allocate-p node)
                (allocation 'list count result list-pointer-lowtag `(,pa-flag ,temp)
                            :stackp t))
               (t
@@ -1180,8 +1176,8 @@ default-value-8
                      (new-freeptr temp)
                      (continue (gen-label)))
                  (without-scheduling ()
-                   (inst lw result null-tn (- cons-region nil-value))
-                   (inst lw end-addr null-tn (+ 4 (- cons-region nil-value)))
+                   (inst lw result null-tn (- cons-region-offset nil-value-offset))
+                   (inst lw end-addr null-tn (+ 4 (- cons-region-offset nil-value-offset)))
                    (inst add new-freeptr result count)
                    ;; Use a different 'code' field for listify. Technically there are enough
                    ;; bits in the code field to indicate how many bytes to skip to branch out
@@ -1193,10 +1189,10 @@ default-value-8
                    ;; Encode CONTEXT into a dummy instruction
                    (inst addu zero-tn context context) ; ADDU never signals overflow
                    ;; If we return here, then skip the loop
-                   (inst beq zero-tn leave-pa)
+                   (inst beq zero-tn ALLOC-DONE)
                    (inst nop)
                    (emit-label continue)
-                   (inst sw new-freeptr null-tn (- cons-region nil-value))
+                   (inst sw new-freeptr null-tn (- cons-region-offset nil-value-offset))
                    (inst or result list-pointer-lowtag)))))
 
         (move dst result)
@@ -1205,11 +1201,11 @@ default-value-8
         (inst srl count 1)
 
         ;; Store the current cons in the cdr of the previous cons.
-        (emit-label loop)
+        LOOP
         (inst addu dst dst (* 2 n-word-bytes))
         (storew dst dst -1 list-pointer-lowtag)
 
-        (emit-label enter)
+        ENTER
         ;; Grab one value.
         (loadw temp context)
         (inst addu context n-word-bytes)
@@ -1223,8 +1219,8 @@ default-value-8
 
         ;; NIL out the last cons.
         (storew null-tn dst 1 list-pointer-lowtag)
-        (emit-label leave-pa))
-      (emit-label done))))
+        ALLOC-DONE))
+      DONE))
 
 ;;; Return the location and size of the more arg glob created by Copy-More-Arg.
 ;;; Supplied is the total number of arguments supplied (originally passed in

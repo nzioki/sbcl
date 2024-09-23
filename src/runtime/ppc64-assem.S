@@ -1,12 +1,6 @@
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "lispregs.h"
-#include "globals.h"
-
-#include "genesis/simple-fun.h"
-#include "genesis/fdefn.h"
 #include "genesis/closure.h"
-#include "genesis/code.h"
-#include "genesis/funcallable-instance.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
 
@@ -156,7 +150,7 @@ Low Address
 
 	/* Turn on pseudo-atomic */
 	BEGIN_PSEUDO_ATOMIC
-	std reg_ZERO,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	std reg_ZERO,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 	ld reg_BSP,THREAD_BINDING_STACK_POINTER_OFFSET(reg_THREAD)
 	ld reg_CSP,THREAD_CONTROL_STACK_POINTER_OFFSET(reg_THREAD)
 	ld reg_OCFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
@@ -184,7 +178,7 @@ Low Address
 	/* Function is an indirect closure */
 	addi reg_NL0,reg_LEXENV,SIMPLE_FUN_SELF_OFFSET
 	ld reg_CODE,0(reg_NL0)
-	addi reg_LIP,reg_CODE,SIMPLE_FUN_INSTS_OFFSET
+	addi reg_LIP,reg_CODE,0
 	mtctr reg_LIP
 	sldi reg_NARGS, reg_NL2, N_FIXNUM_TAG_BITS
 	bctr
@@ -215,7 +209,7 @@ lra:
 	std reg_CFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
 
 	/* No longer in Lisp. */
-	std reg_THREAD,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	std reg_THREAD,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 
 	/* Check for interrupt */
 	END_PSEUDO_ATOMIC
@@ -267,7 +261,7 @@ lra:
 	std reg_CFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
 
 	/* No longer in Lisp. */
-	std reg_CSP,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	std reg_CSP,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 	/* Disable pseudo-atomic; check pending interrupt */
 	END_PSEUDO_ATOMIC
 
@@ -328,7 +322,7 @@ lra:
 	BEGIN_PSEUDO_ATOMIC
 
 	/* No longer in foreign function call. */
-	std reg_ZERO,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	std reg_ZERO,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 
 	/* The binding stack pointer isn't preserved by C. */
 	ld reg_BSP,THREAD_BINDING_STACK_POINTER_OFFSET(reg_THREAD)

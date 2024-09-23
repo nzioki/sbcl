@@ -11,7 +11,8 @@
 
 (in-package "SB-VM")
 
-(defun load-immediate-word (y val &optional single-instruction)
+(defun load-immediate-word (y val &optional single-instruction
+                                            ignore-tag)
   (let (single-mov
         ffff-count
         zero-count
@@ -25,7 +26,8 @@
                    (setf ffff-count ffff
                          zero-count zero
                          single-mov (or (= ffff 1)
-                                        (= zero 1))))))
+                                        (= zero 1))))
+             single-mov))
       (cond ((typep val '(unsigned-byte 16))
              (inst movz y val)
              y)
@@ -35,6 +37,24 @@
             ((encode-logical-immediate val)
              (inst orr y zr-tn val)
              y)
+            ((and (typep val '(unsigned-byte 32))
+                  (cond ((encode-logical-immediate val 32)
+                         (inst orr (32-bit-reg y) zr-tn val)
+                         t)
+                        ((zerop (ldb (byte 16 0) (lognot val)))
+                         (inst movn (32-bit-reg y) (ldb (byte 16 16) (lognot val)) 16)
+                         t)
+                        ((zerop (ldb (byte 16 16) (lognot val)))
+                         (inst movn (32-bit-reg y) (ldb (byte 16 0) (lognot val)))
+                         t)))
+
+             y)
+            ((and ignore-tag
+                  (not (logtest fixnum-tag-mask val))
+                  ;; Contiguous bits are more likely to be better
+                  (logbitp n-fixnum-tag-bits val))
+             (load-immediate-word y (logior val fixnum-tag-mask)
+                                  single-instruction))
             ((and
               (not (single-mov))
               (not single-instruction)
@@ -84,6 +104,18 @@
                                (try b a 0 c 32))
                               ((= c d)
                                (try c a 0 b 16)))))))
+             y)
+            ((and (not single-mov)
+                  (not single-instruction)
+                  (= (ldb (byte 32 0) val)
+                     (ldb (byte 32 32) val))
+                  (let ((a (ldb (byte 16 0) val))
+                        (b (ldb (byte 16 16) val)))
+                    (when (and (/= a #xFFFF 0)
+                               (/= b #xFFFF 0))
+                      (inst movz y a)
+                      (inst movk y b 16)
+                      (inst orr y y (lsl y 32)))))
              y)
             ((and (< ffff-count zero-count)
                   (or single-mov
@@ -146,7 +178,8 @@
        (load-symbol y val))
       (structure-object
        (if (eq val sb-lockless:+tail+)
-           (inst add y null-tn (- sb-vm::lockfree-list-tail-value sb-vm:nil-value))
+           (inst add y null-tn (- lockfree-list-tail-value-offset
+                                  nil-value-offset))
            (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
@@ -263,10 +296,13 @@
              (load-arg (x load-tn)
                (sc-case x
                  ((constant immediate control-stack)
-                  (let ((load-tn (if (and used-load-tn
-                                          (location= used-load-tn load-tn))
-                                     tmp-tn
-                                     load-tn)))
+                  (let ((load-tn (cond ((not (and used-load-tn
+                                                  (location= used-load-tn load-tn)))
+                                        load-tn)
+                                       ((sb-c::tn-reads load-tn)
+                                        (return-from load-arg))
+                                       (t
+                                        tmp-tn))))
                     (setf used-load-tn load-tn)
                     (sc-case x
                       (constant
@@ -457,13 +493,11 @@
 ;;; RESULT may be a bignum, so we have to check.  Use a worst-case
 ;;; cost to make sure people know they may be number consing.
 (define-vop (move-from-signed)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :result))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "signed word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst adds y x x)
     (inst b :vc DONE)
     (with-fixed-allocation (y lr bignum-widetag (1+ bignum-digits-offset)
@@ -499,13 +533,11 @@
 ;;; result.  Use a worst-case cost to make sure people know they may
 ;;; be number consing.
 (define-vop (move-from-unsigned)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :save))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "unsigned word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst tst x (ash (1- (ash 1 (- n-word-bits
                                    n-positive-fixnum-bits)))
                      n-positive-fixnum-bits))

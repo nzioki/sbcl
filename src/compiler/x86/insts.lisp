@@ -761,7 +761,7 @@
            (emit-absolute-fixup segment src)
            (emit-imm-operand segment src size))))))
 
-(defun emit-move-with-extension (segment dst src opcode)
+(flet ((emit* (segment dst src opcode)
   (aver (register-p dst))
   (let ((dst-size (operand-size dst))
         (src-size (operand-size src)))
@@ -782,19 +782,19 @@
          (:word
           (emit-byte segment #b00001111)
           (emit-byte segment (logior opcode 1))
-          (emit-ea segment src (reg-tn-encoding dst))))))))
+          (emit-ea segment src (reg-tn-encoding dst)))))))))
 
 (define-instruction movsx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011111)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10111110)))
+  (:emitter (emit* segment dst src #b10111110)))
 
 (define-instruction movzx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011011)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10110110)))
+  (:emitter (emit* segment dst src #b10110110))))
 
 (define-instruction push (segment src &optional prefix)
   ;; register
@@ -953,7 +953,7 @@
     (maybe-emit-operand-size-prefix segment size)
     (cond
      ((or (integerp src)
-          (and (fixup-p src) (memq (fixup-flavor src) '(:gc-barrier :layout-id))))
+          (and (fixup-p src) (memq (fixup-flavor src) '(:card-table-index-mask :layout-id))))
       (cond ((and (neq size :byte) (typep src '(signed-byte 8)))
              (emit-byte segment #b10000011)
              (emit-ea segment dst opcode)
@@ -2414,7 +2414,7 @@
        (case flavor
          (:layout-id
           (setf (signed-sap-ref-32 sap offset) value))
-         (:gc-barrier
+         (:card-table-index-mask
           ;; the VALUE is nbits, so convert it to an AND mask
           (setf (sap-ref-32 sap offset) (1- (ash 1 value))))
          (t
@@ -2435,7 +2435,11 @@
          (setf (sap-ref-32 sap offset) rel-val)))))
   nil)
 
-(defun sb-c::pack-retained-fixups (fixup-notes)
+;;; There are 3 data streams in the FIXUPS slot:
+;;; 1. absolute fixups
+;;; 2. relative fixups
+;;; 3. card table mask fixups
+(defun sb-c::pack-fixups-for-reapplication (fixup-notes)
   (let (abs-fixups rel-fixups imm-fixups)
     (dolist (note fixup-notes)
       (let* ((fixup (fixup-note-fixup note))
@@ -2452,7 +2456,7 @@
                  (push offset abs-fixups)))
               ((and (eq kind :relative) (member flavor '(:assembly-routine :foreign)))
                (push offset rel-fixups))
-              ((eq flavor :gc-barrier)
+              ((eq flavor :card-table-index-mask)
                (push offset imm-fixups))
               ((or (and (eq kind :absolute)
                         (member flavor '(:assembly-routine :foreign :foreign-dataref)))

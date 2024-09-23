@@ -541,7 +541,7 @@
   (:dependencies (reads src1) (if src2 (reads src2) (reads dst)) (writes dst))
   (:delay 0)
   (:emitter
-   (when (and (fixup-p src2) (eq (fixup-flavor src2) :gc-barrier))
+   (when (and (fixup-p src2) (eq (fixup-flavor src2) :card-table-index-mask))
      (note-fixup segment :sll-sa src2) ; shift amount
      (setq src2 0))
    (emit-shift-inst segment #b00 dst src1 src2)))
@@ -1461,13 +1461,6 @@
        (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
              (ldb (byte 16 0) value)))))
   nil)
-
-(defun sb-c::pack-retained-fixups (fixup-notes)
-  (let (result)
-    (dolist (note fixup-notes (sb-c:pack-code-fixup-locs nil nil result))
-      (let ((fixup (fixup-note-fixup note)))
-        (when (eq (fixup-flavor fixup) :gc-barrier)
-          (push (fixup-note-position note) result))))))
 
 (define-instruction store-coverage-mark (segment mark-index)
   ;; Don't need to annotate the dependence on code-tn, I think?

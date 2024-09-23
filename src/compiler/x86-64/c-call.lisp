@@ -275,17 +275,18 @@
     #+sb-safepoint
     '((:save-p t))
     #-sb-safepoint
-    (let ((gprs (list rcx-offset rdx-offset
-                      #-win32 rsi-offset #-win32 rdi-offset
-                      r8-offset r9-offset r10-offset r11-offset))
+    (let ((gprs (list '#:rcx '#:rdx #-win32 '#:rsi #-win32 '#:rdi
+                      '#:r8 '#:r9 '#:r10 '#:r11))
           (vars))
       (append
        (loop for gpr in gprs
-             collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+             for offset = (symbol-value (intern (concatenate 'string (symbol-name gpr) "-OFFSET") "SB-VM"))
+             collect `(:temporary (:sc any-reg :offset ,offset :from :eval :to :result)
+                                  ,(car (push gpr vars))))
        (loop for float to 15
+             for varname = (format nil "FLOAT~D" float)
              collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+                                  ,(car (push (make-symbol varname) vars))))
        `((:ignore ,@vars))))))
 
 (define-vop (call-out)
@@ -336,9 +337,9 @@
   . #.(destroyed-c-registers))
 
 #+win32
+(progn
 (defconstant win64-seh-direct-thunk-addr win64-seh-data-addr)
-#+win32
-(defconstant win64-seh-indirect-thunk-addr (+ win64-seh-data-addr 8))
+(defconstant win64-seh-indirect-thunk-addr (+ win64-seh-data-addr 8)))
 
 (defun emit-c-call (vop rax fun args varargsp #+sb-safepoint pc-save #+win32 rbx)
   (declare (ignorable varargsp))
@@ -388,7 +389,8 @@
   ;; the UNDEFINED-ALIEN-TRAMP lisp asm routine to recognize the various shapes
   ;; this instruction sequence can take.
   #-win32
-  (inst call (if (tn-p fun)
+  (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+    (inst call (if (tn-p fun)
                  fun
                  #-immobile-space (ea (make-fixup fun :foreign 8))
                  #+immobile-space
@@ -398,19 +400,26 @@
                         ;; RAX has a designated purpose, and RBX is nonvolatile (not always
                         ;; spilled by Lisp because a C function has to save it if used)
                         (inst mov r10-tn (thread-slot-ea thread-alien-linkage-table-base-slot))
-                        (ea (make-fixup fun :alien-code-linkage-index 8) r10-tn)))))
+                        (ea (make-fixup fun :alien-code-linkage-index 8) r10-tn))))))
 
-  ;; On win64, we don't support immobile space (yet) and calls go through one of
-  ;; the thunks defined in set_up_win64_seh_data(). If the linkage table is
-  ;; involved, RBX either points to a linkage table trampoline or to the linkage
-  ;; table operand; this simplifies UNDEFINED-ALIEN-TRAMP's job.
+  ;; On win64, calls go through one of the thunks defined in set_up_win64_seh_data().
   #+win32
   (cond ((tn-p fun)
          (move rbx fun)
          (inst mov rax win64-seh-direct-thunk-addr)
          (inst call rax))
         (t
-         (inst mov rbx (make-fixup fun :foreign 8))
+         ;; RBX is loaded with the address of the word containing the address in the alien
+         ;; linkage table of the alien function to call. This informs UNDEFINED-ALIEN-TRAMP
+         ;; which table cell was referenced, if undefined.
+         #+immobile-space ; relocatable table
+         (cond ((sb-c::code-immobile-p vop)
+                (inst lea rbx (rip-relative-ea (make-fixup fun :foreign 8))))
+               (t
+                (inst mov rbx (make-fixup fun :alien-code-linkage-index 8))
+                (inst add rbx (thread-slot-ea thread-alien-linkage-table-base-slot))))
+         ;; else, wired table base address
+         #-immobile-space (inst mov rbx (make-fixup fun :foreign 8))
          (inst mov rax win64-seh-indirect-thunk-addr)
          (inst call rax)))
 
@@ -437,7 +446,7 @@
     (move result rsp-tn)))
 
 (macrolet ((alien-stack-ptr ()
-             #+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
+             #+sb-thread `(thread-slot-ea ,(symbol-thread-slot '*alien-stack-pointer*))
              #-sb-thread '(static-symbol-value-ea '*alien-stack-pointer*)))
   (define-vop (alloc-alien-stack-space)
     (:info amount)
@@ -550,8 +559,7 @@
           (inst call rax)
 
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave))
 
         #+sb-thread
         (progn
@@ -577,8 +585,7 @@
           #-immobile-space
           (inst call (ea (+ (foreign-symbol-address "callback_wrapper_trampoline") 8)))
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave))
 
         ;; Result now on top of stack, put it in the right register
         (cond

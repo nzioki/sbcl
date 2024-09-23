@@ -43,6 +43,16 @@
 ;;; something not EQ to anything we might legitimately READ
 (define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
 
+(macrolet ((make-file-stream-source-info (s)
+             `(sb-c::make-source-info
+               :file-info (sb-c::make-file-info
+                           :%truename :defer
+                           ;; This T-L-P has been around since at least 2011.
+                           ;; It's unclear why an LPN isn't good enough.
+                           :pathname (translate-logical-pathname ,s)
+                           :external-format (stream-external-format ,s)
+                           :write-date (file-write-date ,s)))))
+
 ;;; Load a text stream.  (Note that load-as-fasl is in another file.)
 ;; We'd like, when entering the debugger as a result of an EVAL error,
 ;; that the condition be annotated with the stream position.
@@ -91,7 +101,7 @@
          (locally (declare (optimize (sb-c::type-check 0)))
            (setf sb-c::*current-path* (make-unbound-marker)))
          (if pathname
-             (let* ((info (sb-c::make-file-stream-source-info stream))
+             (let* ((info (make-file-stream-source-info stream))
                     (sb-c::*source-info* info))
                (locally (declare (optimize (sb-c::type-check 0)))
                  (setf sb-c::*current-path* (make-unbound-marker)))
@@ -111,6 +121,7 @@
                      do (sb-c::with-source-paths
                           (eval-form form nil)))))))))
   t)
+) ; end MACROLET
 
 ;;;; LOAD itself
 
@@ -253,7 +264,7 @@
                    ;; of using the compiler to perform interpretation.
                    (sb-c:with-compiler-error-resignalling
                        (load-as-source stream :verbose verbose :print print))))))
-    (declare (truly-dynamic-extent #'load-stream-1))
+    (declare (dynamic-extent #'load-stream-1))
 
     ;; Case 1: stream.
     (when (streamp filespec)
@@ -322,37 +333,37 @@
 ;; expicitly ask us to load a file with a made-up name (e.g., the
 ;; defaulted filename might exceed filename length limits).
 (defun probe-load-defaults (pathname)
-  (destructuring-bind (defaulted-source-pathname
-                       defaulted-source-truename
-                       defaulted-fasl-pathname
-                       defaulted-fasl-truename)
-      (loop for type in (list *load-source-default-type*
-                              *fasl-file-type*)
-            as probe-pathname = (make-pathname :type type
-                                               :defaults pathname)
-            collect probe-pathname
-            collect (handler-case (probe-file probe-pathname)
-                      (file-error () nil)))
-    (cond ((and defaulted-fasl-truename
-                defaulted-source-truename
-                (> (file-write-date defaulted-source-truename)
-                   (file-write-date defaulted-fasl-truename)))
+  (multiple-value-bind (source-existsp defaulted-source-pathname
+                        fasl-existsp defaulted-fasl-pathname)
+      (flet ((probe (type &aux (candidate (make-pathname :type type
+                                                         :defaults pathname)))
+               (values (sb-impl::query-file-system candidate :existence nil)
+                       candidate)))
+        (multiple-value-call #'values
+          (probe *load-source-default-type*) (probe *fasl-file-type*)))
+    (cond ((and fasl-existsp
+                source-existsp
+                (> (file-write-date defaulted-source-pathname)
+                   (file-write-date defaulted-fasl-pathname)))
            (restart-case
                (error "The object file ~A is~@
                        older than the presumed source:~%  ~A."
-                      defaulted-fasl-truename
-                      defaulted-source-truename)
+                      defaulted-fasl-pathname
+                      defaulted-source-pathname)
              (source () :report "load source file"
                      defaulted-source-pathname)
              (object () :report "load object file"
                      defaulted-fasl-pathname)))
-          (defaulted-fasl-truename defaulted-fasl-pathname)
-          (defaulted-source-truename defaulted-source-pathname))))
+          (fasl-existsp defaulted-fasl-pathname)
+          (source-existsp defaulted-source-pathname))))
 
 ;;;; linkage fixups
 
+(defun %asm-routine-table (code-obj)
+   (#+darwin-jit car #-darwin-jit identity (%code-debug-info code-obj)))
+
 (defun calc-asm-routine-bounds ()
-  (loop for v being each hash-value of (%code-debug-info *assembler-routines*)
+  (loop for v being each hash-value of (%asm-routine-table *assembler-routines*)
         minimize (car v) into min
         maximize (cadr v) into max
         ;; min/max are inclusive byte ranges, but return the answer
@@ -362,41 +373,36 @@
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
-(defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
-  ;; Each architecture can define an "indirect" value in its own peculiar way.
-  ;; Only some of our architectures use that option.
-  (awhen (the list (gethash (the symbol name) (%code-debug-info code)))
-    (destructuring-bind (start end . index) it
-      (declare (ignore end) (ignorable index))
-      (let* ((insts (code-instructions code))
-             (addr (sap-int (sap+ insts start))))
-        (unless indirect
-          (return-from get-asm-routine addr))
-        #-(or ppc ppc64 x86 x86-64) (bug "Indirect asm-routine lookup")
-        #+(or ppc ppc64) (- addr sb-vm:nil-value)
-        #+(or x86 x86-64) ; return the address of a word containing 'addr'
-        (let ((offset (ash index sb-vm:word-shift)))
-          ;; the address is in the "external" static-space jump table
-          #+immobile-space (+ (get-lisp-obj-address *asm-routine-vector*)
-                              (ash sb-vm:vector-data-offset sb-vm:word-shift)
-                          ;; offset is biased by 1 word, accounting for the jump-table-count
-                          ;; at the first word in code-instructions. So unbias it.
-                              (- offset sb-vm:n-word-bytes sb-vm:other-pointer-lowtag))
-          #-immobile-space ; the address is in the "internal" jump table
-          (sap-int (sap+ insts offset)))))))
+(defun get-asm-routine (name &aux (code *assembler-routines*))
+  (awhen (the list (gethash (the symbol name) (%asm-routine-table code)))
+    (sap-int (sap+ (code-instructions code) (car it)))))
+
+(defun asm-routine-index-from-addr (addr)
+  (let* ((code *assembler-routines*)
+         (max (hash-table-count (%asm-routine-table code)))
+         (min 1)
+         (table (code-instructions code)))
+    (loop
+     (let* ((guess-index (floor (+ min max) 2))
+            (guess-val (sap-ref-word table (ash guess-index sb-vm:word-shift))))
+       (cond ((= guess-val addr) (return guess-index))
+             ((< guess-val addr) (setq min (1+ guess-index))) ; guess too small
+             (t (setq max (1- guess-index)))) ; guess too large
+       (if (< max min) (return nil))))))
 
 (defun !loader-cold-init ()
   (let* ((code *assembler-routines*)
          (size (%code-text-size code))
          (vector (the simple-vector *!initial-assembler-routines*))
          (count (length vector))
+         (offsets (make-array (1+ count) :element-type '(unsigned-byte 16)))
          (ht (make-hash-table))) ; keys are symbols
-    (rplaca (%code-debug-info code) ht)
-    (setf *asm-routine-index-to-name* (make-array (1+ (length vector))))
+    (#+darwin-jit rplaca #-darwin-jit setf (%code-debug-info code) ht)
+    (setf sb-c::*asm-routine-offsets* offsets)
     (dotimes (i count)
       (destructuring-bind (name . offset) (svref vector i)
         (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
-          (setf (aref *asm-routine-index-to-name* (1+ i)) name)
+          (setf (aref offsets (1+ i)) offset)
           ;; Must be in ascending order, but one address can have more than one name.
           (aver (>= next-offset offset))
           ;; store inclusive bounds on PC offset range and the function index

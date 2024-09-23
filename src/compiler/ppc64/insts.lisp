@@ -646,6 +646,10 @@
                 (label-position si))
              subop))))
         (t
+         (when (fixup-p si) ; assume the fixup will be valid
+           (aver (eq (fixup-flavor si) :linkage-cell))
+           (note-fixup segment :addis+ld si)
+           (setq si 0))
          (if (= (mod si 4) 0)
              (emit-ds-form-inst segment opcode rt ra (ash si -2) subop)
              (error "Displacement should be a multiple of 4")))))
@@ -807,7 +811,12 @@
   (define-x-instruction      lwax  31 341)
   (define-x-instruction      lwaux 31 373 :other-dependencies ((writes ra)))
   ;; Doubleword
-  (define-ds-instruction     ld    58 #b00)
+  ;;(define-ds-instruction     ld    58 #b00)
+  (define-instruction ld (segment rt ra si)
+    (:declare (type (or (signed-byte 16) label fixup) si))
+    (:printer ds ((op 58) (subop 0)))
+    (:emitter
+     (patchable-emit-ds-form segment 58 (reg-tn-encoding rt) (reg-or-0 ra) si 0)))
   (define-ds-instruction     ldu   58 #b01)
   (define-x-instruction      ldx   31 21)
   (define-x-instruction      ldux  31 53)
@@ -1058,7 +1067,10 @@
                                   (emit-d-form-inst
                                    segment ,op (reg-tn-encoding rt)
                                    ,(if allow-r0 '(reg-tn-encoding ra) '(reg-or-0 ra))
-                                   offset-from-code-tn))))))))
+                                   offset-from-code-tn))))))
+                          (when (and (typep si 'fixup) (eq (fixup-flavor si) :linkage-cell))
+                            (note-fixup segment :addis+ld si)
+                            (setq si 0))))
                     (when (typep si 'fixup)
                       (ecase ,fixup
                         ((:ha :l) (note-fixup segment ,fixup si)))
@@ -1473,7 +1485,7 @@
                   (:declare (type (integer 0 63) sh) (type (or (integer 0 63) fixup) m))
                   (:printer md-form ((op 30) (subop ,op) (rc ,rc)))
                   (:emitter
-                   (when (and (fixup-p m) (eq (fixup-flavor m) :gc-barrier))
+                   (when (and (fixup-p m) (eq (fixup-flavor m) :card-table-index-mask))
                      (note-fixup segment :rldic-m m)
                      (setq m 0))
                    (emit-md-form-inst segment 30
@@ -1574,7 +1586,7 @@
   (define-2-x-5-instructions srad 31 794) ; shift right algebraic doubleword
   (define-2-x-10-instructions cntlzw 31 26)
   (define-2-x-10-instructions cntlzd 31 58)
-  (define-x-10-instruction popcntd 31 506 0)
+  (define-x-10-instruction popcntd 31 506 nil)
   (define-2-x-5-instructions and 31 28)
 
   (define-4-xo-instructions subf 31 40)
@@ -2396,7 +2408,7 @@
                    `(.byte ,@bytes)))))))
 
 (defun sb-vm:fixup-code-object (code offset value kind flavor)
-  (declare (type index offset) (ignore flavor))
+  (declare (type index offset))
   (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
   (let ((sap (code-instructions code)))
@@ -2410,6 +2422,16 @@
       (:rldic-m ; This is the M (mask) immediate operand to RLDIC{L,R} which
        ;; appears in (byte 6 5) of the instruction. See EMIT-MD-FORM-INST.
        (setf (ldb (byte 6 5) (sap-ref-32 sap offset)) (encode-mask6 (- 64 value))))
+      (:addis+ld
+       ;; load from linkage table
+       (binding* (((q r) (floor (ash value word-shift) 65536))
+                  (table-bias (- (ash (ash 1 (+ 19 3)) -16))))
+         (when (>= r 32768) ; LD instruction sign-extends, so this is actually negative
+           (incf q))
+         (setf (sap-ref-32 sap (- offset 4)) ; addis instruction
+               (logior (sap-ref-32 sap (- offset 4)) (ldb (byte 16 0) (+ table-bias q)))
+               (sap-ref-32 sap offset) ; ld instruction
+               (logior (sap-ref-32 sap offset) r))))
       (:b
        (error "Can't deal with CALL fixups, yet."))
       (:ba
@@ -2427,16 +2449,11 @@
           (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
                  (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
       (:l
+       (when (eq flavor :assembly-routine)
+         (decf value nil-value))
        (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
              (ldb (byte 16 0) value)))))
   nil)
-
-(defun sb-c::pack-retained-fixups (fixup-notes)
-  (let (result)
-    (dolist (note fixup-notes (sb-c:pack-code-fixup-locs nil nil result))
-      (let ((fixup (fixup-note-fixup note)))
-        (when (eq (fixup-flavor fixup) :gc-barrier)
-          (push (fixup-note-position note) result))))))
 
 (define-instruction store-coverage-mark (segment mark-index temp)
   (:emitter

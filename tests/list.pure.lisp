@@ -268,6 +268,31 @@
 
       (test 'rassoc nil  tricky  '(:test #'eq)          '(c . nil)))))
 
+(defun cdr-assoc-in-const-list (x)
+  (cdr (assoc x '((:a . #\A) (:b . #\B) (:c . #\C) nil (nil . foo)
+                  (:z . #\Z) (:y . #\Y) (:x . #\X) (:z . "dup")))))
+(compile 'cdr-assoc-in-const-list)
+
+(with-test (:name :cdr-assoc-hash-based)
+  (dolist (input '(nil :a :b :c :x :y :z))
+    (let ((result (cdr-assoc-in-const-list input))
+          (expect (if (eq input nil) 'foo (char (string input) 0))))
+      (assert (eq result expect))))
+  (let ((constants (ctu:find-code-constants #'cdr-assoc-in-const-list)))
+    ;; The ASSOC should have been compiled into a perfectly hashed
+    ;; lookup into a key vector, and a parallel value vector.
+    ;; There are no conses in the vectors. The order of items depends
+    ;; on the symbol-hash, so we don't care what it is.
+    (assert (= (length constants) 2))
+    (dolist (vector constants)
+      ;; Allow this to pass with either a minimal-perfect-hash
+      ;; or a non-minimal perfect hash.
+      (assert (or (typep vector '(simple-vector 7))
+                  (typep vector '(simple-vector 8))))
+      ;; The salient point is that the vector doesn't store cons cells
+      ;; because we've unzipped the alist.
+      (assert (every #'atom vector)))))
+
 ;;;; member-if & assoc-if & rassoc-if
 (with-test (:name (member-if assoc-if rassoc-if) :slow t)
   (macrolet ((test (value form)
@@ -408,3 +433,29 @@
          (tree-equal a '(a (b c) (3/4 (d))) :test #'eql))
     (('(a (b c) (3/4 (d)))) t)
     (('(a (b c) (3/4 (d) e))) nil)))
+
+(with-test (:name :copy-list-derive-type)
+  (assert-type
+   (lambda (l)
+     (declare (optimize space)
+              (cons l))
+     (copy-list l))
+   cons)
+  (assert-type
+   (lambda (l)
+     (declare (optimize space)
+              (list l))
+     (copy-list l))
+   list)
+  (assert-type
+   (lambda (l)
+     (declare (optimize speed (space 0))
+              (cons l))
+     (copy-list l))
+   cons)
+  (assert-type
+   (lambda (l)
+     (declare (optimize speed (space 0))
+              (list l))
+     (copy-list l))
+   list))

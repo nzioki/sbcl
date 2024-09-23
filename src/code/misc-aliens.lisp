@@ -14,12 +14,19 @@
 ;;; Declare each of the free space pointers (except dynamic) as an alien var
 ;;; with darwin-jit, READ-ONLY-SPACE-START is a constant from genesis
 ;;; Maybe this whole file should go in sb-kernel to avoid sb-kernel::
-#-darwin-jit
 (define-alien-variable ("READ_ONLY_SPACE_START" sb-vm:read-only-space-start) sb-kernel::os-vm-size-t)
 (define-alien-variable ("read_only_space_free_pointer"
                         sb-vm:*read-only-space-free-pointer*)
     system-area-pointer)
 
+#+permgen
+(progn
+(define-alien-variable ("permgen_bounds" sb-vm:permgen-space-start) sb-kernel::os-vm-size-t)
+(define-alien-variable ("permgen_space_free_pointer" sb-vm:*permgen-space-free-pointer*)
+    system-area-pointer))
+
+#+relocatable-static-space
+(define-alien-variable ("STATIC_SPACE_START" sb-vm:static-space-start) sb-kernel::os-vm-size-t)
 ;;; STATIC-SPACE-START is a constant from genesis
 (define-alien-variable ("static_space_free_pointer" sb-vm:*static-space-free-pointer*)
   system-area-pointer)
@@ -29,15 +36,13 @@
 (declaim (inline dynamic-space-free-pointer))
 (defun dynamic-space-free-pointer ()
   (sap+ (int-sap sb-vm:dynamic-space-start)
-        ;; not sure why next_free_page is 'sword_t' instead of 'uword_t' !
         (truly-the (signed-byte 64)
-                   (* (extern-alien "next_free_page" signed) sb-vm:gencgc-page-bytes))))
+                   (* (extern-alien "next_free_page" sb-kernel::page-index-t) sb-vm:gencgc-page-bytes))))
 
 (declaim (inline read-only-space-obj-p dynamic-space-obj-p))
 (defun read-only-space-obj-p (x)
   (let ((a (get-lisp-obj-address x))
-        (rospace-start #-darwin-jit (extern-alien "READ_ONLY_SPACE_START" unsigned)
-                       #+darwin-jit sb-vm:read-only-space-start)
+        (rospace-start sb-vm:read-only-space-start)
         (rospace-end (extern-alien "read_only_space_free_pointer" unsigned)))
     (and (< rospace-start a rospace-end))))
 
@@ -49,11 +54,11 @@
     (let ((addr (get-lisp-obj-address x)))
       (< sb-vm:dynamic-space-start addr (sap-int (dynamic-space-free-pointer))))))
 
+(define-alien-variable ("TEXT_SPACE_START" sb-vm:text-space-start) sb-kernel::os-vm-size-t)
+
 #+immobile-space
-(progn
-(define-symbol-macro sb-vm:alien-linkage-table-space-start
-    (extern-alien "ALIEN_LINKAGE_TABLE_SPACE_START" unsigned))
-(define-alien-variable ("TEXT_SPACE_START" sb-vm:text-space-start) unsigned-long))
+(define-symbol-macro sb-vm:alien-linkage-space-start
+    (extern-alien "ALIEN_LINKAGE_SPACE_START" unsigned))
 
 #+darwin-jit
 (define-alien-variable ("static_code_space_free_pointer" sb-vm:*static-code-space-free-pointer*)
@@ -82,6 +87,10 @@
 (define-alien-routine ("os_get_errno" get-errno) int)
 (setf (documentation 'get-errno 'function)
       "Return the value of the C library pseudo-variable named \"errno\".")
+
+(define-alien-routine ("os_set_errno" set-errno) void (new-errno int))
+(setf (documentation 'set-errno 'function)
+      "Set the C library pseudo-variable named \"errno\", for obscure syscalls.")
 
 ;;; Decode errno into a string.
 #-win32

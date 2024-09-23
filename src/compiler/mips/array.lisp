@@ -122,7 +122,7 @@
       (inst addu ea object index)
       (inst addu ea ea (- (ash vector-data-offset word-shift) other-pointer-lowtag))
       (without-scheduling ()
-        (emit-gc-store-barrier object ea temp (vop-nth-arg 2 vop) value)
+        (emit-gengc-barrier object ea temp (vop-nth-arg 2 vop))
         (storew value ea 0 0))))
   (define-vop (data-vector-set/simple-vector-c)
     (:translate data-vector-set)
@@ -136,7 +136,7 @@
     (:generator 5
       (inst addu ea object (- (ash (+ vector-data-offset index) word-shift) other-pointer-lowtag))
       (without-scheduling ()
-        (emit-gc-store-barrier object ea temp (vop-nth-arg 1 vop) value)
+        (emit-gengc-barrier object ea temp (vop-nth-arg 1 vop))
         (storew value object (+ vector-data-offset index) other-pointer-lowtag))))
 
   (def-partial-data-vector-frobs simple-base-string character
@@ -509,3 +509,8 @@
   (unsigned-reg) unsigned-num %vector-raw-bits)
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num %set-vector-raw-bits)
+;;; Weak vectors
+(define-full-reffer %weakvec-ref * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-ref)
+(define-full-setter %weakvec-set * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-set)

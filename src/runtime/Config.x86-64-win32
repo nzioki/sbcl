@@ -36,7 +36,7 @@ LIBSBCL += mswin64.def mswin.def
 USE_LIBSBCL += -Wl,mswin64.def -Wl,mswin.def
 __LDFLAGS__ =
 
-OS_LIBS = -l ws2_32 -ladvapi32
+OS_LIBS = -l ws2_32 -ladvapi32 -lm
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lzstd
 endif
@@ -50,8 +50,11 @@ else
   GC_SRC = fullcgc.c gencgc.c traceroot.c
 endif
 
-CFLAGS =  -g -W -Wall \
+# -Wno-type-limits suppresses a ton of warnings from 'grovel-headers'
+# which seems to produce C code in which a comparison is always false.
+CFLAGS += -g -W -Wall \
        -Wno-unused-function -Wno-unused-parameter -Wno-cast-function-type \
+       -Wno-type-limits \
        -fno-omit-frame-pointer \
        -O5 -m64 -DWINVER=0x0501 \
        -D__W32API_USE_DLLIMPORT__

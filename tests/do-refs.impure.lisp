@@ -16,7 +16,6 @@
 
 (defun collect-slot-values (obj &aux result)
   (flet ((slots (x)
-           #+metaspace (if (typep x 'sb-vm:layout) (setq x (sb-kernel::layout-friend x)))
            (push x result)))
     (do-referenced-object (obj slots))
     (nreverse result)))
@@ -77,12 +76,6 @@
     (walk-slots-test*
      (sb-int:find-fdefn fname)
      (lambda (slots)
-       #+immobile-code
-       (and (= (length slots) 3)
-            (equal (first slots) fname)
-            (closurep (second slots))
-            (code-component-p (third slots)))
-       #-immobile-code
        (and (= (length slots) 2)
             (equal (first slots) fname)
             (closurep (second slots)))))))
@@ -97,7 +90,7 @@
     (walk-slots-test* o
                       (lambda (slots)
                         (destructuring-bind (layout clos-slots) slots
-                          (and (eq layout (%instance-wrapper o))
+                          (and (eq layout (%instance-layout o))
                                (eq clos-slots (sb-pcl::std-instance-slots o))))))))
 
 (define-condition cfoo (simple-condition) ((a :initarg :a) (b :initarg :b) (c :initform 'c)))
@@ -105,19 +98,19 @@
                             :fails-on :interpreter)
   (let ((instance (make-condition 'cfoo :a 'ay :b 'bee :format-arguments "wat")))
     (walk-slots-test instance
-                     `(,(find-layout 'cfoo) (c c format-control nil)
+                     `(,(find-layout 'cfoo) ((c . c) (format-control . nil))
                        :a  ay :b bee :format-arguments "wat"))))
 
 (defun make-random-funinstance (&rest values)
   (let* ((ctor (apply #'sb-pcl::%make-ctor values))
-         (wrapper (sb-kernel:%fun-wrapper ctor)))
+         (layout (sb-kernel:%fun-layout ctor)))
     ;; If the number of payload words is even, then there's a padding word
     ;; because adding the header makes the unaligned total an odd number.
     ;; Fill that padding word with something - it should not be visible.
     ;; Whether GC should trace the word is a different question,
     ;; on whose correct answer I waver back and forth.
     (when (evenp (sb-kernel:get-closure-length ctor)) ; payload length
-      (let ((max (reduce #'max (sb-kernel:dd-slots (sb-kernel:wrapper-dd wrapper))
+      (let ((max (reduce #'max (sb-kernel:dd-slots (sb-kernel:layout-dd layout))
                          :key 'sb-kernel:dsd-index)))
         (setf (sb-kernel:%funcallable-instance-info ctor (1+ max))
               (elt sb-vm:+static-symbols+ 0))))
@@ -140,44 +133,13 @@
                       (lambda (slots)
                         (destructuring-bind (type fin-fun a b c d) slots
                           (declare (ignore a b c))
-                          (and (typep type 'wrapper)
+                          (and (typep type 'layout)
                                (typep fin-fun 'closure)
                                (typep d '(and integer (not (eql 0))))))))))
 
-;;; Compute size of OBJ including descendants.
-;;; LEAFP specifies what object types to treat as not reaching
-;;; any other object. You pretty much have to treat symbols
-;;; as leaves, otherwise you reach a package and then the result
-;;; just explodes to beyond the point of being useful.
-;;; (It works, but might reach the entire heap)
-;;; To turn this into an actual thing, we'd want to reduce the consing.
-(defun deep-size (obj &optional (leafp (lambda (x)
-                                         (typep x '(or package symbol fdefn
-                                                       function code-component
-                                                       wrapper classoid)))))
-  (let ((worklist (list obj))
-        (seen (make-hash-table :test 'eq))
-        (tot-bytes 0))
-    (setf (gethash obj seen) t)
-    (flet ((visit (thing)
-             (when (is-lisp-pointer (get-lisp-obj-address thing))
-               (unless (or (funcall leafp thing)
-                           (gethash thing seen))
-                 (push thing worklist)
-                 (setf (gethash thing seen) t)))))
-      (loop
-        (unless worklist (return))
-        (let ((x (pop worklist)))
-          (incf tot-bytes (primitive-object-size x))
-          (do-referenced-object (x visit)))))
-    ;; Secondary values is number of visited objects not incl. original one.
-    (values tot-bytes
-            (1- (hash-table-count seen))
-            seen)))
-
 (test-util:with-test (:name :deep-sizer)
   (multiple-value-bind (tot-bytes n-kids)
-      (deep-size #(a b c d (e f) #*0101))
+      (test-util:deep-size #(a b c d (e f) #*0101))
     ;; 8 words for the vector
     ;; 4 words for 2 conses
     ;; 4 words for a bit-vector: header/length/bits/padding

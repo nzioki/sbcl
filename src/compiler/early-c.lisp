@@ -16,14 +16,22 @@
 (in-package "SB-C")
 
 ;;; ANSI limits on compilation
-(defconstant call-arguments-limit most-positive-fixnum
+;;; On AMD64 we prefer to use the ECX (not RCX) register,
+;;; which means that there can only be 32 bits of precision,
+;;; so accounting for the fixnum tag and 1 bit for the sign,
+;;; this leaves 30 bits. Of course this number is ridiculous
+;;; as a call with that many args would consume 8 GB of stack,
+;;; but it's surely not as ridiculous as ARRAY-DIMENSION-LIMIT.
+(defconstant call-arguments-limit
+  #+x86-64 (ash 1 30)
+  #-x86-64 array-dimension-limit
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(defconstant lambda-parameters-limit most-positive-fixnum
+(defconstant lambda-parameters-limit call-arguments-limit
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant multiple-values-limit most-positive-fixnum
+(defconstant multiple-values-limit call-arguments-limit
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
@@ -63,7 +71,7 @@
   ;; constants. This coalescing is distinct from the coalescing done
   ;; in the dumper, since the effect here is to reduce the number of
   ;; boxed constants appearing in a code component.
-  (similar-constants (sb-fasl::make-similarity-table) :read-only t :type hash-table))
+  (similar-constants (make-similarity-table) :read-only t :type hash-table))
 (declaim (freeze-type ir1-namespace))
 
 (sb-impl::define-thread-local *ir1-namespace*)
@@ -81,7 +89,7 @@
 ;;; Bind this to a stream to capture various internal debugging output.
 (defvar *compiler-trace-output* nil)
 ;;; These are the default, but the list can also include
-;;; :pre-ir2-optimize, :symbolic-asm.
+;;; :pre-ir2-optimize, :constraints.
 (defvar *compile-trace-targets* '(:ir1 :ir2 :vop :symbolic-asm :disassemble))
 (defvar *current-path*)
 (defvar *current-component*)
@@ -96,60 +104,67 @@
 
 ;;;; miscellaneous utilities
 
-(defstruct (debug-name-marker (:print-function print-debug-name-marker)
-                              (:copier nil)))
-(declaim (freeze-type debug-name-marker))
+;;; COMPILE-FILE usually puts all nontoplevel code in immobile space, but COMPILE
+;;; offers a choice. Because the immobile space GC does not run often enough (yet),
+;;; COMPILE usually places code in the dynamic space managed by our copying GC.
+;;; Change this variable if your application always demands immobile code.
+;;; In particular, ELF cores shrink the immobile code space down to just enough
+;;; to contain all code, plus about 1/2 MiB of spare, which means that you can't
+;;; subsequently compile a whole lot into immobile space.
+;;; The value is changed to :AUTO in make-target-2-load.lisp which supresses
+;;; codegen optimizations for immobile space, but nonetheless prefers to allocate
+;;; the code there, falling back to dynamic space if there is no room left.
+;;; These controls exist whether or not the immobile-space feature is present.
+(declaim (type (member :immobile :dynamic :auto) *compile-to-memory-space*)
+         (type (member :immobile :dynamic) *compile-file-to-memory-space*))
+(defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+(export '*compile-file-to-memory-space*) ; silly user code looks at, even if no immobile-space
+(defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
 
-(defvar *debug-name-level* 4)
-(defvar *debug-name-length* 12)
-(defvar *debug-name-punt*)
-(define-load-time-global *debug-name-sharp* (make-debug-name-marker))
-(define-load-time-global *debug-name-ellipsis* (make-debug-name-marker))
-
-(defun print-debug-name-marker (marker stream level)
-  (declare (ignore level))
-  (cond ((eq marker *debug-name-sharp*)
-         (write-char #\# stream))
-        ((eq marker *debug-name-ellipsis*)
-         (write-string "..." stream))
-        (t
-         (write-string "???" stream))))
+(defun compile-perfect-hash (lambda test-inputs)
+  ;; Don't blindly trust the hash generator: assert that computed values are
+  ;; in range and not repeated.
+  (let ((seen (make-array (power-of-two-ceiling (length test-inputs))
+                          :element-type 'bit :initial-element 0))
+        (f #-sb-xc-host ; use fasteval if possible
+           (cond #+sb-fasteval
+                 ((< (length test-inputs) 100) ; interpreting is faster
+                  (let ((*evaluator-mode* :interpret))
+                    (eval lambda)))
+                 (t (let ((*compile-to-memory-space* :dynamic))
+                      (compile nil lambda))))
+           #+sb-xc-host
+           (destructuring-bind (head lambda-list . body) lambda
+             (aver (eq head 'lambda))
+             (multiple-value-bind (forms decls) (parse-body body nil)
+               (declare (ignore decls))
+               ;; Give the host a definition for SB-C::UINT32-MODULARLY and remove _all_
+               ;; OPTIMIZE decls hidden within. We don't need to pedantically correctly
+               ;; code-walk here, because hash expressions are largely boilerplate that
+               ;; will not confusingly match forms such as (LET ((OPTIMIZE ...))).
+               (let ((new-body
+                      `(macrolet ((uint32-modularly (&whole form &rest exprs)
+                                    (declare (ignore exprs))
+                                    (funcall (sb-xc:macro-function 'sb-c::uint32-modularly)
+                                             form nil)))
+                         ,@(subst-if '(optimize)
+                                     (lambda (x) (typep x '(cons (eql optimize) (not null))))
+                                     forms))))
+                 (compile nil `(lambda ,lambda-list ,new-body)))))))
+    (loop for input across test-inputs
+          do (let ((h (funcall f input)))
+               (unless (zerop (bit seen h))
+                 (bug "Perfect hash generator failed on ~X" test-inputs))
+               (setf (bit seen h) 1)))
+    f))
 
 (declaim (ftype (sfunction () list) name-context))
 (defun debug-name (type thing &optional context)
-  (let ((*debug-name-punt* nil))
-    (labels ((walk (x)
-               (typecase x
-                 (cons
-                  (if (plusp *debug-name-level*)
-                      (let ((*debug-name-level* (1- *debug-name-level*)))
-                        (do ((tail (cdr x) (cdr tail))
-                             (name (cons (walk (car x)) nil)
-                                   (cons (walk (car tail)) name))
-                             (n (1- *debug-name-length*) (1- n)))
-                            ((or (not (consp tail))
-                                 (not (plusp n))
-                                 *debug-name-punt*)
-                             (cond (*debug-name-punt*
-                                    (setf *debug-name-punt* nil)
-                                    (nreverse name))
-                                   ((atom tail)
-                                    (nconc (nreverse name) (walk tail)))
-                                   (t
-                                    (setf *debug-name-punt* t)
-                                    (nconc (nreverse name) (list *debug-name-ellipsis*)))))))
-                      *debug-name-sharp*))
-                 ((or symbol number string)
-                  x)
-                 (t
-                  ;; wtf?? This looks like a source of sensitivity to the cross-compiler host
-                  ;; in addition to which it seems generally a stupid idea.
-                  (type-of x)))))
-      (let ((name (list* type (walk thing) (when context (name-context)))))
-        (when (legal-fun-name-p name)
-          (bug "~S is a legal function name, and cannot be used as a ~
-                debug name." name))
-        name))))
+  (let ((name (list* type thing (when context (name-context)))))
+    (when (legal-fun-name-p name)
+      (bug "~S is a legal function name, and cannot be used as a ~
+            debug name." name))
+    name))
 
 ;;; Bound during eval-when :compile-time evaluation.
 (defvar *compile-time-eval* nil)
@@ -170,26 +185,12 @@
 ;;; 2 implies an even length boxed header; 1 implies no restriction.
 (defconstant code-boxed-words-align (+ 2 #+(or x86 x86-64) -1))
 
-;;; Used as the CDR of the code coverage instrumentation records
-;;; (instead of NIL) to ensure that any well-behaving user code will
-;;; not have constants EQUAL to that record. This avoids problems with
-;;; the records getting coalesced with non-record conses, which then
-;;; get mutated when the instrumentation runs. Note that it's
-;;; important for multiple records for the same location to be
-;;; coalesced. -- JES, 2008-01-02
-(defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%)
-
-;;; Stores the code coverage instrumentation results.
-;;; The CAR is a hashtable. The CDR is a list of weak pointers to code objects
-;;; having coverage marks embedded in the unboxed constants.
-;;; Keys in the hashtable are namestrings, the
-;;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
-;;; for a path that has not been visited, and T for one that has.
-#-sb-xc-host
-(progn
-  (define-load-time-global *code-coverage-info*
-    (list (make-hash-table :test 'equal :synchronized t)))
-  (declaim (type (cons hash-table) *code-coverage-info*)))
+;;; Unique number assigned into high 4 bytes of 64-bit code size slot
+;;; so that we can sort the contents of text space in a more-or-less
+;;; predictable manner based on the order in which code was loaded.
+;;; This wraps around at 32 bits, but it's still deterministic.
+(define-load-time-global *code-serialno* 0)
+(declaim (fixnum *code-serialno*))
 
 (deftype id-array ()
   '(and (array t (*))
@@ -199,10 +200,22 @@
         ;; And who knows what the host considers "simple".
         #-sb-xc-host (not simple-array)))
 
-(defstruct (compilation (:copier nil)
+(defun make-fun-name-hashset ()
+  (make-hashset 32
+                (lambda (a b) (or (eq a b) (and (consp a) (consp b) (equal a b))))
+                ;; We don't emulate sb-xc:sxhash thoroughly enough to hash compound names
+                ;; (lists are rejected) but it doesn't actually matter what the hash is
+                ;; for duplicate name detection.
+                #+sb-xc-host #'cl:sxhash
+                #-sb-xc-host #'sxhash))
+
+(defstruct (compilation (:constructor make-compilation
+                                      (&key coverage-metadata msan-unpoison
+                                       block-compile entry-points compile-toplevel-object))
+                        (:copier nil)
                         (:predicate nil)
                         (:conc-name ""))
-  (fun-names-in-this-file)
+  (fun-names-in-this-file (make-fun-name-hashset))
   ;; for constant coalescing across code components, and/or for situations
   ;; where SIMILARP does not do what you want.
   (constant-cache)
@@ -257,3 +270,64 @@
 ;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"
 #+linux ; shadow space differs by OS
 (defconstant sb-vm::msan-mem-to-shadow-xor-const #x500000000000)
+
+(defstruct (compilation-unit (:conc-name cu-) (:predicate nil) (:copier nil)
+                             (:constructor make-compilation-unit ()))
+  ;; Count of the number of compilation units dynamically enclosed by
+  ;; the current active WITH-COMPILATION-UNIT that were unwound out of.
+  (aborted-count 0 :type fixnum)
+  ;; Keep track of how many times each kind of condition happens.
+  (error-count 0 :type fixnum)
+  (warning-count 0 :type fixnum)
+  (style-warning-count 0 :type fixnum)
+  (note-count 0 :type fixnum)
+  ;; Map of function name -> something about how many calls were converted
+  ;; as ordinary calls not in the scope of a local or global notinline declaration.
+  ;; Useful for finding functions that were supposed to have been converted
+  ;; through some kind of transformation but were not.
+  (emitted-full-calls (make-hash-table :test 'equal))
+  ;; hash-table of hash-tables:
+  ;;  outer: GF-Name -> hash-table
+  ;;  inner: (qualifiers . specializers) -> lambda-list
+  (methods nil :type (or null hash-table)))
+;;; This is a COMPILATION-UNIT if we are within a WITH-COMPILATION-UNIT form (which
+;;; normally causes nested uses to be no-ops).
+(defvar *compilation-unit* nil)
+
+(defmacro get-emitted-full-calls (name)
+  `(awhen *compilation-unit* (gethash ,name (cu-emitted-full-calls it))))
+
+;; Return the number of calls to NAME that IR2 emitted as full calls,
+;; not counting calls via #'F that went untracked.
+;; Return 0 if the answer is nonzero but a warning was already signaled
+;; about any full calls were emitted. This return convention satisfies the
+;; intended use of this statistic - to decide whether to generate a warning
+;; about failure to inline NAME, which is shown at most once per name
+;; to avoid unleashing a flood of identical warnings.
+(defun emitted-full-call-count (name)
+  (let ((status (get-emitted-full-calls name)))
+    (and (integerp status)
+         ;; Bit 0 tells whether any call was NOT in the presence of
+         ;; a 'notinline' declaration, thus eligible to be inline.
+         ;; Bit 1 tells whether any warning was emitted yet.
+         (= (logand status 3) #b01)
+         (ash status -2)))) ; the call count as tracked by IR2
+
+;;; FIXME: the math here is very suspicious-looking. If the flag bits are #b11
+;;; then they can rollover into the counts. And we're ORing counts. Wtf is this doing???
+;;; Well, it doesn't matter really. This is used only in FOP-NOTE-FULL-CALLS which is called
+;;; only if DUMP-EMITTED-FULL-CALLS emits that fop. But that function is never invoked.
+(defun accumulate-full-calls (data)
+  (loop for (name status) in data
+        do
+        (let* ((table (cu-emitted-full-calls *compilation-unit*))
+               (existing (gethash name table 0)))
+          (setf (gethash name table)
+                (logior (+ (logand existing #b11) ; old flag bits
+                           (logand status #b11))  ; new flag bits
+                        (logand existing -4)      ; old count
+                        (logand status -4))))))   ; new count
+
+(declaim (type (simple-array (unsigned-byte 16) 1) *asm-routine-offsets*))
+(define-load-time-global *asm-routine-offsets*
+  (make-array 0 :element-type '(unsigned-byte 16)))

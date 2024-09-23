@@ -10,20 +10,22 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <signal.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
+#include "genesis/sap.h"
 #include "runtime.h"
 #include "os.h"
 #include "interrupt.h"
 #include "arch.h"
+#include "gc.h"
 #include "lispregs.h"
 #include "globals.h"
-#include "alloc.h"
 #include "breakpoint.h"
 #include "thread.h"
 #include "code.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #define REAL_LRA_SLOT 0
 

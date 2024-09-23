@@ -23,15 +23,7 @@
       (let ((info (sb-int:info :function :type s)))
         (when (consp info)
           (let ((parsed (specifier-type info)))
-            (setf (sb-int:info :function :type s) parsed))))))
-  ;; One good kludge deserves another.
-  ;; This is OK only because it's the very first file compiled in warm build.
-  (let ((disallowed-undefineds
-         (remove-if (lambda (x) (member x '(class sb-pcl::condition-class)))
-                    (mapcar #'sb-c::undefined-warning-name
-                            sb-c::*undefined-warnings*))))
-    (assert (not disallowed-undefineds)))
-  (setf sb-c::*undefined-warnings* nil))
+            (setf (sb-int:info :function :type s) parsed)))))))
 
 ;;; Moved from 'cold-error' to this file because of (at least) these reasons:
 ;;;  - the LOAD-TIME-VALUE forms need to run after 'condition.lisp'
@@ -45,7 +37,7 @@
                 (superclassoid-name (classoid-name super)))
             ;; CONDITION is necessarily an INSTANCE,
             ;; but pedantry requires it be the right subtype of instance.
-            (unless (classoid-typep (%instance-wrapper condition)
+            (unless (classoid-typep (%instance-layout condition)
                                     super condition)
               (error 'simple-type-error
                      :datum datum :expected-type superclassoid-name
@@ -75,7 +67,8 @@
   ;; But we would warn about redefinition of STYLE-WARN.
   ;; Do a "gentle" fmakunbound, because real FMAKUNBOUND removes
   ;; sb-c:fun-info thus blowing out the control string transformer.
-  (fdefn-makunbound (find-fdefn 'style-warn))
+  #+linkage-space (fset 'style-warn 0)
+  #-linkage-space (fdefn-makunbound (find-fdefn 'style-warn))
 
   (defun style-warn (datum &rest arguments)
     (declare (explicit-check))

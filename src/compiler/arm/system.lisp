@@ -70,7 +70,7 @@
   (:generator 4
     (let ((test-id (layout-id test-layout))
           (offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst ldr this-id (@ x offset))
       ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
@@ -130,15 +130,6 @@
        ;; maybe it should be promoted to an instruction-macro?
        (inst orr t1 t1 (ash (tn-value data) n-widetag-bits))))
     (storew t1 x 0 other-pointer-lowtag)))
-
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst bic res ptr fixnum-tag-mask)))
 
 ;;;; Allocation
 
@@ -207,19 +198,6 @@
     (inst add ndescr offset ndescr)
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
-;;;
-(define-vop (symbol-dbinfo)
-  (:policy :fast-safe)
-  (:translate symbol-dbinfo)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst and temp res lowtag-mask)
-    (inst cmp temp list-pointer-lowtag)
-    (loadw res res cons-cdr-slot list-pointer-lowtag :eq)))
 
 ;;;; other miscellaneous VOPs
 

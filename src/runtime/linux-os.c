@@ -23,8 +23,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -33,7 +32,7 @@
 #include "lispregs.h"
 #include "runtime.h"
 #include "genesis/static-symbols.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #include <errno.h>
 
@@ -47,7 +46,7 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "gc-internal.h"
+#include "gc.h"
 #include <fcntl.h>
 #include <sys/prctl.h>
 
@@ -66,7 +65,6 @@ int personality (unsigned long);
 #include <errno.h>
 
 #ifdef MUTEX_EVENTRECORDING
-#include "genesis/mutex.h"
 #define MAXEVENTS 200
 static struct {
     struct thread* th;
@@ -127,22 +125,20 @@ void lisp_mutex_done_eventrecording() {
         rel_time.tv_sec -= basetime.tv_sec;
         rel_time.tv_nsec -= basetime.tv_nsec;
         if (rel_time.tv_nsec<0) rel_time.tv_nsec += 1000 * 1000 * 1000, rel_time.tv_sec--;
-        lispobj threadname = ti->name;
+        lispobj threadname = ti->_name;
         if (events[i].timeout >= 0) // must also have mutex_name in this case
             fprintf(stderr, "[%d.%09ld] %s: %s '%s' timeout %ld\n",
                     (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
+                    vector_sap(threadname),
                     events[i].label, events[i].mutex_name, events[i].timeout);
         else if (events[i].mutex_name)
             fprintf(stderr, "[%d.%09ld] %s: %s '%s'\n",
                     (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
-                    events[i].label, events[i].mutex_name);
+                    vector_sap(threadname), events[i].label, events[i].mutex_name);
         else
             fprintf(stderr, "[%d.%09ld] %s: %s\n",
                     (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
-                    events[i].label);
+                    vector_sap(threadname), events[i].label);
     }
     fprintf(stderr, "-----\n");
 }
@@ -164,7 +160,7 @@ void lisp_mutex_done_eventrecording() {
 #define FUTEX_WAKE_PRIVATE (1+128)
 
 /* Not static so that Lisp may query it. */
-boolean futex_private_supported_p;
+bool futex_private_supported_p;
 
 static inline int
 futex_wait_op()
@@ -208,9 +204,8 @@ char* futex_name(int *lock_word)
 {
     // If there is a Lisp string at lock_word+1, return that, otherwise NULL.
     lispobj name = ((lispobj*)lock_word)[1];
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG &&
-        header_widetag(VECTOR(name)->header) == SIMPLE_BASE_STRING_WIDETAG)
-        return (char*)VECTOR(name)->data;
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && simple_base_string_p(name))
+        return vector_sap(name);
     return 0;
 }
 
@@ -221,8 +216,8 @@ futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
   int t;
 
 #ifdef MUTEX_EVENTRECORDING
-    struct mutex* m = (void*)((char*)lock_word - offsetof(struct mutex,state));
-    char *name = m->name != NIL ? (char*)VECTOR(m->name)->data : "(unnamed)";
+    struct lispmutex* m = (void*)((char*)lock_word - offsetof(struct lispmutex,uw_state));
+    char *name = m->name != NIL ? vector_sap(m->name) : "(unnamed)";
 #endif
   if (sec<0) {
       lisp_mutex_event1("start futex wait", name);
@@ -250,8 +245,8 @@ int
 futex_wake(int *lock_word, int n)
 {
 #ifdef MUTEX_EVENTRECORDING
-    struct mutex* m = (void*)((char*)lock_word - offsetof(struct mutex,state));
-    char *name = m->name != NIL ? (char*)VECTOR(m->name)->data : "(unnamed)";
+    struct lispmutex* m = (void*)((char*)lock_word - offsetof(struct lispmutex,uw_state));
+    char *name = m->name != NIL ? vector_sap(m->name) : "(unnamed)";
     lisp_mutex_event1("waking futex", name);
 #endif
     return sys_futex(lock_word, futex_wake_op(),n,0);
@@ -276,6 +271,7 @@ void os_init()
 # define ALLOW_PERSONALITY_CHANGE 0
 #endif
 
+extern char **environ;
 int os_preinit(char *argv[], char *envp[])
 {
 #ifdef LISP_FEATURE_RISCV
@@ -286,8 +282,8 @@ int os_preinit(char *argv[], char *envp[])
      * whether the emulation looks bad. */
     char buf[100];
     FILE *f = fopen("/proc/cpuinfo", "r");
-    fgets(buf, sizeof buf, f);
-    fgets(buf, sizeof buf, f);
+    ignore_value(fgets(buf, sizeof buf, f));
+    ignore_value(fgets(buf, sizeof buf, f));
     if (!strstr(buf, "hart")) { // look for "hardware thread" string
         fprintf(stderr, "WARNING: enabling mmap() workaround. GC time may be affected\n");
         rewind(f);
@@ -347,6 +343,7 @@ int os_preinit(char *argv[], char *envp[])
             char runtime[PATH_MAX+1];
             int i = readlink("/proc/self/exe", runtime, PATH_MAX);
             if (i != -1) {
+                // Why is this needed? env surely was initialized from environ wasn't it?
                 environ = envp;
                 setenv("SBCL_IS_RESTARTING", "T", 1);
                 runtime[i] = '\0';
@@ -389,8 +386,6 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 
 #ifdef LISP_FEATURE_GENCGC
     if (gencgc_handle_wp_violation(context, addr)) return;
-#else
-    if (cheneygc_handle_wp_violation(context, addr)) return;
 #endif
     extern int diagnose_arena_fault(os_context_t*,char*);
 #ifdef LISP_FEATURE_SYSTEM_TLABS

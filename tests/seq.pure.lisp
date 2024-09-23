@@ -256,6 +256,10 @@
           '(find :foo '(1 2 3 :foo) :start 3 :end 0 :from-end t))
     (test 'sb-kernel:bounding-indices-bad-error
           '(position :foo '(1 2 3 :foo) :start 3 :end 0 :from-end t))
+    (test 'sb-kernel:bounding-indices-bad-error
+          '(find :foo '(1 2 3) :start 5))
+    (test 'sb-kernel:bounding-indices-bad-error
+          '(position :foo '(1 2 3) :start 5 :from-end t))
     (test 'type-error
           '(let ((list (list 1 2 3 :foo)))
              (find :bar (nconc list list)))
@@ -487,7 +491,9 @@
 (with-test (:name :position-empty-seq)
   (assert (not (funcall (checked-compile '(lambda (x) (position x #()))) 1))))
 
-(with-test (:name :hash-based-memq)
+;;; I'm keeping this not-very-great test so that if I decide to re-allow hash collisions
+;;; in the hash-based MEMBER transform, then there's already a test for it.
+(with-test (:name :hash-based-memq :skipped-on :sbcl)
   (let* ((f (checked-compile
              '(lambda (x)
                (if (member x '(:and :or :not and or not)) t nil))))
@@ -495,7 +501,7 @@
     ;; Since there's no canonical order within a bin - we don't know
     ;; whether bin 0 is {:AND,AND} or {AND,:AND} - this gets tricky to check.
     ;; This is unfortunately a change-detector (if we alter SXHASH, or anything).
-    (assert (equalp (car consts) #(:and and :not not :or or 0 0)))))
+    (assert (equalp (car consts) #(:and and :or or :not not 0 0)))))
 
 (with-test (:name :memq-empty-seq)
   (assert (not (funcall (checked-compile '(lambda (x) (member x '()))) 1)))
@@ -676,7 +682,9 @@
     (check (find-if #'evenp y) (or integer null))
     (check (find-if #'evenp (the list y) :key #'car) list)
     (check (find x (the (simple-array character (*)) y)) (or character null))
-    (check (find x (the string y)) (or character null))))
+    (check (find x (the string y)) (or character null))
+    (check (find #\A y :test #'char=) (or (eql #\A) null))
+    (check (find #\a y :test #'char-equal) (or standard-char null))))
 
 (with-test (:name :position-type-derive)
   (macrolet
@@ -693,7 +701,9 @@
     (check (position x (the (simple-string 10) y)) (or (mod 10) null))
     (check (position x y :end 10) (or (mod 10) null))
     (check (position x (the cons y) :start 5 :end 10) (or (integer 5 9) null))
-    (check (position-if x y :end 10) (or (mod 10) null))))
+    (check (position-if x y :end 10) (or (mod 10) null))
+    (check (position x y :start (the (integer 10 20) x) :end x) (or (or (integer 10 19) null) null))
+    (check (position x (the (or null (simple-vector 5)) y)) (or null (mod 5)))))
 
 (with-test (:name :string-cmp)
   (macrolet
@@ -795,3 +805,145 @@
                                     (declare ((simple-base-string 10) x))
                                     (fill x y :start 12))
                                  :allow-warnings t))))
+
+(with-test (:name :find-compile-time-mismatch)
+  (assert
+   (nth-value 2 (checked-compile `(lambda (c) (find c #*10 :test #'char-equal))
+                                 :allow-warnings t))))
+
+(with-test (:name :subseq-nil-array)
+  (checked-compile-and-assert
+   ()
+   `(lambda (s)
+      (subseq s 2))
+   (((make-array 5 :element-type nil))
+    3 :test (lambda (s n)
+              (= (car n) (length (car s)))))))
+
+(with-test (:name :use-%bit-pos-fwd/1)
+  (assert (equal  (ctu:ir1-named-calls `(lambda (x)
+                                          (declare (optimize speed))
+                                          (find 1 (the simple-bit-vector x))))
+                  '(SB-KERNEL:%BIT-POS-FWD/1))))
+
+(with-test (:name :sort-inlining-warnings)
+  (checked-compile `(lambda (x)
+                      (declare (optimize (debug 2) (space 0)))
+                      (sort x #'< :key #'car))))
+
+(with-test (:name :sort-inline-return-value)
+  (checked-compile-and-assert
+   ()
+   `(lambda (v)
+      (declare ((vector t) v))
+      (locally (declare (optimize (space 0)))
+        (sort v #'<)))
+   (((vector 2 1)) #(1 2) :test #'equalp)))
+
+(with-test (:name :read-sequence-type)
+  (assert-type
+   (lambda (stream)
+     (let ((seq (make-string 100)))
+       (read-sequence seq stream)))
+   (mod 101))
+  (assert-type
+   (lambda (stream n)
+     (let ((seq (make-string n)))
+       (read-sequence seq stream :end 10)))
+   (mod 11))
+  (assert-type
+   (lambda (stream)
+     (let ((seq (make-string 10)))
+       (read-sequence seq stream :start 1)))
+   (integer 1 10)))
+
+(with-test (:name (replace :or-null))
+  (checked-compile `(lambda (a b)
+                      (declare ((or null simple-base-string) a)
+                               ((or null (simple-array character (*))) b)
+                               (optimize speed))
+                      (replace a b))
+                   :allow-notes nil)
+  (checked-compile `(lambda (a b)
+                      (declare ((or null simple-base-string) a)
+                               ((simple-array character (*)) b)
+                               (optimize speed))
+                      (replace a b))
+                   :allow-notes nil)
+  (checked-compile `(lambda (a b)
+                      (declare ((or null simple-base-string) a b)
+                               (optimize speed))
+                      (replace a b))
+                   :allow-notes nil)
+  (checked-compile `(lambda ()
+                      (coerce nil 'vector))
+                   :allow-notes nil)
+  (checked-compile `(lambda ()
+                      (replace nil #()))
+                   :allow-notes nil))
+
+(with-test (:name :reduce-type)
+  (assert-type
+   (lambda (v)
+     (declare ((vector (unsigned-byte 8)) v))
+     (reduce #'logior v))
+   (unsigned-byte 8)))
+
+(with-test (:name :position-index-errors)
+  (assert (= (count 'sb-int:sequence-bounding-indices-bad-error
+                    (ctu:ir1-named-calls `(lambda (y)
+                                            (declare (optimize speed)
+                                                     (simple-string y))
+                                            (position #\a y :start 1))))
+             1))
+  (assert (= (count 'sb-int:sequence-bounding-indices-bad-error
+                    (ctu:ir1-named-calls `(lambda (y)
+                                            (declare (optimize speed)
+                                                     (string y))
+                                            (find #\a y :start 1))))
+             2)))
+
+(with-test (:name :find-equalp-type)
+  (assert-type
+   (lambda (y j)
+     (declare ((or integer simple-string) j))
+     (find j y :test #'equalp))
+   (or array number null)))
+
+(with-test (:name :sequence-union-types)
+  (assert-type
+   (lambda (x)
+     (declare ((or cons (simple-vector 10)) x))
+     (copy-seq x))
+   (or cons (simple-vector 10)))
+  (assert-type
+   (lambda (x)
+     (declare ((or list (vector t 10)) x))
+     (reverse x))
+   (or list simple-vector))
+  (assert-type
+   (lambda (x)
+     (declare (cons x))
+     (copy-seq x))
+   cons)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-vector 10) x))
+     (remove 10 x))
+   simple-vector))
+
+(with-test (:name :concatenate-list-type)
+  (assert-type
+   (lambda (x)
+     (concatenate 'list '(1 2 3) x))
+   cons)
+  (assert-type
+   (lambda (x)
+     (declare (cons x))
+     (concatenate 'list x x))
+   cons)
+  (assert-type
+   (lambda (x)
+     (declare ((or cons (simple-vector 10)) x))
+     (concatenate 'list x x))
+   cons))

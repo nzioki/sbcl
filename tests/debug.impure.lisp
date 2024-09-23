@@ -201,7 +201,7 @@
 
 (defvar *collected-traces*)
 (defun custom-trace-report (depth what when frame values)
-  (push (list* depth what when (sb-debug::frame-p frame) values)
+  (push (list* depth what when (sb-di:frame-p frame) values)
         *collected-traces*))
 
 (with-test (:name (trace :custom-report))
@@ -1058,11 +1058,11 @@
                             (sb-debug:map-backtrace
                              (lambda (frame)
                                (let ((name (sb-debug::frame-call frame))
-                                     (location (sb-debug::frame-code-location frame))
-                                     (d-fun (sb-debug::frame-debug-fun frame)))
+                                     (location (sb-di:frame-code-location frame))
+                                     (d-fun (sb-di:frame-debug-fun frame)))
                                  (when (eq name 'test)
-                                   (assert (sb-debug::debug-var-info-available d-fun))
-                                   (dolist (v (sb-debug::ambiguous-debug-vars d-fun ""))
+                                   (assert (sb-di:debug-var-info-available d-fun))
+                                   (dolist (v (sb-di:ambiguous-debug-vars d-fun ""))
                                      (assert (not (sb-debug::var-valid-in-frame-p v location frame))))
                                    (return))))))))
       (funcall
@@ -1249,6 +1249,21 @@
               (let ((top (sb-debug::resolve-stack-top-hint)))
                 (return (caar (sb-debug:list-backtrace :from top)))))))
       (funcall fn))))
+
+(defun ds-bind-when (x)
+  (when x
+    (sb-c::ds-bind-error '(foo) 2 3 '((:macro baz . deftype))))
+  (print "something to prevent tco"))
+
+(with-test (:name (:stack-top-hint :arg-count-error))
+  (assert (eq 'ds-bind-when
+              (block nil
+                (handler-bind ((error
+                                 (lambda (c)
+                                   (declare (ignore c))
+                                   (let ((top (sb-debug::resolve-stack-top-hint)))
+                                     (return (caar (sb-debug:list-backtrace :from top)))))))
+                  (ds-bind-when t))))))
 
 ;; If an error occurs within a signal handler, we want to see the handling
 ;; frames in the backtrace.

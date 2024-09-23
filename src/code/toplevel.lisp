@@ -16,9 +16,10 @@
 ;;;; default initfiles
 
 (defun sysinit-pathname ()
-  (or (let ((sbcl-homedir (sbcl-homedir-pathname)))
-        (when sbcl-homedir
-          (probe-file (merge-pathnames "sbclrc" sbcl-homedir))))
+  (or (binding* ((sbcl-homedir (sbcl-homedir-pathname) :exit-if-null)
+                 (merged (merge-pathnames "sbclrc" sbcl-homedir)))
+        (when (sb-unix:unix-access (namestring merged) sb-unix:r_ok)
+          merged))
       #+win32
       (merge-pathnames "sbcl\\sbclrc"
                        (sb-win32::get-folder-pathname
@@ -185,19 +186,19 @@ means to wait indefinitely.")
              (values whole-seconds
                      (truly-the (integer 0 #.(expt 10 9))
                                 (%unary-truncate (* (- seconds (float whole-seconds seconds))
-                                                    $1f9)))))))
+                                                    1f9)))))))
     (declare (inline split-float))
     (typecase seconds
-      ((single-float $0f0 #.(float most-positive-fixnum $1f0))
+      ((single-float 0f0 #.(float most-positive-fixnum 1f0))
        (split-float))
-      ((double-float $0d0 #.(float most-positive-fixnum $1d0))
+      ((double-float 0d0 #.(float most-positive-fixnum 1d0))
        (split-float))
       (ratio
        (split-ratio-for-sleep seconds))
       (t
        (multiple-value-bind (sec frac)
            (truncate seconds)
-         (values sec (truncate frac $1f-9)))))))
+         (values sec (truncate frac 1f-9)))))))
 
 (declaim (inline %nanosleep))
 (defun %nanosleep (sec nsec)
@@ -381,7 +382,13 @@ any non-negative real number."
                    (*debug-io* (make-two-way-stream *stdin* *stderr*))
                    (*standard-input* *stdin*)
                    (*standard-output* *stdout*)
-                   (*error-output* *stderr*))
+                   (*error-output* *stderr*)
+                   ;; Compile/load messages from the language implementation
+                   ;; are not really what one would expect from a script. And
+                   ;; these messages are printed on stdout interfere when
+                   ;; scripts are used as part as a UNIX pipeline.
+                   (*compile-verbose* nil)
+                   (*load-verbose* nil))
                (load stream :verbose nil :print nil)))))
     (handling-end-of-the-world
       (if (eq t script)
@@ -697,7 +704,7 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
    (unwind-protect
         (progn
           (scrub-control-stack)
-          (sb-thread::get-foreground)
+          (sb-thread:get-foreground)
           (unless noprint
             (flush-standard-output-streams)
             (funcall *repl-prompt-fun* *standard-output*)

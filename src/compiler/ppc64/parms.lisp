@@ -18,7 +18,7 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 
-(defconstant +backend-fasl-file-implementation+ :ppc)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :ppc)
 ;; Granularity at which memory is mapped
 (defconstant +backend-page-bytes+ 65536)
 
@@ -32,9 +32,6 @@
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 64)
@@ -78,7 +75,7 @@
 
 ;;;; Where to put the different spaces.
 
-(!gencgc-space-setup #x04000000
+(gc-space-setup #x04000000
                               :read-only-space-size 0
                               :dynamic-space-start #x1000000000)
 
@@ -113,5 +110,11 @@
   #'equalp)
 
 (defconstant-eqx +static-fdefns+
-    `#(two-arg-<= two-arg->= two-arg-/= ,@common-static-fdefns)
+  ;; I really don't understand the need for static-fdefns, since it has only to do
+  ;; with a slightly differenet way of looking up the fdefn; however ltn decides
+  ;; whether to warn or not about "recursion in known fun" based on whether the
+  ;; fdefn is static, which isn't expressing exactly the right notion.
+    `#(two-arg-<= two-arg->= two-arg-/= %negate ,@common-static-fdefns)
   #'equalp)
+
+#+sb-xc-host (defparameter lisp-linkage-space-addr #x1500000000) ; arbitrary

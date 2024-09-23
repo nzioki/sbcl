@@ -11,6 +11,7 @@
 
 #ifndef _INTERR_H_
 #define _INTERR_H_
+#include <stdbool.h>
 #include "os.h"
 extern void lose(char *fmt, ...)
 #ifndef LISP_FEATURE_WIN32
@@ -18,8 +19,10 @@ extern void lose(char *fmt, ...)
 #endif
  never_returns;
 extern void tprintf(char *fmt, ...);
-extern boolean lose_on_corruption_p;
+extern int lose_on_corruption_p;
 extern void corruption_warning_and_maybe_lose(char *fmt, ...);
+extern void corruption_warning(char *fmt, ...);
+extern void maybe_lose();
 extern void enable_lossage_handler(void);
 extern void disable_lossage_handler(void);
 extern void describe_internal_error(os_context_t *context);

@@ -41,7 +41,7 @@
                             (or
                              (sb-fasl:get-asm-routine 'sb-vm::undefined-alien-tramp)
                              (find-foreign-symbol-address "undefined_alien_function")
-                             (bug "unreachable")))))))))
+                             (unreachable)))))))))
 
 ;;; Return the index of NAME+DATAP in the table, adding it if it doesn't exist.
 (defun ensure-alien-linkage-index (name datap)
@@ -51,7 +51,7 @@
     (or (with-system-mutex ((hash-table-lock ht))
           (or (gethash key ht)
               (let* ((index (hash-table-count ht))
-                     (capacity (floor sb-vm:alien-linkage-table-space-size
+                     (capacity (floor sb-vm:alien-linkage-space-size
                                       sb-vm:alien-linkage-table-entry-size)))
                 (when (< index capacity)
                   (multiple-value-bind (defined real-address) (dlsym-wrapper t)
@@ -176,9 +176,9 @@ symbol designates a variable. May enter the symbol into the linkage-table."
   (declare (ignorable sap))
   (let ((addr (sap-int sap)))
     (declare (ignorable addr))
-    (when (<= sb-vm:alien-linkage-table-space-start
+    (when (<= sb-vm:alien-linkage-space-start
               addr
-              (+ sb-vm:alien-linkage-table-space-start sb-vm:alien-linkage-table-space-size))
+              (+ sb-vm:alien-linkage-space-start sb-vm:alien-linkage-space-size))
       (return-from sap-foreign-symbol
         (alien-linkage-index-to-name
          (sb-vm::alien-linkage-table-index-from-address addr))))
@@ -196,7 +196,11 @@ symbol designates a variable. May enter the symbol into the linkage-table."
       ;; How exactly was this deadlocking?  A reductio ad absurdum argument
       ;; says that every call into a system API could potentially acquire
       ;; a lock, and therefore every one should inhibit GC. But they don't.
-      (let ((err (alien-funcall dladdr addr (addr info))))
+      ;; However: We now try to allow libdl to acquire its internal locks in a GCing
+      ;; thread, which means that we need all user threads to agree not to stop
+      ;; for GC in the midst of _any_ libdl call.
+      (let ((err (sb-vm:with-pseudo-atomic-foreign-calls
+                     (alien-funcall dladdr addr (addr info)))))
         (if (zerop err)
             nil
             (slot info 'symbol))))

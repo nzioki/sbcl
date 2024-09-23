@@ -24,7 +24,7 @@ export PATH
 
 # Increase potential soft ulimit on file descriptors for file
 # descriptor test case below.
-test `ulimit -n` -ge 1050 || ulimit -S -n 1050
+test `ulimit -n` -ge 1050 || ulimit -S -n `ulimit -H -n`
 
 # This should probably be broken up into separate pieces.
 run_sbcl --eval "(defvar *exit-ok* $EXIT_LISP_WIN)" <<'EOF'
@@ -39,9 +39,8 @@ run_sbcl --eval "(defvar *exit-ok* $EXIT_LISP_WIN)" <<'EOF'
   (assert (not (zerop (sb-ext:process-exit-code
                        (sb-ext:run-program "false" () :search t :wait t)))))
   (let ((string (with-output-to-string (stream)
-                  (our-run-program    "/bin/echo"
-                                      '("foo" "bar")
-                                      :output stream))))
+                  (run-program  "echo" '("foo" "bar")
+                                :search t :output stream))))
     (assert (string= string "foo bar
 ")))
   (format t ";;; Smoke tests: PASS~%")
@@ -56,11 +55,23 @@ run_sbcl --eval "(defvar *exit-ok* $EXIT_LISP_WIN)" <<'EOF'
     (assert (equal string "FEEFIE=foefum
 ")))
 
+;;; Try to obtain file descriptors numerically greater than FD_SETSIZE
+;;; (which is usually 1024) to show that run-program uses poll() rather
+;;; than select(), but if we can't do that, then don't.
 (when (fboundp (find-symbol "UNIX-POLL" "SB-UNIX"))
-  (let ((f (open "/dev/null")))
+  (let ((f (open "/dev/null"))
+        (got-error)
+        (opened))
     (with-alien ((dup (function int int) :extern))
-      (dotimes (i 1025) (alien-funcall dup (sb-impl::fd-stream-fd f)))
-      (assert (> (alien-funcall dup (sb-impl::fd-stream-fd f)) 1024)))))
+      (dotimes (i 1025)
+        (let ((new (alien-funcall dup (sb-impl::fd-stream-fd f))))
+          (when (< new 0)
+            ;; We've no constant for EMFILE, just assume that's the problem
+            (return (setq got-error t)))
+          (push new opened))))
+    (if got-error ; close a bunch
+        (dotimes (i 6) (sb-unix:unix-close (pop opened)))
+        (assert (> (car opened) 1024)))))
 
  ;; Unicode strings
  #+unix
@@ -103,8 +114,8 @@ run_sbcl --eval "(defvar *exit-ok* $EXIT_LISP_WIN)" <<'EOF'
   ;; make sure that a stream input argument is basically reasonable.
   (let ((string (let ((i (make-string-input-stream "abcdef")))
                   (with-output-to-string (stream)
-                    (our-run-program "/bin/cat" ()
-                                        :input i :output stream)))))
+                    (run-program "cat" ()
+                                 :search t :input i :output stream)))))
     (assert (= (length string) 6))
     (assert (string= string "abcdef")))
 

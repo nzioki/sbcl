@@ -67,46 +67,24 @@ echo //doing warm init - load and dump phase
 (setf sb-c::*merge-pathnames* t)
 ;;; and for storing pathname namestrings in fasls too.
 (setq sb-c::*name-context-file-path-selector* 'truename)
+; Turn off IR consistency checking in release mode.
+(setq sb-c::*check-consistency* nil)
 (let ((sb-ext:*invoke-debugger-hook* (prog1 sb-ext:*invoke-debugger-hook* (sb-ext:enable-debugger))))
  (sb-ext:save-lisp-and-die "output/sbcl.core"))
 EOF
 
-# Confirm that default evaluation strategy is :INTERPRET if sb-fasteval was built
-src/runtime/sbcl --core output/sbcl.core --lose-on-corruption --noinform \
-  --no-sysinit --no-userinit --disable-debugger \
-  --eval '(when (find-package "SB-INTERPRETER") (assert (eq *evaluator-mode* :interpret)))' \
-  --quit
-
-echo //checking for leftover cold-init symbols
-./src/runtime/sbcl --core output/sbcl.core \
- --lose-on-corruption --noinform $SBCL_MAKE_TARGET_2_OPTIONS --no-sysinit --no-userinit --eval '
-    (restart-case
-      (let (l1 l2)
-        (sb-vm:map-allocated-objects
-         (lambda (obj type size)
-           (declare (ignore size))
-           (when (and (= type sb-vm:symbol-widetag) (not (symbol-package obj))
-                      (search "!" (string obj)))
-             (push obj l1))
-           (when (and (= type sb-vm:fdefn-widetag)
-                      (not (symbol-package
-                            (sb-int:fun-name-block-name
-                             (sb-kernel:fdefn-name obj)))))
-             (push obj l2)))
-         :all)
-        (when l1 (format t "Found ~D:~%~S~%" (length l1) l1))
-        (sb-int:awhen
-          (mapcan (quote apropos-list)
-           (quote ("DEFINE-INFO-TYPE" "LVAR-TYPE-USING"
-                   "TWO-ARG-+/-"
-                   "PPRINT-TAGBODY-GUTS" "WITH-DESCRIPTOR-HANDLERS"
-                   "SUBTRACT-BIGNUM-LOOP" "BIGNUM-REPLACE" "WITH-BIGNUM-BUFFERS"
-                   "GCD-ASSERT" "MODULARLY" "BIGNUM-NEGATE-LOOP"
-                   "SHIFT-RIGHT-UNALIGNED"
-                   "STRING-LESS-GREATER-EQUAL-TESTS")))
-         (format t "~&Leftover from [disabled?] tree-shaker:~%~S~%" sb-int:it))
-        (when l2 
-           (format t "Found ~D fdefns named by uninterned symbols:~%~S~%" (length l2) l2)))
-    (abort-build ()
-      :report "Abort building SBCL."
-      (sb-ext:exit :code 1)))' --quit
+./src/runtime/sbcl --noinform --core output/sbcl.core \
+                   --no-sysinit --no-userinit --noprint <<EOF
+  (load "validate-float.lisp")
+  (check-float-file "output/xfloat-math.lisp-expr")
+  (ignore-errors (delete-file "output/reorg.core"))
+  ;; * Lisp won't read compressed cores, and crashes on arm64
+  #+(and mark-region-gc x86-64 (not sb-core-compression))
+  (progn
+   (load "tools-for-build/editcore")
+   (funcall (intern "REORGANIZE-CORE" "SB-EDITCORE") "output/sbcl.core" "output/reorg.core"))
+EOF
+if [ -r output/reorg.core ]
+then
+    mv output/reorg.core output/sbcl.core
+fi

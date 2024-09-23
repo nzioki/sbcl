@@ -34,8 +34,7 @@
 
 (defvar *requiring* nil)
 
-(defun require-error (control &rest arguments)
-  (declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper require-error (control &rest arguments)
   (error 'extension-failure
          :format-control control
          :format-arguments arguments
@@ -86,7 +85,7 @@
            (or (sbcl-homedir-pathname)
                (return-from module-provide-contrib nil))))
          (fasl-path (merge-pathnames
-                     (make-pathname :type *fasl-file-type*)
+                     (make-pathname :type sb-fasl:*fasl-file-type*)
                      unadorned-path))
          (lisp-path (merge-pathnames (make-pathname :type "lisp")
                                      unadorned-path)))
@@ -109,9 +108,11 @@
     ;; because as per the "possible race" cited above, there may be an even newer version
     ;; when you call LOAD, or it may go away. Aside from ensuring existence,
     ;; was there any benefit to using the result of PROBE-FILE?
-    (let ((file (cond ((probe-file fasl-path) fasl-path)
-                      ((probe-file unadorned-path) unadorned-path)
-                      ((probe-file lisp-path) lisp-path))))
+    (let ((file
+           (flet ((try (x) (if (file-exists-p (namestring x)) x)))
+             (or (try fasl-path)
+                 (try unadorned-path)
+                 (try lisp-path)))))
       (when file
         (handler-bind
             (((or style-warning package-at-variance) #'muffle-warning))

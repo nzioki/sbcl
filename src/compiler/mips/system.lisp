@@ -68,7 +68,7 @@
   (:generator 4
     (let ((label (register-inline-constant :layout-id test-layout))
           (offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lw test-id sb-vm::code-tn label)
       (inst lw this-id x offset)
@@ -127,16 +127,6 @@
                 (inst or t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:policy :fast-safe)
-  (:generator 1
-    (inst li temp (lognot fixnum-tag-mask))
-    (inst and res ptr temp)))
 
 
 ;;;; Allocation

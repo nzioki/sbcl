@@ -73,9 +73,12 @@ distinct from the global value. Can also be SETF."
 ;; FIND-SYMBOL by special-casing the finding of CL:NIL with an extra "or"
 ;; in the hash-equality test. i.e. We can't recognize that CL:NIL was the
 ;; object sought (having an exceptional hash) until it has been found.
-(defun compute-symbol-hash (string length)
+(defun calc-symbol-name-hash (string length)
   (declare (simple-string string) (index length))
-  (if (and (= length 3)
+  (cond
+    ;; first case is only needed if NIL's hash is unusual, but it's OK either way
+    #+64-bit
+    ((and (= length 3)
            (locally
             ;; SXHASH-SUBSTRING is unsafe, so this is too. but do we know that
             ;; length is ok, or is it an accident that it can scan too far?
@@ -85,35 +88,23 @@ distinct from the global value. Can also be SETF."
               (and (char= (schar string 0) #\N)
                    (char= (schar string 1) #\I)
                    (char= (schar string 2) #\L)))))
-      (return-from compute-symbol-hash (sxhash nil)))
-  ;; And make a symbol's hash not the same as (sxhash name) in general.
-  (let ((sxhash (logxor (%sxhash-simple-substring string 0 length)
-                        most-positive-fixnum)))
-    ;; The low 32 bits of the word in memory should have at least a 1 bit somewhere.
-    ;; If not, OR in a constant value.
-    (if (ldb-test (byte (- 32 sb-vm:n-fixnum-tag-bits) 0) sxhash)
-        sxhash
-        (logior sxhash #x55AA)))) ; arbitrary
-
-;; Return SYMBOL's hash, a strictly positive fixnum, computing it if not stored.
-;; The inlined code for (SXHASH symbol) only calls ENSURE-SYMBOL-HASH if
-;; needed, however this is ok to call even if the hash is already nonzero.
-(defun ensure-symbol-hash (symbol)
-  (let ((hash (symbol-hash symbol)))
-    (if (zerop hash)
-        (let ((name (symbol-name symbol)))
-          (%set-symbol-hash symbol (compute-symbol-hash name (length name))))
-      hash)))
+     #.(symbol-hash 'nil)) ; utilize the host's function
+    (t
+     ;; Flip the bits so that a symbol hashes differently from its print name,
+     ;; and extract the lesser of 32 or N-POSITIVE-FIXNUM-BITS significant bits.
+     (ldb (byte 32 0)
+          (logxor (%sxhash-simple-substring string 0 length)
+                  most-positive-fixnum)))))
 
 ;;; Return the function binding of SYMBOL or NIL if not fboundp.
 ;;; Don't strip encapsulations.
 (declaim (inline %symbol-function))
 (defun %symbol-function (symbol)
+  #+linkage-space (%primitive sb-vm::fdefn-fun symbol)
+  #-linkage-space
   (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
     (if (eql fdefn 0) nil (fdefn-fun (truly-the fdefn fdefn)))))
-(defun (setf %symbol-function) (newval symbol) ; OK to use only if fdefn exists
-  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
-    (setf (fdefn-fun (truly-the fdefn fdefn)) newval)))
+(defun (setf %symbol-function) (newval symbol) (fset symbol newval))
 
 (defun symbol-function (symbol)
   "Return SYMBOL's current function definition. Settable with SETF."
@@ -144,8 +135,7 @@ distinct from the global value. Can also be SETF."
     ;; e.g. what's up with *USER-HASH-TABLE-TESTS* being checked
     ;; in %SET-FDEFINITION but not here?
     (maybe-clobber-ftype symbol new-value)
-    (let ((fdefn (find-or-create-fdefn symbol)))
-      (setf (fdefn-fun fdefn) new-value))))
+    (fset symbol new-value)))
 
 ;;; Incredibly bogus kludge: the :CAS-TRANS option in objdef makes no indication
 ;;; that you can not use it on certain platforms, so then you do try to use it,
@@ -186,7 +176,8 @@ distinct from the global value. Can also be SETF."
 ;; The function may choose to abort the update by returning NIL.
 (defun update-symbol-info (symbol update-fn)
   (declare (symbol symbol)
-           (type (function (t) t) update-fn))
+           (type (function (t) t) update-fn)
+           (dynamic-extent update-fn))
   (prog ((info-holder (symbol-%info symbol))
          (current-info)) ; a PACKED-INFO or NIL
    outer-restart
@@ -239,6 +230,7 @@ distinct from the global value. Can also be SETF."
 (defun %ensure-plist-holder (symbol info)
   ;; Invoked only when SYMBOL is known to be a symbol.
   (declare (optimize (safety 0)))
+  (declare (sb-c::tlab :system)) ; holder must be in the heap
   (if (consp info) ; it's fine to call this with a cell already installed
       info ; all done
       (let (newcell)
@@ -326,28 +318,25 @@ distinct from the global value. Can also be SETF."
   (let* ((new-id (cond ((not package) +package-id-none+)
                        ((package-id package))
                        (t +package-id-overflow+)))
-         (old-id (symbol-package-id symbol))
-         (name (symbol-name symbol)))
-    (with-pinned-objects (name)
-      (let ((name-bits (logior (ash new-id (- sb-vm:n-word-bits package-id-bits))
-                               (get-lisp-obj-address name))))
-        (declare (ignorable name-bits))
-        (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
-          (setf (info :symbol :package symbol) package))
-        #-compact-symbol (set-symbol-package-id symbol new-id)
-        #+compact-symbol
-        (with-pinned-objects (symbol)
-          (setf (sap-ref-word (int-sap (get-lisp-obj-address symbol))
-                              (- (ash sb-vm:symbol-name-slot sb-vm:word-shift)
-                                 sb-vm:other-pointer-lowtag))
-                name-bits))))
+         (old-id (symbol-package-id symbol)))
+    (when (= new-id +package-id-overflow+) ; put the package in the dbinfo
+      (setf (info :symbol :package symbol) package))
+    #-compact-symbol (set-symbol-package-id symbol new-id)
+    #+compact-symbol
+    (let ((disp #+big-endian 4
+                #+x86-64 1
+                #+(and little-endian (not x86-64)) 2))
+      (with-pinned-objects (symbol)
+        (setf (sap-ref-16 (int-sap (get-lisp-obj-address symbol))
+                          (- disp sb-vm:other-pointer-lowtag))
+              new-id)))
     ;; CLEAR-INFO is inefficient, so try not to call it.
     (when (and (= old-id +package-id-overflow+) (/= new-id +package-id-overflow+))
       (clear-info :symbol :package symbol))
     package))
 
 ;;; MAKE-SYMBOL is the external API, %MAKE-SYMBOL is the internal function receiving
-;;; a known simple-string, and %%MAKE-SYMBOL is the primitive constructor.
+;;; a known simple-string, and %ALLOC-SYMBOL is the primitive constructor.
 (defun make-symbol (string)
   "Make and return a new symbol with the STRING as its print name."
   (declare (type string string))
@@ -376,24 +365,49 @@ distinct from the global value. Can also be SETF."
 
 (defun %make-symbol (kind name)
   (declare (ignorable kind) (type simple-string name))
+  ;; This constructor assumes that you should never create a symbol in an arena.
+  ;; That being the case, you also never want to have its name in an arena,
+  ;; or else it would make a heap->arena reference. Theoretically gensyms could
+  ;; go in an arena, but that's such an obscure case. This has worked well so far
+  ;; with the system TLAB assumption that I'm leaving that as-is, and mitigating the
+  ;; problem with arena-allocated strings, rather than guessing whether you really
+  ;; did want an arena-allocated symbol.
   (declare (sb-c::tlab :system))
-  ;; Avoid writing to the string header if it's already flagged as readonly, or off-heap.
-  (when (and (not (logtest (ash sb-vm:+vector-shareable+ 8) (get-header-data name)))
-             (dynamic-space-obj-p name))
-    (logior-array-flags name sb-vm:+vector-shareable+)) ; Set "logically read-only" bit
-  (let ((symbol
-         (truly-the symbol
-          #+immobile-symbols (sb-vm::make-immobile-symbol name)
-          #-immobile-space (sb-vm::%%make-symbol name)
-          #+(and immobile-space (not immobile-symbols))
-          (if (or (eql kind 1) ; keyword
-                  (and (eql kind 2) ; random interned symbol
-                       (plusp (length name))
-                       (char= (char name 0) #\*)
-                       (char= (char name (1- (length name))) #\*)))
-              (sb-vm::make-immobile-symbol name)
-              (sb-vm::%%make-symbol name)))))
-    (%set-symbol-package symbol nil)
+  (binding*
+      ((name
+        ;; We clearly have permission to copy: "It is implementation-dependent whether
+        ;; the string that becomes the new-symbol's name is the given name"
+        ;; but may or may not have leeway to change the element-type.
+        ;; I don't feel like writing a different variant of POSSIBLY-FROB-TO-HEAP just
+        ;; to satisfy pedants. However, only users of arenas would detect
+        ;; a change of element-type, if they care at all, which they don't.
+        (if (or (dynamic-space-obj-p name) (read-only-space-obj-p name))
+            name ; use as-is
+            (possibly-base-stringize-to-heap name)))
+       (()
+        (when (and (not (logtest (ash sb-vm:+vector-shareable+ 8) (get-header-data name)))
+                   ;; Readonly space is physically unwritable. Don't touch it.
+                   (not (read-only-space-obj-p name)))
+          (logior-array-flags name sb-vm:+vector-shareable+))) ; Set "logically read-only" bit
+       (name-hash (calc-symbol-name-hash name (length name)))
+       (symbol #+x86-64 (symbol-allocator-macro kind name)
+               #-x86-64 (sb-vm::%alloc-symbol name)))
+    (let ((salt (murmur-hash-word/fixnum
+                 (word-mix name-hash (get-lisp-obj-address symbol)))))
+      #+64-bit
+      (let ((hash (logior (ash name-hash 32) (mask-field symbol-hash-prng-byte salt))))
+        ;; %SET-SYMBOL-HASH wants a unsigned fixnum, which HASH is not.
+        (%primitive sb-vm::set-slot symbol (%make-lisp-obj hash)
+                    'make-symbol sb-vm:symbol-hash-slot sb-vm:other-pointer-lowtag))
+      #-64-bit
+      (with-pinned-objects (symbol) ; no vop sets the raw slot
+        (setf (sap-ref-32 (int-sap (get-lisp-obj-address symbol))
+                          (- (ash sb-vm:symbol-hash-slot sb-vm:word-shift)
+                             sb-vm:other-pointer-lowtag))
+              (logior (ash name-hash 3) (ldb (byte 3 0) salt)))))
+    ;; Compact-symbol (which is equivalent to #+64-bit) has the package already NIL
+    ;; because the PACKAGE-ID-BITS field defaults to 0.
+    #-compact-symbol (%set-symbol-package symbol nil)
     symbol))
 
 (defun get (symbol indicator &optional (default nil))
@@ -415,6 +429,7 @@ distinct from the global value. Can also be SETF."
 (defun %put (symbol indicator value)
   "The VALUE is added as a property of SYMBOL under the specified INDICATOR.
   Returns VALUE."
+  (declare (sb-c::tlab :system))
   (do ((pl (symbol-plist symbol) (cddr pl)))
       ((endp pl)
        (setf (symbol-plist symbol)
@@ -450,25 +465,39 @@ distinct from the global value. Can also be SETF."
 (defun getf (place indicator &optional (default ()))
   "Search the property list stored in PLACE for an indicator EQ to INDICATOR.
   If one is found, return the corresponding value, else return DEFAULT."
-  (do ((plist place (cddr plist)))
-      ((null plist) default)
-    (cond ((atom (cdr plist))
+  (declare (explicit-check))
+  (do* (cdr
+        (plist place (cdr (truly-the cons cdr))))
+       ((null plist) default)
+    (cond ((or (atom plist)
+               (atom (setf cdr (cdr plist))))
            (error 'simple-type-error
                   :format-control "malformed property list: ~S."
                   :format-arguments (list place)
-                  :datum (cdr plist)
+                  :datum (if (atom plist)
+                             plist
+                             (cdr plist))
                   :expected-type 'cons))
           ((eq (car plist) indicator)
-           (return (cadr plist))))))
+           (return (car (truly-the cons cdr)))))))
 
-(defun %putf (place property new-value)
-  (declare (type list place))
-  (do ((plist place (cddr plist)))
-      ((endp plist) (list* property new-value place))
-    (declare (type list plist))
-    (when (eq (car plist) property)
-      (setf (cadr plist) new-value)
-      (return place))))
+;;; Note: this will cons in an arena if you're using one.
+(defun %putf (place indicator new-value)
+  (do* (cdr
+        (plist place (cdr (truly-the cons cdr))))
+       ((null plist) (list* indicator new-value place))
+    (cond ((or (atom plist)
+               (atom (setf cdr (cdr plist))))
+           (error 'simple-type-error
+                  :format-control "malformed property list: ~S."
+                  :format-arguments (list place)
+                  :datum (if (atom plist)
+                             plist
+                             (cdr plist))
+                  :expected-type 'cons))
+          ((eq (car plist) indicator)
+           (setf (cadr plist) new-value)
+           (return place)))))
 
 (defun get-properties (place indicator-list)
   "Like GETF, except that INDICATOR-LIST is a list of indicators which will
@@ -485,21 +514,24 @@ distinct from the global value. Can also be SETF."
           ((memq (car plist) indicator-list)
            (return (values (car plist) (cadr plist) plist))))))
 
-(defun copy-symbol (symbol &optional (copy-props nil) &aux new-symbol)
+(defun copy-symbol (symbol &optional (copy-props nil))
   "Make and return a new uninterned symbol with the same print name
   as SYMBOL. If COPY-PROPS is false, the new symbol is neither bound
   nor fbound and has no properties, else it has a copy of SYMBOL's
   function, value and property list."
   (declare (type symbol symbol))
-  (setq new-symbol (make-symbol (symbol-name symbol)))
-  (when copy-props
-    (%set-symbol-value new-symbol
-                       (%primitive sb-c:fast-symbol-value symbol))
-    (setf (symbol-plist new-symbol)
-          (copy-list (symbol-plist symbol)))
-    (when (fboundp symbol)
-      (setf (symbol-function new-symbol) (symbol-function symbol))))
-  new-symbol)
+  (declare (sb-c::tlab :system)) ; heap-cons the property list if copying it
+  (let ((new-symbol (make-symbol (symbol-name symbol))))
+    (when copy-props
+      ;; Should this really copy a thread-local value ?
+      ;; I would think it more correct to copy only a global value.
+      (%set-symbol-value new-symbol (%primitive sb-c:fast-symbol-value symbol))
+      (locally (declare (optimize speed)) ; will inline COPY-LIST
+        (setf (symbol-plist new-symbol)
+              (copy-list (symbol-plist symbol))))
+      (when (fboundp symbol)
+        (setf (symbol-function new-symbol) (symbol-function symbol))))
+    new-symbol))
 
 (defun keywordp (object)
   "Return true if Object is a symbol in the \"KEYWORD\" package."
@@ -555,6 +587,51 @@ distinct from the global value. Can also be SETF."
             (intern (%symbol-nameify prefix (incf *gentemp-counter*)) package)
           (unless accessibility (return sym))))))
 
+(defmacro frob-symbol-progv-optimize (sym bit)
+  (sb-c::if-vop-existsp (:translate reset-header-bits)
+    (ecase bit
+      (1 `(logior-header-bits ,sym sb-vm::+symbol-fast-bindable+))
+      (0 `(reset-header-bits ,sym sb-vm::+symbol-fast-bindable+)))
+
+    ;; This way avoids a race with a thread assigning the TLS index
+    ;; when the required vops don't exist, which matters if and only
+    ;; if #+(and sb-thread 64-bit).
+    ;; Consider two threads binding the same symbol using PROGV:
+    ;;  thread A                    Thread B
+    ;;  --------                    --------
+    ;;  SET BIT:                    SET BIT:
+    ;;    x := load header word        x := load header word
+    ;;    logior x, bit                logior x, bit
+    ;;    store header word            ...
+    ;;                                 ... (descheduled by kernel)
+    ;;  DYNBIND:                       ...
+    ;;    ensure-tls-index             ...
+    ;;                                 store header word ; BUG: clobbers TLS index
+    ;;                              DYNBIND:
+    ;;                                 ensure-tls-index ; BUG: picks a new TLS index
+    ;;
+    `(with-pinned-objects (,sym)
+       (let ((sap (int-sap (get-lisp-obj-address ,sym)))
+             (offset (+ (- sb-vm:other-pointer-lowtag)
+                        #+big-endian (- sb-vm:n-word-bytes 2)
+                        #+little-endian 1)))
+         ;; ASSUMPTION: byte stores are atomic and do not affect adjacent bytes
+         (setf (sap-ref-8 sap offset)
+               (,(ecase bit (1 'logior) (0 'logandc2)) (sap-ref-8 sap offset)
+                 sb-vm::+symbol-fast-bindable+))))))
+
+(defun unset-symbol-progv-optimize (symbol)
+  (frob-symbol-progv-optimize symbol 0)
+  symbol)
+
+(macrolet ((signal-type-error (action-description)
+             `(let ((spec (type-specifier type)))
+                (cerror "Proceed anyway"
+                        'simple-type-error
+                        :format-control "~@<Cannot ~@? to ~S, not of type ~S.~:@>"
+                        :format-arguments (list ,action-description symbol new-value spec)
+                        :datum new-value
+                        :expected-type spec))))
 ;;; This function is to be called just before a change which would affect the
 ;;; symbol value. We don't absolutely have to call this function before such
 ;;; changes, since such changes to constants are given as undefined behavior,
@@ -567,6 +644,10 @@ distinct from the global value. Can also be SETF."
 ;;;   foo => 13, (constantp 'foo) => t
 ;;;
 ;;; ...in which case you frankly deserve to lose.
+;;;
+;;; If this function returns normally and was called from PROGV in unsafe code,
+;;; then we'll remember that it's OK not to call it again.
+;;; However, in safe code, PROGV still performs its type checking.
 (defun about-to-modify-symbol-value (symbol action &optional (new-value nil valuep) bind)
   (declare (symbol symbol))
   (declare (explicit-check))
@@ -578,7 +659,7 @@ distinct from the global value. Can also be SETF."
              (defconstant "define ~S as a constant")
              (makunbound "make ~S unbound"))))
     (let ((kind (info :variable :kind symbol)))
-      (multiple-value-bind (what continue)
+      (multiple-value-bind (complaint continuable)
           (cond ((eq kind :constant)
                  (cond ((eq symbol t)
                         (values "Veritas aeterna. (can't ~@?)" nil))
@@ -599,21 +680,50 @@ distinct from the global value. Can also be SETF."
                  (with-single-package-locked-error (:symbol symbol "unbinding the symbol ~A")
                    (when (eq (info :variable :always-bound symbol) :always-bound)
                      (values "Can't ~@?" nil)))))
-        (when what
-          (if continue
-              (cerror "Modify the constant." what (describe-action) symbol)
-              (error what (describe-action) symbol)))
-        (when valuep
-          (multiple-value-bind (type declaredp) (info :variable :type symbol)
-            ;; If globaldb returned the default of *UNIVERSAL-TYPE*,
-            ;; don't bother with a type test.
-            (when (and declaredp (not (%%typep new-value type 'functionp)))
-              (let ((spec (type-specifier type)))
-                (error 'simple-type-error
-                       :format-control "~@<Cannot ~@? to ~S, not of type ~S.~:@>"
-                       :format-arguments (list (describe-action) symbol new-value spec)
-                       :datum new-value
-                       :expected-type spec)))))))
+        (cond ((not complaint)
+               ;; the optimize bit says whether PROGV can be optimized, and not other actions
+               (when (eq action 'progv)
+                 (let ((package (symbol-package symbol)))
+                   (if (or (not package) (not (package-locked-p package)))
+                       (frob-symbol-progv-optimize symbol 1)))))
+              (continuable
+               (cerror "Modify the constant." complaint (describe-action) symbol))
+              (t
+               (error complaint (describe-action) symbol)))))
+    (when (and valuep (neq action 'progv))
+      (multiple-value-bind (type declaredp) (info :variable :type symbol)
+        ;; If globaldb returned the default of *UNIVERSAL-TYPE*,
+        ;; don't bother with a type test.
+        (when (and declaredp (not (%%typep new-value type 'functionp)))
+          (signal-type-error (describe-action)))))
     nil))
 
+;;; Despite the naming symmetry, these functions are not exactly symmetrical in
+;;; how they are used by the translation of PROGV
+;;; In safe code, the fast-bindable bit is checked inside the assertion,
+;;; because in all cases, we potentially perform a type-check which is too much
+;;; to inline into PROGV.
+;;; In unsafe code, if the symbol's fast-bindable bit is on, then we do NOT call
+;;; the assertion function. When called, its role is to assert that the symbol is
+;;; bindable and then set the bit saying never to call it again unless
+;;; the bit gets unset.
+(defun assert-dynbindable-safe (symbol new-value)
+  (declare (symbol symbol))
+  (unless (test-header-data-bit symbol sb-vm::+symbol-fast-bindable+)
+    (about-to-modify-symbol-value symbol 'progv nil t))
+  ;; Perform the type check here, not in ABOUT-TO-MODIFY-SYMBOL-VALUE, so that that
+  ;; function does not have to be informed when NOT to peform a check (i.e. in usafe code).
+  ;; Specifically, it can always bypass a type-check when the action is progv.
+  (multiple-value-bind (type declaredp) (info :variable :type symbol)
+    (when (and declaredp (not (%%typep new-value type 'functionp)))
+      (signal-type-error "bind ~S"))))
+(defun assert-dynbindable-unsafe (symbol)
+  (declare (symbol symbol))
+  (about-to-modify-symbol-value symbol 'progv nil t))
+) ; end MACROLET
+
 #+sb-thread (defun symbol-tls-index (x) (symbol-tls-index x)) ; necessary stub
+
+(defun symbol-name-hash (symbol) (symbol-name-hash symbol)) ; transformed
+(sb-c::when-vop-existsp (:translate hash-as-if-symbol-name)
+  (defun hash-as-if-symbol-name (x) (hash-as-if-symbol-name x))) ; transformed

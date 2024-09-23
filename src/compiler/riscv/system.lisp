@@ -64,7 +64,7 @@
   (:temporary (:sc unsigned-reg) this-id temp)
   (:generator 4
     (let ((offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lw this-id x offset)
       (if (or (typep (layout-id test-layout) '(and (signed-byte 8) (not (eql 0))))
@@ -138,14 +138,6 @@
                 (inst or t1 t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst andi res ptr (lognot fixnum-tag-mask))))
 
 
 ;;;; Allocation

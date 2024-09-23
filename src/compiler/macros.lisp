@@ -189,22 +189,22 @@
                          keys))
            final-mandatory-arg)
       (collect ((binds))
-        (binds `(,tail (basic-combination-args ,node-var)))
+        (binds `(,tail (basic-combination-args (truly-the basic-combination ,node-var))))
         ;; The way this code checks for mandatory args is to verify that
         ;; the last positional arg is not null (it should be an LVAR).
         ;; But somebody could pedantically declare IGNORE on the last arg
         ;; so bind a dummy for it and then bind from the dummy.
         (mapl (lambda (args)
                 (cond ((cdr args)
-                       (binds `(,(car args) (pop ,tail))))
+                       (binds `(,(car args) (pop (truly-the list ,tail)))))
                       (t
                        (setq final-mandatory-arg (pop dummies))
-                       (binds `(,final-mandatory-arg (pop ,tail))
+                       (binds `(,final-mandatory-arg (pop (truly-the list ,tail)))
                               `(,(car args) ,final-mandatory-arg)))))
               req)
         ;; Optionals are pretty easy.
         (dolist (arg opt)
-          (binds `(,(if (atom arg) arg (car arg)) (pop ,tail))))
+          (binds `(,(if (atom arg) arg (car arg)) (pop (truly-the list ,tail)))))
         ;; Now if min or max # of args is incorrect,
         ;; or there are unacceptable keywords, bail out
         (when (or req keyp (not rest))
@@ -284,26 +284,28 @@
 ;;;           - Don't actually instantiate a transform, instead just DEFUN
 ;;;             Name with the specified transform definition function. This
 ;;;             may be later instantiated with %DEFTRANSFORM.
-;;;   :INFO   - an extra piece of information the transform receives,
-;;;             typically for use with :DEFUN-ONLY
+;;;           - if the value is LAMBDA then returns a lambda form
+;;;             instead of a defun.
+;;;
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
 ;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
 ;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
 ;;;             :SLIGHTLY is the default.
+;;;   :VOP
+;;;           - insert it at the front, stop other transforms from firing
+;;;             if the function returns T.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
-                                          (result-type '*)
-                                          &key result policy node defun-only
-                                          (info nil info-p)
-                                          (important :slightly))
-                             &body body-decls-doc)
+                                                    (result-type '*)
+                              &key result policy node defun-only
+                                   (important :slightly)
+                                   vop)
+                        &body body-decls-doc)
   (declare (type (member nil :slightly t) important))
-  (cond (defun-only
-         (aver (eq important :slightly)) ; can't be specified
-         (aver (not policy))) ; has no effect on the defun
-        (t
-         (aver (not info))))
+  (when defun-only
+    (aver (eq important :slightly))     ; can't be specified
+    (aver (not policy)))            ; has no effect on the defun
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
     (let ((n-node (or node '#:node))
           (n-decls '#:decls)
@@ -312,7 +314,7 @@
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
         (let ((stuff
-                `((,n-node ,@(if info-p (list info)) &aux ,@bindings
+                `((,n-node &aux ,@bindings
                            ,@(when result
                                `((,result (node-lvar ,n-node)))))
                   (declare (ignorable ,@(mapcar #'car bindings)))
@@ -323,21 +325,36 @@
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
                   (block ,(fun-name-block-name name)
-                   (multiple-value-bind (,n-lambda ,n-decls)
-                      (progn ,@body)
-                    (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
-                        ,n-lambda
-                        `(lambda ,',lambda-list
-                           (declare (ignorable ,@',vars))
-                           ,@,n-decls
-                           ,,n-lambda)))))))
-          (if defun-only
-              `(defun ,name ,@stuff)
-              `(%deftransform ',name
-                              ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
-                              '(function ,arg-types ,result-type)
-                              (named-lambda (deftransform ,name) ,@stuff)
-                              ,important)))))))
+                    ,(if vop
+                         `(throw 'give-up-ir1-transform
+                            (values (if (progn ,@body)
+                                        :none
+                                        :failure)))
+                         `(multiple-value-bind (,n-lambda ,n-decls)
+                             (progn ,@body)
+                           (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
+                               ,n-lambda
+                               `(lambda ,',lambda-list
+                                  (declare (ignorable ,@',vars))
+                                  ,@,n-decls
+                                  ,,n-lambda))))))))
+          (cond
+            ((not defun-only)
+             `(let ((fun (named-lambda (deftransform ,name) ,@stuff)))
+                ,@(loop for (types result-type) in (if (typep arg-types '(cons (eql :or)))
+                                                       (cdr arg-types)
+                                                       (list (list arg-types result-type)))
+                        collect `(%deftransform ',name
+                                                ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
+                                                '(function ,types ,result-type)
+                                                fun
+                                                ,(if vop
+                                                     :vop
+                                                     important)))))
+            ((eq defun-only 'lambda)
+             `(named-lambda ,name ,@stuff))
+            (defun-only
+             `(defun ,name ,@stuff))))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
@@ -597,14 +614,15 @@
       (lambda (,cleanup-var) ,@body) ,block ,return-value)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
-;;; so that new, extra IR1 conversion related to NODE can be done
-;;; after the original conversion pass has finished.
+;;; so that IR1 conversion can be done after the main conversion pass
+;;; has finished.
 (defmacro with-ir1-environment-from-node (node &rest forms)
-  `(flet ((closure-needing-ir1-environment-from-node ()
-            ,@forms))
-     (%with-ir1-environment-from-node
-      ,node
-      #'closure-needing-ir1-environment-from-node)))
+  (once-only ((node node))
+    `(let ((*current-component* (node-component ,node))
+           (*lexenv* (node-lexenv ,node))
+           (*current-path* (node-source-path ,node)))
+       (aver-live-component *current-component*)
+       ,@forms)))
 
 ;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
 ;;; taken through the source to reach the form. This provides a way to
@@ -692,7 +710,7 @@
   (let ((vector (coerce attribute-names 'vector))
         (constructor (symbolicate name "-ATTRIBUTES"))
         (test-name (symbolicate name "-ATTRIBUTEP")))
-    `(progn
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
        (defmacro ,constructor (&rest attribute-names)
          "Automagically generated boolean attribute creation function.
   See !DEF-BOOLEAN-ATTRIBUTE."
@@ -882,7 +900,7 @@
                 (key #'identity)
                 (test #'eql))
   (declare (type function next key test))
-  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
+  (declare (dynamic-extent next key test))
   (do ((current list (funcall next current)))
       ((null current) nil)
     (when (funcall test (funcall key current) element)
@@ -898,7 +916,7 @@
                     (key #'identity)
                     (test #'eql))
   (declare (type function next key test))
-  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
+  (declare (dynamic-extent next key test))
   (do ((current list (funcall next current))
        (i 0 (1+ i)))
       ((null current) nil)
@@ -970,64 +988,3 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
-
-#|
-In trying to figure out whether we can rectify the totally unobvious behavior
-that FUN-INFO-TRANSFORMS are tried in the reverse order of their definitions,
-it is helpful to understand when multiple transforms exist where more than
-one could be selected.
-In the absence of type overlap, it wouldn't matter what order they were attempted.
-Unfortunately there are plenty of cases where the _least_ _specific_ fun-type
-should be attempted first, which at least superfically makes no sense at all.
-
-(in-package sb-c)
-;; As a special case, delete any functions where there are 2 transforms
-;; and they can't possibly both apply. Just check the first arg.
-(defun domains-possibly-overlap (xforms)
-  (when (/= (length xforms) 2) ; lazy, just say yes
-    (return-from domains-possibly-overlap t))
-  (let ((t1 (transform-type (car xforms)))
-        (t2 (transform-type (cadr xforms))))
-    (unless (and (fun-type-p t1) (fun-type-p t2))
-      (return-from domains-possibly-overlap t))
-    (let ((req1 (car (fun-type-required t1)))
-          (req2 (car (fun-type-required t2))))
-      (unless (and req1 req2)
-        (return-from domains-possibly-overlap t))
-      (when (or (and (type= req1 (specifier-type 'single-float))
-                     (type= req2 (specifier-type 'double-float)))
-                (and (type= req1 (specifier-type 'double-float))
-                     (type= req2 (specifier-type 'single-float))))
-        (return-from domains-possibly-overlap nil))))
-  ;; The conservative answer is always T.
-  t)
-(let (list)
-  (do-all-symbols (s)
-    (dolist (name (list s `(setf ,s) `(cas ,s)))
-      (let* ((info (sb-int:info :function :info name))
-             (xforms (and info (sb-c::fun-info-transforms info))))
-        (when (and info
-                   (> (length xforms) 1)
-                   (not (assoc name list)))
-          (if (domains-possibly-overlap xforms)
-              (push (cons name xforms) list)
-              (format t "~&Nonoverlapping xforms on ~s~%" name))))))
-  (let ((*print-pretty* nil))
-    (dolist (x (sort (copy-list list) #'> :key (lambda (x) (length (cdr x))))
-               (format t "~s functions~%" (length list)))
-      (format t "~a~%" (car x))
-      (let ((i 0))
-        (dolist (xform (cdr x))
-          (incf i)
-          (format t " ~2d. ~s~%" i (sb-kernel:type-specifier
-                                  (sb-c::transform-type xform)))
-          (let* ((fun (sb-c::transform-function xform))
-                 (code (sb-kernel:fun-code-header fun))
-                 (info (sb-kernel:%code-debug-info code))
-                 (source (sb-c::compiled-debug-info-source info))
-                 (tlf (sb-c::compiled-debug-info-tlf-number info))
-                 (offs (sb-c::compiled-debug-info-char-offset info))
-                 (ns (sb-c::debug-source-namestring source))
-                 (doc (documentation (sb-c::transform-function xform) 'function)))
-            (format t "     ; ~a ~a ~d ~d~%" doc ns tlf offs)))))))
-|#

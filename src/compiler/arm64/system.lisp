@@ -57,6 +57,22 @@
     (inst ldrb result (@ object result))
     done))
 
+;;; Return an index suitable for **PRIMITIVE-OBJECT-LAYOUTS**, with
+;;; instance and funcallable-instance already handled.
+(define-vop (widetag-of-for-layout)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:arg-refs object-ref)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (inst and result object widetag-mask)
+    (inst and tmp-tn object lowtag-mask)
+    (inst cmp tmp-tn other-pointer-lowtag)
+    (inst b :ne done)
+    (inst ldrb result (@ object (- other-pointer-lowtag)))
+    done))
+
 (define-vop (layout-depthoid)
   (:translate layout-depthoid)
   (:policy :fast-safe)
@@ -133,14 +149,6 @@
               byte 2))
       (inst ldrb tmp-tn (@ array (- byte other-pointer-lowtag)))
       (inst tst tmp-tn mask))))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst and res ptr (lognot fixnum-tag-mask))))
 
 ;;;; Allocation
 
@@ -209,26 +217,6 @@
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst add-sub result result (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes)))))
-;;;
-
-(defun load-symbol-dbinfo (result symbol temp)
-  (assemble ()
-    (loadw result symbol symbol-info-slot other-pointer-lowtag)
-    ;; If RESULT has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst and temp result lowtag-mask)
-    (inst cmp temp list-pointer-lowtag)
-    (inst b :ne NE)
-    (loadw result result cons-cdr-slot list-pointer-lowtag)
-    NE))
-
-(define-vop (symbol-dbinfo)
-  (:policy :fast-safe)
-  (:translate symbol-dbinfo)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (load-symbol-dbinfo res x temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -264,7 +252,9 @@
     (:arg-types (:constant (satisfies ldr-str-word-offset-encodable)))
     (:policy :fast-safe)
     (:generator 1
-      (inst ldr sap (@ thread-tn (ash n word-shift)))))
+      (if (= n thread-this-slot)
+          (move sap thread-tn)
+          (inst ldr sap (@ thread-tn (ash n word-shift))))))
 
   (define-vop (current-thread-offset-sap)
     (:results (sap :scs (sap-reg)))
@@ -315,7 +305,7 @@
    (inst store-coverage-mark index tmp vector)))
 
 (define-vop ()
-  (:translate sb-lockless::get-next)
+  (:translate sb-lockless:get-next)
   (:policy :fast-safe)
   (:args (node :scs (descriptor-reg)))
   (:results (next-tagged :scs (descriptor-reg))
@@ -327,3 +317,13 @@
       (loadw next-bits node (+ instance-slots-offset instance-data-start)
              instance-pointer-lowtag)
       (inst orr next-tagged next-bits instance-pointer-lowtag))))
+
+
+(define-vop (switch-to-arena)
+  (:args (x :scs (descriptor-reg immediate)))
+  (:temporary (:sc unsigned-reg :offset nl0-offset :from (:argument 0)) arg0)
+  (:temporary (:sc unsigned-reg :offset nl1-offset) arg1)
+  (:vop-var vop)
+  (:generator 1
+    (inst mov arg0 (if (sc-is x immediate) (tn-value x) x))
+    (invoke-asm-routine 'switch-to-arena arg1)))

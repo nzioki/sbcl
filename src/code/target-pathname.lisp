@@ -74,7 +74,7 @@
   ;; Specifically, hashes that depend on object identity (address) are impermissible.
   (dolist (piece pieces)
     (aver (typep piece '(or string symbol (cons (eql :character-set) string)))))
-  (%make-pattern (sxhash pieces) pieces))
+  (%make-pattern (pathname-sxhash pieces) pieces))
 
 (declaim (inline %pathname-directory))
 (defun %pathname-directory (pathname) (car (%pathname-dir+hash pathname)))
@@ -290,6 +290,10 @@
   (or (eq (car entry) (car key)) ; quick win if lists are EQ
       (and (eq (cdr entry) (cdr key)) ; hashes match
            (compare-component (car entry) (car key)))))
+(defun pn-table-hash (pathname)
+  ;; The pathname table makes distinctions between pathnames that EQUAL does not.
+  (mix (sxhash (%pathname-version pathname))
+       (pathname-sxhash pathname)))
 (defun pn-table-pn= (entry key)
   (and (compare-pathname-host/dev/dir/name/type entry key)
        (eql (%pathname-version entry) (%pathname-version key))))
@@ -297,7 +301,7 @@
 (defun !pathname-cold-init ()
   (setq *pn-dir-table* (make-hashset 32 #'pn-table-dir= #'cdr
                                      :synchronized t :weakness t)
-        *pn-table* (make-hashset 32 #'pn-table-pn= #'pathname-sxhash
+        *pn-table* (make-hashset 32 #'pn-table-pn= #'pn-table-hash
                                  :synchronized t :weakness t)))
 
 ;;; A pathname is logical if the host component is a logical host.
@@ -321,9 +325,11 @@
     (flet ((ensure-heap-string (part) ; return any non-string as-is
              ;; FIXME: what about pattern pieces and (:HOME "user") ?
              (cond ((or (not (stringp part)) (read-only-space-obj-p part)) part)
-                   ((dynamic-space-obj-p part) (logically-readonlyize part))
-                   ;; dynamic-extent strings and lisp strings in alien memory are acceptable.
-                   ;; Copies must be made in that case, since we're holding on to them.
+                   ;; Altering a string that is any piece of any arg to INTERN-PATHNAME
+                   ;; is a surefire way to corrupt the hashset, so *always* copy the input.
+                   ;; Users might not have reason to believe that once a string is passed
+                   ;; to any pathname function, it is immutable. We can only hope that
+                   ;; they don't mutate strings returned by pathname accessors.
                    (t (let ((l (length part)))
                         (logically-readonlyize
                          (replace (typecase part
@@ -337,7 +343,7 @@
                    (lambda (dir)
                      (cons (mapcar #'ensure-heap-string (car dir)) (cdr dir))))))
              (pn-key (!allocate-pathname host device dir+hash name type version)))
-        (declare (truly-dynamic-extent pn-key))
+        (declare (dynamic-extent pn-key))
         (hashset-insert-if-absent
          *pn-table* pn-key
          (lambda (tmp &aux (host (%pathname-host tmp)))
@@ -348,7 +354,7 @@
                        (ensure-heap-string (%pathname-type tmp))
                        (%pathname-version tmp))))
              (when (typep host 'logical-host)
-               (setf (%instance-wrapper new) #.(find-layout 'logical-pathname)))
+               (setf (%instance-layout new) #.(find-layout 'logical-pathname)))
              new)))))))
 
 ;;; Weak vectors don't work at all once rendered pseudo-static.
@@ -360,36 +366,39 @@
   (hashset-rehash *pn-table* nil))
 
 (defun show-pn-cache (&aux (*print-pretty* nil) (*package* (find-package "CL-USER")))
-  (without-gcing
-   (dolist (symbol '(*pn-dir-table* *pn-table*))
-     (let* ((hashset (symbol-value symbol))
-            (dirs (hss-cells (hashset-storage *pn-dir-table*)))
-            (v (hss-cells (hashset-storage hashset)))
-            (n (hs-cells-capacity v)))
-       (format t "~&~S: size=~D tombstones=~D unused=~D~%" symbol n
-               (count nil v :end n) (count 0 v :end n))
-       (dotimes (i n)
-         (let ((entry (aref v i)))
-           (unless (member entry '(nil 0))
-             (if (eq symbol '*pn-dir-table*)
-                 (format t "~4d ~3d ~x ~16x ~s~%" i
-                         (generation-of entry) (get-lisp-obj-address entry)
-                         (cdr entry) (car entry))
-                 (format t "~4d ~3d ~x ~16x [~A ~S ~A ~S ~S ~S]~%"
-                         i (generation-of entry) (get-lisp-obj-address entry)
-                         (pathname-sxhash entry)
-                         (let ((host (%pathname-host entry)))
-                           (cond ((logical-host-p host)
-                                  (prin1-to-string (logical-host-name host)))
-                                 ((eq host *physical-host*) "phys")
-                                 (t host)))
-                         (%pathname-device entry)
-                         (acond ((%pathname-dir+hash entry)
-                                 (format nil "@~D" (position it dirs)))
-                                (t "-"))
-                         (%pathname-name entry)
-                         (%pathname-type entry)
-                         (%pathname-version entry))))))))))
+  (dolist (symbol '(*pn-dir-table* *pn-table*))
+    (let* ((hashset (symbol-value symbol))
+           (v (hss-cells (hashset-storage hashset)))
+           (n (hs-cells-capacity v)))
+      (multiple-value-bind (live tombstones unused) (hs-cells-occupancy v n)
+        (declare (ignore live))
+        (format t "~&~S: size=~D tombstones=~D unused=~D~%" symbol n tombstones unused))
+      (dotimes (i n)
+        (let ((entry (hs-cell-ref v i)))
+          (unless (member entry '(nil 0))
+            (format t "~4d ~3d ~x " i (generation-of entry) (get-lisp-obj-address entry))
+            (if (eq symbol '*pn-dir-table*)
+                (format t "~16x ~s~%" (cdr entry) (car entry))
+                (flet ((index-of (pn-dir)
+                         (let ((dirs (hss-cells (hashset-storage *pn-dir-table*))))
+                           (dotimes (i (weak-vector-len dirs))
+                             (when (eq pn-dir (weak-vector-ref dirs i))
+                               (return i))))))
+                  (format t
+                   "~16x [~A ~S ~A ~S ~S ~S]~%"
+                   (pathname-sxhash entry)
+                   (let ((host (%pathname-host entry)))
+                     (cond ((logical-host-p host)
+                            ;; display with string quotes around name
+                            (prin1-to-string (logical-host-name host)))
+                           ((eq host *physical-host*) "phys")
+                           (t host)))
+                   (%pathname-device entry)
+                   (acond ((%pathname-dir+hash entry) (format nil "@~D" (index-of it)))
+                          (t "-"))
+                   (%pathname-name entry)
+                   (%pathname-type entry)
+                   (%pathname-version entry))))))))))
 
 ;;; Vector of logical host objects, each of which contains its translations.
 ;;; The vector is never mutated- always a new vector is created when adding
@@ -557,8 +566,6 @@
 (defun pathname= (a b)
   (declare (type pathname a b))
   (or (eq a b)
-      ;; I believe that this is actually the same as EQ on pathnames now,
-      ;; but until I prove it, I'm leaving this code in.
       (and (compare-pathname-host/dev/dir/name/type a b)
            (or (eq (%pathname-host a) *physical-host*)
                (compare-component (pathname-version a)
@@ -567,18 +574,27 @@
 (sb-kernel::assign-equalp-impl 'pathname #'pathname=)
 (sb-kernel::assign-equalp-impl 'logical-pathname #'pathname=)
 
-;;; Hash either a PATHNAME or a PATHNAME-DIRECTORY. This is called byt both SXHASH
-;;; and by the interning of pathnames, which uses a multi-step approaching to
-;;; coalescing shared subparts. If an EQUAL directory was used before, we share that.
+;;; Hash a PATHNAME or a PATHNAME-DIRECTORY or pieces of a PATTERN.
+;;; This is called by both SXHASH and by the interning of pathnames, which uses a
+;;; multi-step approaching to coalescing shared subparts.
+;;; If an EQUAL directory was used before, we share that.
 ;;; Since a directory is stored with its hash precomputed, hashing a PATHNAME as a
 ;;; whole entails at most 4 more MIX operations. So using pathnames as keys in
 ;;; a hash-table pays a small up-front price for later speed improvement.
 (defun pathname-sxhash (x)
-  (flet ((hash-piece (piece)
+  (labels
+      ((hash-piece (piece)
            (etypecase piece
-             (string (sxhash piece)) ; transformed
-             (symbol (sxhash piece)) ; transformed
+             (string
+              (let ((res (length piece)))
+                (if (<= res 6) ; hash it more thoroughly than (SXHASH string)
+                    (dovector (ch piece res)
+                      (setf res (mix (murmur-hash-word/+fixnum (char-code ch)) res)))
+                    (sxhash piece))))
+             (symbol (symbol-name-hash piece))
              (pattern (pattern-hash piece))
+             ;; next case is only for MAKE-PATTERN
+             ((cons (eql :character-set)) (hash-piece (the string (cdr piece))))
              ((cons (eql :home) (cons string null))
               ;; :HOME has two representations- one is just '(:absolute :home ...)
               ;; and the other '(:absolute (:home "user") ...)
@@ -592,10 +608,13 @@
          (awhen (%pathname-dir+hash x) (mixf hash (cdr it)))
          (mixf hash (hash-piece (%pathname-name x)))
          (mixf hash (hash-piece (%pathname-type x)))
-         ;; EQUAL might ignore the version, and it doesn't provide many bits
-         ;; of randomness, so don't bother with it.
+         ;; The requirement NOT to mix the version into the resulting hash is mandated
+         ;; by bullet point 1 in the SXHASH specification:
+         ;;  (equal x y) implies (= (sxhash x) (sxhash y))
+         ;; and the observation that in this implementation of Lisp:
+         ;;  (equal (make-pathname :version 1) (make-pathname :version 15)) => T
          hash))
-      (list ;; a directory
+      (list ;; a directory, or the PIECES argument to MAKE-PATTERN
        (let ((hash 0))
          (dolist (piece x hash)
            (mixf hash (hash-piece piece))))))))
@@ -697,9 +716,9 @@ the operating system native pathname conventions."
 
 ;;; Recursively (e.g. for the directory component) change the case of
 ;;; the pathname component THING.
-(declaim (type (sfunction ((or symbol integer string pattern list))
-                          (or symbol integer string pattern list))
-               diddle-case))
+(declaim (ftype (sfunction ((or symbol integer string pattern list))
+                           (or symbol integer string pattern list))
+                diddle-case))
 (defun diddle-case (thing)
   (labels ((check-for (pred in)
              (typecase in
@@ -1267,22 +1286,22 @@ relative to DEFAULTS."
            (type (member nil :host :device :directory :name :type :version)
                  field-key))
   (with-pathname (pathname pathname)
-    (flet ((frob (x)
-             (or (pattern-p x) (member x '(:wild :wild-inferiors)))))
-      (ecase field-key
-        ((nil)
-         (or (wild-pathname-p pathname :host)
-             (wild-pathname-p pathname :device)
-             (wild-pathname-p pathname :directory)
-             (wild-pathname-p pathname :name)
-             (wild-pathname-p pathname :type)
-             (wild-pathname-p pathname :version)))
-        (:host (frob (%pathname-host pathname)))
-        (:device (frob (%pathname-host pathname)))
-        (:directory (some #'frob (%pathname-directory pathname)))
-        (:name (frob (%pathname-name pathname)))
-        (:type (frob (%pathname-type pathname)))
-        (:version (frob (%pathname-version pathname)))))))
+    (labels ((wildp (x)
+               (or (pattern-p x) (if (member x '(:wild :wild-inferiors)) t nil)))
+             (test (field)
+               (wildp
+                (case field
+                  (:host (%pathname-host pathname)) ; always NIL
+                  (:device (%pathname-device pathname))
+                  (:directory
+                   (return-from test (some #'wildp (%pathname-directory pathname))))
+                  (:name (%pathname-name pathname))
+                  (:type (%pathname-type pathname))
+                  (:version (%pathname-version pathname))))))
+      (if (not field-key)
+          ;; SBCL does not allow :WILD in the host
+          (or (test :device) (test :directory) (test :name) (test :type) (test :version))
+          (test field-key)))))
 
 (defun pathname-match-p (in-pathname in-wildname)
   "Pathname matches the wildname template?"
@@ -1555,27 +1574,44 @@ unspecified elements into a completed to-pathname based on the to-wildname."
                 (pathname-host (sane-default-pathname-defaults))))
            namestring))
 
+(defun lpn-word-char-p (char)
+  ;; This predicate is just {alpha|digit|dash} but by expressing it as
+  ;; range comparison we can - I hope - avoid cross-compiling many of
+  ;; the Unicode tables and particularly MISC-INDEX. Taking them out of
+  ;; make-host-2 removes some hassle around dumping specialized vectors.
+  (and (typep (truly-the character char) 'base-char)
+       (let ((code (char-code char)))
+         (or (<= (char-code #\a) code (char-code #\z))
+             (<= (char-code #\A) code (char-code #\Z))
+             (<= (char-code #\0) code (char-code #\9))
+             (= code (char-code #\-))))))
+
 ;;; Canonicalize a logical pathname word by uppercasing it checking that it
 ;;; contains only legal characters.
 (defun logical-word-or-lose (word)
   (declare (string word))
+  ;; Maybe this function used to be called only on the HOST part of a namestring,
+  ;; and so the error message about an empty string made sense in that it mentioned
+  ;; "logical host", but this is also called by UPCASE-MAYBE via INTERN-PATHNAME
+  ;; on every part - name, type, and directory.
+  ;; Maybe INTERN-PATHNAME is the one that's wrong?
   (when (string= word "")
+    ;; https://www.lispworks.com/documentation/HyperSpec/Body/19_cbb.htm
     (error 'namestring-parse-error
-           :complaint "Attempted to treat invalid logical hostname ~
-                       as a logical host:~%  ~S"
+           :complaint "A string of length 0 is not a valid value for any ~
+                       component of a logical pathname"
            :args (list word)
            :namestring word :offset 0))
-  (let ((word (string-upcase word)))
-    (dotimes (i (length word))
-      (let ((ch (schar word i)))
-        (unless (and (typep ch 'standard-char)
-                     (or (alpha-char-p ch) (digit-char-p ch) (char= ch #\-)))
+  (dotimes (i (length word) (string-upcase word))
+    ;; um, how do we know it's SIMPLE-STRING when the decl at the top
+    ;; only says STRING?
+    (let ((ch (schar word i)))
+      (unless (lpn-word-char-p ch)
           (error 'namestring-parse-error
                  :complaint "logical namestring character which ~
                              is not alphanumeric or hyphen:~%  ~S"
                  :args (list ch)
-                 :namestring word :offset i))))
-    (coerce word 'string))) ; why not simple-string?
+                 :namestring word :offset i)))))
 
 ;;; Given a logical host or string, return a logical host. If ERROR-P
 ;;; is NIL, then return NIL when no such host exists.
@@ -1660,8 +1696,7 @@ unspecified elements into a completed to-pathname based on the to-wildname."
          (when (> end prev)
             (chunks (cons (nstring-upcase (subseq namestr prev end)) prev))))
       (let ((ch (schar namestr i)))
-        (unless (or (alpha-char-p ch) (digit-char-p ch)
-                    (member ch '(#\- #\*)))
+        (unless (or (lpn-word-char-p ch) (char= ch #\*))
           (when (> i prev)
             (chunks (cons (nstring-upcase (subseq namestr prev i)) prev)))
           (setq prev (1+ i))

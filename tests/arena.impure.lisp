@@ -1,9 +1,14 @@
-#-system-tlabs (invoke-restart 'run-tests::skip-file)
-#+interpreter (invoke-restart 'run-tests::skip-file)
+#+(or gc-stress ;; c-find-heap->arena is not gc-safe
+      (not system-tlabs) interpreter) (invoke-restart 'run-tests::skip-file)
+
 (in-package sb-vm)
 
 (defvar *many-arenas*
   (coerce (loop for i below 10 collect (new-arena 1048576)) 'vector))
+
+;;; KEEP THIS AS THE FIRST TEST IN THE FILE. (Or make a new file of tests)
+(test-util:with-test (:name :run-finder-with-no-arenas)
+  (assert (null (c-find-heap->arena))))
 
 (defvar *arena* (aref *many-arenas* 0))
 ;;; This REWIND is strictly unnecessary. It simply should not crash
@@ -12,6 +17,102 @@
 (defun f (x y z)
   (with-arena (*arena*) (list x y z)))
 
+;;; The main use-case for inhibiting all arena allocations despite that objects
+;;; should go to arenas is for debugging an application under Slime.
+;;; Users don't understand all the things they have to avoid doing in Slime to avoid
+;;; violating the heap->arena pointer restriction, both in their code and as a side-effect
+;;; of using Slime to interact with SBCL. Supposing it were possible to alter parts of
+;;; slime to guard its own memory use (by injecting SB-VM:WITHOUT-ARENA all over the place)
+;;; - which frankly doesn't seem like it would be a welcome change - there's no assurance
+;;; that Slime customizations and contributed modules adhere to the required contract.
+;;; Thus it seems pretty impossible, and even if it were possible, users debugging at
+;;; a REPL have no idea how to avoid causing further harm due to Slime's background
+;;; threads holding on to objects users have made.  So we offer a toggle switch to
+;;; disable arenas; I think it's our the best shot. And obviously don't debug your
+;;; arena-related bugs using Slime: debug only your non-arena-related bugs.
+(test-util:with-test (:name :arena-inhibit)
+  (let ((arena *arena*))
+    (sb-vm:with-arena (arena)
+      (write (make-array 100) :stream (make-broadcast-stream)))
+    (assert (plusp (sb-vm:arena-bytes-used arena)))
+    (rewind-arena arena)
+    (unwind-protect
+         (progn (setf (extern-alien "inhibit_arena_use" int) 1)
+                (sb-vm:with-arena (arena)
+                  (write (make-array 100) :stream (make-broadcast-stream))))
+      (setf (extern-alien "inhibit_arena_use" int) 0))
+    (assert (zerop (sb-vm:arena-bytes-used arena)))))
+
+(test-util:with-test (:name :arena-huge-object)
+  ;; This arena can grow to 10 MiB.
+  (let ((a (new-arena 1048576 1048576 9)))
+    ;; 4 arrays of about 2MiB each should fit in the allowed space
+    (dotimes (i 4)
+      (test-util:opaque-identity
+       (with-arena (a) (make-array 2097152 :element-type '(unsigned-byte 8)))))
+    (destroy-arena a)))
+
+(test-util:with-test (:name :disassembler)
+  (let ((a (new-arena 1048576)))
+    (with-arena (a) (sb-disassem:get-inst-space))
+    (assert (null (c-find-heap->arena)))
+    (destroy-arena a)))
+
+(test-util:with-test (:name :no-arena-symbol-name)
+  (let* ((a (new-arena 1048576))
+         (symbol
+          (sb-vm:with-arena (a)
+            (let ((string (format nil "test~D" (random 10))))
+              (make-symbol string)))))
+    (assert (heap-allocated-p symbol))
+    (assert (heap-allocated-p (symbol-name symbol)))
+    (destroy-arena a)))
+
+(test-util:with-test (:name :no-arena-symbol-property)
+  (let* ((a (new-arena 1048576))
+         (copy-of-foo
+          (with-arena (a)
+            (setf (get 'testsym 'fooprop) 9)
+            (copy-symbol 'testsym t))))
+    (test-util:opaque-identity copy-of-foo)
+    (assert (not (c-find-heap->arena)))
+    (destroy-arena a)))
+
+(test-util:with-test (:name :interrupt-thread-on-arena)
+  (let* ((a (new-arena 1048576))
+         (sem (sb-thread:make-semaphore))
+         (junk))
+    (sb-vm:with-arena (a)
+      (sb-thread:interrupt-thread
+       sb-thread:*current-thread*
+       (lambda ()
+         (setf junk (cons 'foo 'bar))
+         (sb-thread:signal-semaphore sem))))
+    (sb-thread:wait-on-semaphore sem)
+    (sb-vm:destroy-arena a)
+    (assert (heap-allocated-p junk))))
+
+(defun find-some-pkg () (find-package "NOSUCHPKG"))
+
+(test-util:with-test (:name :find-package-1-element-cache)
+  (let* ((cache (let ((code (fun-code-header #'find-some-pkg)))
+                  (loop for i from code-constants-offset
+                        below (code-header-words code)
+                        when (and (typep (code-header-ref code i) '(cons string))
+                                  (string= (car (code-header-ref code i))
+                                           "NOSUCHPKG"))
+                        return (code-header-ref code i))))
+         (elements (cdr cache)))
+    (assert (or (equalp (cdr cache) #(NIL NIL NIL))
+                (search "#<weak array [3]" (write-to-string (cdr cache)))))
+    (let* ((a (new-arena 1048576))
+           (pkg (with-arena (a) (find-some-pkg))))
+      (assert (not pkg)) ; no package was found of course
+      (assert (neq (cdr cache) elements)) ; the cache got affected
+      (assert (not (c-find-heap->arena)))
+      (destroy-arena a))))
+
+#+nil
 (test-util:with-test (:name :arena-alloc-waste-reduction)
   (let* ((list1 (f 'foo 'bar'baz))
          (list1-addr (get-lisp-obj-address list1))
@@ -91,20 +192,41 @@
             (unless (and (heap-allocated-p line) (not (points-to-arena line)))
               (hexdump line 2 nil)
               (error "~S has ~S" symbol line)))))))
-  #-win32 ; finder crashes (same reason for the :skipped-on below I guess)
   (let ((finder-result (c-find-heap->arena)))
     (assert (null finder-result))))
 
+(defun decode-all-debug-data ()
+  (dolist (code (sb-vm:list-allocated-objects :all :type sb-vm:code-header-widetag))
+    (let ((info (sb-kernel:%code-debug-info code)))
+      (when (typep info 'sb-c::compiled-debug-info)
+        (let ((fun-map (sb-di::get-debug-info-fun-map
+                        (sb-kernel:%code-debug-info code))))
+          (loop for i from 0 below (length fun-map) by 2 do
+            (let ((cdf (aref fun-map i)))
+              (test-util:opaque-identity
+               (sb-di::debug-fun-lambda-list
+                (sb-di::make-compiled-debug-fun cdf code))))))))))
+
+(test-util:with-test (:name :debug-data-force-to-heap)
+  (let ((a (sb-vm:new-arena (* 1024 1024 1024))))
+    (sb-vm:with-arena (a)
+      (decode-all-debug-data))
+    (assert (zerop (length (sb-vm:c-find-heap->arena a))))
+    (sb-vm:destroy-arena a)))
+
 (defun test-with-open-file ()
-  (with-open-file (stream (format nil "/proc/~A/stat" (sb-unix:unix-getpid))
-                          :if-does-not-exist nil)
+  ;; Force allocation of a new BUFFER containing a new SAP,
+  ;; and thereby a new finalizer (a closure) so that the test can
+  ;; ascertain that none of those went to the arena.
+  (setq sb-impl::*available-buffers* nil)
+  (with-open-file (stream *load-pathname*)
     (if stream
         (let ((pn (pathname stream)))
           (values pn (namestring pn) (read-line stream nil)))
         (values nil nil nil))))
 
 (defvar *answerstring*)
-(test-util:with-test (:name :with-open-stream :skipped-on (:not :linux))
+(test-util:with-test (:name :with-open-stream)
   (multiple-value-bind (pathname namestring answer)
       (with-arena (*arena*) (test-with-open-file))
     (when pathname
@@ -221,7 +343,7 @@
 (defvar ptr1 (cons (f arena1) 'foo))
 (defvar ptr2 (g arena2))
 
-(test-util:with-test (:name :find-ptrs-all-arenas :skipped-on :win32)
+(test-util:with-test (:name :find-ptrs-all-arenas)
   (let ((result (c-find-heap->arena)))
     ;; There should be a cons pointing to ARENA1,
     ;; the cons which happens to be in PTR1
@@ -231,7 +353,7 @@
     ;; There should not be anything else
     (assert (= (length result) 2))))
 
-(test-util:with-test (:name :find-ptrs-specific-arena :skipped-on :win32)
+(test-util:with-test (:name :find-ptrs-specific-arena)
   (let ((result (c-find-heap->arena arena1)))
     (assert (equal result (list ptr1))))
   (let ((result (c-find-heap->arena arena2)))
@@ -255,6 +377,7 @@
           (with-arena (arena)
             (test-util:opaque-identity (make-array 5)))))))
   bytes-used)
+#+nil
 (test-util:with-test (:name :allocator-resumption)
   (map nil 'rewind-arena *many-arenas*)
   (let ((bytes-used-per-arena (use-up-some-space 10000)))
@@ -278,100 +401,6 @@
               ;; savearea only when switching away from the arena.
               (unuse-arena)))))
       (sb-thread:join-thread thread))))
-
-(defvar *newpkg* (make-package "PACKAGE-GROWTH-TEST"))
-(defun addalottasymbols ()
-  (with-arena (*arena*)
-    (dotimes (i 200)
-      (let ((str (concatenate 'string "S" (write-to-string i))))
-        (assert (not (heap-allocated-p str)))
-        (let ((sym (intern str *newpkg*)))
-          (assert (heap-allocated-p sym))
-          (assert (heap-allocated-p (symbol-name sym))))))))
-(test-util:with-test (:name :intern-a-bunch)
-  (let ((old-n-cells
-         (length (sb-impl::symtbl-cells
-                  (sb-impl::package-internal-symbols *newpkg*)))))
-    (addalottasymbols)
-    (let* ((cells (sb-impl::symtbl-cells
-                   (sb-impl::package-internal-symbols *newpkg*))))
-      (assert (> (length cells) old-n-cells)))))
-
-(defun all-arenas ()
-  (let ((head (sb-kernel:%make-lisp-obj (extern-alien "arena_chain" unsigned))))
-    (cond ((eql head 0) nil)
-          (t
-           (assert (typep (arena-link head) '(or null arena)))
-           (collect ((output))
-             (do ((a head (arena-link a)))
-                 ((null a)
-                  ;; (format t "CHAIN: ~X~%" (output))
-                  (output))
-               (output (get-lisp-obj-address a))))))))
-
-(test-util:with-test (:name destroy-arena)
-  (macrolet ((exit-if-no-arenas ()
-               '(progn (incf n-deleted)
-                       (when (zerop (extern-alien "arena_chain" unsigned)) (return)))))
-    (let ((n-arenas (length (all-arenas)))
-          (n-deleted 0))
-      (loop ; until all deleted
-        ;; 1.delete the first item
-        (let* ((chain (all-arenas))
-               (item (car chain))
-               (arena (%make-lisp-obj item)))
-          (assert (typep arena 'arena))
-          (destroy-arena arena)
-          (assert (equal (all-arenas) (cdr chain))))
-        (exit-if-no-arenas)
-        ;; 2. delete something from the middle
-        (let* ((chain (all-arenas))
-               (item (nth (floor (length chain) 2) chain))
-               (arena (%make-lisp-obj item)))
-          (assert (typep arena 'arena))
-          (destroy-arena arena)
-          (assert (equal (all-arenas) (delete item chain))))
-        (exit-if-no-arenas)
-        ;; 3. delete the last item
-        (let* ((chain (all-arenas))
-               (item (car (last chain)))
-               (arena (%make-lisp-obj item)))
-          (assert (typep arena 'arena))
-          (destroy-arena arena)
-          (assert (equal (all-arenas) (butlast chain))))
-        (exit-if-no-arenas))
-      (assert (= n-deleted n-arenas)))))
-
-(defvar *another-arena* (new-arena 131072))
-(defun g (n) (make-array (the integer n) :initial-element #\z))
-(defun f (a n) (with-arena (a) (g n)))
-
-(defvar *vect* (f *another-arena* 10))
-(setf (aref *vect* 3) "foo")
-
-;;; "Hiding" an arena asserts that no references will be made to it until
-;;; unhidden and potentially rewound. So any use of it is like a use-after-free bug,
-;;; except that the memory is still there so we can figure out what went wrong
-;;; with user code. This might pass on #+-linux but has not been tested.
-(test-util:with-test (:name :arena-use-after-free :skipped-on (:not :linux))
-  ;; scary messages scare me
-  (format t "::: NOTE: Expect a \"CORRUPTION WARNING\" from this test~%")
-  (hide-arena *another-arena*)
-  (let (caught)
-    (block foo
-      (handler-bind
-          ((sb-sys:memory-fault-error
-            (lambda (c)
-              (format t "~&Uh oh spaghetti-o: tried to read @ ~x~%"
-                      (sb-sys:system-condition-address c))
-              (setq caught t)
-              (return-from foo))))
-        (aref *vect* 3)))
-    (assert caught))
-  ;; Assert that it becomes usable again
-  (unhide-arena *another-arena*)
-  (rewind-arena *another-arena*)
-  (dotimes (i 10) (f *another-arena* 1000)))
 
 ;;;; Type specifier parsing and operations
 
@@ -419,7 +448,7 @@
            (dolist (x *bunch-of-objects*)
              (when (typep x spec)
                (incf result)))))
-    (sb-vm:with-arena (arena)
+    (with-arena (arena)
       (let ((specs (get-bunch-of-type-specs)))
         (dolist (spec1 specs)
           (dolist (spec2 specs)
@@ -427,13 +456,159 @@
             (try `(or ,spec1 ,spec2))
             (try `(and ,spec1 (not ,spec2)))
             (try `(or ,spec1 (not ,spec2))))))))
-  (assert (null (sb-vm:c-find-heap->arena arena)))
+  (assert (not (c-find-heap->arena arena)))
   result)
-(test-util:with-test (:name :ctype-cache
-                      ;; don't have time to figure out the 'c-find-heap->arena' crashes
-                      :skipped-on :win32)
-  (let ((arena (sb-vm:new-arena 1048576)))
+(test-util:with-test (:name :ctype-cache)
+  (let ((arena (new-arena 1048576)))
     (ctype-operator-tests arena)))
+
+;;;;
+
+(defvar *newpkg* (make-package "PACKAGE-GROWTH-TEST"))
+(defun addalottasymbols ()
+  (with-arena (*arena*)
+    (dotimes (i 200)
+      (let ((str (concatenate 'string "S" (write-to-string i))))
+        (assert (not (heap-allocated-p str)))
+        (let ((sym (intern str *newpkg*)))
+          (assert (heap-allocated-p sym))
+          (assert (heap-allocated-p (symbol-name sym)))))))
+  (assert (not (c-find-heap->arena *arena*))))
+
+(test-util:with-test (:name :intern-a-bunch)
+  (let ((old-n-cells
+         (length (sb-impl::symtbl-cells
+                  (sb-impl::package-internal-symbols *newpkg*)))))
+    (addalottasymbols)
+    (let* ((cells (sb-impl::symtbl-cells
+                   (sb-impl::package-internal-symbols *newpkg*))))
+      (assert (> (length cells) old-n-cells)))))
+
+(defun all-arenas ()
+  (let ((head (sb-kernel:%make-lisp-obj (extern-alien "arena_chain" unsigned))))
+    (cond ((eql head 0) nil)
+          (t
+           (assert (typep (arena-link head) '(or null arena)))
+           (collect ((output))
+             (do ((a head (arena-link a)))
+                 ((null a)
+                  ;; (format t "CHAIN: ~X~%" (output))
+                  (output))
+               (output (get-lisp-obj-address a))))))))
+
+(define-condition foo (simple-warning)
+  ((a :initarg :a)
+   (b :initarg :b)))
+(defvar *condition* (make-condition 'foo
+                                    :format-control "hi there"
+                                    :a '(x y) :b #P"foofile"
+                                    :format-arguments '("Yes" "no")))
+(test-util:with-test (:name :arena-condition-slot-access)
+  (assert (null (sb-kernel::condition-assigned-slots *condition*)))
+  (let ((val (with-arena (*arena*)
+               (slot-value *condition* 'b))))
+    (assert (pathnamep val))
+    (assert (not (points-to-arena *condition*)))))
+
+(test-util:with-test (:name :gc-epoch-not-in-arena)
+  (with-arena (*arena*) (gc))
+  (assert (heap-allocated-p sb-kernel::*gc-epoch*)))
+
+(defvar *sem* (sb-thread:make-semaphore))
+(defvar *thing-created-by-hook* nil)
+(push (lambda ()
+        (push (cons 1 2) *thing-created-by-hook*)
+        (sb-thread:signal-semaphore *sem*))
+      *after-gc-hooks*)
+(test-util:with-test (:name :post-gc-hooks-unuse-arena)
+  (with-arena (*arena*) (gc))
+  (sb-thread:wait-on-semaphore *sem*)
+  (setq *after-gc-hooks* nil)
+  (assert *thing-created-by-hook*)
+  (assert (heap-allocated-p *thing-created-by-hook*))
+  (assert (heap-allocated-p (car *thing-created-by-hook*))))
+
+;;; CAUTION: tests of C-FIND-HEAP->ARENA that execute after destroy-arena and a following
+;;; NEW-ARENA might spuriously fail depending on how eagerly malloc() reuses addresses.
+;;; The failure goes something like this:
+;;;
+;;; stack -> some-cons C1 ; conservative reference
+;;; heap: C1 = (#<instance-in-arena> . mumble)
+;;;
+;;; now rewind the arena. "instance-in-arena" is not a valid object.
+;;; But: allocate more stuff in the arena, and suppose the address where instance-in-arena
+;;; formerly was now holds a different primitive object, like a cons cell.
+;;; The C-FIND-HEAP->ARENA function won't die, but you *will* die when trying to examine
+;;; what it found.  The heap cons is conservatively live, its contents are assumed good,
+;;; yet its CAR has instance-pointer-lowtag pointing to something that does not have
+;;; INSTANCE-WIDETAG. The Lisp printer suffers a horrible fate and causes recursive errors.
+;;; Had malloc() not reused an address, this would not happen, because the destroyed arena
+;;; can not be seen, and the cons pointing to nothing will not be returned by the finder.
+(test-util:with-test (:name destroy-arena)
+  (macrolet ((exit-if-no-arenas ()
+               '(progn (incf n-deleted)
+                       (when (zerop (extern-alien "arena_chain" unsigned)) (return)))))
+    (let ((n-arenas (length (all-arenas)))
+          (n-deleted 0))
+      (loop ; until all deleted
+        ;; 1.delete the first item
+        (let* ((chain (all-arenas))
+               (item (car chain))
+               (arena (%make-lisp-obj item)))
+          (assert (typep arena 'arena))
+          (destroy-arena arena)
+          (assert (equal (all-arenas) (cdr chain))))
+        (exit-if-no-arenas)
+        ;; 2. delete something from the middle
+        (let* ((chain (all-arenas))
+               (item (nth (floor (length chain) 2) chain))
+               (arena (%make-lisp-obj item)))
+          (assert (typep arena 'arena))
+          (destroy-arena arena)
+          (assert (equal (all-arenas) (delete item chain))))
+        (exit-if-no-arenas)
+        ;; 3. delete the last item
+        (let* ((chain (all-arenas))
+               (item (car (last chain)))
+               (arena (%make-lisp-obj item)))
+          (assert (typep arena 'arena))
+          (destroy-arena arena)
+          (assert (equal (all-arenas) (butlast chain))))
+        (exit-if-no-arenas))
+      (assert (= n-deleted n-arenas)))))
+
+(defvar *another-arena* (new-arena 131072))
+(defun g (n) (make-array (the integer n) :initial-element #\z))
+(defun f (a n) (with-arena (a) (g n)))
+
+(defvar *vect* (f *another-arena* 10))
+(setf (aref *vect* 3) "foo")
+
+;;; "Hiding" an arena asserts that no references will be made to it until
+;;; unhidden and potentially rewound. So any use of it is like a use-after-free bug,
+;;; except that the memory is still there so we can figure out what went wrong
+;;; with user code. This might pass on #+-linux but has not been tested.
+(setf (extern-alien "lose_on_corruption_p" int) 0)
+(test-util:with-test (:name :arena-use-after-free :skipped-on (:not :linux))
+  ;; scary messages scare me
+  (format t "::: NOTE: Expect a \"CORRUPTION WARNING\" from this test~%")
+  (hide-arena *another-arena*)
+  (let (caught)
+    (block foo
+      (handler-bind
+          ((sb-sys:memory-fault-error
+             (lambda (c)
+               (format t "~&Uh oh spaghetti-o: tried to read @ ~x~%"
+                       (sb-sys:system-condition-address c))
+               (setq caught t)
+               (return-from foo))))
+        (aref *vect* 3)))
+    (assert caught))
+  ;; Assert that it becomes usable again
+  (unhide-arena *another-arena*)
+  (rewind-arena *another-arena*)
+  (dotimes (i 10) (f *another-arena* 1000)))
+(setf (extern-alien "lose_on_corruption_p" int) 1)
 
 ;; #+sb-devel preserves some symbols that the test doesn't care about
 ;; as the associated function will never be called.
@@ -469,3 +644,64 @@
                 (unless (every #'line-ok lines)
                   (format *error-output* "Failure:~{~%~A~}~%" lines)
                   (error  "Bad result for ~S" symbol))))))))))
+
+(defun collect-objects-pointing-off-heap ()
+  (let (list)
+    (flet ((add-to-result (obj referent)
+             ;; If this is a code component and it points to fixups
+             ;; which are a bignum in a random place, assume that it's an ELF core
+             ;; and that the packed fixup locs are in a ".rodata" section
+             (cond ((and (typep obj 'sb-kernel:code-component)
+                         (typep referent 'bignum)
+                         (eq referent (%code-fixups obj)))
+                    nil)
+                   (t
+                    (push (cons (sb-ext:make-weak-pointer obj)
+                                (if (sb-ext:stack-allocated-p referent t)
+                                    :stack
+                                    (sb-sys:int-sap (get-lisp-obj-address referent))))
+                          list)))))
+      (macrolet ((visit (referent)
+                   `(let ((r ,referent))
+                      (when (and (is-lisp-pointer (get-lisp-obj-address r))
+                                 (not (heap-allocated-p r))
+                                 (add-to-result obj r))
+                        (return-from done)))))
+        (map-allocated-objects
+         (lambda (obj type size)
+           (declare (ignore type size))
+           (block done
+             (do-referenced-object (obj visit)
+               (t
+                :extend
+                (case (widetag-of obj)
+                  (#.value-cell-widetag
+                   (visit (value-cell-ref obj)))
+                  (t
+                   (warn "Unknown widetag ~x" (widetag-of obj))))))))
+         :all)))
+    list))
+
+(defun show-objects-pointing-off-heap (list)
+  (dolist (x list)
+    (let ((obj (weak-pointer-value (car x))))
+      (if (typep obj '(or sb-kernel:code-component
+                       symbol))
+          (format t "~s -> ~s~%" obj (cdr x))
+          (format t "~s -> ~s~%" (type-of obj) (cdr x))))))
+
+(defun start-a-thread (arena arg)
+  (sb-vm:with-arena (arena)
+    (let ((name (format nil "worker~d" arg)))
+      (sb-thread:make-thread
+       (lambda () (print 'hi (make-broadcast-stream)))
+       :name name))))
+
+(test-util:with-test (:name :thread-name-not-in-arena)
+  (let* ((arena (new-arena 131072))
+         (thread (start-a-thread arena 1)))
+    (unwind-protect
+         (progn
+           (sb-thread:join-thread thread)
+           (assert (heap-allocated-p (sb-thread:thread-name thread))))
+      (destroy-arena arena))))
