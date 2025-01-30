@@ -40,16 +40,19 @@
 
 (defstruct (dxable-args (:constructor make-dxable-args (list))
                         (:predicate nil)
-                        (:copier nil))
+                        (:copier nil)
+                        #-sb-xc-host :no-constructor-defun)
   (list nil :read-only t))
 (defstruct (inlining-data (:include dxable-args)
                           (:constructor make-inlining-data (expansion list))
                           (:predicate nil)
-                          (:copier nil))
+                          (:copier nil)
+                          #-sb-xc-host :no-constructor-defun)
   (expansion nil :read-only t))
 (declaim (freeze-type dxable-args))
 
-(defstruct (ir1-namespace (:conc-name "") (:copier nil) (:predicate nil))
+(defstruct (ir1-namespace (:conc-name "") (:copier nil) (:predicate nil)
+                          (:constructor make-ir1-namespace ()))
   ;; FREE-VARS translates from the names of variables referenced
   ;; globally to the LEAF structures for them. FREE-FUNS is like
   ;; FREE-VARS, only it deals with function names.
@@ -111,7 +114,7 @@
 ;;; In particular, ELF cores shrink the immobile code space down to just enough
 ;;; to contain all code, plus about 1/2 MiB of spare, which means that you can't
 ;;; subsequently compile a whole lot into immobile space.
-;;; The value is changed to :AUTO in make-target-2-load.lisp which supresses
+;;; The value is changed to :AUTO in make-target-2-load.lisp which suppresses
 ;;; codegen optimizations for immobile space, but nonetheless prefers to allocate
 ;;; the code there, falling back to dynamic space if there is no room left.
 ;;; These controls exist whether or not the immobile-space feature is present.
@@ -210,8 +213,9 @@
                 #-sb-xc-host #'sxhash))
 
 (defstruct (compilation (:constructor make-compilation
-                                      (&key coverage-metadata msan-unpoison
-                                       block-compile entry-points compile-toplevel-object))
+                                      (&optional msan-unpoison
+                                                 coverage-metadata
+                                                 block-compile entry-points compile-toplevel-object))
                         (:copier nil)
                         (:predicate nil)
                         (:conc-name ""))
@@ -226,6 +230,13 @@
   (coverage-metadata nil :type (or (cons hash-table hash-table) null) :read-only t)
   (msan-unpoison nil :read-only t)
   (sset-counter 1 :type fixnum)
+  ;; Which GC the code generator should target. The codegen is basically the same for now
+  ;; (with tiny alterations) but it may be quite different eventually. And it would be
+  ;; great if COMPILE-FILE can be flexibile. If you have a compiler driver image that
+  ;; itself uses a particular GC, it should work to write FASLs for either GC as long as
+  ;; you don't load incompatible artifacts into the current image. Think of it as a
+  ;; compiler that just happens to be written in nearly-the-same implementation.
+  (allocator-target (default-gc-strategy) :type (member :gencgc :mark-region-gc))
   ;; if emitting a cfasl, the fasl stream to that
   (compile-toplevel-object nil :read-only t)
   ;; The current block compilation state.  These are initialized to
@@ -246,7 +257,7 @@
   ;; compiler to dump symbols in such a way that the loader can
   ;; reconstruct them in the correct package.
   (package-environment-changed nil :type boolean)
-  ;; Bidrectional map between IR1/IR2/assembler abstractions and a corresponding
+  ;; Bidirectional map between IR1/IR2/assembler abstractions and a corresponding
   ;; small integer or string identifier. One direction could be done by adding
   ;; the ID as slot to each object, but we want both directions.
   ;; These could just as well be scoped by WITH-IR1-NAMESPACE, but
@@ -285,7 +296,7 @@
   ;; as ordinary calls not in the scope of a local or global notinline declaration.
   ;; Useful for finding functions that were supposed to have been converted
   ;; through some kind of transformation but were not.
-  (emitted-full-calls (make-hash-table :test 'equal))
+  (emitted-full-calls (make-hash-table :test 'equal) :read-only t)
   ;; hash-table of hash-tables:
   ;;  outer: GF-Name -> hash-table
   ;;  inner: (qualifiers . specializers) -> lambda-list

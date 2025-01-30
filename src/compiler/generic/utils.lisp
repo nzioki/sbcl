@@ -106,7 +106,10 @@
                       (nth n *register-arg-offsets*))
       (make-sc+offset control-stack-sc-number n)))
 
-(defstruct fixed-call-args-state
+(defstruct (fixed-call-args-state
+            (:copier nil)
+            (:predicate nil)
+            (:constructor make-fixed-call-args-state ()))
   (descriptors -1 :type fixnum)
   #-c-stack-is-control-stack
   (non-descriptors -1 :type fixnum)
@@ -122,23 +125,35 @@
                        type
                        (primitive-type type)))
          (sc (find descriptor-reg-sc-number (sb-c::primitive-type-scs primtype) :test-not #'eql)))
-    (case (primitive-type-name primtype)
-      ((double-float single-float)
-       (make-wired-tn primtype
-                      sc
-                      (elt *float-regs* (incf (fixed-call-args-state-float state)))))
-      ((unsigned-byte-64 signed-byte-64)
-       (make-wired-tn primtype
-                      sc
-                      (elt #-c-stack-is-control-stack *non-descriptor-args*
-                           #+c-stack-is-control-stack *descriptor-args*
-                           (incf (#-c-stack-is-control-stack fixed-call-args-state-non-descriptors
-                                  #+c-stack-is-control-stack fixed-call-args-state-descriptors
-                                  state)))))
-      (t
-       (make-wired-tn primtype
-                      descriptor-reg-sc-number
-                      (elt *descriptor-args* (incf (fixed-call-args-state-descriptors state))))))))
+    (flet ((descriptor ()
+             (let ((index (incf (fixed-call-args-state-descriptors state)))
+                   (max-regs (length *descriptor-args*)))
+               (if (< index max-regs)
+                   (make-wired-tn primtype
+                                  descriptor-reg-sc-number
+                                  (elt *descriptor-args* index))
+                   (make-wired-tn primtype control-stack-sc-number (+ register-arg-count (- index max-regs)))))))
+      (case (primitive-type-name primtype)
+        ((double-float single-float)
+         (let ((n (incf (fixed-call-args-state-float state))))
+           (if (< n (length *float-regs*))
+               (make-wired-tn primtype
+                              sc
+                              (elt *float-regs* n))
+               (descriptor))))
+        ((unsigned-byte-64 signed-byte-64)
+         (let ((n (incf (#-c-stack-is-control-stack fixed-call-args-state-non-descriptors
+                         #+c-stack-is-control-stack fixed-call-args-state-descriptors
+                         state)))
+               (regs #-c-stack-is-control-stack *non-descriptor-args*
+                     #+c-stack-is-control-stack *descriptor-args*))
+           (if (< n (length regs))
+               (make-wired-tn primtype
+                              sc
+                              (elt regs n))
+               (descriptor))))
+        (t
+         (descriptor))))))
 
 ;;; Make a TN to hold the number-stack frame pointer.  This is allocated
 ;;; once per component, and is component-live.
@@ -383,9 +398,16 @@
                              (not (and ;; Can this TN be boxed after the allocator?
                                    (boxed-tn-p tn)
                                    (or (eq allocator :allocator)
-                                       (and (neq (vop-name (tn-ref-vop ref)) 'instance-set-multiple)
-                                            (sb-c::set-slot-old-p (sb-c::vop-node (tn-ref-vop ref))
-                                                                  (vop-arg-position value-tn-ref (tn-ref-vop ref))))))))
+                                       (let ((vop (tn-ref-vop ref)))
+                                        (and (neq (vop-name vop) 'instance-set-multiple)
+                                             (let ((node (sb-c::vop-node (tn-ref-vop ref))))
+                                               (multiple-value-bind (nth-object nth-value)
+                                                   (if (and (eq (vop-name vop) 'set-slot)
+                                                            (typep (sb-c::combination-fun-source-name node)
+                                                                   '(cons (eql setf))))
+                                                       (values 1 0)
+                                                       (values 0 (vop-arg-position value-tn-ref vop)))
+                                                 (sb-c::set-slot-old-p node nth-object nth-value)))))))))
                     (return t))))))
         (unless any-pointer
           (return-from require-gengc-barrier-p nil))))
@@ -469,7 +491,7 @@
 (defun compute-fastrem-coefficient (d n fraction-bits)
   (multiple-value-bind (smallest-f c)
       (flet ((is-pow2 (n)
-               (declare (unsigned-byte n))
+               (declare (type unsigned-byte n))
                (let ((l (integer-length n)))
                  (= n (ash 1 (1- l))))))
         (if (is-pow2 d)
@@ -552,3 +574,22 @@
            (let ((node (sb-c::vop-node sb-assem::*current-vop*)))
              (and (sb-c::combination-p node)
                   (eq (sb-c::combination-info node) :aligned-stack))))))
+
+(defun target-heap-prezeroed-p ()
+  (eq (sb-c::allocator-target *compilation*) :mark-region-gc))
+
+(defun target-heap-large-object-size ()
+  (ecase (sb-c::allocator-target *compilation*)
+    ;; Needless to say this violates the OAOO principle as the definition
+    ;; of the "constant" for this appears in late-objdef in addition to which
+    ;; it's a crummy assumption that page-size is the same for each GC.
+    ;; For I'm just trying to solve the minimal number of issues in terms
+    ;; of having the ability to target a fasl to a different GC.
+    (:gencgc (* 4 gencgc-page-bytes))
+    (:mark-region-gc (* 3/4 gencgc-page-bytes))))
+
+;;; Print registers from VOPs
+(defmacro mprint (value)
+  `(let ((*location-context* ',value))
+     (emit-error-break sb-assem::*current-vop* cerror-trap (error-number-or-lose 'sb-kernel::mprint-error)
+                       (list ,value))))

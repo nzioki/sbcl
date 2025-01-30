@@ -174,12 +174,18 @@
      (let* ((n-supplied (gensym))
             (nargs (length (lambda-vars fun)))
             (temps (make-gensym-list nargs))
-            (info (info :function :info (functional-%source-name fun)))
-            (types (and info
-                        (ir1-attributep (fun-info-attributes info) fixed-args)
-                        (loop for var in (lambda-vars fun)
-                              for temp in temps
-                              collect `(type ,(type-specifier (lambda-var-type var)) ,temp)))))
+            (name (functional-%source-name fun))
+            (info (info :function :info name))
+            (types (or (and (or
+                             (and info
+                                  (ir1-attributep (fun-info-attributes info) fixed-args))
+                             (typep name '(cons (eql sb-impl::specialized-xep))))
+                            (loop for var in (lambda-vars fun)
+                                  for type in (fun-type-required (if (typep name '(cons (eql sb-impl::specialized-xep)))
+                                                                     (specifier-type `(function ,@(cddr name)))
+                                                                     (info :function :type name)))
+                                  for temp in temps
+                                  collect `(type ,(type-specifier type) ,temp))))))
 
        `(lambda (,n-supplied ,@temps)
           (declare (type index ,n-supplied)
@@ -388,6 +394,7 @@
            (fun (or new (pop (component-reanalyze-functionals component)))))
       (unless fun
         (return))
+      (setf (functional-reanalyze fun) nil)
       (let ((kind (functional-kind fun)))
         (cond ((or (functional-somewhat-letlike-p fun)
                    (logtest kind (functional-kind-attributes deleted zombie))))
@@ -1287,8 +1294,10 @@
        ;; locall.
        (when (and done-something
                   component
+                  (not (functional-reanalyze leaf))
                   (member leaf (component-lambdas component)))
-         (pushnew leaf (component-reanalyze-functionals component)))))
+         (setf (functional-reanalyze leaf) t)
+         (push leaf (component-reanalyze-functionals component)))))
   (values))
 
 ;;; This function is called when there is some reason to believe that

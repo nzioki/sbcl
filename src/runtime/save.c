@@ -98,13 +98,13 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
         input.pos = 0;
 
         size_t buf_size = ZSTD_CStreamOutSize();
-        unsigned char* buf = successful_malloc(buf_size);
+        unsigned char* buf = checked_malloc(buf_size);
         ZSTD_outBuffer output;
         output.dst = buf;
         output.size = buf_size;
 
         unsigned char * written, * end;
-        long total_written = 0;
+        size_t total_written = 0;
         ZSTD_CStream *stream = ZSTD_createCStream();
         if (stream == NULL)
             lose("failed to create zstd compression context");
@@ -134,7 +134,7 @@ write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
                 }
             }
         } while (ret != 0);
-        printf("compressed %lu bytes into %lu at level %i\n",
+        printf("compressed %zu bytes into %zu at level %i\n",
                bytes, total_written, compression);
 
         ZSTD_freeCStream(stream);
@@ -285,10 +285,21 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     int string_words = ALIGN_UP(stringlen, sizeof (core_entry_elt_t))
         / sizeof (core_entry_elt_t);
     int pad = string_words * sizeof (core_entry_elt_t) - stringlen;
-    /* Write 3 word entry header: a word for entry-type-code, a word for
-     * the total length in words, and a word for the string length */
+    /* Write 5 word entry header: a word for entry-type-code, the length in words,
+     * the GC enum, the address of NIL, and the string length */
     write_lispobj(BUILD_ID_CORE_ENTRY_TYPE_CODE, file);
-    write_lispobj(3 + string_words, file);
+    write_lispobj(5 + string_words, file);
+#ifdef LISP_FEATURE_GENCGC
+    write_lispobj(1, file);
+#endif
+#ifdef LISP_FEATURE_MARK_REGION_GC
+    write_lispobj(2, file);
+#endif
+#ifdef LISP_FEATURE_RELOCATABLE_STATIC_SPACE
+    write_lispobj(0, file);
+#else
+    write_lispobj(NIL, file);
+#endif
     write_lispobj(stringlen, file);
     int nwrote = fwrite(build_id, 1, stringlen, file);
     /* Write padding bytes to align to core_entry_elt_t */
@@ -402,7 +413,7 @@ bool save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 #endif
         size_t ptes_nbytes = next_free_page * sizeof(struct corefile_pte);
         size_t aligned_size = ALIGN_UP((bitmapsize+ptes_nbytes), N_WORD_BYTES);
-        char* data = successful_malloc(aligned_size);
+        char* data = checked_malloc(aligned_size);
         // Zeroize the final few bytes of data that get written out
         // but might be untouched by gc_store_corefile_ptes().
         memset(data + aligned_size - N_WORD_BYTES, 0, N_WORD_BYTES);
@@ -492,7 +503,7 @@ load_runtime(char *runtime_path, size_t *size_out)
     if (core_offset != -1 && size > (size_t) core_offset)
         size = core_offset;
 
-    buf = successful_malloc(size);
+    buf = checked_malloc(size);
     if ((count = fread(buf, 1, size, input)) != size) {
         fprintf(stderr, "Premature EOF while reading runtime.\n");
         goto lose;
@@ -552,7 +563,7 @@ bool save_runtime_to_filehandle(FILE *output, void *runtime, size_t runtime_size
 
     padding = (os_vm_page_size - (runtime_size % os_vm_page_size)) & ~os_vm_page_size;
     if (padding > 0) {
-        padbytes = successful_malloc(padding);
+        padbytes = checked_malloc(padding);
         memset(padbytes, 0, padding);
         if (padding != fwrite(padbytes, 1, padding, output)) {
             perror("Error saving runtime");

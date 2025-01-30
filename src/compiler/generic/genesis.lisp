@@ -2929,7 +2929,8 @@ Legal values for OFFSET are -4, -8, -12, ..."
            code-obj offset
            (ecase flavor
              #+linkage-space
-             (:linkage-cell
+             ((:linkage-cell :linkage-cell-ud)
+              (setq flavor :linkage-cell) ; -ud variant is irrelevant
               (let ((i (ensure-linkage-index name)))
                 (unless (permanent-fname-p (warm-fun-name name))
                   (pushnew i callees))
@@ -3051,6 +3052,11 @@ Legal values for OFFSET are -4, -8, -12, ..."
 (defvar +c-literal-64bit+
   #+(and win32 x86-64) "LLU" ; "long" is 32 bits, "long long" is 64 bits
   #-(and win32 x86-64) "LU") ; "long" is 64 bits
+
+(defun gc-strategy-id ()
+  (or #+gencgc 1
+      #+mark-region-gc 2
+      (error "Missing a GC feature")))
 
 (defun write-constants-h (*standard-output*)
   (let ((constants nil))
@@ -3178,6 +3184,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
   ;; values never needed in Lisp, so therefore not a defconstant
   (format t "~:{#define ~A ~D~%~}"
           `(("MAX_CONSES_PER_PAGE" ,sb-vm::max-conses-per-page)
+            ("GC_STRATEGY_ID" ,(gc-strategy-id))
             ("GENCGC_PAGE_SHIFT" ,(1- (integer-length sb-vm:gencgc-page-bytes)))
             ("GENCGC_CARD_SHIFT" ,sb-vm::gencgc-card-shift)
             ("CARDS_PER_PAGE" ,sb-vm::cards-per-page)))
@@ -3330,7 +3337,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
             (aref a sb-vm:list-pointer-lowtag) (format nil "~a_list" flavor)
             (aref a sb-vm:fun-pointer-lowtag) (format nil "~a_fun_or_otherptr" flavor)
             (aref a sb-vm:other-pointer-lowtag) (format nil "~a_fun_or_otherptr" flavor))
-      (format out "static void (*~a_fns[])(lispobj obj) = {~
+      (format out "static void (*~a_fns[])(lispobj,iochannel_t) = {~
 ~{~% ~a, ~a, ~a, ~a~^,~}~%};~%" flavor (coerce a 'list)))))
 
 (defun write-cast-operator (operator-name c-type-name lowtag stream)
@@ -4041,9 +4048,12 @@ INDEX   LINK-ADDR       FNAME    FUNCTION  NAME
                  ((nwords padding) (ceiling (length build-id) sb-vm:n-word-bytes)))
         (declare (type simple-string build-id))
         ;; Write BUILD-ID-CORE-ENTRY-TYPE-CODE, the length of the header,
-        ;; length of the string, then base string chars + maybe padding.
+        ;; the GC this was build for, the address of NIL, the length of the
+        ;; ID string, then base string chars + maybe padding.
         (write-words core-file build-id-core-entry-type-code
-                     (+ 3 nwords) ; 3 = fixed overhead including this word
+                     (+ 5 nwords) ; 5 = fixed overhead including this word
+                     (gc-strategy-id)
+                     (or #-relocatable-static-space sb-vm:nil-value 0)
                      (length build-id))
         (dovector (char build-id) (write-byte (char-code char) core-file))
         (dotimes (j (- padding)) (write-byte #xff core-file)))

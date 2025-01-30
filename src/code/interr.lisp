@@ -172,8 +172,8 @@
   (let* ((frame (find-interrupted-frame))
          (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
          (context (sb-di:error-context)))
-    (cond (context
-           (destructuring-bind (name type . restart) context
+    (cond ((typep context '(cons integer cons))
+           (destructuring-bind (restart name . type) context
                (restart-case
                    (error 'simple-program-error
                           :format-control "Function~@[ ~s~] declared to return ~s returned ~a value~:p"
@@ -184,10 +184,23 @@
                    (sb-vm::incf-context-pc *current-internal-error-context*
                                            restart)))))
           (t
-           (when (typep name '(cons (eql sb-pcl::fast-method)))
-             (decf nargs 2))
            (restart-case
-               (%program-error "invalid number of arguments: ~S" nargs)
+               (error 'simple-program-error
+                      :format-control "invalid number of arguments: ~S"
+                      :format-arguments (list (if (typep name '(cons (eql sb-pcl::fast-method)))
+                                                  (- nargs 2)
+                                                  nargs)))
+             (continue ()
+               :report (lambda (stream)
+                         (format stream "Ignore extra arguments"))
+               :test (lambda ()
+                       (and context
+                            (> nargs (cdr context))))
+               (destructuring-bind (restart . max) context
+                 (setf (sb-vm:boxed-context-register *current-internal-error-context* sb-vm::nargs-offset)
+                       max)
+                 (sb-vm::incf-context-pc *current-internal-error-context*
+                                         restart)))
              #+(or x86-64 arm64)
              (replace-function (value)
                :report (lambda (stream)
@@ -377,11 +390,12 @@
                                         'type-error)
                                     :datum object
                                     :expected-type expected-type
-                                    :context (and (not (integerp context))
-                                                  (not (eq context 'cerror))
-                                                  context))))
-              (cond ((integerp context)
-                     (restart-type-error type condition context))
+                                    :context (and (not (eq context 'cerror))
+                                                  (if (typep context '(cons integer))
+                                                      (cdr context)
+                                                      context)))))
+              (cond ((typep context '(cons integer))
+                     (restart-type-error type condition (car context)))
                     ((eq context 'cerror)
                      (restart-type-error type condition))
                     (t
@@ -394,6 +408,12 @@
   (def etypecase-failure-error etypecase-failure)
   (def ecase-failure-error ecase-failure)
   (def object-not-type-error object-not-type-error))
+
+(deferr check-type-error (value place type)
+  (declare (notinline check-type-error-trap))
+  (setf (sb-vm:boxed-context-register *current-internal-error-context*
+                                      (sb-c:sc+offset-offset (first *current-internal-error-args*)))
+        (check-type-error-trap place value type)))
 
 (deferr odd-key-args-error ()
   (%program-error "odd number of &KEY arguments"))
@@ -480,22 +500,37 @@
 (sb-c::when-vop-existsp (:translate overflow+)
   (flet ((err (x of cf)
            (let* ((raw-x (car *current-internal-error-args*))
-                  (signed (= (sb-c:sc+offset-scn raw-x) sb-vm:signed-reg-sc-number)))
-             (let ((type (or (sb-di:error-context)
-                             'fixnum))
-                   (x (if signed
-                          (cond ((and of cf)
-                                 (dpb x (byte sb-vm:n-word-bits 0) -1))
-                                (of
-                                 (ldb (byte sb-vm:n-word-bits 0) x))
-                                (t
-                                 x))
-                          (cond (cf
-                                 (dpb 1 (byte 1 sb-vm:n-word-bits) x))
-                                (of
-                                 (sb-c::mask-signed-field sb-vm:n-word-bits x))
-                                (t
-                                 (dpb x (byte sb-vm:n-word-bits 0) -1))))))
+                  (scn (sb-c:sc+offset-scn raw-x)))
+             (let* ((type (or (sb-di:error-context)
+                              'fixnum))
+                    (x (cond ((or (= scn sb-vm:descriptor-reg-sc-number)
+                                  (= scn sb-vm:any-reg-sc-number))
+                              (let ((x (sb-di::sub-access-debug-var-slot
+                                        nil (sb-c:make-sc+offset sb-vm:signed-reg-sc-number
+                                                                 (sb-c:sc+offset-offset raw-x))
+                                        *current-internal-error-context*)))
+                                (cond ((and of cf)
+                                       (dpb (ldb (byte sb-vm:n-fixnum-bits sb-vm:n-fixnum-tag-bits) x)
+                                            (byte sb-vm:n-fixnum-bits 0)
+                                            -1))
+                                      (of
+                                       (ldb (byte sb-vm:n-fixnum-bits sb-vm:n-fixnum-tag-bits) x))
+                                      (t
+                                       x))))
+                             ((= scn sb-vm:signed-reg-sc-number)
+                              (cond ((and of cf)
+                                     (dpb x (byte sb-vm:n-word-bits 0) -1))
+                                    (of
+                                     (ldb (byte sb-vm:n-word-bits 0) x))
+                                    (t
+                                     x)))
+                             (t
+                              (cond (cf
+                                     (dpb 1 (byte 1 sb-vm:n-word-bits) x))
+                                    (of
+                                     (sb-c::mask-signed-field sb-vm:n-word-bits x))
+                                    (t
+                                     (dpb x (byte sb-vm:n-word-bits 0) -1)))))))
                (object-not-type-error x type nil)))))
     (deferr add-sub-overflow-error (x)
       (multiple-value-bind (of cf) (sb-vm::context-overflow-carry-flags *current-internal-error-context*)
@@ -557,6 +592,26 @@
       (if (numberp x)
           (object-not-type-error (- x) type nil)
           (object-not-type-error x 'number nil)))))
+
+(deferr fill-pointer-error (array)
+  (declare (notinline fill-pointer-error))
+  (if (and (arrayp array)
+           (array-has-fill-pointer-p array))
+      (error (if (zerop (fill-pointer array))
+                 "There is nothing left to pop."
+                 "Unexpected FILL-POINTER error"))
+      (fill-pointer-error array)))
+
+(deferr mprint-error (x)
+  (declare (ignore x))
+  (let* ((raw-x (car *current-internal-error-args*))
+         (tn-name (sb-disassem::get-random-tn-name raw-x))
+         (context (sb-di:error-context)))
+    (multiple-value-bind (value size)
+        (sb-di::sub-access-debug-var-slot nil raw-x *current-internal-error-context* t)
+      (if size
+          (format t "~7a = ~v,'0,'|,32:x ~a~%" tn-name (* size 2) value context)
+          (format t "~7a = ~a ~a~%" tn-name value context)))))
 
 ;;;; INTERNAL-ERROR signal handler
 

@@ -128,9 +128,10 @@
              (inst add csp-tn csp-tn size)
              (storew cfp-tn res ocfp-save-offset))))
     (when (ir2-environment-number-stack-p callee)
-      (inst sub nfp nsp-tn (add-sub-immediate
-                            (bytes-needed-for-non-descriptor-stack-frame)))
-      (inst mov-sp nsp-tn nfp))))
+      (let ((size (bytes-needed-for-non-descriptor-stack-frame)))
+        (unless (zerop size)
+          (inst sub nfp nsp-tn (add-sub-immediate size))
+          (inst mov-sp nsp-tn nfp))))))
 
 ;;; Allocate a partial frame for passing stack arguments in a full call.  Nargs
 ;;; is the number of arguments passed.  If no stack arguments are passed, then
@@ -202,9 +203,9 @@
                                   :unknown-return))
       (flet ((check-nargs ()
                (assemble ()
-                 (let* ((*location-context* (list* name
-                                                   (type-specifier type)
-                                                   (make-restart-location SKIP)))
+                 (let* ((*location-context* (list* (make-restart-location SKIP)
+                                                   name
+                                                   (type-specifier type)))
                         (err-lab (generate-error-code vop 'invalid-arg-count-error))
                         (min min-values)
                         (max (and (< max-values call-arguments-limit)
@@ -488,9 +489,7 @@
     ;; here because it would conflict with the existing NFP if there
     ;; is a number-stack frame in play, but we only use it prior to
     ;; actually setting up the "real" NFP.
-    (let ((result (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'any-reg)
-                                  :offset nfp-offset))
+    (let ((result (make-random-tn (sc-or-lose 'any-reg) nfp-offset))
           (delta (- (sb-allocated-size 'control-stack) fixed)))
       (assemble ()
         ;; Compute the end of the fixed stack frame (start of the MORE
@@ -726,11 +725,16 @@
   (:arg-types positive-fixnum (:constant t) (:constant t))
   (:info min max)
   (:vop-var vop)
+  (:node-var node)
   (:temporary (:sc unsigned-reg :offset nl0-offset) temp)
   (:save-p :compute-only)
   (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error)))
+    RESTART
+    (let* ((*location-context* (and max
+                                    (policy node (> debug 1))
+                                    (cons (make-restart-location RESTART) max)))
+           (err-lab
+             (generate-error-code vop 'invalid-arg-count-error)))
       (labels ((load-immediate (x)
                  (add-sub-immediate (fixnumize x))))
         (cond ((eql max 0)
@@ -1160,6 +1164,7 @@
 
 (define-full-call unboxed-call-named t :unboxed nil)
 (define-full-call fixed-unboxed-call-named t :unboxed nil :fixed)
+(define-full-call fixed-multiple-call-named t :unknown nil :fixed)
 
 ;;; Defined separately, since needs special code that BLT's the
 ;;; arguments down.

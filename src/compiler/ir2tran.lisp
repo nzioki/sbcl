@@ -130,13 +130,13 @@
       ((:special :unknown)
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-value node block name-tn res)
              (vop symbol-value node block name-tn res))))
       (:global
        (aver (symbolp name))
        (let ((name-tn (emit-constant name)))
-         (if (or unsafe (always-boundp name))
+         (if (or unsafe (always-boundp name node))
              (vop fast-symbol-global-value node block name-tn res)
              (vop symbol-global-value node block name-tn res))))
       (:global-function
@@ -1073,7 +1073,7 @@
                         :unknown)
                (:unknown
                 (ir2-convert-local-unknown-call node block fun lvar start))
-               (:fixed
+               ((:fixed :unboxed)
                 (ir2-convert-local-known-call node block fun returns
                                               lvar start)))))))
   (values))
@@ -1143,19 +1143,24 @@
          :symbol)))
 
 (defun pass-nargs-p (combination)
-  (let ((fun-info (combination-fun-info combination)))
-    (declare (ignorable fun-info))
+  (let ((fun-info (combination-fun-info combination))
+        (name (combination-fun-source-name combination nil)))
+    (declare (ignorable fun-info name))
     (and #+(or arm64 x86-64)
          (or (policy combination (= insert-step-conditions 3))
              (and
               (combination-pass-nargs combination)
-              (not (and (eq (combination-kind combination) :known)
-                        fun-info
-                        (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)
-                        (let ((type (info :function :type (combination-fun-source-name combination))))
-                          (and (not (fun-type-keyp type))
-                               (not (fun-type-rest type))
-                               (not (fun-type-optional type)))))))))))
+              (not (and
+                    (or (and (eq (combination-kind combination) :known)
+                             fun-info
+                             (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count))
+                        (and (typep name
+                                    '(cons (eql sb-impl::specialized-xep)))
+                             (setf name (second name))))
+                    (let ((type (info :function :type name)))
+                      (and (not (fun-type-keyp type))
+                           (not (fun-type-rest type))
+                           (not (fun-type-optional type)))))))))))
 
 ;;; Move the arguments into the passing locations and do a (possibly
 ;;; named) tail call.
@@ -1201,11 +1206,15 @@
   (values))
 
 (defun fixed-args-state (node)
-  (let ((info (combination-fun-info node)))
-    (when (and info
-               (ir1-attributep (fun-info-attributes info) fixed-args))
-      (values (sb-vm::make-fixed-call-args-state)
-              (fun-type-required (info :function :type (combination-fun-source-name node)))))))
+  (let ((info (combination-fun-info node))
+        (name (combination-fun-source-name node nil)))
+    (cond ((and info
+                (ir1-attributep (fun-info-attributes info) fixed-args))
+           (values (sb-vm::make-fixed-call-args-state)
+                   (fun-type-required (info :function :type name))))
+          ((typep name '(cons (eql sb-impl::specialized-xep)))
+           (values (sb-vm::make-fixed-call-args-state)
+                   (fun-type-required (info :function :type (second name))))))))
 
 ;;; like IR2-CONVERT-LOCAL-CALL-ARGS, only different
 (defun ir2-convert-full-call-args (node block)
@@ -1243,9 +1252,11 @@
   (multiple-value-bind (fp args arg-locs nargs fixed-args-p)
       (ir2-convert-full-call-args node block)
     (let* ((lvar (node-lvar node))
-           (unboxed-return (let ((info (combination-fun-info node)))
-                             (and info
-                                  (ir1-attributep (fun-info-attributes info) unboxed-return))))
+           (unboxed-return (or (let ((info (combination-fun-info node)))
+                                 (and info
+                                      (ir1-attributep (fun-info-attributes info) unboxed-return)))
+                               (unboxed-specialized-return-p
+                                (lvar-fun-name (basic-combination-fun node)))))
            (locs (and lvar
                       (if unboxed-return
                           (let ((state (sb-vm::make-fixed-call-args-state))
@@ -1314,11 +1325,14 @@
 ;;; Do full call when unknown values are desired.
 (defun ir2-convert-multiple-full-call (node block)
   (declare (type combination node) (type ir2-block block))
-  (let ((info (combination-fun-info node)))
-    (if (and info
-             (ir1-attributep (fun-info-attributes info) unboxed-return fixed-args))
+  (let ((unboxed-return (or (let ((info (combination-fun-info node)))
+                              (and info
+                                   (ir1-attributep (fun-info-attributes info) unboxed-return)))
+                            (unboxed-specialized-return-p
+                             (lvar-fun-name (basic-combination-fun node))))))
+    (if unboxed-return
         (ir2-convert-fixed-full-call node block)
-        (multiple-value-bind (fp args arg-locs nargs)
+        (multiple-value-bind (fp args arg-locs nargs fixed-args-p)
             (ir2-convert-full-call-args node block)
           (let* ((lvar (node-lvar node))
                  (locs (ir2-lvar-locs (lvar-info lvar)))
@@ -1338,12 +1352,19 @@
                            (loc-refs)
                            arg-locs nargs named
                            (emit-step-p node)))
+                    (fixed-args-p
+                     (when-vop-existsp (:named sb-vm::fixed-multiple-call-named)
+                       (vop* sb-vm::fixed-multiple-call-named node block
+                             (fp #-linkage-space fun-tn args) ; args
+                             (loc-refs) ; results
+                             arg-locs nargs #+linkage-space named ; info
+                             (emit-step-p node))))
                     (t
                      (vop* multiple-call-named node block
                            (fp #-linkage-space fun-tn args) ; args
-                           (loc-refs)   ; results
+                           (loc-refs)                       ; results
                            arg-locs nargs #+linkage-space named ; info
-                           (emit-step-p node)))))))))
+                                          (emit-step-p node)))))))))
   (values))
 
 ;;; stuff to check in PONDER-FULL-CALL
@@ -1466,10 +1487,13 @@
                       ((and optional
                             (not (optional-dispatch-more-entry ef)))
                        (optional-dispatch-max-args ef))))
-           (fun-info (info :function :info (functional-%source-name ef))))
+           (name (functional-%source-name ef))
+           (fun-info (info :function :info name)))
       (unless (or (and (eql min 0) (not max))
-                  (and fun-info
-                       (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count)))
+                  (or
+                   (and fun-info
+                        (ir1-attributep (fun-info-attributes fun-info) no-verify-arg-count))
+                   (typep name '(cons (eql sb-impl::specialized-xep)))))
         (vop verify-arg-count node block
              arg-count-location
              min
@@ -1535,15 +1559,18 @@
                (fixed-args
                  (and fun-info
                       (ir1-attributep (fun-info-attributes fun-info) fixed-args)))
-               (arg-types (and fixed-args
-                               (fun-type-required (info :function :type name))))
-               (fixed-arg-state (and fixed-args
+               (arg-types (or (and fixed-args
+                                   (fun-type-required (info :function :type name)))
+                              (and (typep name
+                                          '(cons (eql sb-impl::specialized-xep)))
+                                   (fun-type-required (specifier-type `(function ,@(cddr name)))))))
+               (fixed-arg-state (and arg-types
                                      (sb-vm::make-fixed-call-args-state))))
           (when (leaf-refs (first vars))
             (emit-move node block arg-count-tn (leaf-info (first vars))))
           (dolist (arg (rest vars))
             (when (leaf-refs arg)
-              (let ((pass (if fixed-args
+              (let ((pass (if fixed-arg-state
                               (sb-vm::fixed-call-arg-location (pop arg-types) fixed-arg-state)
                               (standard-arg-location n)))
                     (home (leaf-info arg)))

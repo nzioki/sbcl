@@ -48,7 +48,7 @@
                    :allow-style-warnings t)
   ;; The sequence must contain a mixture of symbols and non-symbols
   ;; to call %FIND-POSITION. If only symbols, it makes no calls.
-  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g))))))
+  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g) :from-end t)))))
     ;; Assert that the default :TEST of #'EQL was strength-reduced to #'EQ
     (assert (equal calls '((sb-kernel:%find-position identity eq)))))
   (checked-compile-and-assert ()
@@ -1034,7 +1034,7 @@
                                 (declare ((complex rational) x))
                                 (= x 10d0)))))
     (assert (equal (sb-kernel:%simple-fun-type fun)
-                   '(function ((complex integer)) (values null &optional))))
+                   '(function ((complex rational)) (values null &optional))))
     (assert (not (funcall fun #C(10 10))))
     (assert (equal (sb-kernel:%simple-fun-type fun2)
                    '(function ((complex rational)) (values null &optional))))
@@ -4539,3 +4539,61 @@
 
 (with-test (:name :lvar-fun-type-specials)
   (checked-compile `(lambda (y) (find t y :test *))))
+
+(with-test (:name :notinline-with-source-transforms)
+  (checked-compile `(lambda (x y z)
+                      (declare (notinline make-array))
+                      (make-array x y z))))
+
+(with-test (:name :setq-derive-type)
+  (assert-type
+   (lambda (x)
+     (declare (optimize speed))
+     (values (sb-kernel:%with-array-data-macro (the string x) 0 10)))
+   simple-string)
+  (assert-type
+   (lambda (n m)
+     (let ((f most-positive-single-float))
+       (tagbody
+        :next
+          (unless (> f n)
+            (go :end))
+          (funcall m f)
+          (setq f (/ f 2.0))
+          (go :next)
+        :end)
+       f))
+   single-float)
+  (assert-type
+   (lambda (l)
+     (let ((r 0))
+       (dolist (x l)
+         (setq r (logior r (truly-the (signed-byte 32) l))))
+       r))
+   (signed-byte 32)))
+
+(with-test (:name :if-redundant)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let* ((x nil)
+                (y x))
+           (setq x t)
+           (if y x)))
+    (() nil)))
+
+(with-test (:name :important-result-of-a-constant)
+  (checked-compile `(lambda ()
+                      (let (x)
+                        (mapcar #'cdr (sort x #'< :key (constantly nil)))))))
+
+(with-test (:name :values-list-stack-push)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b)
+         (let ((list (if a
+                         '(2 3)
+                         '(1))))
+           (apply #'list b list)))
+    ((t 1) '(1 2 3) :test #'equal)
+    ((nil 1) '(1 1) :test #'equal)))

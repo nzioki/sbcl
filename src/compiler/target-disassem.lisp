@@ -1316,6 +1316,12 @@
 
 (macrolet ((with-print-restrictions (&rest body)
              `(let ((*print-pretty* t)
+                    ;; Truncating end-of-line notes is not very informative, certainly
+                    ;; now that so many FDEFNs have compound names like
+                    ;;  #<SB-KERNEL:FDEFN (SB-IMPL::SPECIALIZED-XEP
+                    ;;                     F ..))
+                    ;; hence the extremely generous overriding value for right-margin.
+                    (*print-right-margin* 200)
                     (*print-lines* 2)
                     (*print-length* 4)
                     (*print-level* 4))
@@ -1373,6 +1379,7 @@
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
+  (declare (inline %make-dstate))
   (let ((alignment sb-assem:+inst-alignment-bytes+)
         (arg-column
          (+ 2 ; for the leading "; " on each line
@@ -1647,7 +1654,8 @@
 ;;; Return a STORAGE-INFO struction describing the object-to-source
 ;;; variable mappings from DEBUG-FUN.
 (defun storage-info-for-debug-fun (debug-fun)
-  (declare (type sb-di:debug-fun debug-fun))
+  (declare (type sb-di:debug-fun debug-fun)
+           (inline make-storage-info))
   (let ((sc-vec sb-c:*backend-sc-numbers*)
         (groups nil)
         (debug-vars (sb-di::debug-fun-debug-vars debug-fun)))
@@ -1839,10 +1847,15 @@
                         (when first-block-seen-p
                           (return)))
                        ((eq kind nil)
-                        (when nil-block-seen-p
-                          (return))
-                        (when first-block-seen-p
-                          (setf nil-block-seen-p t))))
+                        (let ((name (sb-c::compiled-debug-fun-name fmap-entry)))
+                          (cond ((and (typep name '(cons (eql sb-impl::specialized-xep)))
+                                      (eq (%fun-name function)
+                                          (second name)))
+                                 (setf first-block-seen-p t))
+                                (nil-block-seen-p
+                                 (return))
+                                (first-block-seen-p
+                                 (setf nil-block-seen-p t))))))
                  (setf last-debug-fun
                        (sb-di::make-compiled-debug-fun fmap-entry code)))))))
         (let ((max-offset (%code-text-size code)))
@@ -1979,16 +1992,17 @@
                (let* ((debug-fun (seg-debug-fun segment))
                       (name (and debug-fun (sb-di:debug-fun-name debug-fun))))
                  (when name
-                   (format stream " ~Vt ; " *disassem-note-column*)
-                   (case (sb-c::compiled-debug-fun-kind
-                          (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
-                     (:external
-                      (format stream "(XEP ~s)" name))
-                     (:optional
-                      (format stream "(&OPTIONAL ~s)" name))
-                     (:more
-                      (format stream "(&MORE ~s)" name))
-                     (t (prin1 name stream)))))))
+                   (format stream " ~Vt " *disassem-note-column*)
+                   (pprint-logical-block (stream nil :per-line-prefix "; ")
+                     (case (sb-c::compiled-debug-fun-kind
+                            (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                       (:external
+                        (format stream "(XEP ~s)" name))
+                       (:optional
+                        (format stream "(&OPTIONAL ~s)" name))
+                       (:more
+                        (format stream "(&MORE ~s)" name))
+                       (t (prin1 name stream))))))))
         ;; One origin per segment is printed. As with the per-line display,
         ;; the segment is thought of as immovable for rendering of addresses,
         ;; though in fact the disassembler transiently allows movement.
@@ -2040,7 +2054,7 @@
          (list it)))
       (sb-pcl::%method-function
        ;; user's code is in the fast-function
-       (cons fun (recurse (sb-pcl::%method-function-fast-function fun))))
+       (recurse (sb-pcl::%method-function-fast-function fun)))
       (funcallable-instance
        (list (%funcallable-instance-fun fun)))
       (function
@@ -2565,9 +2579,7 @@
     (if (= sc sb-vm:immediate-sc-number)
         (princ-to-string offset)
         (sb-c:location-print-name
-         (sb-c:make-random-tn :kind :normal
-                              :sc (svref sb-c:*backend-sc-numbers* sc)
-                              :offset offset)))))
+         (sb-c:make-random-tn (svref sb-c:*backend-sc-numbers* sc) offset)))))
 
 ;;; When called from an error break instruction's :DISASSEM-CONTROL (or
 ;;; :DISASSEM-PRINTER) function, will correctly deal with printing the

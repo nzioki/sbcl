@@ -943,7 +943,7 @@
    (lambda (x y)
      (when (integerp (+ x y))
        x))
-   (or number null))
+   (or rational (complex rational) null))
   (assert-type
    (lambda (x y)
      (declare (real y))
@@ -966,7 +966,12 @@
               (fixnum x))
      (when (typep (+ m x) '(integer 2 4))
        x))
-   (or (integer -2 2) null)))
+   (or (integer -2 2) null))
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (+ m m))
+     m)
+   rational))
 
 (with-test (:name :-back)
   (assert-type
@@ -983,7 +988,22 @@
    (lambda (x)
      (when (> (- 3 x) 10)
        x))
-   (or real null)))
+   (or real null))
+  (assert-type
+   (lambda (x)
+     (when (floatp (- x))
+       x))
+   (or float null))
+  (assert-type
+   (lambda (x)
+     (when (typep (- x) '(integer 1 2))
+       x))
+   (or (integer -2 -1) null))
+  (assert-type
+   (lambda (m)
+     (the real (+ m m))
+     m)
+   real))
 
 (with-test (:name :*back)
   (assert-type
@@ -996,7 +1016,7 @@
      (declare ((real 0 3) m))
      (when (typep (* x m) '(integer 0 10))
        x))
-   (or number null))
+   (or (or rational (complex rational) null) null))
   (assert-type
    (lambda (x)
      (when (> (* x 3) 10)
@@ -1008,7 +1028,17 @@
               (integer m))
      (when (typep (* x m) 'integer)
        x))
-   (or rational null)))
+   (or rational null))
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (* m m))
+     m)
+   integer)
+  (assert-type
+   (lambda (m)
+     (when (typep (+ m 1) 'float)
+       m))
+   (or null float)))
 
 (with-test (:name :ignore-hairy-types)
   (checked-compile
@@ -1748,13 +1778,14 @@
    (integer 4 4)))
 
 (with-test (:name :inherit-length-var)
-  (assert (not (ctu:ir1-named-calls
-                `(lambda (x y n)
-                   (declare (optimize (space 0))
-                            (fixnum n)
-                            (simple-base-string y))
-                   (when (< n (length y))
-                     (find x y :start n))))))
+  (assert (not (find 'sb-int:sequence-bounding-indices-bad-error
+                     (ctu:ir1-named-calls
+                      `(lambda (x y n)
+                         (declare (optimize (space 0))
+                                  (fixnum n)
+                                  (simple-base-string y))
+                         (when (< n (length y))
+                           (find x y :start n)))))))
   (assert-type
    (lambda (x y)
      (declare (simple-vector x))
@@ -1765,3 +1796,171 @@
                m))
          t))
    (eql t)))
+
+(with-test (:name :multiple-back)
+  (assert-type
+   (lambda (m)
+     (the (integer 0 30) (+ (* m 2) 2))
+     m)
+   (rational -1 14)))
+
+(with-test (:name :truncate-back)
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 10))
+         m))
+   (or (integer -29 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer 0 10))
+         m))
+   (or (integer -4 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer 1 10))
+         m))
+   (or (integer 3 54) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 0))
+         m))
+   (or (integer -29 4) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer 3 5) d))
+     (if (typep (truncate m d) '(integer -5 -2))
+         m))
+   (or (integer -29 -6) null))
+  (assert-type
+   (lambda (m d)
+     (declare (integer m)
+              ((integer -4 3) d))
+     (if (typep (truncate m d) '(integer -5 2))
+         m))
+   (or (integer -17 23) null))
+
+  (assert-type
+   (lambda (m)
+     (if (typep (nth-value 1 (truncate m)) 'double-float)
+         m))
+   (or double-float null))
+  (assert-type
+   (lambda (m)
+     (if (typep (truncate m) 'fixnum)
+         m))
+   (or real null))
+  (assert-type
+   (lambda (m)
+     (if (typep (nth-value 1 (truncate m 2.0)) 'double-float)
+         m))
+   (or double-float null)))
+
+(with-test (:name :ignore-delays
+            :fails-on :arm)
+  (assert-type
+   (lambda (x)
+     (declare (optimize debug))
+     (when (typep (nth-value 1 (truncate x 1)) 'float)
+       x))
+   (or null real)))
+
+(with-test (:name :not-eq-eql)
+  (assert-type
+   (lambda (a b)
+     (and (eql a b)
+          (not (eq a b))))
+   boolean))
+
+(with-test (:name :equal-no-notes)
+  (checked-compile
+   `(lambda (a b)
+      (if (eq a b)
+          (equal a b)
+          nil))
+   :allow-notes nil))
+
+(with-test (:name :contagion-alt)
+  (assert-type
+   (lambda (x y)
+     (declare (real x y))
+     (if (typep (+ x y) 'double-float)
+         (error "")
+         x))
+   (or rational single-float))
+  (assert-type
+   (lambda (x)
+     (declare (real x))
+     (if (typep (+ x 1.0) 'single-float)
+         (error "")
+         x))
+   double-float)
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'single-float)
+         (error "")
+         x))
+   (and number (not rational) (not single-float)))
+  (assert-type
+   (lambda (x)
+     (declare (real x))
+     (if (typep (+ x 1) 'single-float)
+         (error "")
+         x))
+   (or double-float rational))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'single-float)
+         (error "")
+         x))
+   (and number (not single-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'double-float)
+         (error "")
+         x))
+   (and number (not double-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1d0) 'double-float)
+         (error "")
+         x))
+   complex)
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'double-float)
+         (error "")
+         x))
+   (and number (not double-float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'real)
+         (error "")
+         x))
+   (and number (not real)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1.0) 'float)
+         (error "")
+         x))
+   (and number (not real)))
+  (assert-type
+   (lambda (x)
+     (if (typep (+ x 1) 'float)
+         (error "")
+         x))
+   (and number (not float)))
+  (assert-type
+   (lambda (x)
+     (if (typep (* x 3) 'integer)
+         (error "")
+         x))
+   (and number (not integer))))

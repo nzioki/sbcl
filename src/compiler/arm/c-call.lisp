@@ -375,25 +375,12 @@
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type))
-    (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
-               (let ((byte-offset
-                      (cond ((< bits n-word-bits)
-                             (- n-word-bytes
-                                (ceiling bits n-byte-bits)))
-                            (t 0))))
-                 `(deref (sap-alien (sap+ ,sap
-                                          ,(+ byte-offset offset))
-                                    (* ,type)))))
-        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+  `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))
 
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
   (flet ((make-tn (offset &optional (sc-name 'any-reg))
-           (make-random-tn :kind :normal
-                           :sc (sc-or-lose sc-name)
-                           :offset offset)))
+           (make-random-tn (sc-or-lose sc-name) offset)))
     (let* ((segment (make-segment))
            ;; How many arguments have been copied
            (arg-count 0)

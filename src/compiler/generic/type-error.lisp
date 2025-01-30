@@ -65,6 +65,26 @@
     ;; a jump, it's in the regular segment which pollutes the
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
+
+#+(or arm64 x86-64 x86) ;; can continue after cerror-trap
+(define-vop ()
+  (:translate check-type-error-trap)
+  (:args (var :scs (descriptor-reg constant immediate)
+              :to :save)
+         (value :scs (any-reg descriptor-reg) :target r)
+         (type :scs (descriptor-reg constant immediate)
+               :to :save))
+  (:policy :fast-safe)
+  (:results (r :scs (any-reg descriptor-reg)))
+  (:result-types *)
+  (:save-p :compute-only)
+  (:vop-var vop)
+  (:generator 3
+    (move r value)
+    (emit-error-break vop
+      cerror-trap
+      (error-number-or-lose 'check-type-error)
+      (list r var type))))
 
 #+(or immobile-space permgen) ; i.e. can LAYOUT instance have immediate SC
 (defun type-err-type-tn-loadp (thing)
@@ -113,7 +133,8 @@
   (def "ETYPECASE-FAILURE"       etypecase-failure            nil value keys)
   (def "NIL-FUN-RETURNED"        nil-fun-returned-error       nil fun)
   (def "UNREACHABLE"             sb-impl::unreachable         nil)
-  (def "FAILED-AVER"             sb-impl::%failed-aver        nil form))
+  (def "FAILED-AVER"             sb-impl::%failed-aver        nil form)
+  (def "FILL-POINTER"            fill-pointer-error           nil array))
 
 
 (defun emit-internal-error (kind code values &key trap-emitter)

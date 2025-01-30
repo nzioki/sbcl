@@ -244,7 +244,9 @@
   (assert-tri-eq t   t (subtypep '(complex ratio) '(complex rational)))
   (assert-tri-eq t   t (subtypep '(complex ratio) 'complex))
   (assert-tri-eq nil t (subtypep '(complex (integer 1 2))
-                                 '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2)))))
+                                 '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2))))
+  (assert-tri-eq t   t (subtypep '(member #c(1 1) #c(1 2) #c(2 1) #c(2 2))
+                                 '(complex (integer 1 2)))))
 
 (with-test (:name (typep real))
   (assert (typep 0 `(real ,(ash -1 10000) ,(ash 1 10000)))))
@@ -581,9 +583,6 @@
                         (sb-kernel:specifier-type '(not bad)))
                  sb-kernel:parse-unknown-type 2)) ; expect 2 signals
 
-(with-test (:name (typep :complex-integer))
-  (assert (not (eval '(typep #c(0 1/2) '(complex integer))))))
-
 (with-test (:name :typep-satisfies-boolean)
   (assert (eq (eval '(typep 1 '(satisfies eval))) t)))
 
@@ -595,8 +594,7 @@
           sb-kernel:type=
           sb-kernel:find-classoid
           sb-kernel:make-numeric-type
-          sb-kernel::numeric-types-adjacent
-          sb-kernel::numeric-types-intersect
+          sb-kernel:types-equal-or-intersect
           sb-kernel:*empty-type*))
 
 (with-test (:name :partition-array-into-simple/hairy)
@@ -734,15 +732,13 @@
     (dolist (y '(-0s0 0s0))
       (let ((a (specifier-type `(single-float -10s0 ,x)))
             (b (specifier-type `(single-float ,y 20s0))))
-        (assert (numeric-types-intersect a b)))
+        (assert (types-equal-or-intersect a b)))
       (let ((a (specifier-type `(single-float -10s0 (,x))))
             (b (specifier-type `(single-float ,y 20s0))))
-        (assert (not (numeric-types-intersect a b)))
-        (assert (numeric-types-adjacent a b)))
+        (assert (not (types-equal-or-intersect a b))))
       (let ((a (specifier-type `(single-float -10s0 ,x)))
             (b (specifier-type `(single-float (,y) 20s0))))
-        (assert (not (numeric-types-intersect a b)))
-        (assert (numeric-types-adjacent a b))))))
+        (assert (not (types-equal-or-intersect a b)))))))
 
 (with-test (:name :ctypep-function)
   (assert (not (sb-kernel:ctypep #'+ (eval '(sb-kernel:specifier-type '(function (list))))))))
@@ -902,7 +898,7 @@
    ((36757953510256822605) t)
    ((#C(1d0 1d0)) nil)
    ((#C(1 1)) t)
-   ((#C(1 #.(expt 2 300))) nil)))
+   ((#C(1 #.(expt 2 300))) t)))
 
 #+(or arm64 x86-64)
 (with-test (:name :structure-typep-fold)
@@ -948,3 +944,102 @@
    (lambda (j)
      (sb-kernel:%other-pointer-p (the (and sequence (not vector)) j)))
    null))
+
+(with-test (:name :non-simple-arrays)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t) (not simple-array))))
+   ((#()) nil)
+   (((make-array 10 :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t) (not simple-array))))
+   ((#()) nil)
+   ((#2A()) nil)
+   (((make-array '(10 10) :adjustable t)) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (vector t 10) (not simple-array))))
+   ((#10(t)) nil)
+   (((make-array 10 :adjustable t)) t)
+   (((make-array '(2 5) :adjustable t)) nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(and (array t 2) (not simple-array))))
+   ((#2A()) nil)
+   (((make-array '(2 2) :adjustable t)) t)
+   (((make-array 2 :adjustable t)) nil)))
+
+(with-test (:name :member-hairy-type-intersection)
+  (assert
+   (sb-kernel:type=
+    (sb-kernel:type-intersection  (sb-kernel:specifier-type '(member #1=(m) a))
+                                  (sb-kernel:specifier-type '(cons (satisfies eval))))
+    (sb-kernel:specifier-type '(and (cons (satisfies eval) t) (member #1#))))))
+
+(with-test (:name :subtype-array-union)
+  (assert (subtypep (opaque-identity '(array t))
+                    (opaque-identity '(or simple-array (array unsigned-byte)))))
+  (assert (subtypep (opaque-identity '(vector character))
+                    (opaque-identity '(or (and string (not simple-array))
+                                       simple-array))))
+  (assert (subtypep (opaque-identity '(vector unknown))
+                    (opaque-identity 'sequence))))
+
+(deftype subtype-equal-type (&rest args) `(or fixnum (member ,@args)))
+
+(with-test (:name :subtypep-equal-member)
+  (multiple-value-bind (answer certain)
+      ;; Verify that the SUBTYPEP fast path is taken
+      (subtypep (opaque-identity '((invalid)))
+                (opaque-identity '((invalid))))
+    (assert (and answer certain)))
+  (multiple-value-bind (answer certain)
+      (subtypep (opaque-identity '(eql (list 1)))
+                (opaque-identity '(eql (list 1))))
+    (assert (and (not answer) certain)))
+  (multiple-value-bind (answer certain)
+      (subtypep (opaque-identity '(subtype-equal-type 1 (list 2) 3))
+                (opaque-identity '(subtype-equal-type 1 (list 2) 3)))
+    (assert (and (not answer) certain)))
+  (assert (not (subtypep (opaque-identity '(function (&key (member t))))
+                         (opaque-identity '(function (&key (eql t))))))))
+
+(with-test (:name :typep-rational-ratio)
+  (checked-compile-and-assert
+      ()
+      `(lambda (p)
+         (typep p '(and (rational 1) (not integer))))
+    ((4/3) t)
+    ((-4/3) nil)
+    ((1) nil)
+    ((2) nil)))
+
+(with-test (:name :complex-type-of)
+  (assert (equal (type-of (opaque-identity #c(1 2)))
+                 '(complex rational))))
+
+(with-test (:name :complex-sub-real)
+  (assert (equal (sb-ext:typexpand-all '(or (complex rational) (complex single-float)))
+                 (sb-ext:typexpand-all '(complex (or rational single-float))))))
+
+
+(with-test (:name :typep-evaluate)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (block nil
+        (typep (return x) 't)))
+   ((10) 10)))
+
+(with-test (:name :function-simple-union/intersection)
+  (let ((type (sb-kernel:specifier-type
+               '(function (sequence &key (start integer) (end integer)) sequence))))
+    (assert (eq type
+                (sb-kernel::function-simple-union2-type-method type type)))
+    (assert (eq type
+                (sb-kernel::function-simple-intersection2-type-method type type)))))

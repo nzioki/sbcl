@@ -88,13 +88,9 @@
 ;;;
 (defun get-space (id spacemap)
   (find id (cdr spacemap) :key #'space-id))
-(defun compute-nil-addr (spacemap)
-  (let ((space (get-space static-core-space-id spacemap)))
-    ;; TODO: The core should store its address of NIL in the initial function entry
-    ;; so this kludge can be removed.
-    (logior (space-addr space) #x117))) ; SUPER KLUDGE
-(defun compute-nil-object (spacemap) ; terrible, don't use!
-  (%make-lisp-obj (compute-nil-addr spacemap)))
+(defglobal *heap-arrangement* nil)
+(defglobal *nil-taggedptr* 0)
+(defun core-null-p (x) (= (get-lisp-obj-address x) *nil-taggedptr*))
 
 ;;; Given OBJ which is tagged pointer into the target core, translate it into
 ;;; the range at which the core is now mapped during execution of this tool,
@@ -118,7 +114,6 @@
                  (:copier nil)
                  (:constructor %make-core))
   (spacemap)
-  (nil-object)
   ;; mapping from small integer ID to package
   (pkg-id->package)
   ;; mapping from string naming a package to list of symbol names (strings)
@@ -174,14 +169,13 @@
 
 (defun scan-symbol-table (function table core)
   (let* ((spacemap (core-spacemap core))
-         (nil-object (core-nil-object core))
          (cells (translate (symtbl-%cells (truly-the symbol-table
                                                      (translate table spacemap)))
                            spacemap)))
     (dovector (x (translate (cdr cells) spacemap))
       (unless (fixnump x)
         (funcall function
-                 (if (eq x nil-object) ; any random package can export NIL. wow.
+                 (if (core-null-p x) ; any random package can export NIL. wow.
                      "NIL"
                      (translate (symbol-name (translate x spacemap)) spacemap))
                  x)))))
@@ -259,6 +253,7 @@
                             &optional (address-mode :physical))
   (dolist (id `(,immobile-fixedobj-core-space-id
                 ,static-core-space-id
+                ,permgen-core-space-id
                 ,dynamic-core-space-id))
     (binding* ((space (get-space id spacemap) :exit-if-null)
                (start (translate-ptr (space-addr space) spacemap))
@@ -311,7 +306,7 @@
 (defun make-core (spacemap code-bounds fixedobj-bounds &key enable-pie linkage-space-info)
   (let* ((linkage-bounds
           (let ((text-space (get-space immobile-text-core-space-id spacemap)))
-            (if text-space
+            (if (and text-space (/= (space-addr text-space) 0))
                 (let ((linkage-spaces-size
                        (+ #+linkage-space (ash 1 (+ n-linkage-index-bits word-shift))
                           alien-linkage-space-size))
@@ -323,12 +318,10 @@
            (find-target-symbol (package-id "SB-VM") "ALIEN-LINKAGE-TABLE-ENTRY-SIZE"
                                spacemap :physical)))
          (alien-linkage-symbols (compute-alien-linkage-symbols spacemap))
-         (nil-object (compute-nil-object spacemap))
          (ambiguous-symbols (make-hash-table :test 'equal))
          (core
           (%make-core
            :spacemap spacemap
-           :nil-object nil-object
            :nonunique-symbol-names ambiguous-symbols
            :code-bounds code-bounds
            :fixedobj-bounds fixedobj-bounds
@@ -359,7 +352,7 @@
                      (scan-symtbl (package-internal-symbols package))))))
         (dovector (x (translate package-table spacemap))
           (cond ((%instancep x) (scan-package x))
-                ((listp x) (loop (if (eq x nil-object) (return))
+                ((listp x) (loop (if (core-null-p x) (return))
                                  (setq x (translate x spacemap))
                                  (scan-package (car x))
                                  (setq x (cdr x)))))))
@@ -643,7 +636,8 @@
         (page-ranges)
         (first-page 0))
        ((>= first-page nptes) (nreverse page-ranges))
-    #+gencgc
+  (ecase *heap-arrangement*
+   (:gencgc
     (let* ((last-page (find-ending-page first-page ptes))
            (pte (aref (space-page-table space) first-page))
            (start-vaddr (page-addr first-page space))
@@ -673,7 +667,8 @@
             (setq vaddr (sap+ vaddr size)
                   paddr (sap+ paddr size)))))
       (setq first-page (1+ last-page)))
-    #+mark-region-gc
+    )
+   (:mark-region-gc
     (let* ((vaddr (int-sap (+ (space-addr space) (* first-page gencgc-page-bytes))))
            (paddr (int-sap (translate-ptr (sap-int vaddr) spacemap)))
            (pte (aref (space-page-table space) first-page))
@@ -706,7 +701,7 @@
                    (setq vaddr (sap+ vaddr size)
                          paddr (sap+ paddr size))
                    (incf object-offset-in-dualwords (ash size (- (1+ word-shift)))))))))
-      (incf first-page))))
+      (incf first-page))))))
 
 ;;; Unfortunately the idea of using target features to decide whether to
 ;;; read a bitmap from PAGE_TABLE_CORE_ENTRY_TYPE_CODE falls flat,
@@ -718,10 +713,9 @@
 ;;; 3) make a different entry type code for PTES_WITH_BITMAP
 (defun detect-target-features (spacemap &aux result)
   (flet ((scan (symbol)
-           (let ((list (symbol-global-value symbol))
-                 (target-nil (compute-nil-object spacemap)))
+           (let ((list (symbol-global-value symbol)))
              (loop
-               (when (eq list target-nil) (return))
+               (when (core-null-p list) (return))
                (setq list (translate list spacemap))
                (let ((feature (translate (car list) spacemap)))
                  (aver (symbolp feature))
@@ -730,19 +724,10 @@
                    (let ((string (translate (symbol-name feature) spacemap)))
                      (push (intern string "KEYWORD") result))))
                (setq list (cdr list))))))
-    (walk-dynamic-space
-     nil
-     spacemap
-     (lambda (obj vaddr size large)
-       (declare (ignore vaddr size large))
-       (when (symbolp obj)
-         (when (or (and (eq (symbol-package-id obj) #.(symbol-package-id 'sb-impl:+internal-features+))
-                        (string= (translate (symbol-name obj) spacemap) "+INTERNAL-FEATURES+"))
-                   (and (eq (symbol-package-id obj) #.(symbol-package-id '*features*))
-                        (string= (translate (symbol-name obj) spacemap) "*FEATURES*")))
-           (scan obj))))))
-  ;;(format t "~&Target-features=~S~%" result)
-  result)
+    (scan (%find-target-symbol #.(symbol-package-id 'sb-impl:+internal-features+)
+                               "+INTERNAL-FEATURES+" spacemap) )
+    (scan (%find-target-symbol #.(symbol-package-id '*features*) "*FEATURES*" spacemap))
+    result))
 
 (defun transport-code (from-vaddr from-paddr to-vaddr to-paddr size)
   (%byte-blt from-paddr 0 to-paddr 0 size)
@@ -875,10 +860,10 @@
                    (page-type pte) 0
                    (page-scan-start pte) 0)))
       (let ((space (get-space dynamic-core-space-id spacemap)))
-        #+gencgc
+       (ecase *heap-arrangement*
+        (:gencgc
         (dolist (range page-ranges (aver (null codeblobs)))
           (destructuring-bind (in-use first last) range
-            ;;(format t "~&Working on range ~D..~D~%" first last)
             (loop while codeblobs
                   do (destructuring-bind (vaddr . size) (car codeblobs)
                        (let ((page (calc-page-index vaddr space)))
@@ -894,8 +879,8 @@
                                 (pop codeblobs))))))
             (unless in-use
               (loop for page-index from first to last
-                    do (reset-pte (svref (space-page-table space) page-index))))))
-        #+mark-region-gc
+                    do (reset-pte (svref (space-page-table space) page-index)))))))
+        (:mark-region-gc
         (dolist (code codeblobs)
           (destructuring-bind (vaddr . size) code
             (alien-funcall memset (translate-ptr (sap-int vaddr) spacemap) 0 size)
@@ -910,9 +895,9 @@
                                 (aver (not (find 1 (page-bitmap pte))))
                                 (reset-pte pte))))
                     ((not (find 1 (page-bitmap pte)))
-                     ;; is the #+gencgc logic above actually more efficient?
+                     ;; is the gencgc logic above actually more efficient?
                      ;;(format t "~&Code page ~D is now empty~%" page-index)
-                     (reset-pte pte))))))))))
+                     (reset-pte pte))))))))))))
 
 (defmacro linkage-space-header-ptr (x) `(svref ,x 0))
 (defmacro linkage-space-data-page (x) `(svref ,x 1))
@@ -976,10 +961,17 @@
            (let ((space (get-space dynamic-core-space-id (cons nil space-list))))
              (setf (space-page-table space) (read-page-table input n-ptes nbytes data-page)))))
         (#.build-id-core-entry-type-code
-         (let ((string (make-string (%vector-raw-bits core-header ptr)
-                                    :element-type 'base-char)))
-           (%byte-blt core-header (* (1+ ptr) n-word-bytes) string 0 (length string))
-           (format nil "Build ID [~a] len=~D ptr=~D actual-len=~D~%" string len ptr (length string))))
+         (setq *heap-arrangement*
+               (ecase (%vector-raw-bits core-header ptr)
+                 (1 :gencgc)
+                 (2 :mark-region-gc)))
+         (setf *nil-taggedptr* (%vector-raw-bits core-header (+ ptr 1)))
+         (let* ((strptr (+ ptr 2))
+                (string (make-string (%vector-raw-bits core-header strptr)
+                                     :element-type 'base-char)))
+           (%byte-blt core-header (* (1+ strptr) n-word-bytes) string 0 (length string))
+           (format nil "Build ID [~a] len=~D ptr=~D actual-len=~D, gc=~A~%"
+                   string len ptr (length string) *heap-arrangement*)))
         (#.runtime-options-magic) ; ignore
         (#.initial-fun-core-entry-type-code
          (setq initfun (%vector-raw-bits core-header ptr)))))
@@ -1050,12 +1042,12 @@
                (wrote (sb-unix:unix-write fd paddr 0 nbytes)))
           (aver (= wrote nbytes)))))
     (aver (= (file-position output) (* +backend-page-bytes+ (1+ page-count))))
-    #+mark-region-gc ; write the bitmap
-    (dovector (pte (space-page-table dynamic-space))
-      (let ((bitmap (page-bitmap pte)))
-        (sb-sys:with-pinned-objects (bitmap)
-          ;; WRITE-SEQUENCE on a bit vector would write one octet per bit
-          (sb-unix:unix-write fd bitmap 0 (/ (length bitmap) 8)))))
+    (when (eq *heap-arrangement* :mark-region-gc)
+      (dovector (pte (space-page-table dynamic-space))
+        (let ((bitmap (page-bitmap pte)))
+          (sb-sys:with-pinned-objects (bitmap)
+            ;; WRITE-SEQUENCE on a bit vector would write one octet per bit
+            (sb-unix:unix-write fd bitmap 0 (/ (length bitmap) 8))))))
     ;; write the PTEs
     (let ((buffer (make-array 10 :element-type '(unsigned-byte 8))))
       (sb-sys:with-pinned-objects (buffer)
@@ -1085,7 +1077,7 @@
                           (%make-lisp-obj
                            (if (= space-id static-core-space-id)
                                ;; must not visit NIL, bad things happen
-                               (translate-ptr (+ static-space-start sb-vm::static-space-objects-offset)
+                               (translate-ptr (+ (space-addr space) sb-vm::static-space-objects-offset)
                                               spacemap)
                                (sap-int paddr)))
                           (%make-lisp-obj (sap-int (sap+ paddr (space-size space)))))))
@@ -1130,12 +1122,19 @@
   (with-open-file (input input-pathname :element-type '(unsigned-byte 8))
     (with-open-file (output output-pathname :direction :output
                                             :element-type '(unsigned-byte 8) :if-exists :supersede)
-      ;; KLUDGE: see comment above DETECT-TARGET-FEATURES
-      #+gencgc (setq *bitmap-bits-per-page* 0 *bitmap-bytes-per-page* 0)
+      (when (eq *heap-arrangement* :gencgc)
+        (setq *bitmap-bits-per-page* 0 *bitmap-bytes-per-page* 0))
       (let* ((core-header (make-array +backend-page-bytes+ :element-type '(unsigned-byte 8)))
              (core-offset (read-core-header input core-header))
              (parsed-header (parse-core-header input core-header core-offset))
-             (space-list (core-header-space-list parsed-header)))
+             (parsed-spacelist (core-header-space-list parsed-header))
+             ;; Notice that save_to_filehandle() outputs IMMOBILE_TEXT_CORE_SPACE_ID even if it
+             ;; contains nothing. Perhaps that's wrong. Anyway we want to delete the space from
+             ;; the directory as parsed, otherwise two text spaces would exist.
+             (old-text-space (find immobile-text-core-space-id parsed-spacelist :key 'space-id))
+             (space-list (remove old-text-space parsed-spacelist)))
+        (when old-text-space
+          (aver (zerop (space-nwords old-text-space))))
         ;; Map the core file to memory
         (with-mapped-core (sap core-offset (core-header-total-npages parsed-header) input)
           (let* ((spacemap (cons sap (sort (copy-list space-list) #'> :key #'space-addr)))
@@ -1559,7 +1558,6 @@
 
 (defun extract-object-from-core (sap core &optional proxy-symbols
                                  &aux (spacemap (core-spacemap core))
-                                      (targ-nil (compute-nil-addr spacemap))
                                       ;; address (an integer) -> host object
                                       (seen (make-hash-table)))
   (declare (ignorable proxy-symbols)) ; not done
@@ -1572,7 +1570,7 @@
                  (return-from recurse (%make-lisp-obj addr)))
                (awhen (gethash addr seen) ; NIL is not recorded
                  (return-from recurse it))
-               (when (eql addr targ-nil)
+               (when (eql addr *nil-taggedptr*)
                  (return-from recurse nil))
                (let ((sap (int-sap (translate-ptr (logandc2 addr lowtag-mask)
                                                   spacemap))))
@@ -1847,8 +1845,11 @@
          ;;; for large objects. With gencgc we'd have to compute the scan-start
          ;;; on subsequent pages, and put the end-of-page free space in a list.
          ;;; It's not worth the hassle.
-         (largep #+gencgc (>= size gencgc-page-bytes)
-                 #-gencgc (>= size large-object-size))
+         (largep (ecase *heap-arrangement*
+                   ;; FIXME: once-and-only-three-times?
+                   ;; (is also in generic/utils and late-objdef)
+                   (:mark-region-gc (>= size (* 3/4 gencgc-page-bytes)))
+                   (:gencgc (>= size gencgc-page-bytes))))
          (page-type (pick-page-type descriptor sap largep old-spacemap))
          (newspace (get-space dynamic-core-space-id new-spacemap))
          (new-nslots) ; only set if it's a resized instance

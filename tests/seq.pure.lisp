@@ -238,10 +238,7 @@
                (0 (= speed 0))
                (t t)))
            (extra-safe (&key speed safety &allow-other-keys)
-             (case safety
-               (0 (= speed 0))
-               (1 (< speed 2))
-               (t t)))
+             (>= safety 2))
            (test (type expr &key (filter #'safe))
              (checked-compile-and-assert
                  (:optimize `(:compilation-speed nil :space nil :filter ,filter)
@@ -947,3 +944,8 @@
      (declare ((or cons (simple-vector 10)) x))
      (concatenate 'list x x))
    cons))
+
+(with-test (:name :sequencep-test)
+  (assert (not (ctu:ir1-named-calls `(lambda (a)
+                                       (declare ((array t) a))
+                                       (the sequence a))))))

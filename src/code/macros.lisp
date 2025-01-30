@@ -113,7 +113,42 @@ tree structure resulting from the evaluation of EXPRESSION."
               entry-points
               (not (member name entry-points :test #'equal))))))
 
-(flet ((defun-expander (env name lambda-list body snippet &optional source-form)
+(defun specialized-xep-for-type-p (lambda-list name)
+  (let ((type (info :function :type name)))
+    (and #-(or arm64 x86-64) nil
+         (fun-type-p type)
+         (eq (info :function :where-from name) :declared)
+         (not (or (fun-type-optional type)
+                  (fun-type-keyp type)
+                  (fun-type-rest type)))
+         (multiple-value-bind (llks required) (parse-lambda-list lambda-list)
+           (and (zerop llks)
+                (= (length required)
+                   (length (fun-type-required type)))))
+         (or (loop for arg in (fun-type-required type)
+                   thereis (csubtypep arg (specifier-type 'double-float)))
+             (let ((return (fun-type-returns type)))
+               (and (values-type-p return)
+                    (not (or (values-type-optional return)
+                             (values-type-rest return)))
+                    (loop for value in (values-type-required return)
+                          thereis (csubtypep value (specifier-type 'double-float))))))
+         (cdr (type-specifier type)))))
+
+(defun make-specialized-xep-stub (name specialized
+                                  &optional (xep-name
+                                             `(specialized-xep ,name ,@specialized)))
+  (let ((vars (loop for arg in (car specialized)
+                    for i from 0
+                    collect (make-symbol (format nil "A~a" i)))))
+    (values
+     `(named-lambda ,xep-name ,vars
+        (declare (notinline ,name)
+                 (muffle-conditions warning))
+        (funcall ',name ,@vars))
+     xep-name)))
+
+(flet ((defun-expander (env name lambda-list body snippet &optional source-form always-store-source-form)
   (multiple-value-bind (forms decls doc) (parse-body body t)
     ;; Maybe kill docstring, but only under the cross-compiler.
     #+(and (not sb-doc) sb-xc-host) (setq doc nil)
@@ -138,7 +173,11 @@ tree structure resulting from the evaluation of EXPRESSION."
                            #-sb-xc-host sb-c:maybe-compiler-notify
                            "lexical environment too hairy, can't inline DEFUN ~S"
                            name)
-                          nil))))))
+                          nil)))))
+           (specialized-xep (and (not (or inline-thing
+                                          (info :function :info name)
+                                          (eq (info :function :inlinep name) 'notinline)))
+                                 (specialized-xep-for-type-p lambda-list name))))
       (when (and (eq snippet :constructor)
                  (not (typep inline-thing '(cons (eql sb-c:lambda-with-lexenv)))))
         ;; constructor in null lexenv need not save the expansion
@@ -147,29 +186,59 @@ tree structure resulting from the evaluation of EXPRESSION."
         (setq inline-thing (list 'quote inline-thing)))
       (when (and extra-info (not (keywordp extra-info)))
         (setq extra-info (list 'quote extra-info)))
-      (let ((definition
-              (if (block-compilation-non-entry-point name)
-                  `(progn
-                     (sb-c::%refless-defun ,named-lambda)
-                     ',name)
-                  `(%defun ',name ,named-lambda
-                           ,@(when (or inline-thing extra-info) `(,inline-thing))
-                           ,@(when extra-info `(,extra-info))))))
-       `(progn
-          (eval-when (:compile-toplevel)
-            (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
-          ,(if source-form
-               `(sb-c::with-source-form ,source-form ,definition)
-               definition)
-          ;; This warning, if produced, comes after the DEFUN happens.
-          ;; When compiling, there's no real difference, but when interpreting,
-          ;; if there is a handler for style-warning that nonlocally exits,
-          ;; it's wrong to have skipped the DEFUN itself, since if there is no
-          ;; function, then the warning ought not to have been issued at all.
-          ,@(when (typep name '(cons (eql setf)))
-              `((eval-when (:compile-toplevel :execute)
-                  (sb-c::warn-if-setf-macro ',name))
-                ',name))))))))
+      `(progn
+         ,@(let ((existing-specialized-xep (info :function :specialized-xep name)))
+             (if (and existing-specialized-xep
+                      (not (equal existing-specialized-xep specialized-xep)))
+                 (multiple-value-bind (xep xep-name)
+                     (make-specialized-xep-stub name existing-specialized-xep)
+                   `((progn
+                       (eval-when (:compile-toplevel)
+                         (clear-info :function :specialized-xep ',name))
+                       (when (fdefinition ',xep-name)
+                         (setf (fdefinition ',xep-name) ,xep)))))))
+         ,@(if specialized-xep
+               (let ((xep-name `(specialized-xep ,name ,@specialized-xep)))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t nil nil ',specialized-xep))
+                    (let ((xep (named-lambda ,xep-name ,(third named-lambda)
+                                 (declare (sb-c::source-form ,source-form))
+                                 ,@(cdddr named-lambda))))
+                      (sb-impl::%defun-specialized-xep
+                       ',name
+                       (named-lambda ,name ,lambda-list
+                         ,@(when *top-level-form-p* '((declare (sb-c::top-level-form))))
+                         (declare (muffle-conditions compiler-note))
+                         ,@(when doc (list doc))
+                         (multiple-value-prog1
+                             (funcall xep ,@lambda-list)
+                           ;; Avoid tail calls for unboxed returns.
+                           (values)))
+                       xep
+                       ',specialized-xep))))
+               (let ((definition
+                       (if (block-compilation-non-entry-point name)
+                           `(progn
+                              (sb-c::%refless-defun ,named-lambda)
+                              ',name)
+                           `(%defun ',name ,named-lambda
+                                    ,@(when (or inline-thing extra-info) `(,inline-thing))
+                                    ,@(when extra-info `(,extra-info))))))
+                 `((eval-when (:compile-toplevel)
+                     (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
+                   ,(if (and source-form
+                             always-store-source-form)
+                        `(sb-c::with-source-form ,source-form ,definition)
+                        definition)
+                   ;; This warning, if produced, comes after the DEFUN happens.
+                   ;; When compiling, there's no real difference, but when interpreting,
+                   ;; if there is a handler for style-warning that nonlocally exits,
+                   ;; it's wrong to have skipped the DEFUN itself, since if there is no
+                   ;; function, then the warning ought not to have been issued at all.
+                   ,@(when (typep name '(cons (eql setf)))
+                       `((eval-when (:compile-toplevel :execute)
+                           (sb-c::warn-if-setf-macro ',name))
+                         ',name))))))))))
 
 ;;; This is one of the major places where the semantics of block
 ;;; compilation is handled. Substitution for global names is totally
@@ -177,17 +246,17 @@ tree structure resulting from the evaluation of EXPRESSION."
 ;;; (block-compile *compilation*) is true and entry points are
 ;;; specified, then we don't install global definitions for non-entry
 ;;; functions (effectively turning them into local lexical functions.)
-  (sb-xc:defmacro defun (&environment env name lambda-list &body body)
+  (sb-xc:defmacro defun (&whole whole &environment env name lambda-list &body body)
     "Define a function at top level."
     (check-designator name 'defun #'legal-fun-name-p "function name")
     #+sb-xc-host
     (unless (cl:symbol-package (fun-name-block-name name))
       (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
-    (defun-expander env name lambda-list body nil))
+    (defun-expander env name lambda-list body nil whole))
 
   ;; extended defun as used by defstruct
   (sb-xc:defmacro sb-c:xdefun (&environment env name snippet source-form lambda-list &body body)
-    (defun-expander env name lambda-list body snippet source-form)))
+    (defun-expander env name lambda-list body snippet source-form t)))
 
 ;;;; DEFCONSTANT, DEFVAR and DEFPARAMETER
 
@@ -671,11 +740,12 @@ invoked. In that case it will store into PLACE and start over."
                     (type-specifier ctype)
                     type))))
     (if (symbolp expanded)
-        `(do ()
-             ((typep ,place ',type))
-           (setf ,place (check-type-error ',place ,place ',type
-                                          ,@(and type-string
-                                                 `(,type-string)))))
+        `(unless (typep ,place ',type)
+           (setf ,place
+                 ,(if type-string
+                      `(check-type-error-trap '(,place . ,type) ,place (the string ,type-string))
+                      `(check-type-error-trap ',place ,place ',type)))
+           nil)
         (let ((value (gensym)))
           `(do ((,value ,place ,place))
                ((typep ,value ',type))
@@ -760,7 +830,7 @@ invoked. In that case it will store into PLACE and start over."
     (lambda (condition stream)
       (format stream
         "Duplicate key ~S in ~S form, ~
-         occurring in~{~#[~; and~]~{ the ~:R clause:~%~<  ~S~:>~}~^,~}."
+         occurring in~{~#[~; and~]~{ clause ~a:~%~<  ~S~:>~}~^,~}."
         (case-warning-key condition)
         (case-warning-case-kind condition)
         (duplicate-case-key-warning-occurrences condition)))))
@@ -1774,7 +1844,7 @@ of PLACE: if the returned value is EQ to OLD, the swap was carried out.
 PLACE must be an CAS-able place. Built-in CAS-able places are accessor forms
 whose CAR is one of the following:
 
- CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SVREF, SLOT-VALUE
+ CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SLOT-VALUE
  SB-MOP:STANDARD-INSTANCE-ACCESS, SB-MOP:FUNCALLABLE-STANDARD-INSTANCE-ACCESS,
 
 or the name of a DEFSTRUCT created accessor for a slot whose storage type

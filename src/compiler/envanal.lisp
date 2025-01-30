@@ -65,10 +65,11 @@
 ;;; If FUN has an environment, return it, otherwise assign an empty
 ;;; one and return that.
 (defun get-lambda-environment (fun)
-  (declare (type clambda fun))
+  (declare (type clambda fun)
+           (inline make-environment))
   (let ((fun (lambda-home fun)))
     (or (lambda-environment fun)
-        (let ((res (make-environment :lambda fun)))
+        (let ((res (make-environment fun)))
           (setf (lambda-environment fun) res)
           (dolist (lambda (lambda-lets fun))
             (setf (lambda-environment lambda) res))
@@ -198,7 +199,8 @@
 ;;; actually exiting the scope (i.e. a BLOCK), and will also do any
 ;;; other cleanups that may have to be done on the way.
 (defun insert-nlx-entry-stub (exit env)
-  (declare (type environment env) (type exit exit))
+  (declare (type environment env) (type exit exit)
+           (inline make-nlx-info))
   (let* ((exit-block (node-block exit))
          (next-block (first (block-succ exit-block)))
          (entry (exit-entry exit))
@@ -413,8 +415,7 @@
           (when values
             ;; This dynamic extent is over the whole environment and
             ;; needs no cleanup code.
-            (let ((dynamic-extent (make-dynamic-extent :values values
-                                                       :cleanup nil)))
+            (let ((dynamic-extent (make-dynamic-extent values)))
               (push dynamic-extent (lambda-dynamic-extents lambda))
               (dolist (value values)
                 (setf (lvar-dynamic-extent value) dynamic-extent)))))))
@@ -579,6 +580,8 @@
         (let ((result (return-result ret)))
           (do-uses (use result)
             (when (and (immediately-used-p result use)
+                       (not (and (combination-p use)
+                                 (lvar-fun-is (combination-fun use) '(break))))
                        (or (not (eq (node-derived-type use) *empty-type*))
                            (not (basic-combination-p use))
                            ;; This prevents external entry points from
@@ -587,7 +590,7 @@
                            ;; functions they are the entry point for.
                            (eq (basic-combination-kind use) :local)))
               (setf (node-tail-p use) t)))))))
-  ;; Tail call non returning functions if no debugging is wanted.
+  ;; Tail call non-returning functions if no debugging is wanted.
   (dolist (block (block-pred (component-tail component)))
     (let ((last (block-last block)))
       (when (and (combination-p last)

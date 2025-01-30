@@ -2166,6 +2166,38 @@
       (inst cmp high (asr r 63))
       (inst b :ne error))))
 
+(define-vop (overflow*-fixnum)
+  (:translate overflow*)
+  (:args (x :scs (any-reg))
+         (y :scs (signed-reg immediate)))
+  (:arg-types tagged-num tagged-num)
+  (:info type)
+  (:temporary (:sc signed-reg) high)
+  (:results (r :scs (any-reg) :from :load))
+  (:result-types tagged-num)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (let* ((*location-context* (unless (eq type 'fixnum)
+                                 type))
+           (error (generate-error-code vop 'sb-kernel::mul-overflow-error r high)))
+      (let ((value (and (sc-is y immediate)
+                        (tn-value y))))
+        (cond ((and value
+                    (plusp value)
+                    (= (logcount value) 1))
+               (let ((shift (1- (integer-length value))))
+                 (inst lsl r x shift)
+                 (inst asr high x (- 64 shift))))
+              (t
+               (when value
+                 (load-immediate-word high value)
+                 (setf y high))
+               (inst mul r x y)
+               (inst smulh high x y))))
+      (inst cmp high (asr r 63))
+      (inst b :ne error))))
+
 (define-vop (overflow*-signed=>unsigned)
   (:translate overflow*)
   (:args (x :scs (signed-reg))
@@ -2295,6 +2327,29 @@
           (inst adds r x y))
       (inst b :vs error))))
 
+(define-vop (overflow+-fixnum)
+  (:translate overflow+)
+  (:args (x :scs (any-reg))
+         (y :scs (any-reg immediate)))
+  (:arg-types tagged-num tagged-num)
+  (:info type)
+  (:results (r :scs (any-reg)))
+  (:result-types tagged-num)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (let* ((*location-context* (unless (eq type 'fixnum)
+                                 type))
+           (error (generate-error-code vop 'sb-kernel::add-sub-overflow-error r)))
+      (if (sc-is y immediate)
+          (let ((y (fixnumize (tn-value y))))
+            (if (and (minusp y)
+                     (/= y #.(fixnumize most-negative-fixnum)))
+                (inst subs r x (add-sub-immediate (- y)))
+                (inst adds r x (add-sub-immediate y))))
+          (inst adds r x y))
+      (inst b :vs error))))
+
 (define-vop (overflow+-signed=>unsigned)
   (:translate overflow+)
   (:args (x :scs (signed-reg))
@@ -2311,9 +2366,7 @@
     (let* ((*location-context* (unless (eq type 'fixnum)
                                  type))
            (error (generate-error-code vop 'sb-kernel::add-sub-overflow-error
-                                       (make-random-tn :kind :normal
-                                                       :sc (sc-or-lose 'signed-reg)
-                                                       :offset (tn-offset r)))))
+                                       (make-random-tn (sc-or-lose 'signed-reg) (tn-offset r)))))
       (inst asr temp1 x 63)
       (inst asr temp2 y 63)
       (inst adds r x y)
@@ -2413,6 +2466,29 @@
       (if (sc-is y immediate)
           (let ((y (tn-value y)))
             (if (minusp y)
+                (inst adds r x (add-sub-immediate (- y)))
+                (inst subs r x (add-sub-immediate y))))
+          (inst subs r x y))
+      (inst b :vs error))))
+
+(define-vop (overflow-fixnum)
+  (:translate overflow-)
+  (:args (x :scs (any-reg))
+         (y :scs (any-reg immediate)))
+  (:arg-types tagged-num tagged-num)
+  (:info type)
+  (:results (r :scs (any-reg)))
+  (:result-types tagged-num)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (let* ((*location-context* (unless (eq type 'fixnum)
+                                 type))
+           (error (generate-error-code vop 'sb-kernel::add-sub-overflow-error r)))
+      (if (sc-is y immediate)
+          (let ((y (fixnumize (tn-value y))))
+            (if (and (minusp y)
+                     (/= y #.(fixnumize most-negative-fixnum)))
                 (inst adds r x (add-sub-immediate (- y)))
                 (inst subs r x (add-sub-immediate y))))
           (inst subs r x y))
@@ -2665,11 +2741,10 @@
                             nil)
                            (t
                             (setf amount-error
-                                  (make-random-tn :kind :normal
-                                                  :sc (sc-or-lose (if (typep amount 'word)
-                                                                      'unsigned-reg
-                                                                      'signed-reg))
-                                                  :offset (tn-offset tmp-tn)))
+                                  (make-random-tn (sc-or-lose (if (typep amount 'word)
+                                                                  'unsigned-reg
+                                                                  'signed-reg))
+                                                  (tn-offset tmp-tn)))
 
                             (lambda ()
                               (load-immediate-word amount-error amount)))))
@@ -2723,8 +2798,6 @@
              (inst b :ne error))))
     done))
 
-
-
 (define-vop (overflow-ash-unsigned)
   (:translate overflow-ash)
   (:args (number :scs (unsigned-reg))
@@ -2749,11 +2822,10 @@
                             nil)
                            (t
                             (setf amount-error
-                                  (make-random-tn :kind :normal
-                                                  :sc (sc-or-lose (if (typep amount 'word)
-                                                                      'unsigned-reg
-                                                                      'signed-reg))
-                                                  :offset (tn-offset tmp-tn)))
+                                  (make-random-tn (sc-or-lose (if (typep amount 'word)
+                                                                  'unsigned-reg
+                                                                  'signed-reg))
+                                                  (tn-offset tmp-tn)))
 
                             (lambda ()
                               (load-immediate-word amount-error amount)))))
@@ -3221,68 +3293,69 @@
                                                     branch-label
                                                     (sb-c::next-vop-label branch)))))
                             (cond
-                                  ((> lo hi)
-                                   (inst cmp null-tn 0))
-                                  ((= lo hi)
-                                   (change-vop-flags vop '(:eq))
-                                   (inst cmp x (add-sub-immediate lo)))
-                                  ((= hi ,(fixnumize -1))
-                                   (change-vop-flags vop '(:hs))
-                                   (cond (tbz-label
-                                          (inst tbnz* x 0 tbz-label)
-                                          (inst cmn x (add-sub-immediate (- lo))))
-                                         (t
-                                          (inst tst x fixnum-tag-mask)
-                                          (inst ccmn x (ccmp-immediate (- lo)) :eq))))
-                                  ((eq lo ,(fixnumize most-positive-fixnum))
-                                   (change-vop-flags vop '(:le))
-                                   (cond (tbz-label
-                                          (inst tbnz* x 0 tbz-label)
-                                          (inst cmp x (add-sub-immediate hi)))
-                                         (t
-                                          (inst tst x fixnum-tag-mask)
-                                          (inst ccmp x (ccmp-immediate hi) :eq))))
-                                  ((= hi ,(fixnumize most-positive-fixnum))
-                                   (change-vop-flags vop '(:ge))
-                                   (cond (tbz-label
-                                          (inst tbnz* x 0 tbz-label)
-                                          (inst cmp x (add-sub-immediate lo)))
-                                         (t
-                                          (inst tst x fixnum-tag-mask)
-                                          (inst ccmp x (ccmp-immediate lo) :eq #b1000))))
-                                  ((and (> lo 0)
-                                        (= (logcount (+ hi (fixnumize 1))) 1))
-                                   (inst tst x (lognot hi))
-                                   (change-vop-flags vop '(:hs))
-                                   (inst ccmp x (ccmp-immediate lo) :eq))
-                                  (t
-                                   (if (zerop lo)
-                                       (setf temp x)
-                                       (if (plusp lo)
-                                           (inst sub temp x (add-sub-immediate lo))
-                                           (inst add temp x (add-sub-immediate (abs lo)))))
-                                   (let* ((diff (- hi lo))
-                                          (loaded diff))
-                                     (cond ((= (logcount (+ diff (fixnumize 1))) 1)
-                                            (change-vop-flags vop '(:eq))
-                                            (inst tst temp (lognot diff)))
-                                           (t
-                                            (unless (add-sub-immediate-p diff)
-                                              (if (load-immediate-word tmp-tn (+ diff (fixnumize 1)) t)
-                                                  (change-vop-flags vop '(:lo))
-                                                  (load-immediate-word tmp-tn diff))
-                                              (setf loaded tmp-tn))
-                                            (cond
-                                              ((< diff lowest-bignum-address)
-                                               (inst cmp temp loaded))
-                                              (tbz-label
-                                               (inst tbnz* x 0 (if branch-not
-                                                                   branch-label
-                                                                   (sb-c::next-vop-label branch)))
-                                               (inst cmp temp loaded))
-                                              (t
-                                               (inst tst x fixnum-tag-mask)
-                                               (inst ccmp temp (ccmp-immediate loaded) :eq #b10)))))))))))))
+                              ((> lo hi)
+                               (inst cmp null-tn 0))
+                              ((= lo hi)
+                               (change-vop-flags vop '(:eq))
+                               (inst cmp x (add-sub-immediate lo)))
+                              ((= hi ,(fixnumize -1))
+                               (change-vop-flags vop '(:hs))
+                               (cond (tbz-label
+                                      (inst tbnz* x 0 tbz-label)
+                                      (inst cmn x (add-sub-immediate (- lo))))
+                                     (t
+                                      (inst tst x fixnum-tag-mask)
+                                      (inst ccmn x (ccmp-immediate (- lo)) :eq))))
+                              ((eq lo ,(fixnumize most-positive-fixnum))
+                               (change-vop-flags vop '(:le))
+                               (cond (tbz-label
+                                      (inst tbnz* x 0 tbz-label)
+                                      (inst cmp x (add-sub-immediate hi)))
+                                     (t
+                                      (inst tst x fixnum-tag-mask)
+                                      (inst ccmp x (ccmp-immediate hi) :eq))))
+                              ((and (/= lo 0)
+                                    (= hi ,(fixnumize most-positive-fixnum)))
+                               (change-vop-flags vop '(:ge))
+                               (cond (tbz-label
+                                      (inst tbnz* x 0 tbz-label)
+                                      (inst cmp x (add-sub-immediate lo)))
+                                     (t
+                                      (inst tst x fixnum-tag-mask)
+                                      (inst ccmp x (ccmp-immediate lo) :eq #b1000))))
+                              ((and (> lo 0)
+                                    (= (logcount (+ hi (fixnumize 1))) 1))
+                               (inst tst x (lognot hi))
+                               (change-vop-flags vop '(:hs))
+                               (inst ccmp x (ccmp-immediate lo) :eq))
+                              (t
+                               (if (zerop lo)
+                                   (setf temp x)
+                                   (if (plusp lo)
+                                       (inst sub temp x (add-sub-immediate lo))
+                                       (inst add temp x (add-sub-immediate (abs lo)))))
+                               (let* ((diff (- hi lo))
+                                      (loaded diff))
+                                 (cond ((= (logcount (+ diff (fixnumize 1))) 1)
+                                        (change-vop-flags vop '(:eq))
+                                        (inst tst temp (lognot diff)))
+                                       (t
+                                        (unless (add-sub-immediate-p diff)
+                                          (if (load-immediate-word tmp-tn (+ diff (fixnumize 1)) t)
+                                              (change-vop-flags vop '(:lo))
+                                              (load-immediate-word tmp-tn diff))
+                                          (setf loaded tmp-tn))
+                                        (cond
+                                          ((< diff lowest-bignum-address)
+                                           (inst cmp temp loaded))
+                                          (tbz-label
+                                           (inst tbnz* x 0 (if branch-not
+                                                               branch-label
+                                                               (sb-c::next-vop-label branch)))
+                                           (inst cmp temp loaded))
+                                          (t
+                                           (inst tst x fixnum-tag-mask)
+                                           (inst ccmp temp (ccmp-immediate loaded) :eq #b10)))))))))))))
 
                   (define-vop (,(symbolicate name '-integer))
                     (:translate ,name)
@@ -3308,7 +3381,18 @@
                                      (inst ccmn x (ccmp-immediate (- c)) cond flags)
                                      (inst ccmp x (ccmp-immediate c) cond flags))))
                         (inst tst x fixnum-tag-mask)
-                        (cond ((and (sc-is lo immediate)
+                        (cond ,@(unless excl-high
+                                  `(((and (sc-is hi immediate)
+                                          (= (tn-value hi) most-positive-fixnum))
+                                     (change-vop-flags vop '(,(if excl-low
+                                                                  :gt
+                                                                  :ge)))
+                                     (ccmp (imm lo) :eq #b1))))
+                              ,@(unless excl-low
+                                  `(((and (sc-is lo immediate)
+                                          (= (tn-value lo) most-negative-fixnum))
+                                     (ccmp (imm hi) :eq #b10))))
+                              ((and (sc-is lo immediate)
                                     (csubtypep (tn-ref-type hi-ref)
                                                (specifier-type 'unsigned-byte))
                                     (eql (tn-value lo)
@@ -3328,7 +3412,9 @@
   (def range<<= t nil)
   (def range<=< nil t)
 
-  (def check-range<= nil nil t))
+  (def check-range<= nil nil t)
+  (def check-range<<= t nil t)
+  (def check-range<=< nil t t))
 
 
 (define-vop (signed-multiply-low-high)
